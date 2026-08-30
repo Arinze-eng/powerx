@@ -8,6 +8,7 @@ directly from Supabase, so Render bandwidth is untouched.
 The publisher reuses the same Supabase credentials already wired in
 ``nanobot.supabase_auth`` (``SUPABASE_URL`` + ``SUPABASE_SERVICE_ROLE_KEY``)
 and the same ``httpx`` async client pattern, so no new dependencies are needed.
+
 """
 
 from __future__ import annotations
@@ -97,6 +98,11 @@ class SupabaseRealtimePublisher:
         self.url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
         self.service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
         self._enabled: bool | None = None
+        # Persistent httpx client for TCP/TLS connection pooling.
+        # Reusing one client across publish calls avoids a full TLS
+        # handshake on every INSERT, which is the dominant bandwidth
+        # cost for high-frequency stream-delta publishing.
+        self._client: httpx.AsyncClient | None = None
 
     @property
     def configured(self) -> bool:
@@ -109,6 +115,12 @@ class SupabaseRealtimePublisher:
         env_flag = os.getenv("SUPABASE_REALTIME_ENABLED", "true").strip().lower()
         self._enabled = self.configured and env_flag not in {"0", "false", "no"}
         return self._enabled
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Return a cached persistent httpx.AsyncClient for connection pooling."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=10.0)
+        return self._client
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -172,12 +184,12 @@ class SupabaseRealtimePublisher:
             body["stream_id"] = stream_id
 
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(
-                    f"{self.url}/rest/v1/agent_feedback",
-                    headers=self._headers(),
-                    json=body,
-                )
+            client = self._get_client()
+            response = await client.post(
+                f"{self.url}/rest/v1/agent_feedback",
+                headers=self._headers(),
+                json=body,
+            )
             if not response.is_success:
                 logger.warning(
                     "Supabase Realtime publish failed (HTTP {}): {}",
