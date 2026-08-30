@@ -1,0 +1,67 @@
+services:
+  - type: web
+    name: novita-super-agent
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: false
+    plan: free
+    region: frankfurt
+    healthCheckPath: /
+    envVars:
+      - key: LLM_BASE_URL
+        value: https://gemini-proxy.codebanana.app/v1
+      - key: LLM_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_WEBHOOK_URL
+        value: https://minis-yzdb.onrender.com/telegram
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: TELEGRAM_WEBHOOK_ORIGIN
+        value: http://127.0.0.1:8081
+      - key: TELEGRAM_WEBHOOK_PATH
+        value: /telegram
+      - key: WEBUI_UPSTREAM
+        value: http://127.0.0.1:8766
+      - key: WEBUI_WS_UPSTREAM
+        value: ws://127.0.0.1:8766
+      - key: NOVITA_API_KEY
+        sync: false
+      - key: SARVAM_SID
+        sync: false
+      - key: SARVAM_CSRF
+        sync: false
+      - key: SARVAM_CSRF_COOKIE_NAME
+        value: csrf_token_47e7312b4098ea2074fa42ed3e882b46089ff81e1306152464548a6023a49a22
+      - key: SARVAM_ORG
+        value: 01a00dfe-a2ae-7d9d-8ea2-a10684b7de42
+      - key: SARVAM_WS
+        value: 01a00dfe-a2b3-726d-9a1c-8135e570b8d6
+      - key: SARVAM_CONVERSATION_ID
+        value: 01M11TQCXK3K5CWDS4348KZP34
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SUPABASE_URL
+        value: https://nisqfdwvwjbejgeurbol.supabase.co
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: SUPABASE_AUTH_ENABLED
+        value: "true"
+      - key: SUPABASE_GATEWAY_KEY
+        sync: false
+      - key: NANOBOT_WEB_TOKEN
+        generateValue: true
+      - key: RENDER
+        value: "true"
+      - key: PORT
+        value: "8765"
+      - key: NANOBOT_DATA_DIR
+        value: /home/nanobot/.nanobot
+      - key: NANOBOT_SANDBOX_TIMEOUT
+        value: "3600"

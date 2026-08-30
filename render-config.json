@@ -1,0 +1,75 @@
+{
+  "agents": {
+    "defaults": {
+      "model": "custom/${LLM_MODEL}",
+      "provider": "custom",
+      "maxToolIterations": 120,
+      "reasoningEffort": "high",
+      "maxConcurrentSubagents": 1,
+      "workspace": "~/.nanobot/workspace",
+      "botName": "Novita Super Agent"
+    }
+  },
+  "providers": {
+    "custom": {
+      "displayName": "CodeBanana Proxy",
+      "apiKey": "${LLM_API_KEY}",
+      "apiBase": "${LLM_BASE_URL}"
+    }
+  },
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 18790
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "${TELEGRAM_BOT_TOKEN}",
+      "mode": "webhook",
+      "webhookUrl": "${TELEGRAM_WEBHOOK_URL}",
+      "webhookSecretToken": "${TELEGRAM_WEBHOOK_SECRET}",
+      "webhookListenHost": "127.0.0.1",
+      "webhookListenPort": 8081,
+      "webhookPath": "/telegram",
+      "webhookMaxConnections": 8,
+      "allowFrom": ["*"],
+      "groupPolicy": "mention",
+      "streaming": false,
+      "sendProgress": false,
+      "sendToolHints": false,
+      "showReasoning": false
+    },
+    "websocket": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 8766,
+      "tokenIssueSecret": "${NANOBOT_WEB_TOKEN}",
+      "websocketRequiresToken": true
+    }
+  },
+  "tools": {
+    "restrictToWorkspace": true,
+    "webuiAllowRemotePackageInstall": false,
+    "exec": {
+      "enable": false
+    },
+    "file": {
+      "enable": true
+    },
+    "browser": {
+      "enable": true,
+      "provider": "novita",
+      "novitaApiKeyEnv": "NOVITA_API_KEY",
+      "novitaTemplate": "browser-chromium",
+      "novitaTimeoutSeconds": 600,
+      "novitaBrowserPort": 9223,
+      "navigationTimeoutMs": 30000,
+      "actionTimeoutMs": 15000,
+      "sessionIdleSeconds": 900,
+      "maxPageTextChars": 12000
+    },
+    "my": {
+      "allowSet": false
+    }
+  }
+}
