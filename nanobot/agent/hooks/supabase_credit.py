@@ -15,6 +15,10 @@ class SupabaseCreditHook(AgentHook):
         super().__init__(reraise=True)
         self._context = context
         self._supabase = SupabaseAuth()
+        # Cache the drain_rate so subsequent iterations skip the
+        # redundant GET /profiles round-trip.  Fetched once on the
+        # first LLM iteration, then reused for every step after.
+        self._drain_rate: int | None = None
 
     async def before_iteration(self, context: AgentHookContext) -> None:
         if not self._supabase.enabled or self._context.channel != "telegram":
@@ -28,10 +32,19 @@ class SupabaseCreditHook(AgentHook):
         step_no = context.iteration + 1
         task_ref = f"nanobot:{self._context.session_key or self._context.chat_id}:{self._context.message_id or 'turn'}"
         try:
+            # On the first iteration, fetch and cache the drain_rate
+            # so subsequent iterations can pass an explicit amount
+            # and skip the redundant GET /profiles round-trip.
+            if self._drain_rate is None:
+                self._drain_rate = await self._supabase.get_drain_rate(
+                    {"agentx_user_id": str(user_id)},
+                )
+            amount = 3 * self._drain_rate
             await self._supabase.charge_step(
                 {"agentx_user_id": str(user_id)},
                 task_ref,
                 step_no,
+                amount=amount,
             )
         except SupabaseAuthError as exc:
             raise CreditExhaustedError(

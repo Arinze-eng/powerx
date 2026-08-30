@@ -528,6 +528,13 @@ class SupabaseAuth:
             body["model"] = model.strip()[:200]
         return await self._puter_request(account, body)
 
+    async def get_drain_rate(self, account: dict[str, Any]) -> int:
+        """Fetch the drain_rate for a user from the profiles table."""
+        if not account.get("agentx_user_id"):
+            raise SupabaseAuthError("Use /signup or /signin first")
+        rows = await self._request("GET", "/rest/v1/profiles", service=True, params={"id": f"eq.{account['agentx_user_id']}", "limit": "1", "select": "drain_rate"})
+        return max(1, int(rows[0].get("drain_rate") or 1)) if isinstance(rows, list) and rows else 1
+
     async def charge_step(self, account: dict[str, Any], task_ref: str, step_no: int, amount: int = 0) -> dict[str, Any]:
         if not account.get("agentx_user_id"):
             raise SupabaseAuthError("Use /signup or /signin first")

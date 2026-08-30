@@ -846,6 +846,12 @@ class ChannelManager:
 
     async def _publish_realtime(self, msg: OutboundMessage) -> None:
         """Fire-and-forget publish to Supabase Realtime. Never raises."""
+        # Telegram users receive feedback through the Telegram Bot API
+        # directly.  The Supabase Realtime INSERT was a third copy of
+        # the same content leaving Render with no Telegram client
+        # consuming it, so skip it to save bandwidth.
+        if str(msg.channel or "") == "telegram":
+            return
         publisher = self._get_realtime_publisher()
         if publisher is None:
             return
