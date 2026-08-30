@@ -457,7 +457,9 @@ async def test_vps_ocr_uploads_telegram_image_bytes_and_returns_result(
     )
 
     assert "VPS OCR OK" in result
-    assert tmpfile_uploads == [("photo.jpg", b"telegram-image-bytes")]
+    # tmpfiles.org relay is skipped in VPS mode — SFTP delivers
+    # the bytes directly.
+    assert tmpfile_uploads == []
     assert uploads == [("telegram", uploads[0][1], b"telegram-image-bytes")]
     assert uploads[0][1].startswith(f"{workspace}/telegram-images/")
     assert any(
@@ -493,9 +495,9 @@ async def test_vps_attachment_accepts_active_config_media_root_when_env_root_dif
         session_key="telegram:canonical-root",
     )
     assert staged and staged[0][0] == str(document.resolve())
-    tmpfile_upload.assert_awaited_once()
+    # tmpfiles.org relay is skipped — SFTP upload is used directly.
+    tmpfile_upload.assert_not_awaited()
     upload.assert_awaited_once()
-    assert tmpfile_upload.await_args.args[0].read_bytes() == b"%PDF-1.7"
 
 
 @pytest.mark.asyncio
@@ -523,9 +525,9 @@ async def test_vps_confirmed_attachment_is_staged_before_model_turn(tmp_path, mo
 
     assert staged and staged[0][0] == str(document.resolve())
     assert staged[0][1].startswith("/workspace/telegram-attachments/")
-    tmpfile_upload.assert_awaited_once()
+    # tmpfiles.org relay is skipped in VPS mode.
+    tmpfile_upload.assert_not_awaited()
     upload.assert_awaited_once()
-    assert tmpfile_upload.await_args.args[0].read_bytes() == b"%PDF-1.7"
 
 
 @pytest.mark.asyncio
