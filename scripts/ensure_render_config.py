@@ -11,7 +11,7 @@ from typing import Any
 _DEFAULT_MAX_TOOL_ITERATIONS = 120
 _LEGACY_DEFAULT_MAX_TOOL_ITERATIONS = 80
 _DEFAULT_REASONING_EFFORT = "high"
-_DEFAULT_RENDER_MODEL = "gemini-3.1-flash-lite"
+_DEFAULT_RENDER_MODEL = "gemini-2.5-flash"
 
 
 def _load_config(config_path: Path) -> dict[str, Any] | None:

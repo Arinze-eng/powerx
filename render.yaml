@@ -9,6 +9,8 @@ services:
     region: frankfurt
     healthCheckPath: /
     envVars:
+      - key: LLM_MODEL
+        value: gemini-2.5-flash
       - key: LLM_BASE_URL
         value: https://gemini-proxy.codebanana.app/v1
       - key: LLM_API_KEY
