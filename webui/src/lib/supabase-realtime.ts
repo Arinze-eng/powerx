@@ -50,7 +50,6 @@ function rowToInboundEvent(row: Record<string, unknown>): InboundEvent {
 
   // Map our server-side event_type to the InboundEvent shape
   // that NanobotClient.handleMessage dispatches.
-  const base = { chat_id: chatId };
 
   switch (eventType) {
     case "delta":
@@ -74,10 +73,11 @@ function rowToInboundEvent(row: Record<string, unknown>): InboundEvent {
       } as InboundEvent;
     case "progress":
       return {
-        event: "progress",
+        event: "message",
         chat_id: chatId,
-        content,
-      } as InboundEvent;
+        text: content,
+        kind: "progress",
+      };
     case "runtime_model_updated":
       return {
         event: "runtime_model_updated",
@@ -242,7 +242,6 @@ export class SupabaseRealtimeSubscriber {
 
     // Handle channel join confirmation
     if (msg.event === "phx_reply" && msg.payload) {
-      const payload = msg.payload as Record<string, unknown>;
       // Join confirmation — nothing to do beyond logging.
       return;
     }
