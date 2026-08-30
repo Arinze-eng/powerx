@@ -743,7 +743,9 @@ class NovitaSandboxTool(Tool):
                 raise ValueError("Telegram attachment exceeds 200 MiB")
             safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", source.name)[:120] or "attachment.bin"
             remote = f"{root}/telegram-attachments/{uuid4().hex}-{safe_name}"
-            await upload_tmpfile_path(source)
+            # Skip the tmpfiles.org relay upload — the SFTP upload
+            # below delivers the same bytes directly, so the relay
+            # was sending every file out of Render twice.
             await backend.upload("telegram", remote, await asyncio.to_thread(source.read_bytes))
             staged.append((str(source), remote))
         return staged
@@ -790,9 +792,10 @@ class NovitaSandboxTool(Tool):
                     return ToolResult.error("source file does not exist")
                 if source.stat().st_size > _MAX_UPLOAD_BYTES:
                     return ToolResult.error("source file exceeds 200 MiB")
-                await upload_tmpfile_path(source)
+                # Skip the tmpfiles.org relay — SFTP upload is
+                # available and delivers the bytes directly.
                 await backend.upload(str(source), path, await asyncio.to_thread(source.read_bytes))
-                return f"Uploaded {source.name} via tmpfiles.org to {path} in the remote VPS workspace."
+                return f"Uploaded {source.name} to {path} in the remote VPS workspace."
             if action == "list":
                 return await backend.list(path)
             if action == "download_url":
