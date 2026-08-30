@@ -134,6 +134,9 @@ class ChannelManager:
         self._dispatch_task: asyncio.Task[None] | None = None
         self._started = False
         self._origin_reply_fingerprints: dict[tuple[str, str, str], str] = {}
+        # Supabase Realtime publisher for agent feedback delivery. Lazily
+        # imported so the module loads even when Supabase is not configured.
+        self._realtime_publisher: Any = None
 
         self._init_channels()
 
@@ -743,6 +746,10 @@ class ChannelManager:
                     pending.extend(extra_pending)
                     event = outbound_event_from_message(msg)
 
+                # Publish to Supabase Realtime so clients receive feedback
+                # without going through the Render reverse-proxy WebSocket.
+                await self._publish_realtime(msg)
+
                 channel = self.channels.get(msg.channel)
                 if channel:
                     # Duplicate suppression is scoped to a known source message
@@ -820,6 +827,32 @@ class ChannelManager:
             msg.metadata,
             **kwargs,
         )
+
+    def _get_realtime_publisher(self) -> Any:
+        """Return a cached SupabaseRealtimePublisher, or None if not configured."""
+        if self._realtime_publisher is not None:
+            return self._realtime_publisher
+        try:
+            from nanobot.supabase_realtime import SupabaseRealtimePublisher
+
+            publisher = SupabaseRealtimePublisher()
+            if publisher.enabled:
+                self._realtime_publisher = publisher
+                return publisher
+        except Exception:
+            logger.debug("Supabase Realtime publisher unavailable")
+        self._realtime_publisher = None
+        return None
+
+    async def _publish_realtime(self, msg: OutboundMessage) -> None:
+        """Fire-and-forget publish to Supabase Realtime. Never raises."""
+        publisher = self._get_realtime_publisher()
+        if publisher is None:
+            return
+        try:
+            await publisher.publish_outbound(msg)
+        except Exception as exc:
+            logger.debug("Supabase Realtime publish error: {}", type(exc).__name__)
 
     @staticmethod
     async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
