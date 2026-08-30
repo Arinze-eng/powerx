@@ -30,7 +30,6 @@ class _FakeResponse:
         self.text = text
         self.is_success = 200 <= status < 300
 
-
 class _FakePublisher(SupabaseRealtimePublisher):
     """Publisher subclass that captures HTTP calls instead of making real ones."""
 
@@ -257,6 +256,9 @@ async def test_publish_outbound_makes_http_post(monkeypatch: pytest.MonkeyPatch)
     pub = SupabaseRealtimePublisher()
     msg = _make_msg(content="Done", chat_id="99")
     await pub.publish_outbound(msg)
+    # Close the persistent client so the mock transport is released.
+    if pub._client is not None:
+        await pub._client.aclose()
 
     assert "agent_feedback" in captured_request["url"]
     body = captured_request["json"]
@@ -287,6 +289,8 @@ async def test_publish_outbound_logs_on_http_error(monkeypatch: pytest.MonkeyPat
     msg = _make_msg()
     # Should not raise even on HTTP 500.
     await pub.publish_outbound(msg)
+    if pub._client is not None:
+        await pub._client.aclose()
 
 
 async def test_publish_outbound_logs_on_network_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -310,6 +314,49 @@ async def test_publish_outbound_logs_on_network_error(monkeypatch: pytest.Monkey
     msg = _make_msg()
     # Should not raise even on network error.
     await pub.publish_outbound(msg)
+    if pub._client is not None:
+        await pub._client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Persistent client tests
+# ---------------------------------------------------------------------------
+
+
+async def test_publisher_reuses_persistent_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The publisher should reuse a single httpx.AsyncClient across calls."""
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-key")
+    monkeypatch.setenv("SUPABASE_REALTIME_ENABLED", "true")
+
+    class _MockTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.requests = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.requests += 1
+            return httpx.Response(201, text="")
+
+    transport = _MockTransport()
+    original_init = httpx.AsyncClient.__init__
+
+    def _patched_init(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["transport"] = transport
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", _patched_init)
+
+    pub = SupabaseRealtimePublisher()
+    msg = _make_msg(content="first", chat_id="1")
+    await pub.publish_outbound(msg)
+    msg2 = _make_msg(content="second", chat_id="2")
+    await pub.publish_outbound(msg2)
+
+    # Both calls should have gone through the same persistent client.
+    assert pub._client is not None
+    assert not pub._client.is_closed
+    assert transport.requests == 2
+    await pub._client.aclose()
 
 
 # ---------------------------------------------------------------------------
