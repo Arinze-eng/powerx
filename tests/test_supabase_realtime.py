@@ -377,30 +377,41 @@ async def test_publish_outbound_truncates_long_content() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_channel_manager_publishes_to_realtime(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify ChannelManager._publish_realtime calls the publisher."""
+async def _make_manager_with_fake_publisher():
     from nanobot.channels.manager import ChannelManager
     from nanobot.config.schema import Config
-
-    # Build a minimal config + bus.
-    config = Config()
     from nanobot.bus.queue import MessageBus
 
+    config = Config()
     bus = MessageBus()
 
-    # Patch _init_channels to avoid loading real channel plugins.
     with patch.object(ChannelManager, "_init_channels", lambda self: None):
         manager = ChannelManager(config, bus)
 
-    # Inject a fake publisher.
     fake_pub = MagicMock()
     fake_pub.publish_outbound = AsyncMock()
     manager._realtime_publisher = fake_pub
+    return manager, fake_pub
 
-    msg = _make_msg(content="Test feedback", chat_id="chat-1")
+
+async def test_channel_manager_publishes_to_realtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-Telegram outbound messages are published to Supabase Realtime."""
+    manager, fake_pub = await _make_manager_with_fake_publisher()
+
+    msg = _make_msg(content="Test feedback", chat_id="chat-1", channel="websocket")
     await manager._publish_realtime(msg)
 
     fake_pub.publish_outbound.assert_called_once_with(msg)
+
+
+async def test_channel_manager_skips_realtime_for_telegram() -> None:
+    """Telegram feedback travels via the Bot API directly; Realtime is skipped to save bandwidth."""
+    manager, fake_pub = await _make_manager_with_fake_publisher()
+
+    msg = _make_msg(content="Test feedback", chat_id="chat-1", channel="telegram")
+    await manager._publish_realtime(msg)
+
+    fake_pub.publish_outbound.assert_not_called()
 
 
 async def test_channel_manager_realtime_noop_when_not_configured(
