@@ -1869,8 +1869,9 @@ class AgentLoop:
         prefix = (
             f"[Telegram image analysis from {backend_label} ({image_count} image"
             f"{'s' if image_count != 1 else ''})]\n"
-            "The image file was uploaded and inspected by the selected execution backend. "
-            "Do not claim that the image was not received; report the OCR result honestly.\n"
+            "The image file WAS received and forwarded to the selected execution "
+            "backend for OCR. Do not claim the user's image was not received or "
+            "that no file can be found. Report the OCR result below honestly:\n"
             f"{analysis.strip()}"
         )
         original = "\n".join(

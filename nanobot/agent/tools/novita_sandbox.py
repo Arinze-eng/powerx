@@ -855,19 +855,67 @@ class NovitaSandboxTool(Tool):
                     remote_paths.append(remote_path)
                     await asyncio.to_thread(sandbox.files.write, remote_path, raw)
                 # Direct-fetch entries: curl the bytes straight from Telegram
-                # inside the sandbox, so nothing transits Render egress.
+                # inside the sandbox, so nothing transits Render egress. Each
+                # fetch is isolated: a single expired/unreachable Telegram URL
+                # must not silently drop that image or abort the whole batch.
+                # Only successfully-fetched files are added to the OCR manifest.
+                fetch_failures: list[str] = []
                 for _raw_token, (url, safe_name) in token_map.items():
                     suffix = Path(safe_name).suffix.lower() or ".img"
                     remote_path = f"{_WORKSPACE}/telegram-images/{uuid4().hex}{suffix}"
-                    remote_paths.append(remote_path)
-                    await asyncio.to_thread(
-                        sandbox.commands.run,
-                        f"curl -fsSL --retry 2 --max-time 180 {shlex.quote(url)} -o {shlex.quote(remote_path)} "
-                        f"&& test -s {shlex.quote(remote_path)}",
-                        cwd=_WORKSPACE,
-                        timeout=200,
-                        request_timeout=210,
+                    try:
+                        _fetch_result = await asyncio.to_thread(
+                            sandbox.commands.run,
+                            f"curl -fsSL --retry 2 --max-time 180 {shlex.quote(url)} -o {shlex.quote(remote_path)} "
+                            f"&& test -s {shlex.quote(remote_path)}",
+                            cwd=_WORKSPACE,
+                            timeout=200,
+                            request_timeout=210,
+                        )
+                    except Exception as fetch_exc:
+                        # Do not add remote_path to remote_paths (it may not
+                        # exist). Record the failure for an honest report.
+                        with suppress(Exception):
+                            await asyncio.to_thread(
+                                sandbox.commands.run,
+                                f"rm -f {shlex.quote(remote_path)}",
+                                cwd=_WORKSPACE,
+                                timeout=30,
+                                request_timeout=60,
+                            )
+                        fetch_failures.append(f"{safe_name}: {type(fetch_exc).__name__}")
+                        logger.warning(
+                            "Novita direct-fetch failed for {}: {}",
+                            safe_name,
+                            type(fetch_exc).__name__,
+                        )
+                        continue
+                    # The curl's `&& test -s` already gated success, but a
+                    # non-zero sandbox command that did not raise still means no
+                    # usable file; skip it rather than pollute the manifest.
+                    fetch_code = getattr(
+                        _fetch_result, "exit_code", getattr(_fetch_result, "exitCode", 0)
                     )
+                    if fetch_code not in (None, 0):
+                        with suppress(Exception):
+                            await asyncio.to_thread(
+                                sandbox.commands.run,
+                                f"rm -f {shlex.quote(remote_path)}",
+                                cwd=_WORKSPACE,
+                                timeout=30,
+                                request_timeout=60,
+                            )
+                        fetch_failures.append(f"{safe_name}: fetch failed (exit {fetch_code})")
+                        continue
+                    remote_paths.append(remote_path)
+                if not remote_paths:
+                    if fetch_failures:
+                        details = "; ".join(fetch_failures)[:_MAX_IMAGE_ANALYSIS_RESULT_CHARS]
+                        return (
+                            "[Telegram image received, but the OCR backend could not retrieve "
+                            f"its bytes from Telegram for OCR. Fetch failures: {details}]"
+                        )
+                    return "[No readable Telegram images were available to Novita Sandbox.]"
                 await asyncio.to_thread(
                     sandbox.files.write,
                     manifest_path,

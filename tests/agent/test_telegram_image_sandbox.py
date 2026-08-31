@@ -40,7 +40,7 @@ async def test_telegram_images_are_preprocessed_and_removed_from_model_media(tmp
     assert ctx.msg.media == []
     assert "A blue bicycle is visible." in ctx.msg.content
     assert "What is in this image?" in ctx.msg.content
-    assert "uploaded and inspected" in ctx.msg.content
+    assert "WAS received" in ctx.msg.content
     assert ctx.msg.metadata["telegram_images_via_novita_sandbox"] is True
 
 
@@ -75,7 +75,7 @@ async def test_vps_telegram_images_use_ocr_only_and_remove_local_image_reference
     assert ctx.msg.media == []
     assert "VPS IMAGE OCR 2026" in ctx.msg.content
     assert "What is this?" in ctx.msg.content
-    assert "uploaded and inspected" in ctx.msg.content
+    assert "WAS received" in ctx.msg.content
     assert f"[image: {image}]" not in ctx.msg.content
     assert ctx.msg.metadata["telegram_images_execution_backend"] == "vps"
     assert ctx.msg.metadata["telegram_images_via_novita_sandbox"] is False
@@ -986,7 +986,146 @@ async def test_analyze_telegram_images_vps_from_urls_fetches_directly(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_stage_telegram_attachments_local_path_skips_relay(monkeypatch, tmp_path) -> None:
+async def test_novita_direct_fetch_failure_is_isolated_and_reported_honestly(monkeypatch) -> None:
+    """A failing api.telegram.org direct-fetch must not abort the batch or
+    silently drop the image. It must yield an honest 'image received, bytes
+    not retrievable' message instead of a bare OCR-failure string so the model
+    never fabricates 'the image file could not be located'."""
+    from nanobot.agent.tools.novita_sandbox import (
+        _encode_telegram_url_token,
+        NovitaSandboxTool,
+    )
+
+    class FakeFiles:
+        def __init__(self) -> None:
+            self.files: dict[str, bytes] = {}
+
+        def write(self, path: str, content: str | bytes) -> None:
+            del path
+            del content
+
+    class FakeCommands:
+        def __init__(self) -> None:
+            self.fetched: list[tuple[str, str]] = []
+
+        def run(self, command: str, **kwargs):
+            cwd = kwargs.get("cwd")
+            if command.startswith("mkdir -p"):
+                return SimpleNamespace(stdout="", stderr="", exit_code=0)
+            if command.startswith("rm -f"):
+                return SimpleNamespace(stdout="", stderr="", exit_code=0)
+            if command.startswith("curl"):
+                # Simulate a failed Telegram direct-fetch: the sandbox command
+                # raises (CommandExitException in production).
+                raise RuntimeError("sandbox curl failed")
+            del cwd
+            return SimpleNamespace(
+                stdout="",
+                stderr="",
+                exit_code=1,
+            )
+
+    class FakeSandbox:
+        def __init__(self) -> None:
+            self.files = FakeFiles()
+            self.commands = FakeCommands()
+
+    sandbox = FakeSandbox()
+
+    def get_or_create(self, key):
+        del self, key
+        return sandbox
+
+    monkeypatch.setenv("NOVITA_API_KEY", "test-key")
+    monkeypatch.setattr(NovitaSandboxTool, "_get_or_create", get_or_create)
+
+    bad = _encode_telegram_url_token(
+        "https://api.telegram.org/file/bot123/documents/gone.png",
+        "gone.png",
+    )
+    result = await NovitaSandboxTool().analyze_telegram_images(
+        [bad],
+        "Read this",
+        session_key="telegram:direct-fail",
+    )
+
+    assert "bytes from Telegram" in result
+    assert "gone.png" in result
+    assert "Tesseract OCR failed" not in result
+
+
+@pytest.mark.asyncio
+async def test_novita_direct_fetch_success_still_runs_ocr_and_populates_manifest(monkeypatch) -> None:
+    """A successful direct-fetch must write the file path into the manifest and
+    feed it through the OCR reader (happy path preserved)."""
+    import json
+
+    from nanobot.agent.tools.novita_sandbox import (
+        _encode_telegram_url_token,
+        NovitaSandboxTool,
+    )
+
+    class FakeFiles:
+        def __init__(self) -> None:
+            self.files: dict[str, bytes] = {}
+            self.manifest: dict = {}
+
+        def write(self, path: str, content: str | bytes) -> None:
+            if path.endswith("telegram_image_manifest.json"):
+                self.manifest = json.loads(content if isinstance(content, str) else content.decode())
+            else:
+                self.files[path] = content.encode() if isinstance(content, str) else content
+
+    class FakeCommands:
+        def __init__(self, files: FakeFiles) -> None:
+            self.files = files
+
+        def run(self, command: str, **kwargs):
+            del kwargs
+            if command.startswith("mkdir -p"):
+                return SimpleNamespace(stdout="", stderr="", exit_code=0)
+            if command.startswith("rm -f"):
+                return SimpleNamespace(stdout="", stderr="", exit_code=0)
+            if command.startswith("curl"):
+                return SimpleNamespace(stdout="", stderr="", exit_code=0)
+            # OCR script invocation
+            return SimpleNamespace(
+                stdout='{"content":"File: photo.png\\nRecognized text:\\nOK DIRECT"}',
+                stderr="",
+                exit_code=0,
+            )
+
+    class FakeSandbox:
+        def __init__(self) -> None:
+            self.files = FakeFiles()
+            self.commands = FakeCommands(self.files)
+
+    sandbox = FakeSandbox()
+
+    def get_or_create(self, key):
+        del self, key
+        return sandbox
+
+    monkeypatch.setenv("NOVITA_API_KEY", "test-key")
+    monkeypatch.setattr(NovitaSandboxTool, "_get_or_create", get_or_create)
+
+    token = _encode_telegram_url_token(
+        "https://api.telegram.org/file/bot123/photos/photo.png",
+        "photo.png",
+    )
+    result = await NovitaSandboxTool().analyze_telegram_images(
+        [token],
+        "Read this",
+        session_key="telegram:direct-ok",
+    )
+
+    assert "OK DIRECT" in result
+    assert len(sandbox.files.manifest) == 1
+    assert sandbox.files.manifest[0].startswith("/workspace/telegram-images/")
+
+
+@pytest.mark.asyncio
+async def test_novita_stage_telegram_attachments_local_path_skips_relay(monkeypatch, tmp_path) -> None:
     import nanobot.agent.tools.vps_backend as vps_backend_mod
 
     from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool
