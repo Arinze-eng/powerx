@@ -38,6 +38,11 @@ from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.telegram.task_mode import deliberate_task_metadata
+from nanobot.agent.tools.novita_sandbox import (
+    _encode_telegram_url_token,
+    _is_telegram_url_token,
+    set_telegram_url_refresher,
+)
 from nanobot.channels.telegram.sarvam import SarvamAuthError, SarvamClient, telegram_file_ref
 from nanobot.command.builtin import build_help_text
 from nanobot.config.paths import get_media_dir
@@ -733,6 +738,29 @@ class TelegramChannel(BaseChannel):
         self._bot_user_id = getattr(bot_info, "id", None)
         self._bot_username = getattr(bot_info, "username", None)
         self.logger.info("bot @{} connected", bot_info.username)
+
+        # Register a URL refresher so the OCR backend can regenerate a fresh
+        # api.telegram.org download URL from a still-valid file_id when the
+        # original direct-fetch URL has gone stale (404). This keeps image bytes
+        # off Render egress while making Telegram image OCR reliable.
+        try:
+            bot_token = getattr(self.config, "token", "").strip()
+
+            async def _refresh_tgurl(file_id: str) -> str:
+                if not file_id or not self._app:
+                    raise RuntimeError("file_id or app unavailable for URL refresh")
+                fresh_file = await self._app.bot.get_file(file_id)
+                fresh_path = getattr(fresh_file, "file_path", None)
+                if not fresh_path:
+                    raise RuntimeError("get_file returned no file_path")
+                return f"https://api.telegram.org/file/bot{bot_token}/{fresh_path}"
+
+            set_telegram_url_refresher(_refresh_tgurl)
+            self.logger.debug("telegram URL refresher registered")
+        except Exception as e:  # pragma: no cover - best-effort wiring
+            self.logger.warning(
+                "Failed to register telegram URL refresher: {}", type(e).__name__
+            )
 
         try:
             await self._app.bot.set_my_commands(self.BOT_COMMANDS)
@@ -1747,8 +1775,9 @@ class TelegramChannel(BaseChannel):
                 file_path_str = getattr(file, "file_path", None)
                 if file_path_str:
                     download_url = f"https://api.telegram.org/file/bot{self.config.token}/{file_path_str}"
+                    file_id = getattr(media_file, "file_id", "") or ""
                     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", file_name)[:120] or "attachment.bin"
-                    token = f"tgurl::{download_url}::{safe_name}"
+                    token = _encode_telegram_url_token(download_url, safe_name, file_id)
                     return [token], [f"[{media_type}: {file_name}]"]
             await file.download_to_drive(str(file_path))
             path_str = str(file_path)

@@ -10,7 +10,7 @@ import shlex
 import threading
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from loguru import logger
@@ -48,31 +48,62 @@ _OCR_DIR = f"{_WORKSPACE}/.nanobot"
 # "direct fetch" token instead of a local Render disk path.  When present, the
 # active execution backend (Novita sandbox or Linux VPS) downloads the bytes
 # straight from api.telegram.org, so the file never transits Render's egress
-# (near-zero Render bandwidth).  Format: tgurl::<https-download-url>::<filename>
+# (near-zero Render bandwidth).  Telegram `file_path` download URLs can go stale
+# (HTTP 404), but the underlying `file_id` stays valid, so we also carry the
+# file_id in the token and refresh a fresh download URL on demand if the first
+# fetch 404s — all without touching Render egress.
+#
+# Format: tgurl::<https-download-url>::<file_id>::<filename>
+#   - <file_id> is optional (legacy tokens may omit it).
 _TG_URL_PREFIX = "tgurl::"
 
 
-def _encode_telegram_url_token(download_url: str, filename: str) -> str:
+def _encode_telegram_url_token(
+    download_url: str, filename: str, file_id: str = ""
+) -> str:
     """Build an opaque token that routes a Telegram file to a direct backend fetch."""
     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[:120] or "attachment.bin"
+    fid = re.sub(r"[^A-Za-z0-9._-]", "_", str(file_id or ""))[:255]
+    if fid:
+        return f"{_TG_URL_PREFIX}{download_url}::{fid}::{safe_name}"
     return f"{_TG_URL_PREFIX}{download_url}::{safe_name}"
 
 
-def _decode_telegram_url_token(token: str) -> tuple[str, str] | None:
-    """Return (download_url, safe_name) when *token* is a direct-fetch token."""
+def _decode_telegram_url_token(token: str) -> tuple[str, str, str] | None:
+    """Return (download_url, file_id, safe_name) when *token* is a direct-fetch token.
+
+    ``file_id`` is ``""`` for legacy tokens that omit it.
+    """
     if not token.startswith(_TG_URL_PREFIX):
         return None
     body = token[len(_TG_URL_PREFIX):]
     if "::" not in body:
         return None
-    url, safe_name = body.split("::", 1)
+    parts = body.split("::", 2)
+    url = parts[0]
+    if len(parts) == 3:
+        fid, safe_name = parts[1], parts[2]
+    else:
+        fid, safe_name = "", parts[1]
     if not url.startswith("https://api.telegram.org/") or not safe_name:
         return None
-    return url, safe_name
+    return url, fid, safe_name
 
 
 def _is_telegram_url_token(value: str) -> bool:
     return _decode_telegram_url_token(value) is not None
+
+
+# Optional hook the Telegram channel registers so a direct-fetch URL can be
+# refreshed from a still-valid file_id when the first download 404s. Signature:
+#   refresh_fn(file_id: str) -> Awaitable[str]  (returns a fresh api.telegram.org URL)
+_TELEGRAM_URL_REFRESHER: Callable[[str], Awaitable[str]] | None = None
+
+
+def set_telegram_url_refresher(refresher: Callable[[str], Awaitable[str]] | None) -> None:
+    """Register (or clear) a callable that maps a file_id to a fresh download URL."""
+    global _TELEGRAM_URL_REFRESHER
+    _TELEGRAM_URL_REFRESHER = refresher
 
 _TELEGRAM_IMAGE_SCRIPT = r'''import json
 import os
@@ -696,7 +727,7 @@ class NovitaSandboxTool(Tool):
                 decoded = _decode_telegram_url_token(str(raw_token))
                 if decoded is None:
                     continue
-                download_url, safe_name = decoded
+                download_url, _file_id, safe_name = decoded
                 if not (mimetypes.guess_type(safe_name)[0] or "").startswith("image/"):
                     continue
                 suffix = Path(safe_name).suffix.lower() or ".img"
@@ -770,7 +801,7 @@ class NovitaSandboxTool(Tool):
             for raw_path in image_paths[:_MAX_TELEGRAM_IMAGE_COUNT]:
                 token = _decode_telegram_url_token(str(raw_path)) if _is_telegram_url_token(str(raw_path)) else None
                 if token is not None:
-                    url, safe_name = token
+                    url, _fid, safe_name = token
                     guessed = mimetypes.guess_type(safe_name)[0]
                     if guessed and guessed.startswith("image/"):
                         local_images.append((Path(safe_name), b""))  # placeholder, resolved below
@@ -809,15 +840,15 @@ class NovitaSandboxTool(Tool):
 
         # Direct-fetch tokens let the Novita sandbox pull the image from
         # api.telegram.org directly instead of reading local Render bytes.
-        token_map: dict[str, tuple[str, str]] = {}
+        token_map: dict[str, tuple[str, str, str]] = {}
         local_images: list[tuple[Path, bytes]] = []
         for raw_path in image_paths:
             decoded = (_decode_telegram_url_token(str(raw_path))
                        if _is_telegram_url_token(str(raw_path)) else None)
             if decoded is not None:
-                url, safe_name = decoded
+                url, fid, safe_name = decoded
                 if (mimetypes.guess_type(safe_name)[0] or "").startswith("image/"):
-                    token_map[str(raw_path)] = (url, safe_name)
+                    token_map[str(raw_path)] = (url, fid, safe_name)
                 continue
             path = Path(raw_path).expanduser().resolve()
             try:
@@ -860,53 +891,116 @@ class NovitaSandboxTool(Tool):
                 # must not silently drop that image or abort the whole batch.
                 # Only successfully-fetched files are added to the OCR manifest.
                 fetch_failures: list[str] = []
-                for _raw_token, (url, safe_name) in token_map.items():
+                for _raw_token, (url, fid, safe_name) in token_map.items():
                     suffix = Path(safe_name).suffix.lower() or ".img"
                     remote_path = f"{_WORKSPACE}/telegram-images/{uuid4().hex}{suffix}"
-                    try:
-                        _fetch_result = await asyncio.to_thread(
+
+                    async def _fetch_once(target_url: str) -> object:
+                        return await asyncio.to_thread(
                             sandbox.commands.run,
-                            f"curl -fsSL --retry 2 --max-time 180 {shlex.quote(url)} -o {shlex.quote(remote_path)} "
+                            f"curl -fsSL --retry 2 --max-time 180 {shlex.quote(target_url)} -o {shlex.quote(remote_path)} "
                             f"&& test -s {shlex.quote(remote_path)}",
                             cwd=_WORKSPACE,
                             timeout=200,
                             request_timeout=210,
                         )
+
+                    def _fetch_ok(result: object) -> bool:
+                        code = getattr(result, "exit_code", getattr(result, "exitCode", 0))
+                        return code in (None, 0)
+
+                    # Try the carried download URL first (zero Render egress).
+                    # Telegram file_path URLs can go stale (404); if so, refresh
+                    # a fresh URL from the still-valid file_id and retry once —
+                    # this also never touches Render egress.
+                    try:
+                        _fetch_result = await _fetch_once(url)
                     except Exception as fetch_exc:
-                        # Do not add remote_path to remote_paths (it may not
-                        # exist). Record the failure for an honest report.
-                        with suppress(Exception):
-                            await asyncio.to_thread(
-                                sandbox.commands.run,
-                                f"rm -f {shlex.quote(remote_path)}",
-                                cwd=_WORKSPACE,
-                                timeout=30,
-                                request_timeout=60,
+                        fresh_url: str | None = None
+                        if fid and _TELEGRAM_URL_REFRESHER:
+                            try:
+                                fresh_url = await _TELEGRAM_URL_REFRESHER(fid)
+                            except Exception as refresh_exc:
+                                logger.warning(
+                                    "Novita direct-fetch URL refresh failed for {}: {}",
+                                    safe_name,
+                                    type(refresh_exc).__name__,
+                                )
+                                fresh_url = None
+                        if not fresh_url:
+                            with suppress(Exception):
+                                await asyncio.to_thread(
+                                    sandbox.commands.run,
+                                    f"rm -f {shlex.quote(remote_path)}",
+                                    cwd=_WORKSPACE,
+                                    timeout=30,
+                                    request_timeout=60,
+                                )
+                            fetch_failures.append(f"{safe_name}: {type(fetch_exc).__name__}")
+                            logger.warning(
+                                "Novita direct-fetch failed for {}: {}",
+                                safe_name,
+                                type(fetch_exc).__name__,
                             )
-                        fetch_failures.append(f"{safe_name}: {type(fetch_exc).__name__}")
-                        logger.warning(
-                            "Novita direct-fetch failed for {}: {}",
+                            continue
+                        # Retry once with a freshly generated download URL.
+                        logger.info(
+                            "Refreshing stale Telegram URL for {} and retrying direct-fetch",
                             safe_name,
-                            type(fetch_exc).__name__,
                         )
-                        continue
-                    # The curl's `&& test -s` already gated success, but a
-                    # non-zero sandbox command that did not raise still means no
-                    # usable file; skip it rather than pollute the manifest.
-                    fetch_code = getattr(
-                        _fetch_result, "exit_code", getattr(_fetch_result, "exitCode", 0)
-                    )
-                    if fetch_code not in (None, 0):
-                        with suppress(Exception):
-                            await asyncio.to_thread(
-                                sandbox.commands.run,
-                                f"rm -f {shlex.quote(remote_path)}",
-                                cwd=_WORKSPACE,
-                                timeout=30,
-                                request_timeout=60,
+                        try:
+                            _fetch_result = await _fetch_once(fresh_url)
+                        except Exception as retry_exc:
+                            with suppress(Exception):
+                                await asyncio.to_thread(
+                                    sandbox.commands.run,
+                                    f"rm -f {shlex.quote(remote_path)}",
+                                    cwd=_WORKSPACE,
+                                    timeout=30,
+                                    request_timeout=60,
+                                )
+                            fetch_failures.append(f"{safe_name}: {type(retry_exc).__name__}")
+                            logger.warning(
+                                "Novita direct-fetch retry failed for {}: {}",
+                                safe_name,
+                                type(retry_exc).__name__,
                             )
-                        fetch_failures.append(f"{safe_name}: fetch failed (exit {fetch_code})")
-                        continue
+                            continue
+                    if not _fetch_ok(_fetch_result):
+                        # Non-zero sandbox command that did not raise: no usable
+                        # file. Refresh from file_id and retry once as well.
+                        fresh_url = None
+                        if fid and _TELEGRAM_URL_REFRESHER:
+                            try:
+                                fresh_url = await _TELEGRAM_URL_REFRESHER(fid)
+                            except Exception:
+                                fresh_url = None
+                        retried = False
+                        if fresh_url:
+                            try:
+                                _fetch_result = await _fetch_once(fresh_url)
+                                retried = bool(_fetch_ok(_fetch_result))
+                            except Exception:
+                                retried = False
+                        if not retried:
+                            code = getattr(
+                                _fetch_result, "exit_code", getattr(_fetch_result, "exitCode", 0)
+                            )
+                            with suppress(Exception):
+                                await asyncio.to_thread(
+                                    sandbox.commands.run,
+                                    f"rm -f {shlex.quote(remote_path)}",
+                                    cwd=_WORKSPACE,
+                                    timeout=30,
+                                    request_timeout=60,
+                                )
+                            fetch_failures.append(f"{safe_name}: fetch failed ({code})")
+                            logger.warning(
+                                "Novita direct-fetch failed for {} (exit {}) after refresh",
+                                safe_name,
+                                code,
+                            )
+                            continue
                     remote_paths.append(remote_path)
                 if not remote_paths:
                     if fetch_failures:
@@ -1080,7 +1174,7 @@ class NovitaSandboxTool(Tool):
         for raw_path in media_paths:
             token = _decode_telegram_url_token(str(raw_path)) if _is_telegram_url_token(str(raw_path)) else None
             if token is not None:
-                download_url, safe_name = token
+                download_url, _file_id, safe_name = token
                 remote = f"{root}/telegram-attachments/{uuid4().hex}-{safe_name}"
                 # The VPS pulls the bytes from api.telegram.org directly, so the
                 # file never transits Render (near-zero Render bandwidth).
@@ -1144,7 +1238,7 @@ class NovitaSandboxTool(Tool):
                 if token is not None:
                     # Direct-fetch token: the VPS pulls the bytes from Telegram
                     # itself, so no Render egress for the payload.
-                    url, safe_name = token
+                    url, _file_id, safe_name = token
                     remote_dest = str(path or "").strip()
                     await backend.fetch_telegram_url(url, remote_dest or f"{root}/{safe_name}")
                     return f"Uploaded {safe_name} directly from Telegram to {path} in the remote VPS workspace."
@@ -1227,7 +1321,7 @@ class NovitaSandboxTool(Tool):
                     if token is not None:
                         # Direct-fetch: the sandbox curls the bytes from Telegram
                         # itself, so nothing transits Render egress.
-                        url, safe_name = token
+                        url, _file_id, safe_name = token
                         await asyncio.to_thread(
                             sandbox.commands.run,
                             f"curl -fsSL --retry 2 --max-time 180 {shlex.quote(url)} -o {shlex.quote(path)} "

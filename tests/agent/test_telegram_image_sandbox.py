@@ -886,7 +886,7 @@ def test_telegram_url_token_round_trip() -> None:
     token = _encode_telegram_url_token(url, "report dc.pdf")
     assert _is_telegram_url_token(token) is True
     decoded = _decode_telegram_url_token(token)
-    assert decoded == (url, "report_dc.pdf")
+    assert decoded == (url, "", "report_dc.pdf")
 
 
 @pytest.mark.asyncio
