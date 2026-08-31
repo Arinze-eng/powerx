@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import json
 import mimetypes
-import os
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -644,7 +643,6 @@ class GatewayHTTPHandler:
                 "runtime_surface": self._runtime_surface,
                 "runtime_capabilities": self._capabilities,
             }
-            self._maybe_add_supabase_realtime_config(payload)
             return _http_json_response(payload, extra_headers=_NO_STORE_HEADERS)
 
         api_token_allowed = bool(secret) or is_local_browser
@@ -681,19 +679,7 @@ class GatewayHTTPHandler:
         }
         if api_token is not None:
             payload["api_token"] = api_token
-        self._maybe_add_supabase_realtime_config(payload)
         return _http_json_response(payload, extra_headers=_NO_STORE_HEADERS)
-
-    @staticmethod
-    def _maybe_add_supabase_realtime_config(payload: dict[str, Any]) -> None:
-        """Add public Supabase Realtime settings when explicitly configured."""
-        url = os.getenv("SUPABASE_URL", "").strip()
-        anon_key = os.getenv("SUPABASE_ANON_KEY", "").strip()
-        enabled = os.getenv("SUPABASE_REALTIME_ENABLED", "true").strip().lower()
-        if not url or not anon_key or enabled in {"0", "false", "no", "off"}:
-            return
-        payload["supabase_url"] = url
-        payload["supabase_anon_key"] = anon_key
 
     def _bootstrap_ws_url(self, request: Any) -> str:
         headers = getattr(request, "headers", {}) or {}

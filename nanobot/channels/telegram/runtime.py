@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import os
 import re
 import time
 import unicodedata
@@ -38,12 +37,6 @@ from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.telegram.task_mode import deliberate_task_metadata
-from nanobot.agent.tools.novita_sandbox import (
-    _encode_telegram_url_token,
-    _is_telegram_url_token,
-    set_telegram_url_refresher,
-)
-from nanobot.channels.telegram.sarvam import SarvamAuthError, SarvamClient, telegram_file_ref
 from nanobot.command.builtin import build_help_text
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
@@ -526,13 +519,12 @@ class TelegramChannel(BaseChannel):
         BotCommand("video", "Generate a video with Puter"),
         BotCommand("cancel", "Cancel auth or pending work"),
         BotCommand("discard", "Discard pending attachments"),
-        BotCommand("sarvam", "Use Sarvam mode; /sarvam off to disable"),
     ]
 
     # Regex for slash commands routed to AgentLoop via ``_forward_command``.
     # Hyphenated ``dream-*`` commands stay on a separate handler (below).
     TELEGRAM_BUS_SLASH_COMMAND_RE = re.compile(
-        r"^/(?:new|stop|restart|status|dream|history|goal|trigger|pairing|model|skill|signup|signin|signout|credits|credit|buy|verify-payment|verify_payment|image|image_edit|video|cancel|discard|sarvam)(?:@\w+)?(?:\s+.*)?$"
+        r"^/(?:new|stop|restart|status|dream|history|goal|trigger|pairing|model|skill|signup|signin|signout|credits|credit|buy|verify-payment|verify_payment|image|image_edit|video|cancel|discard)(?:@\w+)?(?:\s+.*)?$"
     )
 
     @classmethod
@@ -561,8 +553,6 @@ class TelegramChannel(BaseChannel):
         self._app_ready = asyncio.Event()  # cleared while the app is being rebuilt
         self._teardown_lock = asyncio.Lock()
         self._supabase = SupabaseAuth()
-        self._sarvam_enabled_chats: set[str] = set()
-        self._sarvam = SarvamClient(bot_token=self.config.token)
 
     def _require_app(self) -> TelegramApplication:
         if self._app is None:
@@ -738,29 +728,6 @@ class TelegramChannel(BaseChannel):
         self._bot_user_id = getattr(bot_info, "id", None)
         self._bot_username = getattr(bot_info, "username", None)
         self.logger.info("bot @{} connected", bot_info.username)
-
-        # Register a URL refresher so the OCR backend can regenerate a fresh
-        # api.telegram.org download URL from a still-valid file_id when the
-        # original direct-fetch URL has gone stale (404). This keeps image bytes
-        # off Render egress while making Telegram image OCR reliable.
-        try:
-            bot_token = getattr(self.config, "token", "").strip()
-
-            async def _refresh_tgurl(file_id: str) -> str:
-                if not file_id or not self._app:
-                    raise RuntimeError("file_id or app unavailable for URL refresh")
-                fresh_file = await self._app.bot.get_file(file_id)
-                fresh_path = getattr(fresh_file, "file_path", None)
-                if not fresh_path:
-                    raise RuntimeError("get_file returned no file_path")
-                return f"https://api.telegram.org/file/bot{bot_token}/{fresh_path}"
-
-            set_telegram_url_refresher(_refresh_tgurl)
-            self.logger.debug("telegram URL refresher registered")
-        except Exception as e:  # pragma: no cover - best-effort wiring
-            self.logger.warning(
-                "Failed to register telegram URL refresher: {}", type(e).__name__
-            )
 
         try:
             await self._app.bot.set_my_commands(self.BOT_COMMANDS)
@@ -1765,20 +1732,6 @@ class TelegramChannel(BaseChannel):
             media_dir = get_media_dir("telegram")
             unique_id = getattr(media_file, "file_unique_id", media_file.file_id)
             file_path = media_dir / f"{unique_id}{ext}"
-            file_name = getattr(media_file, "file_name", None) or file_path.name
-            # When a remote execution backend (Novita sandbox or Linux VPS) is
-            # active, do not drag the file bytes onto Render's disk. Instead emit a
-            # "tgurl::" direct-fetch token carrying the api.telegram.org download
-            # URL; the backend downloads those bytes straight from Telegram, so the
-            # payload never transits Render egress (near-zero Render bandwidth).
-            if self._telegram_direct_fetch_enabled() and media_type in ("image", "file", "video"):
-                file_path_str = getattr(file, "file_path", None)
-                if file_path_str:
-                    download_url = f"https://api.telegram.org/file/bot{self.config.token}/{file_path_str}"
-                    file_id = getattr(media_file, "file_id", "") or ""
-                    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", file_name)[:120] or "attachment.bin"
-                    token = _encode_telegram_url_token(download_url, safe_name, file_id)
-                    return [token], [f"[{media_type}: {file_name}]"]
             await file.download_to_drive(str(file_path))
             path_str = str(file_path)
             if media_type in ("voice", "audio"):
@@ -1793,22 +1746,6 @@ class TelegramChannel(BaseChannel):
             if add_failure_content:
                 return [], [f"[{media_type}: download failed]"]
             return [], []
-
-    def _telegram_direct_fetch_enabled(self) -> bool:
-        """Return True when a remote sandbox backend can fetch Telegram files."""
-        env = os.environ.get("NANOBOT_TELEGRAM_DIRECT_FETCH", "").strip().lower()
-        if env in {"1", "true", "on", "yes"}:
-            return True
-        if env in {"0", "false", "off", "no"}:
-            return False
-        # Optional explicit backend override (same signal the sandbox tool uses).
-        backend = os.environ.get("NANOBOT_EXECUTION_BACKEND", "").strip().lower()
-        if backend == "novita":
-            return bool(os.environ.get("NOVITA_API_KEY", "").strip())
-        if backend == "vps":
-            return bool(os.environ.get("NANOBOT_VPS_HOST", "").strip())
-        # Default: enabled when the Novita sandbox backend is configured.
-        return bool(os.environ.get("NOVITA_API_KEY", "").strip())
 
     async def _ensure_bot_identity(self) -> tuple[int | None, str | None]:
         """Load bot identity once and reuse it for mention/reply checks."""
@@ -1992,19 +1929,6 @@ class TelegramChannel(BaseChannel):
         content = self._normalize_telegram_command(content)
         account = await self._supabase_account(message, user)
         command_name = content.split(None, 1)[0].split("@", 1)[0].lower()
-        if command_name == "/sarvam":
-            argument = content.partition(" ")[2].strip().lower()
-            chat_key = str(message.chat_id)
-            if argument == "off":
-                self._sarvam_enabled_chats.discard(chat_key)
-                await message.reply_text("Sarvam mode is off. Normal mode restored.")
-            else:
-                if not os.environ.get("SARVAM_CONVERSATION_ID", "").strip():
-                    await message.reply_text("Sarvam is not configured on this bot yet.")
-                else:
-                    self._sarvam_enabled_chats.add(chat_key)
-                    await message.reply_text("Sarvam mode is on. Send your message or file; use /sarvam off to return to normal mode.")
-            return
         if command_name in {"/cancel", "/discard"}:
             discarded = self._discard_pending_attachments(
                 self._attachment_key(message.chat_id, sender_id)
@@ -2082,12 +2006,6 @@ class TelegramChannel(BaseChannel):
         if await self._supabase_auth_continuation(message, message.text or message.caption or "", account):
             return
         if not await self._require_supabase_auth(message, account):
-            return
-
-        # Sarvam mode intentionally bypasses local media download: Sarvam receives
-        # a direct Telegram file URL, keeping large files off the Render process.
-        if str(chat_id) in self._sarvam_enabled_chats:
-            await self._handle_sarvam_message(message)
             return
 
         # Build content from text and/or media
@@ -2210,53 +2128,6 @@ class TelegramChannel(BaseChannel):
             metadata=metadata,
             session_key=session_key,
         )
-
-    async def _handle_sarvam_message(self, message: Message) -> None:
-        conversation_id = os.environ.get("SARVAM_CONVERSATION_ID", "").strip()
-        if not conversation_id:
-            await message.reply_text("Sarvam is not configured on this bot yet.")
-            return
-        text = message.text or message.caption or ""
-        parts: list[dict[str, Any]] = []
-        attachment = telegram_file_ref(message)
-        if attachment:
-            try:
-                url = await self._sarvam.telegram_file_url(attachment[0])
-                ref = (
-                    "Attached file URL (fetch and inspect this URL directly): "
-                    f"{url}\nFilename: {attachment[1]}"
-                )
-                text = f"{text}\n\n{ref}".strip()
-            except Exception as exc:
-                self.logger.warning("Sarvam file URL preparation failed: {}", exc)
-                await message.reply_text("I could not prepare that file for Sarvam.")
-                return
-        if not text:
-            text = "Please inspect the attached file." if attachment else "[empty message]"
-        parts.append({"type": "text", "text": text})
-        try:
-            result = await self._sarvam.send_result(conversation_id, parts)
-            text_result = result.text or "Sarvam returned an empty response."
-            for chunk in split_message(text_result, TELEGRAM_MAX_MESSAGE_LEN):
-                await message.reply_text(chunk)
-            for file_url in result.file_urls:
-                ok, reason = validate_url_target(file_url)
-                if not ok:
-                    self.logger.warning("Skipping unsafe Sarvam output file URL: {}", reason)
-                    continue
-                await self.send(OutboundMessage(
-                    channel="telegram",
-                    chat_id=str(message.chat_id),
-                    content="Sarvam returned a file:",
-                    media=[file_url],
-                    metadata=self._build_message_metadata(message, message.from_user),
-                ))
-        except SarvamAuthError as exc:
-            self.logger.warning("Sarvam authentication failed: {}", exc)
-            await message.reply_text("Sarvam authentication needs attention. Please refresh the Sarvam session configuration.")
-        except Exception:
-            self.logger.exception("Sarvam request failed")
-            await message.reply_text("Sarvam could not complete that request.")
 
     async def _flush_media_group(self, key: str) -> None:
         """Wait briefly, then forward buffered media-group as one turn."""

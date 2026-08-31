@@ -409,17 +409,8 @@ def is_image_file(path: str) -> bool:
     """Check whether *path* looks like an image file.
 
     Uses magic-byte detection (reads first 16 bytes) with a ``mimetypes``
-    extension-based fallback. Also recognises nanobot's ``tgurl::`` direct-fetch
-    tokens (a Telegram URL plus a safe filename) by classifying the filename
-    extension, so image tokens route to vision/OCR processing.
+    extension-based fallback.
     """
-    if path and path.startswith("tgurl::"):
-        body = path[len("tgurl::"):]
-        if "::" in body:
-            filename = body.rsplit("::", 1)[-1]
-            mime = mimetypes.guess_type(filename)[0]
-            return bool(mime and mime.startswith("image/"))
-        return False
     p = Path(path)
     mime: str | None = None
     if p.is_file():

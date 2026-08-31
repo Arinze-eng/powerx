@@ -15,15 +15,11 @@ class FakeSupabase:
     enabled = True
 
     def __init__(self) -> None:
-        self.calls: list[tuple[dict[str, str], str, int, int]] = []
+        self.calls: list[tuple[dict[str, str], str, int]] = []
         self.failure: Exception | None = None
-        self._drain_rate = 2
 
-    async def get_drain_rate(self, account: dict[str, str]) -> int:
-        return self._drain_rate
-
-    async def charge_step(self, account: dict[str, str], task_ref: str, step_no: int, amount: int = 0) -> dict[str, object]:
-        self.calls.append((account, task_ref, step_no, amount))
+    async def charge_step(self, account: dict[str, str], task_ref: str, step_no: int) -> dict[str, object]:
+        self.calls.append((account, task_ref, step_no))
         if self.failure is not None:
             raise self.failure
         return {"success": True, "balance": 10}
@@ -43,8 +39,8 @@ async def test_credit_hook_charges_each_telegram_iteration(monkeypatch) -> None:
     await hook.before_iteration(AgentHookContext(iteration=0, messages=[]))
     await hook.before_iteration(AgentHookContext(iteration=1, messages=[]))
     assert fake.calls == [
-        ({"agentx_user_id": "user-1"}, "nanobot:telegram:42:7", 1, 6),
-        ({"agentx_user_id": "user-1"}, "nanobot:telegram:42:7", 2, 6),
+        ({"agentx_user_id": "user-1"}, "nanobot:telegram:42:7", 1),
+        ({"agentx_user_id": "user-1"}, "nanobot:telegram:42:7", 2),
     ]
 
 
@@ -54,24 +50,6 @@ async def test_credit_hook_is_inert_for_non_telegram_turns(monkeypatch) -> None:
     monkeypatch.setattr(supabase_credit, "SupabaseAuth", lambda: fake)
     hook = supabase_credit.create_supabase_credit_hook(AgentTurnHookContext(channel="websocket"))
     assert hook is None
-
-
-@pytest.mark.asyncio
-async def test_credit_hook_caches_drain_rate_across_iterations(monkeypatch) -> None:
-    fake = FakeSupabase()
-    monkeypatch.setattr(supabase_credit, "SupabaseAuth", lambda: fake)
-    hook = supabase_credit.SupabaseCreditHook(AgentTurnHookContext(
-        channel="telegram",
-        chat_id="42",
-        message_id="7",
-        session_key="telegram:42",
-        metadata={"supabase_user_id": "user-1"},
-    ))
-    await hook.before_iteration(AgentHookContext(iteration=0, messages=[]))
-    await hook.before_iteration(AgentHookContext(iteration=1, messages=[]))
-    await hook.before_iteration(AgentHookContext(iteration=2, messages=[]))
-    # drain_rate should be cached after the first call
-    assert hook._drain_rate == 2
 
 
 @pytest.mark.asyncio

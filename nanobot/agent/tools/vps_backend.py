@@ -394,40 +394,6 @@ class VPSExecutionBackend:
             conn.close()
             await conn.wait_closed()
 
-    async def fetch_telegram_url(self, url: str, remote_path: str, *, timeout: int = 240) -> str:
-        """Fetch a Telegram file directly from api.telegram.org into the VPS workspace.
-
-        This keeps the file bytes off the orchestration host (Render): the VPS
-        pulls them straight from Telegram.  ``https://api.telegram.org`` is the
-        only host accepted here (see ``_decode_telegram_url_token``).
-        """
-        parsed = urlparse(str(url).strip())
-        if (
-            parsed.scheme != "https"
-            or parsed.netloc != "api.telegram.org"
-            or not parsed.path
-        ):
-            raise ValueError("remote Telegram fetch URL must be an HTTPS api.telegram.org URL")
-        configured = self._configured_workspace(self.config)
-        _safe_remote_path(remote_path, configured)
-        timeout = max(30, min(int(timeout), _MAX_TIMEOUT))
-        conn = await self._connect()
-        try:
-            root = await self._resolve_workspace(conn)
-            remote = self._remote_path(remote_path, root)
-            command = (
-                "curl -fsSL --retry 2 --max-time 180 "
-                f"{shlex.quote(str(url).strip())} -o {shlex.quote(remote)} "
-                f"&& test -s {shlex.quote(remote)}"
-            )
-            result = await conn.run(command, check=False, timeout=timeout)
-            if int(getattr(result, "exit_status", 1)) != 0:
-                raise RuntimeError("VPS could not fetch the Telegram file")
-            return remote
-        finally:
-            conn.close()
-            await conn.wait_closed()
-
     async def download(self, remote_path: str, destination: str | Path) -> str:
         """Download one remote workspace file to an explicit local destination.
 

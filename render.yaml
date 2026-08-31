@@ -9,8 +9,6 @@ services:
     region: frankfurt
     healthCheckPath: /
     envVars:
-      - key: LLM_MODEL
-        value: gemini-2.5-flash
       - key: LLM_BASE_URL
         value: https://gemini-proxy.codebanana.app/v1
       - key: LLM_API_KEY
@@ -31,18 +29,6 @@ services:
         value: ws://127.0.0.1:8766
       - key: NOVITA_API_KEY
         sync: false
-      - key: SARVAM_SID
-        sync: false
-      - key: SARVAM_CSRF
-        sync: false
-      - key: SARVAM_CSRF_COOKIE_NAME
-        value: csrf_token_47e7312b4098ea2074fa42ed3e882b46089ff81e1306152464548a6023a49a22
-      - key: SARVAM_ORG
-        value: 01a00dfe-a2ae-7d9d-8ea2-a10684b7de42
-      - key: SARVAM_WS
-        value: 01a00dfe-a2b3-726d-9a1c-8135e570b8d6
-      - key: SARVAM_CONVERSATION_ID
-        value: 01M11TQCXK3K5CWDS4348KZP34
       - key: ADMIN_PASSWORD
         sync: false
       - key: SUPABASE_URL
@@ -54,8 +40,6 @@ services:
       - key: SUPABASE_TOKEN_ENCRYPTION_KEY
         sync: false
       - key: SUPABASE_AUTH_ENABLED
-        value: "true"
-      - key: SUPABASE_REALTIME_ENABLED
         value: "true"
       - key: SUPABASE_GATEWAY_KEY
         sync: false

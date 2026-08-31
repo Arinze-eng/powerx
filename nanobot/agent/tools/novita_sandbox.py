@@ -10,7 +10,7 @@ import shlex
 import threading
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 from uuid import uuid4
 
 from loguru import logger
@@ -25,7 +25,7 @@ from nanobot.agent.tools.schema import (
 from nanobot.agent.tools.vps_backend import VPSExecutionBackend
 from nanobot.config.paths import get_data_dir, get_workspace_path
 from nanobot.utils.helpers import detect_image_mime
-from nanobot.utils.tmpfiles import upload_bytes as upload_tmpfile_bytes  # noqa: F401 - referenced by VPS relay-skip tests
+from nanobot.utils.tmpfiles import upload_bytes as upload_tmpfile_bytes
 from nanobot.utils.tmpfiles import upload_path as upload_tmpfile_path
 
 try:
@@ -43,67 +43,6 @@ _MAX_TELEGRAM_IMAGE_COUNT = 4
 _MAX_IMAGE_ANALYSIS_RESULT_CHARS = 16_000
 _WORKSPACE = "/workspace"
 _OCR_DIR = f"{_WORKSPACE}/.nanobot"
-
-# A Telegram attachment may be carried through the message bus as a small
-# "direct fetch" token instead of a local Render disk path.  When present, the
-# active execution backend (Novita sandbox or Linux VPS) downloads the bytes
-# straight from api.telegram.org, so the file never transits Render's egress
-# (near-zero Render bandwidth).  Telegram `file_path` download URLs can go stale
-# (HTTP 404), but the underlying `file_id` stays valid, so we also carry the
-# file_id in the token and refresh a fresh download URL on demand if the first
-# fetch 404s — all without touching Render egress.
-#
-# Format: tgurl::<https-download-url>::<file_id>::<filename>
-#   - <file_id> is optional (legacy tokens may omit it).
-_TG_URL_PREFIX = "tgurl::"
-
-
-def _encode_telegram_url_token(
-    download_url: str, filename: str, file_id: str = ""
-) -> str:
-    """Build an opaque token that routes a Telegram file to a direct backend fetch."""
-    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[:120] or "attachment.bin"
-    fid = re.sub(r"[^A-Za-z0-9._-]", "_", str(file_id or ""))[:255]
-    if fid:
-        return f"{_TG_URL_PREFIX}{download_url}::{fid}::{safe_name}"
-    return f"{_TG_URL_PREFIX}{download_url}::{safe_name}"
-
-
-def _decode_telegram_url_token(token: str) -> tuple[str, str, str] | None:
-    """Return (download_url, file_id, safe_name) when *token* is a direct-fetch token.
-
-    ``file_id`` is ``""`` for legacy tokens that omit it.
-    """
-    if not token.startswith(_TG_URL_PREFIX):
-        return None
-    body = token[len(_TG_URL_PREFIX):]
-    if "::" not in body:
-        return None
-    parts = body.split("::", 2)
-    url = parts[0]
-    if len(parts) == 3:
-        fid, safe_name = parts[1], parts[2]
-    else:
-        fid, safe_name = "", parts[1]
-    if not url.startswith("https://api.telegram.org/") or not safe_name:
-        return None
-    return url, fid, safe_name
-
-
-def _is_telegram_url_token(value: str) -> bool:
-    return _decode_telegram_url_token(value) is not None
-
-
-# Optional hook the Telegram channel registers so a direct-fetch URL can be
-# refreshed from a still-valid file_id when the first download 404s. Signature:
-#   refresh_fn(file_id: str) -> Awaitable[str]  (returns a fresh api.telegram.org URL)
-_TELEGRAM_URL_REFRESHER: Callable[[str], Awaitable[str]] | None = None
-
-
-def set_telegram_url_refresher(refresher: Callable[[str], Awaitable[str]] | None) -> None:
-    """Register (or clear) a callable that maps a file_id to a fresh download URL."""
-    global _TELEGRAM_URL_REFRESHER
-    _TELEGRAM_URL_REFRESHER = refresher
 
 _TELEGRAM_IMAGE_SCRIPT = r'''import json
 import os
@@ -124,7 +63,7 @@ except ImportError:
                 stdout=install_subprocess.DEVNULL,
                 stderr=install_subprocess.DEVNULL,
                 check=True,
-                timeout=60,
+                timeout=45,
             )
             from PIL import Image, ImageEnhance, ImageFilter, ImageOps
         except Exception:
@@ -136,71 +75,21 @@ def fail(message):
     raise SystemExit(1)
 
 
-def _save_lazy(image, output_path):
-    """Save variant without requiring left-to-right resize assumptions."""
-    image.save(output_path, format="PNG", optimize=True)
-
-
 def prepare_image(path, output_path):
     if Image is None:
         return False
-    try:
-        with Image.open(path) as image:
-            image.verify()
-        with Image.open(path) as image:
-            image = ImageOps.exif_transpose(image).convert("L")
-            # Upscaling small previews improves OCR. Larger upscale cap and a
-            # floor so tiny thumbnails get a real resolution boost.
-            longest = max(image.width, image.height)
-            scale = max(1, min(4, 2200 // max(1, longest)))
-            if scale > 1:
-                image = image.resize(
-                    (image.width * scale, image.height * scale),
-                    Image.Resampling.LANCZOS,
-                )
-            image = ImageOps.autocontrast(image)
-            image = ImageEnhance.Contrast(image).enhance(1.8)
-            image = image.filter(ImageFilter.SHARPEN)
-            _save_lazy(image, output_path)
-    except Exception:
-        return False
-    return True
-
-
-def prepare_binary(path, output_path):
-    """High-contrast binary variant with adaptive threshold (not fixed 128)."""
-    if Image is None:
-        return False
-    try:
-        with Image.open(path) as image:
-            image = ImageOps.exif_transpose(image).convert("L")
-            image = ImageOps.autocontrast(image)
-            # Adaptive-ish: normalize then threshold near the histogram mid.
-            # Fall back to the classic fixed point if needed.
-            try:
-                threshold = sum(image.histogram()) and (image.getextrema()[0] + image.getextrema()[1]) // 2
-            except Exception:
-                threshold = 128
-            image = image.point(lambda p: 255 if p > threshold else 0)
-            _save_lazy(image, output_path)
-    except Exception:
-        return False
-    return True
-
-
-def prepare_denoised(path, output_path):
-    """Median-denoised gentle variant for speckled photos/scans."""
-    if Image is None:
-        return False
-    try:
-        with Image.open(path) as image:
-            image = ImageOps.exif_transpose(image).convert("L")
-            image = ImageOps.autocontrast(image)
-            image = image.filter(ImageFilter.MedianFilter(size=3))
-            image = ImageEnhance.Contrast(image).enhance(1.4)
-            _save_lazy(image, output_path)
-    except Exception:
-        return False
+    with Image.open(path) as image:
+        image.verify()
+    with Image.open(path) as image:
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        # Upscaling and contrast normalization improve OCR for Telegram previews
+        # without changing the original uploaded file.
+        scale = max(1, min(4, 1800 // max(image.width, image.height)))
+        if scale > 1:
+            image = image.resize((image.width * scale, image.height * scale), Image.Resampling.LANCZOS)
+        image = ImageEnhance.Contrast(image).enhance(1.35)
+        image = image.filter(ImageFilter.SHARPEN)
+        image.save(output_path, format="PNG", optimize=True)
     return True
 
 
@@ -214,18 +103,14 @@ def install_tesseract():
         return False
     commands = [
         ["apt-get", "update", "-qq"],
-        ["apt-get", "install", "-y", "-qq",
-         "tesseract-ocr", "tesseract-ocr-eng"],
+        ["apt-get", "install", "-y", "-qq", "tesseract-ocr", "tesseract-ocr-eng"],
     ]
     for command in commands:
         try:
-            result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=150)
+            result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=120)
             if result.returncode != 0:
                 sudo_command = ["sudo", "-n", *command]
-                try:
-                    result = subprocess.run(sudo_command, capture_output=True, text=True, check=False, timeout=150)
-                except OSError:
-                    return False
+                result = subprocess.run(sudo_command, capture_output=True, text=True, check=False, timeout=120)
         except OSError:
             return False
         if result.returncode != 0:
@@ -257,22 +142,19 @@ def _tesseract_environment():
 def run_tesseract(image_path, psm):
     if not TESSERACT_BINARY:
         return "", []
-    command = [TESSERACT_BINARY, str(image_path), "stdout", "-l", "eng", "--oem", "3", "--psm", str(psm), "tsv"]
+    command = [TESSERACT_BINARY, str(image_path), "stdout", "--oem", "3", "--psm", str(psm), "tsv"]
     try:
         timeout = max(5, min(int(os.getenv("NANOBOT_OCR_TIMEOUT_SECONDS", "90")), 90))
     except ValueError:
         timeout = 90
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout,
-            env=_tesseract_environment(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return "", []
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+        env=_tesseract_environment(),
+    )
     if result.returncode != 0:
         return "", []
     words = []
@@ -292,78 +174,19 @@ def run_tesseract(image_path, psm):
         return "", []
     text = " ".join(word for word, _ in words)
     confidence = sum(conf for _, conf in words if conf >= 0) / max(1, sum(1 for _, conf in words if conf >= 0))
-    return text, [(confidence, len(words), words)]
-
-
-def _word_quality(word):
-    """Score how 'word-like' a token is. Real words are mostly alphanumeric."""
-    if not word:
-        return 0.0
-    letters_digits = sum(1 for ch in word if ch.isalnum())
-    return letters_digits / len(word)
-
-
-def _text_readability(words):
-    """Return (readability 0..1, real_word_count, strong_word_count)."""
-    if not words:
-        return 1.0, 0, 0
-    real = 0
-    strong = 0
-    total_q = 0.0
-    for word, _conf in words:
-        q = _word_quality(word)
-        total_q += q
-        if q >= 0.5 and len(word) >= 2:
-            real += 1
-        # A "strong" word is a multi-character token made of letters/digits
-        # (not screenshot-noise fragments like "ae", "an", "ee").
-        if q >= 0.7 and len(word) >= 3:
-            strong += 1
-    avg_q = total_q / len(words)
-    return avg_q, real, strong
+    return text, [(confidence, len(words))]
 
 
 def read_image(path, temp_dir):
     try:
-        if Image is not None:
-            try:
-                with Image.open(path) as image:
-                    image.verify()
-            except Exception:
-                return f"File: {Path(path).name}\nTesseract could not read this image: IncompleteImage."
-        stem = Path(path).stem
-        variants = [str(path)]  # Always try the original image too.
-        prepared = Path(temp_dir) / f"{stem}_prepared.png"
-        if prepare_image(path, prepared):
-            variants.append(str(prepared))
-        binary = Path(temp_dir) / f"{stem}_binary.png"
-        if prepare_binary(path, binary):
-            variants.append(str(binary))
-        denoised = Path(temp_dir) / f"{stem}_denoised.png"
-        if prepare_denoised(path, denoised):
-            variants.append(str(denoised))
-
+        prepared = Path(temp_dir) / (Path(path).stem + "_prepared.png")
+        prepared_path = prepared if prepare_image(path, prepared) else Path(path)
         candidates = []
-        for variant in variants:
-            for psm in (6, 11, 3, 7, 12):
-                text, scores = run_tesseract(variant, psm)
-                if text and scores:
-                    confidence, _wc, words = scores[0]
-                    readability, real_words, strong_words = _text_readability(words)
-                    # Score is a blend: confidence, readability, and having real
-                    # words. Strong single-line results get a small boost.
-                    score = (
-                        confidence * 0.4
-                        + readability * 100.0 * 0.4
-                        + min(real_words * 12.0, 20.0)
-                    )
-                    # Accept a candidate only when it shows clearly readable text.
-                    # Requiring >=2 real words (or a single strong multi-char word
-                    # at reasonable confidence) avoids tesseract "ghost" output on
-                    # blank/noisy regions ("an", "ae", "ee").
-                    if real_words >= 2 or (strong_words >= 1 and confidence >= 40.0):
-                        candidates.append((score, confidence, real_words, strong_words, readability, text, psm, words))
-
+        for psm in (6, 11, 3):
+            text, scores = run_tesseract(prepared_path, psm)
+            if text:
+                confidence, word_count = scores[0]
+                candidates.append((confidence, word_count, text, psm))
         if not candidates:
             if not TESSERACT_BINARY:
                 return (
@@ -372,13 +195,12 @@ def read_image(path, temp_dir):
                     "an administrator must install tesseract-ocr before image OCR can run."
                 )
             return f"File: {Path(path).name}\nTesseract detected no readable text."
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        score, confidence, real_words, strong_words, readability, text, psm, _words = candidates[0]
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        confidence, word_count, text, psm = candidates[0]
         return (
             f"File: {Path(path).name}\n"
             f"Tesseract OCR confidence: {confidence:.1f}%\n"
-            f"Tesseract page mode: {psm}; words: {real_words}\n"
+            f"Tesseract page mode: {psm}; words: {word_count}\n"
             f"Recognized text:\n{text}"
         )
     except Exception as exc:
@@ -399,7 +221,8 @@ with __import__("tempfile").TemporaryDirectory() as temp_dir:
     content = "\n\n".join(read_image(str(path), temp_dir) for path in image_paths if path)
 if not content:
     fail("no OCR results produced")
-print(json.dumps({"content": content}, ensure_ascii=False))'''
+print(json.dumps({"content": content}, ensure_ascii=False))
+'''
 
 
 class _SandboxStore:
@@ -632,9 +455,7 @@ class NovitaSandboxTool(Tool):
                 suffix = path.suffix.lower() if path.suffix else ".img"
                 remote_path = f"{root}/telegram-images/{uuid4().hex}{suffix}"
                 remote_paths.append(remote_path)
-                # Skip the tmpfiles.org relay — SFTP upload delivers the same
-                # bytes directly, so relay would send every file out of Render
-                # twice (once upload, once cron re-pull).
+                await upload_tmpfile_bytes(raw, filename=path.name, content_type=detect_image_mime(raw))
                 await backend.upload("telegram", remote_path, raw)
             await backend.write(manifest_path, json.dumps(remote_paths))
             output = await backend.run(
@@ -675,106 +496,6 @@ class NovitaSandboxTool(Tool):
                         cwd=root,
                     )
 
-    async def _analyze_telegram_images_vps_from_urls(
-        self,
-        tokens: list[str],
-        *,
-        config: Any,
-    ) -> str:
-        """OCR Telegram images whose bytes were fetched directly from Telegram.
-
-        Each *tokens* entry is a ``tgurl::`` direct-fetch token. The VPS runs
-        ``curl`` to pull the bytes from api.telegram.org, so the files never
-        transit Render (near-zero Render egress). Local-path images are not
-        mixed in here; see ``_analyze_telegram_images_vps`` for those.
-        """
-        backend = VPSExecutionBackend(config)
-        root = str(config.workspace_dir or _WORKSPACE).rstrip("/") or "/workspace"
-        ocr_dir = f"{root}/.nanobot"
-        remote_paths: list[str] = []
-        manifest_path = f"{ocr_dir}/telegram_image_manifest.json"
-        script_path = f"{ocr_dir}/telegram_image_ocr.py"
-        try:
-            img_dir = f"{root}/telegram-images"
-            await backend.run(
-                f"mkdir -p {shlex.quote(ocr_dir)} {shlex.quote(img_dir)}",
-                timeout=30,
-                cwd=root,
-            )
-            tesseract_probe = await backend.run(
-                "if command -v tesseract >/dev/null 2>&1; then printf READY; "
-                "else printf MISSING; fi",
-                timeout=20,
-                cwd=root,
-            )
-            if "READY" not in tesseract_probe:
-                await backend.install_packages(
-                    ["tesseract-ocr", "tesseract-ocr-eng"],
-                    timeout=600,
-                )
-                tesseract_probe = await backend.run(
-                    "if command -v tesseract >/dev/null 2>&1; then printf READY; "
-                    "else printf MISSING; fi",
-                    timeout=20,
-                    cwd=root,
-                )
-                if "READY" not in tesseract_probe:
-                    raise RuntimeError(
-                        "Tesseract was not available after the VPS package installation"
-                    )
-            await backend.write(script_path, _TELEGRAM_IMAGE_SCRIPT)
-            for raw_token in tokens[:_MAX_TELEGRAM_IMAGE_COUNT]:
-                decoded = _decode_telegram_url_token(str(raw_token))
-                if decoded is None:
-                    continue
-                download_url, _file_id, safe_name = decoded
-                if not (mimetypes.guess_type(safe_name)[0] or "").startswith("image/"):
-                    continue
-                suffix = Path(safe_name).suffix.lower() or ".img"
-                remote_path = f"{root}/telegram-images/{uuid4().hex}{suffix}"
-                remote_paths.append(remote_path)
-                await backend.fetch_telegram_url(download_url, remote_path)
-            if not remote_paths:
-                return "[No readable Telegram images were available to the VPS.]"
-            await backend.write(manifest_path, json.dumps(remote_paths))
-            output = await backend.run(
-                "env NANOBOT_OCR_ALLOW_INSTALL=0 NANOBOT_OCR_ALLOW_PILLOW_INSTALL=0 "
-                "NANOBOT_OCR_TIMEOUT_SECONDS=20 "
-                f"python3 {shlex.quote(script_path)} {shlex.quote(manifest_path)}",
-                timeout=45,
-                cwd=root,
-            )
-            stdout = output.split("\n[stderr]", 1)[0].strip()
-            parsed: Any | None = None
-            try:
-                parsed = json.loads(stdout)
-            except (TypeError, ValueError):
-                for line in reversed(stdout.splitlines()):
-                    candidate = line.strip()
-                    if not candidate.startswith("{"):
-                        continue
-                    try:
-                        parsed = json.loads(candidate)
-                        break
-                    except ValueError:
-                        continue
-            if not isinstance(parsed, dict) or not str(parsed.get("content") or "").strip():
-                logger.warning("VPS returned no usable Tesseract OCR result")
-                return "[VPS Tesseract OCR returned no readable result.]"
-            return str(parsed["content"]).strip()[:_MAX_IMAGE_ANALYSIS_RESULT_CHARS]
-        except Exception as exc:
-            logger.warning("VPS Tesseract OCR (direct-fetch) failed: {}", type(exc).__name__)
-            return "[VPS Tesseract OCR failed.]"
-        finally:
-            if remote_paths:
-                with suppress(Exception):
-                    await backend.run(
-                        "rm -f " + " ".join(shlex.quote(path) for path in remote_paths)
-                        + f" {shlex.quote(manifest_path)} {shlex.quote(script_path)}",
-                        timeout=30,
-                        cwd=root,
-                    )
-
     async def analyze_telegram_images(
         self,
         image_paths: list[str],
@@ -796,16 +517,7 @@ class NovitaSandboxTool(Tool):
             if vps_config is None or not str(vps_config.host or "").strip():
                 return "[VPS execution is selected but SSH details are not configured.]"
             local_images: list[tuple[Path, bytes]] = []
-            # Direct-fetch tokens let the VPS pull the file from Telegram instead
-            # of Render; classify them by filename MIME so they route to image OCR.
             for raw_path in image_paths[:_MAX_TELEGRAM_IMAGE_COUNT]:
-                token = _decode_telegram_url_token(str(raw_path)) if _is_telegram_url_token(str(raw_path)) else None
-                if token is not None:
-                    url, _fid, safe_name = token
-                    guessed = mimetypes.guess_type(safe_name)[0]
-                    if guessed and guessed.startswith("image/"):
-                        local_images.append((Path(safe_name), b""))  # placeholder, resolved below
-                    continue
                 path = Path(raw_path).expanduser().resolve()
                 try:
                     raw = path.read_bytes()
@@ -818,17 +530,6 @@ class NovitaSandboxTool(Tool):
                     local_images.append((path, raw))
             if not local_images:
                 return "[No readable Telegram images were available to the VPS.]"
-            # If any entry is a direct-fetch token, fetch every image on the VPS
-            # from Telegram and run OCR there, so no bytes transit Render.
-            needs_direct_fetch = any(
-                _is_telegram_url_token(str(raw)) and _decode_telegram_url_token(str(raw))[0].startswith("https://api.telegram.org/")
-                for raw in image_paths[:_MAX_TELEGRAM_IMAGE_COUNT]
-            )
-            if needs_direct_fetch:
-                return await self._analyze_telegram_images_vps_from_urls(
-                    image_paths[:_MAX_TELEGRAM_IMAGE_COUNT],
-                    config=vps_config,
-                )
             return await self._analyze_telegram_images_vps(local_images, config=vps_config)
         if Novita is None:
             return "[Novita Sandbox Tesseract OCR is unavailable in this deployment; the sandbox will install it on first use.]"
@@ -838,18 +539,8 @@ class NovitaSandboxTool(Tool):
         if len(image_paths) > _MAX_TELEGRAM_IMAGE_COUNT:
             image_paths = image_paths[:_MAX_TELEGRAM_IMAGE_COUNT]
 
-        # Direct-fetch tokens let the Novita sandbox pull the image from
-        # api.telegram.org directly instead of reading local Render bytes.
-        token_map: dict[str, tuple[str, str, str]] = {}
         local_images: list[tuple[Path, bytes]] = []
         for raw_path in image_paths:
-            decoded = (_decode_telegram_url_token(str(raw_path))
-                       if _is_telegram_url_token(str(raw_path)) else None)
-            if decoded is not None:
-                url, fid, safe_name = decoded
-                if (mimetypes.guess_type(safe_name)[0] or "").startswith("image/"):
-                    token_map[str(raw_path)] = (url, fid, safe_name)
-                continue
             path = Path(raw_path).expanduser().resolve()
             try:
                 raw = path.read_bytes()
@@ -861,7 +552,7 @@ class NovitaSandboxTool(Tool):
             if not mime or not mime.startswith("image/"):
                 continue
             local_images.append((path, raw))
-        if not local_images and not token_map:
+        if not local_images:
             return "[No readable Telegram images were available to Novita Sandbox.]"
 
         key = session_key or "telegram:unknown"
@@ -885,131 +576,6 @@ class NovitaSandboxTool(Tool):
                     remote_path = f"{_WORKSPACE}/telegram-images/{uuid4().hex}{suffix}"
                     remote_paths.append(remote_path)
                     await asyncio.to_thread(sandbox.files.write, remote_path, raw)
-                # Direct-fetch entries: curl the bytes straight from Telegram
-                # inside the sandbox, so nothing transits Render egress. Each
-                # fetch is isolated: a single expired/unreachable Telegram URL
-                # must not silently drop that image or abort the whole batch.
-                # Only successfully-fetched files are added to the OCR manifest.
-                fetch_failures: list[str] = []
-                for _raw_token, (url, fid, safe_name) in token_map.items():
-                    suffix = Path(safe_name).suffix.lower() or ".img"
-                    remote_path = f"{_WORKSPACE}/telegram-images/{uuid4().hex}{suffix}"
-
-                    async def _fetch_once(target_url: str) -> object:
-                        return await asyncio.to_thread(
-                            sandbox.commands.run,
-                            f"curl -fsSL --retry 2 --max-time 180 {shlex.quote(target_url)} -o {shlex.quote(remote_path)} "
-                            f"&& test -s {shlex.quote(remote_path)}",
-                            cwd=_WORKSPACE,
-                            timeout=200,
-                            request_timeout=210,
-                        )
-
-                    def _fetch_ok(result: object) -> bool:
-                        code = getattr(result, "exit_code", getattr(result, "exitCode", 0))
-                        return code in (None, 0)
-
-                    # Try the carried download URL first (zero Render egress).
-                    # Telegram file_path URLs can go stale (404); if so, refresh
-                    # a fresh URL from the still-valid file_id and retry once —
-                    # this also never touches Render egress.
-                    try:
-                        _fetch_result = await _fetch_once(url)
-                    except Exception as fetch_exc:
-                        fresh_url: str | None = None
-                        if fid and _TELEGRAM_URL_REFRESHER:
-                            try:
-                                fresh_url = await _TELEGRAM_URL_REFRESHER(fid)
-                            except Exception as refresh_exc:
-                                logger.warning(
-                                    "Novita direct-fetch URL refresh failed for {}: {}",
-                                    safe_name,
-                                    type(refresh_exc).__name__,
-                                )
-                                fresh_url = None
-                        if not fresh_url:
-                            with suppress(Exception):
-                                await asyncio.to_thread(
-                                    sandbox.commands.run,
-                                    f"rm -f {shlex.quote(remote_path)}",
-                                    cwd=_WORKSPACE,
-                                    timeout=30,
-                                    request_timeout=60,
-                                )
-                            fetch_failures.append(f"{safe_name}: {type(fetch_exc).__name__}")
-                            logger.warning(
-                                "Novita direct-fetch failed for {}: {}",
-                                safe_name,
-                                type(fetch_exc).__name__,
-                            )
-                            continue
-                        # Retry once with a freshly generated download URL.
-                        logger.info(
-                            "Refreshing stale Telegram URL for {} and retrying direct-fetch",
-                            safe_name,
-                        )
-                        try:
-                            _fetch_result = await _fetch_once(fresh_url)
-                        except Exception as retry_exc:
-                            with suppress(Exception):
-                                await asyncio.to_thread(
-                                    sandbox.commands.run,
-                                    f"rm -f {shlex.quote(remote_path)}",
-                                    cwd=_WORKSPACE,
-                                    timeout=30,
-                                    request_timeout=60,
-                                )
-                            fetch_failures.append(f"{safe_name}: {type(retry_exc).__name__}")
-                            logger.warning(
-                                "Novita direct-fetch retry failed for {}: {}",
-                                safe_name,
-                                type(retry_exc).__name__,
-                            )
-                            continue
-                    if not _fetch_ok(_fetch_result):
-                        # Non-zero sandbox command that did not raise: no usable
-                        # file. Refresh from file_id and retry once as well.
-                        fresh_url = None
-                        if fid and _TELEGRAM_URL_REFRESHER:
-                            try:
-                                fresh_url = await _TELEGRAM_URL_REFRESHER(fid)
-                            except Exception:
-                                fresh_url = None
-                        retried = False
-                        if fresh_url:
-                            try:
-                                _fetch_result = await _fetch_once(fresh_url)
-                                retried = bool(_fetch_ok(_fetch_result))
-                            except Exception:
-                                retried = False
-                        if not retried:
-                            code = getattr(
-                                _fetch_result, "exit_code", getattr(_fetch_result, "exitCode", 0)
-                            )
-                            with suppress(Exception):
-                                await asyncio.to_thread(
-                                    sandbox.commands.run,
-                                    f"rm -f {shlex.quote(remote_path)}",
-                                    cwd=_WORKSPACE,
-                                    timeout=30,
-                                    request_timeout=60,
-                                )
-                            fetch_failures.append(f"{safe_name}: fetch failed ({code})")
-                            logger.warning(
-                                "Novita direct-fetch failed for {} (exit {}) after refresh",
-                                safe_name,
-                                code,
-                            )
-                            continue
-                    remote_paths.append(remote_path)
-                if not remote_paths:
-                    if fetch_failures:
-                        details = "; ".join(fetch_failures)[:_MAX_IMAGE_ANALYSIS_RESULT_CHARS]
-                        return (
-                            "[Telegram image received, but the OCR backend could not retrieve "
-                            f"its bytes from Telegram for OCR. Fetch failures: {details}]"
-                        )
-                    return "[No readable Telegram images were available to Novita Sandbox.]"
                 await asyncio.to_thread(
                     sandbox.files.write,
                     manifest_path,
@@ -1153,15 +719,11 @@ class NovitaSandboxTool(Tool):
         *,
         session_key: str,
     ) -> list[tuple[str, str]]:
-        """Stage confirmed Telegram files into the active VPS workspace.
+        """Upload confirmed Telegram files to the active VPS workspace.
 
         This is deliberately a VPS-only pre-step. Novita keeps its established
-        model-driven upload flow, while VPS turns confirmed Telegram attachments
+        model-driven upload flow, while VPS turns confirmed local attachments
         into deterministic remote paths before the model turn is built.
-
-        When a media entry is a ``tgurl::`` direct-fetch token, the VPS fetches
-        the bytes straight from api.telegram.org (no Render egress). Local paths
-        fall back to a direct SFTP upload of the on-disk bytes.
         """
         selected_backend, config = self._selected_backend()
         if selected_backend != "vps":
@@ -1172,15 +734,6 @@ class NovitaSandboxTool(Tool):
         root = str(config.workspace_dir or _WORKSPACE).rstrip("/") or _WORKSPACE
         staged: list[tuple[str, str]] = []
         for raw_path in media_paths:
-            token = _decode_telegram_url_token(str(raw_path)) if _is_telegram_url_token(str(raw_path)) else None
-            if token is not None:
-                download_url, _file_id, safe_name = token
-                remote = f"{root}/telegram-attachments/{uuid4().hex}-{safe_name}"
-                # The VPS pulls the bytes from api.telegram.org directly, so the
-                # file never transits Render (near-zero Render bandwidth).
-                await backend.fetch_telegram_url(download_url, remote)
-                staged.append((download_url, remote))
-                continue
             source = Path(str(raw_path)).expanduser().resolve()
             if not self._local_attachment_allowed(source):
                 raise ValueError("Telegram attachment is outside the nanobot media directory")
@@ -1190,9 +743,7 @@ class NovitaSandboxTool(Tool):
                 raise ValueError("Telegram attachment exceeds 200 MiB")
             safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", source.name)[:120] or "attachment.bin"
             remote = f"{root}/telegram-attachments/{uuid4().hex}-{safe_name}"
-            # Skip the tmpfiles.org relay upload — the SFTP upload
-            # below delivers the same bytes directly, so the relay
-            # was sending every file out of Render twice.
+            await upload_tmpfile_path(source)
             await backend.upload("telegram", remote, await asyncio.to_thread(source.read_bytes))
             staged.append((str(source), remote))
         return staged
@@ -1232,27 +783,16 @@ class NovitaSandboxTool(Tool):
                 await backend.write(path, content)
                 return f"Wrote {len(content)} characters to {path} in the remote VPS workspace."
             if action == "upload":
-                source_raw = str(kwargs.get("source") or "")
-                source_path = Path(source_raw).expanduser().resolve()
-                token = _decode_telegram_url_token(source_raw) if _is_telegram_url_token(source_raw) else None
-                if token is not None:
-                    # Direct-fetch token: the VPS pulls the bytes from Telegram
-                    # itself, so no Render egress for the payload.
-                    url, _file_id, safe_name = token
-                    remote_dest = str(path or "").strip()
-                    await backend.fetch_telegram_url(url, remote_dest or f"{root}/{safe_name}")
-                    return f"Uploaded {safe_name} directly from Telegram to {path} in the remote VPS workspace."
-                source = source_path
+                source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
                 if not self._local_attachment_allowed(source):
                     return ToolResult.error("source must be inside the nanobot media/data directory")
                 if not source.is_file():
                     return ToolResult.error("source file does not exist")
                 if source.stat().st_size > _MAX_UPLOAD_BYTES:
                     return ToolResult.error("source file exceeds 200 MiB")
-                # Skip the tmpfiles.org relay — SFTP upload is
-                # available and delivers the bytes directly.
+                await upload_tmpfile_path(source)
                 await backend.upload(str(source), path, await asyncio.to_thread(source.read_bytes))
-                return f"Uploaded {source.name} to {path} in the remote VPS workspace."
+                return f"Uploaded {source.name} via tmpfiles.org to {path} in the remote VPS workspace."
             if action == "list":
                 return await backend.list(path)
             if action == "download_url":
@@ -1316,22 +856,7 @@ class NovitaSandboxTool(Tool):
                     await asyncio.to_thread(sandbox.files.write, path, content)
                     return f"Wrote {len(content)} characters to {path} in the remote sandbox."
                 if action == "upload":
-                    source_raw = str(kwargs.get("source") or "")
-                    token = _decode_telegram_url_token(source_raw) if _is_telegram_url_token(source_raw) else None
-                    if token is not None:
-                        # Direct-fetch: the sandbox curls the bytes from Telegram
-                        # itself, so nothing transits Render egress.
-                        url, _file_id, safe_name = token
-                        await asyncio.to_thread(
-                            sandbox.commands.run,
-                            f"curl -fsSL --retry 2 --max-time 180 {shlex.quote(url)} -o {shlex.quote(path)} "
-                            f"&& test -s {shlex.quote(path)}",
-                            cwd=_WORKSPACE,
-                            timeout=200,
-                            request_timeout=210,
-                        )
-                        return f"Uploaded {safe_name} directly from Telegram to {path} in the remote sandbox."
-                    source = Path(source_raw).expanduser().resolve()
+                    source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
                     allowed_root = Path(os.getenv("NANOBOT_DATA_DIR", str(Path.home() / ".nanobot"))).expanduser().resolve()
                     if allowed_root not in source.parents and source != allowed_root:
                         return ToolResult.error("source must be inside the nanobot media/data directory")

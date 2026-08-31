@@ -81,7 +81,7 @@ def test_render_defaults_activate_environment_provider_over_legacy_gemini(
     config_path.write_text(
         json.dumps(
             {
-                "agents": {"defaults": {"model": "custom/gemini-2.5-flash"}},
+                "agents": {"defaults": {"model": "custom/gemini-3.1-flash-lite"}},
                 "providers": {
                     "custom": {
                         "apiBase": "https://legacy.example/api",
