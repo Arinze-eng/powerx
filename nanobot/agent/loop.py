@@ -34,7 +34,7 @@ from nanobot.agent.tools.context import RequestContext, bind_request_context, re
 from nanobot.agent.tools.exec_session import ExecSessionManager
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import MessageTool
-from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool
+from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool, telegram_token_image_urls
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.runtime_control import AgentRuntimeControl
 from nanobot.agent.tools.self import MyTool
@@ -1024,32 +1024,55 @@ class AgentLoop:
                         if isinstance(path, str) and path and is_image_file(path)
                     ]
                     if telegram_images:
-                        analyzer = NovitaSandboxTool()
-                        backend_name = analyzer.backend_name()
-                        analysis = await analyzer.analyze_telegram_images(
-                            telegram_images,
-                            content,
-                            session_key=active_session_key,
-                        )
-                        backend_label = (
-                            "Novita Sandbox" if backend_name == "novita" else "Linux VPS over SSH"
-                        )
-                        prefix = (
-                            f"[Telegram image analysis from {backend_label} "
-                            f"({len(telegram_images)} image"
-                            f"{'s' if len(telegram_images) != 1 else ''})]\n"
-                            "The image file was uploaded and inspected by the selected execution backend. "
-                            "Do not claim that the image was not received; report the OCR result honestly.\n"
-                            f"{analysis.strip()}"
-                        )
-                        original = "\n".join(
-                            line for line in content.splitlines()
-                            if not line.lstrip().startswith("[image:")
-                        ).strip()
-                        content = f"{prefix}\n\nUser message: {original}" if original else prefix
-                        image_paths = [
-                            path for path in image_paths if path not in telegram_images
+                        # Direct-fetch tokens go straight to the vision model as
+                        # remote image_url blocks; only on-disk local images need
+                        # the Tesseract OCR handoff.
+                        token_urls = telegram_token_image_urls(telegram_images)
+                        local_images = [
+                            path
+                            for path in telegram_images
+                            if not (isinstance(path, str) and str(path).startswith("tgurl::"))
                         ]
+                        if token_urls:
+                            content = (
+                                f"[Telegram image(s) forwarded to the vision model through their "
+                                f"Telegram download URL ({len(token_urls)} image"
+                                f"{'s' if len(token_urls) != 1 else ''}); file bytes never transit "
+                                f"the Render host.]\n{content.strip()}".strip()
+                            )
+                        if local_images:
+                            analyzer = NovitaSandboxTool()
+                            backend_name = analyzer.backend_name()
+                            analysis = await analyzer.analyze_telegram_images(
+                                local_images,
+                                content,
+                                session_key=active_session_key,
+                            )
+                            backend_label = (
+                                "Novita Sandbox" if backend_name == "novita" else "Linux VPS over SSH"
+                            )
+                            prefix = (
+                                f"[Telegram image analysis from {backend_label} "
+                                f"({len(local_images)} image"
+                                f"{'s' if len(local_images) != 1 else ''})]\n"
+                                "The image file was uploaded and inspected by the selected execution backend. "
+                                "Do not claim that the image was not received; report the OCR result honestly.\n"
+                                f"{analysis.strip()}"
+                            )
+                            original = "\n".join(
+                                line for line in content.splitlines()
+                                if not line.lstrip().startswith("[image:")
+                            ).strip()
+                            content = f"{prefix}\n\nUser message: {original}" if original else prefix
+                        # Keep direct-fetch tokens in media for vision and REMOVE
+                        # the OCR-handled local images from model-visible media.
+                        kept = [
+                            path
+                            for path in telegram_images
+                            if isinstance(path, str) and str(path).startswith("tgurl::")
+                        ]
+                        image_paths = [path for path in image_paths if path not in telegram_images]
+                        image_paths = list(kept) + image_paths
                 if image_paths:
                     content, image_paths = reference_non_image_attachments(
                         content,
@@ -1844,7 +1867,16 @@ class AgentLoop:
         )
 
     async def _prepare_telegram_images(self, ctx: TurnContext) -> None:
-        """Move Telegram images through the selected backend before the model sees the turn."""
+        """Move Telegram images before the model sees the turn.
+
+        Images arriving as ``tgurl::`` direct-fetch tokens are handed to the
+        vision-capable model as remote ``image_url`` blocks (via
+        ``build_user_content``), so Render never downloads the payload and the
+        image is genuinely analysed (not reduced to Tesseract OCR).  On-disk
+        local image paths keep the existing atomic Tesseract OCR handoff so the
+        configured LLM always sees a described result even when it cannot read
+        raw image input.
+        """
         msg = ctx.msg
         if ctx.kind is not TurnKind.USER or msg.channel != "telegram" or not msg.media:
             return
@@ -1857,35 +1889,64 @@ class AgentLoop:
         if not image_paths:
             return
 
-        analyzer = NovitaSandboxTool()
-        backend_name = analyzer.backend_name()
-        analysis = await analyzer.analyze_telegram_images(
-            image_paths,
-            msg.content,
-            session_key=ctx.session_key,
-        )
-        image_count = len(image_paths)
-        backend_label = "Novita Sandbox" if backend_name == "novita" else "Linux VPS over SSH"
-        prefix = (
-            f"[Telegram image analysis from {backend_label} ({image_count} image"
-            f"{'s' if image_count != 1 else ''})]\n"
-            "The image file was uploaded and inspected by the selected execution backend. "
-            "Do not claim that the image was not received; report the OCR result honestly.\n"
-            f"{analysis.strip()}"
-        )
-        original = "\n".join(
-            line for line in msg.content.splitlines()
-            if not line.lstrip().startswith("[image:")
-        ).strip()
-        content = f"{prefix}\n\nUser message: {original}" if original else prefix
+        # Remote direct-fetch tokens can be surfaced straight to the vision LLM.
+        token_urls = telegram_token_image_urls(image_paths)
+        # The remaining on-disk local images still need the atomic OCR handoff.
+        local_images = [
+            path
+            for path in image_paths
+            if not (isinstance(path, str) and str(path).startswith("tgurl::"))
+        ]
+
         metadata = dict(msg.metadata or {})
-        metadata["telegram_images_execution_backend"] = backend_name
-        metadata["telegram_images_via_novita_sandbox"] = backend_name == "novita"
-        # Both backends receive OCR text rather than raw image blocks. Novita
-        # already used this safe OCR-only handoff; VPS must use it too because
-        # the configured LLM may not support image input. Never expose an image
-        # path in the model-visible text after the atomic OCR handoff.
         visible_media: list[str] = []
+        content = msg.content
+
+        if token_urls:
+            # Keep the original tokens in media so build_user_content fabricates
+            # remote image_url blocks the vision model can fetch directly.
+            visible_media = [
+                path for path in image_paths if str(path).startswith("tgurl::")
+            ]
+            metadata["telegram_images_via_vision_url"] = True
+            metadata["telegram_images_execution_backend"] = "vision"
+            note = (
+                f"[Telegram image(s) forwarded to the vision model through their "
+                f"Telegram download URL ({len(token_urls)} image"
+                f"{'s' if len(token_urls) != 1 else ''}); file bytes never transit "
+                f"the Render host.]\n{msg.content.strip()}".strip()
+            )
+            content = note
+
+        if local_images:
+            analyzer = NovitaSandboxTool()
+            backend_name = analyzer.backend_name()
+            analysis = await analyzer.analyze_telegram_images(
+                local_images,
+                content,
+                session_key=ctx.session_key,
+            )
+            backend_label = (
+                "Novita Sandbox" if backend_name == "novita" else "Linux VPS over SSH"
+            )
+            prefix = (
+                f"[Telegram image analysis from {backend_label} "
+                f"({len(local_images)} image"
+                f"{'s' if len(local_images) != 1 else ''})]\n"
+                "The image file was uploaded and inspected by the selected execution backend. "
+                "Do not claim that the image was not received; report the OCR result honestly.\n"
+                f"{analysis.strip()}"
+            )
+            original = "\n".join(
+                line for line in content.splitlines()
+                if not line.lstrip().startswith("[image:")
+            ).strip()
+            content = f"{prefix}\n\nUser message: {original}" if original else prefix
+            metadata["telegram_images_execution_backend"] = backend_name
+            metadata["telegram_images_via_novita_sandbox"] = backend_name == "novita"
+
+        if not visible_media and not local_images:
+            return
         ctx.msg = dataclasses.replace(
             msg,
             content=content,
@@ -1893,9 +1954,10 @@ class AgentLoop:
             metadata=metadata,
         )
         logger.info(
-            "Telegram image turn routed through {} for session {}",
-            backend_label,
+            "Telegram image turn prepared for session {} ({} direct-fetch, {} local)",
             ctx.session_key,
+            len(token_urls),
+            len(local_images),
         )
 
     async def _restore_turn(self, ctx: TurnContext) -> None:

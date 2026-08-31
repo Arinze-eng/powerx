@@ -74,6 +74,27 @@ def _decode_telegram_url_token(token: str) -> tuple[str, str] | None:
 def _is_telegram_url_token(value: str) -> bool:
     return _decode_telegram_url_token(value) is not None
 
+
+def telegram_token_image_urls(image_paths: list[str]) -> list[str]:
+    """Return the remote api.telegram.org image URLs for direct-fetch tokens.
+
+    Only entries that decode to a valid ``tgurl::`` token whose filename is an
+    image MIME are returned.  These URLs can be handed straight to a
+    vision-capable model (Render never downloads the payload).
+    """
+    urls: list[str] = []
+    for raw in image_paths:
+        decoded = (_decode_telegram_url_token(str(raw))
+                   if _is_telegram_url_token(str(raw)) else None)
+        if decoded is None:
+            continue
+        url, safe_name = decoded
+        if url.startswith("https://api.telegram.org/") and (
+            mimetypes.guess_type(safe_name)[0] or ""
+        ).startswith("image/"):
+            urls.append(url)
+    return urls
+
 _TELEGRAM_IMAGE_SCRIPT = r'''import json
 import os
 import shutil

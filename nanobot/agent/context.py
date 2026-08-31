@@ -337,17 +337,61 @@ class ContextBuilder:
             }
         return current
 
+    @staticmethod
+    def _remote_image_url(path: str) -> str | None:
+        """Resolve a media entry to a directly fetchable image URL, if any.
+
+        Nanobot's Telegram direct-fetch handoff carries a ``tgurl::<url>::<name>``
+        token so the file bytes never transit Render.  Adding a dependency flag,
+        an entry can also be a plain ``http(s)://`` image URL.  For both we hand
+        the remote URL to the (vision-capable) LLM provider, which pulls the
+        bytes straight from that URL - matching the bandwidth-saving design where
+        Render never downloads the payload.
+        """
+        if not isinstance(path, str) or not path:
+            return None
+        if path.startswith("tgurl::"):
+            body = path[len("tgurl::"):]
+            if "::" in body:
+                url, safe_name = body.split("::", 1)
+                # Only api.telegram.org download URLs are ever produced by the
+                # runtime, and the trailing filename must look like an image so
+                # a non-image (e.g. a document) is not surfaced as a vision block.
+                if url.startswith("https://api.telegram.org/") and safe_name:
+                    if (mimetypes.guess_type(safe_name)[0] or "").startswith("image/"):
+                        return url
+            return None
+        if path.startswith(("http://", "https://")):
+            if (mimetypes.guess_type(path)[0] or "").startswith("image/"):
+                return path
+            return None
+        return None
+
     def build_user_content(
         self,
         text: str,
         image_paths: list[str] | None,
     ) -> str | list[dict[str, Any]]:
-        """Build user message content from prefiltered image paths."""
+        """Build user message content from prefiltered image paths.
+
+        Local files are inlined as base64 ``image_url`` blocks.  ``tgurl::``
+        direct-fetch tokens and ``http(s)://`` image URLs are handed to the
+        vision-capable model as remote ``image_url`` blocks, so Render never
+        downloads the payload (preserving near-zero Render egress).
+        """
         if not image_paths:
             return text
 
         image_blocks: list[dict[str, Any]] = []
         for path in image_paths:
+            remote = self._remote_image_url(path)
+            if remote is not None:
+                image_blocks.append({
+                    "type": "image_url",
+                    "image_url": {"url": remote},
+                    "_meta": {"remote": True},
+                })
+                continue
             p = Path(path)
             if not p.is_file():
                 continue
