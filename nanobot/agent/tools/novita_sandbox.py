@@ -93,7 +93,7 @@ except ImportError:
                 stdout=install_subprocess.DEVNULL,
                 stderr=install_subprocess.DEVNULL,
                 check=True,
-                timeout=45,
+                timeout=60,
             )
             from PIL import Image, ImageEnhance, ImageFilter, ImageOps
         except Exception:
@@ -105,6 +105,11 @@ def fail(message):
     raise SystemExit(1)
 
 
+def _save_lazy(image, output_path):
+    """Save variant without requiring left-to-right resize assumptions."""
+    image.save(output_path, format="PNG", optimize=True)
+
+
 def prepare_image(path, output_path):
     if Image is None:
         return False
@@ -112,34 +117,57 @@ def prepare_image(path, output_path):
         with Image.open(path) as image:
             image.verify()
         with Image.open(path) as image:
-            image = ImageOps.exif_transpose(image).convert("L")  # grayscale helps Tesseract a lot
-            # Upscaling small previews improves OCR without touching the original.
-            scale = max(1, min(4, 1800 // max(image.width, image.height)))
+            image = ImageOps.exif_transpose(image).convert("L")
+            # Upscaling small previews improves OCR. Larger upscale cap and a
+            # floor so tiny thumbnails get a real resolution boost.
+            longest = max(image.width, image.height)
+            scale = max(1, min(4, 2200 // max(1, longest)))
             if scale > 1:
-                image = image.resize((image.width * scale, image.height * scale), Image.Resampling.LANCZOS)
-            # Normalize contrast; autocontrast recovers faint or washed-out text.
+                image = image.resize(
+                    (image.width * scale, image.height * scale),
+                    Image.Resampling.LANCZOS,
+                )
             image = ImageOps.autocontrast(image)
-            image = ImageEnhance.Contrast(image).enhance(1.6)
+            image = ImageEnhance.Contrast(image).enhance(1.8)
             image = image.filter(ImageFilter.SHARPEN)
-            image.save(output_path, format="PNG", optimize=True)
+            _save_lazy(image, output_path)
     except Exception:
         return False
     return True
 
 
 def prepare_binary(path, output_path):
-    """Produce a high-contrast binary (black/white) variant for stubborn images."""
+    """High-contrast binary variant with adaptive threshold (not fixed 128)."""
     if Image is None:
         return False
     try:
         with Image.open(path) as image:
             image = ImageOps.exif_transpose(image).convert("L")
             image = ImageOps.autocontrast(image)
-            # Simple Otsu-style threshold binarization; robust across Pillow
-            # versions (avoid the version-dependent ImageFilter.MEDIANFILTER
-            # constant partly because some images are better left sharp).
-            image = image.point(lambda pixel: 255 if pixel > 128 else 0)
-            image.save(output_path, format="PNG", optimize=True)
+            # Adaptive-ish: normalize then threshold near the histogram mid.
+            # Fall back to the classic fixed point if needed.
+            try:
+                threshold = sum(image.histogram()) and (image.getextrema()[0] + image.getextrema()[1]) // 2
+            except Exception:
+                threshold = 128
+            image = image.point(lambda p: 255 if p > threshold else 0)
+            _save_lazy(image, output_path)
+    except Exception:
+        return False
+    return True
+
+
+def prepare_denoised(path, output_path):
+    """Median-denoised gentle variant for speckled photos/scans."""
+    if Image is None:
+        return False
+    try:
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image).convert("L")
+            image = ImageOps.autocontrast(image)
+            image = image.filter(ImageFilter.MedianFilter(size=3))
+            image = ImageEnhance.Contrast(image).enhance(1.4)
+            _save_lazy(image, output_path)
     except Exception:
         return False
     return True
@@ -155,14 +183,18 @@ def install_tesseract():
         return False
     commands = [
         ["apt-get", "update", "-qq"],
-        ["apt-get", "install", "-y", "-qq", "tesseract-ocr", "tesseract-ocr-eng"],
+        ["apt-get", "install", "-y", "-qq",
+         "tesseract-ocr", "tesseract-ocr-eng"],
     ]
     for command in commands:
         try:
-            result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=120)
+            result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=150)
             if result.returncode != 0:
                 sudo_command = ["sudo", "-n", *command]
-                result = subprocess.run(sudo_command, capture_output=True, text=True, check=False, timeout=120)
+                try:
+                    result = subprocess.run(sudo_command, capture_output=True, text=True, check=False, timeout=150)
+                except OSError:
+                    return False
         except OSError:
             return False
         if result.returncode != 0:
@@ -199,14 +231,17 @@ def run_tesseract(image_path, psm):
         timeout = max(5, min(int(os.getenv("NANOBOT_OCR_TIMEOUT_SECONDS", "90")), 90))
     except ValueError:
         timeout = 90
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout,
-        env=_tesseract_environment(),
-    )
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+            env=_tesseract_environment(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "", []
     if result.returncode != 0:
         return "", []
     words = []
@@ -226,13 +261,39 @@ def run_tesseract(image_path, psm):
         return "", []
     text = " ".join(word for word, _ in words)
     confidence = sum(conf for _, conf in words if conf >= 0) / max(1, sum(1 for _, conf in words if conf >= 0))
-    return text, [(confidence, len(words))]
+    return text, [(confidence, len(words), words)]
+
+
+def _word_quality(word):
+    """Score how 'word-like' a token is. Real words are mostly alphanumeric."""
+    if not word:
+        return 0.0
+    letters_digits = sum(1 for ch in word if ch.isalnum())
+    return letters_digits / len(word)
+
+
+def _text_readability(words):
+    """Return (readability 0..1, real_word_count, strong_word_count)."""
+    if not words:
+        return 1.0, 0, 0
+    real = 0
+    strong = 0
+    total_q = 0.0
+    for word, _conf in words:
+        q = _word_quality(word)
+        total_q += q
+        if q >= 0.5 and len(word) >= 2:
+            real += 1
+        # A "strong" word is a multi-character token made of letters/digits
+        # (not screenshot-noise fragments like "ae", "an", "ee").
+        if q >= 0.7 and len(word) >= 3:
+            strong += 1
+    avg_q = total_q / len(words)
+    return avg_q, real, strong
 
 
 def read_image(path, temp_dir):
     try:
-        # A corrupt / non-image payload is reported as unreadable rather than
-        # being fed to Tesseract (which would otherwise just see noise bytes).
         if Image is not None:
             try:
                 with Image.open(path) as image:
@@ -247,19 +308,31 @@ def read_image(path, temp_dir):
         binary = Path(temp_dir) / f"{stem}_binary.png"
         if prepare_binary(path, binary):
             variants.append(str(binary))
+        denoised = Path(temp_dir) / f"{stem}_denoised.png"
+        if prepare_denoised(path, denoised):
+            variants.append(str(denoised))
+
         candidates = []
         for variant in variants:
-            # Sparse, auto, and single-line modes cover most layouts; try a wide
-            # net so a failing page mode never blocks text that another mode reads.
             for psm in (6, 11, 3, 7, 12):
                 text, scores = run_tesseract(variant, psm)
-                if text:
-                    confidence, word_count = scores[0]
-                    # Reject tesseract "ghost" text on blank noisy regions (a
-                    # lone 0% word). Real OCR carries a few words or decent
-                    # confidence; noise does not.
-                    if word_count >= 3 or confidence >= 30.0:
-                        candidates.append((confidence, word_count, text, psm))
+                if text and scores:
+                    confidence, _wc, words = scores[0]
+                    readability, real_words, strong_words = _text_readability(words)
+                    # Score is a blend: confidence, readability, and having real
+                    # words. Strong single-line results get a small boost.
+                    score = (
+                        confidence * 0.4
+                        + readability * 100.0 * 0.4
+                        + min(real_words * 12.0, 20.0)
+                    )
+                    # Accept a candidate only when it shows clearly readable text.
+                    # Requiring >=2 real words (or a single strong multi-char word
+                    # at reasonable confidence) avoids tesseract "ghost" output on
+                    # blank/noisy regions ("an", "ae", "ee").
+                    if real_words >= 2 or (strong_words >= 1 and confidence >= 40.0):
+                        candidates.append((score, confidence, real_words, strong_words, readability, text, psm, words))
+
         if not candidates:
             if not TESSERACT_BINARY:
                 return (
@@ -268,12 +341,13 @@ def read_image(path, temp_dir):
                     "an administrator must install tesseract-ocr before image OCR can run."
                 )
             return f"File: {Path(path).name}\nTesseract detected no readable text."
-        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        confidence, word_count, text, psm = candidates[0]
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        score, confidence, real_words, strong_words, readability, text, psm, _words = candidates[0]
         return (
             f"File: {Path(path).name}\n"
             f"Tesseract OCR confidence: {confidence:.1f}%\n"
-            f"Tesseract page mode: {psm}; words: {word_count}\n"
+            f"Tesseract page mode: {psm}; words: {real_words}\n"
             f"Recognized text:\n{text}"
         )
     except Exception as exc:
@@ -294,8 +368,7 @@ with __import__("tempfile").TemporaryDirectory() as temp_dir:
     content = "\n\n".join(read_image(str(path), temp_dir) for path in image_paths if path)
 if not content:
     fail("no OCR results produced")
-print(json.dumps({"content": content}, ensure_ascii=False))
-'''
+print(json.dumps({"content": content}, ensure_ascii=False))'''
 
 
 class _SandboxStore:
