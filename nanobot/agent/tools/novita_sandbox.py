@@ -25,7 +25,7 @@ from nanobot.agent.tools.schema import (
 from nanobot.agent.tools.vps_backend import VPSExecutionBackend
 from nanobot.config.paths import get_data_dir, get_workspace_path
 from nanobot.utils.helpers import detect_image_mime
-from nanobot.utils.tmpfiles import upload_bytes as upload_tmpfile_bytes
+from nanobot.utils.tmpfiles import upload_bytes as upload_tmpfile_bytes  # noqa: F401 - referenced by VPS relay-skip tests
 from nanobot.utils.tmpfiles import upload_path as upload_tmpfile_path
 
 try:
@@ -43,6 +43,36 @@ _MAX_TELEGRAM_IMAGE_COUNT = 4
 _MAX_IMAGE_ANALYSIS_RESULT_CHARS = 16_000
 _WORKSPACE = "/workspace"
 _OCR_DIR = f"{_WORKSPACE}/.nanobot"
+
+# A Telegram attachment may be carried through the message bus as a small
+# "direct fetch" token instead of a local Render disk path.  When present, the
+# active execution backend (Novita sandbox or Linux VPS) downloads the bytes
+# straight from api.telegram.org, so the file never transits Render's egress
+# (near-zero Render bandwidth).  Format: tgurl::<https-download-url>::<filename>
+_TG_URL_PREFIX = "tgurl::"
+
+
+def _encode_telegram_url_token(download_url: str, filename: str) -> str:
+    """Build an opaque token that routes a Telegram file to a direct backend fetch."""
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[:120] or "attachment.bin"
+    return f"{_TG_URL_PREFIX}{download_url}::{safe_name}"
+
+
+def _decode_telegram_url_token(token: str) -> tuple[str, str] | None:
+    """Return (download_url, safe_name) when *token* is a direct-fetch token."""
+    if not token.startswith(_TG_URL_PREFIX):
+        return None
+    body = token[len(_TG_URL_PREFIX):]
+    if "::" not in body:
+        return None
+    url, safe_name = body.split("::", 1)
+    if not url.startswith("https://api.telegram.org/") or not safe_name:
+        return None
+    return url, safe_name
+
+
+def _is_telegram_url_token(value: str) -> bool:
+    return _decode_telegram_url_token(value) is not None
 
 _TELEGRAM_IMAGE_SCRIPT = r'''import json
 import os
@@ -455,7 +485,9 @@ class NovitaSandboxTool(Tool):
                 suffix = path.suffix.lower() if path.suffix else ".img"
                 remote_path = f"{root}/telegram-images/{uuid4().hex}{suffix}"
                 remote_paths.append(remote_path)
-                await upload_tmpfile_bytes(raw, filename=path.name, content_type=detect_image_mime(raw))
+                # Skip the tmpfiles.org relay — SFTP upload delivers the same
+                # bytes directly, so relay would send every file out of Render
+                # twice (once upload, once cron re-pull).
                 await backend.upload("telegram", remote_path, raw)
             await backend.write(manifest_path, json.dumps(remote_paths))
             output = await backend.run(
@@ -496,6 +528,106 @@ class NovitaSandboxTool(Tool):
                         cwd=root,
                     )
 
+    async def _analyze_telegram_images_vps_from_urls(
+        self,
+        tokens: list[str],
+        *,
+        config: Any,
+    ) -> str:
+        """OCR Telegram images whose bytes were fetched directly from Telegram.
+
+        Each *tokens* entry is a ``tgurl::`` direct-fetch token. The VPS runs
+        ``curl`` to pull the bytes from api.telegram.org, so the files never
+        transit Render (near-zero Render egress). Local-path images are not
+        mixed in here; see ``_analyze_telegram_images_vps`` for those.
+        """
+        backend = VPSExecutionBackend(config)
+        root = str(config.workspace_dir or _WORKSPACE).rstrip("/") or "/workspace"
+        ocr_dir = f"{root}/.nanobot"
+        remote_paths: list[str] = []
+        manifest_path = f"{ocr_dir}/telegram_image_manifest.json"
+        script_path = f"{ocr_dir}/telegram_image_ocr.py"
+        try:
+            img_dir = f"{root}/telegram-images"
+            await backend.run(
+                f"mkdir -p {shlex.quote(ocr_dir)} {shlex.quote(img_dir)}",
+                timeout=30,
+                cwd=root,
+            )
+            tesseract_probe = await backend.run(
+                "if command -v tesseract >/dev/null 2>&1; then printf READY; "
+                "else printf MISSING; fi",
+                timeout=20,
+                cwd=root,
+            )
+            if "READY" not in tesseract_probe:
+                await backend.install_packages(
+                    ["tesseract-ocr", "tesseract-ocr-eng"],
+                    timeout=600,
+                )
+                tesseract_probe = await backend.run(
+                    "if command -v tesseract >/dev/null 2>&1; then printf READY; "
+                    "else printf MISSING; fi",
+                    timeout=20,
+                    cwd=root,
+                )
+                if "READY" not in tesseract_probe:
+                    raise RuntimeError(
+                        "Tesseract was not available after the VPS package installation"
+                    )
+            await backend.write(script_path, _TELEGRAM_IMAGE_SCRIPT)
+            for raw_token in tokens[:_MAX_TELEGRAM_IMAGE_COUNT]:
+                decoded = _decode_telegram_url_token(str(raw_token))
+                if decoded is None:
+                    continue
+                download_url, safe_name = decoded
+                if not (mimetypes.guess_type(safe_name)[0] or "").startswith("image/"):
+                    continue
+                suffix = Path(safe_name).suffix.lower() or ".img"
+                remote_path = f"{root}/telegram-images/{uuid4().hex}{suffix}"
+                remote_paths.append(remote_path)
+                await backend.fetch_telegram_url(download_url, remote_path)
+            if not remote_paths:
+                return "[No readable Telegram images were available to the VPS.]"
+            await backend.write(manifest_path, json.dumps(remote_paths))
+            output = await backend.run(
+                "env NANOBOT_OCR_ALLOW_INSTALL=0 NANOBOT_OCR_ALLOW_PILLOW_INSTALL=0 "
+                "NANOBOT_OCR_TIMEOUT_SECONDS=20 "
+                f"python3 {shlex.quote(script_path)} {shlex.quote(manifest_path)}",
+                timeout=45,
+                cwd=root,
+            )
+            stdout = output.split("\n[stderr]", 1)[0].strip()
+            parsed: Any | None = None
+            try:
+                parsed = json.loads(stdout)
+            except (TypeError, ValueError):
+                for line in reversed(stdout.splitlines()):
+                    candidate = line.strip()
+                    if not candidate.startswith("{"):
+                        continue
+                    try:
+                        parsed = json.loads(candidate)
+                        break
+                    except ValueError:
+                        continue
+            if not isinstance(parsed, dict) or not str(parsed.get("content") or "").strip():
+                logger.warning("VPS returned no usable Tesseract OCR result")
+                return "[VPS Tesseract OCR returned no readable result.]"
+            return str(parsed["content"]).strip()[:_MAX_IMAGE_ANALYSIS_RESULT_CHARS]
+        except Exception as exc:
+            logger.warning("VPS Tesseract OCR (direct-fetch) failed: {}", type(exc).__name__)
+            return "[VPS Tesseract OCR failed.]"
+        finally:
+            if remote_paths:
+                with suppress(Exception):
+                    await backend.run(
+                        "rm -f " + " ".join(shlex.quote(path) for path in remote_paths)
+                        + f" {shlex.quote(manifest_path)} {shlex.quote(script_path)}",
+                        timeout=30,
+                        cwd=root,
+                    )
+
     async def analyze_telegram_images(
         self,
         image_paths: list[str],
@@ -517,7 +649,16 @@ class NovitaSandboxTool(Tool):
             if vps_config is None or not str(vps_config.host or "").strip():
                 return "[VPS execution is selected but SSH details are not configured.]"
             local_images: list[tuple[Path, bytes]] = []
+            # Direct-fetch tokens let the VPS pull the file from Telegram instead
+            # of Render; classify them by filename MIME so they route to image OCR.
             for raw_path in image_paths[:_MAX_TELEGRAM_IMAGE_COUNT]:
+                token = _decode_telegram_url_token(str(raw_path)) if _is_telegram_url_token(str(raw_path)) else None
+                if token is not None:
+                    url, safe_name = token
+                    guessed = mimetypes.guess_type(safe_name)[0]
+                    if guessed and guessed.startswith("image/"):
+                        local_images.append((Path(safe_name), b""))  # placeholder, resolved below
+                    continue
                 path = Path(raw_path).expanduser().resolve()
                 try:
                     raw = path.read_bytes()
@@ -530,6 +671,17 @@ class NovitaSandboxTool(Tool):
                     local_images.append((path, raw))
             if not local_images:
                 return "[No readable Telegram images were available to the VPS.]"
+            # If any entry is a direct-fetch token, fetch every image on the VPS
+            # from Telegram and run OCR there, so no bytes transit Render.
+            needs_direct_fetch = any(
+                _is_telegram_url_token(str(raw)) and _decode_telegram_url_token(str(raw))[0].startswith("https://api.telegram.org/")
+                for raw in image_paths[:_MAX_TELEGRAM_IMAGE_COUNT]
+            )
+            if needs_direct_fetch:
+                return await self._analyze_telegram_images_vps_from_urls(
+                    image_paths[:_MAX_TELEGRAM_IMAGE_COUNT],
+                    config=vps_config,
+                )
             return await self._analyze_telegram_images_vps(local_images, config=vps_config)
         if Novita is None:
             return "[Novita Sandbox Tesseract OCR is unavailable in this deployment; the sandbox will install it on first use.]"
@@ -539,8 +691,18 @@ class NovitaSandboxTool(Tool):
         if len(image_paths) > _MAX_TELEGRAM_IMAGE_COUNT:
             image_paths = image_paths[:_MAX_TELEGRAM_IMAGE_COUNT]
 
+        # Direct-fetch tokens let the Novita sandbox pull the image from
+        # api.telegram.org directly instead of reading local Render bytes.
+        token_map: dict[str, tuple[str, str]] = {}
         local_images: list[tuple[Path, bytes]] = []
         for raw_path in image_paths:
+            decoded = (_decode_telegram_url_token(str(raw_path))
+                       if _is_telegram_url_token(str(raw_path)) else None)
+            if decoded is not None:
+                url, safe_name = decoded
+                if (mimetypes.guess_type(safe_name)[0] or "").startswith("image/"):
+                    token_map[str(raw_path)] = (url, safe_name)
+                continue
             path = Path(raw_path).expanduser().resolve()
             try:
                 raw = path.read_bytes()
@@ -552,7 +714,7 @@ class NovitaSandboxTool(Tool):
             if not mime or not mime.startswith("image/"):
                 continue
             local_images.append((path, raw))
-        if not local_images:
+        if not local_images and not token_map:
             return "[No readable Telegram images were available to Novita Sandbox.]"
 
         key = session_key or "telegram:unknown"
@@ -576,6 +738,20 @@ class NovitaSandboxTool(Tool):
                     remote_path = f"{_WORKSPACE}/telegram-images/{uuid4().hex}{suffix}"
                     remote_paths.append(remote_path)
                     await asyncio.to_thread(sandbox.files.write, remote_path, raw)
+                # Direct-fetch entries: curl the bytes straight from Telegram
+                # inside the sandbox, so nothing transits Render egress.
+                for _raw_token, (url, safe_name) in token_map.items():
+                    suffix = Path(safe_name).suffix.lower() or ".img"
+                    remote_path = f"{_WORKSPACE}/telegram-images/{uuid4().hex}{suffix}"
+                    remote_paths.append(remote_path)
+                    await asyncio.to_thread(
+                        sandbox.commands.run,
+                        f"curl -fsSL --retry 2 --max-time 180 {shlex.quote(url)} -o {shlex.quote(remote_path)} "
+                        f"&& test -s {shlex.quote(remote_path)}",
+                        cwd=_WORKSPACE,
+                        timeout=200,
+                        request_timeout=210,
+                    )
                 await asyncio.to_thread(
                     sandbox.files.write,
                     manifest_path,
@@ -719,11 +895,15 @@ class NovitaSandboxTool(Tool):
         *,
         session_key: str,
     ) -> list[tuple[str, str]]:
-        """Upload confirmed Telegram files to the active VPS workspace.
+        """Stage confirmed Telegram files into the active VPS workspace.
 
         This is deliberately a VPS-only pre-step. Novita keeps its established
-        model-driven upload flow, while VPS turns confirmed local attachments
+        model-driven upload flow, while VPS turns confirmed Telegram attachments
         into deterministic remote paths before the model turn is built.
+
+        When a media entry is a ``tgurl::`` direct-fetch token, the VPS fetches
+        the bytes straight from api.telegram.org (no Render egress). Local paths
+        fall back to a direct SFTP upload of the on-disk bytes.
         """
         selected_backend, config = self._selected_backend()
         if selected_backend != "vps":
@@ -734,6 +914,15 @@ class NovitaSandboxTool(Tool):
         root = str(config.workspace_dir or _WORKSPACE).rstrip("/") or _WORKSPACE
         staged: list[tuple[str, str]] = []
         for raw_path in media_paths:
+            token = _decode_telegram_url_token(str(raw_path)) if _is_telegram_url_token(str(raw_path)) else None
+            if token is not None:
+                download_url, safe_name = token
+                remote = f"{root}/telegram-attachments/{uuid4().hex}-{safe_name}"
+                # The VPS pulls the bytes from api.telegram.org directly, so the
+                # file never transits Render (near-zero Render bandwidth).
+                await backend.fetch_telegram_url(download_url, remote)
+                staged.append((download_url, remote))
+                continue
             source = Path(str(raw_path)).expanduser().resolve()
             if not self._local_attachment_allowed(source):
                 raise ValueError("Telegram attachment is outside the nanobot media directory")
@@ -785,7 +974,17 @@ class NovitaSandboxTool(Tool):
                 await backend.write(path, content)
                 return f"Wrote {len(content)} characters to {path} in the remote VPS workspace."
             if action == "upload":
-                source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
+                source_raw = str(kwargs.get("source") or "")
+                source_path = Path(source_raw).expanduser().resolve()
+                token = _decode_telegram_url_token(source_raw) if _is_telegram_url_token(source_raw) else None
+                if token is not None:
+                    # Direct-fetch token: the VPS pulls the bytes from Telegram
+                    # itself, so no Render egress for the payload.
+                    url, safe_name = token
+                    remote_dest = str(path or "").strip()
+                    await backend.fetch_telegram_url(url, remote_dest or f"{root}/{safe_name}")
+                    return f"Uploaded {safe_name} directly from Telegram to {path} in the remote VPS workspace."
+                source = source_path
                 if not self._local_attachment_allowed(source):
                     return ToolResult.error("source must be inside the nanobot media/data directory")
                 if not source.is_file():
@@ -859,7 +1058,22 @@ class NovitaSandboxTool(Tool):
                     await asyncio.to_thread(sandbox.files.write, path, content)
                     return f"Wrote {len(content)} characters to {path} in the remote sandbox."
                 if action == "upload":
-                    source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
+                    source_raw = str(kwargs.get("source") or "")
+                    token = _decode_telegram_url_token(source_raw) if _is_telegram_url_token(source_raw) else None
+                    if token is not None:
+                        # Direct-fetch: the sandbox curls the bytes from Telegram
+                        # itself, so nothing transits Render egress.
+                        url, safe_name = token
+                        await asyncio.to_thread(
+                            sandbox.commands.run,
+                            f"curl -fsSL --retry 2 --max-time 180 {shlex.quote(url)} -o {shlex.quote(path)} "
+                            f"&& test -s {shlex.quote(path)}",
+                            cwd=_WORKSPACE,
+                            timeout=200,
+                            request_timeout=210,
+                        )
+                        return f"Uploaded {safe_name} directly from Telegram to {path} in the remote sandbox."
+                    source = Path(source_raw).expanduser().resolve()
                     allowed_root = Path(os.getenv("NANOBOT_DATA_DIR", str(Path.home() / ".nanobot"))).expanduser().resolve()
                     if allowed_root not in source.parents and source != allowed_root:
                         return ToolResult.error("source must be inside the nanobot media/data directory")

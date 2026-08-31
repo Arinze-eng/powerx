@@ -318,10 +318,11 @@ async def test_vps_upload_action_accepts_active_config_media_root_when_env_root_
         source=str(source),
         path="/workspace/telegram-attachments/report.txt",
     )
-    assert "Uploaded report.txt via tmpfiles.org" in str(result)
-    tmpfile_upload.assert_awaited_once()
+    assert "Uploaded report.txt to /workspace/telegram-attachments/report.txt in the remote VPS workspace." in str(result)
+    # tmpfiles.org relay is skipped in VPS mode — SFTP upload delivers the bytes
+    # directly, so the file is not relayed out of Render twice.
+    tmpfile_upload.assert_not_awaited()
     upload.assert_awaited_once()
-    assert tmpfile_upload.await_args.args[0].read_text(encoding="utf-8") == "VPS FILE FIXTURE"
     assert upload.await_args.args[2] == b"VPS FILE FIXTURE"
 
 
@@ -435,3 +436,47 @@ async def test_novita_tool_install_action_delegates_to_vps(
     assert "VPS package installation result:" in str(result)
     assert "installed" in str(result)
     install.assert_awaited_once_with(["tesseract-ocr", "python3-pil"], timeout=600)
+
+
+@pytest.mark.asyncio
+async def test_vps_backend_fetch_telegram_url_uses_curl(
+    monkeypatch: pytest.MonkeyPatch,
+    vps_config: VPSExecutionConfig,
+) -> None:
+    """The VPS must fetch Telegram bytes itself (near-zero Render egress)."""
+    connection = _FakeConnection()
+
+    async def connect(**_kwargs: Any) -> _FakeConnection:
+        return connection
+
+    monkeypatch.setattr(vps_backend.asyncssh, "connect", connect)
+    backend = vps_backend.VPSExecutionBackend(vps_config)
+    url = "https://api.telegram.org/file/bot123/documents/report.pdf"
+    remote = await backend.fetch_telegram_url(url, "/workspace/telegram-attachments/report.pdf")
+    assert remote.endswith("/telegram-attachments/report.pdf")
+    assert any(command.startswith("curl -fsSL") and "api.telegram.org" in command
+               for command in connection.commands)
+    assert connection.closed is True
+
+
+@pytest.mark.asyncio
+async def test_vps_backend_fetch_telegram_url_rejects_non_telegram_host(
+    monkeypatch: pytest.MonkeyPatch,
+    vps_config: VPSExecutionConfig,
+) -> None:
+    """Only api.telegram.org is an acceptable direct-fetch source."""
+    async def connect(**_kwargs: Any) -> None:
+        raise AssertionError("host validation must fail before connecting")
+
+    monkeypatch.setattr(vps_backend.asyncssh, "connect", connect)
+    backend = vps_backend.VPSExecutionBackend(vps_config)
+    with pytest.raises(ValueError, match="api.telegram.org"):
+        await backend.fetch_telegram_url(
+            "https://evil.example.test/file.pdf",
+            "/workspace/telegram-attachments/file.pdf",
+        )
+    with pytest.raises(ValueError, match="api.telegram.org"):
+        await backend.fetch_telegram_url(
+            "http://api.telegram.org/file/bot123/x",
+            "/workspace/telegram-attachments/x",
+        )

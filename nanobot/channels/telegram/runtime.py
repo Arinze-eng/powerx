@@ -1737,6 +1737,19 @@ class TelegramChannel(BaseChannel):
             media_dir = get_media_dir("telegram")
             unique_id = getattr(media_file, "file_unique_id", media_file.file_id)
             file_path = media_dir / f"{unique_id}{ext}"
+            file_name = getattr(media_file, "file_name", None) or file_path.name
+            # When a remote execution backend (Novita sandbox or Linux VPS) is
+            # active, do not drag the file bytes onto Render's disk. Instead emit a
+            # "tgurl::" direct-fetch token carrying the api.telegram.org download
+            # URL; the backend downloads those bytes straight from Telegram, so the
+            # payload never transits Render egress (near-zero Render bandwidth).
+            if self._telegram_direct_fetch_enabled() and media_type in ("image", "file", "video"):
+                file_path_str = getattr(file, "file_path", None)
+                if file_path_str:
+                    download_url = f"https://api.telegram.org/file/bot{self.config.token}/{file_path_str}"
+                    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", file_name)[:120] or "attachment.bin"
+                    token = f"tgurl::{download_url}::{safe_name}"
+                    return [token], [f"[{media_type}: {file_name}]"]
             await file.download_to_drive(str(file_path))
             path_str = str(file_path)
             if media_type in ("voice", "audio"):
@@ -1751,6 +1764,22 @@ class TelegramChannel(BaseChannel):
             if add_failure_content:
                 return [], [f"[{media_type}: download failed]"]
             return [], []
+
+    def _telegram_direct_fetch_enabled(self) -> bool:
+        """Return True when a remote sandbox backend can fetch Telegram files."""
+        env = os.environ.get("NANOBOT_TELEGRAM_DIRECT_FETCH", "").strip().lower()
+        if env in {"1", "true", "on", "yes"}:
+            return True
+        if env in {"0", "false", "off", "no"}:
+            return False
+        # Optional explicit backend override (same signal the sandbox tool uses).
+        backend = os.environ.get("NANOBOT_EXECUTION_BACKEND", "").strip().lower()
+        if backend == "novita":
+            return bool(os.environ.get("NOVITA_API_KEY", "").strip())
+        if backend == "vps":
+            return bool(os.environ.get("NANOBOT_VPS_HOST", "").strip())
+        # Default: enabled when the Novita sandbox backend is configured.
+        return bool(os.environ.get("NOVITA_API_KEY", "").strip())
 
     async def _ensure_bot_identity(self) -> tuple[int | None, str | None]:
         """Load bot identity once and reuse it for mention/reply checks."""

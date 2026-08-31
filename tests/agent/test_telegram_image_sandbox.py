@@ -830,3 +830,155 @@ def test_telegram_ocr_turn_strips_all_image_block_shapes_before_provider() -> No
     assert all(block.get("type") != "image_url" for block in content)
     assert all(block.get("type") != "input_image" for block in content)
     assert any("raw image content was not sent" in block.get("text", "") for block in content)
+
+
+# --- Direct-fetch (tgurl::) token paths: keep file bytes off Render egress ---
+
+
+def test_is_image_file_recognises_tgurl_image_token() -> None:
+    from nanobot.utils.document import is_image_file
+
+    token = "tgurl::https://api.telegram.org/file/bot123/documents/photo_2235492.png::photo_2235492.png"
+    assert is_image_file(token) is True
+    pdf_token = "tgurl::https://api.telegram.org/file/bot123/documents/report_dc.pdf::report_dc.pdf"
+    assert is_image_file(pdf_token) is False
+
+
+def test_telegram_url_token_round_trip() -> None:
+    from nanobot.agent.tools.novita_sandbox import (
+        _decode_telegram_url_token,
+        _encode_telegram_url_token,
+        _is_telegram_url_token,
+    )
+
+    url = "https://api.telegram.org/file/bot123/documents/report%20dc.pdf"
+    token = _encode_telegram_url_token(url, "report dc.pdf")
+    assert _is_telegram_url_token(token) is True
+    decoded = _decode_telegram_url_token(token)
+    assert decoded == (url, "report_dc.pdf")
+
+
+@pytest.mark.asyncio
+async def test_stage_telegram_attachments_token_fetches_directly_from_telegram(monkeypatch) -> None:
+    import nanobot.agent.tools.vps_backend as vps_backend_mod
+
+    from nanobot.agent.tools.novita_sandbox import (
+        _encode_telegram_url_token,
+        NovitaSandboxTool,
+    )
+
+    execution = SimpleNamespace(
+        backend="vps",
+        vps=SimpleNamespace(host="vps.example.test", workspace_dir="/workspace"),
+    )
+    monkeypatch.setattr(NovitaSandboxTool, "_execution_config", staticmethod(lambda: execution))
+    fetched: list[tuple[str, str]] = []
+    upload = AsyncMock()
+
+    async def fake_fetch_telegram_url(self, url: str, remote_path: str) -> str:
+        del self
+        fetched.append((url, remote_path))
+        return remote_path
+
+    monkeypatch.setattr(
+        vps_backend_mod.VPSExecutionBackend,
+        "fetch_telegram_url",
+        fake_fetch_telegram_url,
+    )
+    monkeypatch.setattr(
+        vps_backend_mod.VPSExecutionBackend, "upload", upload
+    )
+
+    url = "https://api.telegram.org/file/bot123/documents/report.pdf"
+    token = _encode_telegram_url_token(url, "report.pdf")
+    staged = await NovitaSandboxTool().stage_telegram_attachments(
+        [token],
+        session_key="telegram:direct-stage",
+    )
+
+    assert len(staged) == 1
+    assert staged[0][0] == url
+    assert staged[0][1].startswith("/workspace/telegram-attachments/")
+    assert len(fetched) == 1 and fetched[0][0] == url
+    upload.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_analyze_telegram_images_vps_from_urls_fetches_directly(monkeypatch) -> None:
+    import nanobot.agent.tools.vps_backend as vps_backend_mod
+
+    from nanobot.agent.tools.novita_sandbox import (
+        _encode_telegram_url_token,
+        NovitaSandboxTool,
+    )
+
+    execution = SimpleNamespace(
+        backend="vps",
+        vps=SimpleNamespace(host="vps.example.test", workspace_dir="/workspace"),
+    )
+    monkeypatch.setattr(NovitaSandboxTool, "_execution_config", staticmethod(lambda: execution))
+    fetched: list[str] = []
+
+    async def fake_run(self, command: str, *, timeout: int = 120, cwd: str | None = None) -> str:
+        del self, timeout, cwd
+        if "command -v tesseract" in command:
+            return "READY"
+        if command.startswith("env "):
+            return '{"content":"File: photo.jpg\\nRecognized text:\\nDIRECT VPS OCR OK"}'
+        return ""
+
+    async def fake_write(self, path: str, content: str) -> None:
+        del path, content
+
+    async def fake_fetch_telegram_url(self, url: str, remote_path: str) -> str:
+        del self
+        fetched.append(remote_path)
+        return remote_path
+
+    monkeypatch.setattr(vps_backend_mod.VPSExecutionBackend, "run", fake_run)
+    monkeypatch.setattr(vps_backend_mod.VPSExecutionBackend, "write", fake_write)
+    monkeypatch.setattr(
+        vps_backend_mod.VPSExecutionBackend, "fetch_telegram_url", fake_fetch_telegram_url
+    )
+
+    url = "https://api.telegram.org/file/bot123/photos/photo_1.jpg"
+    token = _encode_telegram_url_token(url, "photo_1.jpg")
+    result = await NovitaSandboxTool().analyze_telegram_images(
+        [token],
+        "Read this",
+        session_key="telegram:direct-vps-ocr",
+    )
+
+    assert "DIRECT VPS OCR OK" in result
+    assert len(fetched) == 1
+    assert fetched[0].startswith("/workspace/telegram-images/")
+
+
+@pytest.mark.asyncio
+async def test_stage_telegram_attachments_local_path_skips_relay(monkeypatch, tmp_path) -> None:
+    import nanobot.agent.tools.vps_backend as vps_backend_mod
+
+    from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool
+
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.7")
+    monkeypatch.setenv("NANOBOT_DATA_DIR", str(tmp_path))
+    execution = SimpleNamespace(
+        backend="vps",
+        vps=SimpleNamespace(host="vps.example.test", workspace_dir="/workspace"),
+    )
+    monkeypatch.setattr(NovitaSandboxTool, "_execution_config", staticmethod(lambda: execution))
+    tmpfile_upload = AsyncMock()
+    upload = AsyncMock()
+    monkeypatch.setattr("nanobot.agent.tools.novita_sandbox.upload_tmpfile_path", tmpfile_upload)
+    monkeypatch.setattr(vps_backend_mod.VPSExecutionBackend, "upload", upload)
+
+    staged = await NovitaSandboxTool().stage_telegram_attachments(
+        [str(document.resolve())],
+        session_key="telegram:local-stage",
+    )
+
+    assert len(staged) == 1
+    assert staged[0][1].startswith("/workspace/telegram-attachments/")
+    tmpfile_upload.assert_not_awaited()
+    upload.assert_awaited_once()
