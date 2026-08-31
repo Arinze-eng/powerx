@@ -108,18 +108,40 @@ def fail(message):
 def prepare_image(path, output_path):
     if Image is None:
         return False
-    with Image.open(path) as image:
-        image.verify()
-    with Image.open(path) as image:
-        image = ImageOps.exif_transpose(image).convert("RGB")
-        # Upscaling and contrast normalization improve OCR for Telegram previews
-        # without changing the original uploaded file.
-        scale = max(1, min(4, 1800 // max(image.width, image.height)))
-        if scale > 1:
-            image = image.resize((image.width * scale, image.height * scale), Image.Resampling.LANCZOS)
-        image = ImageEnhance.Contrast(image).enhance(1.35)
-        image = image.filter(ImageFilter.SHARPEN)
-        image.save(output_path, format="PNG", optimize=True)
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image).convert("L")  # grayscale helps Tesseract a lot
+            # Upscaling small previews improves OCR without touching the original.
+            scale = max(1, min(4, 1800 // max(image.width, image.height)))
+            if scale > 1:
+                image = image.resize((image.width * scale, image.height * scale), Image.Resampling.LANCZOS)
+            # Normalize contrast; autocontrast recovers faint or washed-out text.
+            image = ImageOps.autocontrast(image)
+            image = ImageEnhance.Contrast(image).enhance(1.6)
+            image = image.filter(ImageFilter.SHARPEN)
+            image.save(output_path, format="PNG", optimize=True)
+    except Exception:
+        return False
+    return True
+
+
+def prepare_binary(path, output_path):
+    """Produce a high-contrast binary (black/white) variant for stubborn images."""
+    if Image is None:
+        return False
+    try:
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image).convert("L")
+            image = ImageOps.autocontrast(image)
+            # Simple Otsu-style threshold binarization; robust across Pillow
+            # versions (avoid the version-dependent ImageFilter.MEDIANFILTER
+            # constant partly because some images are better left sharp).
+            image = image.point(lambda pixel: 255 if pixel > 128 else 0)
+            image.save(output_path, format="PNG", optimize=True)
+    except Exception:
+        return False
     return True
 
 
@@ -172,7 +194,7 @@ def _tesseract_environment():
 def run_tesseract(image_path, psm):
     if not TESSERACT_BINARY:
         return "", []
-    command = [TESSERACT_BINARY, str(image_path), "stdout", "--oem", "3", "--psm", str(psm), "tsv"]
+    command = [TESSERACT_BINARY, str(image_path), "stdout", "-l", "eng", "--oem", "3", "--psm", str(psm), "tsv"]
     try:
         timeout = max(5, min(int(os.getenv("NANOBOT_OCR_TIMEOUT_SECONDS", "90")), 90))
     except ValueError:
@@ -209,14 +231,35 @@ def run_tesseract(image_path, psm):
 
 def read_image(path, temp_dir):
     try:
-        prepared = Path(temp_dir) / (Path(path).stem + "_prepared.png")
-        prepared_path = prepared if prepare_image(path, prepared) else Path(path)
+        # A corrupt / non-image payload is reported as unreadable rather than
+        # being fed to Tesseract (which would otherwise just see noise bytes).
+        if Image is not None:
+            try:
+                with Image.open(path) as image:
+                    image.verify()
+            except Exception:
+                return f"File: {Path(path).name}\nTesseract could not read this image: IncompleteImage."
+        stem = Path(path).stem
+        variants = [str(path)]  # Always try the original image too.
+        prepared = Path(temp_dir) / f"{stem}_prepared.png"
+        if prepare_image(path, prepared):
+            variants.append(str(prepared))
+        binary = Path(temp_dir) / f"{stem}_binary.png"
+        if prepare_binary(path, binary):
+            variants.append(str(binary))
         candidates = []
-        for psm in (6, 11, 3):
-            text, scores = run_tesseract(prepared_path, psm)
-            if text:
-                confidence, word_count = scores[0]
-                candidates.append((confidence, word_count, text, psm))
+        for variant in variants:
+            # Sparse, auto, and single-line modes cover most layouts; try a wide
+            # net so a failing page mode never blocks text that another mode reads.
+            for psm in (6, 11, 3, 7, 12):
+                text, scores = run_tesseract(variant, psm)
+                if text:
+                    confidence, word_count = scores[0]
+                    # Reject tesseract "ghost" text on blank noisy regions (a
+                    # lone 0% word). Real OCR carries a few words or decent
+                    # confidence; noise does not.
+                    if word_count >= 3 or confidence >= 30.0:
+                        candidates.append((confidence, word_count, text, psm))
         if not candidates:
             if not TESSERACT_BINARY:
                 return (

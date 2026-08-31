@@ -339,6 +339,37 @@ def test_tesseract_reader_reports_no_text_for_blank_image(tmp_path) -> None:
     assert "Tesseract detected no readable text." in content
 
 
+def test_tesseract_reader_recognizes_faint_low_contrast_text(tmp_path) -> None:
+    """Improved preprocessing must rescue faint/low-contrast text from 'no text'."""
+    import json
+    import subprocess
+    import sys
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    image = Image.new("RGB", (1200, 400), "#f5f5f5")
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 54)
+    ImageDraw.Draw(image).text((50, 160), "RETURNABLE ITEM", fill="#777777", font=font)
+    image_path = tmp_path / "faint.png"
+    image.save(image_path)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([str(image_path)]))
+    script = tmp_path / "reader.py"
+    script.write_text(_TELEGRAM_IMAGE_SCRIPT)
+
+    result = subprocess.run(
+        [sys.executable, str(script), str(manifest)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    content = json.loads(result.stdout)["content"]
+    assert "Recognized text:" in content
+    assert "RETURNABLE ITEM" in content
+
+
 def test_tesseract_reader_recognizes_text_image_without_installing_dependencies(tmp_path) -> None:
     import json
     import os
