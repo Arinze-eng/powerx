@@ -49,7 +49,7 @@ from nanobot.runtime_context import (
 )
 from nanobot.security.network import validate_url_target
 from nanobot.supabase_auth import SupabaseAuth, SupabaseAuthError
-from nanobot.utils.gofile import upload_gofile
+from nanobot.utils.gofile import upload_gofile_stream
 from nanobot.utils.helpers import detect_image_mime, split_message
 from nanobot.utils.logging_bridge import redirect_lib_logging
 
@@ -60,6 +60,27 @@ TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
 # boundary so the final rendered message never overflows.
 TELEGRAM_HTML_MAX_LEN = 4096
 TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
+# Hard Telegram Bot API cap: get_file() cannot download files >= 20 MiB. When a
+# user forwards/sends a larger file, Telegram clips the reported file_size to
+# exactly this ceiling, so size >= this value reliably means "too big to fetch".
+TELEGRAM_BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+
+
+def _is_telegram_too_big_error(exc: BaseException) -> bool:
+    """Return True when a Telegram error means the file exceeds the 20 MiB cap.
+
+    ``get_file()`` / ``download_to_drive()`` raise a BadRequest whose message
+    contains "File is too big" for files the Bot API cannot download. Matching
+    on both the message text and the ``file_is_too_big`` attribute (where PTB
+    exposes it) keeps this robust across SDK versions.
+    """
+    text = str(getattr(exc, "message", None) or "") + " " + str(exc)
+    if "File is too big" in text.lower() or "file is too big" in text.lower():
+        return True
+    try:
+        return bool(getattr(exc, "file_is_too_big", False))
+    except Exception:  # noqa: BLE001 - attribute probe should never raise
+        return False
 
 # python-telegram-bot exposes a six-parameter Application generic. Nanobot
 # doesn't customize its context/data/job-queue types, so keep that SDK boundary
@@ -454,6 +475,11 @@ class TelegramConfig(Base):
     # Public HTTPS URL of the large-file upload Mini App opened by /upload.
     # When empty, it is derived from webhook_url (same origin, /upload path).
     miniapp_url: str = ""
+    # Stage forwarded/normal Telegram file uploads to gofile.io and surface the
+    # public link in the confirmation prompt. When False, the file is kept only
+    # on the local host (the agent still receives it), saving Render's outbound
+    # upload bandwidth — large files never re-cross the host to gofile.io.
+    gofile_staging: bool = True
 
     @field_validator("webhook_path")
     @classmethod
@@ -524,6 +550,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("image_edit", "Edit an image with Puter"),
         BotCommand("video", "Generate a video with Puter"),
         BotCommand("upload", "Upload a large file for analysis"),
+        BotCommand("chat", "Open the full AI chat app (tasks + file upload)"),
         BotCommand("cancel", "Cancel auth or pending work"),
         BotCommand("discard", "Discard pending attachments"),
     ]
@@ -702,6 +729,7 @@ class TelegramChannel(BaseChannel):
         )
         self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
         self._app.add_handler(MessageHandler(filters.Regex(r"^/upload(?:@\w+)?$"), self._on_upload))
+        self._app.add_handler(MessageHandler(filters.Regex(r"^/chat(?:@\w+)?$"), self._on_chat))
 
         # Add message handler for text, photos, video, voice, documents, and locations
         self._app.add_handler(
@@ -1415,6 +1443,44 @@ class TelegramChannel(BaseChannel):
             return env_url
         return "https://minis-yzdb.onrender.com/upload"
 
+    def _chatapp_url(self) -> str:
+        """Public URL for the chat Mini App (/chat command).
+
+        Same origin as the upload app but on the /app path; overridable via
+        NANOBOT_CHATAPP_URL or by pointing miniapp_url at an explicit URL.
+        """
+        explicit = os.getenv("NANOBOT_CHATAPP_URL", "").strip()
+        if explicit:
+            return explicit
+        webhook = self.config.webhook_url.strip()
+        if webhook:
+            parsed = urlparse(webhook)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}/app"
+        return "https://minis-yzdb.onrender.com/app"
+
+    async def _on_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /chat command — open the full AI-agent chat Mini App."""
+        if not update.message or not update.effective_user:
+            return
+        user = update.effective_user
+        sender_id = self._sender_id(user)
+        if not self.is_allowed(sender_id):
+            await self._send_pairing_code_if_private(sender_id, update.message, user)
+            return
+
+        url = self._chatapp_url()
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🤖 Open Chat", web_app=WebAppInfo(url=url))]
+        ])
+        await update.message.reply_text(
+            "Chat with me in the full app — send messages, run real tasks "
+            "(files get analyzed on the sandbox), and attach files of any size.\n\n"
+            "Large files upload straight to gofile.io from your phone, so nothing "
+            "heavy crosses the server.",
+            reply_markup=keyboard,
+        )
+
     async def _on_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /upload command — open the large-file upload Mini App."""
         if not update.message or not update.effective_user:
@@ -1787,9 +1853,67 @@ class TelegramChannel(BaseChannel):
             return [path_str], [f"[{media_type}: {path_str}]"]
         except Exception as e:
             self.logger.warning("Failed to download message media: {}", e)
-            if add_failure_content:
-                return [], [f"[{media_type}: download failed]"]
-            return [], []
+            if not add_failure_content:
+                return [], []
+            # Telegram refuses get_file() for >= 20 MiB. Surface a clear, actionable
+            # note so the user opens the large-file upload Mini App instead of
+            # staring at a generic "download failed".
+            if isinstance(e, Exception) and _is_telegram_too_big_error(e):
+                return [], ["[file: too large for Telegram's 20 MB bot download limit — use /upload]"]
+            return [], [f"[{media_type}: download failed]"]
+
+    @staticmethod
+    def _media_file_too_big(msg: Message) -> bool:
+        """Return True when the message carries a file too large for get_file.
+
+        Telegram clips ``file_size`` to the 20 MiB bot-download ceiling for any
+        file >= that size, so ``file_size >= TELEGRAM_BOT_DOWNLOAD_LIMIT`` means
+        the file cannot be fetched server-side and the user should use the
+        large-file upload Mini App instead.
+        """
+        media_file = None
+        if getattr(msg, "photo", None):
+            media_file = msg.photo[-1]
+        elif getattr(msg, "voice", None):
+            media_file = msg.voice
+        elif getattr(msg, "audio", None):
+            media_file = msg.audio
+        elif getattr(msg, "document", None):
+            media_file = msg.document
+        elif getattr(msg, "video", None):
+            media_file = msg.video
+        elif getattr(msg, "video_note", None):
+            media_file = msg.video_note
+        elif getattr(msg, "animation", None):
+            media_file = msg.animation
+        if media_file is None:
+            return False
+        try:
+            size = int(getattr(media_file, "file_size") or 0)
+        except (TypeError, ValueError):
+            return False
+        return size >= TELEGRAM_BOT_DOWNLOAD_LIMIT
+
+    async def _offer_upload_app(self, message: Message) -> None:
+        """Reply with the large-file Upload App button when a file is too big.
+
+        Downloads >= 20 MiB are impossible through the Bot API (Telegram's hard
+        cap). Route the user to the existing Mini App, which streams the file
+        straight from their browser to gofile.io, bypassing both the 20 MiB
+        limit and the Render-hosted bot entirely.
+        """
+        url = self._miniapp_url()
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Open Upload App", web_app=WebAppInfo(url=url))]
+        ])
+        await message.reply_text(
+            "That file is too large to fetch through Telegram's bot download "
+            "limit (20 MB).\n\n"
+            "Tap the button below to open the upload app and send the file "
+            "straight to gofile.io. When it finishes, just say: "
+            "*analyze the file I just uploaded*.",
+            reply_markup=keyboard,
+        )
 
     async def _ensure_bot_identity(self) -> tuple[int | None, str | None]:
         """Load bot identity once and reuse it for mention/reply checks."""
@@ -2068,6 +2192,13 @@ class TelegramChannel(BaseChannel):
             lon = message.location.longitude
             content_parts.append(f"[location: {lat}, {lon}]")
 
+        # Files >= 20 MiB cannot be downloaded via the Bot API (Telegram's hard
+        # cap). Route the user straight to the large-file upload Mini App instead
+        # of attempting a doomed get_file() that would just fail and waste a hop.
+        if self._media_file_too_big(message):
+            await self._offer_upload_app(message)
+            return
+
         # Download current message media
         current_media_paths, current_media_parts = await self._download_message_media(
             message, add_failure_content=True
@@ -2299,21 +2430,26 @@ class TelegramChannel(BaseChannel):
 
         Forwarded files are staged to gofile.io and their public link is shown
         in the prompt so the user sees a ready-to-use link before typing their
-        instruction. Staging is best-effort and never blocks the prompt.
+        instruction. Staging is best-effort and never blocks the prompt. When
+        ``gofile_staging`` is disabled the file stays local-only so Render's
+        outbound upload bandwidth is not spent re-crossing it to gofile.io.
         """
         gofile_links: list[str] = []
-        try:
-            for media_path in list(media_paths)[:3]:
-                path = Path(media_path)
-                if not path.is_file():
-                    continue
-                raw = await asyncio.to_thread(path.read_bytes)
-                result = await upload_gofile(
-                    raw, filename=path.name, timeout_seconds=120
-                )
-                gofile_links.append(str(result["url"]))
-        except Exception as exc:  # noqa: BLE001 - staging is best-effort
-            self.logger.warning("gofile staging failed: {}", exc)
+        if self.config.gofile_staging:
+            try:
+                for media_path in list(media_paths)[:3]:
+                    path = Path(media_path)
+                    if not path.is_file():
+                        continue
+                    # Stream the file into the multipart body instead of loading
+                    # the whole blob into RAM (large files OOM low-memory hosts).
+                    with path.open("rb") as fp:
+                        result = await upload_gofile_stream(
+                            fp, filename=path.name, timeout_seconds=120
+                        )
+                    gofile_links.append(str(result["url"]))
+            except Exception as exc:  # noqa: BLE001 - staging is best-effort
+                self.logger.warning("gofile staging failed: {}", exc)
 
         names = ", ".join(Path(path).name for path in media_paths)
         count = len(media_paths)

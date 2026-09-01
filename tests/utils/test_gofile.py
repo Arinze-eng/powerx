@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+
 import pytest
 
 from nanobot.utils import gofile
@@ -226,6 +228,62 @@ async def test_upload_gofile_returns_share_url(monkeypatch):
     assert result["url"] == "https://gofile.io/d/abc123"
     assert result["file_id"] == "abc123"
     assert result["filename"] == "notes.txt"
+
+
+@pytest.mark.asyncio
+async def test_upload_gofile_stream_passes_file_object(monkeypatch):
+    """upload_gofile_stream streams the file object instead of buffering bytes."""
+
+    uploaded_handle = {}
+
+    class UploadSession:
+        timeout = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def get(self, url, headers=None, **kwargs):
+            assert url == f"{gofile.GOFILE_API}/servers"
+            return _FakeResponse(
+                {"status": "ok", "data": {"servers": [{"name": "store1"}]}}
+            )
+
+        def post(self, url, headers=None, data=None, **kwargs):
+            assert url == "https://store1.gofile.io/contents/uploadfile"
+            form = kwargs.get("data") or data
+            fields = getattr(form, "_fields", []) or []
+            # The open file handle (fields[0][2]) — not raw bytes — is handed to
+            # multipart, so aiohttp streams it to GoFile without buffering it all
+            # in RAM on the staging host.
+            value = fields[0][2] if fields else None
+            uploaded_handle["value"] = value
+            return _FakeResponse(
+                {
+                    "status": "ok",
+                    "data": {
+                        "fileId": "abc123",
+                        "downloadPage": "https://gofile.io/d/abc123",
+                    },
+                }
+            )
+
+    session = UploadSession()
+
+    def fake_session(*, timeout):
+        session.timeout = timeout
+        return session
+
+    monkeypatch.setattr(gofile.aiohttp, "ClientSession", fake_session)
+    # Use an in-memory file-like object (aiohttp streams any readable handle).
+    fp = io.BytesIO(b"streamed-file-bytes")
+    result = await gofile.upload_gofile_stream(fp, filename="notes2.txt")
+    assert uploaded_handle["value"] is fp
+    assert result["url"] == "https://gofile.io/d/abc123"
+    assert result["file_id"] == "abc123"
+    assert result["filename"] == "notes2.txt"
 
 
 def test_format_upload_link_message_includes_url():

@@ -18,6 +18,7 @@ from aiohttp import web
 from loguru import logger
 
 from nanobot.api.miniapp import register_miniapp_routes
+from nanobot.api.telegram_auth import miniapp_tokens
 from nanobot.config.paths import get_media_dir
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.media_decode import (
@@ -490,16 +491,23 @@ def create_app(
         # endpoints. Telegram Web Apps open /upload inside the client without
         # carrying the API Bearer token, and /upload/complete receives the
         # browser's gofile.io result. Both only hand off an in-memory record.
-        if request.path in ("/health", "/upload", "/upload/complete"):
+        # /app serves the chat page; /app/token mints a short-lived bearer from
+        # validated initData — neither carries the api_key itself.
+        if request.path in ("/health", "/upload", "/upload/complete", "/app", "/app/token"):
             return await handler(request)
         if not api_key:
             return await handler(request)
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return _error_json(401, "Missing Authorization header. Use: Bearer <api_key>")
-        if not hmac.compare_digest(auth[len("Bearer "):], api_key):
-            return _error_json(401, "Invalid API key")
-        return await handler(request)
+        supplied = auth[len("Bearer "):]
+        # Accept either the long-lived api_key or a Mini App token minted from
+        # validated Telegram initData (short-lived, bound to one user session).
+        if hmac.compare_digest(supplied, api_key):
+            return await handler(request)
+        if miniapp_tokens.verify(supplied) is not None:
+            return await handler(request)
+        return _error_json(401, "Invalid API key")
 
     app.middlewares.append(auth_middleware)
 

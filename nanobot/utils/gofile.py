@@ -270,26 +270,18 @@ async def _pick_upload_server(session: aiohttp.ClientSession) -> str:
     return name
 
 
-async def upload_gofile(
-    data: bytes,
-    *,
-    filename: str = "upload.bin",
-    timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
-) -> dict[str, str]:
-    """Upload raw *data* to gofile.io and return ``{url, file_id, filename}``.
+async def _upload_to_gofile(form: aiohttp.FormData, *, timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS) -> dict[str, str]:
+    """POST *form* to a freshly selected GoFile upload server.
 
-    The returned ``url`` is the public ``https://gofile.io/d/<code>`` share
-    link that the agent can later fetch with :func:`resolve_gofile_download`.
-    Used to stage files (e.g. Telegram-forwarded files) into GoFile directly
-    from the server without routing the large file through a browser.
+    Shared upload core for :func:`upload_gofile` (bytes) and
+    :func:`upload_gofile_stream` (streamed). Returns ``{url, file_id, filename}``
+    where ``url`` is the public ``https://gofile.io/d/<code>`` share link.
     """
     timeout = aiohttp.ClientTimeout(total=max(60, min(int(timeout_seconds), 600)))
     async with aiohttp.ClientSession(timeout=timeout) as session:
         server = await _pick_upload_server(session)
         upload_url = f"https://{server}.gofile.io/contents/uploadfile"
         try:
-            form = aiohttp.FormData()
-            form.add_field("file", data, filename=filename, content_type="application/octet-stream")
             async with session.post(
                 upload_url,
                 data=form,
@@ -307,5 +299,53 @@ async def upload_gofile(
         raise GoFileError("GoFile upload returned no file id")
     if not page_url:
         page_url = f"https://gofile.io/d/{file_id}"
-    logger.debug("Uploaded {} bytes to gofile.io as {}", len(data), page_url)
-    return {"url": page_url, "file_id": file_id, "filename": filename}
+    logger.debug("Uploaded to gofile.io as {}", page_url)
+    return {"url": page_url, "file_id": file_id}
+
+
+async def upload_gofile(
+    data: bytes,
+    *,
+    filename: str = "upload.bin",
+    timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+) -> dict[str, str]:
+    """Upload raw *data* to gofile.io and return ``{url, file_id, filename}``.
+
+    The returned ``url`` is the public ``https://gofile.io/d/<code>`` share
+    link that the agent can later fetch with :func:`resolve_gofile_download`.
+    Used to stage files (e.g. Telegram-forwarded files) into GoFile directly
+    from the server without routing the large file through a browser.
+    """
+    form = aiohttp.FormData()
+    form.add_field("file", data, filename=filename, content_type="application/octet-stream")
+    result = await _upload_to_gofile(form, timeout_seconds=timeout_seconds)
+    logger.debug("Uploaded {} bytes to gofile.io", len(data))
+    result["filename"] = filename
+    return result
+
+
+async def upload_gofile_stream(
+    fileobj: Any,
+    *,
+    filename: str = "upload.bin",
+    timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+) -> dict[str, str]:
+    """Stream *fileobj* to gofile.io without buffering it fully in memory.
+
+    *fileobj* must be a readable binary file-like object (e.g. an open file or
+    ``io.BytesIO``). ``aiohttp`` streams the multipart body it is handed, so a
+    large forwarded file is never loaded wholesale into RAM on the staging
+    server (important on low-memory hosts such as Render's free tier).
+
+    Returns the same ``{url, file_id, filename}`` shape as :func:`upload_gofile`.
+    """
+    form = aiohttp.FormData()
+    form.add_field(
+        "file",
+        fileobj,
+        filename=filename,
+        content_type="application/octet-stream",
+    )
+    result = await _upload_to_gofile(form, timeout_seconds=timeout_seconds)
+    result["filename"] = filename
+    return result

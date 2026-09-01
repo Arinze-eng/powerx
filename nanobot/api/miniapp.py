@@ -27,6 +27,8 @@ import aiohttp
 from aiohttp import web
 from loguru import logger
 
+from nanobot.api.telegram_auth import miniapp_tokens, validate_init_data
+
 GOFILE_DOMAINS = {
     "gofile.io",
     "api.gofile.io",
@@ -488,6 +490,293 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
 
 
 # ---------------------------------------------------------------------------
+# Chat Mini App: full agent chat UI served at /app, backed by /v1/chat/completions
+# ---------------------------------------------------------------------------
+
+CHAT_MINIAPP_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>AI Assistant</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#f59e0b; --text:#e2e8f0; --muted:#94a3b8; --user:#2563eb; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; padding:0; background:var(--bg); color:var(--text); height:100%;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  #app { display:flex; flex-direction:column; height:100vh; max-width:720px; margin:0 auto; }
+  header { padding:12px 16px; border-bottom:1px solid #334155; display:flex; align-items:center; gap:10px; }
+  header h1 { font-size:16px; margin:0; }
+  header .dot { width:8px; height:8px; border-radius:50%; background:#22c55e; }
+  #log { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:12px; }
+  .msg { max-width:85%; padding:10px 14px; border-radius:14px; font-size:14px; line-height:1.5; white-space:pre-wrap; word-break:break-word; }
+  .msg.user { align-self:flex-end; background:var(--user); color:#fff; border-bottom-right-radius:4px; }
+  .msg.bot { align-self:flex-start; background:var(--card); border-bottom-left-radius:4px; }
+  .msg.err { background:#7f1d1d; color:#fecaca; }
+  .att { display:inline-flex; align-items:center; gap:6px; font-size:12px; opacity:.9; margin-top:4px; }
+  footer { border-top:1px solid #334155; padding:10px 12px; }
+  .row { display:flex; gap:8px; align-items:flex-end; }
+  textarea { flex:1; resize:none; max-height:120px; min-height:40px; border:1px solid #334155; background:#0b1220;
+    color:var(--text); border-radius:12px; padding:10px 12px; font-size:14px; font-family:inherit; }
+  button.icon { border:0; background:#334155; color:var(--text); width:40px; height:40px; border-radius:12px; cursor:pointer; font-size:18px; }
+  button.send { border:0; background:var(--accent); color:#0f172a; width:40px; height:40px; border-radius:12px; cursor:pointer; font-weight:700; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .hint { color:var(--muted); font-size:11px; margin:6px 2px 0; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header><span class="dot"></span><h1>🤖 AI Assistant</h1></div>
+  <div id="log"><div class="msg bot">Hi! Ask me anything, or tap 📎 to attach a file. Large files upload straight to gofile.io.</div></div>
+  <footer>
+    <div class="row">
+      <button class="icon" id="attach" title="Attach file">📎</button>
+      <textarea id="input" placeholder="Message…" rows="1"></textarea>
+      <button class="send" id="send" title="Send">➤</button>
+    </div>
+    <input type="file" id="file" style="display:none" />
+    <div class="hint" id="hint">Connecting…</div>
+  </footer>
+</div>
+
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+(function () {
+  'use strict';
+  var app = window.Telegram && window.Telegram.WebApp;
+  if (app) { try { app.ready(); app.expand(); } catch (e) {} }
+
+  var log = document.getElementById('log');
+  var input = document.getElementById('input');
+  var sendBtn = document.getElementById('send');
+  var attachBtn = document.getElementById('attach');
+  var fileInput = document.getElementById('file');
+  var hint = document.getElementById('hint');
+
+  var token = null;          // short-lived bearer minted from initData
+  var sessionKey = 'unknown';
+  var busy = false;
+  var pendingFile = null;    // {name,url,size} once uploaded via gofile for big files
+
+  function el(cls, text) {
+    var d = document.createElement('div');
+    d.className = 'msg ' + cls;
+    if (text != null) d.textContent = text;
+    return d;
+  }
+  function scroll() { log.scrollTop = log.scrollHeight; }
+
+  async function mintToken() {
+    var initData = (app && app.initData) ? app.initData : '';
+    try {
+      var r = await fetch('/app/token', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ initData: initData })
+      });
+      var j = await r.json();
+      if (!r.ok || !j.token) throw new Error((j.error && j.error.message) || 'auth failed');
+      token = j.token; sessionKey = j.session_key || 'unknown';
+      hint.textContent = 'Connected · session ' + sessionKey;
+    } catch (e) {
+      hint.textContent = 'Not connected: ' + e.message;
+    }
+  }
+
+  function fmtSize(n){ if(!n)return '?'; if(n>=1073741824)return (n/1073741824).toFixed(2)+' GB'; if(n>=1048576)return (n/1048576).toFixed(1)+' MB'; return Math.round(n/1024)+' KB'; }
+
+  // Upload a File object directly to gofile.io from the browser (no Render bytes).
+  function uploadToGofile(file) {
+    return fetch('https://api.gofile.io/servers').then(function(r){return r.json();}).then(function(res){
+      var server = (res && res.data && res.data.servers && res.data.servers[0]) ? res.data.servers[0].name : null;
+      if (!server) throw new Error('No gofile server available');
+      return new Promise(function(resolve, reject){
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', 'https://' + server + '.gofile.io/contents/uploadfile', true);
+        xhr.onload = function(){ resolve(xhr); };
+        xhr.onerror = function(){ reject(new Error('Upload request failed')); };
+        var form = new FormData(); form.append('file', file);
+        xhr.send(form);
+      });
+    }).then(function(xhr){
+      var res = JSON.parse(xhr.responseText || '{}');
+      if (xhr.status < 200 || xhr.status >= 300 || !res || res.status !== 'ok') throw new Error('Upload failed');
+      var data = res.data || {};
+      var pageUrl = data.downloadPage || ('https://gofile.io/d/' + data.fileId);
+      fetch('/upload/complete?url=' + encodeURIComponent(pageUrl) + '&file_id=' + encodeURIComponent(data.fileId||'') +
+            '&filename=' + encodeURIComponent(file.name) + '&size=' + encodeURIComponent(String(file.size||0)) +
+            '&session_key=' + encodeURIComponent(sessionKey), {method:'GET', mode:'no-cors'}).catch(function(){});
+      return { name: file.name, url: pageUrl, size: file.size };
+    });
+  }
+
+  attachBtn.addEventListener('click', function(){ fileInput.click(); });
+  fileInput.addEventListener('change', async function(){
+    var f = fileInput.files && fileInput.files[0];
+    if (!f) return;
+    if (f.size <= 5 * 1024 * 1024) {
+      // Small enough: keep as an inline attachment sent with the next message.
+      pendingFile = { inline: true, file: f };
+      hint.textContent = 'Attached ' + f.name + ' (' + fmtSize(f.size) + ')';
+    } else {
+      hint.textContent = 'Uploading ' + f.name + ' to gofile.io…';
+      try {
+        var res = await uploadToGofile(f);
+        pendingFile = { link: res.url, name: res.name };
+        hint.textContent = 'Uploaded ' + res.name + ' (' + fmtSize(res.size) + ') — ready';
+      } catch (e) {
+        hint.textContent = 'Upload failed: ' + e.message;
+      }
+    }
+    fileInput.value = '';
+  });
+
+  async function streamChat(text) {
+    var messages = [{ role: 'user', content: text }];
+    var resp = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify({ model: 'nanobot', stream: true, session_id: sessionKey, messages: messages })
+    });
+    if (!resp.ok) {
+      var t = await resp.text();
+      throw new Error('HTTP ' + resp.status + ' ' + t.slice(0, 120));
+    }
+    var reader = resp.body.getReader();
+    var decoder = new TextDecoder();
+    var botMsg = el('bot', '');
+    log.appendChild(botMsg);
+    var buf = '';
+    while (true) {
+      var chunk = await reader.read();
+      if (chunk.done) break;
+      buf += decoder.decode(chunk.value, { stream: true });
+      var lines = buf.split('\n');
+      buf = lines.pop();
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim();
+        if (!line.startsWith('data:')) continue;
+        var payload = line.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        try {
+          var obj = JSON.parse(payload);
+          var delta = obj.choices && obj.choices[0] && obj.choices[0].delta && obj.choices[0].delta.content;
+          if (delta) { botMsg.textContent += delta; scroll(); }
+        } catch (e) {}
+      }
+    }
+    if (!botMsg.textContent.trim()) botMsg.remove();
+  }
+
+  async function doSend() {
+    if (busy) return;
+    var text = input.value.trim();
+    if (!text && !pendingFile) return;
+    if (!token) { await mintToken(); if (!token) { log.appendChild(el('err','Still connecting… try again.')); return; } }
+    var outgoing = text;
+    var userBubble = el('user', text || '(file)');
+    if (pendingFile) {
+      var a = document.createElement('div'); a.className = 'att';
+      a.textContent = '📎 ' + (pendingFile.link ? pendingFile.name + ' → ' + pendingFile.link : pendingFile.file.name);
+      userBubble.appendChild(a);
+    }
+    log.appendChild(userBubble);
+    input.value = ''; autoGrow();
+    busy = true; sendBtn.disabled = true; attachBtn.disabled = true;
+    try {
+      if (pendingFile && pendingFile.link) {
+        outgoing = (text ? text + '\n\n' : '') + 'Here is my uploaded file: ' + pendingFile.link;
+        await streamChat(outgoing);
+      } else if (pendingFile && pendingFile.inline) {
+        await sendInline(pendingFile.file, text);
+      } else {
+        await streamChat(outgoing);
+      }
+    } catch (e) {
+      log.appendChild(el('err', 'Error: ' + e.message));
+    } finally {
+      pendingFile = null; busy = false; sendBtn.disabled = false; attachBtn.disabled = false;
+      hint.textContent = 'Connected · session ' + sessionKey;
+      scroll();
+    }
+  }
+
+  // Small-file path: multipart POST straight to the API (bytes cross Render, but only tiny ones).
+  async function sendInline(file, text) {
+    var fd = new FormData();
+    fd.append('model', 'nanobot');
+    fd.append('session_id', sessionKey);
+    fd.append('message', text || 'Please analyze this file.');
+    fd.append('files', file);
+    var resp = await fetch('/v1/chat/completions', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + token }, body: fd
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    var obj = await resp.json();
+    var out = (obj.choices && obj.choices[0] && obj.choices[0].message && obj.choices[0].message.content) || '(no reply)';
+    log.appendChild(el('bot', out));
+  }
+
+  function autoGrow(){ input.style.height='auto'; input.style.height=Math.min(input.scrollHeight,120)+'px'; }
+  input.addEventListener('input', autoGrow);
+  input.addEventListener('keydown', function(e){ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); doSend(); } });
+  sendBtn.addEventListener('click', doSend);
+
+  mintToken();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+async def handle_chat_page(request: web.Request) -> web.Response:
+    """GET /app — serve the chat Mini App (agent conversation + file attach)."""
+    return web.Response(
+        text=CHAT_MINIAPP_HTML,
+        content_type="text/html",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
+
+
+async def handle_mint_token(request: web.Request) -> web.Response:
+    """POST /app/token — exchange validated Telegram initData for a short token.
+
+    Body: ``{"initData": "<raw telegram webapp initData>"}``. The initData is
+    verified against ``TELEGRAM_BOT_TOKEN``; on success we mint a bearer token
+    bound to the user's Telegram id and return it together with the session key
+    so the page can call ``/v1/chat/completions`` without ever seeing api_key.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_error(400, "Request body must be valid JSON")
+    if not isinstance(body, dict):
+        return _json_error(400, "Request body must be a JSON object")
+    init_data = str(body.get("initData") or "").strip()
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not bot_token:
+        # Without the bot token we cannot prove identity; refuse rather than
+        # hand out an unauthenticated token.
+        logger.warning("Mini App token mint requested but TELEGRAM_BOT_TOKEN is unset")
+        return _json_error(503, "Telegram authentication is not configured")
+    fields = validate_init_data(init_data, bot_token)
+    if not fields:
+        return _json_error(401, "Invalid Telegram initData")
+    user_id = ""
+    try:
+        import json as _json
+
+        user_blob = _json.loads(fields.get("user") or "{}")
+        user_id = str(user_blob.get("id") or "").strip()
+    except Exception:  # noqa: BLE001 - malformed user blob should not crash mint
+        user_id = ""
+    if not user_id:
+        return _json_error(401, "Authenticated initData missing user id")
+    token = miniapp_tokens.mint(user_id)
+    return web.json_response({"token": token, "session_key": user_id})
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -503,6 +792,10 @@ def register_miniapp_routes(app: web.Application) -> None:
     """Add the Mini App GET and completion routes to *app*."""
     app.router.add_get("/upload", handle_miniapp_page)
     app.router.add_route("*", "/upload/complete", handle_upload_complete)
+    # Chat Mini App (full agent conversation + file attach), backed by
+    # /v1/chat/completions via a short-lived initData-minted token.
+    app.router.add_get("/app", handle_chat_page)
+    app.router.add_post("/app/token", handle_mint_token)
 
 
 # Keep the uuid import used by callers that construct mini-app session id values.

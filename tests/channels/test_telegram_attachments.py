@@ -8,6 +8,8 @@ import pytest
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.telegram.runtime import (
     TelegramChannel,
+    TelegramConfig,
+    _is_telegram_too_big_error,
     _PendingTelegramAttachments,
 )
 
@@ -168,3 +170,93 @@ def test_expired_pending_attachment_is_pruned(channel, tmp_path) -> None:
 
     assert key not in channel._pending_attachments
     assert not document.exists()
+
+
+def test_is_telegram_too_big_error_matches_message_text() -> None:
+    error = RuntimeError("400 Bad Request: File is too big")
+    assert _is_telegram_too_big_error(error) is True
+
+
+def test_is_telegram_too_big_error_is_robust_to_case() -> None:
+    error = RuntimeError("bad message: FILE IS TOO BIG")
+    assert _is_telegram_too_big_error(error) is True
+
+
+def test_is_telegram_too_big_error_checks_attribute() -> None:
+    error = RuntimeError("generic failure")
+    error.file_is_too_big = True  # type: ignore[attr-defined]
+    assert _is_telegram_too_big_error(error) is True
+
+
+def test_is_telegram_too_big_error_rejects_other_errors() -> None:
+    assert _is_telegram_too_big_error(RuntimeError("timed out")) is False
+    assert _is_telegram_too_big_error(ValueError("file not found")) is False
+
+
+class _FakeMediaFile:
+    def __init__(self, size: int) -> None:
+        self.file_size = size
+        self.file_id = "fake-id"
+        self.file_unique_id = "fake-unique"
+
+
+class _FakeMessage:
+    def __init__(self, document=None) -> None:
+        self.document = document
+        self.photo = None
+        self.voice = None
+        self.audio = None
+        self.video = None
+        self.video_note = None
+        self.animation = None
+
+
+def test_media_file_too_big_flags_at_the_download_ceiling() -> None:
+    msg = _FakeMessage(document=_FakeMediaFile(20 * 1024 * 1024))
+    assert TelegramChannel._media_file_too_big(msg) is True
+
+
+def test_media_file_too_big_flags_files_above_the_ceiling() -> None:
+    msg = _FakeMessage(document=_FakeMediaFile(150 * 1024 * 1024))
+    assert TelegramChannel._media_file_too_big(msg) is True
+
+
+def test_media_file_too_big_allows_small_files() -> None:
+    msg = _FakeMessage(document=_FakeMediaFile(5 * 1024 * 1024))
+    assert TelegramChannel._media_file_too_big(msg) is False
+
+
+def test_media_file_too_big_ignores_messages_without_media() -> None:
+    assert TelegramChannel._media_file_too_big(_FakeMessage()) is False
+
+
+@pytest.mark.asyncio
+async def test_chat_command_opens_chat_mini_app(channel, monkeypatch) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    monkeypatch.setenv("NANOBOT_CHATAPP_URL", "https://example.onrender.com/app")
+    message = SimpleNamespace(
+        reply_text=_AsyncMock(),
+        chat=SimpleNamespace(type="private"),
+    )
+    update = SimpleNamespace(
+        message=message,
+        effective_user=SimpleNamespace(id=42, username="tester", first_name="T"),
+    )
+    await channel._on_chat(update, None)  # type: ignore[arg-type]
+
+    message.reply_text.assert_awaited_once()
+    kwargs = message.reply_text.await_args.kwargs
+    keyboard = kwargs["reply_markup"]
+    button = keyboard.inline_keyboard[0][0]
+    assert button.web_app.url == "https://example.onrender.com/app"
+
+
+def test_chatapp_url_derives_from_webhook_url() -> None:
+    instance = TelegramChannel.__new__(TelegramChannel)
+    instance.config = TelegramConfig(webhook_url="https://bot.example.com/telegram")
+    import os
+
+    os.environ.pop("NANOBOT_CHATAPP_URL", None)
+    assert instance._chatapp_url() == "https://bot.example.com/app"
