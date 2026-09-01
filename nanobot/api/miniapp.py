@@ -16,6 +16,8 @@ through the Render-hosted process.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import os
 import threading
 import time
@@ -569,10 +571,9 @@ CHAT_MINIAPP_HTML = r"""<!DOCTYPE html>
   async function mintToken() {
     var initData = (app && app.initData) ? app.initData : '';
     try {
-      var r = await fetch('/app/token', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ initData: initData })
-      });
+      // The gateway serves /app/token without reading request bodies, so the
+      // initData travels as a query parameter (works on both aiohttp and ws).
+      var r = await fetch('/app/token?initdata=' + encodeURIComponent(initData), { method: 'POST' });
       var j = await r.json();
       if (!r.ok || !j.token) throw new Error((j.error && j.error.message) || 'auth failed');
       token = j.token; sessionKey = j.session_key || 'unknown';
@@ -632,7 +633,10 @@ CHAT_MINIAPP_HTML = r"""<!DOCTYPE html>
 
   async function streamChat(text) {
     var messages = [{ role: 'user', content: text }];
-    var resp = await fetch('/v1/chat/completions', {
+    // The gateway HTTP layer cannot read request bodies, so the turn travels
+    // as a query parameter with the token; aiohttp accepts the same shape.
+    var params = new URLSearchParams({ q: text, token: token });
+    var resp = await fetch('/app/chat?' + params.toString(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
       body: JSON.stringify({ model: 'nanobot', stream: true, session_id: sessionKey, messages: messages })
@@ -700,14 +704,14 @@ CHAT_MINIAPP_HTML = r"""<!DOCTYPE html>
     }
   }
 
-  // Small-file path: multipart POST straight to the API (bytes cross Render, but only tiny ones).
+  // Small-file path: multipart POST to the chat endpoint (bytes cross Render, but only tiny ones).
   async function sendInline(file, text) {
     var fd = new FormData();
     fd.append('model', 'nanobot');
     fd.append('session_id', sessionKey);
     fd.append('message', text || 'Please analyze this file.');
     fd.append('files', file);
-    var resp = await fetch('/v1/chat/completions', {
+    var resp = await fetch('/app/chat?token=' + encodeURIComponent(token), {
       method: 'POST', headers: { 'Authorization': 'Bearer ' + token }, body: fd
     });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -741,18 +745,23 @@ async def handle_chat_page(request: web.Request) -> web.Response:
 async def handle_mint_token(request: web.Request) -> web.Response:
     """POST /app/token — exchange validated Telegram initData for a short token.
 
-    Body: ``{"initData": "<raw telegram webapp initData>"}``. The initData is
-    verified against ``TELEGRAM_BOT_TOKEN``; on success we mint a bearer token
-    bound to the user's Telegram id and return it together with the session key
-    so the page can call ``/v1/chat/completions`` without ever seeing api_key.
+    Accepts ``initData`` as a JSON body (aiohttp API server) or an
+    ``initdata`` query parameter (the WebUI gateway, whose HTTP layer never
+    reads request bodies). The initData is verified against
+    ``TELEGRAM_BOT_TOKEN``; on success we mint a bearer token bound to the
+    user's Telegram id and return it together with the session key so the page
+    can call the agent without ever seeing api_key.
     """
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error(400, "Request body must be valid JSON")
-    if not isinstance(body, dict):
-        return _json_error(400, "Request body must be a JSON object")
-    init_data = str(body.get("initData") or "").strip()
+    init_data = ""
+    if "application/json" in str(request.content_type or ""):
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                init_data = str(body.get("initData") or "").strip()
+        except Exception:  # noqa: BLE001 - fall back to query param below
+            init_data = ""
+    if not init_data:
+        init_data = str(request.query.get("initdata") or "").strip()
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not bot_token:
         # Without the bot token we cannot prove identity; refuse rather than
@@ -776,6 +785,94 @@ async def handle_mint_token(request: web.Request) -> web.Response:
     return web.json_response({"token": token, "session_key": user_id})
 
 
+async def handle_miniapp_chat(request: web.Request) -> web.StreamResponse:
+    """POST /app/chat — the Mini App's chat turn endpoint (aiohttp server).
+
+    The page streams through the bridge when the gateway agent is attached;
+    otherwise it falls back to the local ``/v1/chat/completions`` handler path
+    used by standalone API deployments.
+    """
+    auth = request.headers.get("Authorization", "")
+    supplied = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+    supplied = supplied or str(request.query.get("token") or "").strip()
+    if not supplied or miniapp_tokens.verify(supplied) is None:
+        return _json_error(401, "Valid mini-app token required")
+
+    content = ""
+    media_paths: list[str] = []
+    session_id = ""
+    content_type = str(request.content_type or "")
+    if content_type.startswith("multipart/"):
+        from nanobot.api.server import _parse_multipart
+
+        try:
+            text, media_paths, session_id, _model = await _parse_multipart(request)
+            content = text
+        except Exception as exc:  # noqa: BLE001 - surface parse failures plainly
+            return _json_error(400, f"Invalid multipart upload: {exc}")
+    elif "application/json" in content_type:
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_error(400, "Request body must be valid JSON")
+        if isinstance(body, dict):
+            session_id = str(body.get("session_id") or "").strip()
+            messages = body.get("messages") or []
+            if isinstance(messages, list) and messages:
+                last = messages[-1]
+                if isinstance(last, dict):
+                    content = str(last.get("content") or "")
+    # Gateway-style callers pass the turn text via ?q= (no readable body).
+    if not content:
+        content = str(request.query.get("q") or "").strip()
+
+    from nanobot.api.miniapp_bridge import miniapp_bridge
+
+    if miniapp_bridge.ready:
+        resp = web.StreamResponse()
+        resp.content_type = "text/event-stream"
+        resp.headers["Cache-Control"] = "no-cache"
+        await resp.prepare(request)
+        try:
+            async for chunk in miniapp_bridge.run_turn(
+                token=supplied, content=content, media_paths=media_paths
+            ):
+                await resp.write(chunk)
+        except Exception as exc:  # noqa: BLE001 - stream already open; report via SSE
+            with contextlib.suppress(Exception):
+                await resp.write(_sse_error(str(exc)))
+        finally:
+            with contextlib.suppress(Exception):
+                await resp.write_eof()
+        return resp
+
+    # Standalone API deployment: no gateway bus here, so run the agent loop
+    # directly like /v1/chat/completions does.
+    agent_loop = getattr(request.app, "agent_loop", None)
+    if agent_loop is None:
+        return _json_error(503, "agent unavailable")
+    session_key = f"api:{session_id}" if session_id else "api:default"
+    try:
+        response = await agent_loop.process_direct(
+            content=content,
+            media=media_paths or None,
+            session_key=session_key,
+            channel="api",
+            chat_id="default",
+        )
+        reply = str(response) if response is not None else ""
+    except Exception as exc:  # noqa: BLE001 - keep contract simple for the page
+        logger.warning("mini-app direct turn failed: {}", exc)
+        return _json_error(500, "agent turn failed")
+    return web.json_response({
+        "choices": [{"message": {"role": "assistant", "content": reply}}]
+    })
+
+
+def _sse_error(message: str) -> bytes:
+    return f"data: {json.dumps({'error': message[:200]})}\n\n".encode()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -796,6 +893,7 @@ def register_miniapp_routes(app: web.Application) -> None:
     # /v1/chat/completions via a short-lived initData-minted token.
     app.router.add_get("/app", handle_chat_page)
     app.router.add_post("/app/token", handle_mint_token)
+    app.router.add_post("/app/chat", handle_miniapp_chat)
 
 
 # Keep the uuid import used by callers that construct mini-app session id values.

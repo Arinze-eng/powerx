@@ -135,7 +135,7 @@ async def test_chat_page_served_without_auth() -> None:
         assert resp.status == 200
         text = await resp.text()
         assert "AI Assistant" in text
-        assert "/v1/chat/completions" in text
+        assert "/app/chat" in text
     finally:
         await client.close()
 

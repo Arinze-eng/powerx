@@ -1176,6 +1176,102 @@ class GatewayHTTPHandler:
         )
         return _http_json_response({"ok": True, "stored": True, "url": url, "filename": filename})
 
+    # -- Telegram Chat Mini App (/app) ---------------------------------------
+
+    def _handle_chat_app_page(self) -> Response:
+        """GET /app — serve the chat Mini App page."""
+        from nanobot.api.miniapp import CHAT_MINIAPP_HTML
+
+        return _http_response(
+            CHAT_MINIAPP_HTML.encode("utf-8"),
+            status=200,
+            content_type="text/html; charset=utf-8",
+            extra_headers=[("Cache-Control", "no-store, no-cache")],
+        )
+
+    def _handle_chat_app_token(self, request: WsRequest) -> Response:
+        """POST /app/token?initdata=… — mint a short-lived mini-app bearer token.
+
+        The websockets HTTP layer never exposes request bodies, so initData
+        arrives as a query parameter. Validation and minting reuse the shared
+        helpers so aiohttp and gateway deployments behave identically.
+        """
+        import os
+
+        from nanobot.api.telegram_auth import miniapp_tokens, validate_init_data
+
+        query = _parse_query(request.path)
+        init_data = (_query_first(query, "initdata") or "").strip()
+        bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        if not bot_token:
+            self._log.warning("mini-app token mint requested but TELEGRAM_BOT_TOKEN is unset")
+            return _http_error(503, "Telegram authentication is not configured")
+        fields = validate_init_data(init_data, bot_token)
+        if not fields:
+            return _http_error(401, "Invalid Telegram initData")
+        user_id = ""
+        try:
+            user_blob = json.loads(fields.get("user") or "{}")
+            user_id = str(user_blob.get("id") or "").strip()
+        except (ValueError, TypeError):
+            user_id = ""
+        if not user_id:
+            return _http_error(401, "Authenticated initData missing user id")
+        token = miniapp_tokens.mint(user_id)
+        return _http_json_response({"token": token, "session_key": user_id})
+
+    async def _handle_chat_app_turn(self, request: WsRequest) -> Response:
+        """POST /app/chat — one agent turn for the chat Mini App.
+
+        Auth is the minted bearer token (Authorization header or ?token=).
+        The turn text travels as ?q= because this HTTP layer has no bodies;
+        attachments are referenced by their gofile.io links inside the text.
+        """
+        from nanobot.api.miniapp_bridge import TURN_TIMEOUT_SECONDS, miniapp_bridge
+
+        auth = _case_insensitive_header(request.headers, "authorization") or ""
+        token_value = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+        query = _parse_query(request.path)
+        token_value = token_value or (_query_first(query, "token") or "").strip()
+        content = (_query_first(query, "q") or "").strip()
+
+        if not token_value:
+            return _http_error(401, "Valid mini-app token required")
+        from nanobot.api.telegram_auth import miniapp_tokens
+
+        if miniapp_tokens.verify(token_value) is None:
+            return _http_error(401, "Valid mini-app token required")
+        if not content:
+            return _http_error(400, "Nothing to send")
+        if not miniapp_bridge.ready:
+            return _http_error(503, "agent unavailable")
+
+        chunks: list[bytes] = []
+        try:
+            async def _pump() -> None:
+                async for chunk in miniapp_bridge.run_turn(
+                    token=token_value, content=content, media_paths=[]
+                ):
+                    chunks.append(chunk)
+
+            # asyncio.timeout is 3.11+; the repo requires 3.11 but stay safe.
+            if hasattr(asyncio, "timeout"):
+                async with asyncio.timeout(TURN_TIMEOUT_SECONDS + 30):
+                    await _pump()
+            else:  # pragma: no cover - legacy interpreters only
+                await asyncio.wait_for(_pump(), TURN_TIMEOUT_SECONDS + 30)
+        except (TimeoutError, asyncio.TimeoutError):
+            chunks.append(b'data: {"error": "turn timed out"}\n\n')
+        except Exception as exc:  # noqa: BLE001 - report through SSE contract
+            self._log.exception("mini-app gateway turn failed")
+            chunks.append(f"data: {{\"error\": {json.dumps(str(exc)[:200])}}}\n\n".encode())
+        return _http_response(
+            b"".join(chunks),
+            status=200,
+            content_type="text/event-stream; charset=utf-8",
+            extra_headers=[("Cache-Control", "no-cache")],
+        )
+
     # -- Misc routes --------------------------------------------------------
 
     async def _dispatch_misc_routes(
@@ -1185,6 +1281,12 @@ class GatewayHTTPHandler:
             return self._handle_miniapp_page()
         if got == "/upload/complete":
             return await self._handle_miniapp_complete(request)
+        if got == "/app":
+            return self._handle_chat_app_page()
+        if got == "/app/token":
+            return self._handle_chat_app_token(request)
+        if got == "/app/chat":
+            return await self._handle_chat_app_turn(request)
         if got == "/api/sessions":
             return await self._handle_sessions_list(request)
         if got == "/api/commands":

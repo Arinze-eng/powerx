@@ -70,6 +70,8 @@ from nanobot.webui.forking import handle_webui_fork_chat
 from nanobot.webui.gateway_services import GatewayServices
 from nanobot.webui.http_utils import (
     http_error as _http_error,
+)
+from nanobot.webui.http_utils import (
     is_trusted_proxy_authenticated_request as _is_trusted_proxy_authenticated_request,
 )
 from nanobot.webui.http_utils import (
@@ -743,6 +745,15 @@ class WebSocketChannel(BaseChannel):
 
         redirect_lib_logging("websockets", level="WARNING")
         ws_logger = websockets_server_logger()
+
+        # Attach the Telegram chat Mini App bridge so /app turns run through
+        # this channel's agent (bus) instead of a separate API process.
+        try:
+            from nanobot.api.miniapp_bridge import miniapp_bridge
+
+            miniapp_bridge.wire(self)
+        except Exception:  # noqa: BLE001 - bridge is optional, never blocks startup
+            self.logger.warning("mini-app bridge wiring failed", exc_info=True)
 
         self._running = True
         self._stop_event = asyncio.Event()
