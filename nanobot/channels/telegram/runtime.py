@@ -49,6 +49,7 @@ from nanobot.runtime_context import (
 )
 from nanobot.security.network import validate_url_target
 from nanobot.supabase_auth import SupabaseAuth, SupabaseAuthError
+from nanobot.utils.gofile import upload_gofile
 from nanobot.utils.helpers import detect_image_mime, split_message
 from nanobot.utils.logging_bridge import redirect_lib_logging
 
@@ -2294,12 +2295,35 @@ class TelegramChannel(BaseChannel):
     async def _send_attachment_prompt(
         self, *, chat_id: str, metadata: dict[str, Any], media_paths: list[str], context: str,
     ) -> None:
-        """Ask what the user wants before attachments enter the agent workflow."""
+        """Ask what the user wants before attachments enter the agent workflow.
+
+        Forwarded files are staged to gofile.io and their public link is shown
+        in the prompt so the user sees a ready-to-use link before typing their
+        instruction. Staging is best-effort and never blocks the prompt.
+        """
+        gofile_links: list[str] = []
+        try:
+            for media_path in list(media_paths)[:3]:
+                path = Path(media_path)
+                if not path.is_file():
+                    continue
+                raw = await asyncio.to_thread(path.read_bytes)
+                result = await upload_gofile(
+                    raw, filename=path.name, timeout_seconds=120
+                )
+                gofile_links.append(str(result["url"]))
+        except Exception as exc:  # noqa: BLE001 - staging is best-effort
+            self.logger.warning("gofile staging failed: {}", exc)
+
         names = ", ".join(Path(path).name for path in media_paths)
         count = len(media_paths)
         noun = "attachment" if count == 1 else "attachments"
-        prompt = (
-            f"I received {count} {noun}: {names}.\n\n"
+        prompt = f"I received {count} {noun}: {names}.\n\n"
+        if gofile_links:
+            prompt += "Ready link(s) you can also reuse:\n" + "\n".join(
+                f"{url}" for url in gofile_links
+            ) + "\n\n"
+        prompt += (
             "What would you like me to do with it? Reply with your instruction, "
             "for example: `analyze this`, `summarize it`, `edit the code`, or `upload it to the workspace`."
             "\n\nReply /cancel or /discard to remove the pending attachment(s)."

@@ -15,13 +15,15 @@ through the Render-hosted process.
 
 from __future__ import annotations
 
-import json
+import asyncio
+import os
 import threading
 import time
 import uuid
 from typing import Any
 from urllib.parse import urlparse
 
+import aiohttp
 from aiohttp import web
 from loguru import logger
 
@@ -153,6 +155,55 @@ async def handle_miniapp_page(request: web.Request) -> web.Response:
     return _foundation()
 
 
+def _format_upload_link_message(filename: str, url: str) -> str:
+    """Build the Telegram message that surfaces a freshly-uploaded gofile link."""
+    name = (filename or "upload").strip()[:120] or "upload"
+    return (
+        f"✅ File *{name}* is on GoFile and ready.\n\n"
+        f"Your link:\n`{url}`\n\n"
+        f"Now type what you want me to do with it (e.g. *analyze this file*, "
+        f"*extract the contents*, *summarize it*). I'll pull it from the link."
+    )
+
+
+async def _push_link_to_telegram(
+    url: str,
+    filename: str,
+    chat_id: str,
+) -> None:
+    """Best-effort: send the gofile link into the user's Telegram private chat.
+
+    ``chat_id`` is the Telegram user id (the Mini App's ``session_key``), which
+    matches the private bot chat id. Failures are logged, never raised, so the
+    upload-completion response is not blocked if Telegram is unreachable.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = (chat_id or "").strip()
+    if not token or not chat_id or chat_id == "unknown":
+        logger.debug("Skipping Telegram link push (no token/chat) for {}", url)
+        return
+    text = _format_upload_link_message(filename, url)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": False,
+                },
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    logger.warning(
+                        "Telegram link push failed: HTTP {} {}", response.status, body[:200]
+                    )
+    except Exception as exc:  # noqa: BLE001 - best-effort outbound
+        logger.warning("Telegram link push skipped: {}", exc)
+
+
 async def handle_upload_complete(request: web.Request) -> web.Response:
     """Accept a gofile.io URL reported by the Mini App.
 
@@ -203,6 +254,15 @@ async def handle_upload_complete(request: web.Request) -> web.Response:
         "Mini App upload received session={} file={} size={} url={}",
         session_key, filename, size, url,
     )
+    # Fire-and-forget push of the gofile link into the user's private chat so
+    # they immediately see a ready-to-use link and can type their request.
+    if session_key not in ("", "unknown"):
+        try:
+            asyncio.ensure_future(
+                _push_link_to_telegram(url, filename, session_key)
+            )
+        except RuntimeError:  # no event loop running
+            logger.debug("No event loop to push gofile link for {}", url)
     return web.json_response({
         "ok": True,
         "stored": True,

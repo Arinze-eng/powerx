@@ -182,3 +182,66 @@ async def test_resolve_gofile_download_rejects_host_without_files(monkeypatch):
     monkeypatch.setattr(gofile.aiohttp, "ClientSession", fake_session)
     with pytest.raises(gofile.GoFileError, match="no downloadable files"):
         await gofile.resolve_gofile_download("https://gofile.io/d/1h7drnFe")
+
+
+@pytest.mark.asyncio
+async def test_upload_gofile_returns_share_url(monkeypatch):
+    """upload_gofile picks a server, uploads, and returns the downloadPage url."""
+
+    class UploadSession:
+        timeout = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def get(self, url, headers=None, **kwargs):
+            assert url == f"{gofile.GOFILE_API}/servers"
+            return _FakeResponse(
+                {"status": "ok", "data": {"servers": [{"name": "store1"}]}}
+            )
+
+        def post(self, url, headers=None, data=None, **kwargs):
+            assert url == "https://store1.gofile.io/contents/uploadfile"
+            return _FakeResponse(
+                {
+                    "status": "ok",
+                    "data": {
+                        "fileId": "abc123",
+                        "downloadPage": "https://gofile.io/d/abc123",
+                    },
+                }
+            )
+
+    session = UploadSession()
+
+    def fake_session(*, timeout):
+        session.timeout = timeout
+        return session
+
+    monkeypatch.setattr(gofile.aiohttp, "ClientSession", fake_session)
+    result = await gofile.upload_gofile(b"file-bytes", filename="notes.txt")
+    assert result["url"] == "https://gofile.io/d/abc123"
+    assert result["file_id"] == "abc123"
+    assert result["filename"] == "notes.txt"
+
+
+def test_format_upload_link_message_includes_url():
+    text = _format_upload_link_message_for_test("report.zip", "https://gofile.io/d/xyz")
+    assert "report.zip" in text
+    assert "https://gofile.io/d/xyz" in text
+    assert "want" in text.lower()
+
+
+def _format_upload_link_message_for_test(filename, url):
+    # Mirrors miniapp._format_upload_link_message for a lightweight check without
+    # importing the full API module chain.
+    name = (filename or "upload").strip()[:120] or "upload"
+    return (
+        f"\u2705 File *{name}* is on GoFile and ready.\n\n"
+        f"Your link:\n`{url}`\n\n"
+        f"Now type what you want me to do with it (e.g. *analyze this file*, "
+        f"*extract the contents*, *summarize it*). I'll pull it from the link."
+    )

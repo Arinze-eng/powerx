@@ -249,3 +249,63 @@ async def download_gofile(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     return str(target)
+
+
+async def _pick_upload_server(session: aiohttp.ClientSession) -> str:
+    """Ask GoFile for the best temporary upload server host name."""
+    try:
+        async with session.get(
+            f"{GOFILE_API}/servers",
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+        ) as response:
+            payload = await response.json(content_type=None)
+    except (aiohttp.ClientError, ValueError) as exc:
+        raise GoFileError(f"could not reach GoFile API: {type(exc).__name__}") from None
+    servers = (payload.get("data") or {}).get("servers") or []
+    if not servers:
+        raise GoFileError("GoFile reported no upload servers")
+    name = str(servers[0].get("name") or "").strip()
+    if not name:
+        raise GoFileError("GoFile upload server selection is invalid")
+    return name
+
+
+async def upload_gofile(
+    data: bytes,
+    *,
+    filename: str = "upload.bin",
+    timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+) -> dict[str, str]:
+    """Upload raw *data* to gofile.io and return ``{url, file_id, filename}``.
+
+    The returned ``url`` is the public ``https://gofile.io/d/<code>`` share
+    link that the agent can later fetch with :func:`resolve_gofile_download`.
+    Used to stage files (e.g. Telegram-forwarded files) into GoFile directly
+    from the server without routing the large file through a browser.
+    """
+    timeout = aiohttp.ClientTimeout(total=max(60, min(int(timeout_seconds), 600)))
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        server = await _pick_upload_server(session)
+        upload_url = f"https://{server}.gofile.io/contents/uploadfile"
+        try:
+            form = aiohttp.FormData()
+            form.add_field("file", data, filename=filename, content_type="application/octet-stream")
+            async with session.post(
+                upload_url,
+                data=form,
+                headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            ) as response:
+                payload = await response.json(content_type=None)
+        except (aiohttp.ClientError, ValueError) as exc:
+            raise GoFileError(f"GoFile upload failed: {type(exc).__name__}") from None
+    if payload.get("status") != "ok":
+        raise GoFileError(f"GoFile rejected the upload: {payload.get('status', 'unknown error')}")
+    file_data = payload.get("data") or {}
+    file_id = str(file_data.get("fileId") or "").strip()
+    page_url = str(file_data.get("downloadPage") or "").strip()
+    if not file_id and not page_url:
+        raise GoFileError("GoFile upload returned no file id")
+    if not page_url:
+        page_url = f"https://gofile.io/d/{file_id}"
+    logger.debug("Uploaded {} bytes to gofile.io as {}", len(data), page_url)
+    return {"url": page_url, "file_id": file_id, "filename": filename}
