@@ -10,6 +10,8 @@ from urllib.parse import urlparse
 
 from loguru import logger
 
+from nanobot.utils.gofile import GoFileError, resolve_gofile_download
+
 try:
     import asyncssh
 except ImportError:  # pragma: no cover - dependency is installed in production
@@ -25,6 +27,13 @@ _MAX_INSTALL_PACKAGES = 24
 _USERNAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.@-]{0,63}$")
 _PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.:@~=-]{0,127}$")
 _FINGERPRINT_RE = re.compile(r"^(?:SHA256:[A-Za-z0-9+/=]+|MD5:[0-9a-fA-F:]{47})$")
+
+# Browser-like User-Agent used when fetching remote files so download hosts
+# return the real artifact instead of an HTML landing page.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
 
 # Hosts whose URLs the VPS ``fetch_url`` may download. tmpfiles.org is the
 # established transfer host; ``gofile.io`` (and its ``*.gofile.io`` upload
@@ -393,9 +402,9 @@ class VPSExecutionBackend:
         """Fetch a validated tmpfiles.org or gofile.io URL into the VPS workspace.
 
         tmpfiles.org links are downloaded directly. gofile.io ``/d/<code>``
-        pages resolve through the gofile download wrapper, so we follow
-        redirects and only accept a non-HTML (binary) download; otherwise an
-        actionable error is returned rather than writing an HTML shell.
+        shares are resolved through the GoFile API first to obtain the real
+        direct-download link, then that link is fetched on the VPS so we never
+        write an HTML landing page to disk.
         """
         fetch_url = str(url).strip()
         parsed = urlparse(fetch_url)
@@ -412,16 +421,31 @@ class VPSExecutionBackend:
         try:
             root = await self._resolve_workspace(conn)
             remote = self._remote_path(remote_path, root)
+            # gofile.io ``/d/<code>`` pages return an HTML shell; the default
+            # remote_path may be a guessed slug, so pick the real file name.
             if _is_gofile_fetch_url(fetch_url):
-                # gofile.io download pages return an HTML shell unless the request
-                # carries a browser-like User-Agent and follows redirects down to
-                # the actual CDN file. Guard against writing that shell with an
-                # HTML sniff on the downloaded artifact.
-                user_agent = "Mozilla/5.0"
+                try:
+                    resolved = await resolve_gofile_download(
+                        fetch_url, timeout_seconds=timeout
+                    )
+                except GoFileError as exc:
+                    raise RuntimeError(
+                        f"VPS could not resolve the gofile.io upload: {exc}"
+                    ) from None
+                item = resolved[0]
+                direct_url = str(item["link"]).strip()
+                direct_host = urlparse(direct_url).netloc.lower()
+                if not _is_allowed_fetch_host(direct_host):
+                    raise RuntimeError(
+                        "resolved gofile.io download host is not permitted"
+                    )
+                # The resolved link is a direct binary download; the only guard
+                # we still need is a sanity check that we did not write an
+                # HTML shell (the direct link normally streams the file).
                 command = (
                     "curl -fsSL --retry 2 --max-time 180 -L "
-                    f"{shlex.quote(fetch_url)} "
-                    f"-H {shlex.quote('User-Agent: ' + user_agent)} "
+                    f"{shlex.quote(direct_url)} "
+                    f"-H {shlex.quote('User-Agent: ' + USER_AGENT)} "
                     f"-o {shlex.quote(remote)} "
                     f"&& test -s {shlex.quote(remote)} "
                     f"&& ! LC_ALL=C grep -aq '<html' {shlex.quote(remote)}"
@@ -436,8 +460,8 @@ class VPSExecutionBackend:
             if int(getattr(result, "exit_status", 1)) != 0:
                 if _is_gofile_fetch_url(fetch_url):
                     raise RuntimeError(
-                        "VPS could not fetch the gofile.io upload (page did not resolve "
-                        "to a direct binary download)"
+                        "VPS could not fetch the gofile.io upload (resolved link "
+                        "did not return a direct binary download)"
                     )
                 raise RuntimeError("VPS could not fetch the tmpfiles.org upload")
             return remote

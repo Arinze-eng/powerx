@@ -25,6 +25,7 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.agent.tools.vps_backend import VPSExecutionBackend
 from nanobot.config.paths import get_data_dir, get_workspace_path
+from nanobot.utils.gofile import GoFileError, is_gofile_url, resolve_gofile_download
 from nanobot.utils.helpers import detect_image_mime
 from nanobot.utils.tmpfiles import upload_bytes as upload_tmpfile_bytes
 from nanobot.utils.tmpfiles import upload_path as upload_tmpfile_path
@@ -895,11 +896,35 @@ class NovitaSandboxTool(Tool):
                         f"{_WORKSPACE}/{re.sub(r'[^A-Za-z0-9._-]', '_', parsed_url.path.rstrip('/').split('/')[-1] or 'download.bin')}"
                     ))
                     timeout = max(30, min(int(kwargs.get("timeout") or 150), _MAX_TIMEOUT))
-                    # Download on the Render host, then write the bytes into the sandbox.
+                    # Download on the host, then write the bytes into the sandbox.
                     # Using the host avoids depending on the sandbox image shipping curl.
+                    if is_gofile_url(url):
+                        # gofile.io ``/d/<code>`` pages are HTML landing pages; resolve
+                        # the share through the GoFile API to get the real direct link
+                        # and file name so we never write an HTML shell to disk.
+                        try:
+                            resolved = await resolve_gofile_download(
+                                url, timeout_seconds=timeout
+                            )
+                        except GoFileError as exc:
+                            return ToolResult.error(
+                                f"could not resolve gofile.io link: {exc}"
+                            )
+                        item = resolved[0]
+                        download_url = str(item["link"]).strip()
+                        real_name = re.sub(
+                            r"[^A-Za-z0-9._-]",
+                            "_",
+                            str(item.get("name") or "gofile_file"),
+                        ) or "gofile_file"
+                        dest = _safe_path(str(kwargs.get("path") or "") or (
+                            f"{_WORKSPACE}/{real_name}"
+                        ))
+                    else:
+                        download_url = url
                     import aiohttp
                     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-                        async with session.get(url, allow_redirects=True) as resp:
+                        async with session.get(download_url, allow_redirects=True) as resp:
                             if resp.status < 200 or resp.status >= 300:
                                 return ToolResult.error(f"remote fetch failed with HTTP {resp.status}")
                             content_type = resp.headers.get("Content-Type", "")
