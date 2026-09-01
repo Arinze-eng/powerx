@@ -1,10 +1,11 @@
-"""Telegram Mini App for large file uploads (catbox.to).
+"""Telegram Mini App for large file uploads (gofile.io).
 
 Telegram's inline file upload is limited (documents and photos are transferred
 through the bot, which is impractical for files above the 100 MB-plus range and
 eats Render bandwidth). This module serves a Mini App that lets a user pick a
-large file in the Telegram client, upload it through the catbox.to transfer API,
-and then report the public catbox.to share URL back to the API server.
+large file in the Telegram client, upload it directly to gofile.io from the
+browser (bypassing the Render-hosted bot entirely), and then report the public
+gofile.io download URL back to the API server.
 
 The recorded upload is then available to the agent, which uses the
 ``novita_sandbox`` ``fetch_url`` action to pull the file into the Novita
@@ -14,23 +15,37 @@ through the Render-hosted process.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import uuid
 from typing import Any
+from urllib.parse import urlparse
 
 from aiohttp import web
 from loguru import logger
 
-from nanobot.utils.catbox import (
-    is_catbox_url,
-    shared_id_from_url,
-    upload_bytes,
-)
+GOFILE_DOMAINS = {
+    "gofile.io",
+    "api.gofile.io",
+}
+# gofile.io exposes upload servers under ``*.gofile.io`` as well.
+def _is_gofile_host(host: str) -> bool:
+    host = (host or "").strip().lower()
+    if not host:
+        return False
+    if host in GOFILE_DOMAINS:
+        return True
+    return host.endswith(".gofile.io")
 
-# Public share URLs produced by the catbox upload flow.
-# catbox.to exposes file pages and CDN content under ``*.catbox.to`` as well.
-MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # Mini App advertises "up to 2 GB"
+
+def is_gofile_url(value: str) -> bool:
+    """Return True when *value* is an HTTPS share/page URL on gofile.io."""
+    try:
+        parsed = urlparse((value or "").strip())
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and _is_gofile_host(parsed.netloc) and bool(parsed.path)
 
 
 # ---------------------------------------------------------------------------
@@ -138,68 +153,8 @@ async def handle_miniapp_page(request: web.Request) -> web.Response:
     return _foundation()
 
 
-async def handle_upload_transfer(request: web.Request) -> web.Response:
-    """POST /upload/transfer — proxy a Mini App file upload to catbox.to.
-
-    catbox.to disallows direct cross-origin browser uploads (CORS + per-session
-    CSRF), so the Mini App posts the file to this same-origin endpoint and the
-    server uploads the bytes on its behalf. Returns the public catbox share URL.
-    """
-    session_key = ""
-    try:
-        reader = await request.multipart()
-    except Exception:
-        return _json_error(400, "Request must be multipart/form-data")
-
-    file_bytes: bytes | None = None
-    filename = "upload.bin"
-    while True:
-        part = await reader.next()
-        if part is None:
-            break
-        name = (part.name or "").strip()
-        if name == "session_key":
-            session_key = (await part.read()).decode("utf-8", "replace").strip()
-        elif name == "file":
-            raw = await part.read()
-            file_bytes = raw
-            filename = part.filename or "upload.bin"
-        else:
-            await part.read()  # drain
-
-    if not file_bytes:
-        return _json_error(400, "a 'file' part is required")
-    if len(file_bytes) > MAX_UPLOAD_BYTES:
-        return _json_error(400, "file exceeds the supported upload range")
-
-    try:
-        result = await upload_bytes(file_bytes, filename=filename)
-    except Exception as exc:  # CatboxError and network errors
-        logger.warning("Mini App catbox upload failed: {}", exc)
-        return _json_error(502, "upload to catbox.to failed")
-
-    url = result["url"]
-    upload_store.record(
-        session_key or "unknown",
-        url=url,
-        file_id=result["shared_id"],
-        filename=result["file_name"],
-        size=len(file_bytes),
-    )
-    logger.info(
-        "Mini App catbox upload received session={} file={} size={} url={}",
-        session_key, filename, len(file_bytes), url,
-    )
-    return web.json_response({
-        "ok": True,
-        "stored": True,
-        "url": url,
-        "filename": result["file_name"],
-    })
-
-
 async def handle_upload_complete(request: web.Request) -> web.Response:
-    """Accept a catbox.to share URL reported by the Mini App.
+    """Accept a gofile.io URL reported by the Mini App.
 
     Supports both POST with a JSON body (API server / aiohttp) and GET with
     query-string fields (also supported by the light-weight gateway that only
@@ -231,16 +186,16 @@ async def handle_upload_complete(request: web.Request) -> web.Response:
             size = 0
         session_key = str(body.get("session_key") or "").strip()
 
-    if not is_catbox_url(url):
-        return _json_error(400, "url must be an HTTPS catbox.to share/file URL")
-    if size < 0 or size > MAX_UPLOAD_BYTES:
+    if not is_gofile_url(url):
+        return _json_error(400, "url must be an HTTPS gofile.io share/page URL")
+    if size < 0 or size > (200 * 1024 * 1024 * 1024):
         return _json_error(400, "size is outside the supported upload range")
     session_key = session_key or "unknown"
 
     record = upload_store.record(
         session_key,
         url=url,
-        file_id=file_id or shared_id_from_url(url) or "",
+        file_id=file_id,
         filename=filename,
         size=size,
     )
@@ -300,13 +255,14 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
 <div class="wrap">
   <h1>📤 Upload Large File</h1>
   <p class="sub">Telegram buttons cap out around 50&nbsp;MB. Use this Mini App to upload files up to
-    2&nbsp;GB, then ask the bot to analyze it.</p>
+    2&nbsp;GB directly to gofile.io, then ask the bot to analyze it.</p>
 
   <div class="drop" id="drop">
     <div class="big">Tap to choose a file</div>
     <div class="small">or drag &amp; drop it here · up to 2&nbsp;GB</div>
   </div>
   <input type="file" id="file" />
+  <button class="btn hidden" id="pick">Choose File</button>
 
   <div class="status hidden" id="status">
     <div class="row"><span class="k">File</span><span id="fname">—</span></div>
@@ -324,7 +280,7 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
   <div class="urlbox hidden" id="next">
     <label>Next step</label>
     <p class="sub" style="margin:4px 0 0;">Go back to the chat and send a message like
-      <b>analyze the file I just uploaded</b>. The agent will pull it from catbox.to.</p>
+      <b>analyze the file I just uploaded</b>. The agent will pull it from gofile.io.</p>
   </div>
 </div>
 
@@ -399,50 +355,63 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
       fprog.style.color = '#f87171';
       return;
     }
-    uploadViaServer(file);
+    uploadToGofile(file);
   }
 
-  // catbox.to does not allow cross-origin browser uploads, so the file bytes go
-  // to this origin's /upload/transfer endpoint, which proxies them to catbox.
-  function uploadViaServer(file) {
-    var form = new FormData();
-    form.append('session_key', sessionKey);
-    form.append('file', file, file.name);
-    var xhr = new XMLHttpRequest();
-    xhr.open('POST', '/upload/transfer', true);
-    xhr.upload.onprogress = function (e) {
-      if (e.lengthComputable) setProgress(Math.round(e.loaded / e.total * 100));
-    };
-    xhr.onload = function () {
-      var res = null;
-      try { res = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
-      if (xhr.status < 200 || xhr.status >= 300 || !res || !res.ok) {
-        var msg = (res && res.error && res.error.message) ? res.error.message : 'Upload failed';
+  function uploadToGofile(file) {
+    fetch('https://api.gofile.io/servers', { method: 'GET' })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        var server = (res && res.data && res.data.servers && res.data.servers[0])
+          ? res.data.servers[0].name : null;
+        if (!server) throw new Error('No gofile server available');
+        return server;
+      })
+      .then(function (server) {
+        return new Promise(function (resolve, reject) {
+          var xhr = new XMLHttpRequest();
+          xhr.open('POST', 'https://' + server + '.gofile.io/contents/uploadfile', true);
+          xhr.upload.onprogress = function (e) {
+            if (e.lengthComputable) setProgress(Math.round(e.loaded / e.total * 100));
+          };
+          xhr.onload = function () { resolve(xhr); };
+          xhr.onerror = function () { reject(new Error('Upload request failed')); };
+          xhr.onabort = function () { reject(new Error('Upload aborted')); };
+          var form = new FormData();
+          form.append('file', file);
+          xhr.send(form);
+        });
+      })
+      .then(function (xhr) {
+        var res = JSON.parse(xhr.responseText || '{}');
+        if (xhr.status < 200 || xhr.status >= 300 || !res || res.status !== 'ok') {
+          var msg = res && res.data && res.data ? (res.data.error || JSON.stringify(res.data)) : 'Upload failed';
+          throw new Error(msg);
+        }
+        var data = res.data || {};
+        var pageUrl = data.downloadPage || ('https://gofile.io/d/' + data.fileId);
+        complete(pageUrl, data.fileId, file);
+      })
+      .catch(function (err) {
         fprog.textContent = 'error';
         fprog.style.color = '#f87171';
-        return;
-      }
-      complete(res.url, file);
-    };
-    xhr.onerror = function () { fprog.textContent = 'error'; fprog.style.color = '#f87171'; };
-    xhr.onabort = function () { fprog.textContent = 'error'; fprog.style.color = '#f87171'; };
-    xhr.send(form);
+      });
   }
 
-  function complete(pageUrl, file) {
+  function complete(pageUrl, fileId, file) {
     setProgress(100);
     urlInput.value = pageUrl;
     urlbox.classList.remove('hidden');
     nextBox.classList.remove('hidden');
-    // Best-effort beacon so the gateway can also track the upload with only
-    // query-parameter support.
     var params = new URLSearchParams({
       url: pageUrl,
-      file_id: '',
+      file_id: fileId || '',
       filename: file.name,
       size: String(file.size || 0),
       session_key: sessionKey
     });
+    // Best-effort beacon. GET is used so the callback works on both the API
+    // server (aiohttp) and the gateway (which only exposes query parameters).
     fetch('/upload/complete?' + params.toString(), { method: 'GET', mode: 'no-cors' }).catch(function () {});
   }
 
@@ -471,9 +440,8 @@ def _json_error(status: int, message: str) -> web.Response:
 
 
 def register_miniapp_routes(app: web.Application) -> None:
-    """Add the Mini App GET, transfer, and completion routes to *app*."""
+    """Add the Mini App GET and completion routes to *app*."""
     app.router.add_get("/upload", handle_miniapp_page)
-    app.router.add_post("/upload/transfer", handle_upload_transfer)
     app.router.add_route("*", "/upload/complete", handle_upload_complete)
 
 

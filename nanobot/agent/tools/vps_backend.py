@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import posixpath
 import re
 import shlex
@@ -16,8 +15,6 @@ try:
 except ImportError:  # pragma: no cover - dependency is installed in production
     asyncssh = None  # type: ignore[assignment]
 
-from nanobot.utils.catbox import CatboxError, resolve_raw_url
-
 _MAX_COMMAND_CHARS = 12_000
 _MAX_CONTENT_CHARS = 120_000
 _MAX_RESULT_CHARS = 16_000
@@ -30,9 +27,9 @@ _PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.:@~=-]{0,127}$")
 _FINGERPRINT_RE = re.compile(r"^(?:SHA256:[A-Za-z0-9+/=]+|MD5:[0-9a-fA-F:]{47})$")
 
 # Hosts whose URLs the VPS ``fetch_url`` may download. tmpfiles.org is the
-# established transfer host; ``catbox.to`` (and its ``*.catbox.to`` upload
+# established transfer host; ``gofile.io`` (and its ``*.gofile.io`` upload
 # servers) is used by the Telegram Mini App for large files (100 MB+).
-_ALLOWED_FETCH_HOSTS = {"tmpfiles.org", "catbox.to"}
+_ALLOWED_FETCH_HOSTS = {"tmpfiles.org", "gofile.io"}
 
 
 def _is_allowed_fetch_host(host: str) -> bool:
@@ -41,22 +38,13 @@ def _is_allowed_fetch_host(host: str) -> bool:
         return False
     if host in _ALLOWED_FETCH_HOSTS:
         return True
-    return host.endswith(".catbox.to")
+    return host.endswith(".gofile.io")
 
 
-def _is_catbox_fetch_url(url: str) -> bool:
-    """Return True when *url* points at a catbox.to share/download resource."""
+def _is_gofile_fetch_url(url: str) -> bool:
+    """Return True when *url* points at a gofile.io share/download resource."""
     parsed = urlparse(url)
-    return parsed.scheme == "https" and _is_allowed_fetch_host(parsed.netloc)
-
-
-def _resolve_catbox_raw(share_url: str, timeout: int) -> str:
-    """Synchronously resolve a catbox share URL to its raw download link.
-
-    Thread-safe wrapper around the async ``resolve_raw_url`` helper so it can be
-    called from an event-loop thread without blocking it.
-    """
-    return asyncio.run(resolve_raw_url(share_url, timeout_seconds=max(20, timeout)))
+    return _is_allowed_fetch_host(parsed.netloc)
 
 
 def validate_vps_host(raw: str) -> str:
@@ -402,12 +390,12 @@ class VPSExecutionBackend:
             await conn.wait_closed()
 
     async def fetch_url(self, url: str, remote_path: str, *, timeout: int = 150) -> str:
-        """Fetch a validated tmpfiles.org or catbox.to URL into the VPS workspace.
+        """Fetch a validated tmpfiles.org or gofile.io URL into the VPS workspace.
 
-        tmpfiles.org links are downloaded directly. catbox.to share pages
-        (``/<id>/file``) are HTML download pages, so we first resolve the direct
-        raw ``/download/<id>/<hash>/<name>`` link on the Render host, then curl
-        it on the VPS and guard against writing an HTML shell.
+        tmpfiles.org links are downloaded directly. gofile.io ``/d/<code>``
+        pages resolve through the gofile download wrapper, so we follow
+        redirects and only accept a non-HTML (binary) download; otherwise an
+        actionable error is returned rather than writing an HTML shell.
         """
         fetch_url = str(url).strip()
         parsed = urlparse(fetch_url)
@@ -415,7 +403,7 @@ class VPSExecutionBackend:
             raise ValueError("remote fetch URL must be HTTPS")
         if not _is_allowed_fetch_host(parsed.netloc) or not parsed.path:
             raise ValueError(
-                "remote fetch URL must be an HTTPS tmpfiles.org or catbox.to URL"
+                "remote fetch URL must be an HTTPS tmpfiles.org or gofile.io URL"
             )
         configured = self._configured_workspace(self.config)
         _safe_remote_path(remote_path, configured)
@@ -424,18 +412,17 @@ class VPSExecutionBackend:
         try:
             root = await self._resolve_workspace(conn)
             remote = self._remote_path(remote_path, root)
-            if _is_catbox_fetch_url(fetch_url):
-                # catbox share pages return an HTML shell; resolve the direct
-                # raw download URL here (needs a catbox session), then curl it.
-                try:
-                    direct = await asyncio.to_thread(
-                        _resolve_catbox_raw, fetch_url, timeout - 10
-                    )
-                except CatboxError as exc:
-                    raise RuntimeError(f"VPS could not resolve the catbox.to upload: {exc}") from exc
+            if _is_gofile_fetch_url(fetch_url):
+                # gofile.io download pages return an HTML shell unless the request
+                # carries a browser-like User-Agent and follows redirects down to
+                # the actual CDN file. Guard against writing that shell with an
+                # HTML sniff on the downloaded artifact.
+                user_agent = "Mozilla/5.0"
                 command = (
-                    "curl -fsSL --retry 2 --max-time 180 "
-                    f"{shlex.quote(direct)} -o {shlex.quote(remote)} "
+                    "curl -fsSL --retry 2 --max-time 180 -L "
+                    f"{shlex.quote(fetch_url)} "
+                    f"-H {shlex.quote('User-Agent: ' + user_agent)} "
+                    f"-o {shlex.quote(remote)} "
                     f"&& test -s {shlex.quote(remote)} "
                     f"&& ! LC_ALL=C grep -aq '<html' {shlex.quote(remote)}"
                 )
@@ -447,9 +434,9 @@ class VPSExecutionBackend:
                 )
             result = await conn.run(command, check=False, timeout=timeout)
             if int(getattr(result, "exit_status", 1)) != 0:
-                if _is_catbox_fetch_url(fetch_url):
+                if _is_gofile_fetch_url(fetch_url):
                     raise RuntimeError(
-                        "VPS could not fetch the catbox.to upload (page did not resolve "
+                        "VPS could not fetch the gofile.io upload (page did not resolve "
                         "to a direct binary download)"
                     )
                 raise RuntimeError("VPS could not fetch the tmpfiles.org upload")

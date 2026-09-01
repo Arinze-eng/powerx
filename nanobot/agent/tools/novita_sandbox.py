@@ -25,8 +25,6 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.agent.tools.vps_backend import VPSExecutionBackend
 from nanobot.config.paths import get_data_dir, get_workspace_path
-from nanobot.utils.catbox import CatboxError
-from nanobot.utils.catbox import download_bytes as catbox_download_bytes
 from nanobot.utils.helpers import detect_image_mime
 from nanobot.utils.tmpfiles import upload_bytes as upload_tmpfile_bytes
 from nanobot.utils.tmpfiles import upload_path as upload_tmpfile_path
@@ -325,7 +323,7 @@ def _output(result: Any) -> str:
         ),
         command=StringSchema("Command to run inside the remote sandbox"),
         path=StringSchema("Sandbox path, relative paths resolve under /workspace"),
-        url=StringSchema("Remote HTTPS URL to fetch into the sandbox (tmpfiles.org or catbox.to)"),
+        url=StringSchema("Remote HTTPS URL to fetch into the sandbox (tmpfiles.org or gofile.io)"),
         content=StringSchema("Text content for write"),
         timeout=IntegerSchema(description="Command timeout in seconds", minimum=1, maximum=_MAX_TIMEOUT),
         source=StringSchema("Local media path to upload into the remote sandbox"),
@@ -377,7 +375,7 @@ class NovitaSandboxTool(Tool):
         return (
             "Use the configured isolated execution backend for coding and operations. "
             "Run shell commands, inspect or write project files, list a workspace, "
-            "fetch a remote HTTPS file (tmpfiles.org or catbox.to) into the workspace, "
+            "fetch a remote HTTPS file (tmpfiles.org or gofile.io) into the workspace, "
             "download generated artifacts, or reset the current user sandbox. "
             "Use this for all coding, tests, builds, package installs, Git, and CI/CD work; "
             "never use the host shell for user work. "
@@ -404,7 +402,7 @@ class NovitaSandboxTool(Tool):
                 "command": {"type": "string"},
                 "packages": {"type": "string", "description": "Space-separated Linux distro package names to install in VPS mode."},
                 "path": {"type": "string"},
-                "url": {"type": "string", "description": "Remote HTTPS URL to fetch into the sandbox (tmpfiles.org or catbox.to)."},
+                "url": {"type": "string", "description": "Remote HTTPS URL to fetch into the sandbox (tmpfiles.org or gofile.io)."},
                 "content": {"type": "string"},
                 "timeout": {"type": "integer", "minimum": 1, "maximum": _MAX_TIMEOUT},
                 "source": {"type": "string"},
@@ -885,40 +883,31 @@ class NovitaSandboxTool(Tool):
                     if not url:
                         return ToolResult.error("url is required for fetch_url")
                     parsed_url = urlparse(url)
-                    netloc = parsed_url.netloc
                     allowed = parsed_url.scheme == "https" and (
-                        netloc in {"tmpfiles.org", "catbox.to"}
-                        or netloc.endswith(".catbox.to")
+                        parsed_url.netloc in {"tmpfiles.org", "gofile.io"}
+                        or parsed_url.netloc.endswith(".gofile.io")
                     )
                     if not allowed:
                         return ToolResult.error(
-                            "url must be an HTTPS tmpfiles.org or catbox.to URL"
+                            "url must be an HTTPS tmpfiles.org or gofile.io URL"
                         )
                     dest = _safe_path(str(kwargs.get("path") or "") or (
                         f"{_WORKSPACE}/{re.sub(r'[^A-Za-z0-9._-]', '_', parsed_url.path.rstrip('/').split('/')[-1] or 'download.bin')}"
                     ))
                     timeout = max(30, min(int(kwargs.get("timeout") or 150), _MAX_TIMEOUT))
-                    if "catbox.to" in netloc:
-                        # catbox share pages are HTML; follow the /download/create
-                        # resolution to the raw binary and stream the bytes.
-                        try:
-                            data = await catbox_download_bytes(url, timeout_seconds=timeout)
-                        except CatboxError as exc:
-                            return ToolResult.error(f"catbox fetch failed: {exc}")
-                    else:
-                        # Download on the Render host, then write the bytes into the sandbox.
-                        # Using the host avoids depending on the sandbox image shipping curl.
-                        import aiohttp
-                        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-                            async with session.get(url, allow_redirects=True) as resp:
-                                if resp.status < 200 or resp.status >= 300:
-                                    return ToolResult.error(f"remote fetch failed with HTTP {resp.status}")
-                                content_type = resp.headers.get("Content-Type", "")
-                                if "text/html" in content_type.lower():
-                                    return ToolResult.error(
-                                        "remote URL resolved to an HTML page rather than a direct binary file"
-                                    )
-                                data = await resp.read()
+                    # Download on the Render host, then write the bytes into the sandbox.
+                    # Using the host avoids depending on the sandbox image shipping curl.
+                    import aiohttp
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+                        async with session.get(url, allow_redirects=True) as resp:
+                            if resp.status < 200 or resp.status >= 300:
+                                return ToolResult.error(f"remote fetch failed with HTTP {resp.status}")
+                            content_type = resp.headers.get("Content-Type", "")
+                            if "text/html" in content_type.lower():
+                                return ToolResult.error(
+                                    "remote URL resolved to an HTML page rather than a direct binary file"
+                                )
+                            data = await resp.read()
                     await asyncio.to_thread(sandbox.files.write, dest, data)
                     return (
                         f"Fetched remote file to {dest} in the remote sandbox "

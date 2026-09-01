@@ -1144,13 +1144,12 @@ class GatewayHTTPHandler:
         )
 
     async def _handle_miniapp_complete(self, request: WsRequest) -> Response:
-        """GET /upload/complete — record a catbox.to URL reported by the Mini App.
+        """GET /upload/complete — record a gofile.io URL reported by the Mini App.
 
         The gateway's WebSocket HTTP layer only exposes query parameters (not the
         request body), so the Mini App uses a GET beacon instead of a JSON POST.
         """
-        from nanobot.api.miniapp import upload_store
-        from nanobot.utils.catbox import is_catbox_url
+        from nanobot.api.miniapp import is_gofile_url, upload_store
 
         query = _parse_query(request.path)
         url = (_query_first(query, "url") or "").strip()
@@ -1163,8 +1162,8 @@ class GatewayHTTPHandler:
             size = 0
         session_key = (_query_first(query, "session_key") or "").strip()
 
-        if not is_catbox_url(url):
-            return _http_error(400, "url must be an HTTPS catbox.to share/file URL")
+        if not is_gofile_url(url):
+            return _http_error(400, "url must be an HTTPS gofile.io share/page URL")
         if size < 0 or size > (200 * 1024 * 1024 * 1024):
             return _http_error(400, "size is outside the supported upload range")
 
