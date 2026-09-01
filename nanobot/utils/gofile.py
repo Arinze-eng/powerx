@@ -129,13 +129,12 @@ async def resolve_gofile_download(
     """Resolve a GoFile share into a list of direct-download descriptors.
 
     Each descriptor contains ``name`` (the real file name), ``link`` (a direct
-    download URL), and ``size`` (the file size in bytes, when reported).
+    download URL), ``size`` (the file size in bytes, when reported) and
+    ``token`` (the temporary guest session token needed to authorise fetching
+    the file). Pass the per-file dict straight into :func:`request_file` or
+    ``gofile_file_headers`` to download it.
     """
-    code = extract_gofile_code(url)
-    timeout = aiohttp.ClientTimeout(total=max(30, min(int(timeout_seconds), 300)))
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        token = await _create_guest_token(session)
-        data = await _resolve_share(session, code, token)
+    token, data = await _resolve(url, timeout_seconds=timeout_seconds)
     children = data.get("children") or {}
     files: list[dict[str, Any]] = []
     if children:
@@ -158,6 +157,7 @@ async def resolve_gofile_download(
                 "name": name,
                 "link": link,
                 "size": str(int(size)) if isinstance(size, (int, float)) else str(size or ""),
+                "token": token,
             }
         )
     if not resolved:
@@ -166,6 +166,68 @@ async def resolve_gofile_download(
         )
     logger.debug("Resolved GoFile share to {} downloadable file(s)", len(resolved))
     return resolved
+
+
+async def _resolve(
+    url: str,
+    *,
+    timeout_seconds: int,
+) -> tuple[str, dict[str, Any]]:
+    """Create a guest session and resolve the share, returning ``(token, data)``."""
+    code = extract_gofile_code(url)
+    timeout = aiohttp.ClientTimeout(total=max(30, min(int(timeout_seconds), 300)))
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        token = await _create_guest_token(session)
+        data = await _resolve_share(session, code, token)
+    return token, data
+
+
+def gofile_file_headers(token: str, *, range_header: str | None = "bytes=0-") -> dict[str, str]:
+    """Headers required to fetch a GoFile file from its direct download link.
+
+    Without the ``accountToken`` cookie GoFile serves an HTML landing page
+    instead of the file; the ``Range`` header makes the CDN stream the binary
+    directly (HTTP 206). ``X-Website-Token`` is required on the download too.
+    """
+    headers: dict[str, str] = {
+        "User-Agent": USER_AGENT,
+        "Referer": "https://gofile.io/",
+        "Accept": "*/*",
+        "Cookie": f"accountToken={token}",
+        "X-Website-Token": _website_token(token, 0),
+        "X-BL": LANGUAGE,
+    }
+    if range_header:
+        headers["Range"] = range_header
+    return headers
+
+
+async def request_file(
+    item: dict[str, str],
+    *,
+    timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+) -> bytes:
+    """Fetch the binary content of a resolved GoFile file.
+
+    *item* is one descriptor from :func:`resolve_gofile_download`. Returns the
+    raw file bytes.
+    """
+    link = str(item.get("link") or "").strip()
+    token = str(item.get("token") or "").strip() or ""
+    if not link:
+        raise GoFileError("resolved GoFile file has no link")
+    timeout = aiohttp.ClientTimeout(total=max(30, min(int(timeout_seconds), 300)))
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(link, headers=gofile_file_headers(token)) as response:
+                if response.status < 200 or response.status >= 300:
+                    raise GoFileError(f"GoFile download failed with HTTP {response.status}")
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "text/html" in content_type:
+                    raise GoFileError("GoFile file download resolved to an HTML page")
+                return await response.read()
+    except aiohttp.ClientError as exc:
+        raise GoFileError(f"GoFile download failed: {type(exc).__name__}") from None
 
 
 async def download_gofile(
@@ -182,22 +244,8 @@ async def download_gofile(
     items = await resolve_gofile_download(url, timeout_seconds=timeout_seconds)
     if not items:
         raise GoFileError("GoFile share contained no downloadable files")
-    item = items[0]
+    data = await request_file(items[0], timeout_seconds=timeout_seconds)
     target = Path(destination).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    timeout = aiohttp.ClientTimeout(total=max(30, min(int(timeout_seconds), 300)))
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                item["link"],
-                headers={"User-Agent": USER_AGENT, "Referer": "https://gofile.io/"},
-            ) as response:
-                if response.status < 200 or response.status >= 300:
-                    raise GoFileError(f"GoFile download failed with HTTP {response.status}")
-                content_type = response.headers.get("Content-Type", "").lower()
-                if "text/html" in content_type and int(item["size"] or 0) == 0:
-                    raise GoFileError("GoFile download resolved to an HTML page")
-                target.write_bytes(await response.read())
-    except aiohttp.ClientError as exc:
-        raise GoFileError(f"GoFile download failed: {type(exc).__name__}") from None
+    target.write_bytes(data)
     return str(target)

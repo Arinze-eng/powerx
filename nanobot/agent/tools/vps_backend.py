@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from loguru import logger
 
-from nanobot.utils.gofile import GoFileError, resolve_gofile_download
+from nanobot.utils.gofile import GoFileError, gofile_file_headers, resolve_gofile_download
 
 try:
     import asyncssh
@@ -439,13 +439,19 @@ class VPSExecutionBackend:
                     raise RuntimeError(
                         "resolved gofile.io download host is not permitted"
                     )
-                # The resolved link is a direct binary download; the only guard
-                # we still need is a sanity check that we did not write an
-                # HTML shell (the direct link normally streams the file).
+                # The direct link serves the HTML landing page unless the request
+                # carries the guest "accountToken" cookie and a Range header; curl
+                # must reproduce those or it will save the gofile page instead of
+                # the file. The resolved item carries the temporary guest token.
+                file_headers = gofile_file_headers(str(item.get("token") or ""))
+                curl_headers = " ".join(
+                    f"-H {shlex.quote(f'{key}: {val}')}"
+                    for key, val in file_headers.items()
+                )
                 command = (
                     "curl -fsSL --retry 2 --max-time 180 -L "
                     f"{shlex.quote(direct_url)} "
-                    f"-H {shlex.quote('User-Agent: ' + USER_AGENT)} "
+                    f"{curl_headers} "
                     f"-o {shlex.quote(remote)} "
                     f"&& test -s {shlex.quote(remote)} "
                     f"&& ! LC_ALL=C grep -aq '<html' {shlex.quote(remote)}"

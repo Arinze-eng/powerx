@@ -25,7 +25,7 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.agent.tools.vps_backend import VPSExecutionBackend
 from nanobot.config.paths import get_data_dir, get_workspace_path
-from nanobot.utils.gofile import GoFileError, is_gofile_url, resolve_gofile_download
+from nanobot.utils.gofile import GoFileError, is_gofile_url, request_file, resolve_gofile_download
 from nanobot.utils.helpers import detect_image_mime
 from nanobot.utils.tmpfiles import upload_bytes as upload_tmpfile_bytes
 from nanobot.utils.tmpfiles import upload_path as upload_tmpfile_path
@@ -908,7 +908,9 @@ class NovitaSandboxTool(Tool):
                     if is_gofile_url(url):
                         # gofile.io ``/d/<code>`` pages are HTML landing pages; resolve
                         # the share through the GoFile API to get the real direct link
-                        # and file name so we never write an HTML shell to disk.
+                        # and file name so we never write an HTML shell to disk. The
+                        # resolved descriptor carries the guest token that must be sent
+                        # (as the accountToken cookie + Range header) to get the file.
                         try:
                             resolved = await resolve_gofile_download(
                                 url, timeout_seconds=timeout
@@ -918,7 +920,6 @@ class NovitaSandboxTool(Tool):
                                 f"could not resolve gofile.io link: {exc}"
                             )
                         item = resolved[0]
-                        download_url = str(item["link"]).strip()
                         real_name = re.sub(
                             r"[^A-Za-z0-9._-]",
                             "_",
@@ -927,19 +928,25 @@ class NovitaSandboxTool(Tool):
                         dest = _safe_path(str(kwargs.get("path") or "") or (
                             f"{_WORKSPACE}/{real_name}"
                         ))
+                        try:
+                            data = await request_file(item, timeout_seconds=timeout)
+                        except GoFileError as exc:
+                            return ToolResult.error(
+                                f"could not download gofile.io file: {exc}"
+                            )
                     else:
                         download_url = url
-                    import aiohttp
-                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-                        async with session.get(download_url, allow_redirects=True) as resp:
-                            if resp.status < 200 or resp.status >= 300:
-                                return ToolResult.error(f"remote fetch failed with HTTP {resp.status}")
-                            content_type = resp.headers.get("Content-Type", "")
-                            if "text/html" in content_type.lower():
-                                return ToolResult.error(
-                                    "remote URL resolved to an HTML page rather than a direct binary file"
-                                )
-                            data = await resp.read()
+                        import aiohttp
+                        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+                            async with session.get(download_url, allow_redirects=True) as resp:
+                                if resp.status < 200 or resp.status >= 300:
+                                    return ToolResult.error(f"remote fetch failed with HTTP {resp.status}")
+                                content_type = resp.headers.get("Content-Type", "")
+                                if "text/html" in content_type.lower():
+                                    return ToolResult.error(
+                                        "remote URL resolved to an HTML page rather than a direct binary file"
+                                    )
+                                data = await resp.read()
                     await asyncio.to_thread(sandbox.files.write, dest, data)
                     return (
                         f"Fetched remote file to {dest} in the remote sandbox "

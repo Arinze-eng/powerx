@@ -119,8 +119,19 @@ async def test_resolve_gofile_download_creates_guest_and_returns_direct_links(mo
             "name": "report.pdf",
             "link": "https://cdn.gofile.io/dl/report.pdf",
             "size": "12345",
+            "token": "guest-token-123",
         }
     ]
+
+
+def test_gofile_file_headers_use_accounttoken_cookie_and_range():
+    headers = gofile.gofile_file_headers("guest-token-123")
+    assert headers["Cookie"] == "accountToken=guest-token-123"
+    assert headers["Range"] == "bytes=0-"
+    assert headers["Referer"] == "https://gofile.io/"
+    assert "X-Website-Token" in headers
+    assert len(headers["X-Website-Token"]) == 64
+    assert headers["User-Agent"] == gofile.USER_AGENT
 
 
 @pytest.mark.asyncio
