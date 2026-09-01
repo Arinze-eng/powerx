@@ -488,9 +488,10 @@ def create_app(
     ) -> web.StreamResponse:
         # Allow unauthenticated health checks and the Telegram Mini App
         # endpoints. Telegram Web Apps open /upload inside the client without
-        # carrying the API Bearer token, and /upload/complete receives the
-        # browser's gofile.io result. Both only hand off an in-memory record.
-        if request.path in ("/health", "/upload", "/upload/complete"):
+        # carrying the API Bearer token, /upload/transfer receives the chosen
+        # file and proxies it to catbox.to, and /upload/complete receives the
+        # browser's catbox.to result. All only hand off an in-memory record.
+        if request.path in ("/health", "/upload", "/upload/transfer", "/upload/complete"):
             return await handler(request)
         if not api_key:
             return await handler(request)
@@ -507,6 +508,6 @@ def create_app(
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/health", handle_health)
 
-    # Telegram Mini App routes (large file upload via gofile.io).
+    # Telegram Mini App routes (large file upload via catbox.to).
     register_miniapp_routes(app)
     return app
