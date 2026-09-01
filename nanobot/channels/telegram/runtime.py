@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 import re
 import time
 import unicodedata
@@ -26,6 +27,7 @@ from telegram import (
     ReplyParameters,
     Update,
     User,
+    WebAppInfo,
 )
 from telegram.error import BadRequest, InvalidToken, NetworkError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -448,6 +450,9 @@ class TelegramConfig(Base):
     webhook_path: str = "/telegram"
     webhook_secret_token: str = ""
     webhook_max_connections: int = Field(default=4, ge=1, le=100)
+    # Public HTTPS URL of the large-file upload Mini App opened by /upload.
+    # When empty, it is derived from webhook_url (same origin, /upload path).
+    miniapp_url: str = ""
 
     @field_validator("webhook_path")
     @classmethod
@@ -517,6 +522,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("image", "Generate an image with Puter"),
         BotCommand("image_edit", "Edit an image with Puter"),
         BotCommand("video", "Generate a video with Puter"),
+        BotCommand("upload", "Upload a large file for analysis"),
         BotCommand("cancel", "Cancel auth or pending work"),
         BotCommand("discard", "Discard pending attachments"),
     ]
@@ -694,6 +700,7 @@ class TelegramChannel(BaseChannel):
             )
         )
         self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
+        self._app.add_handler(MessageHandler(filters.Regex(r"^/upload(?:@\w+)?$"), self._on_upload))
 
         # Add message handler for text, photos, video, voice, documents, and locations
         self._app.add_handler(
@@ -1390,6 +1397,42 @@ class TelegramChannel(BaseChannel):
             + "\n/image <prompt> — Generate an image with Puter."
             + "\n/image edit <instruction> — Edit an attached or replied-to image with Puter."
             + "\n/image_edit <instruction> — Telegram command-menu alias for /image edit."
+        )
+
+    def _miniapp_url(self) -> str:
+        """Public URL for the large-file upload Mini App (/upload command)."""
+        explicit = self.config.miniapp_url.strip()
+        if explicit:
+            return explicit
+        webhook = self.config.webhook_url.strip()
+        if webhook:
+            parsed = urlparse(webhook)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}/upload"
+        env_url = os.getenv("NANOBOT_MINIAPP_URL", "").strip()
+        if env_url:
+            return env_url
+        return "https://minis-yzdb.onrender.com/upload"
+
+    async def _on_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /upload command — open the large-file upload Mini App."""
+        if not update.message or not update.effective_user:
+            return
+        user = update.effective_user
+        sender_id = self._sender_id(user)
+        if not self.is_allowed(sender_id):
+            await self._send_pairing_code_if_private(sender_id, update.message, user)
+            return
+
+        url = self._miniapp_url()
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Open Upload App", web_app=WebAppInfo(url=url))]
+        ])
+        await update.message.reply_text(
+            "Ready to upload a large file (100 MB+).\n\n"
+            "Tap the button below to open the upload app. Once your file finishes "
+            "uploading, send a message here like: *analyze the file I just uploaded*.",
+            reply_markup=keyboard,
         )
 
     @staticmethod

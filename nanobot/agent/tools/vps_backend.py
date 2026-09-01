@@ -26,6 +26,26 @@ _USERNAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.@-]{0,63}$")
 _PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.:@~=-]{0,127}$")
 _FINGERPRINT_RE = re.compile(r"^(?:SHA256:[A-Za-z0-9+/=]+|MD5:[0-9a-fA-F:]{47})$")
 
+# Hosts whose URLs the VPS ``fetch_url`` may download. tmpfiles.org is the
+# established transfer host; ``gofile.io`` (and its ``*.gofile.io`` upload
+# servers) is used by the Telegram Mini App for large files (100 MB+).
+_ALLOWED_FETCH_HOSTS = {"tmpfiles.org", "gofile.io"}
+
+
+def _is_allowed_fetch_host(host: str) -> bool:
+    host = (host or "").strip().lower()
+    if not host:
+        return False
+    if host in _ALLOWED_FETCH_HOSTS:
+        return True
+    return host.endswith(".gofile.io")
+
+
+def _is_gofile_fetch_url(url: str) -> bool:
+    """Return True when *url* points at a gofile.io share/download resource."""
+    parsed = urlparse(url)
+    return _is_allowed_fetch_host(parsed.netloc)
+
 
 def validate_vps_host(raw: str) -> str:
     value = raw.strip()
@@ -370,10 +390,21 @@ class VPSExecutionBackend:
             await conn.wait_closed()
 
     async def fetch_url(self, url: str, remote_path: str, *, timeout: int = 150) -> str:
-        """Fetch a validated tmpfiles.org URL into the actual writable VPS workspace."""
-        parsed = urlparse(str(url).strip())
-        if parsed.scheme != "https" or parsed.netloc != "tmpfiles.org" or not parsed.path:
-            raise ValueError("remote fetch URL must be an HTTPS tmpfiles.org URL")
+        """Fetch a validated tmpfiles.org or gofile.io URL into the VPS workspace.
+
+        tmpfiles.org links are downloaded directly. gofile.io ``/d/<code>``
+        pages resolve through the gofile download wrapper, so we follow
+        redirects and only accept a non-HTML (binary) download; otherwise an
+        actionable error is returned rather than writing an HTML shell.
+        """
+        fetch_url = str(url).strip()
+        parsed = urlparse(fetch_url)
+        if parsed.scheme not in ("https",):
+            raise ValueError("remote fetch URL must be HTTPS")
+        if not _is_allowed_fetch_host(parsed.netloc) or not parsed.path:
+            raise ValueError(
+                "remote fetch URL must be an HTTPS tmpfiles.org or gofile.io URL"
+            )
         configured = self._configured_workspace(self.config)
         _safe_remote_path(remote_path, configured)
         timeout = max(30, min(int(timeout), _MAX_TIMEOUT))
@@ -381,13 +412,33 @@ class VPSExecutionBackend:
         try:
             root = await self._resolve_workspace(conn)
             remote = self._remote_path(remote_path, root)
-            command = (
-                "curl -fsSL --retry 2 --max-time 120 "
-                f"{shlex.quote(str(url).strip())} -o {shlex.quote(remote)} "
-                f"&& test -s {shlex.quote(remote)}"
-            )
+            if _is_gofile_fetch_url(fetch_url):
+                # gofile.io download pages return an HTML shell unless the request
+                # carries a browser-like User-Agent and follows redirects down to
+                # the actual CDN file. Guard against writing that shell with an
+                # HTML sniff on the downloaded artifact.
+                user_agent = "Mozilla/5.0"
+                command = (
+                    "curl -fsSL --retry 2 --max-time 180 -L "
+                    f"{shlex.quote(fetch_url)} "
+                    f"-H {shlex.quote('User-Agent: ' + user_agent)} "
+                    f"-o {shlex.quote(remote)} "
+                    f"&& test -s {shlex.quote(remote)} "
+                    f"&& ! LC_ALL=C grep -aq '<html' {shlex.quote(remote)}"
+                )
+            else:
+                command = (
+                    "curl -fsSL --retry 2 --max-time 120 "
+                    f"{shlex.quote(fetch_url)} -o {shlex.quote(remote)} "
+                    f"&& test -s {shlex.quote(remote)}"
+                )
             result = await conn.run(command, check=False, timeout=timeout)
             if int(getattr(result, "exit_status", 1)) != 0:
+                if _is_gofile_fetch_url(fetch_url):
+                    raise RuntimeError(
+                        "VPS could not fetch the gofile.io upload (page did not resolve "
+                        "to a direct binary download)"
+                    )
                 raise RuntimeError("VPS could not fetch the tmpfiles.org upload")
             return remote
         finally:

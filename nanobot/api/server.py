@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 from aiohttp import web
 from loguru import logger
 
+from nanobot.api.miniapp import register_miniapp_routes
 from nanobot.config.paths import get_media_dir
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.media_decode import (
@@ -485,8 +486,11 @@ def create_app(
         request: web.Request,
         handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
     ) -> web.StreamResponse:
-        # Allow unauthenticated health checks.
-        if request.path == "/health":
+        # Allow unauthenticated health checks and the Telegram Mini App
+        # endpoints. Telegram Web Apps open /upload inside the client without
+        # carrying the API Bearer token, and /upload/complete receives the
+        # browser's gofile.io result. Both only hand off an in-memory record.
+        if request.path in ("/health", "/upload", "/upload/complete"):
             return await handler(request)
         if not api_key:
             return await handler(request)
@@ -502,4 +506,7 @@ def create_app(
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/health", handle_health)
+
+    # Telegram Mini App routes (large file upload via gofile.io).
+    register_miniapp_routes(app)
     return app

@@ -1130,11 +1130,61 @@ class GatewayHTTPHandler:
             request=request,
         )
 
+    # -- Telegram Mini App (large-file upload) -------------------------------
+
+    def _handle_miniapp_page(self) -> Response:
+        """GET /upload — serve the Telegram Mini App (plain served bytes)."""
+        from nanobot.api.miniapp import MINIAPP_HTML
+
+        return _http_response(
+            MINIAPP_HTML.encode("utf-8"),
+            status=200,
+            content_type="text/html; charset=utf-8",
+            extra_headers=[("Cache-Control", "no-store, no-cache")],
+        )
+
+    async def _handle_miniapp_complete(self, request: WsRequest) -> Response:
+        """GET /upload/complete — record a gofile.io URL reported by the Mini App.
+
+        The gateway's WebSocket HTTP layer only exposes query parameters (not the
+        request body), so the Mini App uses a GET beacon instead of a JSON POST.
+        """
+        from nanobot.api.miniapp import is_gofile_url, upload_store
+
+        query = _parse_query(request.path)
+        url = (_query_first(query, "url") or "").strip()
+        filename = (_query_first(query, "filename") or "upload.bin").strip()[:255]
+        file_id = (_query_first(query, "file_id") or "").strip()[:128]
+        raw_size = (_query_first(query, "size") or "0").strip() or "0"
+        try:
+            size = int(raw_size)
+        except ValueError:
+            size = 0
+        session_key = (_query_first(query, "session_key") or "").strip()
+
+        if not is_gofile_url(url):
+            return _http_error(400, "url must be an HTTPS gofile.io share/page URL")
+        if size < 0 or size > (200 * 1024 * 1024 * 1024):
+            return _http_error(400, "size is outside the supported upload range")
+
+        upload_store.record(
+            session_key or "unknown",
+            url=url,
+            file_id=file_id,
+            filename=filename,
+            size=size,
+        )
+        return _http_json_response({"ok": True, "stored": True, "url": url, "filename": filename})
+
     # -- Misc routes --------------------------------------------------------
 
     async def _dispatch_misc_routes(
         self, connection: Any, request: WsRequest, got: str
     ) -> Response | None:
+        if got == "/upload":
+            return self._handle_miniapp_page()
+        if got == "/upload/complete":
+            return await self._handle_miniapp_complete(request)
         if got == "/api/sessions":
             return await self._handle_sessions_list(request)
         if got == "/api/commands":
