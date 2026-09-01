@@ -245,45 +245,26 @@ def test_model_command_in_help_and_palette() -> None:
 
 
 @pytest.mark.asyncio
-async def test_goal_command_shows_usage_without_args(tmp_path) -> None:
+async def test_goal_command_deprecated_without_args(tmp_path) -> None:
     loop = _make_loop(tmp_path)
     out = await cmd_goal(_ctx(loop, "/goal"))
     assert out is not None
     assert out.channel == "cli"
     assert out.chat_id == "direct"
     assert out.metadata == {"render_as": "text"}
-    assert out.content == "Usage: /goal <long-running task description>"
+    assert "Goal mode is automatic now" in out.content
 
 
 @pytest.mark.asyncio
-async def test_goal_command_rejects_mid_turn_without_session(tmp_path) -> None:
+async def test_goal_command_deprecated_with_args(tmp_path) -> None:
     loop = _make_loop(tmp_path)
-    out = await cmd_goal(_ctx(loop, "/goal do work", args="do work"))
-    assert out is not None
-    assert out.channel == "cli"
-    assert out.chat_id == "direct"
-    assert out.metadata == {"render_as": "text"}
-    assert out.content == (
-        "A task is already running for this chat. "
-        "Use `/stop` first, then send `/goal <long-running task description>` again."
-    )
-
-
-@pytest.mark.asyncio
-async def test_goal_command_marks_turn_and_preserves_explicit_request(tmp_path) -> None:
-    loop = _make_loop(tmp_path)
-    ctx = _ctx_session(loop, "/goal audit the repo", args="audit the repo")
+    ctx = _ctx_session(loop, "/goal do work", args="do work")
     out = await cmd_goal(ctx)
-    assert out is None
-    assert ctx.msg.content == "/goal audit the repo"
-    assert ctx.msg.metadata.get("original_command") == "/goal"
-    assert ctx.msg.metadata.get("original_content") == "/goal audit the repo"
-    assert ctx.msg.metadata.get("goal_requested") is True
-    assert isinstance(ctx.msg.metadata.get("goal_started_at"), int | float)
-    assert len(ctx.turn_scopes) == 1
-    with ctx.turn_scopes[0]:
-        assert goal_mutation_allowed() is True
-    assert goal_mutation_allowed() is False
+    assert out is not None
+    assert "Goal mode is automatic now" in out.content
+    # The command must no longer mutate the turn into an explicit goal.
+    assert ctx.msg.metadata.get("goal_requested") is None
+    assert ctx.turn_scopes == []
 
 
 @pytest.mark.asyncio
@@ -293,12 +274,9 @@ async def test_goal_command_registered_on_router(tmp_path) -> None:
     loop = _make_loop(tmp_path)
     ctx = _ctx_session(loop, "/goal ship it", args="ship it")
     out = await router.dispatch(ctx)
-    assert out is None
-    assert "ship it" in ctx.msg.content
-    assert len(ctx.turn_scopes) == 1
-    with ctx.turn_scopes[0]:
-        assert goal_mutation_allowed() is True
-    assert goal_mutation_allowed() is False
+    assert out is not None
+    assert "Goal mode is automatic now" in out.content
+    assert ctx.turn_scopes == []
 
 
 @pytest.mark.asyncio
@@ -322,14 +300,14 @@ async def test_goal_command_does_not_allow_internal_turn(tmp_path) -> None:
     out = await cmd_goal(ctx)
 
     assert out is not None
-    assert "only be started by a user" in out.content
+    assert "Goal mode is automatic now" in out.content
     assert ctx.turn_scopes == []
 
 
 def test_goal_command_in_help_and_palette() -> None:
     palette = builtin_command_palette()
     goal = next(item for item in palette if item["command"] == "/goal")
-    assert goal["arg_hint"] == "<goal>"
-    assert goal["lifecycle"] == "agent_turn_with_args"
+    assert goal["arg_hint"] == "[deprecated]"
+    assert goal["lifecycle"] == "side_channel"
     assert goal["accepts_args"] is True
-    assert "/goal <goal>" in build_help_text()
+    assert "/goal [deprecated]" in build_help_text()

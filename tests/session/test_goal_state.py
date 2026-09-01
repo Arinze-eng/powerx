@@ -144,9 +144,23 @@ def test_sustained_goal_active_respects_legacy_thread_goal_key():
 
 def test_automatic_goal_lifecycle_is_bounded_and_marked():
     metadata = {}
-    assert begin_automatic_goal(metadata, "Build and verify the feature")
+    active, created = begin_automatic_goal(metadata, "Build and verify the feature")
+    assert (active, created) == (True, True)
     assert metadata[GOAL_STATE_KEY]["status"] == "active"
     assert metadata[GOAL_STATE_KEY]["automatic"] is True
+    # A second automatic classification while active replaces the stale
+    # automatic objective and grants a fresh continuation budget.
+    metadata["_sustained_goal_continuation_rounds"] = 5
+    active, created = begin_automatic_goal(
+        metadata, "Do another deliberate task", allow_replace=True
+    )
+    assert (active, created) == (True, True)
+    assert metadata[GOAL_STATE_KEY]["objective"] == "Do another deliberate task"
+    assert "_sustained_goal_continuation_rounds" not in metadata
+    # Without allow_replace, an active automatic goal is left untouched.
+    active, created = begin_automatic_goal(metadata, "third task")
+    assert (active, created) == (True, False)
+    assert metadata[GOAL_STATE_KEY]["objective"] == "Do another deliberate task"
     assert complete_automatic_goal(metadata, "Verified")
     assert metadata[GOAL_STATE_KEY]["status"] == "completed"
     assert not complete_automatic_goal(metadata, "Again")

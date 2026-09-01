@@ -64,7 +64,8 @@ async def test_ephemeral_runner_enters_and_restores_turn_scopes(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_goal_command_can_implement_plan_from_prior_discussion(tmp_path):
+async def test_telegram_deliberate_turn_creates_automatic_goal(tmp_path):
+    """A complex Telegram message starts a sustained goal without /goal."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.events import InboundMessage
     from nanobot.bus.queue import MessageBus
@@ -96,13 +97,79 @@ async def test_goal_command_can_implement_plan_from_prior_discussion(tmp_path):
             ],
             usage={},
         ),
+        LLMResponse(content="done", tool_calls=[], usage={}),
+    ])
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
+    session = loop.sessions.get_or_create("telegram:direct")
+    session.add_message("user", "Let's agree on the migration implementation.")
+    session.add_message("assistant", "Use the staged migration plan and run integration tests.")
+
+    # No /goal command: an ordinary multi-step Telegram task enters deliberate
+    # mode, which begins an automatic sustained goal for the turn.
+    result = await loop._process_message(
+        InboundMessage(
+            channel="telegram",
+            sender_id="user",
+            chat_id="direct",
+            content=(
+                "implement the plan above, build and verify the entire repository, "
+                "run the tests, then push to github"
+            ),
+            metadata={"telegram_deliberate_task": True},
+        )
+    )
+
+    assert result is not None
+    assert result.content == "done"
+    assert goal_mutation_allowed() is False
+    assert session.metadata[GOAL_STATE_KEY]["status"] == "completed"
+    assert session.metadata[GOAL_STATE_KEY]["automatic"] is True
+    first_request = provider.chat_with_retry.await_args_list[0].kwargs["messages"]
+    assert "staged migration plan" in str(first_request)
+    assert "implement the plan above" in str(first_request)
+    # The goal runtime guidance rides along as hidden runtime context on the
+    # persisted user turn, never in public history.
+    guidance_message = next(
+        m
+        for m in session.messages
+        if m.get("role") == "user" and _GOAL_RUNTIME_GUIDANCE_TAG in str(m.get("content"))
+    )
+    assert _GOAL_RUNTIME_GUIDANCE_TAG not in str(
+        public_history_message(guidance_message)["content"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_goal_command_deprecated_and_agent_turns_can_use_goal_tools(tmp_path):
+    """/goal is a side-channel notice now; agent turns keep goal-tool access."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_with_retry = AsyncMock(side_effect=[
         LLMResponse(
-            content="trying to start another goal",
+            content="recording the agreed plan",
             tool_calls=[
                 ToolCallRequest(
-                    id="call_create_again",
+                    id="call_create",
                     name="create_goal",
-                    arguments={"objective": "Start an unrelated follow-up."},
+                    arguments={
+                        "objective": "Implement the agreed migration plan and run its tests.",
+                    },
+                )
+            ],
+            usage={},
+        ),
+        LLMResponse(
+            content="closing goal",
+            tool_calls=[
+                ToolCallRequest(
+                    id="call_update",
+                    name="update_goal",
+                    arguments={"action": "complete", "recap": "Implemented and tested."},
                 )
             ],
             usage={},
@@ -115,7 +182,8 @@ async def test_goal_command_can_implement_plan_from_prior_discussion(tmp_path):
     session.add_message("user", "Let's agree on the migration implementation.")
     session.add_message("assistant", "Use the staged migration plan and run integration tests.")
 
-    result = await loop._process_message(
+    # 1) The /goal command no longer starts an agent turn — it explains the new behavior.
+    notice = await loop._process_message(
         InboundMessage(
             channel="cli",
             sender_id="user",
@@ -123,21 +191,30 @@ async def test_goal_command_can_implement_plan_from_prior_discussion(tmp_path):
             content="/goal implement the plan above",
         )
     )
+    assert notice is not None
+    assert "Goal mode is automatic now" in notice.content
+    provider.chat_with_retry.assert_not_awaited()
+
+    # 2) A normal user turn can still create/complete goals via tools when the
+    #    turn carries explicit-goal metadata (legacy clients / other channels).
+    result = await loop._process_message(
+        InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="direct",
+            content="implement the plan above",
+            metadata={"goal_requested": True},
+        )
+    )
 
     assert result is not None
     assert result.content == "done"
     assert goal_mutation_allowed() is False
     assert session.metadata[GOAL_STATE_KEY]["status"] == "completed"
-    first_request = provider.chat_with_retry.await_args_list[0].kwargs["messages"]
-    assert "staged migration plan" in str(first_request)
-    assert "/goal implement the plan above" in str(first_request)
-    assert _GOAL_RUNTIME_GUIDANCE_TAG in str(first_request)
     final_request = provider.chat_with_retry.await_args_list[-1].kwargs["messages"]
-    assert "create_goal is unavailable for this turn" in str(final_request)
-    assert _GOAL_RUNTIME_GUIDANCE_TAG in str(session.messages[2]["content"])
-    assert _GOAL_RUNTIME_GUIDANCE_TAG not in str(
-        public_history_message(session.messages[2])["content"]
-    )
+    assert "staged migration plan" in str(final_request)
+    assert "implement the plan above" in str(final_request)
+    assert _GOAL_RUNTIME_GUIDANCE_TAG in str(final_request)
 
 
 @pytest.mark.asyncio

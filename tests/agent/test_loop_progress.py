@@ -370,7 +370,7 @@ class TestToolEventProgress:
 
     @pytest.mark.asyncio
     async def test_goal_turn_keeps_file_edit_progress_for_webui(self, tmp_path: Path) -> None:
-        """The /goal command rewrites the prompt but must not bypass WebUI file-edit progress."""
+        """A sustained-goal turn must not bypass WebUI file-edit progress."""
         bus = MessageBus()
         provider = MagicMock()
         provider.supports_progress_deltas = True
@@ -423,8 +423,8 @@ class TestToolEventProgress:
             channel="websocket",
             sender_id="u1",
             chat_id="chat1",
-            content="/goal create goal file",
-            metadata={"_wants_stream": True},
+            content="create goal file",
+            metadata={"_wants_stream": True, "goal_requested": True},
         ))
 
         outbound = []

@@ -108,11 +108,11 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
     ),
     BuiltinCommandSpec(
         "/goal",
-        "Start long-running goal",
-        "Tell the agent to treat the request as a long-running goal.",
+        "Deprecated — goal mode is automatic",
+        "Just send your task as a normal message; the agent treats complex requests as sustained goals automatically.",
         "activity",
-        "<goal>",
-        lifecycle="agent_turn_with_args",
+        "[deprecated]",
+        lifecycle="side_channel",
         accepts_args=True,
     ),
     BuiltinCommandSpec(
@@ -885,45 +885,17 @@ async def cmd_history(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_goal(ctx: CommandContext) -> OutboundMessage | None:
-    """Mark this turn as an explicit sustained-goal request."""
-    from nanobot.agent.goal_permission import goal_mutation_permission
-
-    goal = ctx.args.strip()
-    if not goal:
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content="Usage: /goal <long-running task description>",
-            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
-        )
-    if ctx.session is None:
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content=(
-                "A task is already running for this chat. "
-                "Use `/stop` first, then send `/goal <long-running task description>` again."
-            ),
-            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
-        )
-    if not ctx.is_user_turn:
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content="Goal mode can only be started by a user `/goal <task>` command.",
-            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
-        )
-
-    ctx.turn_scopes.append(goal_mutation_permission(True))
-    ctx.msg.metadata = {
-        **dict(ctx.msg.metadata or {}),
-        "original_command": "/goal",
-        "original_content": ctx.raw,
-        "goal_requested": True,
-        "goal_started_at": time.time(),
-    }
-    ctx.msg.content = ctx.raw
-    return None
+    """Deprecated: goal mode now activates automatically for Telegram tasks."""
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=(
+            "Goal mode is automatic now — just send your task as a normal "
+            "message and the agent will plan, keep working across turns, "
+            "and finish it. No command needed."
+        ),
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
 
 
 async def cmd_pairing(ctx: CommandContext) -> OutboundMessage:

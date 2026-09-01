@@ -529,7 +529,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("restart", "Restart the bot"),
         BotCommand("status", "Show bot status"),
         BotCommand("history", "Show recent conversation messages"),
-        BotCommand("goal", "Start a sustained objective (long-running task)"),
+        BotCommand("goal", "Deprecated — goal mode is automatic, just send your task"),
         BotCommand("trigger", "Create a named local trigger"),
         BotCommand("pairing", "Manage DM pairing (approve/deny/list)"),
         BotCommand("model", "Switch runtime model preset"),

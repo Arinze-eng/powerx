@@ -20,15 +20,40 @@ MAX_GOAL_OBJECTIVE_CHARS = 4000
 _LEGACY_GOAL_STATE_SESSION_KEY = "thread_goal"
 _MAX_OBJECTIVE_WS = 600
 AUTO_GOAL_MARKER = "automatic"
+# Same key used by nanobot.session.turn_continuation for its continuation budget.
+_GOAL_CONTINUATION_ROUNDS_KEY = "_sustained_goal_continuation_rounds"
 
 
-def begin_automatic_goal(metadata: MutableMapping[str, Any], objective: str) -> bool:
-    """Create a bounded internal goal for an automatically classified task."""
+def reset_goal_continuation_rounds_local(metadata: MutableMapping[str, Any]) -> None:
+    """Clear the automatic-goal continuation budget.
+
+    Mirrors ``turn_continuation.reset_goal_continuation_rounds`` without a
+    circular import; both operate on the same metadata key.
+    """
+    metadata.pop(_GOAL_CONTINUATION_ROUNDS_KEY, None)
+
+
+def begin_automatic_goal(
+    metadata: MutableMapping[str, Any],
+    objective: str,
+    *,
+    allow_replace: bool = False,
+) -> tuple[bool, bool]:
+    """Create a bounded internal goal for an automatically classified task.
+
+    Returns ``(active, freshly_created)`` so callers can decide whether this
+    turn should also receive explicit goal-mutation permission.
+
+    When ``allow_replace`` is True, an active *automatic* goal (and no explicit
+    ``/goal`` one) may be replaced so a new user request can take over the
+    automatic-goal machinery instead of being pinned to a stale objective.
+    """
     if sustained_goal_active(metadata):
-        return False
+        if not allow_replace or not is_automatic_goal(metadata):
+            return True, False
     objective_text = " ".join((objective or "").split()).strip()[:MAX_GOAL_OBJECTIVE_CHARS]
     if not objective_text:
-        return False
+        return sustained_goal_active(metadata), False
     metadata[GOAL_STATE_KEY] = {
         "status": "active",
         "objective": objective_text,
@@ -37,7 +62,8 @@ def begin_automatic_goal(metadata: MutableMapping[str, Any], objective: str) -> 
         AUTO_GOAL_MARKER: True,
     }
     discard_legacy_goal_state_key(metadata)
-    return True
+    reset_goal_continuation_rounds_local(metadata)
+    return True, True
 
 
 def is_automatic_goal(metadata: Mapping[str, Any] | None) -> bool:
