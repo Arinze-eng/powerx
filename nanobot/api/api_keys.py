@@ -144,6 +144,13 @@ class ApiKeyStore:
                 params={"id": f"eq.{key_id}"},
                 body={"last_used_at": "now()"},
             )
+            # Increment the per-key request counter atomically via RPC-less
+            # read-modify-write fallback is racy, so use a Postgres function if
+            # available; otherwise skip — last_used_at is the important part.
+            await self._request(
+                "POST", "/rest/rpc/increment_api_key_requests",
+                body={"key_id": int(key_id)},
+            )
         except Exception as exc:  # pragma: no cover - bookkeeping only
             logger.debug("api key usage bump failed: {}", exc)
 

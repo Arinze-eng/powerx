@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from typing import Any
+
+from loguru import logger
+
 from nanobot.agent.hook import (
     AgentHook,
     AgentHookContext,
@@ -22,11 +26,29 @@ class SupabaseCreditHook(AgentHook):
         self._context = context
         self._supabase = SupabaseAuth()
 
+    async def _resolve_account(self) -> dict[str, Any] | None:
+        """Look up the Telegram account for this turn (used by API-bridge turns)."""
+        chat_id = str(self._context.chat_id or "").strip()
+        if not chat_id.isdigit():
+            return None
+        try:
+            rows = await self._supabase._request(  # noqa: SLF001 - read-only lookup
+                "GET", "/rest/v1/telegram_accounts", service=True,
+                params={"telegram_user_id": f"eq.{chat_id}", "limit": "1", "select": "*"},
+            )
+            return rows[0] if isinstance(rows, list) and rows else None
+        except Exception as exc:
+            logger.debug("account resolution failed for {}: {}", chat_id, exc)
+            return None
+
     async def before_iteration(self, context: AgentHookContext) -> None:
         if not self._supabase.enabled or self._context.channel != "telegram":
             return
         metadata = self._context.metadata or {}
         user_id = metadata.get("supabase_user_id")
+        if not user_id:
+            account = await self._resolve_account()
+            user_id = str(account.get("agentx_user_id")) if account else None
         if not user_id:
             raise CreditExhaustedError(
                 "Your Supabase account is not linked. Use /signup or /signin before sending tasks."
