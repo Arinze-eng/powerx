@@ -36,6 +36,13 @@ def _api_port() -> int:
         cfg_path = Path(get_config_path())
         if cfg_path.exists():
             data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            # Single-process (Render gateway) deployment: the public reverse
+            # proxy forwards every non-Telegram path — including /v1/* — to
+            # the WebUI websocket channel, so the API lives on the webhook
+            # origin itself (standard HTTPS port).
+            ws = (data.get("channels") or {}).get("websocket") or {}
+            if isinstance(ws, dict) and ws.get("enabled"):
+                return 443
             port = data.get("api", {}).get("port")
             if isinstance(port, int):
                 return port
