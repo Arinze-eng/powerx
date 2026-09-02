@@ -23,12 +23,12 @@ from nanobot.agent.tools.context import ToolContext
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["analyze", "backtest", "buy", "sell", "positions", "account", "close"],
-                "description": "The trading action to perform: 'analyze' runs strategy analysis on a symbol (use for 'what do you think about X', 'analyze X', technical signals); 'backtest' runs a historical backtest; 'buy'/'sell' submit paper orders (use for 'buy/sell X', 'open a position'); 'positions' lists open positions (use for 'what am I holding', 'my positions'); 'account' shows paper account info (use for 'how much money do I have', 'account balance'); 'close' closes a position.",
+                "enum": ["buy", "sell", "positions", "account", "close"],
+                "description": "The trading action to perform: 'buy'/'sell' submit paper orders (use for 'buy/sell X', 'open a position'); 'positions' lists open positions (use for 'what am I holding', 'my positions'); 'account' shows paper account info (use for 'how much money do I have', 'account balance'); 'close' closes a position.",
             },
             "symbol": {
                 "type": "string",
-                "description": "Stock or FX symbol, e.g. AAPL, MSFT, TSLA. Use this for analyze/backtest/buy/sell/close.",
+                "description": "Stock or FX symbol, e.g. AAPL, MSFT, TSLA. Use this for buy/sell/close.",
             },
             "qty": {
                 "type": "number",
@@ -38,18 +38,6 @@ from nanobot.agent.tools.context import ToolContext
                 "type": "string",
                 "enum": ["buy", "sell"],
                 "description": "Order side (for buy/sell actions).",
-            },
-            "pairs": {
-                "type": "string",
-                "description": "Comma-separated FX pairs for backtest/analyze, e.g. EURGBP,EURCAD.",
-            },
-            "start": {
-                "type": "string",
-                "description": "Start date (YYYY-MM-DD) for backtest or bar data.",
-            },
-            "end": {
-                "type": "string",
-                "description": "End date (YYYY-MM-DD) for backtest or bar data.",
             },
             "limit_price": {
                 "type": "number",
@@ -72,14 +60,12 @@ class AlpacaTradeTool(Tool):
     def description(self) -> str:
         return (
             "Trade US stocks via the Alpaca paper-trading account. Use this tool whenever the user "
-            "asks about trading, positions, account balance, buying/selling stocks, market analysis, "
-            "or technical signals. Actions: "
-            "'analyze' runs the five-cluster strategy engine on a symbol; "
-            "'backtest' runs a historical backtest; 'buy'/'sell' submit paper orders; "
-            "'positions' lists open positions; 'account' shows paper account info; "
-            "'close' closes a position."
+            "asks about trading, positions, account balance, buying/selling stocks, or closing a "
+            "position. Actions: 'buy'/'sell' submit paper orders; 'positions' lists open positions; "
+            "'account' shows paper account info; 'close' closes a position. For market analysis or "
+            "backtesting, run them as normal coding tasks in the novita_sandbox/VPS execution backend "
+            "instead - do not use this tool for heavy compute. Paper trading only."
         )
-
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
         return True
@@ -163,10 +149,6 @@ class AlpacaTradeTool(Tool):
                 return await self._place_order(kwargs)
             elif action == "close":
                 return await self._close_position(kwargs)
-            elif action == "analyze":
-                return await self._analyze(kwargs)
-            elif action == "backtest":
-                return await self._backtest(kwargs)
             else:
                 return ToolResult.error(f"Unknown action: {action}")
         except Exception as exc:
@@ -230,88 +212,3 @@ class AlpacaTradeTool(Tool):
             return ToolResult.error("symbol is required to close a position")
         result = adapter.close_position(symbol)
         return ToolResult(f"Position closed: {result['symbol']}")
-
-    async def _analyze(self, params: dict) -> ToolResult:
-        symbol = params.get("symbol", "") or params.get("pairs", "")
-        if not symbol:
-            return ToolResult.error("symbol or pairs is required for analysis")
-        pairs = [p.strip().upper() for p in symbol.split(",") if p.strip()]
-        from nanobot.trading.config import AgentConfig
-        from nanobot.trading.data_loader import load_market_data
-        from nanobot.trading.backtest_engine import BacktestEngine
-
-        config = AgentConfig(pairs=tuple(pairs))
-        try:
-            market_data = load_market_data(
-                pairs,
-                config.start,
-                config.end,
-                config.timeframe,
-                str(config.data_dir) if config.data_dir else None,
-            )
-        except Exception as exc:
-            return ToolResult.error(f"Data loading failed: {exc}")
-        engine = BacktestEngine(config)
-        result = engine.run(dict(market_data))
-        last_decisions = [d for d in result["decisions"] if d.get("action") in ("signal", "no_trade")]
-        if not last_decisions:
-            return ToolResult("No analysis generated — insufficient data.")
-        latest = last_decisions[-1]
-        lines = [
-            f"Strategy Analysis for {symbol}",
-            f"  Regime: {latest.get('regime', 'N/A')}",
-            f"  AWD Confidence: {latest.get('awd', 0):.2f}",
-            f"  TMA Slope: {latest.get('tma_slope', 'N/A')}",
-            f"  Basket Correlation: {latest.get('basket_correlation', 0):.2f}",
-            f"  Cluster: {latest.get('cluster', 'None')}",
-            f"  Direction: {latest.get('direction', 0)}",
-            f"  Killzone: {'Yes' if latest.get('killzone_active') else 'No'}",
-            f"  Reason: {latest.get('reason', '')}",
-        ]
-        return ToolResult("\n".join(lines))
-
-    async def _backtest(self, params: dict) -> ToolResult:
-        pairs_str = params.get("pairs", "") or params.get("symbol", "")
-        if not pairs_str:
-            return ToolResult.error("pairs is required for backtest")
-        pairs = [p.strip().upper() for p in pairs_str.split(",") if p.strip()]
-        start = params.get("start")
-        end = params.get("end")
-        from nanobot.trading.config import AgentConfig
-        from nanobot.trading.data_loader import load_market_data
-        from nanobot.trading.backtest_engine import BacktestEngine
-
-        config = AgentConfig(pairs=tuple(pairs), start=start, end=end)
-        try:
-            market_data = load_market_data(
-                pairs, start, end, config.timeframe, str(config.data_dir) if config.data_dir else None
-            )
-        except Exception as exc:
-            return ToolResult.error(f"Data loading failed: {exc}")
-        engine = BacktestEngine(config)
-        result = engine.run(dict(market_data))
-        summary = engine.write_results(result)
-        combined = summary.get("combined", {})
-        lines = [
-            f"Backtest Results for {pairs_str}",
-            f"  Trades: {combined.get('trades', 0)}",
-            f"  Wins: {combined.get('wins', 0)} | Losses: {combined.get('losses', 0)}",
-            f"  Win Rate: {combined.get('win_rate', 0)*100:.1f}%",
-            f"  Total R: {combined.get('total_r', 0):.2f}R",
-            f"  Avg R/Trade: {combined.get('average_r_per_trade', 0):.2f}R",
-            f"  Max Drawdown: {combined.get('max_drawdown_pct', 0):.1f}%",
-            f"  Sharpe: {combined.get('sharpe_trade_r', 0):.2f}",
-        ]
-        if "in_sample" in summary:
-            ins = summary["in_sample"]
-            lines.append("  --- In-Sample ---")
-            lines.append(
-                f"  Trades: {ins.get('trades', 0)} | Win Rate: {ins.get('win_rate', 0)*100:.1f}% | Total R: {ins.get('total_r', 0):.2f}R"
-            )
-        if "out_of_sample" in summary:
-            oos = summary["out_of_sample"]
-            lines.append("  --- Out-of-Sample ---")
-            lines.append(
-                f"  Trades: {oos.get('trades', 0)} | Win Rate: {oos.get('win_rate', 0)*100:.1f}% | Total R: {oos.get('total_r', 0):.2f}R"
-            )
-        return ToolResult("\n".join(lines))

@@ -87,24 +87,26 @@ using the analyst's directional bias rather than forcing a trend trade.
 ## Usage
 
 The bot is an AI agent. When a user asks anything about trading, stocks, positions, account
-balance, or the market, use the `alpaca_trade` tool directly as a normal conversational task
-— there are no slash commands for trading. The tool is always available and connected to the
-Alpaca paper-trading account.
+balance, or the market, handle it as a normal task — there are no slash commands for trading.
 
-- "What do you think about AAPL?" → `alpaca_trade` with `action=analyze`, `symbol=AAPL`
+**Live account actions** (fast, use the `alpaca_trade` tool directly):
 - "Buy 5 shares of MSFT" → `alpaca_trade` with `action=buy`, `symbol=MSFT`, `qty=5`
 - "Sell half my TSLA" → `alpaca_trade` with `action=sell`, `symbol=TSLA`, `qty=<qty>`
 - "What am I holding?" → `alpaca_trade` with `action=positions`
 - "How much money do I have?" → `alpaca_trade` with `action=account`
 - "Close my position in AAPL" → `alpaca_trade` with `action=close`, `symbol=AAPL`
-- "Backtest this strategy on AAPL" → `alpaca_trade` with `action=backtest`, `symbol=AAPL`
 
-Always pick the appropriate action and call the tool yourself. Explain the result to the user
-in plain language. Trading is **unrestricted** — execute whatever the user asks for: any symbol,
-any quantity, market or limit orders, open and close positions freely. Do not add your own
-size limits, minimums, or "are you sure" gates; if the user asks to buy, sell, or close, do it
-with the given quantity and parameters. There are no per-trade risk ceilings on your side.
-This is paper trading — no real money moves.
+**Analysis & backtesting** (CPU-heavy) — **do NOT run these on the web server.** Treat them as
+ordinary coding tasks and execute them in the isolated execution backend using the
+`novita_sandbox` tool (Novita Sandbox or VPS, whichever the admin selected): write a Python
+script that pulls data (e.g. yfinance / Alpaca history) and computes indicators or runs a
+backtest, then `run` it there and report the results. This keeps the service responsive.
+
+Trading is **unrestricted** — execute whatever the user asks for: any symbol, any quantity,
+market or limit orders, open and close positions freely. Do not add your own size limits,
+minimums, or "are you sure" gates; if the user asks to buy, sell, or close, do it with the given
+quantity and parameters. There are no per-trade risk ceilings on your side. This is paper
+trading — no real money moves.
 
 **This is technical research, not financial advice or a promise of
 profitability. Paper trading only.**

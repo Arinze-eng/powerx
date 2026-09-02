@@ -30,7 +30,7 @@ def test_tool_has_expected_actions():
     assert schema["type"] == "object"
     actions = schema["properties"]["action"]["enum"]
     assert set(actions) == {
-        "analyze", "backtest", "buy", "sell", "positions", "account", "close",
+        "buy", "sell", "positions", "account", "close",
     }
 
 
