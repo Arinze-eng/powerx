@@ -13,14 +13,83 @@ existing credit system when used against ``/v1/chat/completions``.
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from loguru import logger
 
-from nanobot.api.api_keys import ApiKeyError, ApiKeyStore
+from nanobot.api.api_keys import ApiKeyError, ApiKeyStore, hash_api_key  # noqa: F401 (re-export)
 
 _MAX_KEYS_PER_USER = 10
+
+
+def _api_port() -> int:
+    raw = os.getenv("NANOBOT_API_PORT", "").strip()
+    if raw.isdigit():
+        return int(raw)
+    try:
+        from nanobot.config.loader import get_config_path
+
+        cfg_path = Path(get_config_path())
+        if cfg_path.exists():
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            port = data.get("api", {}).get("port")
+            if isinstance(port, int):
+                return port
+    except Exception as exc:  # config unreadable — fall back to the default port
+        logger.debug("api port lookup from config failed: {}", exc)
+    return 8900
+
+
+def _webhook_origin(parsed) -> str:
+    """scheme://host[:port] of the webhook URL (default HTTPS ports omitted)."""
+    host = parsed.hostname or ""
+    if ":" in host:  # IPv6 literal
+        host = f"[{host}]"
+    netloc = host if parsed.port in (None, 443) else f"{host}:{parsed.port}"
+    return f"{parsed.scheme}://{netloc}"
+
+
+def resolve_base_url() -> str:
+    """Public base URL of the OpenAI-compatible API, e.g. ``https://api.powerx.ai``.
+
+    Resolution order:
+    1. ``NANOBOT_API_PUBLIC_URL`` / ``API_SERVER_URL`` env override.
+    2. Derived from the Telegram webhook URL host (the bot's public origin),
+       with the API port attached — works when both run on the same server.
+    Returns "" when neither is available; callers must handle that.
+    """
+    for var in ("NANOBOT_API_PUBLIC_URL", "API_SERVER_URL"):
+        value = os.getenv(var, "").strip().rstrip("/")
+        if value and "YOUR-SERVER" not in value.upper():
+            return value
+    try:
+        from nanobot.config.loader import get_config_path
+
+        cfg_path = Path(get_config_path())
+        if cfg_path.exists():
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            telegram = data.get("channels", {}).get("telegram", {}) or {}
+            webhook = str(telegram.get("webhook_url", "")).strip()
+            parsed = urlparse(webhook)
+            if parsed.scheme == "https" and parsed.hostname:
+                api_port = _api_port()
+                # API on standard HTTPS port → same origin as the webhook.
+                if api_port in (443, None):
+                    return _webhook_origin(parsed)
+                host = parsed.hostname
+                if ":" in host:  # IPv6 literal
+                    host = f"[{host}]"
+                # Webhook itself sits on the API port → already the right origin.
+                if parsed.port == api_port:
+                    return _webhook_origin(parsed)
+                return f"https://{host}:{api_port}"
+    except Exception as exc:  # malformed config etc.
+        logger.debug("api base url derivation failed: {}", exc)
+    return ""
 
 DOC_TEMPLATE = """🔌 <b>PowerX Agent API</b> — OpenAI-compatible
 
@@ -65,20 +134,21 @@ Send <code>multipart/form-data</code> with these fields:
 Need help? Just ask me here in Telegram."""
 
 
-def _base_url() -> str:
-    return (
-        os.getenv("NANOBOT_API_PUBLIC_URL", "").strip().rstrip("/")
-        or os.getenv("API_SERVER_URL", "").strip().rstrip("/")
-        or "https://YOUR-SERVER-HOST:8900"
-    )
-
-
 def _model_name() -> str:
     return os.getenv("NANOBOT_API_MODEL_NAME", "").strip() or "powerx-agent"
 
 
 def render_docs() -> str:
-    return DOC_TEMPLATE.format(base_url=_base_url(), model=_model_name())
+    base_url = resolve_base_url()
+    if not base_url:
+        return (
+            "⚠️ The API server address is not configured on this bot yet.\n\n"
+            "The admin must set NANOBOT_API_PUBLIC_URL (e.g. https://api.example.com) "
+            "in the server environment, or run the bot in Telegram webhook mode so the "
+            "address can be derived automatically. Everything else — /apikey, "
+            "/listapikeys, /revokeapikey — already works."
+        )
+    return DOC_TEMPLATE.format(base_url=base_url, model=_model_name())
 
 
 def _require_account(message: Any, account: dict[str, Any] | None) -> str | None:
@@ -136,11 +206,13 @@ async def _cmd_create_key(store: ApiKeyStore, message: Any, user_id: str, telegr
         agentx_user_id=user_id, telegram_user_id=telegram_id, name=name or "default"
     )
     key_id = row.get("id", "?")
+    base_url = resolve_base_url()
+    where = f"\nBase URL: {base_url}/v1 (see /apidoc for examples)" if base_url else ""
     await message.reply_text(
         "✅ <b>New API key created</b>\n\n"
         f"<code>{plain}</code>\n\n"
         "⚠️ Copy this key now — it is shown only once and cannot be retrieved later.\n\n"
-        f"Name: {name or 'default'} (ID {key_id})\n"
+        f"Name: {name or 'default'} (ID {key_id}){where}\n"
         "Use /apidoc for integration docs, /listapikeys to manage keys.",
         parse_mode="HTML",
     )
