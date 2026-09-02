@@ -545,6 +545,12 @@ class GatewayHTTPHandler:
         if response is not None:
             return response
 
+        # Public OpenAI-compatible API (/v1/*) bridged onto the gateway agent.
+        if got.startswith("/v1/"):
+            from nanobot.api.gateway_routes import dispatch_v1_routes
+
+            return await dispatch_v1_routes(request, got)
+
         # Automation routes
         response = await self._dispatch_automation_routes(request, got)
         if response is not None:
