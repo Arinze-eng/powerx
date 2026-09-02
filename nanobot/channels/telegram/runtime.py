@@ -51,13 +51,7 @@ from nanobot.security.network import validate_url_target
 from nanobot.supabase_auth import SupabaseAuth, SupabaseAuthError
 from nanobot.api.api_keys import ApiKeyStore
 from nanobot.channels.telegram.api_platform import handle_api_command
-from nanobot.trading.alpaca_commands import is_alpaca_command, handle_alpaca_command
-from nanobot.trading.trading_commands import (
-    handle_trade_command,
-    handle_backtest_command,
-    is_trade_command,
-    is_backtest_command,
-)
+from nanobot.trading.alpaca_commands import handle_alpaca_command
 from nanobot.utils.gofile import upload_gofile_stream
 from nanobot.utils.helpers import detect_image_mime, split_message
 from nanobot.utils.logging_bridge import redirect_lib_logging
@@ -564,8 +558,6 @@ class TelegramChannel(BaseChannel):
         BotCommand("apidoc", "Show API integration documentation"),
         BotCommand("listapikeys", "List your API keys and usage"),
         BotCommand("revokeapikey", "Revoke all your API keys"),
-        BotCommand("trade", "Trading: analyze, buy, sell, positions"),
-        BotCommand("backtest", "Run a strategy backtest"),
         BotCommand("alpaca", "Connect/disconnect Alpaca account"),
         BotCommand("cancel", "Cancel auth or pending work"),
         BotCommand("discard", "Discard pending attachments"),
@@ -574,7 +566,7 @@ class TelegramChannel(BaseChannel):
     # Regex for slash commands routed to AgentLoop via ``_forward_command``.
     # Hyphenated ``dream-*`` commands stay on a separate handler (below).
     TELEGRAM_BUS_SLASH_COMMAND_RE = re.compile(
-        r"^/(?:new|stop|restart|status|dream|history|goal|trigger|pairing|model|skill|signup|signin|signout|credits|credit|buy|verify-payment|verify_payment|image|image_edit|video|trade|backtest|cancel|discard)(?:@\w+)?(?:\s+.*)?$"
+        r"^/(?:new|stop|restart|status|dream|history|goal|trigger|pairing|model|skill|signup|signin|signout|credits|credit|buy|verify-payment|verify_payment|image|image_edit|video|cancel|discard)(?:@\w+)?(?:\s+.*)?$"
     )
 
     # Commands for the public OpenAI-compatible API platform (key management).
@@ -2142,18 +2134,6 @@ class TelegramChannel(BaseChannel):
             return
         if command_name == "/alpaca" or content.strip().startswith("/alpaca "):
             response = await handle_alpaca_command(
-                account, content, message.chat_id, message.message_id
-            )
-            await message.reply_text(response)
-            return
-        if is_trade_command(content):
-            response = await handle_trade_command(
-                account, content, message.chat_id, message.message_id
-            )
-            await message.reply_text(response)
-            return
-        if is_backtest_command(content):
-            response = await handle_backtest_command(
                 account, content, message.chat_id, message.message_id
             )
             await message.reply_text(response)

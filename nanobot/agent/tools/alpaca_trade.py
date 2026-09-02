@@ -9,7 +9,6 @@ environment keys are used as fallback.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from typing import Any
 
@@ -26,11 +25,11 @@ from nanobot.agent.tools.context import ToolContext
             "action": {
                 "type": "string",
                 "enum": ["analyze", "backtest", "buy", "sell", "positions", "account", "close"],
-                "description": "The trading action to perform.",
+                "description": "The trading action to perform: 'analyze' runs strategy analysis on a symbol (use for 'what do you think about X', 'analyze X', technical signals); 'backtest' runs a historical backtest; 'buy'/'sell' submit paper orders (use for 'buy/sell X', 'open a position'); 'positions' lists open positions (use for 'what am I holding', 'my positions'); 'account' shows paper account info (use for 'how much money do I have', 'account balance'); 'close' closes a position.",
             },
             "symbol": {
                 "type": "string",
-                "description": "Stock or FX symbol, e.g. AAPL or EURGBP.",
+                "description": "Stock or FX symbol, e.g. AAPL, MSFT, TSLA. Use this for analyze/backtest/buy/sell/close.",
             },
             "qty": {
                 "type": "number",
@@ -73,7 +72,9 @@ class AlpacaTradeTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Trade stocks and FX via Alpaca paper trading. Actions: "
+            "Trade US stocks via the Alpaca paper-trading account. Use this tool whenever the user "
+            "asks about trading, positions, account balance, buying/selling stocks, market analysis, "
+            "or technical signals. Actions: "
             "'analyze' runs the five-cluster strategy engine on a symbol; "
             "'backtest' runs a historical backtest; 'buy'/'sell' submit paper orders; "
             "'positions' lists open positions; 'account' shows paper account info; "
@@ -83,32 +84,27 @@ class AlpacaTradeTool(Tool):
     def enabled(self, ctx: ToolContext) -> bool:
         return True
 
-    def _get_credentials(self, ctx: ToolContext) -> dict[str, str] | None:
-        """Resolve per-user Alpaca credentials from Supabase or env."""
-        account = getattr(ctx, "account", None)
-        if account and account.get("telegram_user_id"):
+    def _get_credentials(self) -> dict[str, str] | None:
+        """Resolve Alpaca credentials.
+
+        Priority: a per-user credential stored via /alpaca connect (read from
+        Supabase when the request context carries a known Telegram sender), then
+        the server-level ALPACA_API_KEY / ALPACA_SECRET_KEY environment
+        variables. Returns None when neither is available.
+        """
+        user_id = self._current_telegram_user_id()
+        if user_id:
             try:
                 from nanobot.trading.alpaca_credentials import AlpacaCredentialStore
 
                 store = AlpacaCredentialStore()
                 if store.enabled:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        import concurrent.futures
-
-                        with concurrent.futures.ThreadPoolExecutor() as pool:
-                            creds = pool.submit(
-                                asyncio.run,
-                                store.get_credentials(int(account["telegram_user_id"])),
-                            ).result()
-                    else:
-                        creds = loop.run_until_complete(
-                            store.get_credentials(int(account["telegram_user_id"]))
-                        )
+                    creds = asyncio.run(store.get_credentials(user_id))
                     if creds:
                         return creds
             except Exception as exc:
                 logger.debug(f"Could not load per-user Alpaca credentials: {exc}")
+
         api_key = os.getenv("ALPACA_API_KEY", "")
         secret_key = os.getenv("ALPACA_SECRET_KEY", "")
         if api_key and secret_key:
@@ -119,8 +115,21 @@ class AlpacaTradeTool(Tool):
             }
         return None
 
-    def _get_adapter(self, ctx: ToolContext):
-        creds = self._get_credentials(ctx)
+    @staticmethod
+    def _current_telegram_user_id() -> int | None:
+        """Return the authenticated Telegram sender id from the request context, if any."""
+        try:
+            from nanobot.agent.tools.context import current_request_context
+
+            ctx = current_request_context()
+            metadata = getattr(ctx, "metadata", {}) if ctx is not None else {}
+            sender = (metadata or {}).get("telegram_user_id")
+            return int(sender) if sender else None
+        except Exception:
+            return None
+
+    def _get_adapter(self):
+        creds = self._get_credentials()
         if not creds:
             raise RuntimeError(
                 "Alpaca credentials not configured. Use /alpaca connect to link "
@@ -130,9 +139,6 @@ class AlpacaTradeTool(Tool):
         from nanobot.trading.alpaca_adapter import AlpacaCredentials, AlpacaExecutionAdapter
 
         return AlpacaExecutionAdapter(AlpacaCredentials(**creds))
-
-    def _get_context(self) -> ToolContext:
-        return ToolContext.current()
 
     async def execute(self, **kwargs) -> Any:
         action = kwargs.get("action", "")
@@ -156,8 +162,7 @@ class AlpacaTradeTool(Tool):
             return ToolResult.error(str(exc))
 
     async def _account(self, params: dict) -> ToolResult:
-        ctx = self._get_context()
-        adapter = self._get_adapter(ctx)
+        adapter = self._get_adapter()
         account = adapter.get_account()
         return ToolResult(
             f"Alpaca Paper Account\n"
@@ -170,8 +175,7 @@ class AlpacaTradeTool(Tool):
         )
 
     async def _positions(self, params: dict) -> ToolResult:
-        ctx = self._get_context()
-        adapter = self._get_adapter(ctx)
+        adapter = self._get_adapter()
         positions = adapter.get_positions()
         if not positions:
             return ToolResult("No open positions.")
@@ -186,8 +190,7 @@ class AlpacaTradeTool(Tool):
         return ToolResult("\n".join(lines))
 
     async def _place_order(self, params: dict) -> ToolResult:
-        ctx = self._get_context()
-        adapter = self._get_adapter(ctx)
+        adapter = self._get_adapter()
         symbol = params.get("symbol", "")
         qty = params.get("qty")
         side = params.get("side", params.get("action", ""))
@@ -209,8 +212,7 @@ class AlpacaTradeTool(Tool):
         )
 
     async def _close_position(self, params: dict) -> ToolResult:
-        ctx = self._get_context()
-        adapter = self._get_adapter(ctx)
+        adapter = self._get_adapter()
         symbol = params.get("symbol", "")
         if not symbol:
             return ToolResult.error("symbol is required to close a position")
@@ -290,13 +292,13 @@ class AlpacaTradeTool(Tool):
         ]
         if "in_sample" in summary:
             ins = summary["in_sample"]
-            lines.append(f"  --- In-Sample ---")
+            lines.append("  --- In-Sample ---")
             lines.append(
                 f"  Trades: {ins.get('trades', 0)} | Win Rate: {ins.get('win_rate', 0)*100:.1f}% | Total R: {ins.get('total_r', 0):.2f}R"
             )
         if "out_of_sample" in summary:
             oos = summary["out_of_sample"]
-            lines.append(f"  --- Out-of-Sample ---")
+            lines.append("  --- Out-of-Sample ---")
             lines.append(
                 f"  Trades: {oos.get('trades', 0)} | Win Rate: {oos.get('win_rate', 0)*100:.1f}% | Total R: {oos.get('total_r', 0):.2f}R"
             )

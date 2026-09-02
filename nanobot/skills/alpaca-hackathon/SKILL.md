@@ -86,13 +86,21 @@ using the analyst's directional bias rather than forcing a trend trade.
 
 ## Usage
 
-When a user asks to analyze a pair, the tool runs the full five-cluster
-engine on historical bars and reports the latest regime, AWD confidence,
-TMA slope, basket correlation, and the routed cluster with direction.
+The bot is an AI agent. When a user asks anything about trading, stocks, positions, account
+balance, or the market, use the `alpaca_trade` tool directly as a normal conversational task
+— there are no slash commands for trading. The tool is always available and connected to the
+Alpaca paper-trading account.
 
-When a user asks to backtest, the tool runs the event-driven backtest
-over the specified date range and reports trades, win rate, total R,
-max drawdown, and in-sample/out-of-sample split.
+- "What do you think about AAPL?" → `alpaca_trade` with `action=analyze`, `symbol=AAPL`
+- "Buy 5 shares of MSFT" → `alpaca_trade` with `action=buy`, `symbol=MSFT`, `qty=5`
+- "Sell half my TSLA" → `alpaca_trade` with `action=sell`, `symbol=TSLA`, `qty=<qty>`
+- "What am I holding?" → `alpaca_trade` with `action=positions`
+- "How much money do I have?" → `alpaca_trade` with `action=account`
+- "Close my position in AAPL" → `alpaca_trade` with `action=close`, `symbol=AAPL`
+- "Backtest this strategy on AAPL" → `alpaca_trade` with `action=backtest`, `symbol=AAPL`
+
+Always pick the appropriate action and call the tool yourself. Explain the result to the user
+in plain language. This is paper trading — no real money moves.
 
 **This is technical research, not financial advice or a promise of
 profitability. Paper trading only.**

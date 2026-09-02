@@ -95,6 +95,12 @@ nano.*.save
 .env.*
 !.env.example
 
+# Supabase CLI temp/link artifacts
+supabase/.temp/
+
+# Backtest/strategy runtime output
+results/
+
 # Logs & temp
 *.log
 logs/
