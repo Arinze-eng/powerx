@@ -63,6 +63,35 @@ def test_get_credentials_none_without_env():
         assert creds is None
 
 
+def test_tool_registers_via_real_loader():
+    """The tool must register through ToolLoader.load, the path the agent runtime
+    uses. enabled() is a classmethod, so this also guards against the previous
+    bug where an instance-method enabled() raised TypeError and the tool was
+    silently dropped from the agent's tool set."""
+    from unittest.mock import MagicMock
+
+    from nanobot.agent.tools.context import ToolContext
+    from nanobot.agent.tools.registry import ToolRegistry
+
+    mock_config = MagicMock()
+    mock_config.exec.enable = True
+    mock_config.web.enable = True
+    mock_config.image_generation.enabled = False
+    mock_config.my.enable = False
+
+    ctx = ToolContext(
+        config=mock_config,
+        workspace="/tmp",
+        bus=MagicMock(),
+        subagent_manager=MagicMock(),
+        cron_service=MagicMock(),
+        timezone="UTC",
+    )
+    registry = ToolRegistry()
+    ToolLoader().load(ctx, registry)
+    assert registry.has("alpaca_trade")
+
+
 def test_unknown_action_returns_error():
     tool = AlpacaTradeTool()
     result = asyncio.run(tool.execute(action="not-a-real-action"))

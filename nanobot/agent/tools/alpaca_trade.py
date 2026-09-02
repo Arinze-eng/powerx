@@ -81,7 +81,8 @@ class AlpacaTradeTool(Tool):
             "'close' closes a position."
         )
 
-    def enabled(self, ctx: ToolContext) -> bool:
+    @classmethod
+    def enabled(cls, ctx: ToolContext) -> bool:
         return True
 
     def _get_credentials(self) -> dict[str, str] | None:

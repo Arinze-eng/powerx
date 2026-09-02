@@ -11,7 +11,6 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.supabase_auth import SupabaseAuth
 from nanobot.trading.alpaca_credentials import AlpacaCredentialStore
 
 
@@ -80,7 +79,8 @@ async def _handle_status(telegram_user_id: int) -> str:
                 "✅ Your Alpaca paper account is connected.\n"
                 f"  API Key: {creds['api_key'][:8]}...{creds['api_key'][-4:]}\n"
                 f"  Base URL: {creds['base_url']}\n"
-                "Use /trade to analyze, buy, sell, or check positions."
+                "You can now ask me to trade directly — e.g. \"analyze AAPL\", "
+                "\"buy 5 MSFT\", \"check my positions\", or \"backtest TSLA\"."
             )
         return (
             "❌ Your Alpaca account is not connected.\n"
@@ -158,7 +158,8 @@ async def _store_credentials(
         return (
             "✅ Your Alpaca paper account is now connected!\n"
             f"  API Key: {api_key[:8]}...{api_key[-4:]}\n"
-            "You can now use /trade to buy, sell, analyze, and backtest.\n"
+            "You can now ask me to analyze, buy, sell, backtest, or check "
+            "positions — e.g. \"analyze AAPL\" or \"buy 5 MSFT\".\n"
             "Use /alpaca disconnect to remove your credentials at any time."
         )
     except Exception as exc:
