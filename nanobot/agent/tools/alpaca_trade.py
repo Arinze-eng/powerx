@@ -17,7 +17,6 @@ from loguru import logger
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext
-from nanobot.agent.tools.schema import ObjectSchema, StringSchema, NumberSchema, BooleanSchema
 
 
 @tool_parameters(
@@ -90,11 +89,22 @@ class AlpacaTradeTool(Tool):
         if account and account.get("telegram_user_id"):
             try:
                 from nanobot.trading.alpaca_credentials import AlpacaCredentialStore
+
                 store = AlpacaCredentialStore()
                 if store.enabled:
-                    creds = asyncio.get_event_loop().run_until_complete(
-                        store.get_credentials(int(account["telegram_user_id"]))
-                    )
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        import concurrent.futures
+
+                        with concurrent.futures.ThreadPoolExecutor() as pool:
+                            creds = pool.submit(
+                                asyncio.run,
+                                store.get_credentials(int(account["telegram_user_id"])),
+                            ).result()
+                    else:
+                        creds = loop.run_until_complete(
+                            store.get_credentials(int(account["telegram_user_id"]))
+                        )
                     if creds:
                         return creds
             except Exception as exc:
@@ -118,7 +128,11 @@ class AlpacaTradeTool(Tool):
                 "environment variables."
             )
         from nanobot.trading.alpaca_adapter import AlpacaCredentials, AlpacaExecutionAdapter
+
         return AlpacaExecutionAdapter(AlpacaCredentials(**creds))
+
+    def _get_context(self) -> ToolContext:
+        return ToolContext.current()
 
     async def execute(self, **kwargs) -> Any:
         action = kwargs.get("action", "")
@@ -211,10 +225,15 @@ class AlpacaTradeTool(Tool):
         from nanobot.trading.config import AgentConfig
         from nanobot.trading.data_loader import load_market_data
         from nanobot.trading.backtest_engine import BacktestEngine
+
         config = AgentConfig(pairs=tuple(pairs))
         try:
             market_data = load_market_data(
-                pairs, config.start, config.end, config.timeframe, str(config.data_dir) if config.data_dir else None
+                pairs,
+                config.start,
+                config.end,
+                config.timeframe,
+                str(config.data_dir) if config.data_dir else None,
             )
         except Exception as exc:
             return ToolResult.error(f"Data loading failed: {exc}")
@@ -247,6 +266,7 @@ class AlpacaTradeTool(Tool):
         from nanobot.trading.config import AgentConfig
         from nanobot.trading.data_loader import load_market_data
         from nanobot.trading.backtest_engine import BacktestEngine
+
         config = AgentConfig(pairs=tuple(pairs), start=start, end=end)
         try:
             market_data = load_market_data(
@@ -271,14 +291,13 @@ class AlpacaTradeTool(Tool):
         if "in_sample" in summary:
             ins = summary["in_sample"]
             lines.append(f"  --- In-Sample ---")
-            lines.append(f"  Trades: {ins.get('trades', 0)} | Win Rate: {ins.get('win_rate', 0)*100:.1f}% | Total R: {ins.get('total_r', 0):.2f}R")
+            lines.append(
+                f"  Trades: {ins.get('trades', 0)} | Win Rate: {ins.get('win_rate', 0)*100:.1f}% | Total R: {ins.get('total_r', 0):.2f}R"
+            )
         if "out_of_sample" in summary:
             oos = summary["out_of_sample"]
             lines.append(f"  --- Out-of-Sample ---")
-            lines.append(f"  Trades: {oos.get('trades', 0)} | Win Rate: {oos.get('win_rate', 0)*100:.1f}% | Total R: {oos.get('total_r', 0):.2f}R")
+            lines.append(
+                f"  Trades: {oos.get('trades', 0)} | Win Rate: {oos.get('win_rate', 0)*100:.1f}% | Total R: {oos.get('total_r', 0):.2f}R"
+            )
         return ToolResult("\n".join(lines))
-
-    def _get_context(self) -> ToolContext:
-        from nanobot.agent.tools.context import ToolContext, RequestConACCESS
-t
-        return ToolContext.current()
