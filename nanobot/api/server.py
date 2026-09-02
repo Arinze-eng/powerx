@@ -19,6 +19,7 @@ from loguru import logger
 
 from nanobot.api.miniapp import register_miniapp_routes
 from nanobot.api.telegram_auth import miniapp_tokens
+from nanobot.api.api_keys import ApiKeyStore, hash_api_key
 from nanobot.config.paths import get_media_dir
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.media_decode import (
@@ -46,6 +47,8 @@ __all__ = (
 
 API_SESSION_KEY = "api:default"
 API_CHAT_ID = "default"
+_API_KEY_STORE_KEY = web.AppKey[ApiKeyStore]("api_key_store")
+_API_KEY_INFO_KEY = web.AppKey[dict[str, Any]]("api_key_info")
 _AGENT_LOOP_KEY = web.AppKey[Any]("agent_loop")
 _MODEL_NAME_KEY = web.AppKey[str]("model_name")
 _REQUEST_TIMEOUT_KEY = web.AppKey[float]("request_timeout")
@@ -368,6 +371,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                             session_key=session_key,
                             channel="api",
                             chat_id=API_CHAT_ID,
+                            metadata=_api_billing_metadata(request),
                             on_stream=_on_stream,
                             on_stream_end=_on_stream_end,
                         )
@@ -411,6 +415,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                         session_key=session_key,
                         channel="api",
                         chat_id=API_CHAT_ID,
+                        metadata=_api_billing_metadata(request),
                     )
                 response_text = _response_text(response)
                 if not response_text or not response_text.strip():
@@ -429,6 +434,23 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
     return web.json_response(
         _chat_completion_response(response_text, model_name, getattr(agent_loop, "_last_usage", None))
     )
+
+
+def _api_billing_metadata(request: web.Request) -> dict[str, Any]:
+    """Turn metadata that lets the API credit hook bill the key owner.
+
+    ``request[_API_KEY_INFO_KEY]`` is populated by the auth middleware when the
+    caller authenticated with a user-issued ``px_...`` API key. Mini App tokens
+    and the static server key carry no per-user identity, so billing falls back
+    to whatever the session/turn provides (i.e. no charge).
+    """
+    info = request.get(_API_KEY_INFO_KEY) or {}
+    if not info:
+        return {}
+    return {
+        "api_key_id": info.get("id"),
+        "supabase_user_id": info.get("agentx_user_id"),
+    }
 
 
 async def handle_models(request: web.Request) -> web.Response:
@@ -452,6 +474,13 @@ async def handle_models(request: web.Request) -> web.Response:
 async def handle_health(request: web.Request) -> web.Response:
     """GET /health"""
     return web.json_response({"status": "ok"})
+
+
+async def handle_api_docs(request: web.Request) -> web.Response:
+    """GET /v1/api-docs — plain-text integration docs for the public API."""
+    from nanobot.channels.telegram.api_platform import render_docs
+
+    return web.json_response({"documentation": render_docs()})
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +510,8 @@ def create_app(
     app[_REQUEST_TIMEOUT_KEY] = request_timeout
     app[_SESSION_LOCKS_KEY] = {}  # per-user locks, keyed by session_key
     app[_PREPARE_AGENT_KEY] = prepare_agent
+    key_store = ApiKeyStore()
+    app[_API_KEY_STORE_KEY] = key_store
 
     @web.middleware
     async def auth_middleware(
@@ -493,14 +524,26 @@ def create_app(
         # browser's gofile.io result. Both only hand off an in-memory record.
         # /app serves the chat page; /app/token mints a short-lived bearer from
         # validated initData — neither carries the api_key itself.
-        if request.path in ("/health", "/upload", "/upload/complete", "/app", "/app/token"):
+        if request.path in ("/health", "/upload", "/upload/complete", "/app", "/app/token", "/v1/api-docs"):
+            return await handler(request)
+        auth = request.headers.get("Authorization", "")
+        supplied = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+        # User-issued public API keys (generated via the bot's /apikey command)
+        # authenticate against Supabase and carry per-user billing identity.
+        if supplied.startswith("px_") and key_store.enabled:
+            try:
+                key_row = await key_store.find_active_by_hash(hash_api_key(supplied))
+            except Exception:
+                logger.exception("API key lookup failed")
+                return _error_json(503, "API key service unavailable", err_type="server_error")
+            if key_row is None:
+                return _error_json(401, "Invalid or revoked API key")
+            request[_API_KEY_INFO_KEY] = key_row
             return await handler(request)
         if not api_key:
             return await handler(request)
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
+        if not supplied:
             return _error_json(401, "Missing Authorization header. Use: Bearer <api_key>")
-        supplied = auth[len("Bearer "):]
         # Accept either the long-lived api_key or a Mini App token minted from
         # validated Telegram initData (short-lived, bound to one user session).
         if hmac.compare_digest(supplied, api_key):
@@ -513,6 +556,7 @@ def create_app(
 
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
     app.router.add_get("/v1/models", handle_models)
+    app.router.add_get("/v1/api-docs", handle_api_docs)
     app.router.add_get("/health", handle_health)
 
     # Telegram Mini App routes (large file upload via gofile.io).

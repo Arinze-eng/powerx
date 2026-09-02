@@ -49,6 +49,8 @@ from nanobot.runtime_context import (
 )
 from nanobot.security.network import validate_url_target
 from nanobot.supabase_auth import SupabaseAuth, SupabaseAuthError
+from nanobot.api.api_keys import ApiKeyStore
+from nanobot.channels.telegram.api_platform import handle_api_command
 from nanobot.utils.gofile import upload_gofile_stream
 from nanobot.utils.helpers import detect_image_mime, split_message
 from nanobot.utils.logging_bridge import redirect_lib_logging
@@ -551,6 +553,10 @@ class TelegramChannel(BaseChannel):
         BotCommand("video", "Generate a video with Puter"),
         BotCommand("upload", "Upload a large file for analysis"),
         BotCommand("chat", "Open the full AI chat app (tasks + file upload)"),
+        BotCommand("apikey", "Generate an API key for the PowerX Agent API"),
+        BotCommand("apidoc", "Show API integration documentation"),
+        BotCommand("listapikeys", "List your API keys and usage"),
+        BotCommand("revokeapikey", "Revoke all your API keys"),
         BotCommand("cancel", "Cancel auth or pending work"),
         BotCommand("discard", "Discard pending attachments"),
     ]
@@ -559,6 +565,11 @@ class TelegramChannel(BaseChannel):
     # Hyphenated ``dream-*`` commands stay on a separate handler (below).
     TELEGRAM_BUS_SLASH_COMMAND_RE = re.compile(
         r"^/(?:new|stop|restart|status|dream|history|goal|trigger|pairing|model|skill|signup|signin|signout|credits|credit|buy|verify-payment|verify_payment|image|image_edit|video|cancel|discard)(?:@\w+)?(?:\s+.*)?$"
+    )
+
+    # Commands for the public OpenAI-compatible API platform (key management).
+    TELEGRAM_API_PLATFORM_COMMAND_RE = re.compile(
+        r"^/(?:apikey|listapikeys|revokeapikey|apidoc)(?:@\w+)?(?:\s+.*)?$"
     )
 
     @classmethod
@@ -587,6 +598,7 @@ class TelegramChannel(BaseChannel):
         self._app_ready = asyncio.Event()  # cleared while the app is being rebuilt
         self._teardown_lock = asyncio.Lock()
         self._supabase = SupabaseAuth()
+        self._api_keys = ApiKeyStore()
 
     def _require_app(self) -> TelegramApplication:
         if self._app is None:
@@ -713,6 +725,12 @@ class TelegramChannel(BaseChannel):
 
         # Add command handlers (using Regex to support @username suffixes before bot initialization)
         self._app.add_handler(MessageHandler(filters.Regex(r"^/start(?:@\w+)?$"), self._on_start))
+        self._app.add_handler(
+            MessageHandler(
+                filters.Regex(TelegramChannel.TELEGRAM_API_PLATFORM_COMMAND_RE),
+                self._forward_command,
+            )
+        )
         self._app.add_handler(
             MessageHandler(
                 filters.Regex(TelegramChannel.TELEGRAM_BUS_SLASH_COMMAND_RE),
@@ -2097,6 +2115,10 @@ class TelegramChannel(BaseChannel):
         content = self._normalize_telegram_command(content)
         account = await self._supabase_account(message, user)
         command_name = content.split(None, 1)[0].split("@", 1)[0].lower()
+        if command_name in {"/apikey", "/listapikeys", "/revokeapikey", "/apidoc"}:
+            args = content.split(None, 1)[1] if " " in content else ""
+            await handle_api_command(self._api_keys, message, user, command_name, args, account)
+            return
         if command_name in {"/cancel", "/discard"}:
             discarded = self._discard_pending_attachments(
                 self._attachment_key(message.chat_id, sender_id)
