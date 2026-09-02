@@ -76,7 +76,8 @@ class BacktestEngine:
     def run(self, market_data: dict[str, pd.DataFrame]) -> dict:
         if len(market_data) < 1:
             raise ValueError("Backtest requires at least one instrument.")
-        timeline = sorted(set().intersection(*(set(frame.index) for frame in market_data.values())))
+        working = list(set(frame.index) for frame in market_data.values())
+        timeline = sorted(set.intersection(*working))
         if len(timeline) < 2:
             raise ValueError("Instruments do not share at least two timestamps.")
 

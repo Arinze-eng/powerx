@@ -4,11 +4,28 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from nanobot.trading.config import AgentConfig, RiskConfig, SessionWindow
 from nanobot.trading.risk_manager import RiskManager
 from nanobot.trading.strategy_router import StrategyRouter
+
+
+def _ohlcv_frame(days: int = 60, start="2024-01-01") -> pd.DataFrame:
+    """Build a synthetic OHLCV DataFrame sharing a common day index."""
+    idx = pd.date_range(start, periods=days, freq="D", tz="UTC")
+    rng = np.random.default_rng(7)
+    closes = pd.Series(100 + np.cumsum(rng.normal(0, 1, days)), index=idx)
+    frame = pd.DataFrame({
+        "open": closes.shift(1).fillna(closes.iloc[0]),
+        "high": closes + 1.0,
+        "low": closes - 1.0,
+        "close": closes,
+        "volume": 1_000_000.0,
+    }, index=idx)
+    return frame
 
 
 def test_default_config():
@@ -121,3 +138,31 @@ def test_strategy_router_cluster_d():
     decision = router.route(analyst, scout, 0.5, 0.5)
     assert decision.cluster == "D - Correlation Basket"
     assert decision.direction == -1  # positive slope → short
+
+
+def test_backtest_engine_run_single_pair():
+    """Backtest.run() must not fail on a single instrument timeline."""
+    from nanobot.trading.backtest_engine import BacktestEngine
+
+    engine = BacktestEngine(AgentConfig(), starting_equity=100_000.0)
+    data = {"EURGBP": _ohlcv_frame(days=90)}
+    result = engine.run(data)
+    assert result["trades"] is not None
+    assert result["decisions"]
+    assert result["equity"]
+    assert len(result["equity"]) >= 2
+
+
+def test_backtest_engine_run_multi_pair_shared_timeline():
+    """Backtest.run() must intersect shared timestamps across instruments."""
+    from nanobot.trading.backtest_engine import BacktestEngine
+
+    engine = BacktestEngine(AgentConfig(), starting_equity=100_000.0)
+    data = {
+        "EURGBP": _ohlcv_frame(days=90),
+        "EURCAD": _ohlcv_frame(days=90),
+        "GBPCAD": _ohlcv_frame(days=90),
+    }
+    result = engine.run(data)
+    assert result["trades"] is not None
+    assert len(result["equity"]) >= 2

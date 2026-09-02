@@ -52,6 +52,12 @@ from nanobot.supabase_auth import SupabaseAuth, SupabaseAuthError
 from nanobot.api.api_keys import ApiKeyStore
 from nanobot.channels.telegram.api_platform import handle_api_command
 from nanobot.trading.alpaca_commands import is_alpaca_command, handle_alpaca_command
+from nanobot.trading.trading_commands import (
+    handle_trade_command,
+    handle_backtest_command,
+    is_trade_command,
+    is_backtest_command,
+)
 from nanobot.utils.gofile import upload_gofile_stream
 from nanobot.utils.helpers import detect_image_mime, split_message
 from nanobot.utils.logging_bridge import redirect_lib_logging
@@ -2138,7 +2144,19 @@ class TelegramChannel(BaseChannel):
             response = await handle_alpaca_command(
                 account, content, message.chat_id, message.message_id
             )
-            await self._reply_text(message, response)
+            await message.reply_text(response)
+            return
+        if is_trade_command(content):
+            response = await handle_trade_command(
+                account, content, message.chat_id, message.message_id
+            )
+            await message.reply_text(response)
+            return
+        if is_backtest_command(content):
+            response = await handle_backtest_command(
+                account, content, message.chat_id, message.message_id
+            )
+            await message.reply_text(response)
             return
         if command_name in {"/cancel", "/discard"}:
             discarded = self._discard_pending_attachments(
