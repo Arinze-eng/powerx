@@ -37,8 +37,9 @@ def wired_bridge(monkeypatch):
     """Pretend the websocket channel is attached and turns succeed."""
     calls: list[dict] = []
 
-    async def fake_run_turn(user_id, content, auth_token="", api_key_id=None):
-        calls.append({"user_id": user_id, "content": content, "api_key_id": api_key_id})
+    async def fake_run_turn(*, user_id, content, media_paths=None, auth_token=None, api_key_id=None):
+        calls.append({"user_id": user_id, "content": content, "api_key_id": api_key_id,
+                      "auth_token": auth_token})
         return f"echo:{content}", {}
 
     monkeypatch.setattr(ab_mod.api_bridge, "_channel", object())  # ready=True
@@ -90,25 +91,59 @@ async def test_bad_json_payload(wired_bridge):
     assert resp.status_code == 400
 
 
+
+def _patch_account(monkeypatch, agentx_user_id="user-123"):
+    class _Auth:
+        enabled = True
+
+        async def account_for(self, telegram_user_id, chat_id, *, username, first_name, last_name):
+            return {"agentx_user_id": agentx_user_id}
+
+    monkeypatch.setattr("nanobot.supabase_auth.SupabaseAuth", lambda: _Auth())
+
+
+@pytest.mark.asyncio
+async def test_no_telegram_id_409(wired_bridge, monkeypatch):
+    class _Store:
+        enabled = True
+
+        async def find_active_by_hash(self, digest):
+            return {"id": 5, "telegram_user_id": None}
+
+    monkeypatch.setattr("nanobot.api.api_keys.ApiKeyStore", lambda: _Store())
+    req = _FakeRequest(
+        "/v1/chat/completions" + _payload(),
+        {"authorization": "Bearer px_" + "e" * 40},
+    )
+    resp = await gr.dispatch_v1_routes(req, "/v1/chat/completions")
+    assert resp.status_code == 409
+
+
 @pytest.mark.asyncio
 async def test_valid_key_runs_turn(wired_bridge, monkeypatch):
     class _Store:
         enabled = True
 
         async def find_active_by_hash(self, digest):
-            return {"id": 7, "agentx_user_id": "user-123"}
+            return {"id": 7, "telegram_user_id": 111}
 
     monkeypatch.setattr("nanobot.api.api_keys.ApiKeyStore", lambda: _Store())
     req = _FakeRequest(
         "/v1/chat/completions" + _payload([{"role": "user", "content": "ping"}]),
         {"authorization": "Bearer px_" + "a" * 40},
     )
+    _patch_account(monkeypatch)
     resp = await gr.dispatch_v1_routes(req, "/v1/chat/completions")
     assert resp.status_code == 200
     body = json.loads(bytes(resp.body))
     assert body["choices"][0]["message"]["content"] == "echo:ping"
     assert body["object"] == "chat.completion"
-    assert wired_bridge == [{"user_id": "user-123", "content": "ping", "api_key_id": 7}]
+    assert len(wired_bridge) == 1
+    call = wired_bridge[0]
+    assert call["user_id"] == "111"
+    assert call["content"] == "ping"
+    assert call["api_key_id"] == 7
+    assert call["auth_token"]  # minted mini-app token for billing
 
 
 @pytest.mark.asyncio
@@ -117,9 +152,10 @@ async def test_stream_flag_returns_sse(wired_bridge, monkeypatch):
         enabled = True
 
         async def find_active_by_hash(self, digest):
-            return {"id": 1, "agentx_user_id": "u"}
+            return {"id": 1, "telegram_user_id": 22}
 
     monkeypatch.setattr("nanobot.api.api_keys.ApiKeyStore", lambda: _Store())
+    _patch_account(monkeypatch)
     req = _FakeRequest(
         "/v1/chat/completions" + _payload(stream=True),
         {"authorization": "Bearer px_" + "b" * 40},
@@ -133,16 +169,17 @@ async def test_stream_flag_returns_sse(wired_bridge, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_credit_error_maps_402(wired_bridge, monkeypatch):
-    async def failing_run_turn(user_id, content, auth_token="", api_key_id=None):
+    async def failing_run_turn(*, user_id, content, media_paths=None, auth_token=None, api_key_id=None):
         return "", {"error": "Insufficient credits"}
 
     class _Store:
         enabled = True
 
         async def find_active_by_hash(self, digest):
-            return {"id": 2, "agentx_user_id": "u"}
+            return {"id": 2, "telegram_user_id": 33}
 
     monkeypatch.setattr("nanobot.api.api_keys.ApiKeyStore", lambda: _Store())
+    _patch_account(monkeypatch)
     monkeypatch.setattr(ab_mod.api_bridge, "run_turn", failing_run_turn)
     req = _FakeRequest(
         "/v1/chat/completions" + _payload(),
