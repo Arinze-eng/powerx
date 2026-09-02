@@ -128,7 +128,23 @@ async def dispatch_v1_routes(request: WsRequest, got: str) -> Any | None:
         None,
     )
     content = str((last_user or {}).get("content") or "").strip()
-    if not content:
+
+    # --- attachments: OpenAI-style multimodal parts with base64 data URLs ----
+    media_paths: list[str] = []
+    if isinstance((last_user or {}).get("content"), list):
+        from nanobot.config.paths import get_media_dir
+        from nanobot.utils.media_decode import save_base64_data_url
+
+        for part in (last_user or {}).get("content", []):
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            url_obj = part.get("image_url")
+            url = str(url_obj.get("url") if isinstance(url_obj, dict) else url_obj or "")
+            if url.startswith("data:"):
+                saved = save_base64_data_url(url, get_media_dir("api"))
+                if saved:
+                    media_paths.append(saved)
+    if not content and not media_paths:
         return _http_error(400, "No user message content")
 
     store = ApiKeyStore()
@@ -154,7 +170,8 @@ async def dispatch_v1_routes(request: WsRequest, got: str) -> Any | None:
     want_stream = bool(body.get("stream"))
     text, meta = await api_bridge.run_turn(
         user_id=user_id,
-        content=content,
+        content=content or "(see attached file)",
+        media_paths=media_paths,
         api_key_id=key_id,
         supabase_user_id=user_id,
         model=str(body.get("model") or ""),

@@ -100,41 +100,53 @@ def resolve_base_url() -> str:
 
 DOC_TEMPLATE = """🔌 <b>PowerX Agent API</b> — OpenAI-compatible
 
-Your API key lets your own apps, agents, and platforms call the PowerX agent directly. Every request runs fully on our servers: questions, file uploads, and image analysis are processed here, and results come back to your app. Usage is billed with your existing credits (same balance as this bot).
+Your API key lets your own apps, agents, and platforms call the PowerX agent directly. Questions, file uploads, and image analysis all run fully on our servers; results come back to your app. Billed with your existing credits (same balance as this bot).
 
 <b>Base URL</b>
 <code>{base_url}/v1</code>
 
-<b>Authentication</b>
-Send your key as a bearer token:
-<code>Authorization: Bearer YOUR_API_KEY</code>
+⚠️ <b>How to send requests:</b> put everything in the URL query string — the <code>token</code> parameter carries your key and the <code>payload</code> parameter carries the JSON request body (URL-encoded). Do not use POST bodies.
 
-<b>Endpoints</b>
-• POST /v1/chat/completions — run the agent (JSON or multipart)
-• GET /v1/models — list available models
-• GET /health — server status
+<b>1) Chat</b>
+<pre><code>GET {base_url}/v1/chat/completions?token=$POWERX_API_KEY&amp;payload={{"model":"{model}","messages":[{{"role":"user","content":"What is 2+2?"}}]}}</code></pre>
+curl example:
+<pre><code>curl -G {base_url}/v1/chat/completions \\
+  --data-urlencode "token=$POWERX_API_KEY" \\
+  --data-urlencode 'payload={{"model":"{model}","messages":[{{"role":"user","content":"What is 2+2?"}}]}}'</code></pre>
 
-<b>Example — text question</b>
-<pre><code>curl {base_url}/v1/chat/completions \\
-  -H "Authorization: Bearer $POWERX_API_KEY" \\
-  -H "Content-Type: application/json" \\
-  -d '{{"model": "{model}", "messages": [{{"role": "user", "content": "What is 2+2?"}}]}}'</code></pre>
+Python example:
+<pre><code>import json, urllib.parse, urllib.request
+payload = {{"model": "{model}", "messages": [{{"role": "user", "content": "What is 2+2?"}}]}}
+url = ("{base_url}/v1/chat/completions?token=" + KEY +
+       "&payload=" + urllib.parse.quote(json.dumps(payload)))
+print(json.loads(urllib.request.urlopen(url, timeout=420).read())["choices"][0]["message"]["content"])</code></pre>
 
-<b>Example — upload a file or image</b>
-Send <code>multipart/form-data</code> with these fields:
-• <code>file</code> — the image/file to analyze
-• <code>content</code> — your question about it
-• <code>model</code> — {model}
-• <code>session_id</code> — optional; reuse one value to keep conversation context
+<b>2) File / image upload</b>
+Attach files inside the payload as base64 data URLs (OpenAI multimodal format). Keep files under ~6 MB:
+<pre><code>{{"model": "{model}", "messages": [{{"role": "user", "content": [
+  {{"type": "text", "text": "What is in this image?"}},
+  {{"type": "image_url", "image_url": {{"url": "data:image/png;base64,&lt;BASE64&gt;"}}}}
+]}}]}}</code></pre>
+Any file type works (PDF, zip, docs…) — set the real mime type in the data URL and the agent saves it into its workspace and reads it with its tools.
 
-<pre><code>curl {base_url}/v1/chat/completions \\
-  -H "Authorization: Bearer $POWERX_API_KEY" \\
-  -F "file=@photo.png" \\
-  -F "content=What is in this image?" \\
-  -F "model={model}"</code></pre>
+<b>3) Streaming (optional)</b>
+Add <code>"stream":true</code> to the payload → response arrives as SSE chunks ending with <code>data: [DONE]</code>.
+
+<b>Other endpoints</b>
+• <code>GET {base_url}/v1/models</code> — list available models
+• <code>GET {base_url}/v1/api-docs</code> — these docs as plain text
+
+<b>Response shape (OpenAI-compatible)</b>
+<pre><code>{{"id":"chatcmpl-…","object":"chat.completion","model":"{model}",
+ "choices":[{{"index":0,"message":{{"role":"assistant","content":"…"}},"finish_reason":"stop"}}],
+ "usage":{{"prompt_tokens":N,"completion_tokens":N,"total_tokens":N}}}}</code></pre>
+
+<b>Errors</b>
+401 bad/missing key • 400 invalid payload JSON • 402 out of credits • 503 starting up, retry shortly
 
 <b>Notes</b>
 • Multi-step agentic tasks consume 1 credit per step, same as chatting here.
+• Conversation context persists server-side per user across calls.
 • Keep your key secret — anyone with it can spend your credits.
 • Manage keys anytime: /apikey, /listapikeys, /revokeapikey
 
