@@ -19,7 +19,6 @@ import time
 import uuid
 from typing import Any
 
-from loguru import logger
 from websockets.http11 import Request as WsRequest
 
 from nanobot.webui.http_utils import (
@@ -144,44 +143,24 @@ async def dispatch_v1_routes(request: WsRequest, got: str) -> Any | None:
     if not api_bridge.ready:
         return _http_error(503, "Gateway agent is starting up, retry shortly")
 
-    # The bridge publishes into the owner's Telegram private-chat session, so
-    # it needs their numeric telegram id (the same lookup /apikey replies use).
     key_id = record.get("id")
-    telegram_id = str(record.get("telegram_user_id") or "").strip()
-    if not telegram_id:
-        return _http_error(
-            409,
-            "This API key has no linked Telegram account; create a new key with /apikey",
-        )
-
-    # Mint a gateway mini-app token for the key owner and pass it as the turn's
-    # auth token — this is what the credit hook reads to bill the right account.
-    from nanobot.api.telegram_auth import miniapp_tokens
-    from nanobot.supabase_auth import SupabaseAuth
-
-    supabase = SupabaseAuth()
-    if not supabase.enabled:
-        return _http_error(503, "Supabase integration is not configured on this server")
-    try:
-        account = await supabase.account_for(
-            int(telegram_id), int(telegram_id), username=None,
-            first_name=None, last_name=None,
-        )
-    except Exception as exc:  # noqa: BLE001 - surface as a clean error
-        logger.warning("api route account lookup failed: {}", exc)
-        return _http_error(502, "Account lookup failed, retry shortly")
-    user_id = str((account or {}).get("agentx_user_id") or "").strip()
+    # Billing identity comes straight from the key row (telegram_user_id kept
+    # for backwards-compatible keys created before the column existed).
+    user_id = str(record.get("agentx_user_id") or "").strip()
     if not user_id:
         return _http_error(409, "No AgentX account is linked to this API key yet")
-    auth_token = miniapp_tokens.mint(user_id)
 
     # --- run the turn -----------------------------------------------------
-    text, err = await api_bridge.run_turn(
-        user_id=telegram_id,
+    want_stream = bool(body.get("stream"))
+    text, meta = await api_bridge.run_turn(
+        user_id=user_id,
         content=content,
-        auth_token=auth_token,
         api_key_id=key_id,
+        supabase_user_id=user_id,
+        model=str(body.get("model") or ""),
+        stream=want_stream,
     )
+    err = {k: v for k, v in meta.items() if k == "error"}
     if err:
         message = str(err.get("error") or "agent error")
         status = 402 if "credit" in message.lower() else 502
@@ -190,7 +169,7 @@ async def dispatch_v1_routes(request: WsRequest, got: str) -> Any | None:
             status=status,
         )
 
-    want_stream = bool(body.get("stream"))
+
     completion = _completion(text, str(body.get("model") or model_name))
     if want_stream:
         chunk = {

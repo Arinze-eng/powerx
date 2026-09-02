@@ -371,7 +371,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                             session_key=session_key,
                             channel="api",
                             chat_id=API_CHAT_ID,
-                            metadata=_api_billing_metadata(request),
+                            extra_metadata=_api_billing_metadata(request),
                             on_stream=_on_stream,
                             on_stream_end=_on_stream_end,
                         )
@@ -415,7 +415,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                         session_key=session_key,
                         channel="api",
                         chat_id=API_CHAT_ID,
-                        metadata=_api_billing_metadata(request),
+                        extra_metadata=_api_billing_metadata(request),
                     )
                 response_text = _response_text(response)
                 if not response_text or not response_text.strip():

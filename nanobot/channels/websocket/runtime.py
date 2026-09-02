@@ -755,15 +755,6 @@ class WebSocketChannel(BaseChannel):
         except Exception:  # noqa: BLE001 - bridge is optional, never blocks startup
             self.logger.warning("mini-app bridge wiring failed", exc_info=True)
 
-        # Attach the public OpenAI-compatible API bridge so /v1/* turns run
-        # through this channel's agent on single-process (Render) deployments.
-        try:
-            from nanobot.api.api_bridge import api_bridge
-
-            api_bridge.wire(self)
-        except Exception:  # noqa: BLE001 - bridge is optional, never blocks startup
-            self.logger.warning("public API bridge wiring failed", exc_info=True)
-
         self._running = True
         self._stop_event = asyncio.Event()
 

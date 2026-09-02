@@ -1,29 +1,27 @@
 """Bridge the public OpenAI-compatible API onto the live gateway agent.
 
 Render (and any other single-process deployment) runs ``nanobot gateway``, not
-``nanobot serve`` — so without this bridge the ``/v1/*`` routes 404. This module
-mirrors :mod:`nanobot.api.miniapp_bridge`: it publishes an InboundMessage on the
-*telegram* channel into the key owner's own session and collects the agent's
-replies through a temporary websocket sink, then wraps them in OpenAI-shaped
-responses.
+``nanobot serve`` — so without this bridge the ``/v1/*`` routes 404.
 
-Billing: unlike the Mini App bridge, API turns must be charged per iteration.
-The telegram credit hook keys off ``metadata["supabase_user_id"]``; we mint a
-one-shot auth token for the key owner and pass it in metadata so the *existing*
-SupabaseCreditHook bills their credits — no second billing path.
+Unlike the Mini App bridge (which funnels bus traffic through a websocket
+sink), this module calls ``AgentLoop.process_direct`` *directly*, mirroring the
+proven ``nanobot serve`` path. Publishing through the bus with
+``channel="telegram"`` does not work here: the ChannelManager routes the agent's
+reply back out via the real Telegram channel, so the sink never sees it and the
+request hangs until timeout.
+
+Billing: the turn runs with ``channel="api"`` and metadata carrying
+``api_key_id`` + ``supabase_user_id``, which activates
+:class:`nanobot.agent.hooks.supabase_credit.ApiCreditHook` (registered by the
+gateway runtime) for per-step charging and request logging.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import time
-import uuid
 from typing import Any
 
 from loguru import logger
-
-from nanobot.bus.events import InboundMessage
 
 # Per-request wall clock. Long enough for tool-heavy sandbox tasks, bounded so
 # a wedged agent turn cannot pin a connection forever.
@@ -31,40 +29,22 @@ TURN_TIMEOUT_SECONDS = 600.0
 
 
 class ApiBridge:
-    """Singleton bridging /v1 requests to the gateway websocket channel."""
+    """Singleton bridging /v1 requests to the gateway agent loop."""
 
     def __init__(self) -> None:
-        self._channel: Any = None
+        self._agent: Any = None
 
-    def wire(self, channel: Any) -> None:
-        """Attach the live WebSocketChannel (called from its start())."""
-        if channel is not self._channel:
+    def wire(self, agent: Any) -> None:
+        """Attach the live AgentLoop (called from the gateway runtime)."""
+        if agent is not self._agent:
             logger.info("public API bridge wired to gateway agent")
-        self._channel = channel
+        self._agent = agent
 
     @property
     def ready(self) -> bool:
-        return self._channel is not None
+        return self._agent is not None
 
-    @staticmethod
-    def _session_key(user_id: str) -> str:
-        # Same session as the user's Telegram private chat, so context carries
-        # over between bot chats and API calls (identical to the Mini App).
-        return f"telegram:{user_id}"
-
-    class _Sink:
-        """Stand-in websocket connection that funnels frames into a queue."""
-
-        def __init__(self, queue: asyncio.Queue[str], loop: asyncio.AbstractEventLoop) -> None:
-            self._queue = queue
-            self._loop = loop
-            self.id = f"api-{uuid.uuid4().hex[:8]}"
-
-        async def send(self, raw: str) -> None:
-            try:
-                self._loop.call_soon_threadsafe(self._queue.put_nowait, raw)
-            except RuntimeError:  # loop closed during shutdown
-                pass
+    # -- main entry point -----------------------------------------------------
 
     async def run_turn(
         self,
@@ -72,92 +52,63 @@ class ApiBridge:
         user_id: str,
         content: str,
         media_paths: list[str] | None = None,
-        auth_token: str | None = None,
         api_key_id: int | None = None,
+        supabase_user_id: str | None = None,
+        model: str = "",
+        stream: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """Run one agent turn; returns (final_text, meta).
 
-        ``meta`` may carry ``{"error": ...}`` when the turn failed or timed out.
+        ``meta`` may carry ``{"error": ...}`` when the turn failed or timed out,
+        otherwise it carries ``{"usage": {...}}`` best-effort token counts.
+        ``user_id`` is the key owner's agentx user id (billing identity); the
+        session is shared with their Telegram chat so context carries over.
         """
-        channel = self._channel
-        if channel is None:
+        agent = self._agent
+        if agent is None:
             raise RuntimeError("agent is starting up, try again in a moment")
 
-        cid = self._session_key(user_id)
-        turn_started = time.monotonic()
-        queue: asyncio.Queue[str] = asyncio.Queue()
-        loop = asyncio.get_running_loop()
-        sink = self._Sink(queue, loop)
-
-        metadata: dict[str, Any] = {"api_request": True}
-        if auth_token:
-            metadata["supabase_auth_token"] = auth_token
+        # Share the user's Telegram private-chat session (chat id == telegram id
+        # for agentx users is unknown here, so keep an api-namespaced key that
+        # still persists memory per user).
+        session_key = f"api:{user_id}"
+        metadata: dict[str, Any] = {}
         if api_key_id is not None:
             metadata["api_key_id"] = api_key_id
+        if supabase_user_id:
+            metadata["supabase_user_id"] = supabase_user_id
+        if model:
+            metadata["api_model"] = model
+        metadata["api_stream"] = bool(stream)
 
-        subs_added = False
-        final_parts: list[str] = []
-        got_message = False
-        error: str | None = None
         try:
-            channel._attach(sink, cid)  # noqa: SLF001 - intentional integration seam
-            subs_added = True
-            await channel.bus.publish_inbound(
-                InboundMessage(
-                    channel="telegram",
-                    sender_id=user_id,
-                    chat_id=user_id,
+            async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
+                response = await agent.process_direct(
                     content=content,
-                    media=list(media_paths or []),
-                    metadata=metadata,
-                    session_key_override=cid,
+                    media=list(media_paths or []) or None,
+                    session_key=session_key,
+                    channel="api",
+                    chat_id=user_id or "default",
+                    sender_id=str(supabase_user_id or user_id or "api"),
+                    extra_metadata=metadata,
                 )
-            )
+        except (TimeoutError, asyncio.TimeoutError):
+            return "", {"error": "turn timed out"}
+        except Exception as exc:  # noqa: BLE001 - surface as API error
+            logger.warning("public API turn failed: {}", str(exc)[:300])
+            message = str(exc)
+            lowered = message.lower()
+            if "credit" in lowered or "exhausted" in lowered:
+                return "", {"error": f"Insufficient credits: {message[:300]}"}
+            return "", {"error": message[:300] or "agent error"}
 
-            deadline = turn_started + TURN_TIMEOUT_SECONDS
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    error = "turn timed out"
-                    break
-                try:
-                    raw = await asyncio.wait_for(queue.get(), timeout=min(remaining, 30.0))
-                except asyncio.TimeoutError:
-                    continue
-                try:
-                    frame = json.loads(raw)
-                except (ValueError, TypeError):
-                    continue
-                if not isinstance(frame, dict):
-                    continue
-                kind = frame.get("event")
-                if kind == "message":
-                    text = str(frame.get("text") or "")
-                    if text:
-                        got_message = True
-                        final_parts.append(text)
-                elif kind == "turn_end":
-                    break
-                elif kind == "error":
-                    error = str(frame.get("detail") or "agent error")
-                    break
-        finally:
-            if subs_added:
-                conns = getattr(channel, "_subs", {}).get(cid)  # noqa: SLF001
-                if conns is not None:
-                    conns.discard(sink)
-                    if not conns:
-                        channel._subs.pop(cid, None)  # noqa: SLF001
-            tracked = getattr(channel, "_conn_chats", None)
-            if tracked is not None:
-                tracked.pop(sink, None)
-
-        text = "\n\n".join(p for p in final_parts if p.strip()).strip()
-        if error and not text:
-            return "", {"error": error}
-        if not got_message and not text:
+        text = ""
+        if response is not None:
+            text = str(getattr(response, "content", "") or "").strip()
+        usage = getattr(agent, "_last_usage", None) or {}
+        if not text:
             return "", {"error": "no response from agent"}
-        return text, {}
+        return text, {"usage": dict(usage) if isinstance(usage, dict) else {}}
 
 
 api_bridge = ApiBridge()

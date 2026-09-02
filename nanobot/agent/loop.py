@@ -2647,11 +2647,12 @@ class AgentLoop:
         runtime: LLMRuntime | None = None,
         on_runtime_admitted: Callable[[LLMRuntime], Awaitable[None]] | None = None,
         attributes: Mapping[str, Any] | None = None,
+        extra_metadata: Mapping[str, Any] | None = None,
     ) -> OutboundMessage | None:
         """Process an external message directly and return the outbound payload."""
         if channel == "system":
             raise ValueError("channel 'system' is reserved for internal messages")
-        metadata: dict[str, Any] = {}
+        metadata: dict[str, Any] = dict(extra_metadata or {})
         if not persist_user_message:
             metadata[turn_continuation.SKIP_USER_PERSIST_META] = True
         msg = InboundMessage(

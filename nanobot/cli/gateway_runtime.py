@@ -448,6 +448,15 @@ def _run_gateway(
     def _schedule_webui_background(awaitable: Awaitable[None]) -> None:
         agent.schedule_background(cast(Coroutine[Any, Any, None], awaitable))
 
+    # Attach the live agent loop to the public API bridge so /v1/* requests
+    # served by the WebUI HTTP router can run turns directly (Render).
+    try:
+        from nanobot.api.api_bridge import api_bridge
+
+        api_bridge.wire(agent)
+    except Exception:  # noqa: BLE001 - bridge is optional, never blocks startup
+        logger.warning("public API bridge wiring failed", exc_info=True)
+
     webui_turn_coordinator = WebuiTurnCoordinator(
         bus=bus,
         sessions=session_manager,
