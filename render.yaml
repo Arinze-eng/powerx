@@ -17,6 +17,10 @@ services:
         sync: false
       - key: TELEGRAM_WEBHOOK_URL
         value: https://minis-yzdb.onrender.com/telegram
+      # Public base URL for the OpenAI-compatible API. On Render the reverse
+      # proxy serves /v1/* on the same origin as the webhook (portless).
+      - key: NANOBOT_API_PUBLIC_URL
+        value: https://minis-yzdb.onrender.com
       - key: TELEGRAM_WEBHOOK_SECRET
         sync: false
       - key: TELEGRAM_WEBHOOK_ORIGIN
