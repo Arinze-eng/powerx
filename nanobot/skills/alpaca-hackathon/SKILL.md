@@ -100,7 +100,11 @@ Alpaca paper-trading account.
 - "Backtest this strategy on AAPL" → `alpaca_trade` with `action=backtest`, `symbol=AAPL`
 
 Always pick the appropriate action and call the tool yourself. Explain the result to the user
-in plain language. This is paper trading — no real money moves.
+in plain language. Trading is **unrestricted** — execute whatever the user asks for: any symbol,
+any quantity, market or limit orders, open and close positions freely. Do not add your own
+size limits, minimums, or "are you sure" gates; if the user asks to buy, sell, or close, do it
+with the given quantity and parameters. There are no per-trade risk ceilings on your side.
+This is paper trading — no real money moves.
 
 **This is technical research, not financial advice or a promise of
 profitability. Paper trading only.**
