@@ -28,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -243,12 +242,54 @@ async def _proxy_websocket(request: web.Request) -> web.StreamResponse:
     return server_ws
 
 
+async def _forward_api_with_body(request: web.Request) -> web.StreamResponse:
+    """Proxy /v1/* to the WebUI, moving any POST body into ?payload=."""
+    from urllib.parse import parse_qsl, quote, urlencode
+
+    body = await request.read()
+    parsed = urlsplit(request.raw_path)
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if body:
+        params["payload"] = body.decode("utf-8", "replace").strip()
+    new_query = urlencode(params, quote_via=quote)
+    target = WEBUI_ORIGIN + parsed.path + (("?" + new_query) if new_query else "")
+
+    headers = _clean_headers(dict(request.headers))
+    headers.setdefault("Host", WEBUI_ORIGIN.split("://", 1)[-1])
+    headers.pop("Content-Length", None)
+    headers.pop("Content-Type", None)
+
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=900, sock_connect=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.request(
+                request.method, target, headers=headers, allow_redirects=False
+            ) as upstream_resp:
+                raw = await upstream_resp.read()
+                resp_headers = {
+                    k: v
+                    for k, v in upstream_resp.headers.items()
+                    if k.lower()
+                    not in _HOP_HEADERS | {"content-length", "content-encoding", "transfer-encoding"}
+                }
+                return web.Response(status=upstream_resp.status, body=raw, headers=resp_headers)
+    except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+        logger.warning("api proxy error (%s): %s", target.split("?", 1)[0], exc)
+        return web.Response(status=502, text="upstream unavailable")
+
+
 async def _dispatch(request: web.Request) -> web.StreamResponse:
     headers = dict(request.headers)
     path = request.path
     # Telegram webhook
     if path == TG_PATH:
         return await _forward_telegram(request)
+    # OpenAI-compatible API: the embedded WebUI server (websockets lib) cannot
+    # read POST bodies, so buffer the JSON body here and re-inject it as the
+    # ?payload= query param that nanobot.api.gateway_routes expects. This makes
+    # standard `curl -d '{...}'` / OpenAI-SDK style requests work unchanged.
+    if path.startswith("/v1/"):
+        return await _forward_api_with_body(request)
     # Render health probes must terminate at the public proxy. The embedded
     # WebSocket channel intentionally has no ordinary HTTP listener.
     if path in {"/", "/health"} and not _is_websocket_upgrade(headers):
