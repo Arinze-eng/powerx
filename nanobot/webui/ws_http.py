@@ -561,8 +561,8 @@ class GatewayHTTPHandler:
         if response is not None:
             return response
 
-        # API 404 (never serve SPA for /api/ routes)
-        if got.startswith("/api/"):
+        # API 404 (never serve SPA for /api/ or /v1/ routes)
+        if got.startswith("/api/") or got.startswith("/v1/"):
             return _http_error(404, "API route not found")
 
         # Static SPA serving
