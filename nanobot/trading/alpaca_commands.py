@@ -130,8 +130,7 @@ async def _handle_connect(
     return (
         "🔗 Connect your Alpaca paper account\n\n"
         "Send your Alpaca API credentials in this format:\n"
-        "```
-/alpaca connect YOUR_API_KEY YOUR_SECRET_KEY\n```\n\n"
+        "```\n/alpaca connect YOUR_API_KEY YOUR_SECRET_KEY\n```\n\n"
         "Get your API keys from: https://app.alpaca.markets/paper/dashboard/overview\n"
         "Make sure you're using your **paper trading** keys.\n\n"
         "Your credentials will be encrypted and stored securely."
