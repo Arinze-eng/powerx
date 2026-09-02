@@ -256,8 +256,9 @@ async def _forward_api_with_body(request: web.Request) -> web.StreamResponse:
 
     headers = _clean_headers(dict(request.headers))
     headers.setdefault("Host", WEBUI_ORIGIN.split("://", 1)[-1])
+    # Content-Length must NOT be forwarded: we send no body upstream now, and
+    # aiohttp would otherwise emit a stale length that breaks the request.
     headers.pop("Content-Length", None)
-    headers.pop("Content-Type", None)
 
     timeout = aiohttp.ClientTimeout(total=None, sock_read=900, sock_connect=10)
     try:
