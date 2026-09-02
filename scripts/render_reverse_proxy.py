@@ -96,9 +96,15 @@ async def _proxy_webui_http_raw(request: web.Request) -> web.StreamResponse:
     body = await request.read()
     headers = _clean_headers(dict(request.headers))
     headers["Host"] = parsed.netloc
+    # HTTP/1.1 keep-alive (default when no Connection header is sent): the
+    # upstream reads the next pipelined request from this same connection and
+    # our raw writer never follows up, so the response times out -> 502.
+    # Force "close" to match how aiohttp's connector behaves.
     headers["Connection"] = "close"
     if body:
         headers["Content-Length"] = str(len(body))
+    else:
+        headers.pop("Content-Length", None)
     request_head = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
     raw_request = (
         f"{request.method} {target} HTTP/1.1\r\n"
