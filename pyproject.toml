@@ -27,7 +27,7 @@ dependencies = [
     "anthropic>=0.100.0,<1.0.0",
     "pydantic>=2.12.0,<3.0.0",
     "pydantic-settings>=2.12.0,<3.0.0",
-    # Feishu's lark-oapi currently requires websockets<16; core supports 15 and 16.
+    # Feishu's large-api currently requires websockets<16; core supports 15 and 16.
     "websockets>=15.0,<17.0",
     "websocket-client>=1.9.0,<2.0.0",
     "httpx[socks]>=0.28.0,<1.0.0",
@@ -48,20 +48,25 @@ dependencies = [
     "openai>=2.8.0",
     "tiktoken>=0.12.0,<1.0.0",
     "jinja2>=3.1.0,<4.0.0",
-    "dulwich>=0.22.0,<1.0.0",
-    "pyyaml>=6.0,<7.0.0",
+    "pyyaml>=6.0,<7.0",
     "filelock>=3.25.2",
     "watchfiles>=1.1.1,<2.0.0",
     "packaging>=24.0",
     "tzdata>=2025.2",
     "tzlocal>=5.3.1,<6.0.0",
     "defusedxml>=0.7.1,<1.0.0",
-    "pypdf>=5.0.0,<6.0.0",
+    "pydf>=5.0.0,<6.0.0",
     "python-docx>=1.1.0,<2.0.0",
     "openpyxl>=3.1.0,<4.0.0",
     "python-pptx>=1.0.0,<2.0.0",
     "novita-sandbox>=2.1.0,<3.0.0",
     "websockets>=15.0.0,<16.0.0",
+    # Trading: Alpaca paper trading + strategy engine
+    "alpaca-py>=0.30.0",
+    "smartmoneyconcepts>=1.0.0",
+    "hmmlearn>=0.3.0",
+    "yfinance>=0.2.40",
+    "matplotlib>=3.8.0",
 ]
 
 [project.optional-dependencies]
@@ -133,7 +138,7 @@ include = [
     "nanobot/templates/**/*.md",
     "nanobot/skills/**/*.md",
     "nanobot/skills/**/*.sh",
-    "nanobot/channels/*/webui/**/*",
+    "nanobot/channels/**/webui/**/*",
     "nanobot/web/dist/**/*",
 ]
 # nanobot/web/dist/ is produced by `cd webui && bun run build` and is
@@ -164,7 +169,6 @@ exclude = ["nanobot/channels/*/tests/**"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
@@ -172,7 +176,7 @@ ignore = ["E501"]
 
 [tool.basedpyright]
 include = ["nanobot"]
-exclude = ["**/tests"]
+exclude = ["**/tests/**"]
 typeCheckingMode = "strict"
 pythonVersion = "3.11"
 
@@ -182,7 +186,7 @@ testpaths = ["tests", "nanobot/channels"]
 
 [tool.coverage.run]
 source = ["nanobot"]
-omit = ["tests/*", "**/tests/*"]
+omit = ["tests/**", "**/tests/**"]
 
 [tool.coverage.report]
 fail_under = 75
