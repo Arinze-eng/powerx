@@ -8,7 +8,6 @@ environment keys are used as fallback.
 
 from __future__ import annotations
 
-import asyncio
 import os
 from typing import Any
 
@@ -85,13 +84,20 @@ class AlpacaTradeTool(Tool):
     def enabled(cls, ctx: ToolContext) -> bool:
         return True
 
-    def _get_credentials(self) -> dict[str, str] | None:
-        """Resolve Alpaca credentials.
+    async def _get_credentials(self) -> dict[str, str] | None:
+        """Resolve the *current user's* Alpaca credentials.
 
-        Priority: a per-user credential stored via /alpaca connect (read from
-        Supabase when the request context carries a known Telegram sender), then
-        the server-level ALPACA_API_KEY / ALPACA_SECRET_KEY environment
-        variables. Returns None when neither is available.
+        Per-user isolation: when the request context identifies a Telegram
+        sender, credentials are resolved strictly from that user's Supabase
+        row (set via /alpaca connect). If the user has no stored credentials
+        (never connected or disconnected), this returns None so the agent
+        reports "not connected" — it does NOT fall back to shared server
+        environment keys, otherwise per-user disconnect would have no effect
+        and every user would see the same account.
+
+        The server-level ALPACA_API_KEY / ALPACA_SECRET_KEY environment
+        variables are only used when no per-user identity is present at all
+        (e.g. non-Telegram or anonymous contexts).
         """
         user_id = self._current_telegram_user_id()
         if user_id:
@@ -100,11 +106,11 @@ class AlpacaTradeTool(Tool):
 
                 store = AlpacaCredentialStore()
                 if store.enabled:
-                    creds = asyncio.run(store.get_credentials(user_id))
-                    if creds:
-                        return creds
+                    # Return what belongs to *this* user (or None), never env.
+                    return await store.get_credentials(user_id)
             except Exception as exc:
                 logger.debug(f"Could not load per-user Alpaca credentials: {exc}")
+                return None
 
         api_key = os.getenv("ALPACA_API_KEY", "")
         secret_key = os.getenv("ALPACA_SECRET_KEY", "")
@@ -123,19 +129,24 @@ class AlpacaTradeTool(Tool):
             from nanobot.agent.tools.context import current_request_context
 
             ctx = current_request_context()
-            metadata = getattr(ctx, "metadata", {}) if ctx is not None else {}
-            sender = (metadata or {}).get("telegram_user_id")
-            return int(sender) if sender else None
+            if ctx is None:
+                return None
+            metadata = getattr(ctx, "metadata", None) or {}
+            sender = metadata.get("user_id") or metadata.get("telegram_user_id")
+            if not sender and getattr(ctx, "attributes", None):
+                sender = ctx.attributes.get("telegram_user_id")
+            if not sender:
+                return None
+            return int(sender)
         except Exception:
             return None
 
-    def _get_adapter(self):
-        creds = self._get_credentials()
+    async def _get_adapter(self):
+        creds = await self._get_credentials()
         if not creds:
             raise RuntimeError(
-                "Alpaca credentials not configured. Use /alpaca connect to link "
-                "your Alpaca paper account, or set ALPACA_API_KEY/ALPACA_SECRET_KEY "
-                "environment variables."
+                "Your Alpaca account is not connected. Use /alpaca connect to link "
+                "your own Alpaca paper trading account."
             )
         from nanobot.trading.alpaca_adapter import AlpacaCredentials, AlpacaExecutionAdapter
 
@@ -163,7 +174,7 @@ class AlpacaTradeTool(Tool):
             return ToolResult.error(str(exc))
 
     async def _account(self, params: dict) -> ToolResult:
-        adapter = self._get_adapter()
+        adapter = await self._get_adapter()
         account = adapter.get_account()
         return ToolResult(
             f"Alpaca Paper Account\n"
@@ -176,7 +187,7 @@ class AlpacaTradeTool(Tool):
         )
 
     async def _positions(self, params: dict) -> ToolResult:
-        adapter = self._get_adapter()
+        adapter = await self._get_adapter()
         positions = adapter.get_positions()
         if not positions:
             return ToolResult("No open positions.")
@@ -191,7 +202,7 @@ class AlpacaTradeTool(Tool):
         return ToolResult("\n".join(lines))
 
     async def _place_order(self, params: dict) -> ToolResult:
-        adapter = self._get_adapter()
+        adapter = await self._get_adapter()
         symbol = params.get("symbol", "")
         qty = params.get("qty")
         side = params.get("side", params.get("action", ""))
@@ -213,7 +224,7 @@ class AlpacaTradeTool(Tool):
         )
 
     async def _close_position(self, params: dict) -> ToolResult:
-        adapter = self._get_adapter()
+        adapter = await self._get_adapter()
         symbol = params.get("symbol", "")
         if not symbol:
             return ToolResult.error("symbol is required to close a position")

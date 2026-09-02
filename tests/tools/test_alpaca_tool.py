@@ -45,7 +45,7 @@ def test_get_credentials_from_env():
         clear=False,
     ):
         tool = AlpacaTradeTool()
-        creds = tool._get_credentials()
+        creds = asyncio.run(tool._get_credentials())
         assert creds is not None
         assert creds["api_key"] == "PK-test-key-abc"
         assert creds["secret_key"] == "secret-value"
@@ -59,7 +59,79 @@ def test_get_credentials_none_without_env():
         clear=False,
     ):
         tool = AlpacaTradeTool()
-        creds = tool._get_credentials()
+        creds = asyncio.run(tool._get_credentials())
+        assert creds is None
+
+
+def test_get_credentials_prefers_per_user_over_env():
+    """A resolved Telegram user gets ONLY their stored credentials — never the
+    shared server env keys. This enforces per-user isolation and makes
+    /alpaca disconnect effective."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    fake_store = MagicMock()
+    fake_store.enabled = True
+    fake_store.get_credentials = AsyncMock(
+        return_value={
+            "api_key": "PK-user-key-111",
+            "secret_key": "user-secret",
+            "base_url": "https://paper-api.alpaca.markets",
+        }
+    )
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "ALPACA_API_KEY": "PK-server-key-999",
+                "ALPACA_SECRET_KEY": "server-secret",
+            },
+            clear=False,
+        ),
+        patch(
+            "nanobot.trading.alpaca_credentials.AlpacaCredentialStore",
+            return_value=fake_store,
+        ),
+        patch(
+            "nanobot.agent.tools.alpaca_trade.AlpacaTradeTool._current_telegram_user_id",
+            return_value=12345,
+        ),
+    ):
+        tool = AlpacaTradeTool()
+        creds = asyncio.run(tool._get_credentials())
+        assert creds["api_key"] == "PK-user-key-111"
+        assert creds["api_key"] != "PK-server-key-999"
+
+
+def test_get_credentials_none_when_user_disconnected_even_with_env():
+    """If a user has disconnected (no stored row), the tool returns None even
+    when server env keys are present — wiring the /alpaca disconnect behavior."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    fake_store = MagicMock()
+    fake_store.enabled = True
+    fake_store.get_credentials = AsyncMock(return_value=None)
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "ALPACA_API_KEY": "PK-server-key-999",
+                "ALPACA_SECRET_KEY": "server-secret",
+            },
+            clear=False,
+        ),
+        patch(
+            "nanobot.trading.alpaca_credentials.AlpacaCredentialStore",
+            return_value=fake_store,
+        ),
+        patch(
+            "nanobot.agent.tools.alpaca_trade.AlpacaTradeTool._current_telegram_user_id",
+            return_value=12345,
+        ),
+    ):
+        tool = AlpacaTradeTool()
+        creds = asyncio.run(tool._get_credentials())
         assert creds is None
 
 
