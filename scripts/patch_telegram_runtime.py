@@ -1,17 +1,20 @@
-"""Patch script: adds /trade, /backtest, /alpaca commands to Telegram runtime.
+#!/usr/bin/env python3
+"""Restore runtime.py with Alpaca trading command edits.
 
-This script downloads the current nanobot/channels/telegram/runtime.py from
-the feat/alpaca-trading branch, applies 6 targeted edits to add trading
-commands, and commits the updated file back.
+This script:
+1. Downloads the original runtime.py from the pre-merge commit
+2. Applies 6 edits to add /trade, /backtest, /alpaca commands
+3. Writes the updated file to nanobot/channels/telegram/runtime.py
+4. Commits the change via the GitHub API
 
 Usage:
+    export GITHUB_TOKEN="your_token"
     python scripts/patch_telegram_runtime.py
-
-Requires GITHUB_TOKEN environment variable with repo write access.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -19,8 +22,11 @@ import urllib.request
 
 OWNER = "Arinze-eng"
 REPO = "powerx"
-BRANCH = "feat/alpaca-trading"
+BRANCH = "main"
 PATH = "nanobot/channels/telegram/runtime.py"
+# The pre-merge commit that still has the full runtime.py
+# This is the commit just before the merge of feat/alpaca-trading
+PRE_MERGE_REF = "cf61d11c85fe767051d0864c46d281132e5812a1"
 
 
 def github_request(url: str, method: str = "GET", body: dict | None = None) -> dict:
@@ -37,23 +43,18 @@ def github_request(url: str, method: str = "GET", body: dict | None = None) -> d
         return json.loads(resp.read())
 
 
-def main() -> int:
-    # 1. Download current runtime.py from main branch (the original, untruncated)
-    url = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{PATH}?ref=main"
+def download_original() -> str:
+    """Download the original runtime.py from the pre-merge commit."""
+    url = (
+        f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{PATH}"
+        f"?ref={PRE_MERGE_REF}"
+    )
     data = github_request(url)
-    import base64
-    content = base64.b64decode(data["content"]).decode("utf-8")
-    sha = None  # We'll get the SHA from the feature branch
+    return base64.b64decode(data["content"]).decode("utf-8")
 
-    # 2. Get the SHA from the feature branch (if it exists)
-    try:
-        feat_url = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{PATH}?ref={BRANCH}"
-        feat_data = github_request(feat_url)
-        sha = feat_data["sha"]
-    except Exception:
-        pass  # File doesn't exist on branch yet, will create
 
-    # 3. Apply the 6 edits
+def apply_edits(content: str) -> str:
+    """Apply the 6 trading command edits to runtime.py."""
 
     # Edit 1: Add import for alpaca_commands
     old = "from nanobot.channels.telegram.api_platform import handle_api_command"
@@ -76,8 +77,8 @@ def main() -> int:
     content = content.replace(old, new, 1)
 
     # Edit 3: Add trade|backtest to TELEGRAM_BUS_SLASH_COMMAND_RE
-    old = "video|cancel|discard)(?:@\\\\w+)?(?:\\\\s+.*)?$"
-    new = "video|trade|backtest|cancel|discard)(?:@\\\\w+)?(?:\\\\s+.*)?$"
+    old = r"video|cancel|discard)(?:@\w+)?(?:\s+.*)?$"
+    new = r"video|trade|backtest|cancel|discard)(?:@\w+)?(?:\s+.*)?$"
     assert old in content, "Could not find bus slash command regex"
     content = content.replace(old, new, 1)
 
@@ -90,8 +91,8 @@ def main() -> int:
         "\n\n"
         "    # Commands for the Alpaca trading integration (connect/disconnect/status).\n"
         "    TELEGRAM_ALPACA_COMMAND_RE = re.compile(\n"
-        '        r"^/alpaca(?:@\\\\w+)?(?:\\\\s+.*)?$"\n'
-        "    )"
+        r'        r"^/alpaca(?:@\w+)?(?:\s+.*)?$"'
+        "\n    )"
     )
     content = content[: end_idx + 5] + alpaca_re + content[end_idx + 5 :]
 
@@ -145,10 +146,22 @@ def main() -> int:
     assert old in content, "Could not find apikey dispatch block"
     content = content.replace(old, new, 1)
 
-    # 4. Commit the updated file
+    return content
+
+
+def commit_file(content: str) -> None:
+    """Commit the updated runtime.py via the GitHub API."""
+    # Get the current file SHA
+    url = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{PATH}?ref={BRANCH}"
+    try:
+        data = github_request(url)
+        sha = data["sha"]
+    except Exception:
+        sha = None
+
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     body = {
-        "message": "feat: add /trade, /backtest, /alpaca commands to Telegram runtime",
+        "message": "fix: restore full runtime.py with /trade /backtest /alpaca command edits",
         "content": encoded,
         "branch": BRANCH,
     }
@@ -162,6 +175,38 @@ def main() -> int:
     )
     print(f"✅ Committed: {result['commit']['html_url']}")
     print(f"   File size: {len(content)} chars")
+
+
+def main() -> int:
+    print("📥 Downloading original runtime.py from pre-merge commit...")
+    content = download_original()
+    print(f"   Downloaded: {len(content)} chars")
+
+    print("🔧 Applying 6 trading command edits...")
+    content = apply_edits(content)
+    print(f"   Result: {len(content)} chars")
+
+    # Verify edits
+    checks = {
+        "import": "from nanobot.trading.alpaca_commands import" in content,
+        "BOT_COMMANDS": 'BotCommand("trade"' in content,
+        "bus_regex": "trade|backtest" in content,
+        "alpaca_regex": "TELEGRAM_ALPACA_COMMAND_RE" in content,
+        "handler": "filters.Regex(TelegramChannel.TELEGRAM_ALPACA_COMMAND_RE)" in content,
+        "dispatch": 'command_name == "/alpaca"' in content,
+    }
+    all_ok = True
+    for name, ok in checks.items():
+        print(f"   {'✅' if ok else '❌'} {name}")
+        if not ok:
+            all_ok = False
+
+    if not all_ok:
+        print("\n❌ Some edits failed verification. Aborting.")
+        return 1
+
+    print("\n📤 Committing to GitHub...")
+    commit_file(content)
     return 0
 
 
