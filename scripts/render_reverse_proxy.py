@@ -297,14 +297,15 @@ async def _dispatch(request: web.Request) -> web.StreamResponse:
     # standard `curl -d '{...}'` / OpenAI-SDK style requests work unchanged.
     if path.startswith("/v1/"):
         return await _forward_api_with_body(request)
-    # Render health probes must terminate at the public proxy. The embedded
-    # WebSocket channel intentionally has no ordinary HTTP listener.
-    if path in {"/", "/health"} and not _is_websocket_upgrade(headers):
+    # Render health probes terminate at the public proxy. Only the explicit
+    # /health path is a plain "ok"; the root "/" is forwarded to the WebUI so
+    # the admin dashboard loads at the site root instead of returning "ok".
+    if path == "/health" and not _is_websocket_upgrade(headers):
         return web.Response(text="ok", content_type="text/plain")
     # WebSocket upgrade to the WebUI
     if _is_websocket_upgrade(headers):
         return await _proxy_websocket(request)
-    # Everything else: forward HTTP to the WebUI
+    # Everything else (including "/"): forward HTTP to the WebUI
     return await _proxy_http(request, WEBUI_ORIGIN)
 
 

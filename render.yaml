@@ -7,7 +7,7 @@ services:
     autoDeploy: false
     plan: free
     region: frankfurt
-    healthCheckPath: /
+    healthCheckPath: /health
     envVars:
       - key: LLM_BASE_URL
         value: https://gemini-proxy.codebanana.app/v1
