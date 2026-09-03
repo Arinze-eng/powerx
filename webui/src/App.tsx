@@ -59,6 +59,7 @@ import {
 } from "@/lib/bootstrap";
 import {
   fetchCredits,
+  getCurrentUser,
   getSessionToken,
   signIn,
   signOut,
@@ -1104,6 +1105,25 @@ export default function App() {
 
   const handleSupabaseSignUp = useCallback(
     async (url: string, anonKey: string, name: string, email: string, password: string) => {
+      // Defense-in-depth: if this browser already holds a signed-in Supabase
+      // session, creating another account here would let one person farm the
+      // credit sign-up bonus repeatedly. Require sign-out first.
+      if (url && anonKey) {
+        const existing = await getCurrentUser(url, anonKey).catch(() => null);
+        if (existing?.id) {
+          setState((current) =>
+            current.status === "supabase"
+              ? {
+                  ...current,
+                  failed: true,
+                  message:
+                    "This browser is already signed in to an account. Sign out first before creating a new account.",
+                }
+              : current,
+          );
+          return { error: "You already have an active session in this browser. Please sign out first." };
+        }
+      }
       const { session, error } = await signUp(url, anonKey, email, password, name);
       if (error || !session) {
         setState((current) =>

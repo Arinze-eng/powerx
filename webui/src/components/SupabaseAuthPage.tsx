@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Eye, EyeOff, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { guardSignup } from "@/lib/anti-loot";
 
 type Mode = "signin" | "signup";
 
@@ -45,6 +46,15 @@ export function SupabaseAuthPage({
     if (password.length < 6) {
       setLocalError("Password must be at least 6 characters.");
       return;
+    }
+    // Anti-loot guard: block repeated free-credit account creation on the same
+    // browser while still allowing genuinely new users (fresh device / store).
+    if (mode === "signup") {
+      const guard = guardSignup(cleanEmail);
+      if (!guard.allowed) {
+        setLocalError(guard.reason);
+        return;
+      }
     }
     setSubmitting(true);
     setLocalError(null);
