@@ -46,6 +46,14 @@ if [ "$RENDER" = "true" ]; then
         python3 /app/scripts/supabase_chat_sync.py --dir "$dir" --restore || \
             echo "[entrypoint] warning: chat restore failed (continuing)"
     fi
+    # Restore scheduled cron jobs from Supabase so a redeploy does not wipe the
+    # user's scheduled reminders / assignments (the cron store lives on the same
+    # ephemeral Render disk as chat history). Runs before the app starts.
+    if [ -f /app/scripts/supabase_cron_sync.py ]; then
+        NANOBOT_DATA_DIR="$dir" /app/.venv/bin/python3 \
+            /app/scripts/supabase_cron_sync.py --restore || \
+            echo "[entrypoint] warning: cron restore failed (continuing)"
+    fi
 fi
 
 # Drop privileges whenever the container starts as root. Render mounts the
@@ -60,6 +68,14 @@ if [ "$(id -u)" = "0" ]; then
     if [ -f /app/scripts/supabase_chat_sync.py ]; then
         setpriv --reuid=nanobot --regid=nanobot --init-groups python3 \
             /app/scripts/supabase_chat_sync.py --dir "$dir" --loop 60 \
+            >/dev/null 2>&1 &
+    fi
+    # Start the cron-job backup sidecar so newly scheduled reminders /
+    # assignments are pushed to Supabase continuously too.
+    if [ -f /app/scripts/supabase_cron_sync.py ]; then
+        setpriv --reuid=nanobot --regid=nanobot --init-groups env \
+            NANOBOT_DATA_DIR="$dir" /app/.venv/bin/python3 \
+            /app/scripts/supabase_cron_sync.py --loop 60 \
             >/dev/null 2>&1 &
     fi
     if setpriv --reuid=nanobot --regid=nanobot --init-groups true 2>/dev/null; then
@@ -87,6 +103,12 @@ fi
 # Start the chat-history backup sidecar (non-root / local dev path).
 if [ -f /app/scripts/supabase_chat_sync.py ]; then
     python3 /app/scripts/supabase_chat_sync.py --dir "$dir" --loop 60 >/dev/null 2>&1 &
+fi
+
+# Start the cron-job backup sidecar (non-root / local dev path).
+if [ -f /app/scripts/supabase_cron_sync.py ]; then
+    NANOBOT_DATA_DIR="$dir" /app/.venv/bin/python3 \
+        /app/scripts/supabase_cron_sync.py --loop 60 >/dev/null 2>&1 &
 fi
 
 exec /app/scripts/nanobot_launcher.sh "$@"
