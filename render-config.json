@@ -6,6 +6,9 @@
       "maxToolIterations": 120,
       "reasoningEffort": "high",
       "maxConcurrentSubagents": 1,
+      "contextWindowTokens": 1048576,
+      "maxTokens": 32768,
+      "maxToolResultChars": 524288,
       "workspace": "~/.nanobot/workspace",
       "botName": "Novita Super Agent"
     }

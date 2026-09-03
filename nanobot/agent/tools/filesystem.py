@@ -270,7 +270,10 @@ class ReadFileTool(_FsTool):
     """Read file contents with optional line-based pagination."""
     _scopes = {"core", "subagent", "memory"}
 
-    _MAX_CHARS = 128_000
+    # Raised from 128K so large repo files can be read in full before the tool
+    # truncates (the previous 128K cap caused "reads everything it can, then
+    # gives partial results" on big codebases).
+    _MAX_CHARS = 1_000_000
     _MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024
     _DEFAULT_LIMIT = 2000
     _MAX_PDF_PAGES = 20
@@ -295,7 +298,7 @@ class ReadFileTool(_FsTool):
             "are based on current content. "
             "Use offset and limit for large text files. "
             "Use force=true to re-read content even if unchanged. "
-            "Reads exceeding ~128K chars are truncated."
+            "Reads exceeding ~1M chars are truncated."
         )
 
     @property
@@ -501,7 +504,7 @@ class ReadFileTool(_FsTool):
             return f"({fp.suffix.upper().lstrip('.')} has no extractable text: {fp})"
 
         if len(result) > self._MAX_CHARS:
-            result = result[:self._MAX_CHARS] + "\n\n(Document text truncated at ~128K chars)"
+            result = result[:self._MAX_CHARS] + "\n\n(Document text truncated at ~1M chars)"
 
         return result
 

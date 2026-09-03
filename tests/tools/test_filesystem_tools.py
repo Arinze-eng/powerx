@@ -92,8 +92,9 @@ class TestReadFileTool:
     async def test_char_budget_trims(self, tool, tmp_path):
         """When the selected slice exceeds _MAX_CHARS the output is trimmed."""
         f = tmp_path / "big.txt"
-        # Each line is ~110 chars, 2000 lines ≈ 220 KB > 128 KB limit
-        f.write_text("\n".join("x" * 110 for _ in range(2000)), encoding="utf-8")
+        # Each line is ~110 chars; enough lines to exceed the ~1M char budget.
+        line_count = (ReadFileTool._MAX_CHARS // 110) + 2000
+        f.write_text("\n".join("x" * 110 for _ in range(line_count)), encoding="utf-8")
         result = await tool.execute(path=str(f))
         assert len(result) <= ReadFileTool._MAX_CHARS + 500  # small margin for footer
         assert "Use offset=" in result

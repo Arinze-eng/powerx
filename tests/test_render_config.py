@@ -158,3 +158,43 @@ def test_render_defaults_migrate_local_browser_to_novita(tmp_path: Path) -> None
     assert browser["novitaTimeoutSeconds"] == 600
     assert browser["novitaBrowserPort"] == 9223
     assert browser["actionTimeoutMs"] == 9000
+
+
+def test_render_defaults_raise_execution_limits_when_null(tmp_path: Path) -> None:
+    """A config with no explicit context limits gets the elevated defaults."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"agents": {"defaults": {"model": "custom/muse"}}}),
+        encoding="utf-8",
+    )
+
+    assert ensure_render_defaults(config_path) is True
+    defaults = json.loads(config_path.read_text(encoding="utf-8"))["agents"]["defaults"]
+    assert defaults["contextWindowTokens"] == 1_048_576
+    assert defaults["maxTokens"] == 32_768
+    assert defaults["maxToolResultChars"] == 524_288
+
+
+def test_render_defaults_do_not_raise_already_higher_values(tmp_path: Path) -> None:
+    """Operator-set values equal to or above our elevated defaults are preserved."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {
+                        "contextWindowTokens": 2_000_000,
+                        "maxTokens": 64_000,
+                        "maxToolResultChars": 1_000_000,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert ensure_render_defaults(config_path) is True
+    defaults = json.loads(config_path.read_text(encoding="utf-8"))["agents"]["defaults"]
+    assert defaults["contextWindowTokens"] == 2_000_000
+    assert defaults["maxTokens"] == 64_000
+    assert defaults["maxToolResultChars"] == 1_000_000

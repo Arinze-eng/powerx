@@ -205,6 +205,51 @@ def _ensure_deliberate_defaults(data: dict[str, Any]) -> bool:
     return changed
 
 
+# Elevated execution/context limits so the running agent can read through large
+# repos in full instead of truncating ("reads what it can, then gives partial
+# results"). Only filled in when the value is absent or structurally null, so a
+# value the operator set even higher is never reduced here. The deployed render
+# config leaves these null, so they default to the old code defaults (ctx 200K,
+# out 8K, tool-result 16K chars) — well below what the custom provider supports.
+_ELEVATED_LIMITS: dict[str, int] = {
+    # context_window_tokens: accept one of the WebUI-valid options; 1M tokens.
+    "context_window_tokens": 1_048_576,
+    # max_tokens (max output tokens): raise to 32K so long responses are not cut.
+    "max_tokens": 32_768,
+    # max_tool_result_chars: how many chars a tool result may carry before the
+    # context governor snips it. 16K was far too small for full file reads.
+    "max_tool_result_chars": 524_288,
+}
+
+
+def _ensure_high_context_defaults(data: dict[str, Any]) -> bool:
+    """Raise execution/context limits to the elevated defaults on Render."""
+    agents = data.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        return False
+    defaults = agents.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        return False
+
+    changed = False
+    for snake_key, value in _ELEVATED_LIMITS.items():
+        camel_key = {
+            "context_window_tokens": "contextWindowTokens",
+            "max_tokens": "maxTokens",
+            "max_tool_result_chars": "maxToolResultChars",
+        }[snake_key]
+        existing = defaults.get(camel_key)
+        try:
+            cur = int(existing) if existing is not None else None
+        except (TypeError, ValueError):
+            cur = None
+        # Raise only when unset/null or below our elevated target.
+        if cur is None or cur < value:
+            defaults[camel_key] = value
+            changed = True
+    return changed
+
+
 def ensure_render_defaults(config_path: Path) -> bool:
     """Apply attachment and deliberate-execution defaults without clobbering config."""
     data = _load_config(config_path)
@@ -215,6 +260,7 @@ def ensure_render_defaults(config_path: Path) -> bool:
     changed = _ensure_provider_defaults(data) or changed
     changed = _ensure_telegram_polling_defaults(data) or changed
     changed = _ensure_deliberate_defaults(data) or changed
+    changed = _ensure_high_context_defaults(data) or changed
     return _write_config(config_path, data) if changed else False
 
 

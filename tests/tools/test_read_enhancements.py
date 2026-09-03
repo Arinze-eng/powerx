@@ -415,12 +415,13 @@ class TestOfficeDocTruncation:
 
     @pytest.mark.asyncio
     async def test_large_document_truncated(self, tool, tmp_path):
-        with patch("nanobot.utils.document.extract_text", return_value="x" * 200_000):
+        with patch("nanobot.utils.document.extract_text",
+                   return_value="x" * (ReadFileTool._MAX_CHARS + 50_000)):
             f = tmp_path / "large.docx"
             f.write_bytes(b"PK")
             result = await tool.execute(path=str(f))
         assert len(result) <= ReadFileTool._MAX_CHARS + 100
-        assert "truncated at ~128K chars" in result
+        assert "truncated at ~1M chars" in result
 
     @pytest.mark.asyncio
     async def test_small_document_not_truncated(self, tool, tmp_path):
