@@ -134,3 +134,50 @@ export async function fetchCredits(
     return null;
   }
 }
+
+export interface VerifyPaymentResult {
+  ok: boolean;
+  credits?: number;
+  pkg?: string;
+  error?: string;
+}
+
+/**
+ * Verify a Flutterwave payment by invoking the same Supabase Edge Function
+ * that the Telegram bot uses (pay-verify), authenticated with the caller's own
+ * Supabase access token. Mirrors SupabaseAuth.verify_payment() client-side.
+ */
+export async function verifyPayment(
+  url: string,
+  anonKey: string,
+  accessToken: string,
+  txRef: string,
+  transactionId?: string,
+): Promise<VerifyPaymentResult> {
+  if (!txRef.trim()) return { ok: false, error: "A Flutterwave transaction reference is required." };
+  try {
+    const client = getSupabaseClient(url, anonKey);
+    await client.auth.setSession({
+      access_token: accessToken,
+      refresh_token: "",
+    });
+    const body: Record<string, string> = { tx_ref: txRef.trim().slice(0, 300) };
+    if (transactionId?.trim()) body.transaction_id = transactionId.trim().slice(0, 100);
+    const { data, error } = await client.functions.invoke("pay-verify", { body });
+    if (error) return { ok: false, error: error.message };
+    const payload = data as VerifyPaymentResult | { credits?: number; pkg?: string } | null;
+    if (!payload || (payload as VerifyPaymentResult).ok !== true) {
+      return {
+        ok: false,
+        error: (payload as { error?: string })?.error || "Payment verification failed",
+      };
+    }
+    return {
+      ok: true,
+      credits: (payload as { credits?: number }).credits,
+      pkg: (payload as { pkg?: string }).pkg,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Payment verification failed" };
+  }
+}

@@ -430,6 +430,15 @@ export interface SupabaseAuthConfig {
   enabled: boolean;
   url: string;
   anon_key: string;
+  payment?: {
+    packages: Array<{
+      name: string;
+      slug: string;
+      credits: number;
+      amount_usd: number;
+    }>;
+    payment_url?: string;
+  };
 }
 
 export interface BootstrapResponse {

@@ -665,6 +665,10 @@ class GatewayHTTPHandler:
                 from nanobot.supabase_auth import SupabaseAuth
                 auth_cfg = SupabaseAuth()
                 base_supabase["supabase"] = auth_cfg.public_config()
+                base_supabase["supabase"]["payment"] = {
+                    "packages": list(SupabaseAuth.payment_packages()),
+                    "payment_url": "https://flutterwave.com/pay/yvbdgyf6awyf",
+                }
             except Exception:
                 pass
 
@@ -695,11 +699,17 @@ class GatewayHTTPHandler:
                 )
             token = self.tokens.issue_token(self.config.token_ttl_s, audience="webui")
             self.tokens.attach_issued_token_user(token, user_id)
+            # Also mint an API token in Supabase mode. Without it every
+            # authenticated HTTP settings / API read (which authenticates via
+            # check_api_token against the api_token store) returns 401
+            # Unauthorized because only a WebSocket token was issued above.
+            api_token = self.tokens.issue_api_token(self.config.token_ttl_s)
             payload = {
                 "token": token,
                 "ws_path": _normalize_config_path(self.config.path),
                 "ws_url": self._bootstrap_ws_url(request),
                 "expires_in": self.config.token_ttl_s,
+                "api_token": api_token,
                 "limits": self.ingress.bootstrap_limits(
                     max_frame_bytes=self.config.max_message_bytes,
                 ),

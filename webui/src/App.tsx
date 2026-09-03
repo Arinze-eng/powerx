@@ -59,6 +59,7 @@ import {
 } from "@/lib/bootstrap";
 import {
   fetchCredits,
+  getSessionToken,
   signIn,
   signOut,
   signUp,
@@ -128,6 +129,22 @@ type BootState =
           granted: number;
           drainRate: number;
         } | null;
+        supabaseUrl?: string;
+        anonKey?: string;
+        paymentPackages?: Array<{
+          name: string;
+          slug: string;
+          credits: number;
+          amount_usd: number;
+        }>;
+        paymentUrl?: string;
+        refreshCredits?: () => Promise<{
+          total: number;
+          daily: number;
+          purchased: number;
+          granted: number;
+          drainRate: number;
+        } | null>;
       };
     };
 
@@ -895,6 +912,34 @@ export default function App() {
       });
       bootstrapSecretRef.current = authValue;
       client.connect();
+      const bootSupabase = boot.supabase;
+      const supabaseUrl = bootSupabase?.url ?? "";
+      const anonKey = bootSupabase?.anon_key ?? "";
+      const paymentPackages = bootSupabase?.payment?.packages ?? [];
+      const paymentUrl = bootSupabase?.payment?.payment_url ?? "";
+      const supabaseUserId = boot.supabase_user_id;
+
+      const refreshCredits = async () => {
+        if (!supabaseUrl || !anonKey || !supabaseUserId) return null;
+        const token = await getSessionToken(supabaseUrl, anonKey).catch(() => null);
+        if (!token) return null;
+        const credits = await fetchCredits(supabaseUrl, anonKey, token);
+        if (credits) {
+          setState((current) =>
+            current.status === "ready"
+              ? {
+                  ...current,
+                  supabaseUser: {
+                    ...current.supabaseUser,
+                    credits,
+                  },
+                }
+              : current,
+          );
+        }
+        return credits;
+      };
+
       setState({
         status: "ready",
         client,
@@ -909,8 +954,18 @@ export default function App() {
           id: boot.supabase_user_id,
           email: boot.user_email,
           credits: null,
+          supabaseUrl,
+          anonKey,
+          paymentPackages,
+          paymentUrl,
+          refreshCredits,
         },
       });
+
+      // Populate credits asynchronously once the socket connects (Supabase mode).
+      if (supabaseUrl && anonKey && supabaseUserId) {
+        void refreshCredits();
+      }
     },
     [refreshReadyClient],
   );
@@ -995,6 +1050,7 @@ export default function App() {
                   ? {
                       ...current,
                       supabaseUser: {
+                        ...current.supabaseUser,
                         id: boot.supabase_user_id,
                         email: userEmail ?? boot.user_email,
                         credits,
