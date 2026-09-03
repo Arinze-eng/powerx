@@ -402,7 +402,7 @@ async def test_message_rejected_when_too_many_total_attachments(tmp_path) -> Non
 async def test_message_rejected_on_oversize_payload(tmp_path) -> None:
     channel = _make_channel()
     mock_conn = AsyncMock()
-    oversized = b"x" * (9 * 1024 * 1024)  # > 8 MB WS limit
+    oversized = b"x" * (29 * 1024 * 1024)  # > 28 MB attachment policy limit
     envelope = {
         "type": "message",
         "chat_id": "abc123",
@@ -474,14 +474,48 @@ async def test_message_with_csv_forwards_saved_path(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mime", "name"),
+    [
+        ("application/zip", "bundle.zip"),
+        ("application/vnd.android.package-archive", "app.apk"),
+    ],
+)
+async def test_message_accepts_zip_and_apk_files(
+    tmp_path: Path, mime: str, name: str
+) -> None:
+    """zip / apk files upload and are forwarded instead of being rejected."""
+    channel = _make_channel()
+    mock_conn = AsyncMock()
+    envelope = {
+        "type": "message",
+        "chat_id": "abc123",
+        "content": "load this file",
+        "media": [{"data_url": _data_url(mime, b"PK\x03\x04fakezip"), "name": name}],
+    }
+
+    with patch(
+        "nanobot.webui.media_gateway.get_media_dir", return_value=tmp_path
+    ):
+        await channel._dispatch_envelope(mock_conn, "client-1", envelope)
+
+    channel._handle_message.assert_awaited_once()
+    paths = channel._handle_message.call_args.kwargs["media"]
+    assert isinstance(paths, list) and len(paths) == 1
+    saved = Path(paths[0])
+    assert saved.exists()
+    assert saved.read_bytes() == b"PK\x03\x04fakezip"
+
+
+@pytest.mark.asyncio
 async def test_message_rejected_on_unsupported_file_mime(tmp_path) -> None:
     channel = _make_channel()
     mock_conn = AsyncMock()
     envelope = {
         "type": "message",
         "chat_id": "abc123",
-        "content": "zip?",
-        "media": [{"data_url": _data_url("application/zip", b"PK")}],
+        "content": "svg?",
+        "media": [{"data_url": _data_url("image/svg+xml", b"<svg/>")}],
     }
 
     with patch(

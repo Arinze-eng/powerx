@@ -115,3 +115,34 @@ def test_total_attachment_policy_rolls_back_the_batch(tmp_path: Path) -> None:
     assert paths == []
     assert rejection == "total_size"
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "mime",
+    [
+        "application/zip",
+        "application/vnd.android.package-archive",
+        "application/x-tar",
+        "application/gzip",
+        "application/x-7z-compressed",
+        "application/octet-stream",
+    ],
+)
+def test_binary_archive_files_are_accepted(tmp_path: Path, mime: str) -> None:
+    """Any binary/archive file (zip, apk, tar, …) uploads instead of being
+    rejected as an unsupported type."""
+    paths, rejection = store_inbound_attachments(
+        [
+            {
+                "data_url": _data_url(mime, b"\x50\x4b\x03\x04 some-blob"),
+                "name": f"bundle.{mime.split('/')[-1]}",
+            },
+        ],
+        media_dir=tmp_path,
+        logger=MagicMock(),
+    )
+
+    assert rejection is None
+    assert len(paths) == 1
+    saved = Path(paths[0])
+    assert saved.read_bytes() == b"\x50\x4b\x03\x04 some-blob"

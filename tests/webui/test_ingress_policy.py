@@ -22,7 +22,10 @@ def test_bootstrap_keeps_transport_and_business_limits_separate() -> None:
     assert payload["message"] == {"max_text_bytes": 65_536}
     assert payload["attachments"] == {
         "max_count": 4,
-        "max_file_bytes": 6_291_456,
-        "max_total_bytes": 25_165_824,
+        "max_file_bytes": 29_360_128,
+        "max_total_bytes": 29_360_128,
     }
-    assert policy.minimum_full_policy_frame_bytes() < 36 * 1024 * 1024
+    # A policy-valid message must fit inside the 40 MB WebSocket frame ceiling.
+    minimum = policy.minimum_full_policy_frame_bytes()
+    assert minimum < 41_943_040
+    assert minimum > 36 * 1024 * 1024  # now sized for large files, not small images

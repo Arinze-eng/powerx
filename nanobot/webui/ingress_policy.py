@@ -22,8 +22,8 @@ class MessageIngressLimits:
 @dataclass(frozen=True)
 class AttachmentIngressLimits:
     max_count: int = 4
-    max_file_bytes: int = 6 * 1024 * 1024
-    max_total_bytes: int = 24 * 1024 * 1024
+    max_file_bytes: int = 28 * 1024 * 1024
+    max_total_bytes: int = 28 * 1024 * 1024
 
 
 @dataclass(frozen=True)

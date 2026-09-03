@@ -210,11 +210,11 @@ class WebSocketConfig(Base):
     websocket_requires_token: bool = True
     allow_from: list[str] = Field(default_factory=lambda: ["*"])
     streaming: bool = True
-    # Default 36 MB, upper 40 MB: supports up to 4 images at ~6 MB each after
-    # client-side Worker normalization (see webui Composer). 4 × 6 MB × 1.37
-    # (base64 overhead) + envelope framing stays under 36 MB; the 40 MB ceiling
-    # leaves a small margin for sender slop without opening a DoS avenue.
-    max_message_bytes: int = Field(default=37_748_736, ge=1024, le=41_943_040)
+    # Default 40 MB (the WebSocket protocol ceiling). Supports large single
+    # files (e.g. zip / apk archives up to ~28 MB decoded → ~37 MB base64) plus
+    # envelope framing. Keeping the ceiling at 40 MB bounds memory per frame
+    # without opening a DoS avenue.
+    max_message_bytes: int = Field(default=41_943_040, ge=1024, le=41_943_040)
     ping_interval_s: float = Field(default=20.0, ge=5.0, le=300.0)
     ping_timeout_s: float = Field(default=20.0, ge=5.0, le=300.0)
     ssl_certfile: str = ""

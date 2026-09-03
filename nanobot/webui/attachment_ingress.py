@@ -59,8 +59,41 @@ _DOCUMENT_MIME_ALLOWED: frozenset[str] = frozenset({
     "text/yaml",
 })
 
+# Archives, installers, executables, and other binary blobs (zip, apk, tar,
+# gz, rar, 7z, dmg, deb, exe, …). "Generic file" support so the WebUI can
+# accept ANY user file instead of rejecting it as an unsupported type.
+_BINARY_MIME_ALLOWED: frozenset[str] = frozenset({
+    "application/octet-stream",
+    "application/zip",
+    "application/gzip",
+    "application/x-gzip",
+    "application/x-tar",
+    "application/x-bzip2",
+    "application/x-bzip",
+    "application/x-7z-compressed",
+    "application/x-rar-compressed",
+    "application/vnd.rar",
+    "application/x-xz",
+    "application/xz",
+    "application/x-compressed-tar",
+    "application/vnd.android.package-archive",
+    "application/vnd.debian.binary-package",
+    "application/x-apple-diskimage",
+    "application/x-msdownload",
+    "application/x-msi",
+    "application/vnd.ms-excel",
+    "application/vnd.ms-powerpoint",
+    "application/msword",
+    "application/rtf",
+    "application/x-shockwave-flash",
+    "application/java-archive",
+    "application/x-python-code",
+    "application/illustrator",
+    "application/postscript",
+})
+
 _UPLOAD_MIME_ALLOWED: frozenset[str] = (
-    _IMAGE_MIME_ALLOWED | _VIDEO_MIME_ALLOWED | _DOCUMENT_MIME_ALLOWED
+    _IMAGE_MIME_ALLOWED | _VIDEO_MIME_ALLOWED | _DOCUMENT_MIME_ALLOWED | _BINARY_MIME_ALLOWED
 )
 
 _DATA_URL_MIME_RE = re.compile(r"^data:([^;,]+)(?:;[^,]*)*;base64,", re.DOTALL)
@@ -103,7 +136,7 @@ def store_inbound_attachments(
             video_count += 1
         elif mime in _IMAGE_MIME_ALLOWED:
             image_count += 1
-        elif mime in _DOCUMENT_MIME_ALLOWED:
+        elif mime in (_DOCUMENT_MIME_ALLOWED | _BINARY_MIME_ALLOWED):
             document_count += 1
     if image_count > limits.max_count:
         return [], "too_many_images"
@@ -136,7 +169,7 @@ def store_inbound_attachments(
         if mime not in _UPLOAD_MIME_ALLOWED:
             return abort("mime")
         is_video = mime in _VIDEO_MIME_ALLOWED
-        is_document = mime in _DOCUMENT_MIME_ALLOWED
+        is_document = mime in (_DOCUMENT_MIME_ALLOWED | _BINARY_MIME_ALLOWED)
         max_bytes = (
             _MAX_VIDEO_BYTES if is_video
             else limits.max_file_bytes

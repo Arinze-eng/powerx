@@ -55,8 +55,8 @@ export type AttachmentError =
   | "io";                // file read failed at the browser layer
 
 export const MAX_ATTACHMENTS_PER_MESSAGE = 4;
-export const MAX_ATTACHMENT_BYTES = 6 * 1024 * 1024;
-export const MAX_TOTAL_ATTACHMENT_BYTES = 24 * 1024 * 1024;
+export const MAX_ATTACHMENT_BYTES = 28 * 1024 * 1024;
+export const MAX_TOTAL_ATTACHMENT_BYTES = 28 * 1024 * 1024;
 
 /** MIME whitelist — mirrors the server's and the ``<input accept>`` attr. */
 const ACCEPTED_IMAGE_MIMES: ReadonlySet<string> = new Set([
@@ -88,10 +88,38 @@ const DOCUMENT_MIME_BY_EXTENSION: ReadonlyMap<string, string> = new Map([
 
 const ACCEPTED_DOCUMENT_MIMES: ReadonlySet<string> = new Set(DOCUMENT_MIME_BY_EXTENSION.values());
 
+/** Archives, installers, executables, and other binary blobs (zip, apk, …).
+ * Generic-file support so the WebUI accepts ANY user file instead of showing
+ * "Unsupported file type". Mirrors the server-side binary allow-set. */
+const BINARY_MIME_BY_EXTENSION: ReadonlyMap<string, string> = new Map([
+  [".zip", "application/zip"],
+  [".gz", "application/gzip"],
+  [".tgz", "application/gzip"],
+  [".tar", "application/x-tar"],
+  [".bz2", "application/x-bzip2"],
+  [".7z", "application/x-7z-compressed"],
+  [".rar", "application/vnd.rar"],
+  [".xz", "application/x-xz"],
+  [".apk", "application/vnd.android.package-archive"],
+  [".deb", "application/vnd.debian.binary-package"],
+  [".dmg", "application/x-apple-diskimage"],
+  [".exe", "application/x-msdownload"],
+  [".msi", "application/x-msi"],
+  [".jar", "application/java-archive"],
+  [".pyc", "application/x-python-code"],
+]);
+
+const ACCEPTED_BINARY_MIMES: ReadonlySet<string> = new Set([
+  "application/octet-stream",
+  ...BINARY_MIME_BY_EXTENSION.values(),
+]);
+
 export const ACCEPT_ATTR = [
   ...ACCEPTED_IMAGE_MIMES,
   ...ACCEPTED_DOCUMENT_MIMES,
+  ...ACCEPTED_BINARY_MIMES,
   ...DOCUMENT_MIME_BY_EXTENSION.keys(),
+  ...BINARY_MIME_BY_EXTENSION.keys(),
 ].join(",");
 
 function extensionOf(name: string): string {
@@ -100,7 +128,9 @@ function extensionOf(name: string): string {
 }
 
 function mimeForFile(file: File): string {
-  const byName = DOCUMENT_MIME_BY_EXTENSION.get(extensionOf(file.name));
+  const byName =
+    DOCUMENT_MIME_BY_EXTENSION.get(extensionOf(file.name)) ??
+    BINARY_MIME_BY_EXTENSION.get(extensionOf(file.name));
   if (byName) return byName;
   if (!file.type || file.type === "application/octet-stream") {
     return "application/octet-stream";
@@ -139,9 +169,14 @@ function attachmentPayloadBudget(limits: WebUIIngressLimits | null | undefined):
 
 export function acceptedAttachmentKind(file: File): AttachmentKind | null {
   if (DOCUMENT_MIME_BY_EXTENSION.has(extensionOf(file.name))) return "file";
+  if (BINARY_MIME_BY_EXTENSION.has(extensionOf(file.name))) return "file";
   if (ACCEPTED_IMAGE_MIMES.has(file.type)) return "image";
   const mime = mimeForFile(file);
   if (ACCEPTED_DOCUMENT_MIMES.has(mime)) return "file";
+  if (ACCEPTED_BINARY_MIMES.has(mime)) return "file";
+  // Fallback: any non-empty binary blob is accepted as a generic file so the
+  // composer never blocks a legitimate user file with "Unsupported file type".
+  if (mime === "application/octet-stream" || (!file.type && file.size > 0)) return "file";
   return null;
 }
 
