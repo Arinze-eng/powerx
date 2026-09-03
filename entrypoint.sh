@@ -40,6 +40,12 @@ if [ "$RENDER" = "true" ]; then
     python3 /app/scripts/ensure_render_config.py "$config" || \
         echo "[entrypoint] warning: config migration failed"
     set -- "$@" --config "$config"
+    # Restore chat history from Supabase onto the (ephemeral) Render disk so a
+    # redeploy does not wipe user conversations. Runs before the app starts.
+    if [ -f /app/scripts/supabase_chat_sync.py ]; then
+        python3 /app/scripts/supabase_chat_sync.py --dir "$dir" --restore || \
+            echo "[entrypoint] warning: chat restore failed (continuing)"
+    fi
 fi
 
 # Drop privileges whenever the container starts as root. Render mounts the
@@ -49,6 +55,13 @@ fi
 # exit rather than run the agent as root.
 if [ "$(id -u)" = "0" ]; then
     chown -R nanobot:nanobot "$dir" 2>/dev/null || echo "[entrypoint] warning: chown $dir failed"
+    # Start the chat-history backup sidecar as the nanobot user so it keeps
+    # pushing the latest conversations to Supabase while the app runs.
+    if [ -f /app/scripts/supabase_chat_sync.py ]; then
+        setpriv --reuid=nanobot --regid=nanobot --init-groups python3 \
+            /app/scripts/supabase_chat_sync.py --dir "$dir" --loop 60 \
+            >/dev/null 2>&1 &
+    fi
     if setpriv --reuid=nanobot --regid=nanobot --init-groups true 2>/dev/null; then
         echo "[entrypoint] dropping privileges to nanobot via setpriv"
         exec setpriv --reuid=nanobot --regid=nanobot --init-groups /app/scripts/nanobot_launcher.sh "$@"
@@ -69,6 +82,11 @@ Fix (pick one):
   Podman: podman run --userns=keep-id ...
 EOF
     exit 1
+fi
+
+# Start the chat-history backup sidecar (non-root / local dev path).
+if [ -f /app/scripts/supabase_chat_sync.py ]; then
+    python3 /app/scripts/supabase_chat_sync.py --dir "$dir" --loop 60 >/dev/null 2>&1 &
 fi
 
 exec /app/scripts/nanobot_launcher.sh "$@"
