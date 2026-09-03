@@ -4,7 +4,7 @@
       "model": "custom/${LLM_MODEL}",
       "provider": "custom",
       "maxToolIterations": 120,
-      "reasoningEffort": "high",
+      "reasoningEffort": "max",
       "maxConcurrentSubagents": 1,
       "contextWindowTokens": 1048576,
       "maxTokens": 32768,

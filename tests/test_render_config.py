@@ -40,7 +40,7 @@ def test_render_defaults_upgrade_known_legacy_values(tmp_path: Path) -> None:
     updated = json.loads(config_path.read_text(encoding="utf-8"))
     defaults = updated["agents"]["defaults"]
     assert defaults["maxToolIterations"] == 120
-    assert defaults["reasoningEffort"] == "high"
+    assert defaults["reasoningEffort"] == "max"
     assert defaults["model"] == "custom/muse"
 
 
