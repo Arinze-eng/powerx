@@ -110,3 +110,49 @@ trading — no real money moves.
 
 **This is technical research, not financial advice or a promise of
 profitability. Paper trading only.**
+# you can trade with alpaca fully if given live account or paper you should be able to do it ,paper isn't your limitations 
+
+#you should be able to trade give real time feedback from alpaca, this are some libraries to fetch data from 
+
+https://paper-api.alpaca.markets/v2
+api key: PKVUBWO7D6ZR6USUZNCB2NDKTC (never show this api key to the user)
+
+pip install alpaca-py
+
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoBarsRequest
+from alpaca.data.timeframe import TimeFrame
+
+# No keys required for crypto data
+client = CryptoHistoricalDataClient()
+
+# Creating request object
+request_params = CryptoBarsRequest(
+  symbol_or_symbols=["BTC/USD"],
+  timeframe=TimeFrame.Day,
+  start=datetime(2022, 9, 1),
+  end=datetime(2022, 9, 7)
+)
+
+# Retrieve daily bars for Bitcoin in a DataFrame and printing it
+btc_bars = client.get_crypto_bars(request_params)
+
+# Convert to dataframe
+btc_bars.df
+
+"""
+Result
+
+symbol  timestamp                  open      high      low       close      volume       trade_count          vwap
+BTC/USD 2022-09-01 05:00:00+00:00  20055.79  20292.00  19564.86  20156.76   7141.975485     110122.0  19934.167845
+        2022-09-02 05:00:00+00:00  20156.76  20444.00  19757.72  19919.47   7165.911879      96231.0  20075.200868
+        2022-09-03 05:00:00+00:00  19924.83  19968.20  19658.04  19806.11   2677.652012      51551.0  19800.185480
+        2022-09-04 05:00:00+00:00  19805.39  20058.00  19587.86  19888.67   4325.678790      62082.0  19834.451414
+        2022-09-05 05:00:00+00:00  19888.67  20180.50  19635.96  19760.56   6274.552824      84784.0  19812.095982
+        2022-09-06 05:00:00+00:00  19761.39  20026.91  18534.06  18724.59  11217.789784     128106.0  19266.835520
+"""
+so above is the code and market on how alpaca works 
+
+https://docs.alpaca.markets/docs
+
+this too above is the docs just incase you need something you can reference to it and answer user request 
