@@ -9,6 +9,23 @@ dir="$HOME/.nanobot"
 # logs. Privilege dropping is handled below, for every root start (not just here).
 if [ "$RENDER" = "true" ]; then
     echo "[entrypoint] Render deploy — starting as $(id)"
+    # Recover any missing runtime env vars from Supabase (system_settings). The
+    # container only strictly needs SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY;
+    # everything else is restored here so a wiped Render env self-heals. The
+    # script emits `export KEY=value` lines which we source in THIS shell so the
+    # values reach the nanobot process launched below.
+    if [ -f /app/scripts/supabase_env_sync.py ]; then
+        sync_file="$dir/supabase-env-$$.sh"
+        ( python3 /app/scripts/supabase_env_sync.py --emit-shell > "$sync_file" 2>"$sync_file.err" ) || \
+            echo "[entrypoint] warning: supabase env sync failed, continuing with current env"
+        if [ -s "$sync_file" ]; then
+            # shellcheck disable=SC1090
+            . "$sync_file" && echo "[entrypoint] restored runtime env vars from Supabase"
+        else
+            echo "[entrypoint] no additional env vars needed from Supabase"
+        fi
+        rm -f "$sync_file" "$sync_file.err"
+    fi
     mkdir -p "$dir" || echo "[entrypoint] warning: mkdir $dir failed"
     config="$dir/config.json"
     # Initialize config only when it does not already exist, so WebUI/provider

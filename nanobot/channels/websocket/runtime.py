@@ -551,6 +551,40 @@ class WebSocketChannel(BaseChannel):
         self._conn_supabase_user.pop(connection, None)
         self._discard_webui_request_lock_if_idle(connection)
 
+    def _record_webui_activity_later(self, supabase_user_id: str, content: str) -> None:
+        """Fire-and-forget record of a WebUI user's activity for the admin view.
+
+        Runs in a short-lived background task so a slow Supabase write never
+        blocks the active WebSocket turn. Failures are swallowed and logged.
+        """
+        user_id = (supabase_user_id or "").strip()
+        if not user_id or not content.strip():
+            return
+        try:
+            from nanobot.supabase_auth import SupabaseAuth
+
+            task = asyncio.ensure_future(
+                SupabaseAuth().record_webui_activity(
+                    user_id,
+                    question=content,
+                    channel="webui",
+                )
+            )
+            task.add_done_callback(self._record_webui_activity_done)
+
+        except Exception as exc:  # noqa: BLE001 - best-effort admin telemetry
+            self.logger.warning("webui activity record failed: {}", type(exc).__name__)
+
+    def _record_webui_activity_done(self, task: asyncio.Task[None]) -> None:
+        """Safe completion handler for the fire-and-forget webui activity task."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.logger.warning(
+                "webui activity record failed: {}", type(exc).__name__
+            )
+
     async def _maybe_push_persisted_goal_state(self, chat_id: str) -> None:
         """Replay actionable goal state after *chat_id* is subscribed.
 
@@ -903,6 +937,8 @@ class WebSocketChannel(BaseChannel):
                     metadata=meta,
                     is_dm=False,
                 )
+                if supabase_user:
+                    self._record_webui_activity_later(supabase_user, content)
         except Exception as e:
             self.logger.debug("connection ended: {}", e)
         finally:
@@ -1302,6 +1338,8 @@ class WebSocketChannel(BaseChannel):
                     ),
                 )
                 accepted = True
+                if supabase_user:
+                    self._record_webui_activity_later(supabase_user, dispatch_content)
             finally:
                 if not accepted and queued_owner is not None:
                     clear_websocket_turn_if_current(cid, queued_owner)

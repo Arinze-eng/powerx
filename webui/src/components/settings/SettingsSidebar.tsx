@@ -134,6 +134,16 @@ export function SettingsSidebar({
                 </DropdownMenuItem>
               );
             })}
+            {onLogout ? (
+              <DropdownMenuItem
+                onSelect={onLogout}
+                className="flex h-10 cursor-default items-center gap-2.5 px-2.5 text-[13px] font-medium text-destructive focus:bg-destructive/10 focus:text-destructive lg:hidden"
+                data-testid="settings-logout-mobile"
+              >
+                <LogOut className="h-4 w-4 shrink-0" strokeWidth={2} aria-hidden />
+                <span className="min-w-0 flex-1 truncate">{t("app.account.logout")}</span>
+              </DropdownMenuItem>
+            ) : null}
           </DropdownMenuContent>
         </DropdownMenu>
 
@@ -171,12 +181,13 @@ export function SettingsSidebar({
       </nav>
 
       <div className="hidden lg:mt-auto lg:block lg:pt-4">
-        {onLogout && !hostChromeInset ? (
+        {onLogout ? (
           <Button
             type="button"
             variant="ghost"
             onClick={onLogout}
             className="h-9 w-full justify-start gap-2 rounded-control px-2.5 text-[13px] font-medium text-muted-foreground hover:bg-destructive/8 hover:text-destructive"
+            data-testid="settings-logout"
           >
             <LogOut className="h-4 w-4" aria-hidden />
             {t("app.account.logout")}

@@ -1419,12 +1419,67 @@ class GatewayHTTPHandler:
             return self._handle_webui_sidebar_state(request)
         if got == "/api/webui/sidebar-state/update":
             return self._handle_webui_sidebar_state_update(request)
+        if got == "/api/announcements":
+            return self._handle_announcements(request)
+        if got == "/api/announcements/read":
+            return await self._handle_announcements_mark_read(request)
         return None
 
     def _handle_commands(self, request: WsRequest) -> Response:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
         return _http_json_response({"commands": builtin_command_palette()})
+
+    def _handle_announcements(self, request: WsRequest) -> Response:
+        """Return active announcements for the WebUI, with read-state relative
+        to the signed-in Supabase user. Uses the service-role key server-side so
+        regular users never need DB credentials."""
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        try:
+            import nanobot.supabase_admin as sui
+
+            anns = sui.announcements()
+        except Exception as exc:
+            return _http_error(502, f"announcements unavailable: {type(exc).__name__}")
+        # Announcements are already ordered newest first. Return compact rows.
+        return _http_json_response({"ok": True, "announcements": anns})
+
+    async def _handle_announcements_mark_read(self, request: WsRequest) -> Response:
+        """Mark an announcement as read by the signed-in Supabase user."""
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        payload = _mutation_payload(request) or _request_query(request)
+        announcement_id = str(payload.get("announcement_id") or "").strip()
+        if not announcement_id:
+            return _http_error(400, "announcement_id is required")
+        # Resolve the signed-in user from the request token.
+        user_id = self._supabase_user_id_for_request(request)
+        if not user_id:
+            return _http_json_response({"ok": True, "anonymous": True})
+        try:
+            import nanobot.supabase_admin as sui
+
+            if sui.set_announcement_read(announcement_id, user_id):
+                return _http_json_response({"ok": True, "read": True})
+            return _http_json_response({"ok": True, "read": False})
+        except Exception as exc:
+            return _http_error(502, f"could not mark read: {type(exc).__name__}")
+
+    def _supabase_user_id_for_request(self, request: WsRequest) -> str:
+        """Best-effort resolution of the supabase user id for a plain HTTP request."""
+        try:
+            from nanobot.supabase_auth import SupabaseAuth
+
+            access_token = _case_insensitive_header(
+                getattr(request, "headers", {}), "X-Nanobot-Auth"
+            ).strip()
+            if not access_token:
+                return ""
+            uid, _email = SupabaseAuth().verify_access_token_sync(access_token)
+            return uid or ""
+        except Exception:
+            return ""
 
     def _handle_workspaces(self, connection: Any, request: WsRequest) -> Response:
         if not self.check_api_token(request):

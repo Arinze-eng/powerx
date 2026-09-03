@@ -232,6 +232,73 @@ class SupabaseAuth:
             body=body,
         )
 
+    async def record_webui_activity(
+        self,
+        user_id: str,
+        *,
+        question: str,
+        channel: str = "webui",
+    ) -> None:
+        """Record WebUI user activity for the admin dashboard.
+
+        Updates ``profiles.last_seen_at``, increments ``profiles.questions_count``
+        and records the sanitized user question so admins can see the type of
+        questions webUI users ask. Best-effort: failures never raise into the
+        message bus so the agent keeps working even if Supabase is briefly down.
+        """
+        user_id = (user_id or "").strip()
+        if not user_id or not self.enabled:
+            return
+        try:
+            await self._request(
+                "POST",
+                "/rest/v1/rpc/update_last_seen",
+                service=True,
+                body={"p_user": user_id},
+            )
+        except SupabaseAuthError:
+            pass
+
+        text = self._sanitize_question(question or "")
+        if text:
+            try:
+                await self._request(
+                    "POST",
+                    "/rest/v1/user_questions",
+                    service=True,
+                    params={"select": "id"},
+                    body={
+                        "user_id": user_id,
+                        "title": text[:500],
+                        "message": text,
+                        "category": channel,
+                        "created_by": user_id,
+                    },
+                )
+            except SupabaseAuthError:
+                pass
+        try:
+            # Increment the running question counter on the profile
+            # (read current count, then write the incremented value).
+            rows = await self._request(
+                "GET",
+                "/rest/v1/profiles",
+                service=True,
+                params={"id": f"eq.{user_id}", "select": "questions_count", "limit": "1"},
+            )
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                current = int(rows[0].get("questions_count") or 0)
+                patch = {"questions_count": current + 1, "updated_at": self._now()}
+                await self._request(
+                    "PATCH",
+                    "/rest/v1/profiles",
+                    service=True,
+                    params={"id": f"eq.{user_id}"},
+                    body=patch,
+                )
+        except SupabaseAuthError:
+            pass
+
     async def account_for(self, telegram_user_id: int, chat_id: int, *, username: str | None, first_name: str | None, last_name: str | None) -> dict[str, Any]:
         rows = await self._request("GET", "/rest/v1/telegram_accounts", service=True, params={"telegram_user_id": f"eq.{telegram_user_id}", "limit": "1", "select": "*"})
         patch = {"chat_id": chat_id, "username": username, "first_name": first_name, "last_name": last_name, "last_seen_at": self._now(), "updated_at": self._now()}

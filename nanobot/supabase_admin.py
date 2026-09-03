@@ -136,6 +136,81 @@ def telegram_question_history() -> list[dict[str, Any]]:
     return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
+def webui_question_history() -> list[dict[str, Any]]:
+    """Question history from the WebUI app (user_questions table)."""
+    # Enrich rows with the user's name/email from profiles when available.
+    rows = _request(
+        "GET",
+        "/rest/v1/user_questions",
+        params={
+            "select": "id,user_id,title,message,category,created_by,created_at",
+            "order": "created_at.desc",
+            "limit": "500",
+        },
+    )
+    items = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    user_ids = list({str(row.get("user_id") or "") for row in items})
+    by_user: dict[str, dict[str, Any]] = {}
+    if user_ids:
+        profiles = _request(
+            "GET",
+            "/rest/v1/profiles",
+            params={
+                "select": "id,name,email",
+                "id": f"in.({','.join(user_ids)})",
+                "limit": "500",
+            },
+        )
+        for profile in profiles if isinstance(profiles, list) else []:
+            if isinstance(profile, dict):
+                by_user[str(profile.get("id") or "")] = profile
+    for row in items:
+        profile = by_user.get(str(row.get("user_id") or ""), {})
+        row["user_name"] = profile.get("name")
+        row["user_email"] = profile.get("email")
+    return items
+
+
+def announcements() -> list[dict[str, Any]]:
+    """Active announcements shown to WebUI users."""
+    rows = _request(
+        "GET",
+        "/rest/v1/announcements",
+        params={
+            "select": "id,title,message,is_active,created_by,created_at,expires_at",
+            "is_active": "eq.true",
+            "order": "created_at.desc",
+            "limit": "100",
+        },
+    )
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def set_announcement_read(announcement_id: Any, user_id: Any) -> bool:
+    """Record that a user read an announcement (idempotent). Returns True when
+    a new read was recorded."""
+    announcement = _uuid(announcement_id)
+    user = _uuid(user_id)
+    existing = _request(
+        "GET",
+        "/rest/v1/announcement_reads",
+        params={
+            "select": "announcement_id,user_id",
+            "announcement_id": f"eq.{announcement}",
+            "user_id": f"eq.{user}",
+            "limit": "1",
+        },
+    )
+    if isinstance(existing, list) and existing:
+        return False
+    _request(
+        "POST",
+        "/rest/v1/announcement_reads",
+        json={"announcement_id": announcement, "user_id": user},
+    )
+    return True
+
+
 def _profile(user_id: str) -> dict[str, Any]:
     rows = _request(
         "GET",
