@@ -363,13 +363,20 @@ def test_add_job_binds_current_session_key(tmp_path) -> None:
     assert job.payload.to is None
 
 
-def test_add_job_requires_session_key(tmp_path) -> None:
+def test_add_job_without_session_binds_general_session(tmp_path) -> None:
     tool = _make_tool(tmp_path)
     with request_context(RequestContext(channel="telegram", chat_id="chat-1")):
         result = tool._add_job(None, "Background refresh", 60, None, None, None)
 
-    assert result == "Error: scheduled cron jobs must be created from a chat session"
-    assert tool._cron.list_jobs() == []
+    # General fallback: without a session key the job still schedules in a
+    # stable general session, preserving any available channel route.
+    assert result.startswith("Created job")
+    jobs = tool._cron.list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].enabled is True
+    assert jobs[0].payload.session_key == "general"
+    assert jobs[0].payload.origin_channel == "telegram"
+    assert jobs[0].payload.origin_chat_id == "chat-1"
 
 
 def test_cron_schema_advertises_action_specific_requirements(tmp_path) -> None:

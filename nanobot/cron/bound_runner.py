@@ -27,6 +27,25 @@ class BoundCronAgent(Protocol):
         ...
 
 
+class GeneralCronAgent(Protocol):
+    """Minimal agent surface needed by the general (unbound) cron runner."""
+
+    tools: ToolRegistry
+
+    async def process_direct(
+        self,
+        content: str,
+        *,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+        sender_id: str | None = None,
+        on_progress: Any = None,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        ...
+
+
 class CronRunRecorder(Protocol):
     def write_run_record(self, run_id: str, record: dict[str, Any]) -> None:
         ...
@@ -152,3 +171,79 @@ async def run_bound_cron_job(
         },
     )
     return response
+
+
+def _general_cron_session_key(job: CronJob) -> str:
+    """Stable general session key for an unbound (not chat-bound) cron job.
+
+    Using a deterministic per-job session keeps the whole conversation in one
+    place while isolating different general tasks from each other and from live
+    user chats.
+    """
+    return f"cron-general:{job.id}"
+
+
+async def run_general_cron_job(
+    job: CronJob,
+    *,
+    agent: GeneralCronAgent,
+    cron: CronRunRecorder,
+    channel: str,
+    chat_id: str,
+) -> str | None:
+    """Execute a general (unbound) cron job through the agent loop.
+
+    Unlike :func:`run_bound_cron_job`, general jobs are not tied to a specific
+    chat session. They run in a dedicated ``cron-general:<job_id>`` session so
+    that ANY task the user scheduled — not just chat-bound reminders — actually
+    executes. The response is returned to the caller (the gateway), which
+    delivers it to ``channel``/``chat_id`` (a configured default target).
+    """
+    prompt = render_template(
+        "agent/cron_reminder.md",
+        strip=True,
+        message=job.payload.message,
+    )
+    prompt_ref = _cron_prompt_ref(prompt)
+    run_id = f"{job.id}:{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
+    session_key = _general_cron_session_key(job)
+    run_record_base: dict[str, Any] = {
+        "job_id": job.id,
+        "job_name": job.name,
+        "session_key": session_key,
+        "prompt_ref": prompt_ref,
+        "prompt_vars": {"message": job.payload.message},
+        "rendered_prompt": prompt,
+    }
+
+    cron.write_run_record(run_id, {**run_record_base, "status": "queued"})
+
+    cron_tool = agent.tools.get("cron")
+    cron_token = None
+    if isinstance(cron_tool, CronTool):
+        cron_token = cron_tool.set_cron_context(True)
+    try:
+        resp = await agent.process_direct(
+            content=prompt,
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+            sender_id="cron",
+        )
+    except (Exception, asyncio.CancelledError) as exc:
+        error_text = str(exc) or exc.__class__.__name__
+        cron.write_run_record(
+            run_id,
+            {**run_record_base, "status": "error", "error": error_text},
+        )
+        raise
+    finally:
+        if isinstance(cron_tool, CronTool) and cron_token is not None:
+            cron_tool.reset_cron_context(cron_token)
+
+    response = str(getattr(resp, "content", "") or "").strip()
+    cron.write_run_record(
+        run_id,
+        {**run_record_base, "status": "ok", "response": response},
+    )
+    return response or None

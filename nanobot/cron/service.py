@@ -160,7 +160,16 @@ class CronService:
         store_path: Path,
         on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
         max_sleep_ms: int = 300_000,  # 5 minutes
+        *,
+        allow_unbound_agent_jobs: bool = True,
     ):
+        """Create a cron service.
+
+        ``allow_unbound_agent_jobs`` controls whether generic agent jobs that are
+        not bound to a concrete chat session are kept enabled (and run through
+        the general execution path) instead of being silently disabled. Defaults
+        to ``True`` so cron works for any task from any context.
+        """
         self.store_path = store_path
         self._action_path = store_path.parent / "action.jsonl"
         self._run_records_dir = store_path.parent / "runs"
@@ -172,6 +181,7 @@ class CronService:
         self._active_executions = 0
         self._store_dirty = False
         self.max_sleep_ms = max_sleep_ms
+        self._allow_unbound_agent_jobs = allow_unbound_agent_jobs
 
     def _should_persist_store(self) -> bool:
         """Return whether this instance currently owns the live store."""
@@ -181,7 +191,14 @@ class CronService:
         return job.payload.kind == "agent_turn" and not is_bound_cron_job(job)
 
     def _enforce_agent_binding(self, job: CronJob) -> bool:
-        """Disable user cron jobs that cannot be routed to a concrete session."""
+        """Disable user cron jobs that cannot be routed to a concrete session.
+
+        Kept for backward compatibility and explicit ``allow_unbound_agent_jobs``
+        opt-outs. When unbound general jobs are allowed (the default), they are
+        left enabled so the general execution path can run them for any task.
+        """
+        if self._allow_unbound_agent_jobs:
+            return False
         if not self._is_unbound_agent_job(job):
             return False
         if (
@@ -845,7 +862,10 @@ class CronService:
             store = self._require_store(reload_during_execution=reload_store)
             for job in store.jobs:
                 if job.id == job_id:
-                    if self._is_unbound_agent_job(job):
+                    # General/unbound agent jobs are allowed to run through the
+                    # general execution path; only block them when the strict
+                    # mode is explicitly enabled.
+                    if self._is_unbound_agent_job(job) and not self._allow_unbound_agent_jobs:
                         self._enforce_agent_binding(job)
                         self._save_store()
                         return False

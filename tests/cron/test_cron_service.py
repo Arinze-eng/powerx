@@ -182,7 +182,7 @@ def test_write_run_record_uses_cron_runs_dir(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_unbound_agent_jobs_are_disabled_on_add(tmp_path) -> None:
+async def test_unbound_agent_jobs_are_enabled_general_mode(tmp_path) -> None:
     called: list[str] = []
 
     async def on_job(job):
@@ -198,6 +198,34 @@ async def test_unbound_agent_jobs_are_disabled_on_add(tmp_path) -> None:
         message="hello",
     )
 
+    # General mode (default): unbound agent jobs stay enabled and run through
+    # the general execution path instead of being silently disabled.
+    assert job.enabled is True
+    assert job.state.next_run_at_ms is not None
+    assert job.state.last_status is None
+    assert await service.run_job(job.id, force=True) is True
+    assert called == [job.id]
+
+
+@pytest.mark.asyncio
+async def test_unbound_agent_jobs_disabled_in_strict_mode(tmp_path) -> None:
+    """With allow_unbound_agent_jobs=False, old strict behavior is retained."""
+    called: list[str] = []
+
+    async def on_job(job):
+        called.append(job.id)
+
+    service = CronService(
+        tmp_path / "cron" / "jobs.json",
+        on_job=on_job,
+        allow_unbound_agent_jobs=False,
+    )
+    job = service.add_job(
+        name="unbound",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+    )
+
     assert job.enabled is False
     assert job.state.next_run_at_ms is None
     assert job.state.last_status == "error"
@@ -206,7 +234,7 @@ async def test_unbound_agent_jobs_are_disabled_on_add(tmp_path) -> None:
     assert called == []
 
 
-def test_unbound_agent_jobs_are_disabled_on_load(tmp_path) -> None:
+def test_unbound_agent_jobs_kept_enabled_on_load(tmp_path) -> None:
     store_path = tmp_path / "cron" / "jobs.json"
     store_path.parent.mkdir(parents=True)
     store_path.write_text(
@@ -234,6 +262,44 @@ def test_unbound_agent_jobs_are_disabled_on_load(tmp_path) -> None:
     )
 
     job = CronService(store_path).get_job("unbound-1")
+
+    # General mode (default) keeps the job enabled so it can still run.
+    assert job is not None
+    assert job.enabled is True
+    assert job.state.next_run_at_ms is not None
+    assert job.state.last_status is None
+
+
+def test_unbound_agent_jobs_disabled_on_load_in_strict_mode(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    store_path.parent.mkdir(parents=True)
+    store_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "jobs": [
+                    {
+                        "id": "unbound-1",
+                        "name": "Unbound reminder",
+                        "enabled": True,
+                        "schedule": {"kind": "every", "everyMs": 60_000},
+                        "payload": {
+                            "kind": "agent_turn",
+                            "message": "check status",
+                        },
+                        "state": {"nextRunAtMs": 1},
+                        "createdAtMs": 1,
+                        "updatedAtMs": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    job = CronService(
+        store_path, allow_unbound_agent_jobs=False
+    ).get_job("unbound-1")
 
     assert job is not None
     assert job.enabled is False

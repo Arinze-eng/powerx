@@ -313,7 +313,7 @@ def _run_gateway(
     from nanobot.bus.runtime_events import RuntimeEventBus
     from nanobot.channels.manager import ChannelManager
     from nanobot.config.watcher import watch_config_file
-    from nanobot.cron.bound_runner import run_bound_cron_job
+    from nanobot.cron.bound_runner import run_bound_cron_job, run_general_cron_job
     from nanobot.cron.service import CronJobSkippedError, CronService
     from nanobot.cron.session_turns import is_bound_cron_job
     from nanobot.cron.types import CronJob
@@ -656,14 +656,50 @@ def _run_gateway(
         if is_bound_cron_job(job):
             return await run_bound_cron_job(job, agent=agent, cron=cron)
 
-        reason = "unbound agent cron job must be recreated from a chat session"
-        logger.warning(
-            "Cron: skipped unbound agent job '{}' ({}): {}",
-            job.name,
-            job.id,
-            reason,
-        )
-        raise CronJobSkippedError(reason)
+        # General (unbound) agent job — run through the general execution path so
+        # cron works for ANY task, not just chat-bound reminders.
+        general_channel, general_chat_id, should_deliver = _general_cron_target()
+        if not should_deliver:
+            logger.warning(
+                "Cron: general job '{}' ({}) has no routable delivery target; "
+                "running it and recording the result only.",
+                job.name,
+                job.id,
+            )
+        try:
+            response = await run_general_cron_job(
+                job,
+                agent=agent,
+                cron=cron,
+                channel=general_channel,
+                chat_id=general_chat_id,
+            )
+        except CronJobSkippedError:
+            raise
+        if response and should_deliver:
+            try:
+                await _deliver_to_channel(
+                    OutboundMessage(
+                        channel=general_channel,
+                        chat_id=general_chat_id,
+                        content=response,
+                    ),
+                    record=True,
+                )
+            except Exception:
+                logger.exception(
+                    "Cron: general job '{}' ({}) response delivery failed",
+                    job.name,
+                    job.id,
+                )
+        return response
+
+    def _general_cron_target() -> tuple[str, str, bool]:
+        """Return ``(channel, chat_id, should_deliver)`` for general cron runs."""
+        target = _pick_heartbeat_target()
+        if target and target[0] != "cli":
+            return target[0], target[1], True
+        return "webui", "general", False
 
     cron.on_job = on_cron_job
 

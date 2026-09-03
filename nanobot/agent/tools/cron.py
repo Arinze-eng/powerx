@@ -170,10 +170,15 @@ class CronTool(Tool):
                 "(e.g. the reminder text). Retry including message=\"...\"."
             )
         session_key, origin_channel, origin_chat_id, origin_metadata = self._request_route()
-        if not session_key:
-            return ToolResult.error("Error: scheduled cron jobs must be created from a chat session")
-        if not origin_channel or not origin_chat_id:
-            return ToolResult.error("Error: scheduled cron jobs must be created from a chat session")
+        # General fallback: a cron job must be schedulable from ANY context
+        # (chat sessions, the public API, or fully autonomous runs). When no
+        # chat-bound request context is available, bind the job to a stable
+        # general session so it still schedules and runs through the general
+        # delivery path instead of being refused like the old code did.
+        if not (session_key and origin_channel and origin_chat_id):
+            session_key = session_key or "general"
+            origin_channel = origin_channel or "webui"
+            origin_chat_id = origin_chat_id or "general"
         if tz and not cron_expr:
             return ToolResult.error("Error: tz can only be used with cron_expr")
         if tz:
