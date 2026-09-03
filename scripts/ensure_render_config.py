@@ -126,7 +126,14 @@ def _ensure_provider_defaults(data: dict[str, Any]) -> bool:
     return changed
 
 
-def _ensure_telegram_webhook_defaults(data: dict[str, Any]) -> bool:
+def _ensure_telegram_polling_defaults(data: dict[str, Any]) -> bool:
+    """Force Telegram into pure polling mode on Render.
+
+    The previous default forced `mode: webhook` every boot, which silently
+    reverted any polling config on each deploy. The bot runs pure polling now,
+    so strip any stale webhook keys and force streamed progress like a normal
+    interactive session.
+    """
     channels = data.setdefault("channels", {})
     if not isinstance(channels, dict):
         return False
@@ -134,23 +141,23 @@ def _ensure_telegram_webhook_defaults(data: dict[str, Any]) -> bool:
     if not isinstance(telegram, dict):
         return False
 
-    defaults = {
-        "mode": "webhook",
-        "webhookUrl": "${TELEGRAM_WEBHOOK_URL}",
-        "webhookSecretToken": "${TELEGRAM_WEBHOOK_SECRET}",
-        "webhookListenHost": "127.0.0.1",
-        "webhookListenPort": 8081,
-        "webhookPath": "/telegram",
-        "webhookMaxConnections": 8,
-        "streaming": False,
-        "sendProgress": False,
-        "sendToolHints": False,
-        "showReasoning": False,
-    }
     changed = False
-    for key, value in defaults.items():
-        if telegram.get(key) != value:
-            telegram[key] = value
+    if telegram.get("mode") != "polling":
+        telegram["mode"] = "polling"
+        changed = True
+    if not telegram.get("streaming", True):
+        telegram["streaming"] = True
+        changed = True
+    for webhook_key in (
+        "webhookUrl",
+        "webhookSecretToken",
+        "webhookListenHost",
+        "webhookListenPort",
+        "webhookPath",
+        "webhookMaxConnections",
+    ):
+        if webhook_key in telegram:
+            telegram.pop(webhook_key, None)
             changed = True
     return changed
 
@@ -192,7 +199,7 @@ def ensure_render_defaults(config_path: Path) -> bool:
     changed = _ensure_tools_file(data) or False
     changed = _ensure_browser_defaults(data) or changed
     changed = _ensure_provider_defaults(data) or changed
-    changed = _ensure_telegram_webhook_defaults(data) or changed
+    changed = _ensure_telegram_polling_defaults(data) or changed
     changed = _ensure_deliberate_defaults(data) or changed
     return _write_config(config_path, data) if changed else False
 
@@ -210,7 +217,7 @@ def main() -> int:
         return 0
     changed = ensure_render_defaults(Path(sys.argv[1]).expanduser())
     if changed:
-        print("[entrypoint] applied Render runtime defaults (including Telegram webhook mode)")
+        print("[entrypoint] applied Render runtime defaults (Telegram polling mode)")
     return 0
 
 
