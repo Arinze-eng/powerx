@@ -12,6 +12,8 @@ import { Eye, EyeOff, Moon, PanelLeft, ShieldCheck, Sun, X } from "lucide-react"
 import { useTranslation } from "react-i18next";
 import { channelUiPresentation } from "@/channel-plugins/registry";
 import { Sidebar } from "@/components/Sidebar";
+import { SupabaseAuthPage } from "@/components/SupabaseAuthPage";
+import { CreditBadge } from "@/components/CreditBadge";
 import type { SidebarDeleteItem } from "@/components/ChatList";
 import type { SettingsSectionKey } from "@/components/settings/SettingsView";
 import { ThreadShell } from "@/components/thread/ThreadShell";
@@ -55,6 +57,15 @@ import {
   loadSavedSecret,
   saveSecret,
 } from "@/lib/bootstrap";
+import {
+  fetchCredits,
+  signIn,
+  signOut,
+  signUp,
+} from "@/lib/supabase-auth";
+import {
+  SupabaseUserContext,
+} from "@/lib/supabase-user-context";
 import { displayTitle, sortSessions } from "@/lib/chat-groups";
 import { deriveTitle } from "@/lib/format";
 import { NanobotClient } from "@/lib/nanobot-client";
@@ -92,6 +103,14 @@ type BootState =
   | { status: "error"; message: string }
   | { status: "auth"; failed?: boolean }
   | {
+      status: "supabase";
+      supabaseUrl: string;
+      anonKey: string;
+      userEmail?: string;
+      failed?: boolean;
+      message?: string;
+    }
+  | {
       status: "ready";
       client: NanobotClient;
       token: string;
@@ -99,6 +118,17 @@ type BootState =
       modelName: string | null;
       ingressLimits: BootstrapResponse["limits"] | null;
       runtimeSurface: RuntimeSurface;
+      supabaseUser?: {
+        id?: string;
+        email?: string;
+        credits?: {
+          total: number;
+          daily: number;
+          purchased: number;
+          granted: number;
+          drainRate: number;
+        } | null;
+      };
     };
 
 const SIDEBAR_STORAGE_KEY = "nanobot-webui.sidebar";
@@ -813,6 +843,7 @@ export default function App() {
   const refreshReadyClient = useCallback(
     async (client: NanobotClient, fallbackSurface: RuntimeSurface) => {
       const boot = await fetchBootstrap("", bootstrapSecretRef.current);
+      if (boot.needs_auth) throw new BootstrapAuthRequiredError("bootstrap requires auth");
       const url = deriveWsUrl(boot.ws_path, boot.token, boot.ws_url);
       const runtimeSurface = boot.runtime_surface
         ? toRuntimeSurface(boot.runtime_surface)
@@ -844,6 +875,46 @@ export default function App() {
     [],
   );
 
+  const connectWithBoot = useCallback(
+    (boot: BootstrapResponse, authValue: string) => {
+      const url = deriveWsUrl(boot.ws_path, boot.token, boot.ws_url);
+      const runtimeSurface = toRuntimeSurface(boot.runtime_surface);
+      const runtimeHost = createRuntimeHost(runtimeSurface, boot.runtime_capabilities);
+      const client = new NanobotClient({
+        url,
+        maxFrameBytes: boot.limits?.transport.max_frame_bytes,
+        socketFactory: runtimeHost.socketFactory,
+        onReauth: async () => {
+          try {
+            const refreshed = await refreshReadyClient(client, runtimeSurface);
+            return refreshed.url;
+          } catch {
+            return null;
+          }
+        },
+      });
+      bootstrapSecretRef.current = authValue;
+      client.connect();
+      setState({
+        status: "ready",
+        client,
+        token: boot.api_token ?? "",
+        tokenExpiresAt: boot.expires_in
+          ? bootstrapTokenExpiresAt(boot.expires_in)
+          : null,
+        modelName: boot.model_name ?? null,
+        ingressLimits: boot.limits ?? null,
+        runtimeSurface,
+        supabaseUser: {
+          id: boot.supabase_user_id,
+          email: boot.user_email,
+          credits: null,
+        },
+      });
+    },
+    [refreshReadyClient],
+  );
+
   const bootstrapWithSecret = useCallback(
     (secret: string) => {
       let cancelled = false;
@@ -852,36 +923,22 @@ export default function App() {
         try {
           const boot = await fetchBootstrap("", secret);
           if (cancelled) return;
+          if (boot.needs_auth) {
+            const cfg = boot.supabase;
+            if (cfg?.url && cfg?.anon_key) {
+              setState({
+                status: "supabase",
+                supabaseUrl: cfg.url,
+                anonKey: cfg.anon_key,
+                failed: !!secret,
+              });
+              return;
+            }
+            setState({ status: "auth", failed: !!secret });
+            return;
+          }
           if (secret) saveSecret(secret);
-          const url = deriveWsUrl(boot.ws_path, boot.token, boot.ws_url);
-          const runtimeSurface = toRuntimeSurface(boot.runtime_surface);
-          const runtimeHost = createRuntimeHost(runtimeSurface, boot.runtime_capabilities);
-          const client = new NanobotClient({
-            url,
-            maxFrameBytes: boot.limits?.transport.max_frame_bytes,
-            socketFactory: runtimeHost.socketFactory,
-            onReauth: async () => {
-              try {
-                const refreshed = await refreshReadyClient(client, runtimeSurface);
-                return refreshed.url;
-              } catch {
-                return null;
-              }
-            },
-          });
-          bootstrapSecretRef.current = secret;
-          client.connect();
-          setState({
-            status: "ready",
-            client,
-            token: boot.api_token ?? "",
-            tokenExpiresAt: boot.expires_in
-              ? bootstrapTokenExpiresAt(boot.expires_in)
-              : null,
-            modelName: boot.model_name ?? null,
-            ingressLimits: boot.limits ?? null,
-            runtimeSurface,
-          });
+          connectWithBoot(boot, secret);
         } catch (e) {
           if (cancelled) return;
           if (isBootstrapAuthRequired(e)) {
@@ -898,7 +955,112 @@ export default function App() {
         cancelled = true;
       };
     },
-    [refreshReadyClient],
+    [refreshReadyClient, connectWithBoot],
+  );
+
+  const bootstrapWithSupabaseToken = useCallback(
+    (accessToken: string, userEmail?: string) => {
+      let cancelled = false;
+      (async () => {
+        setState({ status: "loading" });
+        try {
+          const boot = await fetchBootstrap("", accessToken);
+          if (cancelled) return;
+          if (boot.needs_auth) {
+            const cfg = boot.supabase;
+            setState({
+              status: "supabase",
+              supabaseUrl: cfg?.url ?? "",
+              anonKey: cfg?.anon_key ?? "",
+              failed: true,
+              message: "Session could not be verified. Please sign in again.",
+            });
+            return;
+          }
+          // Persist the access token so a refresh can silently re-authenticate.
+          saveSecret(accessToken);
+          connectWithBoot(boot, accessToken);
+
+          // Populate credits asynchronously once socket connects.
+          const bootSupabase = boot.supabase;
+          if (bootSupabase?.url && bootSupabase?.anon_key && boot.supabase_user_id) {
+            const credits = await fetchCredits(
+              bootSupabase.url,
+              bootSupabase.anon_key,
+              accessToken,
+            );
+            if (!cancelled) {
+              setState((current) =>
+                current.status === "ready"
+                  ? {
+                      ...current,
+                      supabaseUser: {
+                        id: boot.supabase_user_id,
+                        email: userEmail ?? boot.user_email,
+                        credits,
+                      },
+                    }
+                  : current,
+              );
+            }
+          }
+        } catch (e) {
+          if (cancelled) return;
+          if (isBootstrapAuthRequired(e)) {
+            setState({
+              status: "supabase",
+              supabaseUrl: "",
+              anonKey: "",
+              failed: true,
+              message: "Your session expired. Please sign in again.",
+            });
+          } else {
+            setState({
+              status: "error",
+              message: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    },
+    [connectWithBoot],
+  );
+
+  const handleSupabaseSignIn = useCallback(
+    async (url: string, anonKey: string, email: string, password: string) => {
+      const { session, error } = await signIn(url, anonKey, email, password);
+      if (error || !session) {
+        setState((current) =>
+          current.status === "supabase"
+            ? { ...current, failed: true, message: error ?? "Sign-in failed" }
+            : current,
+        );
+        return { error: error ?? "Sign-in failed" };
+      }
+      bootstrapWithSupabaseToken(session.access_token, session.user?.email);
+      return { error: undefined };
+    },
+    [bootstrapWithSupabaseToken],
+  );
+
+  const handleSupabaseSignUp = useCallback(
+    async (url: string, anonKey: string, name: string, email: string, password: string) => {
+      const { session, error } = await signUp(url, anonKey, email, password, name);
+      if (error || !session) {
+        setState((current) =>
+          current.status === "supabase"
+            ? { ...current, failed: true, message: error ?? "Sign-up failed" }
+            : current,
+        );
+        return { error: error ?? "Sign-up failed" };
+      }
+      bootstrapWithSupabaseToken(session.access_token, session.user?.email);
+      return { error: undefined };
+    },
+    [bootstrapWithSupabaseToken],
   );
 
   useEffect(() => {
@@ -944,6 +1106,22 @@ export default function App() {
       />
     );
   }
+  if (state.status === "supabase") {
+    return (
+      <SupabaseAuthPage
+        supabaseUrl={state.supabaseUrl}
+        anonKey={state.anonKey}
+        failed={state.failed}
+        message={state.message}
+        onSignIn={(email, password) =>
+          handleSupabaseSignIn(state.supabaseUrl, state.anonKey, email, password)
+        }
+        onSignUp={(name, email, password) =>
+          handleSupabaseSignUp(state.supabaseUrl, state.anonKey, name, email, password)
+        }
+      />
+    );
+  }
   if (state.status === "error") {
     return (
       <div className="flex h-full w-full items-center justify-center px-4 text-center">
@@ -969,6 +1147,7 @@ export default function App() {
       state.client.close();
     }
     clearSavedSecret();
+    void signOut();
     setState({ status: "auth" });
   };
 
@@ -998,19 +1177,21 @@ export default function App() {
   };
 
   return (
-    <ClientProvider
-      client={state.client}
-      token={state.token}
-      modelName={state.modelName}
-      ingressLimits={state.ingressLimits}
-    >
-      <Shell
-        runtimeSurface={state.runtimeSurface}
-        onModelNameChange={handleModelNameChange}
-        onLogout={handleLogout}
-        onNativeEngineRestart={handleNativeEngineRestart}
-      />
-    </ClientProvider>
+    <SupabaseUserContext.Provider value={state.supabaseUser ?? null}>
+      <ClientProvider
+        client={state.client}
+        token={state.token}
+        modelName={state.modelName}
+        ingressLimits={state.ingressLimits}
+      >
+        <Shell
+          runtimeSurface={state.runtimeSurface}
+          onModelNameChange={handleModelNameChange}
+          onLogout={handleLogout}
+          onNativeEngineRestart={handleNativeEngineRestart}
+        />
+      </ClientProvider>
+    </SupabaseUserContext.Provider>
   );
 }
 
@@ -2611,6 +2792,12 @@ function Shell({
             "relative flex h-full w-full overflow-hidden",
           )}
         >
+          {/* Credit badge overlay (Supabase-gated WebUI only). */}
+          {view === "chat" ? (
+            <div className="pointer-events-none absolute right-3 top-3 z-30 flex items-center gap-2">
+              <CreditBadge />
+            </div>
+          ) : null}
           {/* Host sidebar: in normal flow, so the thread area width stays honest. */}
           {showMainSidebar ? (
             <aside

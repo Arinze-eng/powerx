@@ -21,6 +21,7 @@ class GatewayTokenStore:
     max_tokens: int = 10_000
     issued_tokens: dict[str, float] = field(default_factory=dict)
     issued_token_audiences: dict[str, IssuedTokenAudience] = field(default_factory=dict)
+    issued_token_users: dict[str, str] = field(default_factory=dict)
     api_tokens: dict[str, float] = field(default_factory=dict)
 
     def check_api_token(self, request: WsRequest) -> bool:
@@ -63,6 +64,17 @@ class GatewayTokenStore:
         self.api_tokens[token_value] = expiry
         return token_value
 
+    def attach_issued_token_user(self, token_value: str, supabase_user_id: str) -> None:
+        """Associate a Supabase user id with an already-issued WebUI token."""
+        if token_value and supabase_user_id:
+            self.issued_token_users[token_value] = supabase_user_id
+
+    def consume_issued_token_user(self, token_value: str | None) -> str:
+        """Return and drop the Supabase user id bound to an issued token."""
+        if not token_value:
+            return ""
+        return self.issued_token_users.pop(token_value, "")
+
     def take_issued_token_if_valid(self, token_value: str | None) -> bool:
         return self.take_issued_token_audience(token_value) is not None
 
@@ -85,6 +97,7 @@ class GatewayTokenStore:
     def clear(self) -> None:
         self.issued_tokens.clear()
         self.issued_token_audiences.clear()
+        self.issued_token_users.clear()
         self.api_tokens.clear()
 
     def _purge_expired_api_tokens(self) -> None:

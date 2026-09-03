@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import mimetypes
+import os
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -620,6 +621,17 @@ class GatewayHTTPHandler:
 
     # -- Bootstrap ----------------------------------------------------------
 
+    def _supabase_webui_auth_enabled(self) -> bool:
+        """True when the WebUI should gate access behind Supabase auth."""
+        if os.getenv("SUPABASE_WEBUI_AUTH", "").lower() not in {"1", "true", "yes", "on"}:
+            return False
+        try:
+            from nanobot.supabase_auth import SupabaseAuth
+        except Exception:
+            return False
+        auth = SupabaseAuth()
+        return auth.enabled
+
     def _handle_bootstrap(self, connection: Any, request: Any) -> Response:
         secret = self.config.token_issue_secret.strip() or self.config.token.strip()
         is_local_browser = _is_local_browser_request(connection, request.headers)
@@ -628,7 +640,82 @@ class GatewayHTTPHandler:
             request.headers,
             self.config,
         )
-        if not is_proxy_authenticated:
+
+        # Supabase-gated WebUI: the client authenticates against Supabase on its
+        # own and presents the resulting access token in the X-Nanobot-Auth
+        # header. The gateway validates it and only then mints a scoped token.
+        supabase_mode = self._supabase_webui_auth_enabled()
+        if supabase_mode and not is_proxy_authenticated:
+            access_token = _case_insensitive_header(request.headers, "X-Nanobot-Auth").strip()
+            user_id = ""
+            user_email = ""
+            if access_token:
+                try:
+                    from nanobot.supabase_auth import SupabaseAuth
+                    auth = SupabaseAuth()
+                    user_id, user_email = auth.verify_access_token_sync(access_token)
+                except Exception:
+                    user_id = ""
+                    user_email = ""
+
+            base_supabase = {
+                "auth_provider": "supabase",
+            }
+            try:
+                from nanobot.supabase_auth import SupabaseAuth
+                auth_cfg = SupabaseAuth()
+                base_supabase["supabase"] = auth_cfg.public_config()
+            except Exception:
+                pass
+
+            if not user_id:
+                # No (or invalid) session: tell the client it must sign in.
+                payload = {
+                    "needs_auth": "supabase",
+                    **base_supabase,
+                    "ws_path": _normalize_config_path(self.config.path),
+                    "ws_url": self._bootstrap_ws_url(request),
+                    "model_name": _resolve_bootstrap_model_name(
+                        self.runtime_model_name,
+                        self.settings.config.path,
+                    ),
+                    "runtime_surface": self._runtime_surface,
+                    "runtime_capabilities": self._capabilities,
+                }
+                return _http_json_response(payload, extra_headers=_NO_STORE_HEADERS)
+
+            # Authenticated Supabase user → behave like the normal (non-proxy)
+            # issuer but stamp the Supabase identity on the bootstrap payload.
+            if not self.tokens.can_issue():
+                return _http_response(
+                    json.dumps({"error": "too many outstanding tokens"}).encode("utf-8"),
+                    status=429,
+                    content_type="application/json; charset=utf-8",
+                    extra_headers=_NO_STORE_HEADERS,
+                )
+            token = self.tokens.issue_token(self.config.token_ttl_s, audience="webui")
+            self.tokens.attach_issued_token_user(token, user_id)
+            payload = {
+                "token": token,
+                "ws_path": _normalize_config_path(self.config.path),
+                "ws_url": self._bootstrap_ws_url(request),
+                "expires_in": self.config.token_ttl_s,
+                "limits": self.ingress.bootstrap_limits(
+                    max_frame_bytes=self.config.max_message_bytes,
+                ),
+                "model_name": _resolve_bootstrap_model_name(
+                    self.runtime_model_name,
+                    self.settings.config.path,
+                ),
+                "runtime_surface": self._runtime_surface,
+                "runtime_capabilities": self._capabilities,
+                **base_supabase,
+                "supabase_user_id": user_id,
+                "user_email": user_email,
+            }
+            return _http_json_response(payload, extra_headers=_NO_STORE_HEADERS)
+
+        if not is_proxy_authenticated and not supabase_mode:
             if secret:
                 if not _issue_route_secret_matches(request.headers, secret):
                     return _http_error(401, "Unauthorized")

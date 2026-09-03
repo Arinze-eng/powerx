@@ -401,6 +401,8 @@ class WebSocketChannel(BaseChannel):
         # Connections authenticated with a one-time token from /webui/bootstrap.
         self._webui_connections: set[ServerConnection] = set()
         self._admin_connections: set[ServerConnection] = set()
+        # connection -> supabase user id bound via a Supabase-gated WebUI token.
+        self._conn_supabase_user: dict[ServerConnection, str] = {}
         # Delivery tasks are connection-bound, while operations are keyed only
         # by request_id so reconnect retries join or replay the original work.
         self._webui_request_tasks: dict[
@@ -546,6 +548,7 @@ class WebSocketChannel(BaseChannel):
         self._conn_default.pop(connection, None)
         self._webui_connections.discard(connection)
         self._admin_connections.discard(connection)
+        self._conn_supabase_user.pop(connection, None)
         self._discard_webui_request_lock_if_idle(connection)
 
     async def _maybe_push_persisted_goal_state(self, chat_id: str) -> None:
@@ -736,6 +739,10 @@ class WebSocketChannel(BaseChannel):
             self._webui_connections.add(connection)
         if audience == "admin":
             self._admin_connections.add(connection)
+        if audience in {"webui", "admin"}:
+            supabase_user = self._tokens.consume_issued_token_user(token)
+            if supabase_user:
+                self._conn_supabase_user[connection] = supabase_user
         return audience is not None
 
     # -- Server lifecycle and connection ingress ---------------------------
@@ -885,11 +892,15 @@ class WebSocketChannel(BaseChannel):
                 # WebSocket already authenticates at handshake time (token),
                 # so pairing is not applicable. Treat as non-DM to avoid
                 # sending pairing codes to an already-authenticated client.
+                supabase_user = self._conn_supabase_user.get(connection, "")
+                meta: dict[str, Any] = {"remote": getattr(connection, "remote_address", None)}
+                if supabase_user:
+                    meta["supabase_user_id"] = supabase_user
                 await self._handle_message(
                     sender_id=client_id,
                     chat_id=default_chat_id,
                     content=content,
-                    metadata={"remote": getattr(connection, "remote_address", None)},
+                    metadata=meta,
                     is_dm=False,
                 )
         except Exception as e:
@@ -1194,6 +1205,9 @@ class WebSocketChannel(BaseChannel):
                 return
 
             metadata: dict[str, Any] = {"remote": getattr(connection, "remote_address", None)}
+            supabase_user = self._conn_supabase_user.get(connection, "")
+            if supabase_user:
+                metadata["supabase_user_id"] = supabase_user
             if envelope.get("webui") is True:
                 metadata["webui"] = True
                 metadata.update(self._transcripts.client_turn_metadata(envelope.get("turn_id")))
@@ -1625,6 +1639,7 @@ class WebSocketChannel(BaseChannel):
         self._conn_default.clear()
         self._webui_connections.clear()
         self._admin_connections.clear()
+        self._conn_supabase_user.clear()
         self._tokens.clear()
         self._temporary_chats.close()
 

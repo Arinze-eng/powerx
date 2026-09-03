@@ -42,7 +42,16 @@ class SupabaseCreditHook(AgentHook):
             return None
 
     async def before_iteration(self, context: AgentHookContext) -> None:
-        if not self._supabase.enabled or self._context.channel != "telegram":
+        if not self._supabase.enabled:
+            return
+        if self._context.channel == "telegram":
+            pass
+        elif self._context.channel in {"websocket", "webui"}:
+            # WebUI turns must already carry an identity in metadata; the hook
+            # factory guarantees it when it constructs this hook.
+            if not (self._context.metadata or {}).get("supabase_user_id"):
+                return
+        else:
             return
         metadata = self._context.metadata or {}
         user_id = metadata.get("supabase_user_id")
@@ -69,10 +78,20 @@ class SupabaseCreditHook(AgentHook):
 
 
 def create_supabase_credit_hook(context: AgentTurnHookContext) -> AgentHook | None:
-    """Create billing only for configured Telegram turns."""
-    if context.channel != "telegram":
+    """Create billing for configured Supabase-backed turns.
+
+    Telegram turns resolve the account from the numeric chat id. WebUI turns
+    (``channel == "websocket"``) carry the authenticated user's Supabase id in
+    turn metadata and are charged the same per-step rate.
+    """
+    if context.channel == "telegram":
+        return SupabaseCreditHook(context)
+    if context.channel in {"websocket", "webui"}:
+        metadata = context.metadata or {}
+        if metadata.get("supabase_user_id"):
+            return SupabaseCreditHook(context)
         return None
-    return SupabaseCreditHook(context)
+    return None
 
 
 class ApiCreditHook(AgentHook):

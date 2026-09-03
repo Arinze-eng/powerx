@@ -63,17 +63,22 @@ export function consumeUrlBootstrapSecret(): string {
 }
 
 /**
- * Fetch a short-lived token + the WebSocket path from the gateway's
- * ``/webui/bootstrap`` endpoint.
+ * Fetch the gateway bootstrap payload.
+ *
+ * Two modes:
+ * - Legacy: the client supplies a static secret and receives a token.
+ * - Supabase-gated: the client supplies a Supabase access token (or none) and
+ *   receives either ``needs_auth`` (must sign in) or a full payload with a
+ *   token for the authenticated user.
  */
 export async function fetchBootstrap(
   baseUrl: string = "",
-  secret: string = "",
+  authValue: string = "",
   timeoutMs?: number,
 ): Promise<BootstrapResponse> {
   const headers: Record<string, string> = {};
-  if (secret) {
-    headers["X-Nanobot-Auth"] = secret;
+  if (authValue) {
+    headers["X-Nanobot-Auth"] = authValue;
   }
   const res = await fetchWithTimeout(`${baseUrl}/webui/bootstrap`, {
     method: "GET",
@@ -87,6 +92,10 @@ export async function fetchBootstrap(
     throw new Error(`bootstrap failed: HTTP ${res.status}`);
   }
   const body = (await res.json()) as BootstrapResponse;
+  // Supabase-gated gateway that has not seen a valid session yet.
+  if (body.needs_auth) {
+    return body;
+  }
   if (!body.ws_path) {
     throw new Error("bootstrap response missing ws_path");
   }

@@ -68,6 +68,89 @@ class SupabaseAuth:
     def configured(self) -> bool:
         return bool(self.url and self.anon_key and self.service_key)
 
+    def public_config(self) -> dict[str, Any]:
+        """Public-safe auth config shared with the WebUI so the client can
+        render a sign-up / sign-in page without any secret keys."""
+        return {
+            "enabled": self.enabled,
+            "url": self.url,
+            "anon_key": self.anon_key,
+        }
+
+    async def verify_access_token(self, access_token: str) -> str | None:
+        """Validate an access token against Supabase Auth and return the user id.
+
+        Uses Supabase's own ``/auth/v1/user`` endpoint so the backend never has
+        to reproduce the JWT signature. Returns ``None`` when the token is
+        absent or invalid.
+        """
+        return (await self.verify_access_token_details(access_token) or {}).get("id")
+
+    async def verify_access_token_details(
+        self, access_token: str,
+    ) -> dict[str, str] | None:
+        """Return ``{"id": ..., "email": ...}`` for a valid access token, else None."""
+        token = (access_token or "").strip()
+        if not token:
+            return None
+        if not self.configured:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+                response = await client.request(
+                    "GET",
+                    f"{self.url}/auth/v1/user",
+                    headers={
+                        "apikey": self.anon_key,
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                )
+        except httpx.HTTPError:
+            return None
+        if not response.is_success:
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        user_id = (payload.get("id") or "")
+        if not user_id:
+            return None
+        email = (payload.get("email") or "")
+        return {"id": str(user_id), "email": str(email)}
+
+    def verify_access_token_sync(self, access_token: str) -> tuple[str, str]:
+        """Synchronous variant returning ``(user_id, email)`` for sync handlers.
+
+        Avoids the async plumbing that a synchronous HTTP route cannot await.
+        """
+        token = (access_token or "").strip()
+        if not token or not self.configured:
+            return ("", "")
+        try:
+            import urllib.request
+
+            req = urllib.request.Request(
+                f"{self.url}/auth/v1/user",
+                headers={
+                    "apikey": self.anon_key,
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return ("", "")
+        if not isinstance(payload, dict):
+            return ("", "")
+        user_id = str(payload.get("id") or "")
+        email = str(payload.get("email") or "")
+        return (user_id, email)
+
     @property
     def enabled(self) -> bool:
         return self.configured and os.getenv("SUPABASE_AUTH_ENABLED", "true").lower() not in {"0", "false", "no"}

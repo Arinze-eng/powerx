@@ -426,6 +426,12 @@ export interface SidebarStatePayload {
   updated_at?: string | null;
 }
 
+export interface SupabaseAuthConfig {
+  enabled: boolean;
+  url: string;
+  anon_key: string;
+}
+
 export interface BootstrapResponse {
   token?: string;
   api_token?: string;
@@ -436,6 +442,20 @@ export interface BootstrapResponse {
   model_name?: string | null;
   runtime_surface?: RuntimeSurface;
   runtime_capabilities?: RuntimeCapabilities;
+  /** Present (and non-empty) when the gateway requires Supabase sign-in. */
+  needs_auth?: string;
+  auth_provider?: string;
+  supabase?: SupabaseAuthConfig;
+  supabase_user_id?: string;
+  user_email?: string;
+}
+
+export interface SupabaseProfileCredits {
+  daily_credits: number;
+  purchased_credits: number;
+  granted_credits: number;
+  drain_rate: number;
+  total: number;
 }
 
 export interface WebUITransportLimits {
