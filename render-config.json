@@ -28,7 +28,10 @@
       "mode": "polling",
       "allowFrom": ["*"],
       "groupPolicy": "mention",
-      "streaming": true
+      "streaming": true,
+      "sendToolHints": false,
+      "sendProgress": true,
+      "showReasoning": false
     },
     "websocket": {
       "enabled": true,

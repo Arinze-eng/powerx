@@ -131,8 +131,11 @@ def _ensure_telegram_polling_defaults(data: dict[str, Any]) -> bool:
 
     The previous default forced `mode: webhook` every boot, which silently
     reverted any polling config on each deploy. The bot runs pure polling now,
-    so strip any stale webhook keys and force streamed progress like a normal
-    interactive session.
+    so strip any stale webhook keys, force streamed progress like a normal
+    interactive session, and suppress per-tool-call hint spam (each `tool(...)`
+    call was published as its own Telegram message). Progress still streams as
+    one condensed message; tool-call hints are no longer dropped as separate
+    messages.
     """
     channels = data.setdefault("channels", {})
     if not isinstance(channels, dict):
@@ -145,8 +148,19 @@ def _ensure_telegram_polling_defaults(data: dict[str, Any]) -> bool:
     if telegram.get("mode") != "polling":
         telegram["mode"] = "polling"
         changed = True
-    if not telegram.get("streaming", True):
+    if telegram.get("streaming") is not True:
         telegram["streaming"] = True
+        changed = True
+    # Do not flood Telegram with a separate message per tool call (e.g. each
+    # `cron(...)` / `read_file(...)` invocation). Keep text progress streaming.
+    if telegram.get("send_progress", telegram.get("sendProgress", True)) is not True:
+        telegram["sendProgress"] = True
+        changed = True
+    if telegram.get("send_tool_hints", telegram.get("sendToolHints", True)) is not False:
+        telegram["sendToolHints"] = False
+        changed = True
+    if telegram.get("show_reasoning", telegram.get("showReasoning", True)) is not False:
+        telegram["showReasoning"] = False
         changed = True
     for webhook_key in (
         "webhookUrl",
