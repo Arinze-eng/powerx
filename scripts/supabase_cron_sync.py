@@ -7,13 +7,13 @@ Render's disk is ephemeral: every redeploy/redeploy creates a fresh container
 whose ``~/.nanobot`` data dir is wiped. On the free plan there is no persistent
 disk, so the nanobot cron store (``workspace/cron/jobs.json``, which holds every
 user-scheduled reminder / assignment / recurring task) is destroyed on every
-restart. Chat history and runtime env vars are already made durable through
-Supabase (``supabase_chat_sync.py`` / ``supabase_env_sync.py``); scheduled cron
+restart. Runtime env vars are already made durable through Supabase
+(``supabase_env_sync.py``); scheduled cron
 jobs were the one piece left unprotected — a registered job could silently stop
 firing because its store vanished.
 
 This script gives the cron store the same durable home in Supabase (which
-already hosts the app's users, chat history and runtime secrets) so scheduled
+already hosts the app's users and runtime secrets) so scheduled
 jobs survive redeploys.
 
 How
