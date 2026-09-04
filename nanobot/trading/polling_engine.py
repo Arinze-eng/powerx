@@ -530,17 +530,71 @@ async def default_market_tick(
     if not symbol:
         return {"summary": "no symbol configured; idle poll", "condition_met": False, "stop": False}
 
-    if not credentials:
-        # Fetching a live market price requires valid broker credentials. Be
-        # graceful rather than crashing the polling loop.
+    action = str(cond.get("action") or "notify").lower()
+    # Trading actions require a real broker account; they place orders. If we
+    # have no credentials, a buy/sell/close watch can never be acted on — fail
+    # fast and tell the user, rather than pretending a public price lets us trade.
+    needs_broker = action in ("buy", "sell", "close")
+    if not credentials and needs_broker:
         return {
             "summary": (
-                f"cannot fetch price for {symbol}: no connected trading account. "
-                "Use /alpaca connect (or set ALPACA_API_KEY/SECRET_KEY) so I can "
-                "poll real-time prices."
+                f"cannot place {action} order for {symbol}: no connected "
+                "trading account. Use /alpaca connect (or set "
+                "ALPACA_API_KEY/SECRET_KEY) so I can trade."
             ),
             "condition_met": False,
+            "actions": ["trade requires a connected account"],
             "stop": False,
+        }
+
+    # No broker credentials → do a full public price fetch and evaluate the
+    # watch against it. For notify/alert watches this completes the task and
+    # delivers the result to the user — the key fix for "check XAUUSD in 2
+    # minutes" style requests which previously stalled forever because prices
+    # were only fetchable through Alpaca.
+    if not credentials:
+        from nanobot.trading.public_prices import fetch_public_price
+
+        public_price = await fetch_public_price(symbol)
+        if public_price is None:
+            return {
+                "summary": f"no public price available for {symbol} right now.",
+                "condition_met": False,
+                "stop": False,
+            }
+
+        # We have a live public price. Evaluate the structured condition.
+        met, reason = evaluate_price_condition(
+            public_price,
+            target_price=_as_float(cond.get("target_price") or cond.get("trigger_price")),
+            direction=str(cond.get("direction") or "breakout").lower(),
+            reference_price=_as_float(cond.get("reference_price")),
+            move_percent=_as_float(cond.get("move_percent")),
+        )
+        actions: list[str] = []
+        stop = False
+        if met:
+            # notify-only condition met → report it and finish so the user gets
+            # feedback (non-market watch completion).
+            actions.append(reason)
+            stop = True
+        elif spec.poll_limit_reached(tick) or "notify" in (cond.get("action") or ""):
+            # Reached the maximum number of polls (or this is a plain "tell me
+            # the price" watch): report the final observed price so the user
+            # still hears something back, then complete.
+            actions.append(f"{symbol} observed at {public_price:,.6g} USD")
+            stop = True
+        summary = reason
+        if met and cond.get("symbol"):
+            summary = f"{symbol} {reason}"
+        elif "observed" in (actions[-1] if actions else ""):
+            summary = f"{symbol} price: {public_price:,.6g} USD"
+        return {
+            "price": public_price,
+            "condition_met": met,
+            "actions": actions,
+            "stop": stop,
+            "summary": summary,
         }
 
     target = _as_float(cond.get("target_price") or cond.get("trigger_price"))

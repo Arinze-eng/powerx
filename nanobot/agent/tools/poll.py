@@ -23,6 +23,8 @@ When to use this tool (the description is the intent guide given to the model):
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
 from typing import Any
 
 from loguru import logger
@@ -397,32 +399,125 @@ def _make_tick(*, credentials: dict[str, str] | None):
 async def _generic_tick(spec: WatchSpec, tick: int) -> dict[str, Any]:
     """Generic worker for non-market, non-trading watches.
 
-    This is what makes the poll tool task-agnostic: any repeated real-time task
-    the user asks for in natural language (waiting for a website to come up,
-    monitoring an API/endpoint, watching for a file change, tracking a metric,
-    "keep checking X until Y") can be expressed as a generic watch with a
-    natural-language ``description`` / ``check_goal``. Each tick records a
-    progress row so the agent can report "I'm on tick N of <goal>".
+    This is what makes the poll tool a general-purpose polling engine for *any*
+    task: waiting for a website/API to come up, monitoring an endpoint,
+    watching for a metric, "keep checking X until Y" — all expressed in natural
+    language via ``description`` / ``check_goal``. Instead of returning an idle
+    tick (the old behaviour), this now executes a real worker each tick so the
+    watch actually does something, and it completes + notifies the user when the
+    goal is reached or the poll budget is exhausted.
 
-    If Supabase is configured, each tick is persisted to polling_watch_runs so
-    the agent (via poll/status) and the user can see progress over time.
+    Deterministic handling:
+      * ``check_goal``/``description`` mentioning an http(s) URL → the worker
+        polls that URL and reports its HTTP status as progress.
+      * ``check_goal``/``description`` mentioning a price symbol → the worker
+        resolves a live price via the public price feed (no broker needed).
+      * otherwise → meaningful progress is recorded, and the watch completes
+        and notifies on poll-budget exhaustion.
     """
     from nanobot.trading.polling_engine import generic_task_tick
 
     goal = (spec.condition or {}).get("check_goal") or spec.description or spec.label
+    worker = await _build_generic_worker(spec, goal)
     stop = spec.poll_limit_reached(tick)
-    summary = (
-        f"tick {tick}: checking '{goal}'"
-        + (" → goal check reached, stopping." if stop else " → no objective met yet, continuing.")
-    )
 
-    result = await generic_task_tick(
-        spec,
-        tick,
-        worker=None,  # real logic is agent-driven via description + poll status
-    )
-    # Preserve the meaningful progress summary generated here.
+    result = await generic_task_tick(spec, tick, worker=worker)
+    # Preserve a meaningful progress summary when the worker produced none.
     result.setdefault("summary", "")
     if result.get("summary") in ("", "idle", None):
-        result["summary"] = summary
+        if stop:
+            result["summary"] = f"watched \u201c{goal}\u201d for {tick} poll(s); done."
+        else:
+            result["summary"] = f"poll tick {tick}: \u201c{goal}\u201d \u2014 still checking, nothing met yet."
+    # A worker that hits its objective must complete so the user gets notified.
+    if result.get("condition_met") and not result.get("stop"):
+        result["stop"] = True
     return result
+
+
+async def _build_generic_worker(spec: WatchSpec, goal: str) -> Callable | None:
+    """Return a callable generic worker for ``goal``, or None.
+
+    The decision is deterministic and bounded so a generic watch always either
+    (a) actively checks something reachable, or (b) records honest progress and
+    completes when its poll budget is spent. It never silently idles.
+    """
+    text = (goal or "").lower()
+
+    # 1. HTTP / endpoint availability check ("website comes online", "API 200",
+    #    "staging server returns HTTP 200", "check http://...").
+    url_match = re.search(r"https?://[^\s'\"]+", text)
+    if url_match:
+        url = url_match.group(0).rstrip(".,;)]}")
+        return _http_check_worker(url, goal)
+
+    # 2. Price check for a symbol in the description ("check XAUUSD", "BTC price").
+    symbol = _extract_price_symbol(text)
+    if symbol:
+        return _price_check_worker(symbol, goal)
+
+    return None
+
+
+def _extract_price_symbol(text: str) -> str | None:
+    """Pull out a plausible price/watch symbol (BTC, XAU, ETH…) from text."""
+    from nanobot.trading.public_prices import is_public_price_symbol
+
+    # Explicit "XUSD / XUSDT / X-USD" patterns first.
+    for pattern in (r"\b([A-Z]{2,6})-?USD\b", r"\b([A-Z]{2,6})USDT\b"):
+        hits = re.findall(pattern, text.upper())
+        for hit in hits:
+            if is_public_price_symbol(hit):
+                return hit
+    # Otherwise look for known crypto/metal tickers mentioned in the text.
+    for word in re.findall(r"\b[A-Z]{2,6}\b", text.upper()):
+        if is_public_price_symbol(word):
+            return word
+    return None
+
+
+def _http_check_worker(url: str, goal: str):
+    """Worker that polls ``url`` and reports its reachability / HTTP status."""
+    import httpx
+
+    async def worker(spec: WatchSpec, tick: int, _description: str) -> dict[str, Any]:
+        try:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                response = await client.get(url)
+            code = response.status_code
+            ok = 200 <= code < 400
+            summary = f"tick {tick}: GET {url} \u2192 HTTP {code}" + (
+                " \u2014 endpoint is UP." if ok else " \u2014 still not up."
+            )
+            return {"summary": summary, "condition_met": ok, "data": {"url": url, "http": code}}
+        except (httpx.HTTPError, ValueError) as exc:
+            return {
+                "summary": f"tick {tick}: GET {url} \u2014 request failed ({type(exc).__name__}); still waiting.",
+                "condition_met": False,
+                "data": {"url": url, "error": type(exc).__name__},
+            }
+
+    return worker
+
+
+def _price_check_worker(symbol: str, goal: str):
+    """Worker that fetches a live public price and reports it each tick."""
+    async def worker(spec: WatchSpec, tick: int, _description: str) -> dict[str, Any]:
+        from nanobot.trading.public_prices import fetch_public_price
+        price = await fetch_public_price(symbol)
+        if price is None:
+            return {
+                "summary": f"tick {tick}: no public price available for {symbol} yet.",
+                "condition_met": False,
+                "data": {"symbol": symbol},
+            }
+        # User asked to "check the price" → report it and complete so they hear back.
+        return {
+            "summary": f"{symbol} current price: {price:,.6g} USD",
+            "condition_met": True,
+            "actions": [f"{symbol} = {price:,.6g} USD"],
+            "price": price,
+            "data": {"symbol": symbol, "price": price},
+        }
+
+    return worker
