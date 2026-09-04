@@ -19,6 +19,8 @@ services:
         value: https://minis-yzdb.onrender.com
       - key: NOVITA_API_KEY
         sync: false
+      - key: VERCEL_TOKEN
+        sync: false
       - key: ADMIN_PASSWORD
         sync: false
       - key: SUPABASE_URL

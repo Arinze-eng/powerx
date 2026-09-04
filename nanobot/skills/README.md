@@ -29,5 +29,6 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `tmux` | Remote-control tmux sessions |
 | `clawhub` | Search and install skills from ClawHub registry |
 | `skill-creator` | Create new skills |
+| `web-development` | Build and deploy web applications (frontend/backend) to Vercel and return the live URL |
 | `poll` | Real-time polling & vigilance: watch anything over time and react — live trading or any repeated non-trading task |
 | `alpaca-hackathon` | ICT/SMC + TMA + HMM five-cluster trading strategy playbook (backing the `alpaca_trade` tool) |
