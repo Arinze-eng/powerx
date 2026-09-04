@@ -127,23 +127,69 @@ async def dispatch_v1_routes(request: WsRequest, got: str) -> Any | None:
         (m for m in reversed(messages) if isinstance(m, dict) and m.get("role") == "user"),
         None,
     )
-    content = str((last_user or {}).get("content") or "").strip()
+    raw_content = (last_user or {}).get("content")
+    # ``content`` may be a plain string or an OpenAI-style multimodal array of
+    # parts. Extract only the human-readable text here; every attachment part
+    # (image or arbitrary file) is decoded to disk below and handed to the agent
+    # as a local media path, never dumped inline into the prompt text.
+    text_parts: list[str] = []
+    if isinstance(raw_content, str):
+        content = raw_content.strip()
+    elif isinstance(raw_content, list):
+        for part in raw_content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_parts.append(str(part.get("text", "")))
+        content = "\n".join(t for t in text_parts if t).strip()
+    else:
+        content = ""
 
     # --- attachments: OpenAI-style multimodal parts with base64 data URLs ----
+    # Supports BOTH image parts (``{"type":"image_url","image_url":{"url":...}}``)
+    # and arbitrary file parts (``{"type":"file","file":{"filename":...,
+    # "file_data":"data:<mime>;base64,..."}}`` — also accepted under the
+    # ``input_file`` alias). Any file type works (PDF, XLSX, DOCX, PPTX, ZIP,
+    # APK, images, …): the bytes are written to the agent's media dir and passed
+    # as a local path. The agent loop references non-image paths as
+    # ``[Attachment: <path>]`` lines so the model reads them with its file tools
+    # instead of receiving megabytes of base64 in the prompt.
     media_paths: list[str] = []
-    if isinstance((last_user or {}).get("content"), list):
-        from nanobot.config.paths import get_media_dir
-        from nanobot.utils.media_decode import save_base64_data_url
+    from nanobot.config.paths import get_media_dir
+    from nanobot.utils.media_decode import FileSizeExceededError, save_base64_data_url
 
-        for part in (last_user or {}).get("content", []):
-            if not isinstance(part, dict) or part.get("type") != "image_url":
+    upload_error: str | None = None
+
+    def _save_data_url(url: str, filename: str | None) -> None:
+        nonlocal upload_error
+        if not url.startswith("data:"):
+            return
+        try:
+            saved = save_base64_data_url(url, get_media_dir("api"), filename=filename)
+        except FileSizeExceededError as exc:
+            upload_error = str(exc)
+            return
+        if saved:
+            media_paths.append(saved)
+
+    if isinstance(raw_content, list):
+        for part in raw_content:
+            if not isinstance(part, dict):
                 continue
-            url_obj = part.get("image_url")
-            url = str(url_obj.get("url") if isinstance(url_obj, dict) else url_obj or "")
-            if url.startswith("data:"):
-                saved = save_base64_data_url(url, get_media_dir("api"))
-                if saved:
-                    media_paths.append(saved)
+            ptype = part.get("type")
+            if ptype in ("image_url", "input_image"):
+                url_obj = part.get("image_url") or part.get("input_image")
+                url = str(url_obj.get("url") if isinstance(url_obj, dict) else url_obj or "")
+                _save_data_url(url, None)
+            elif ptype in ("file", "input_file"):
+                file_obj = part.get("file") or part.get("input_file") or {}
+                if isinstance(file_obj, dict):
+                    url = str(file_obj.get("file_data") or file_obj.get("url") or "")
+                    filename = str(file_obj.get("filename") or "") or None
+                else:
+                    url = str(file_obj or "")
+                    filename = None
+                _save_data_url(url, filename)
+    if upload_error:
+        return _http_error(413, upload_error)
     if not content and not media_paths:
         return _http_error(400, "No user message content")
 

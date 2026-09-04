@@ -122,12 +122,17 @@ url = ("{base_url}/v1/chat/completions?token=" + KEY +
 print(json.loads(urllib.request.urlopen(url, timeout=420).read())["choices"][0]["message"]["content"])</code></pre>
 
 <b>2) File / image upload</b>
-Attach files inside the payload as base64 data URLs (OpenAI multimodal format). Keep files under ~6 MB:
+Attach files inside the payload as base64 data URLs (OpenAI multimodal format). Keep each file under ~10 MB:
 <pre><code>{{"model": "{model}", "messages": [{{"role": "user", "content": [
   {{"type": "text", "text": "What is in this image?"}},
   {{"type": "image_url", "image_url": {{"url": "data:image/png;base64,&lt;BASE64&gt;"}}}}
 ]}}]}}</code></pre>
-Any file type works (PDF, zip, docs…) — set the real mime type in the data URL and the agent saves it into its workspace and reads it with its tools.
+<b>Any file type works</b> (PDF, XLSX, DOCX, PPTX, ZIP, APK, CSV, text, images…). For non-image files use a <code>"file"</code> part with a filename and the real mime type in the data URL — the agent saves it into its workspace and reads it with its file tools (documents, spreadsheets and archives are parsed natively):
+<pre><code>{{"model": "{model}", "messages": [{{"role": "user", "content": [
+  {{"type": "text", "text": "Summarize this spreadsheet"}},
+  {{"type": "file", "file": {{"filename": "data.xlsx", "file_data": "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,&lt;BASE64&gt;"}}}}
+]}}]}}</code></pre>
+Keep each file under ~10 MB. To build the <code>file_data</code>, base64-encode the file (e.g. <code>base64 -w0 report.pdf</code>) and prefix it with <code>data:&lt;mime&gt;;base64,</code>.
 
 <b>3) Streaming (optional)</b>
 Add <code>"stream":true</code> to the payload → response arrives as SSE chunks ending with <code>data: [DONE]</code>.
