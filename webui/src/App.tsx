@@ -858,9 +858,47 @@ export default function App() {
   const [state, setState] = useState<BootState>({ status: "loading" });
   const bootstrapSecretRef = useRef("");
 
+  // [FIX 2026-09-04] Keep the current Supabase url + anon key in a ref (set on
+  // every successful connect) so token refresh can run from any state without
+  // TypeScript narrowing problems on the union BootState.
+  const supabaseConfigRef = useRef<{ url: string; anonKey: string }>({
+    url: "",
+    anonKey: "",
+  });
+
+  // [FIX 2026-09-04] Pull a fresh (possibly auto-refreshed) Supabase access
+  // token from the client, keep it in the ref used for X-Nanobot-Auth, and
+  // persist it so re-bootstrap keeps working after the token expiry window.
+  const getSessionTokenForBootstrap = useCallback(async (): Promise<string> => {
+    const { url, anonKey } = supabaseConfigRef.current;
+    if (url && anonKey) {
+      try {
+        const fresh = await getSessionToken(url, anonKey);
+        if (fresh) {
+          bootstrapSecretRef.current = fresh;
+          try {
+            saveSecret(fresh);
+          } catch {
+            // storage write failure is non-fatal
+          }
+          return fresh;
+        }
+      } catch {
+        // fall back to the stored token below
+      }
+    }
+    return bootstrapSecretRef.current;
+  }, []);
+
   const refreshReadyClient = useCallback(
     async (client: NanobotClient, fallbackSurface: RuntimeSurface) => {
-      const boot = await fetchBootstrap("", bootstrapSecretRef.current);
+      // [FIX 2026-09-04] Supabase access tokens expire (~1h). Before we use the
+      // stored token to re-bootstrap (or to authorize session reads via
+      // X-Nanobot-Auth), refresh it through the auto-refreshing Supabase client
+      // so the gateway can still resolve the owning user id. Without this the
+      // token goes stale and per-user chat isolation fails after an hour.
+      const refreshedToken = await getSessionTokenForBootstrap();
+      const boot = await fetchBootstrap("", refreshedToken);
       if (boot.needs_auth) throw new BootstrapAuthRequiredError("bootstrap requires auth");
       const url = deriveWsUrl(boot.ws_path, boot.token, boot.ws_url);
       const runtimeSurface = boot.runtime_surface
@@ -890,7 +928,7 @@ export default function App() {
       );
       return { token: boot.api_token ?? "", url };
     },
-    [],
+    [getSessionTokenForBootstrap],
   );
 
   const connectWithBoot = useCallback(
@@ -916,6 +954,7 @@ export default function App() {
       const bootSupabase = boot.supabase;
       const supabaseUrl = bootSupabase?.url ?? "";
       const anonKey = bootSupabase?.anon_key ?? "";
+      supabaseConfigRef.current = { url: supabaseUrl, anonKey };
       const paymentPackages = bootSupabase?.payment?.packages ?? [];
       const paymentUrl = bootSupabase?.payment?.payment_url ?? "";
       const supabaseUserId = boot.supabase_user_id;

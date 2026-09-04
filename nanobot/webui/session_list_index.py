@@ -255,6 +255,11 @@ def _public_row(sessions_dir: Path, webui_dir: Path, row: dict[str, Any]) -> dic
         _MODEL_PRESET_FIELD: row.get(_MODEL_PRESET_FIELD),
         _WORKSPACE_SCOPE_PRESENT_FIELD: row.get(_WORKSPACE_SCOPE_PRESENT_FIELD, False),
         _WORKSPACE_SCOPE_VALUE_FIELD: row.get(_WORKSPACE_SCOPE_VALUE_FIELD),
+        # [FIX 2026-09-04] Keep the per-user owner id on the public row so the
+        # sidebar list handler can filter sessions to the requesting user only.
+        # Without this the owner field is dropped and every session leaks to
+        # every user whenever the request user cannot be resolved.
+        _OWNER_USER_ID_FIELD: row.get(_OWNER_USER_ID_FIELD, ""),
         "path": str(path),
     }
 

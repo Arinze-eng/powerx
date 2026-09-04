@@ -18,6 +18,7 @@ from nanobot.session.automation_turns import AUTOMATION_HISTORY_META
 from nanobot.session.history_visibility import HIDDEN_HISTORY_META
 from nanobot.session.manager import SessionManager
 from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY
+from nanobot.webui.metadata import WEBUI_SESSION_OWNER_KEY
 
 
 @pytest.fixture(autouse=True)
@@ -799,3 +800,43 @@ def test_session_manager_list_sessions_fallback_time_when_missing(tmp_path: Path
     assert sessions[0]["updated_at"] is not None
     datetime.fromisoformat(sessions[0]["created_at"])
     datetime.fromisoformat(sessions[0]["updated_at"])
+
+
+def test_webui_session_list_public_row_exposes_owner_for_filtering(
+    tmp_path: Path,
+) -> None:
+    """Regression: the sidebar list must carry the per-user owner id on the
+    public row so `_sessions_list_payload` can filter sessions to the
+    requesting user. Without this the owner field is dropped and every session
+    leaks to every user whenever the request owner cannot be resolved."""
+    manager = SessionManager(tmp_path)
+    owner = manager.get_or_create("websocket:owned")
+    owner.metadata[WEBUI_SESSION_OWNER_KEY] = "user-123"
+    owner.add_message("user", "hello")
+    manager.save(owner)
+
+    manager.get_or_create("websocket:unowned").add_message("user", "hi")
+    manager.save(manager.get_or_create("websocket:unowned"))
+
+    rows = list_webui_sessions(manager)
+    by_key = {row["key"]: row for row in rows}
+    assert "websocket:owned" in by_key
+    assert "websocket:unowned" in by_key
+    # The owner id must survive the public-row projection.
+    assert by_key["websocket:owned"][WEBUI_SESSION_OWNER_KEY] == "user-123"
+    assert by_key["websocket:unowned"][WEBUI_SESSION_OWNER_KEY] == ""
+
+
+def test_webui_session_list_owner_survives_index_roundtrip(tmp_path: Path) -> None:
+    """The owner field is written to and read back from the cache index."""
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("websocket:owner-persisted")
+    session.metadata[WEBUI_SESSION_OWNER_KEY] = "user-abc"
+    session.add_message("user", "hello")
+    manager.save(session)
+
+    # First call builds the index cache; second read reuses it.
+    first = {row["key"]: row for row in list_webui_sessions(manager)}
+    second = {row["key"]: row for row in list_webui_sessions(manager)}
+    assert first["websocket:owner-persisted"][WEBUI_SESSION_OWNER_KEY] == "user-abc"
+    assert second["websocket:owner-persisted"][WEBUI_SESSION_OWNER_KEY] == "user-abc"

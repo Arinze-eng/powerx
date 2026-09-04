@@ -44,6 +44,7 @@ COPY scripts/render_reverse_proxy.py scripts/
 COPY scripts/nanobot_launcher.sh scripts/
 COPY scripts/supabase_env_sync.py scripts/
 COPY scripts/supabase_cron_sync.py scripts/
+COPY scripts/supabase_chat_sync.py scripts/
 COPY --from=webui-builder /app/nanobot/web/dist/ nanobot/web/dist/
 RUN NANOBOT_SKIP_WEBUI_BUILD=1 uv pip install --python "$VIRTUAL_ENV/bin/python" --no-cache .
 

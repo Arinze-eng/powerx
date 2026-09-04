@@ -3,11 +3,13 @@ import { useEffect, useRef, useState } from "react";
 import { usePageVisibility } from "@/hooks/usePageVisibility";
 import { fetchSessionAutomations } from "@/lib/api";
 import type { SessionAutomationJob } from "@/lib/types";
+import { useClient } from "@/providers/ClientProvider";
 
 const AUTOMATIONS_REFRESH_MS = 3000;
 
 export function useSessionAutomationJobs(open: boolean, token: string, sessionKey: string) {
   const pageVisible = usePageVisibility();
+  const { getAuthValue } = useClient();
   const [jobs, setJobs] = useState<SessionAutomationJob[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
@@ -30,7 +32,7 @@ export function useSessionAutomationJobs(open: boolean, token: string, sessionKe
         setJobs([]);
       }
       try {
-        const next = await fetchSessionAutomations(tokenRef.current, sessionKey);
+        const next = await fetchSessionAutomations(tokenRef.current, sessionKey, "", getAuthValue());
         if (cancelled) return;
         setJobs(next.jobs);
         setLoadFailed(false);

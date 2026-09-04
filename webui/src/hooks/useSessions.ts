@@ -267,9 +267,9 @@ export function useSessions(): {
   );
 
   const getSessionAutomations = useCallback(async (key: string) => {
-    const result = await fetchSessionAutomations(tokenRef.current, key);
+    const result = await fetchSessionAutomations(tokenRef.current, key, "", getAuthValue());
     return result.jobs;
-  }, []);
+  }, [getAuthValue]);
 
   return {
     sessions,

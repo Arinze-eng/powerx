@@ -297,11 +297,15 @@ export async function fetchSessionAutomations(
   token: string,
   key: string,
   base: string = "",
+  authValue: string = "",
 ): Promise<SessionAutomationsPayload> {
+  const init = authValue
+    ? { headers: { "X-Nanobot-Auth": authValue } }
+    : undefined;
   return request<SessionAutomationsPayload>(
     `${base}/api/sessions/${encodeURIComponent(key)}/automations`,
     token,
-    undefined,
+    init,
     API_READ_TIMEOUT_MS,
   );
 }

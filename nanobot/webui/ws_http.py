@@ -862,6 +862,12 @@ class GatewayHTTPHandler:
         # [FIX 2026-09-04] Resolve the signed-in Supabase user and scope the
         # returned session list to that user only (per-user chat isolation).
         owner_user_id = self._supabase_user_id_for_request(request)
+        # Fail closed in Supabase mode: if we cannot resolve an authentic owner
+        # for the request, return an empty list instead of leaking every user's
+        # sessions. This is the core guard that prevents one user seeing all
+        # other users' chats.
+        if self._supabase_webui_auth_enabled() and not owner_user_id:
+            return _http_json_response({"sessions": []})
         payload = await asyncio.to_thread(
             self._sessions_list_payload, owner_user_id
         )
@@ -1511,10 +1517,20 @@ class GatewayHTTPHandler:
         unrestricted. Returns ``None`` when access is permitted.
         """
         owner_user_id = self._supabase_user_id_for_request(request)
+        session_owner = ""
+        chat_id = decoded_key.split(":", 1)[1] if ":" in decoded_key else decoded_key
+        try:
+            session_owner = self.workspaces.session_owner_user_id(chat_id)
+        except Exception:  # noqa: BLE001 - never leak on storage errors
+            session_owner = ""
+        # Fail closed in Supabase mode: an unverifiable or mismatched owner is
+        # denied so a user can never read another user's chat history.
+        if self._supabase_webui_auth_enabled():
+            if not owner_user_id or session_owner != owner_user_id:
+                return _http_error(404, "session not found")
+            return None
         if not owner_user_id:
             return None
-        chat_id = decoded_key.split(":", 1)[1] if ":" in decoded_key else decoded_key
-        session_owner = self.workspaces.session_owner_user_id(chat_id)
         if session_owner != owner_user_id:
             return _http_error(404, "session not found")
         return None
