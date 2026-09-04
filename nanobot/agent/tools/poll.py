@@ -120,7 +120,14 @@ class PollTool(Tool):
 
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
-        return True
+        # DISABLED: host-side background polling is intentionally removed. All
+        # polling / watching / monitoring should be done inside the sandbox
+        # (novita_sandbox) with a normal shell loop, exactly like watching a
+        # GitHub Actions workflow — never as a background process on the Render
+        # host. Keeping this tool disabled means the LLM cannot start host-side
+        # watches via WatchManager; it must set up its own poll loop in the
+        # sandbox instead.
+        return False
 
     @property
     def name(self) -> str:
