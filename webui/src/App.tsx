@@ -61,6 +61,7 @@ import {
   fetchCredits,
   getCurrentUser,
   getSessionToken,
+  onSupabaseAuthLifecycle,
   signIn,
   signOut,
   signUp,
@@ -1021,6 +1022,27 @@ export default function App() {
           if (boot.needs_auth) {
             const cfg = boot.supabase;
             if (cfg?.url && cfg?.anon_key) {
+              // Fresh page load likely holds a persisted, refreshable Supabase
+              // session (stored by the SDK under its own key). The bootstrap
+              // secret we saved may be stale (access tokens rotate ~hourly).
+              // Before forcing the user to sign in again, try to refresh the
+              // SDK session with the url/anonKey the server just gave us and
+              // silently re-bootstrap with the fresh token.
+              if (secret) {
+                try {
+                  const fresh = await getSessionToken(cfg.url, cfg.anon_key);
+                  if (fresh && !cancelled) {
+                    const retry = await fetchBootstrap("", fresh);
+                    if (retry && !retry.needs_auth) {
+                      saveSecret(fresh);
+                      connectWithBoot(retry, fresh);
+                      return;
+                    }
+                  }
+                } catch {
+                  // fall through to the sign-in page below
+                }
+              }
               setState({
                 status: "supabase",
                 supabaseUrl: cfg.url,
@@ -1198,6 +1220,44 @@ export default function App() {
     return bootstrapWithSecret(saved);
   }, [bootstrapWithSecret]);
 
+  // Keep the Supabase access token (and therefore the bootstrap secret + the
+  // gateway token) in sync with the SDK's automatic refresh cycle.
+  //
+  // Supabase access tokens expire (~1h). The SDK rotates them in the
+  // background (token_refreshed). Without this listener the app kept using a
+  // stale access token as its bootstrap secret, so on the next page reload or
+  // reconnect the gateway rejected it (401) → the user was force-logged-out.
+  useEffect(() => {
+    const unsubscribe = onSupabaseAuthLifecycle((event, token) => {
+      if (event === "signed_in" || event === "token_refreshed") {
+        // Keep the persisted bootstrap secret pointing at the CURRENT token so
+        // a page reload re-bootstraps with a fresh, still-valid token.
+        if (token) {
+          bootstrapSecretRef.current = token;
+          try {
+            saveSecret(token);
+          } catch {
+            // storage failure is non-fatal
+          }
+        }
+        // The gateway token we were issued on bootstrap is tied to the access
+        // token that minted it; once the access token rotates, silently
+        // re-bootstrap to obtain a fresh gateway token before it goes stale.
+        if (state.status === "ready" && token) {
+          void refreshReadyClient(state.client, state.runtimeSurface).catch(() => {
+            // best-effort; the periodic refresh and reconnect reauth handle retries
+          });
+        }
+        return;
+      }
+      if (event === "signed_out") {
+        clearSavedSecret();
+        bootstrapSecretRef.current = "";
+      }
+    });
+    return unsubscribe;
+  }, [state, refreshReadyClient]);
+
   if (state.status === "loading") {
     return (
       <div className="flex h-full w-full items-center justify-center">
@@ -1263,7 +1323,15 @@ export default function App() {
     }
     clearSavedSecret();
     void signOut();
-    setState({ status: "auth" });
+    // Supabase-gated WebUI should return to the Supabase sign-in page (there is
+    // no shared static bootstrap secret in that mode). Non-supabase mode goes
+    // back to the generic auth form.
+    const { url, anonKey } = supabaseConfigRef.current;
+    if (url && anonKey) {
+      setState({ status: "supabase", supabaseUrl: url, anonKey, failed: false });
+    } else {
+      setState({ status: "auth", failed: false });
+    }
   };
 
   const handleNativeEngineRestart = async (): Promise<string> => {
