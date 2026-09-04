@@ -1,71 +1,54 @@
 ---
 name: web-development
-description: "Build and deploy web applications (frontend and/or backend) to Vercel. Use the web_dev tool to scaffold a project, edit it, set environment variables, deploy via the Vercel CLI, and return the live URL to the user."
-version: 1.0.0
+description: "Hub for building and deploying web applications end-to-end with the web_dev tool. Use whenever the user asks to create/build/modify a website, web app, landing page, dashboard, API, or full-stack product — especially if they want it deployed and a link returned. Routes to specialized skills - web-design (look & feel), frontend-development (UI code), backend-development (API/auth/security), database-development (data/persistence), fullstack-development (wiring it together), vercel-deployment (ship + env + live URL)."
+metadata:
+  nanobot:
+    always: false
 ---
 
-# Web Development & Deployment
+# Web Development (hub)
 
-Use this skill whenever a user asks you to **build a website / web app** (frontend,
-backend, or full-stack) and/or **deploy it and give them a link**. It pairs the
-agent's normal code-writing abilities with a `web_dev` tool that ships projects
-to Vercel non-interactively.
+This is the entry point for all web-building work. The actual depth lives in the
+specialized skills below — load whichever apply to the task; you don't need them all.
 
-## When to use it
+## Route by what the user wants
 
-* "build me a landing page", "create a website", "make a web app"
-* "add a backend / API", "full-stack app"
-* "deploy it", "host it", "put it online", "send me the link to my site"
-* "set this env/secret/API key for the app"
+| User intent | Load skill(s) |
+| --- | --- |
+| "make it look good / design / UI" | `web-design` |
+| "build the pages / React / Next.js / Tailwind" | `frontend-development` (+ `web-design`) |
+| "add an API / auth / server logic" | `backend-development` |
+| "store data / database / users / persistence" | `database-development` |
+| "a whole working app (UI + API + DB)" | `fullstack-development` |
+| "deploy it / give me a link / set env vars" | `vercel-deployment` |
 
-## Workflow
+## The web_dev tool (what actually ships code)
 
-1. **Understand what to build.** Clarify the type of project if it is not obvious:
-   a static frontend, a backend/API, or a full-stack app. Keep the scope reasonable.
+The agent uses the `web_dev` tool to scaffold and deploy to Vercel:
+- `action=scaffold` — starter project (`project`, `type=frontend|backend|fullstack`).
+- `action=deploy` — ship a directory, get back the live `https://…vercel.app` URL.
+- `action=set_env` — add an env var (`name`,`value`,`environment`) BEFORE deploying.
+- `action=status` / `action=inspect` — inspect deployments and env.
 
-2. **Scaffold (optional).** Use `web_dev` with `action=scaffold`,
-   `project=<name>`, and `type=frontend|backend|fullstack` to create a starter
-   directory. You can also build files by hand with the normal filesystem tools
-   (`write_file`/`edit_file`/`apply_patch`) in a new directory under the workspace.
+Auth uses the operator's `VERCEL_TOKEN`. If the tool reports disabled, tell the user an
+admin must configure `VERCEL_TOKEN` on the backend.
 
-3. **Write / edit the code.** Use the filesystem tools to add your HTML/CSS/JS
-   (frontend) or your server/API code (backend). For a full-stack app provide an
-   `index.html` plus a server entrypoint; the scaffold's defaults are a safe start.
+## Standard workflow (every web build)
 
-4. **Set environment variables BEFORE deploying** if the app needs secrets or
-   config (API keys, database URLs). Use `web_dev` with `action=set_env`,
-   `project=<dir>`, `name=<VAR>`, `value=<value>`, `environment=production`
-   (or `preview`/`development`). Deploying after setting env means the build can
-   read them.
+1. **Clarify scope** — what kind of app, does it need a backend/database, any design vibe?
+2. **Scaffold or write files** — use `web_dev scaffold` or build directly with filesystem tools.
+3. **Design well** — follow `web-design`; never leave default unstyled markup.
+4. **Implement** — `frontend-development` / `backend-development` / `database-development`.
+5. **Set env** — `web_dev action=set_env` for every secret/config the app needs.
+6. **Deploy** — `web_dev action=deploy`; capture the returned URL.
+7. **Deliver** — give the user the live URL and confirm it loads.
 
-5. **Deploy.** Use `web_dev` with `action=deploy`, `project=<dir>`. It runs the
-   Vercel CLI against that directory and returns the **live URL**.
+## Quality bar
 
-6. **Give the user the link.** After a successful deploy, tell the user the
-   public https URL(s) from the tool output. For full-stack projects, list the
-   frontend URL and the API route(s) explicitly.
+- Builds cleanly before deploy (`npm run build`).
+- Looks intentional (design tokens, hierarchy, responsive) — not generic AI output.
+- Handles loading/error/empty states.
+- Secrets in env, none hardcoded; public vars prefixed correctly.
+- Tested at mobile widths.
 
-## Environment variables
-
-The Vercel CLI authenticates with an operator-configured `VERCEL_TOKEN`
-(the same way `novita_sandbox` uses `NOVITA_API_KEY`). When it is missing the
-`web_dev` tool is disabled — tell the user an admin must set `VERCEL_TOKEN`.
-
-Common env vars to set per app (as asked by the user): `DATABASE_URL`,
-`OPENAI_API_KEY`, `STRIPE_SECRET`, `PUBLIC_*` build vars, etc. Prefer
-`environment=production` so production deployments see them.
-
-## Deploying again after a change
-
-If the user asks for changes after a deploy, edit the files, then `action=deploy`
-again. The tool reports the refreshed deployment URL(s). Setting env vars also
-requires a redeploy for the running app to pick them up.
-
-## Notes
-
-* Keep secrets private: never echo raw env values back verbatim in chat unless the user
-  explicitly asked; the CLI hides sensitive values anyway.
-* The tool deploys the project directory you name — always point it at the same
-  directory you wrote the code into.
-* `web_dev` `action=status` lists a project's deployments and env vars; `inspect`
-  prints its live URLs. Use them to confirm or debug.
+See the linked skills for deep guidance; this file only coordinates them.
