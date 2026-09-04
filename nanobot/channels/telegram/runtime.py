@@ -9,14 +9,14 @@ import re
 import time
 import unicodedata
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, TypeAlias, TypeVar, cast
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
@@ -432,6 +432,21 @@ class _StreamBuf:
 
 
 @dataclass
+class _ActivityBuf:
+    """Per-chat live "what the AI is doing" aggregation.
+
+    Holds the single message that shows the agent's current step plus a compact
+    history of completed steps. The message is progressively edited in place,
+    so the user never sees a flood of per-step bubbles — only one status card
+    that updates as the agent works, exactly like the WebUI activity panel.
+    """
+    message_id: int | None = None
+    # Ordered step log: (kind, text) where kind is "" (running) or "done"/"err".
+    steps: list[tuple[str, str]] = field(default_factory=list)
+    last_edit: float = 0.0
+
+
+@dataclass
 class _QueuedTelegramUpdate:
     """Telegram update staged for per-session ordered processing."""
 
@@ -483,6 +498,16 @@ class TelegramConfig(Base):
     # on the local host (the agent still receives it), saving Render's outbound
     # upload bandwidth — large files never re-cross the host to gofile.io.
     gofile_staging: bool = True
+    # Consolidate per-step progress/tool events into ONE live "activity" message
+    # per chat that is edited in place (like the WebUI shows what the AI is doing),
+    # instead of sending a separate message bubble for every step. When enabled
+    # the running step log appears as a single pinned-status message and is
+    # finalized to a compact "done — N steps" note when the answer starts.
+    live_activity: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("liveActivity", "live_activity"),
+        serialization_alias="liveActivity",
+    )
 
     @field_validator("webhook_path")
     @classmethod
@@ -598,6 +623,9 @@ class TelegramChannel(BaseChannel):
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
+        self._activity_bufs: dict[str, _ActivityBuf] = {}  # chat_id -> live activity state
+        # chat_id (int) -> activity buf awaiting finalization to a "done" card.
+        self._pending_activity_finals: dict[int, _ActivityBuf] = {}
         self._inbound_buffers: dict[str, list[_QueuedTelegramUpdate]] = {}
         self._inbound_workers: dict[str, asyncio.Task[None]] = {}
         self._rich_send_disabled: bool = False  # Latch off if Bot API < 10.1
@@ -911,6 +939,8 @@ class TelegramChannel(BaseChannel):
             task.cancel()
         self._inbound_workers.clear()
         self._inbound_buffers.clear()
+        self._activity_bufs.clear()
+        self._pending_activity_finals.clear()
 
         if self._app:
             self.logger.info("Stopping bot...")
@@ -1005,6 +1035,190 @@ class TelegramChannel(BaseChannel):
             self.logger.debug("sendRichMessage failed: {}", exc)
             return False
 
+    # -- Live activity aggregation -------------------------------------------------
+    #
+    # The agent emits a separate progress/tool event for every step it takes. If
+    # each one became its own Telegram message the chat would be flooded. Instead,
+    # when ``live_activity`` is enabled we keep ONE message per chat and edit it in
+    # place to show the current step plus a compact history of completed steps —
+    # the same "here's what the AI is doing right now" experience as the WebUI.
+
+    @staticmethod
+    def _activity_display_name(text: str) -> str:
+        """Trim a raw progress/tool-hint line to a short readable step label."""
+        text = (text or "").strip()
+        # Collapse whitespace/newlines into a single line.
+        text = " ".join(text.split())
+        # For tool hints like read_file("a.py") -> read_file a.py, strip quotes.
+        text = re.sub(r'"|\'|`', "", text)
+        if len(text) > 72:
+            text = text[:69] + "..."
+        return text or "working…"
+
+    @staticmethod
+    def _activity_header(running: bool, done_count: int) -> str:
+        if running:
+            return f"<b>\U0001f916 Working…</b> (<code>{done_count + 1}</code> step)"
+        return f"<b>\u2705 Done \u2014 {done_count} step{'s' if done_count != 1 else ''}</b>"
+
+    @staticmethod
+    def _activity_summary_text(buf: "_ActivityBuf") -> str:
+        """Compact finalized card shown once the agent starts its answer."""
+        lines = ["<b>\u2705 Done</b>"]
+        for kind, text in buf.steps[-8:]:
+            mark = "\u2713" if kind == "ok" else ("\u274c" if kind == "err" else "\u25cf")
+            html_text = _escape_telegram_html(text)
+            if kind == "err":
+                html_text = f"<s>{html_text}</s>"
+            lines.append(f"{mark} {html_text}")
+        if len(buf.steps) > 8:
+            lines.append(f"\u2026 and {len(buf.steps) - 8} more")
+        return "\n".join(lines)[:TELEGRAM_HTML_MAX_LEN]
+
+    def _render_activity_text(self, buf: "_ActivityBuf") -> str:
+        """Render the live activity message body (running state)."""
+        header = self._activity_header(running=True, done_count=len(buf.steps))
+        lines = [header]
+        # Last step (if any) is the current running one.
+        for i, (kind, text) in enumerate(buf.steps):
+            mark = "\u2713" if kind == "ok" else ("\u274c" if kind == "err" else "\u25cf")
+            html_text = _escape_telegram_html(text)
+            if kind == "err":
+                html_text = f"<s>{html_text}</s>"
+            lines.append(f"{mark} {html_text}")
+        body = "\n".join(lines)
+        # Keep under Telegram's HTML limit by trimming the oldest steps first.
+        while len(body) > TELEGRAM_HTML_MAX_LEN and len(buf.steps) > 1:
+            buf.steps.pop(0)
+            lines = [self._activity_header(True, len(buf.steps))]
+            for kind, text in buf.steps:
+                mark = "\u2713" if kind == "ok" else ("\u274c" if kind == "err" else "\u25cf")
+                html_text = _escape_telegram_html(text)
+                if kind == "err":
+                    html_text = f"<s>{html_text}</s>"
+                lines.append(f"{mark} {html_text}")
+            body = "\n".join(lines)
+        return body
+
+    async def _update_activity(
+        self,
+        chat_id: int,
+        buf: "_ActivityBuf",
+        thread_kwargs: dict[str, int],
+        *,
+        final: bool = False,
+    ) -> None:
+        """Send or in-place edit the single live activity message for *chat_id*."""
+        app = self._require_app()
+        text = (
+            self._activity_summary_text(buf)
+            if final
+            else self._render_activity_text(buf)
+        )
+        now = time.monotonic()
+        if buf.message_id is None:
+            try:
+                sent = await self._call_with_retry(
+                    app.bot.send_message,
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    **thread_kwargs,
+                )
+                buf.message_id = sent.message_id
+                buf.last_edit = now
+            except Exception as exc:
+                self.logger.warning("Failed to open live activity message: {}", exc)
+                # Don't let a transient failure spam the chat with repeats later.
+                buf.steps = []
+            return
+        # Throttle edits to avoid hammering Telegram on hot progress streams.
+        if not final and (now - buf.last_edit) < self.config.stream_edit_interval:
+            return
+        try:
+            await self._call_with_retry(
+                app.bot.edit_message_text,
+                chat_id=chat_id,
+                message_id=buf.message_id,
+                text=text,
+                parse_mode="HTML",
+            )
+            buf.last_edit = now
+        except BadRequest as exc:
+            if self._is_not_modified_error(exc):
+                buf.last_edit = now
+                return
+            match = re.search(r"message is not modified", str(exc), re.IGNORECASE)
+            if not match:
+                self.logger.warning("Live activity edit failed: {}", exc)
+
+    def _close_activity(self, chat_id: str) -> None:
+        """Forget the live activity message for a chat (no final card)."""
+        self._activity_bufs.pop(chat_id, None)
+
+    async def _aggregate_activity(
+        self,
+        chat_id: int,
+        msg: "OutboundMessage",
+        progress_event: "ProgressEvent",
+        thread_kwargs: dict[str, int],
+    ) -> None:
+        """Fold one progress/tool event into the chat's single live activity card."""
+        chat_key = str(chat_id)
+        buf = self._activity_bufs.get(chat_key)
+        if buf is None:
+            buf = _ActivityBuf()
+            self._activity_bufs[chat_key] = buf
+
+        # Determine the step kind + label for this event.
+        content = (msg.content or "").strip()
+        if progress_event.file_edit_events:
+            # One row per edited/read file.
+            for edit in progress_event.file_edit_events:
+                tool = str(edit.get("tool") or "edit")
+                path = str(edit.get("path") or "")
+                op = str(edit.get("operation") or edit.get("phase") or "edit")
+                label = self._activity_display_name(f"{tool} {path} ({op})")
+                self._append_activity_step(buf, "ok" if op != "error" else "err", label)
+        elif progress_event.tool_hint:
+            label = self._activity_display_name(content or "using a tool")
+            self._append_activity_step(buf, "run", label)
+        elif content:
+            label = self._activity_display_name(content)
+            kind = "ok" if getattr(progress_event, "tool_events") else "run"
+            self._append_activity_step(buf, kind, label)
+        else:
+            # reasoning end / empty deltas carry no user-visible step.
+            return
+
+        await self._update_activity(chat_id, buf, thread_kwargs)
+
+    @staticmethod
+    def _append_activity_step(buf: "_ActivityBuf", kind: str, label: str) -> None:
+        """Add a step, replacing a trailing identical 'run' step to avoid noise."""
+        if not label:
+            return
+        if buf.steps and buf.steps[-1][0] == "run" and buf.steps[-1][1] == label:
+            # Same tool re-invoked in place — keep a single running entry.
+            return
+        buf.steps.append((kind, label))
+        # Hard cap on retained steps; Telegram edits keep only the visible window.
+        if len(buf.steps) > 40:
+            del buf.steps[0]
+
+    async def _finalize_activity_chat(self, chat_id: int) -> None:
+        """Settle the chat's live activity card into a compact 'done' note."""
+        chat_key = str(chat_id)
+        buf = self._activity_bufs.pop(chat_key, None)
+        if buf is None:
+            buf = self._pending_activity_finals.pop(chat_id, None)
+        if buf is None:
+            return
+        try:
+            await self._update_activity(chat_id, buf, {}, final=True)
+        finally:
+            self._pending_activity_finals.pop(chat_id, None)
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
         app = await self._wait_for_app()
@@ -1033,6 +1247,22 @@ class TelegramChannel(BaseChannel):
         thread_kwargs: dict[str, int] = {}
         if message_thread_id is not None:
             thread_kwargs["message_thread_id"] = message_thread_id
+
+        # --- Live activity aggregation -----------------------------------------
+        # When enabled, every per-step progress/tool event is folded into ONE
+        # in-place-edited status card for the chat, instead of a new bubble per
+        # step. A non-progress send (the actual answer / media / command reply)
+        # finalizes that card into a compact "done" note before continuing.
+        if getattr(self.config, "live_activity", True):
+            if progress_event is not None:
+                await self._aggregate_activity(chat_id, msg, progress_event, thread_kwargs)
+                return
+            # Final content is arriving: settle the live card, then send normally.
+            if self._activity_bufs.get(str(chat_id)) or chat_id in self._pending_activity_finals:
+                try:
+                    await self._finalize_activity_chat(chat_id)
+                except Exception:
+                    self.logger.warning("Failed to settle live activity for {}", chat_id)
 
         reply_params = None
         if self.config.reply_to_message:
@@ -1230,6 +1460,13 @@ class TelegramChannel(BaseChannel):
                 return
             stream_end = False
         if stream_end:
+            # Final answer arrived — settle the live activity card for this chat.
+            if getattr(self.config, "live_activity", True) and (
+                self._activity_bufs.get(str(int_chat_id))
+                or int_chat_id in self._pending_activity_finals
+            ):
+                with suppress(Exception):
+                    await self._finalize_activity_chat(int_chat_id)
             buf = self._stream_bufs.get(chat_id)
             if not buf or not buf.message_id or not buf.text:
                 return

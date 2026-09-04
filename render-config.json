@@ -32,7 +32,8 @@
       "allowFrom": ["*"],
       "groupPolicy": "mention",
       "streaming": true,
-      "sendToolHints": false,
+      "liveActivity": true,
+      "sendToolHints": true,
       "sendProgress": true,
       "showReasoning": false
     },

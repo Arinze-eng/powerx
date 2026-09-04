@@ -131,11 +131,14 @@ def _ensure_telegram_polling_defaults(data: dict[str, Any]) -> bool:
 
     The previous default forced `mode: webhook` every boot, which silently
     reverted any polling config on each deploy. The bot runs pure polling now,
-    so strip any stale webhook keys, force streamed progress like a normal
-    interactive session, and suppress per-tool-call hint spam (each `tool(...)`
-    call was published as its own Telegram message). Progress still streams as
-    one condensed message; tool-call hints are no longer dropped as separate
-    messages.
+    so strip any stale webhook keys and force streamed progress like a normal
+    interactive session.
+
+    Tool-call hints are enabled and folded into the channel's single live
+    "activity" card (liveActivity), so each `tool(...)` call becomes a checkable
+    line in one in-place-edited status message instead of a separate Telegram
+    message. This is the anti-spam mechanism — it replaces the old behavior
+    where every tool call was published as its own message.
     """
     channels = data.setdefault("channels", {})
     if not isinstance(channels, dict):
@@ -151,13 +154,17 @@ def _ensure_telegram_polling_defaults(data: dict[str, Any]) -> bool:
     if telegram.get("streaming") is not True:
         telegram["streaming"] = True
         changed = True
-    # Do not flood Telegram with a separate message per tool call (e.g. each
-    # `cron(...)` / `read_file(...)` invocation). Keep text progress streaming.
+    # Consolidate per-step events into ONE live activity card instead of a
+    # separate message per step.
+    if telegram.get("live_activity", telegram.get("liveActivity", True)) is not True:
+        telegram["liveActivity"] = True
+        changed = True
+    # Feed tool steps into the live card; they are no longer separate bubbles.
+    if telegram.get("send_tool_hints", telegram.get("sendToolHints", True)) is not True:
+        telegram["sendToolHints"] = True
+        changed = True
     if telegram.get("send_progress", telegram.get("sendProgress", True)) is not True:
         telegram["sendProgress"] = True
-        changed = True
-    if telegram.get("send_tool_hints", telegram.get("sendToolHints", True)) is not False:
-        telegram["sendToolHints"] = False
         changed = True
     if telegram.get("show_reasoning", telegram.get("showReasoning", True)) is not False:
         telegram["showReasoning"] = False
