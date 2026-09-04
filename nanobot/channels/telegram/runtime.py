@@ -435,14 +435,14 @@ class _StreamBuf:
 class _ActivityBuf:
     """Per-chat live "what the AI is doing" aggregation.
 
-    Holds the single message that shows the agent's current step plus a compact
-    history of completed steps. The message is progressively edited in place,
-    so the user never sees a flood of per-step bubbles — only one status card
-    that updates as the agent works, exactly like the WebUI activity panel.
+    Holds the *single* Telegram message per chat that shows the agent's working
+    state. Every step/thinking/tool line is appended into this one message and
+    edited in place, and the final streamed answer continues into the same
+    message. A new buffer (a fresh single message) only starts on a new user
+    turn — never per step — so the chat is never flooded with bubbles.
     """
+    text: str = ""
     message_id: int | None = None
-    # Ordered step log: (kind, text) where kind is "" (running) or "done"/"err".
-    steps: list[tuple[str, str]] = field(default_factory=list)
     last_edit: float = 0.0
 
 
@@ -623,9 +623,8 @@ class TelegramChannel(BaseChannel):
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
-        self._activity_bufs: dict[str, _ActivityBuf] = {}  # chat_id -> live activity state
-        # chat_id (int) -> activity buf awaiting finalization to a "done" card.
-        self._pending_activity_finals: dict[int, _ActivityBuf] = {}
+        self._activity_bufs: dict[str, _ActivityBuf] = {}  # chat_id -> single live working message
+        self._reasoning_stream: dict[str, str] = {}  # chat_id -> cumulative reasoning text
         self._inbound_buffers: dict[str, list[_QueuedTelegramUpdate]] = {}
         self._inbound_workers: dict[str, asyncio.Task[None]] = {}
         self._rich_send_disabled: bool = False  # Latch off if Bot API < 10.1
@@ -940,7 +939,6 @@ class TelegramChannel(BaseChannel):
         self._inbound_workers.clear()
         self._inbound_buffers.clear()
         self._activity_bufs.clear()
-        self._pending_activity_finals.clear()
 
         if self._app:
             self.logger.info("Stopping bot...")
@@ -1035,104 +1033,72 @@ class TelegramChannel(BaseChannel):
             self.logger.debug("sendRichMessage failed: {}", exc)
             return False
 
-    # -- Live activity aggregation -------------------------------------------------
+    # -- Single live "working" message -------------------------------------------
     #
-    # The agent emits a separate progress/tool event for every step it takes. If
-    # each one became its own Telegram message the chat would be flooded. Instead,
-    # when ``live_activity`` is enabled we keep ONE message per chat and edit it in
-    # place to show the current step plus a compact history of completed steps —
-    # the same "here's what the AI is doing right now" experience as the WebUI.
+    # The agent emits a separate progress/tool event for every step it takes,
+    # plus thinking/reasoning deltas. Sending each as its own Telegram message
+    # floods the chat. When ``live_activity`` is enabled we keep exactly ONE
+    # message per chat per turn and edit it in place: the first step opens the
+    # message, every subsequent step/thinking line is appended and the message
+    # is re-edited, and the final streamed answer is written into the SAME
+    # message. The user sees one message that updates as the model works — the
+    # same "here's what the AI is doing right now" experience as the WebUI.
 
     @staticmethod
-    def _activity_display_name(text: str) -> str:
-        """Trim a raw progress/tool-hint line to a short readable step label."""
-        text = (text or "").strip()
-        # Collapse whitespace/newlines into a single line.
-        text = " ".join(text.split())
-        # For tool hints like read_file("a.py") -> read_file a.py, strip quotes.
-        text = re.sub(r'"|\'|`', "", text)
-        if len(text) > 72:
-            text = text[:69] + "..."
-        return text or "working…"
+    def _progress_display_text(msg: "OutboundMessage", event: "ProgressEvent") -> str:
+        """Build a compact one-line step/thinking label from a progress event."""
+        content = (msg.content or "").strip()
+        if not content:
+            return ""
+        # Collapse whitespace/newlines into a single readable line.
+        content = " ".join(content.split())
+        if len(content) > 200:
+            content = content[:197] + "..."
+        return content
 
-    @staticmethod
-    def _activity_header(running: bool, done_count: int) -> str:
-        if running:
-            return f"<b>\U0001f916 Working…</b> (<code>{done_count + 1}</code> step)"
-        return f"<b>\u2705 Done \u2014 {done_count} step{'s' if done_count != 1 else ''}</b>"
+    def _activity_buf(self, chat_id: str) -> "_ActivityBuf":
+        buf = self._activity_bufs.get(chat_id)
+        if buf is None:
+            buf = _ActivityBuf()
+            self._activity_bufs[chat_id] = buf
+        return buf
 
-    @staticmethod
-    def _activity_summary_text(buf: "_ActivityBuf") -> str:
-        """Compact finalized card shown once the agent starts its answer."""
-        lines = ["<b>\u2705 Done</b>"]
-        for kind, text in buf.steps[-8:]:
-            mark = "\u2713" if kind == "ok" else ("\u274c" if kind == "err" else "\u25cf")
-            html_text = _escape_telegram_html(text)
-            if kind == "err":
-                html_text = f"<s>{html_text}</s>"
-            lines.append(f"{mark} {html_text}")
-        if len(buf.steps) > 8:
-            lines.append(f"\u2026 and {len(buf.steps) - 8} more")
-        return "\n".join(lines)[:TELEGRAM_HTML_MAX_LEN]
-
-    def _render_activity_text(self, buf: "_ActivityBuf") -> str:
-        """Render the live activity message body (running state)."""
-        header = self._activity_header(running=True, done_count=len(buf.steps))
-        lines = [header]
-        # Last step (if any) is the current running one.
-        for i, (kind, text) in enumerate(buf.steps):
-            mark = "\u2713" if kind == "ok" else ("\u274c" if kind == "err" else "\u25cf")
-            html_text = _escape_telegram_html(text)
-            if kind == "err":
-                html_text = f"<s>{html_text}</s>"
-            lines.append(f"{mark} {html_text}")
-        body = "\n".join(lines)
-        # Keep under Telegram's HTML limit by trimming the oldest steps first.
-        while len(body) > TELEGRAM_HTML_MAX_LEN and len(buf.steps) > 1:
-            buf.steps.pop(0)
-            lines = [self._activity_header(True, len(buf.steps))]
-            for kind, text in buf.steps:
-                mark = "\u2713" if kind == "ok" else ("\u274c" if kind == "err" else "\u25cf")
-                html_text = _escape_telegram_html(text)
-                if kind == "err":
-                    html_text = f"<s>{html_text}</s>"
-                lines.append(f"{mark} {html_text}")
-            body = "\n".join(lines)
-        return body
-
-    async def _update_activity(
+    async def _render_and_edit_working_message(
         self,
         chat_id: int,
-        buf: "_ActivityBuf",
+        text: str,
         thread_kwargs: dict[str, int],
         *,
         final: bool = False,
     ) -> None:
-        """Send or in-place edit the single live activity message for *chat_id*."""
+        """Send or edit the chat's single live working message with *text*.
+
+        Opens the message on the first call for a turn (end of the previous turn
+        clears ``_activity_bufs``), then edits it in place on every later call.
+        Final content (the answer) is rendered as HTML so markdown/links/code
+        look right; intermediate step lines use plain text for fast, flicker-free
+        edits.
+        """
         app = self._require_app()
-        text = (
-            self._activity_summary_text(buf)
-            if final
-            else self._render_activity_text(buf)
-        )
+        buf = self._activity_buf(str(chat_id))
         now = time.monotonic()
         if buf.message_id is None:
+            payload = text if final else text
             try:
                 sent = await self._call_with_retry(
                     app.bot.send_message,
                     chat_id=chat_id,
-                    text=text,
-                    parse_mode="HTML",
+                    text=payload,
+                    parse_mode="HTML" if final else None,
                     **thread_kwargs,
                 )
                 buf.message_id = sent.message_id
                 buf.last_edit = now
             except Exception as exc:
-                self.logger.warning("Failed to open live activity message: {}", exc)
-                # Don't let a transient failure spam the chat with repeats later.
-                buf.steps = []
+                self.logger.warning("Failed to open live working message: {}", exc)
+                return
             return
-        # Throttle edits to avoid hammering Telegram on hot progress streams.
+        # Throttle intermediate edits to avoid hammering Telegram.
         if not final and (now - buf.last_edit) < self.config.stream_edit_interval:
             return
         try:
@@ -1141,20 +1107,47 @@ class TelegramChannel(BaseChannel):
                 chat_id=chat_id,
                 message_id=buf.message_id,
                 text=text,
-                parse_mode="HTML",
+                parse_mode="HTML" if final else None,
             )
             buf.last_edit = now
         except BadRequest as exc:
             if self._is_not_modified_error(exc):
                 buf.last_edit = now
                 return
-            match = re.search(r"message is not modified", str(exc), re.IGNORECASE)
-            if not match:
-                self.logger.warning("Live activity edit failed: {}", exc)
+            self.logger.warning("Live working message edit failed: {}", exc)
 
     def _close_activity(self, chat_id: str) -> None:
-        """Forget the live activity message for a chat (no final card)."""
+        """Forget the chat's live working message so a new turn opens a fresh one."""
         self._activity_bufs.pop(chat_id, None)
+        self._reasoning_stream.pop(chat_id, None)
+
+    def _working_message_text(self, chat_id: str) -> str:
+        """Compose the single working message: reasoning block + step log."""
+        chat_key = str(chat_id)
+        buf = self._activity_bufs.get(chat_key)
+        steps = buf.text if buf else ""
+        if not steps.startswith("🤖 Working…"):
+            steps = "🤖 Working… here's what I'm doing:\n"
+        reasoning = self._reasoning_stream.get(chat_key, "")
+        parts = [steps.rstrip("\n")]
+        if reasoning.strip():
+            text = reasoning.strip()
+            if len(text) > 200:
+                text = text[:197] + "..."
+            parts.append("\n💭 " + text)
+        text = "\n".join(parts)
+        # Hard cap: keep the newest N lines within the HTML limit.
+        if len(text) > (TELEGRAM_HTML_MAX_LEN - 64):
+            lines = text.split("\n")
+            kept = [lines[0]]
+            for line in lines[1:]:
+                if sum(len(k) + 1 for k in kept) + len(line) > (TELEGRAM_HTML_MAX_LEN - 64):
+                    break
+                kept.append(line)
+            text = "\n".join(kept)
+            if buf is not None:
+                buf.text = text
+        return text
 
     async def _aggregate_activity(
         self,
@@ -1163,61 +1156,76 @@ class TelegramChannel(BaseChannel):
         progress_event: "ProgressEvent",
         thread_kwargs: dict[str, int],
     ) -> None:
-        """Fold one progress/tool event into the chat's single live activity card."""
+        """Append one step line to the chat's single working message."""
         chat_key = str(chat_id)
         buf = self._activity_bufs.get(chat_key)
-        if buf is None:
-            buf = _ActivityBuf()
-            self._activity_bufs[chat_key] = buf
+        if buf is None or buf.message_id is None:
+            buf = self._activity_buf(chat_key)
+            buf.text = "🤖 Working… here's what I'm doing:\n"
+        elif not buf.text.startswith("🤖 Working…"):
+            buf.text = "🤖 Working… here's what I'm doing:\n" + buf.text
 
-        # Determine the step kind + label for this event.
-        content = (msg.content or "").strip()
+        labels: list[str] = []
         if progress_event.file_edit_events:
-            # One row per edited/read file.
             for edit in progress_event.file_edit_events:
                 tool = str(edit.get("tool") or "edit")
                 path = str(edit.get("path") or "")
                 op = str(edit.get("operation") or edit.get("phase") or "edit")
-                label = self._activity_display_name(f"{tool} {path} ({op})")
-                self._append_activity_step(buf, "ok" if op != "error" else "err", label)
+                labels.append(f"{tool} {path} ({op})")
         elif progress_event.tool_hint:
-            label = self._activity_display_name(content or "using a tool")
-            self._append_activity_step(buf, "run", label)
-        elif content:
-            label = self._activity_display_name(content)
-            kind = "ok" if getattr(progress_event, "tool_events") else "run"
-            self._append_activity_step(buf, kind, label)
-        else:
-            # reasoning end / empty deltas carry no user-visible step.
-            return
+            text = self._progress_display_text(msg, progress_event)
+            labels.append(text or "using a tool…")
+        elif msg.content and msg.content.strip():
+            labels.append(self._progress_display_text(msg, progress_event))
 
-        await self._update_activity(chat_id, buf, thread_kwargs)
+        for label in labels:
+            # De-dupe a repeated identical running step to avoid noise.
+            tail = buf.text.rstrip()
+            if tail.endswith(f"→ {label}"):
+                continue
+            if len(label) > 180:
+                label = label[:177] + "..."
+            buf.text += f"→ {label}\n"
 
-    @staticmethod
-    def _append_activity_step(buf: "_ActivityBuf", kind: str, label: str) -> None:
-        """Add a step, replacing a trailing identical 'run' step to avoid noise."""
-        if not label:
-            return
-        if buf.steps and buf.steps[-1][0] == "run" and buf.steps[-1][1] == label:
-            # Same tool re-invoked in place — keep a single running entry.
-            return
-        buf.steps.append((kind, label))
-        # Hard cap on retained steps; Telegram edits keep only the visible window.
-        if len(buf.steps) > 40:
-            del buf.steps[0]
+        await self._render_and_edit_working_message(
+            chat_id, self._working_message_text(chat_key), thread_kwargs
+        )
 
-    async def _finalize_activity_chat(self, chat_id: int) -> None:
-        """Settle the chat's live activity card into a compact 'done' note."""
+    async def send_reasoning_delta(
+        self,
+        chat_id: str,
+        delta: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        stream_id: str | None = None,
+    ) -> None:
+        """Fold model thinking chunks into the single working message's reasoning block."""
+        if not getattr(self.config, "live_activity", True):
+            return
+        if not (delta or "").strip():
+            return
         chat_key = str(chat_id)
-        buf = self._activity_bufs.pop(chat_key, None)
-        if buf is None:
-            buf = self._pending_activity_finals.pop(chat_id, None)
-        if buf is None:
-            return
-        try:
-            await self._update_activity(chat_id, buf, {}, final=True)
-        finally:
-            self._pending_activity_finals.pop(chat_id, None)
+        self._reasoning_stream[chat_key] = self._reasoning_stream.get(chat_key, "") + delta
+        # Ensure a working message exists so reasoning has a home in the single bubble.
+        buf = self._activity_buf(chat_key)
+        if not buf.text.startswith("🤖 Working…"):
+            buf.text = "🤖 Working… here's what I'm doing:\n"
+        thread_kwargs: dict[str, int] = {}
+        if metadata and metadata.get("message_thread_id") is not None:
+            thread_kwargs["message_thread_id"] = int(metadata["message_thread_id"])
+        await self._render_and_edit_working_message(
+            int(chat_id), self._working_message_text(chat_key), thread_kwargs
+        )
+
+    async def send_reasoning_end(
+        self,
+        chat_id: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        stream_id: str | None = None,
+    ) -> None:
+        """Reasoning segment finished. The single live message is left as-is."""
+        return
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
@@ -1248,21 +1256,16 @@ class TelegramChannel(BaseChannel):
         if message_thread_id is not None:
             thread_kwargs["message_thread_id"] = message_thread_id
 
-        # --- Live activity aggregation -----------------------------------------
-        # When enabled, every per-step progress/tool event is folded into ONE
-        # in-place-edited status card for the chat, instead of a new bubble per
-        # step. A non-progress send (the actual answer / media / command reply)
-        # finalizes that card into a compact "done" note before continuing.
+        # --- Single live working message --------------------------------------
+        # Per-step progress/tool events are folded into ONE in-place-edited
+        # message per chat. The final answer streams into that SAME message via
+        # send_delta. A non-progress send (media / command reply / non-streamed
+        # answer) closes the working message so a future turn opens a fresh one.
         if getattr(self.config, "live_activity", True):
             if progress_event is not None:
                 await self._aggregate_activity(chat_id, msg, progress_event, thread_kwargs)
                 return
-            # Final content is arriving: settle the live card, then send normally.
-            if self._activity_bufs.get(str(chat_id)) or chat_id in self._pending_activity_finals:
-                try:
-                    await self._finalize_activity_chat(chat_id)
-                except Exception:
-                    self.logger.warning("Failed to settle live activity for {}", chat_id)
+            self._close_activity(str(chat_id))
 
         reply_params = None
         if self.config.reply_to_message:
@@ -1460,13 +1463,10 @@ class TelegramChannel(BaseChannel):
                 return
             stream_end = False
         if stream_end:
-            # Final answer arrived — settle the live activity card for this chat.
-            if getattr(self.config, "live_activity", True) and (
-                self._activity_bufs.get(str(int_chat_id))
-                or int_chat_id in self._pending_activity_finals
-            ):
-                with suppress(Exception):
-                    await self._finalize_activity_chat(int_chat_id)
+            # Final answer complete — close the single live working message so a
+            # future turn starts a fresh one (the answer already lives in it).
+            if getattr(self.config, "live_activity", True):
+                self._close_activity(str(int_chat_id))
             buf = self._stream_bufs.get(chat_id)
             if not buf or not buf.message_id or not buf.text:
                 return
@@ -1566,6 +1566,21 @@ class TelegramChannel(BaseChannel):
         stream_thread_kwargs: dict[str, int] = {}
         if message_thread_id := meta.get("message_thread_id"):
             stream_thread_kwargs["message_thread_id"] = message_thread_id
+        # If a live "working" message is already open for this chat (opened by the
+        # per-step aggregation), stream the answer into that SAME message instead
+        # of opening a second one. One message carries the steps and the answer.
+        if (
+            buf.message_id is None
+            and getattr(self.config, "live_activity", True)
+            and (activity := self._activity_bufs.get(str(int_chat_id)))
+            and activity.message_id is not None
+        ):
+            buf.message_id = activity.message_id
+            # Carry the step log into the same single message so the final answer
+            # renders on top of the work the model just did.
+            if activity.text and not buf.text.startswith(activity.text):
+                buf.text = activity.text + buf.text
+            buf.last_edit = now - self.config.stream_edit_interval
         if buf.message_id is None:
             preview = _strip_md_block(buf.text)
             try:

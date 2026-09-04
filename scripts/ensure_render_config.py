@@ -166,8 +166,11 @@ def _ensure_telegram_polling_defaults(data: dict[str, Any]) -> bool:
     if telegram.get("send_progress", telegram.get("sendProgress", True)) is not True:
         telegram["sendProgress"] = True
         changed = True
-    if telegram.get("show_reasoning", telegram.get("showReasoning", True)) is not False:
-        telegram["showReasoning"] = False
+    # Fold the model's reasoning ("thinking") into the SAME single live working
+    # message (via the send_reasoning_delta override in the Telegram channel)
+    # instead of dropping it or emitting separate messages.
+    if telegram.get("show_reasoning", telegram.get("showReasoning", True)) is not True:
+        telegram["showReasoning"] = True
         changed = True
     for webhook_key in (
         "webhookUrl",
