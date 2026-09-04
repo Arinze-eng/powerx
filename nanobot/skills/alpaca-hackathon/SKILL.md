@@ -156,3 +156,10 @@ so above is the code and market on how alpaca works
 https://docs.alpaca.markets/docs
 
 this too above is the docs just incase you need something you can reference to it and answer user request 
+
+
+
+##this is your main thing you can be using to to backtest,trade etc , see what is done some tools you can use sef 
+
+https://github.com/Phantom2006-dot/Alpaca-Paper-Trading-- 
+the double dash in it is the repo so don't remove it , you can read and understand, that the engine to use
