@@ -85,6 +85,18 @@ class WatchManager:
         self._registry: dict[int, WatchSpec] = {}
         self._next_id = 1
         self._lock = asyncio.Lock()
+        # Optional user-facing delivery hook set by the gateway so a finished or
+        # triggered watch can push feedback back to the originating chat. Without
+        # this the poll tool only records runs to Supabase and the user never
+        # hears back ("does the task but no feedback").
+        self._notifier: Callable[[WatchSpec, PollResult], Awaitable[None]] | None = None
+
+    def set_notifier(
+        self, notifier: Callable[[WatchSpec, PollResult], Awaitable[None]] | None
+    ) -> None:
+        """Register a coroutine called with (spec, result) after each watch ends."""
+        self._notifier = notifier
+
 
     async def start(
         self,
@@ -170,6 +182,7 @@ class WatchManager:
             result.error = str(exc)[:500]
         finally:
             await self._safe_complete(watch_id, result, on_complete)
+            await self._notify(spec, result)
             self._watches.pop(watch_id, None)
             self._registry.pop(watch_id, None)
 
@@ -179,6 +192,22 @@ class WatchManager:
             return
         with contextlib.suppress(Exception):
             await on_complete(watch_id, result)
+
+    async def _notify(self, spec: WatchSpec, result: PollResult) -> None:
+        """Push user-facing feedback for a watch that reached a reportable state.
+
+        Only fires for outcomes the user should hear about — a met condition /
+        completed task or an error — never for a watch the user explicitly
+        stopped. Delivery failures are swallowed so they cannot crash the loop.
+        """
+        if self._notifier is None:
+            return
+        if result.status not in ("completed", "error"):
+            return
+        try:
+            await self._notifier(spec, result)
+        except Exception:  # pragma: no cover - never break the watch loop
+            logger.exception("poll watch %s notifier failed", result.watch_id)
 
     async def stop(self, watch_id: int) -> bool:
         task = self._watches.get(watch_id)
@@ -209,6 +238,60 @@ def get_manager() -> WatchManager:
     if _manager is None:
         _manager = WatchManager()
     return _manager
+
+
+def format_poll_feedback(spec: "WatchSpec", result: "PollResult") -> str:
+    """Render a user-facing feedback message for a finished poll watch.
+
+    Returns "" when there is nothing worth notifying about, so callers can skip
+    empty deliveries.
+    """
+    label = (getattr(spec, "label", "") or "").strip() or "your watch"
+    status = getattr(result, "status", "") or ""
+    summary = (getattr(result, "summary", "") or "").strip()
+    actions = list(getattr(result, "actions_taken", []) or [])
+    last_price = getattr(result, "last_price", None)
+    met = bool(getattr(result, "condition_met", False))
+
+    if status == "error":
+        err = (getattr(result, "error", "") or "unknown error").strip()
+        body = f"⚠️ Your watch “{label}” hit an error and stopped.\n{err}"
+        if summary:
+            body += f"\n\nLast update: {summary}"
+        return body
+
+    # Completed / condition met.
+    header = f"✅ Update on your watch “{label}”:"
+    lines = [header]
+    if met:
+        lines.append("The condition you asked me to watch for has been met.")
+    elif summary:
+        lines.append("This task has finished.")
+    if summary:
+        lines.append("")
+        lines.append(summary)
+    if last_price is not None:
+        cond = getattr(spec, "condition", {}) or {}
+        sym = str(cond.get("symbol") or "").strip()
+        price_line = f"Latest price: {last_price}"
+        if sym:
+            price_line = f"Latest {sym} price: {last_price}"
+        lines.append(price_line)
+    if actions:
+        lines.append("")
+        lines.append("Actions taken:")
+        for a in actions:
+            lines.append(f"  • {a}")
+    # Deduplicate accidental repeats of the summary line while keeping order.
+    seen: set[str] = set()
+    out_lines: list[str] = []
+    for ln in lines:
+        if ln and ln in seen:
+            continue
+        seen.add(ln)
+        out_lines.append(ln)
+    text = "\n".join(out_lines).strip()
+    return text if text else ""
 
 
 def _as_float(value: Any) -> float | None:

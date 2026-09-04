@@ -509,6 +509,35 @@ def _run_gateway(
     if isinstance(message_tool, MessageTool):
         message_tool.set_send_callback(_deliver_to_channel)
 
+    # Wire real-time poll watches so a triggered/completed watch pushes feedback
+    # back to the chat that started it. Without this the poll tool only records
+    # runs to Supabase and the user never hears back ("does the task but no
+    # feedback"). Reuses _deliver_to_channel so replies also mirror into the
+    # session history like cron/heartbeat do.
+    try:
+        from nanobot.trading.polling_engine import format_poll_feedback, get_manager
+
+        async def _poll_notify(spec, result) -> None:
+            content = format_poll_feedback(spec, result)
+            if not content:
+                return
+            channel = getattr(spec, "channel", None) or "telegram"
+            chat_id = getattr(spec, "chat_id", None)
+            if not chat_id:
+                logger.warning(
+                    "Poll watch '{}' finished but has no routable chat_id; feedback dropped.",
+                    getattr(spec, "label", "?"),
+                )
+                return
+            await _deliver_to_channel(
+                OutboundMessage(channel=channel, chat_id=str(chat_id), content=content),
+                record=True,
+            )
+
+        get_manager().set_notifier(_poll_notify)
+    except Exception:  # pragma: no cover - polling is optional, never block startup
+        logger.exception("poll notifier wiring failed")
+
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
