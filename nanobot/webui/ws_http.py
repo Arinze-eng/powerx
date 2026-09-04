@@ -890,10 +890,14 @@ class GatewayHTTPHandler:
                 continue
             # [FIX 2026-09-04] Per-user isolation. In Supabase (multi-user) mode
             # the caller resolves to a user id; only return sessions owned by
-            # that user. Sessions with no recorded owner (legacy) are
-            # deliberately hidden so no user leaks into another user's history.
+            # that user, plus any session that has not yet been claimed by a
+            # user. A session with no recorded owner is a bot/background
+            # delivery (scheduled cron, poll watch, heartbeat) — it is not
+            # another user's private chat, so an authenticated caller must still
+            # see it to receive the scheduled-task feedback it carries. Owned
+            # sessions (e.g. a different user's chat) stay hidden.
             row_owner = s.get(_OWNER_USER_ID_FIELD, "")
-            if owner_user_id and row_owner != owner_user_id:
+            if owner_user_id and row_owner and row_owner != owner_user_id:
                 continue
             row = {
                 k: v
@@ -1515,14 +1519,25 @@ class GatewayHTTPHandler:
         the requesting user must match the session owner or the read is denied.
         In legacy secret mode there is no per-user identity, so access remains
         unrestricted. Returns ``None`` when access is permitted.
+
+        A session that has **no recorded owner** is not private to any user —
+        it is a bot/background delivery (scheduled cron, poll watch, heartbeat)
+        that has not yet been claimed by a user. Such sessions remain readable
+        so the user actually receives the scheduled/cron/poll feedback they
+        asked for (the whole point of the automation). Once a user stamps the
+        session as theirs, only that user may read it.
         """
         owner_user_id = self._supabase_user_id_for_request(request)
-        session_owner = ""
         chat_id = decoded_key.split(":", 1)[1] if ":" in decoded_key else decoded_key
         try:
             session_owner = self.workspaces.session_owner_user_id(chat_id)
         except Exception:  # noqa: BLE001 - never leak on storage errors
             session_owner = ""
+        # An unowned session is delivered-to-by-the-system, never another
+        # user's private chat; allow any authenticated WebUI caller to read it
+        # so scheduled/background feedback stays visible.
+        if not session_owner:
+            return None
         # Fail closed in Supabase mode: an unverifiable or mismatched owner is
         # denied so a user can never read another user's chat history.
         if self._supabase_webui_auth_enabled():

@@ -530,6 +530,69 @@ async def test_session_automations_route_lists_local_triggers(
 
 
 @pytest.mark.asyncio
+async def test_scheduled_feedback_session_visible_to_authenticated_webui_user(
+    bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: scheduled/cron/poll feedback (an owner-less delivery session)
+    must stay visible to an authenticated WebUI user in Supabase mode, while
+    another user's OWNED session remains hidden (no cross-user leakage).
+
+    Prior to the fix the fail-closed owner check treated an owner-less session
+    as if it belonged to no one and returned 404 / hid it — so the scheduled
+    task feedback a user asked for never appeared. An owner-less session is a
+    bot/background delivery, not another user's private chat, so it must not be
+    hidden from an authenticated caller."""
+    # Force Supabase (multi-user) webui auth mode.
+    monkeypatch.setenv("SUPABASE_WEBUI_AUTH", "true")
+
+    sm = SessionManager(tmp_path)
+    # Session owned by user "user-AAAAAAAA" — the acting caller's own chat.
+    mine = Session(key="websocket:mine")
+    mine.metadata["webui"] = True
+    mine.metadata["_webui_owner_user_id"] = "user-AAAAAAAA"
+    sm.save(mine)
+    # Owner-less session: a scheduled/cron/poll delivery the user asked for.
+    feedback = Session(key="websocket:feedback")
+    feedback.metadata["webui"] = True
+    feedback.add_message("assistant", "Your scheduled check finished: price is 65,432")
+    sm.save(feedback)
+    # Session owned by a DIFFERENT user — must stays hidden.
+    theirs = Session(key="websocket:theirs")
+    theirs.metadata["webui"] = True
+    theirs.metadata["_webui_owner_user_id"] = "user-BBBBBBBB"
+    sm.save(theirs)
+
+    channel = _ch(bus, session_manager=sm, port=_free_port())
+
+    class _FakeReq:
+        headers = {"X-Nanobot-Auth": "valid-user-token"}
+
+    handler = channel.gateway.http
+    # Resolve owner_user_id for the acting caller.
+    monkeypatch.setattr(
+        handler,
+        "_supabase_user_id_for_request",
+        lambda req: "user-AAAAAAAA",
+    )
+
+    # 1) The session list includes the owner's chat AND the owner-less
+    #    scheduled-feedback session, but NOT another user's session.
+    payload = handler._sessions_list_payload("user-AAAAAAAA")
+    keys = {s["key"] for s in payload["sessions"]}
+    assert "websocket:mine" in keys
+    assert "websocket:feedback" in keys
+    assert "websocket:theirs" not in keys
+
+    # 2) The owner-less scheduled-feedback thread is now readable (was 404).
+    assert handler._webui_session_access_error(_FakeReq(), "websocket:feedback") is None
+    # 3) The owner's own thread remains readable.
+    assert handler._webui_session_access_error(_FakeReq(), "websocket:mine") is None
+    # 4) Another user's thread stays denied.
+    denied = handler._webui_session_access_error(_FakeReq(), "websocket:theirs")
+    assert denied is not None and denied.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_webui_skills_route_requires_token_and_hides_paths(
     bus: MagicMock, tmp_path: Path
 ) -> None:
