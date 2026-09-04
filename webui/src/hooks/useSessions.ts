@@ -135,7 +135,7 @@ export function useSessions(): {
   ) => Promise<SessionDeleteResult>;
   getSessionAutomations: (key: string) => Promise<SessionAutomationJob[]>;
 } {
-  const { client, token } = useClient();
+  const { client, token, getAuthValue } = useClient();
   const [sessions, setSessions] = useState<ChatSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -154,7 +154,7 @@ export function useSessions(): {
         while (refreshPendingRef.current) {
           refreshPendingRef.current = false;
           try {
-            const rows = await listSessions(tokenRef.current);
+            const rows = await listSessions(tokenRef.current, "", getAuthValue());
             const serverKeys = new Set(rows.map((row) => row.key));
             setSessions((prev) => [
               ...rows,
@@ -306,7 +306,7 @@ export function useSessionHistory(key: string | null): {
   /** Exact active turn when supplied by a current gateway. */
   activeTurnId: string | null;
 } {
-  const { getToken } = useClient();
+  const { getToken, getAuthValue } = useClient();
   const loadingOlderRef = useRef(false);
   const olderRequestAbortRef = useRef<AbortController | null>(null);
   const historyVersionRef = useRef(0);
@@ -410,7 +410,7 @@ export function useSessionHistory(key: string | null): {
           limit: INITIAL_HISTORY_PAGE_LIMIT,
           direction: "latest",
           signal: controller.signal,
-        });
+        }, "", getAuthValue());
         if (cancelled) return;
         historyVersionRef.current += 1;
         const responseVersion = historyVersionRef.current;
@@ -514,7 +514,7 @@ export function useSessionHistory(key: string | null): {
       cancelled = true;
       controller.abort();
     };
-  }, [getToken, key, refreshSeq]);
+  }, [getToken, getAuthValue, key, refreshSeq]);
 
   const loadOlder = useCallback(async () => {
     if (!key || loadingOlderRef.current) return;
@@ -538,7 +538,7 @@ export function useSessionHistory(key: string | null): {
         limit: OLDER_HISTORY_PAGE_LIMIT,
         before: beforeCursor,
         signal: controller.signal,
-      });
+      }, "", getAuthValue());
       setState((prev) => {
         if (!matchesRequest(prev)) return prev;
         if (!body?.messages?.length) {
@@ -592,6 +592,7 @@ export function useSessionHistory(key: string | null): {
     state.key,
     state.lineage,
     getToken,
+    getAuthValue,
   ]);
 
   if (!key) {

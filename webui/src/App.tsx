@@ -1259,6 +1259,7 @@ export default function App() {
         token={state.token}
         modelName={state.modelName}
         ingressLimits={state.ingressLimits}
+        authValue={bootstrapSecretRef.current}
       >
         <Shell
           runtimeSurface={state.runtimeSurface}

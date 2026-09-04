@@ -183,6 +183,7 @@ function normalizeSessionHandle(value: unknown): SessionHandle | null {
 export async function listSessions(
   token: string,
   base: string = "",
+  authValue: string = "",
 ): Promise<ChatSummary[]> {
   type Row = {
     key: string;
@@ -195,10 +196,13 @@ export async function listSessions(
     workspace_scope?: WorkspaceScopePayload | null;
     handle?: SessionHandle | null;
   };
+  const init = authValue
+    ? { headers: { "X-Nanobot-Auth": authValue } }
+    : undefined;
   const body = await request<{ sessions: Row[] }>(
     `${base}/api/sessions`,
     token,
-    undefined,
+    init,
     API_READ_TIMEOUT_MS,
   );
   return body.sessions.map((s) => {
@@ -231,6 +235,7 @@ export async function fetchWebuiThread(
   key: string,
   optionsOrBase?: FetchWebuiThreadOptions | string,
   base: string = "",
+  authValue: string = "",
 ): Promise<WebuiThreadPersistedPayload | null> {
   const options = typeof optionsOrBase === "string" ? undefined : optionsOrBase;
   const resolvedBase = typeof optionsOrBase === "string" ? optionsOrBase : base;
@@ -241,8 +246,10 @@ export async function fetchWebuiThread(
   const query = params.toString();
   const suffix = query ? `?${query}` : "";
   const url = `${resolvedBase}/api/sessions/${encodeURIComponent(key)}/webui-thread${suffix}`;
+  const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+  if (authValue) headers["X-Nanobot-Auth"] = authValue;
   const res = await fetchWithTimeout(url, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers,
     credentials: "same-origin",
     cache: "no-store",
     signal: options?.signal,

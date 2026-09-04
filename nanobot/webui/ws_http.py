@@ -106,6 +106,7 @@ from nanobot.webui.session_automations import (
 from nanobot.webui.session_context import session_context_payload
 from nanobot.webui.session_list_index import (
     WEBUI_SESSION_INDEX_INTERNAL_FIELDS,
+    _OWNER_USER_ID_FIELD,
     indexed_workspace_scope,
     list_webui_sessions,
 )
@@ -839,6 +840,10 @@ class GatewayHTTPHandler:
             return _http_error(400, "invalid session key")
         if not _is_websocket_channel_session_key(decoded_key):
             return _http_error(404, "session not found")
+        # [FIX 2026-09-04] Per-user isolation on session reads.
+        denied = self._webui_session_access_error(request, decoded_key)
+        if denied is not None:
+            return denied
         if self.session_manager is None:
             return _http_error(503, "session manager unavailable")
         session = await asyncio.to_thread(
@@ -854,13 +859,18 @@ class GatewayHTTPHandler:
             return _http_error(401, "Unauthorized")
         if self.session_manager is None:
             return _http_error(503, "session manager unavailable")
-        payload = await asyncio.to_thread(self._sessions_list_payload)
+        # [FIX 2026-09-04] Resolve the signed-in Supabase user and scope the
+        # returned session list to that user only (per-user chat isolation).
+        owner_user_id = self._supabase_user_id_for_request(request)
+        payload = await asyncio.to_thread(
+            self._sessions_list_payload, owner_user_id
+        )
         return _http_json_response(
             payload,
             accept_encoding=_combined_list_header(request.headers, "Accept-Encoding"),
         )
 
-    def _sessions_list_payload(self) -> dict[str, Any]:
+    def _sessions_list_payload(self, owner_user_id: str = "") -> dict[str, Any]:
         assert self.session_manager is not None
         from nanobot.session.webui_turns import websocket_turn_wall_started_at
 
@@ -871,6 +881,13 @@ class GatewayHTTPHandler:
         for s in sessions:
             key = s.get("key")
             if not (isinstance(key, str) and key.startswith("websocket:")):
+                continue
+            # [FIX 2026-09-04] Per-user isolation. In Supabase (multi-user) mode
+            # the caller resolves to a user id; only return sessions owned by
+            # that user. Sessions with no recorded owner (legacy) are
+            # deliberately hidden so no user leaks into another user's history.
+            row_owner = s.get(_OWNER_USER_ID_FIELD, "")
+            if owner_user_id and row_owner != owner_user_id:
                 continue
             row = {
                 k: v
@@ -904,6 +921,12 @@ class GatewayHTTPHandler:
             return _http_error(400, "invalid session key")
         if not _is_websocket_channel_session_key(decoded_key):
             return _http_error(404, "session not found")
+        # [FIX 2026-09-04] Per-user isolation: only the owner of a session may
+        # read its thread. In Supabase mode the caller resolves to a user id and
+        # is blocked from every session it does not own.
+        denied = self._webui_session_access_error(request, decoded_key)
+        if denied is not None:
+            return denied
         scope = self.workspaces.scope_for_session_key(decoded_key)
 
         def load_session_messages() -> list[dict[str, Any]] | None:
@@ -1001,6 +1024,10 @@ class GatewayHTTPHandler:
             return _http_error(400, "invalid session key")
         if not _is_websocket_channel_session_key(decoded_key):
             return _http_error(404, "session not found")
+        # [FIX 2026-09-04] Per-user isolation on session automations read.
+        denied = self._webui_session_access_error(request, decoded_key)
+        if denied is not None:
+            return denied
         pending_job_ids = self._pending_automation_ids_for_session(decoded_key)
         return _http_json_response(
             session_automations_payload(
@@ -1021,6 +1048,11 @@ class GatewayHTTPHandler:
             return _http_error(400, "invalid session key")
         if not _is_websocket_channel_session_key(decoded_key):
             return _http_error(404, "session not found")
+        # [FIX 2026-09-04] Per-user isolation on session delete (prevents a user
+        # deleting another user's chat).
+        denied = self._webui_session_access_error(request, decoded_key)
+        if denied is not None:
+            return denied
         query = _request_query(request)
         delete_automations = (_query_first(query, "delete_automations") or "").lower()
         automation_jobs = session_automation_jobs(
@@ -1465,6 +1497,27 @@ class GatewayHTTPHandler:
             return _http_json_response({"ok": True, "read": False})
         except Exception as exc:
             return _http_error(502, f"could not mark read: {type(exc).__name__}")
+
+    def _webui_session_access_error(
+        self,
+        request: WsRequest,
+        decoded_key: str,
+    ) -> Response | None:
+        """Return a 404 when a user reads a WebUI session it does not own.
+
+        [FIX 2026-09-04] Per-user chat isolation. In Supabase (multi-user) mode
+        the requesting user must match the session owner or the read is denied.
+        In legacy secret mode there is no per-user identity, so access remains
+        unrestricted. Returns ``None`` when access is permitted.
+        """
+        owner_user_id = self._supabase_user_id_for_request(request)
+        if not owner_user_id:
+            return None
+        chat_id = decoded_key.split(":", 1)[1] if ":" in decoded_key else decoded_key
+        session_owner = self.workspaces.session_owner_user_id(chat_id)
+        if session_owner != owner_user_id:
+            return _http_error(404, "session not found")
+        return None
 
     def _supabase_user_id_for_request(self, request: WsRequest) -> str:
         """Best-effort resolution of the supabase user id for a plain HTTP request."""

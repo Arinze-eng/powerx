@@ -519,6 +519,13 @@ class WebSocketChannel(BaseChannel):
     ) -> None:
         """Attach and hydrate a newly created WebUI chat fork."""
         scope = self._workspaces.scope_for_session_key(fork_key)
+        # [FIX 2026-09-04] A fork is a brand-new session owned by the user who
+        # forked it, so stamp the creating user as the owner.
+        self._workspaces.persist_scope(
+            fork_id,
+            scope,
+            owner_user_id=self._conn_supabase_user.get(connection, ""),
+        )
         self._attach(connection, fork_id)
         await self._send_event(
             connection,
@@ -968,7 +975,11 @@ class WebSocketChannel(BaseChannel):
             )
             if scope is None:
                 return
-            self._workspaces.persist_scope(new_id, scope)
+            self._workspaces.persist_scope(
+                new_id,
+                scope,
+                owner_user_id=self._conn_supabase_user.get(connection, ""),
+            )
             self._attach(connection, new_id)
             await self._send_event(
                 connection,

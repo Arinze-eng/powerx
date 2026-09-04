@@ -31,8 +31,9 @@ from nanobot.session.manager import (
     _metadata_title,  # pyright: ignore[reportPrivateUsage]
 )
 from nanobot.session.model_selection import model_preset_from_metadata
+from nanobot.webui.metadata import WEBUI_SESSION_OWNER_KEY
 
-_INDEX_VERSION = 7
+_INDEX_VERSION = 8
 _INDEX_FILENAME = ".webui_session_index.json"
 _MODEL_PRESET_FIELD = "model_preset"
 _ROW_SOURCE_FIELD = "_source"
@@ -40,8 +41,15 @@ _SESSION_SOURCE = "session"
 _TRANSCRIPT_SOURCE = "webui_transcript"
 _WORKSPACE_SCOPE_PRESENT_FIELD = "_workspace_scope_present"
 _WORKSPACE_SCOPE_VALUE_FIELD = "_workspace_scope_value"
+# [FIX 2026-09-04] Per-user chat isolation: index the owner user id on each
+# WebUI session so the sidebar can be filtered to the requesting user only.
+_OWNER_USER_ID_FIELD = "_webui_owner_user_id"
 WEBUI_SESSION_INDEX_INTERNAL_FIELDS = frozenset(
-    {_WORKSPACE_SCOPE_PRESENT_FIELD, _WORKSPACE_SCOPE_VALUE_FIELD}
+    {
+        _WORKSPACE_SCOPE_PRESENT_FIELD,
+        _WORKSPACE_SCOPE_VALUE_FIELD,
+        _OWNER_USER_ID_FIELD,
+    }
 )
 _INDEXED_WORKSPACE_SCOPE_KEYS = ("project_path", "path", "access_mode")
 _MAX_INDEXED_WORKSPACE_SCOPE_BYTES = 4096
@@ -474,6 +482,7 @@ def _indexed_row_for_session(session: Session, path: Path, webui_dir: Path) -> d
     activity_signature = _webui_activity_signature(session.key, webui_dir)
     activity_updated_at = _webui_activity_updated_at(activity_signature)
     visible_message_at = _last_visible_message_at(session.messages)
+    owner_raw = session.metadata.get(WEBUI_SESSION_OWNER_KEY)
     return {
         "key": session.key,
         "created_at": session.created_at.isoformat(),
@@ -485,6 +494,7 @@ def _indexed_row_for_session(session: Session, path: Path, webui_dir: Path) -> d
         "title": _metadata_title(session.metadata),
         "preview": _preview_from_messages(session.messages),
         _MODEL_PRESET_FIELD: model_preset_from_metadata(session.metadata),
+        _OWNER_USER_ID_FIELD: owner_raw if isinstance(owner_raw, str) else "",
         **_indexed_workspace_scope_fields(session.metadata),
         _ROW_SOURCE_FIELD: _SESSION_SOURCE,
         "file": path.name,
@@ -676,6 +686,9 @@ def _scan_session_row(
             metadata = data.get("metadata", {})
             activity_signature = _webui_activity_signature(key, webui_dir)
             activity_updated_at = _webui_activity_updated_at(activity_signature)
+            if not isinstance(metadata, dict):
+                metadata = {}
+            owner_raw = metadata.get(WEBUI_SESSION_OWNER_KEY)
             return {
                 "key": key,
                 "created_at": created_at_s,
@@ -687,6 +700,7 @@ def _scan_session_row(
                 "title": _metadata_title(metadata),
                 "preview": preview or fallback_preview,
                 _MODEL_PRESET_FIELD: model_preset_from_metadata(metadata),
+                _OWNER_USER_ID_FIELD: owner_raw if isinstance(owner_raw, str) else "",
                 **_indexed_workspace_scope_fields(metadata),
                 _ROW_SOURCE_FIELD: _SESSION_SOURCE,
                 "file": path.name,

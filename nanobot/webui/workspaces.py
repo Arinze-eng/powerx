@@ -19,6 +19,7 @@ from nanobot.security.workspace_access import (
     default_workspace_scope,
     validate_workspace_scope_payload,
 )
+from nanobot.webui.metadata import WEBUI_SESSION_OWNER_KEY
 
 if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
@@ -327,9 +328,33 @@ class WebUIWorkspaceController:
             raise WorkspaceScopeError("chat_running", status=409)
         return scope
 
-    def persist_scope(self, chat_id: str, scope: WorkspaceScope) -> None:
+    def persist_scope(self, chat_id: str, scope: WorkspaceScope, owner_user_id: str = "") -> None:
         if self._sessions is not None:
             session = self._sessions.get_or_create(f"websocket:{chat_id}")
             session.metadata["webui"] = True
             session.metadata[WORKSPACE_SCOPE_METADATA_KEY] = scope.metadata()
             self._sessions.save(session)
+            self._persist_owner_later(chat_id, owner_user_id)
+
+    def _persist_owner_later(self, chat_id: str, owner_user_id: str) -> None:
+        """Stamp the Supabase user id that owns a WebUI chat.
+
+        [FIX 2026-09-04] Isolates chat history per user. Written as its own
+        session write so a missing/empty owner never corrupts scope persistence.
+        """
+        owner_user_id = (owner_user_id or "").strip()
+        if not owner_user_id or self._sessions is None:
+            return
+        session = self._sessions.get_or_create(f"websocket:{chat_id}")
+        session.metadata[WEBUI_SESSION_OWNER_KEY] = owner_user_id
+        self._sessions.save(session)
+
+    def session_owner_user_id(self, chat_id: str) -> str:
+        """Return the stored owner user id for a WebUI chat ('' if unset)."""
+        if self._sessions is None:
+            return ""
+        session = self._sessions.get_cached(f"websocket:{chat_id}")
+        if session is None:
+            return ""
+        raw = session.metadata.get(WEBUI_SESSION_OWNER_KEY)
+        return raw if isinstance(raw, str) else ""
