@@ -178,8 +178,8 @@ def _provider_settings() -> dict[str, Any]:
         if model.startswith("custom/"):
             model = model[len("custom/"):]
         return {
-            "apiBase": str(api_base or ""),
-            "model": model,
+            "apiBase": str(api_base or "").strip(),
+            "model": model.strip(),
             "apiKeyConfigured": bool(str(api_key or "").strip()),
         }
     except Exception:
@@ -200,9 +200,9 @@ def _credentials(payload: dict[str, Any]) -> tuple[str, str, str]:
     if not api_key:
         try:
             config = load_config(_config_path())
-            api_key = str(resolve_env_refs(config.providers.custom.api_key or "") or "")
+            api_key = str(resolve_env_refs(config.providers.custom.api_key or "") or "").strip()
         except Exception:
-            api_key = os.getenv("LLM_API_KEY", "")
+            api_key = os.getenv("LLM_API_KEY", "").strip()
     if not api_key:
         raise ValueError("API key is required")
     return api_base, model, api_key

@@ -349,6 +349,26 @@ def _extract_tc_extras(tc: Any) -> tuple[
     return extra_content, prov, fn_prov
 
 
+def _sanitize_header_value(value: str | None) -> str | None:
+    """Strip whitespace and control characters from an HTTP header value.
+
+    API keys, base URLs and custom headers frequently arrive with a stray
+    trailing newline (``\\n``) or carriage return — pasted into the dashboard,
+    read back from ``config.json``, or injected by env-var resolution that keeps
+    surrounding whitespace. httpcore's strict h11 framing rejects such values
+    with ``LocalProtocolError: Illegal header value``, which the OpenAI SDK then
+    surfaces as ``APIConnectionError("Connection error.")`` — indistinguishable
+    from a genuine network outage. Removing the offending characters here fixes
+    the request without masking real connectivity failures.
+    """
+    if not isinstance(value, str):
+        return value
+    # Drop every ASCII control char (0x00-0x1F, 0x7F) plus surrounding spaces so
+    # only a clean, header-safe token remains.
+    cleaned = "".join(ch for ch in value if ch >= " " and ch != "\x7f").strip()
+    return cleaned
+
+
 def _uses_openrouter_attribution(spec: "ProviderSpec | None", api_base: str | None) -> bool:
     """Apply Nanobot attribution headers to OpenRouter requests by default."""
     if spec and spec.name == "openrouter":
@@ -574,13 +594,21 @@ class OpenAICompatProvider(LLMProvider):
         self._native_compaction_available = True
 
         effective_base = api_base or (spec.default_api_base if spec else None) or None
+        effective_base = _sanitize_header_value(effective_base)
         self._effective_base = effective_base
         self._default_headers = {"x-session-affinity": uuid.uuid4().hex}
         if _uses_openrouter_attribution(spec, effective_base):
             self._default_headers.update(_DEFAULT_OPENROUTER_HEADERS)
         if extra_headers:
             self._default_headers.update(extra_headers)
-        self._api_key_for_client = api_key or "no-key"
+        # Sanitize every outbound header value so a stray newline/control char in
+        # an API key never trips httpcore's strict h11 framing (which surfaces as
+        # a misleading "Connection error." instead of the real cause).
+        self._default_headers = {
+            k: _sanitize_header_value(v) if isinstance(v, str) else v
+            for k, v in self._default_headers.items()
+        }
+        self._api_key_for_client = _sanitize_header_value(api_key) or "no-key"
         self._is_local = _is_local_endpoint(spec, effective_base)
 
         # Lazy-init: the OpenAI client and its httpx transport are expensive
