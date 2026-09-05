@@ -56,6 +56,29 @@
 - Use `write_file` for new files or intentional full-file rewrites, not routine partial edits.
 - If `apply_patch` or `edit_file` fails, re-read with `force=true`, narrow the context, and try a smaller patch rather than switching to shell `sed` or `echo`.
 
+## Batched Execution in the Sandbox (cost-critical)
+
+Every separate tool turn costs a fresh model call and a billed step. Doing many
+small steps one-at-a-time inside the sandbox multiplies cost linearly. To work
+like an efficient autonomous agent, **collapse related work into as few calls as
+possible**:
+
+- When coding or running operations in the isolated sandbox, prefer the
+  `sandbox_batch` tool over calling `novita_sandbox` repeatedly. A single
+  `sandbox_batch` call runs an ordered list of write/read/run/upload/install
+  operations in ONE session and counts as ONE step.
+- The cheapest pattern for any multi-step task is: (1) `action=write` a single
+  self-contained script (bash or python) that performs all the work and prints a
+  clear summary; (2) `action=run` that script once; optionally (3) `action=read`
+  the produced artifact. Put loops, retries, installs, builds, and checks INSIDE
+  the script so the sandbox runs them autonomously without extra model calls.
+- Chain independent shell commands with `&&` (stop on failure) or `;` (continue)
+  inside a single `run` instead of splitting them across turns.
+- Do NOT narrate each micro-command back to yourself. Plan once, batch the work,
+  then read the combined result and decide the next milestone.
+- Reserve separate turns for moments where you genuinely need to inspect an
+  intermediate result before choosing what to do next.
+
 ## Process Execution
 
 - Use `exec` for tests, builds, package commands, git commands, and other process execution.

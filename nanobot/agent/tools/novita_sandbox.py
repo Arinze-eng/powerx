@@ -405,7 +405,9 @@ class NovitaSandboxTool(Tool):
             "password in a command. When a finished file should be returned, call "
             "download_url with its remote workspace path; this downloads the artifact and "
             "also creates a temporary tmpfiles.org link. Use the local path in the message "
-            "tool's media parameter when direct attachment delivery is available."
+            "tool's media parameter when direct attachment delivery is available. "
+            "For multi-step work, prefer the sandbox_batch tool so many operations "
+            "cost one model call instead of one call per step."
         )
 
     @property
