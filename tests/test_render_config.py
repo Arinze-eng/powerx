@@ -1,7 +1,11 @@
 import json
 from pathlib import Path
 
-from scripts.ensure_render_config import ensure_file_tool_enabled, ensure_render_defaults
+from scripts.ensure_render_config import (
+    _ensure_provider_defaults,
+    ensure_file_tool_enabled,
+    ensure_render_defaults,
+)
 
 
 def test_enable_file_tool_preserves_existing_runtime_settings(tmp_path: Path) -> None:
@@ -105,9 +109,12 @@ def test_render_defaults_activate_environment_provider_over_legacy_gemini(
     }
 
 
-def test_render_defaults_preserve_intentional_admin_provider_selection(
+def test_render_defaults_env_overrides_stale_admin_provider(
     tmp_path: Path, monkeypatch
 ) -> None:
+    """Env-backed provider must win over any persisted value, including a model
+    that was previously saved via the admin panel. This is what stops users from
+    being stuck on a stale model after the operator reconfigures LLM_* env vars."""
     config_path = tmp_path / "config.json"
     original = {
         "agents": {"defaults": {"model": "custom/admin-selected-model"}},
@@ -123,10 +130,35 @@ def test_render_defaults_preserve_intentional_admin_provider_selection(
     monkeypatch.setenv("LLM_API_KEY", "environment-key")
     monkeypatch.setenv("LLM_MODEL", "muse-spark-1.2-contributor-free")
 
-    ensure_render_defaults(config_path)
+    assert ensure_render_defaults(config_path) is True
     updated = json.loads(config_path.read_text(encoding="utf-8"))
-    assert updated["agents"]["defaults"]["model"] == original["agents"]["defaults"]["model"]
-    assert updated["providers"] == original["providers"]
+    # Env references now take precedence over the stale admin selection.
+    assert updated["agents"]["defaults"]["model"] == "custom/${LLM_MODEL}"
+    assert updated["providers"]["custom"]["apiBase"] == "${LLM_BASE_URL}"
+    assert updated["providers"]["custom"]["apiKey"] == "${LLM_API_KEY}"
+
+
+def test_render_defaults_leave_config_untouched_without_env(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """With no LLM_* env vars, the migration must not clobber existing config
+    (protects local/dev and admin-only flows)."""
+    config_path = tmp_path / "config.json"
+    original = {
+        "agents": {"defaults": {"model": "custom/admin-selected-model"}},
+        "providers": {
+            "custom": {
+                "apiBase": "https://admin.example/api",
+                "apiKey": "admin-selected-key",
+            }
+        },
+    }
+    config_path.write_text(json.dumps(original), encoding="utf-8")
+    for var in ("LLM_MODEL", "LLM_BASE_URL", "LLM_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    changed = _ensure_provider_defaults(json.loads(json.dumps(original)))
+    assert changed is False
 
 
 def test_render_defaults_migrate_local_browser_to_novita(tmp_path: Path) -> None:

@@ -87,25 +87,32 @@ def _ensure_browser_defaults(data: dict[str, Any]) -> bool:
 
 
 def _ensure_provider_defaults(data: dict[str, Any]) -> bool:
-    """Activate Render's environment-backed custom provider over the old Gemini default.
+    """Make the environment-configured provider win over any stale on-disk model.
 
-    Existing admin-selected models are preserved. The migration only changes the
-    known legacy Render fallback, keeping the endpoint and key as environment
-    references rather than writing secrets into the persistent config.
+    Render persists ``~/.nanobot/config.json`` across deploys. Historically this
+    file could end up pinned to the old ``gemini-3.1-flash-lite`` fallback (from
+    an early boot or an admin-panel save), and the previous migration only
+    rewrote a narrow set of known-legacy values — so a stale model survived even
+    after the operator configured LLM_* env vars, and users kept seeing Gemini.
+
+    New behaviour: whenever the full set of LLM_MODEL / LLM_BASE_URL /
+    LLM_API_KEY env vars is present, the agents.defaults.model and the custom
+    provider endpoint/key are FORCE-refreshed to reference those env vars on
+    every boot. Env is the single source of truth over stale disk state. When
+    the env vars are absent we leave the config untouched (so local/dev setups
+    and admin-only flows are unaffected). Secrets stay as ``${VAR}`` references;
+    nothing literal is written to disk.
     """
     render_model = os.environ.get("LLM_MODEL", "").strip()
     render_base = os.environ.get("LLM_BASE_URL", "").strip()
     render_key = os.environ.get("LLM_API_KEY", "").strip()
     if not render_model or not render_base or not render_key:
+        # Operator has not wired the environment-backed provider; do not touch.
         return False
 
     agents = data.setdefault("agents", {})
     defaults = agents.setdefault("defaults", {}) if isinstance(agents, dict) else None
     if not isinstance(defaults, dict):
-        return False
-    current_model = str(defaults.get("model") or "").strip()
-    current_model_name = current_model.removeprefix("custom/")
-    if current_model_name not in {"", _DEFAULT_RENDER_MODEL, "${LLM_MODEL}"}:
         return False
 
     providers = data.setdefault("providers", {})
@@ -114,9 +121,16 @@ def _ensure_provider_defaults(data: dict[str, Any]) -> bool:
         return False
 
     changed = False
-    if defaults.get("model") != "custom/${LLM_MODEL}":
+    # On Render the environment is the single source of truth for the provider.
+    # Whenever LLM_MODEL/BASE_URL/API_KEY are all present, the persisted config
+    # is forced to reference them — this is what stops a stale on-disk model
+    # (e.g. the old Gemini fallback) from surviving deploys. Secrets remain as
+    # ${VAR} references; nothing literal is written to disk.
+    current_model = str(defaults.get("model") or "").strip()
+    if current_model != "custom/${LLM_MODEL}":
         defaults["model"] = "custom/${LLM_MODEL}"
         changed = True
+
     if custom.get("apiBase") != "${LLM_BASE_URL}":
         custom["apiBase"] = "${LLM_BASE_URL}"
         changed = True
