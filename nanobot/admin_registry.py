@@ -185,7 +185,7 @@ def _provider_settings() -> dict[str, Any]:
     except Exception:
         return {
             "apiBase": os.getenv("LLM_BASE_URL", ""),
-            "model": os.getenv("LLM_MODEL", "gemini-3.1-flash-lite"),
+            "model": os.getenv("LLM_MODEL", ""),
             "apiKeyConfigured": bool(os.getenv("LLM_API_KEY", "").strip()),
         }
 
