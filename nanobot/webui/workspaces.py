@@ -350,11 +350,32 @@ class WebUIWorkspaceController:
         self._sessions.save(session)
 
     def session_owner_user_id(self, chat_id: str) -> str:
-        """Return the stored owner user id for a WebUI chat ('' if unset)."""
+        """Return the stored owner user id for a WebUI chat ('' if unset).
+
+        [FIX 2026-09-05] Read the *persisted* metadata as well as the in-memory
+        cache. After a Render reboot/redeploy the restored session files are on
+        disk but not yet loaded into the cache, so relying on ``get_cached``
+        alone made every restored chat look "unowned" and therefore readable by
+        any user. Reading durable metadata keeps per-user isolation intact
+        across restarts.
+        """
         if self._sessions is None:
             return ""
-        session = self._sessions.get_cached(f"websocket:{chat_id}")
-        if session is None:
+        key = f"websocket:{chat_id}"
+        session = self._sessions.get_cached(key)
+        if session is not None:
+            raw = session.metadata.get(WEBUI_SESSION_OWNER_KEY)
+            if isinstance(raw, str) and raw.strip():
+                return raw
+        # Fall back to the on-disk metadata record (authoritative after restore).
+        try:
+            payload = self._sessions.read_session_metadata(key)
+        except Exception:  # noqa: BLE001 - never leak or crash on storage errors
             return ""
-        raw = session.metadata.get(WEBUI_SESSION_OWNER_KEY)
+        if not isinstance(payload, dict):
+            return ""
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            return ""
+        raw = metadata.get(WEBUI_SESSION_OWNER_KEY)
         return raw if isinstance(raw, str) else ""

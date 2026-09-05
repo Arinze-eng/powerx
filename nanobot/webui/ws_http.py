@@ -1011,6 +1011,12 @@ class GatewayHTTPHandler:
             return _http_error(400, "invalid session key")
         if not _is_websocket_channel_session_key(decoded_key):
             return _http_error(404, "session not found")
+        # [FIX 2026-09-05] Per-user isolation: file previews read from the chat's
+        # workspace, so only the owner may probe/read them. Without this one user
+        # could pass another user's session key to read their project files.
+        denied = self._webui_session_access_error(request, decoded_key)
+        if denied is not None:
+            return denied
         query = _parse_query(request.path)
         path = _query_first(query, "path")
         is_probe = _query_first(query, "probe") == "1"

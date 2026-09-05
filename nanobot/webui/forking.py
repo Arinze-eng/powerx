@@ -84,6 +84,12 @@ async def handle_webui_fork_chat(
     if not _valid_webui_chat_id(source_chat_id):
         await channel.send_webui_protocol_error(connection, "invalid source_chat_id")
         return
+    # [FIX 2026-09-05] Per-user isolation: a user may only fork a chat they own
+    # (or an unowned background/cron session). Forking copies the full source
+    # transcript, so without this one user could clone another's private history.
+    if channel._deny_unless_owner(connection, str(source_chat_id)):
+        await channel.send_webui_protocol_error(connection, "access_denied")
+        return
     if isinstance(raw_index, bool) or not isinstance(raw_index, int) or raw_index < 0:
         await channel.send_webui_protocol_error(connection, "invalid before_user_index")
         return

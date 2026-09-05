@@ -3839,3 +3839,81 @@ def test_bootstrap_secret_also_enforced_on_localhost(bus: MagicMock) -> None:
     channel = _ch(bus, host="0.0.0.0", tokenIssueSecret="s3cret")
     resp = channel.gateway.http._handle_bootstrap(_LOCAL, _NO_HEADERS)
     assert resp.status_code == 401
+
+
+# -- [FIX 2026-09-05] Per-user chat isolation on the WebSocket ingress path ----
+
+
+class _IsolationConn:
+    """Minimal stand-in for a websockets ServerConnection (isolation tests)."""
+
+
+def _make_owner_session(tmp_path: Path, owner: str | None, key: str = "websocket:c1") -> SessionManager:
+    sm = SessionManager(tmp_path)
+    s = Session(key=key)
+    s.metadata["webui"] = True
+    if owner:
+        s.metadata["_webui_owner_user_id"] = owner
+    s.add_message("user", "secret hi")
+    s.add_message("assistant", "secret reply")
+    sm.save(s)
+    return sm
+
+
+def test_session_owner_reads_persisted_metadata_after_restart(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    """[Bug A] Owner survives when the session is only on disk (post-reboot)."""
+    sm = _make_owner_session(tmp_path, "user-AAAAAAAA")
+    # Simulate a fresh process: drop everything from the in-memory cache so only
+    # the durable JSONL file remains (this is the Render-restart condition).
+    sm.invalidate("websocket:c1")
+    assert sm.get_cached("websocket:c1") is None
+
+    channel = _ch(bus, session_manager=sm, port=_free_port())
+    owner = channel._workspaces.session_owner_user_id("c1")
+    assert owner == "user-AAAAAAAA"
+
+
+@pytest.mark.parametrize(
+    "session_owner, conn_user, expect_allowed",
+    [
+        ("user-AAAAAAAA", "user-AAAAAAAA", True),   # own chat
+        ("user-BBBBBBBB", "user-AAAAAAAA", False),  # another user's chat
+        ("user-BBBBBBBB", "", False),               # identity unresolved
+        ("", "user-AAAAAAAA", True),                # unowned background/cron
+    ],
+)
+def test_ws_ownership_gate(
+    bus: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_owner: str,
+    conn_user: str,
+    expect_allowed: bool,
+) -> None:
+    """[Bug B] attach/message/fork refuse access to chats owned by others."""
+    monkeypatch.setenv("SUPABASE_WEBUI_AUTH", "true")
+    monkeypatch.setattr(WebSocketChannel, "_supabase_webui_auth_enabled", staticmethod(lambda: True))
+
+    sm = _make_owner_session(tmp_path, session_owner or None)
+    channel = _ch(bus, session_manager=sm, port=_free_port())
+
+    conn = _IsolationConn()
+    channel._conn_supabase_user[conn] = conn_user
+
+    assert channel._owns_webui_chat(conn, "c1") is expect_allowed
+    assert channel._deny_unless_owner(conn, "c1") is (not expect_allowed)
+
+
+def test_ws_ownership_disabled_in_legacy_mode(
+    bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without Supabase auth (single-operator gateway) all chats stay reachable."""
+    monkeypatch.setattr(WebSocketChannel, "_supabase_webui_auth_enabled", staticmethod(lambda: False))
+    sm = _make_owner_session(tmp_path, "user-BBBBBBBB")
+    channel = _ch(bus, session_manager=sm, port=_free_port())
+    conn = _IsolationConn()
+    # No supabase user bound; legacy mode must still allow.
+    assert channel._owns_webui_chat(conn, "c1") is True
+    assert channel._deny_unless_owner(conn, "c1") is False

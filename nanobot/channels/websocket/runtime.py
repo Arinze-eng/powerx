@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import os
 import re
 import ssl
 import time
@@ -440,6 +441,60 @@ class WebSocketChannel(BaseChannel):
 
     def _workspace_controls_available(self, connection: ServerConnection) -> bool:
         return self._http_router.workspace_controls_available(connection)
+
+    @staticmethod
+    def _supabase_webui_auth_enabled() -> bool:
+        """True when WebUI access is gated behind Supabase per-user auth."""
+        if os.getenv("SUPABASE_WEBUI_AUTH", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            return False
+        try:
+            from nanobot.supabase_auth import SupabaseAuth
+
+            return SupabaseAuth().enabled
+        except Exception:  # noqa: BLE001 - fail closed on auth misconfig
+            return False
+
+    def _owns_webui_chat(self, connection: ServerConnection, chat_id: str) -> bool:
+        """Return whether *connection* may read/write the WebUI chat *chat_id*.
+
+        [FIX 2026-09-05] Per-user isolation on the WebSocket ingress path. The
+        HTTP thread reads are already owner-gated, but ``attach`` / ``message`` /
+        ``fork`` were not, so a user who learned another user's chat id could
+        subscribe to it and receive its live streaming events (and post into it).
+
+        Rules mirror the HTTP guard in ``ws_http``:
+        * Legacy (non-Supabase) mode → unrestricted (single-operator gateway).
+        * A chat with **no recorded owner** is a bot/background delivery
+          (cron/poll/heartbeat) and stays reachable so scheduled feedback works.
+        * Otherwise, in Supabase mode the connecting user's id must match the
+          stored owner; missing identity or mismatch is denied (fail closed).
+        """
+        if not self._supabase_webui_auth_enabled():
+            return True
+        session_owner = ""
+        try:
+            session_owner = self._workspaces.session_owner_user_id(chat_id)
+        except Exception:  # noqa: BLE001 - never leak/crash on storage errors
+            session_owner = ""
+        if not session_owner:
+            # Unowned background/cron session — allow so automation output lands.
+            return True
+        conn_user = self._conn_supabase_user.get(connection, "")
+        return bool(conn_user) and conn_user == session_owner
+
+    def _deny_unless_owner(
+        self,
+        connection: ServerConnection,
+        chat_id: str,
+    ) -> bool:
+        """Send ``access_denied`` and return True when *connection* lacks access."""
+        if self._owns_webui_chat(connection, chat_id):
+            return False
+        self.logger.warning(
+            "webui access denied: connection tried to reach chat_id={} it does not own",
+            chat_id,
+        )
+        return True
 
     def _attach(self, connection: ServerConnection, chat_id: str) -> None:
         """Idempotently subscribe *connection* to *chat_id*."""
@@ -1031,6 +1086,14 @@ class WebSocketChannel(BaseChannel):
             if not _is_valid_chat_id(cid):
                 await self._send_event(connection, "error", detail="invalid chat_id")
                 return
+            # [FIX 2026-09-05] Per-user isolation: refuse to subscribe a
+            # connection to a chat owned by another Supabase user. Without this
+            # a user who knew another's chat id could stream their live thread.
+            if self._deny_unless_owner(connection, cid):
+                await self._send_event(
+                    connection, "error", detail="access_denied", chat_id=cid
+                )
+                return
             try:
                 self._temporary_chats.validate_attach(cid)
             except TemporaryChatError as exc:
@@ -1128,6 +1191,18 @@ class WebSocketChannel(BaseChannel):
                 "chat_id": cid,
                 **({"turn_id": turn_id} if turn_id else {}),
             }
+            # [FIX 2026-09-05] Per-user isolation: a connection may only post
+            # into a chat it owns (or an unowned background/cron session). This
+            # blocks writing into another user's conversation and the live
+            # broadcast that would leak their thread to the sender.
+            if self._deny_unless_owner(connection, cid):
+                await self._send_event(
+                    connection,
+                    "error",
+                    detail="access_denied",
+                    **rejection_fields,
+                )
+                return
             # The allowlist can change while an authenticated websocket stays
             # open. Reject the exact application turn before hydration,
             # transcript persistence, or an acceptance ACK; BaseChannel's
