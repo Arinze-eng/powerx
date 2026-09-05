@@ -56,12 +56,17 @@
 - Use `write_file` for new files or intentional full-file rewrites, not routine partial edits.
 - If `apply_patch` or `edit_file` fails, re-read with `force=true`, narrow the context, and try a smaller patch rather than switching to shell `sed` or `echo`.
 
-## Batched Execution in the Sandbox (cost-critical)
+## Batched Execution in the Sandbox (cost-critical, ENFORCED)
 
 Every separate tool turn costs a fresh model call and a billed step. Doing many
 small steps one-at-a-time inside the sandbox multiplies cost linearly. To work
 like an efficient autonomous agent, **collapse related work into as few calls as
 possible**:
+
+- **This is enforced at runtime:** after a few lone `novita_sandbox` run/write/read
+  steps in one task, further single steps are rejected until you switch to
+  `sandbox_batch`. Do not wait to be blocked — batch from the start on any task
+  that needs more than ~3 sandbox operations.
 
 - When coding or running operations in the isolated sandbox, prefer the
   `sandbox_batch` tool over calling `novita_sandbox` repeatedly. A single

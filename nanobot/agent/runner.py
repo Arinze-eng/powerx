@@ -122,6 +122,11 @@ class AgentRunSpec:
     # covers the first request, post-tool continuations, and finalization
     # retries, including provider-owned state restored from an earlier turn.
     strip_image_content_before_provider: bool = False
+    # Per-run enforcement state for Manus-style batching. Tracks how many times
+    # the model has issued a single novita_sandbox 'run' step so we can push it
+    # toward sandbox_batch once it clearly needs multi-step work. Mutable dict
+    # (not slots-blocked) so _run_tool can bump counters across iterations.
+    batch_enforcement_state: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -1518,6 +1523,72 @@ class AgentRunner:
             args = repr(tool_call.arguments)
         return f"{tool_call.name}:{args}"
 
+    # How many lone novita_sandbox 'run' steps are tolerated in a single task
+    # before the model is forced to switch to sandbox_batch. Small enough that
+    # genuine one-shot commands still work; low enough to cap cost on multi-step
+    # tasks. Overridable via POWERX_BATCH_ENFORCE_AFTER for tuning without a
+    # code change.
+    _BATCH_ENFORCE_AFTER = int(os.environ.get("POWERX_BATCH_ENFORCE_AFTER", "3"))
+
+    def _batch_enforcement_check(
+        self,
+        spec: AgentRunSpec,
+        tool_call: ToolCallRequest,
+    ) -> tuple[str, dict[str, str]] | None:
+        """Return (detail, event) to block a call, or None to allow it.
+
+        Enforces Manus-style batching: once the model has issued more than
+        ``_BATCH_ENFORCE_AFTER`` single ``novita_sandbox`` ``run`` steps in one
+        task, further lone runs are rejected until it uses ``sandbox_batch``.
+        Using ``sandbox_batch`` resets the counter so well-behaved turns pay no
+        penalty. Only active when the batch tool is registered/available.
+        """
+        state = getattr(spec, "batch_enforcement_state", None)
+        if state is None:
+            return None
+        name = tool_call.name
+        # Reward correct behaviour: a batch resets the streak counter.
+        if name == "sandbox_batch":
+            state["single_run_streak"] = 0
+            return None
+        # Only police lone sandbox run/read/write steps; other tools pass through.
+        if name != "novita_sandbox":
+            return None
+        batch_available = bool(getattr(spec.tools, "has", lambda _: False)("sandbox_batch"))
+        if not batch_available:
+            return None
+        action = ""
+        arguments = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+        if isinstance(arguments, dict):
+            action = str(arguments.get("action", "")).strip().lower()
+        # Only 'run'/'write'/'read' style sequential ops are worth batching;
+        # install/upload/download_url are typically one-off and left alone.
+        if action not in {"run", "write", "read"}:
+            return None
+        streak = int(state.get("single_run_streak", 0)) + 1
+        state["single_run_streak"] = streak
+        if streak <= self._BATCH_ENFORCE_AFTER:
+            return None
+        detail = (
+            f"BATCHING REQUIRED: you have issued {streak} separate novita_sandbox "
+            f"'{action}' steps in this task, and each one costs a full model round-trip "
+            "and a billed step. Stop doing single commands. Combine the remaining work "
+            "into ONE sandbox_batch call — ideally write a single script (bash/python) "
+            "that performs every step and prints a summary, then run it once inside the "
+            "batch. Chain related shell commands with && instead of splitting them "
+            "across turns. Retry now using sandbox_batch."
+        )
+        event = {
+            "name": name,
+            "status": "error",
+            "detail": "batching required: use sandbox_batch",
+        }
+        logger.info(
+            "Batching enforcement blocked lone novita_sandbox '{}' (streak={}) for {}",
+            action, streak, spec.session_key or "default",
+        )
+        return detail, event
+
     async def _run_tool(
         self,
         spec: AgentRunSpec,
@@ -1562,6 +1633,19 @@ class AgentRunner:
                 "status": "error",
                 "detail": "identical tool call blocked",
             }
+            if spec.fail_on_tool_error:
+                return detail + hint, event, RuntimeError(detail)
+            return detail + hint, event, None
+        # --- Manus-style batching enforcement -----------------------------
+        # Each agent iteration is one LLM call and one billed credit step. A
+        # model that issues many single novita_sandbox 'run' commands pays for
+        # every one of them. Once it has clearly committed to multi-step work,
+        # we reject further lone 'run' calls and require sandbox_batch so the
+        # remaining steps collapse into a single round-trip. Gated on the batch
+        # tool actually being available, so non-sandbox agents are unaffected.
+        enforcement_block = self._batch_enforcement_check(spec, tool_call)
+        if enforcement_block is not None:
+            detail, event = enforcement_block
             if spec.fail_on_tool_error:
                 return detail + hint, event, RuntimeError(detail)
             return detail + hint, event, None
