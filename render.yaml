@@ -10,7 +10,9 @@ services:
     healthCheckPath: /health
     envVars:
       - key: LLM_BASE_URL
-        value: https://gemini-proxy.codebanana.app/v1
+        value: https://kymaapi.com/v1
+      - key: LLM_MODEL
+        value: deepseek-v4-flash
       - key: LLM_API_KEY
         sync: false
       - key: TELEGRAM_BOT_TOKEN
