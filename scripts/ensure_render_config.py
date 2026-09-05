@@ -127,18 +127,23 @@ def _ensure_provider_defaults(data: dict[str, Any]) -> bool:
 
 
 def _ensure_telegram_polling_defaults(data: dict[str, Any]) -> bool:
-    """Force Telegram into pure polling mode on Render.
+    """Force Telegram into pure polling mode and stop step/progress noise on Render.
 
-    The previous default forced `mode: webhook` every boot, which silently
-    reverted any polling config on each deploy. The bot runs pure polling now,
-    so strip any stale webhook keys and force streamed progress like a normal
-    interactive session.
+    The previous default forced streamed step/tool/reasoning events into a single
+    live "working" message (liveActivity) so users saw every step. The operator
+    wants the bot to STOP showing steps, so the migration now hard-pins the
+    progress-affecting flags to False. Setting them False here (rather than just
+    leaving the committed render-config.json) matters because Render keeps a live
+    ``~/.nanobot/config.json`` that already has these set True — this migration
+    runs on every boot (entrypoint) and flips the existing on-disk config so the
+    change takes effect on the next deploy/restart.
 
-    Tool-call hints are enabled and folded into the channel's single live
-    "activity" card (liveActivity), so each `tool(...)` call becomes a checkable
-    line in one in-place-edited status message instead of a separate Telegram
-    message. This is the anti-spam mechanism — it replaces the old behavior
-    where every tool call was published as its own message.
+    * ``liveActivity``   — the single in-place-edited step/working message.
+    * ``sendToolHints``  — tool-call hints (e.g. ``read_file("...")``).
+    * ``sendProgress``   — per-step progress text (also the fallback that would
+      otherwise spam a separate message per step when liveActivity is off).
+    * ``showReasoning``  — the model's 💭 "thinking" block.
+    All are pinned to False so the bot replies with just the final answer.
     """
     channels = data.setdefault("channels", {})
     if not isinstance(channels, dict):
@@ -154,24 +159,19 @@ def _ensure_telegram_polling_defaults(data: dict[str, Any]) -> bool:
     if telegram.get("streaming") is not True:
         telegram["streaming"] = True
         changed = True
-    # Consolidate per-step events into ONE live activity card instead of a
-    # separate message per step.
-    if telegram.get("live_activity", telegram.get("liveActivity", True)) is not True:
-        telegram["liveActivity"] = True
-        changed = True
-    # Feed tool steps into the live card; they are no longer separate bubbles.
-    if telegram.get("send_tool_hints", telegram.get("sendToolHints", True)) is not True:
-        telegram["sendToolHints"] = True
-        changed = True
-    if telegram.get("send_progress", telegram.get("sendProgress", True)) is not True:
-        telegram["sendProgress"] = True
-        changed = True
-    # Fold the model's reasoning ("thinking") into the SAME single live working
-    # message (via the send_reasoning_delta override in the Telegram channel)
-    # instead of dropping it or emitting separate messages.
-    if telegram.get("show_reasoning", telegram.get("showReasoning", True)) is not True:
-        telegram["showReasoning"] = True
-        changed = True
+    # Stop showing steps: disable the live activity card, tool/progress events,
+    # and model reasoning on Telegram (the operator wants only the final reply).
+    step_flags = (
+        ("liveActivity", "live_activity"),
+        ("sendToolHints", "send_tool_hints"),
+        ("sendProgress", "send_progress"),
+        ("showReasoning", "show_reasoning"),
+    )
+    for camel, snake in step_flags:
+        current = telegram.get(camel, telegram.get(snake))
+        if current is not False:
+            telegram[camel] = False
+            changed = True
     for webhook_key in (
         "webhookUrl",
         "webhookSecretToken",
