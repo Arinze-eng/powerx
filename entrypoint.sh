@@ -56,6 +56,16 @@ if [ "$RENDER" = "true" ]; then
             /app/scripts/supabase_chat_sync.py --restore || \
             echo "[entrypoint] warning: chat restore failed (continuing)"
     fi
+    # [FIX 2026-09-05] Backfill per-user chat ownership. Chat isolation is now
+    # fail-closed: an unowned chat is hidden from / denied to every user, so it
+    # must never be left anonymously shared. This reconciles unowned legacy
+    # chats against their core session metadata (which records the owner) and
+    # stamps it. Truly-unowned chats stay hidden, safe, and reclaimable.
+    if [ -f /app/scripts/backfill_chat_owners.py ]; then
+        NANOBOT_DATA_DIR="$dir" /app/.venv/bin/python3 \
+            /app/scripts/backfill_chat_owners.py --apply || \
+            echo "[entrypoint] warning: chat-owner backfill failed (continuing)"
+    fi
 fi
 
 # Drop privileges whenever the container starts as root. Render mounts the

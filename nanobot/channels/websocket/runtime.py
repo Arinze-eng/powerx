@@ -464,8 +464,10 @@ class WebSocketChannel(BaseChannel):
 
         Rules mirror the HTTP guard in ``ws_http``:
         * Legacy (non-Supabase) mode → unrestricted (single-operator gateway).
-        * A chat with **no recorded owner** is a bot/background delivery
-          (cron/poll/heartbeat) and stays reachable so scheduled feedback works.
+        * [FIX 2026-09-05] In Supabase mode a chat with **no recorded owner** is
+          anonymous/unassigned and now **denied** (fail closed). Formerly it was
+          treated as bot/background delivery and thus reachable by every user - the
+          root cause of users seeing each other's chats.
         * Otherwise, in Supabase mode the connecting user's id must match the
           stored owner; missing identity or mismatch is denied (fail closed).
         """
@@ -477,8 +479,10 @@ class WebSocketChannel(BaseChannel):
         except Exception:  # noqa: BLE001 - never leak/crash on storage errors
             session_owner = ""
         if not session_owner:
-            # Unowned background/cron session — allow so automation output lands.
-            return True
+            # [FIX 2026-09-05] FAIL CLOSED: formerly an unowned chat was
+            # reachable by every user (the cross-user leak). It is now denied.
+            # A caller may only reach chats it provably owns.
+            return False
         conn_user = self._conn_supabase_user.get(connection, "")
         return bool(conn_user) and conn_user == session_owner
 
@@ -966,6 +970,20 @@ class WebSocketChannel(BaseChannel):
             )
             # Register only after ready is successfully sent to avoid out-of-order sends
             self._conn_default[connection] = default_chat_id
+            # [FIX 2026-09-05] Claim the per-connection default chat for the
+            # signed-in Supabase user. Chat ownership is now fail-closed: an
+            # unowned chat is denied to every user, so a freshly-created default
+            # chat must be stamped with its creator or the user could not use
+            # their own workspace before creating a named chat.
+            if self._supabase_webui_auth_enabled():
+                supabase_user = self._conn_supabase_user.get(connection, "")
+                if supabase_user:
+                    try:
+                        self._workspaces.claim_session_owner(default_chat_id, supabase_user)
+                    except Exception:  # noqa: BLE001 - never crash on claim
+                        self.logger.warning(
+                            "webui default-chat claim failed for chat_id={}", default_chat_id
+                        )
             self._attach(connection, default_chat_id)
             await self._hydrate_after_subscribe(default_chat_id)
 
@@ -1204,6 +1222,17 @@ class WebSocketChannel(BaseChannel):
             # into a chat it owns (or an unowned background/cron session). This
             # blocks writing into another user's conversation and the live
             # broadcast that would leak their thread to the sender.
+            # [FIX 2026-09-05] Claim-on-first-activity: an authenticated user
+            # posting the first message to an unowned chat (e.g. reclaiming a
+            # legacy chat) becomes its owner. Must run before the fail-closed
+            # gate below, else a reclaim would be denied before it can claim.
+            if self._supabase_webui_auth_enabled():
+                try:
+                    self._workspaces.claim_session_owner(
+                        cid, self._conn_supabase_user.get(connection, "")
+                    )
+                except Exception:  # noqa: BLE001 - never crash the turn
+                    pass
             if self._deny_unless_owner(connection, cid):
                 await self._send_event(
                     connection,

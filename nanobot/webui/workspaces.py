@@ -336,6 +336,27 @@ class WebUIWorkspaceController:
             self._sessions.save(session)
             self._persist_owner_later(chat_id, owner_user_id)
 
+    def claim_session_owner(self, chat_id: str, owner_user_id: str) -> bool:
+        """Stamp *owner_user_id* as the owner of *chat_id* if it has none.
+
+        [FIX 2026-09-05] Idempotent per-user reclaim. Returns True when the
+        owner was (re)stamped, False when the chat already belonged to an
+        identical owner (so callers may avoid a redundant write). An existing
+        different owner is never overwritten.
+        """
+        owner_user_id = (owner_user_id or "").strip()
+        if not owner_user_id or self._sessions is None:
+            return False
+        existing = self.session_owner_user_id(chat_id)
+        if existing and existing != owner_user_id:
+            return False
+        if existing == owner_user_id:
+            return False
+        session = self._sessions.get_or_create(f"websocket:{chat_id}")
+        session.metadata[WEBUI_SESSION_OWNER_KEY] = owner_user_id
+        self._sessions.save(session)
+        return True
+
     def _persist_owner_later(self, chat_id: str, owner_user_id: str) -> None:
         """Stamp the Supabase user id that owns a WebUI chat.
 

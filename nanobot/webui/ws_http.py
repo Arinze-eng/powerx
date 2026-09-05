@@ -897,7 +897,8 @@ class GatewayHTTPHandler:
             # see it to receive the scheduled-task feedback it carries. Owned
             # sessions (e.g. a different user's chat) stay hidden.
             row_owner = s.get(_OWNER_USER_ID_FIELD, "")
-            if owner_user_id and row_owner and row_owner != owner_user_id:
+            # [FIX 2026-09-05] FAIL CLOSED: formely unowned chats were public.
+            if owner_user_id and row_owner != owner_user_id:
                 continue
             row = {
                 k: v
@@ -1526,12 +1527,12 @@ class GatewayHTTPHandler:
         In legacy secret mode there is no per-user identity, so access remains
         unrestricted. Returns ``None`` when access is permitted.
 
-        A session that has **no recorded owner** is not private to any user —
-        it is a bot/background delivery (scheduled cron, poll watch, heartbeat)
-        that has not yet been claimed by a user. Such sessions remain readable
-        so the user actually receives the scheduled/cron/poll feedback they
-        asked for (the whole point of the automation). Once a user stamps the
-        session as theirs, only that user may read it.
+        [FIX 2026-09-05] In Supabase mode, a session with **no recorded owner**
+        is anonymous/unassigned and is now **denied** (fail closed) instead of
+        being shared with every user. Formerly "unowned" chats were treated as
+        bot/background delivery and were readable by everyone, which let users
+        see each other's chats. An unowned chat becomes readable to a user only
+        after that user claims it via first activity (new_chat / message).
         """
         owner_user_id = self._supabase_user_id_for_request(request)
         chat_id = decoded_key.split(":", 1)[1] if ":" in decoded_key else decoded_key
@@ -1539,10 +1540,12 @@ class GatewayHTTPHandler:
             session_owner = self.workspaces.session_owner_user_id(chat_id)
         except Exception:  # noqa: BLE001 - never leak on storage errors
             session_owner = ""
-        # An unowned session is delivered-to-by-the-system, never another
-        # user's private chat; allow any authenticated WebUI caller to read it
-        # so scheduled/background feedback stays visible.
+        # [FIX 2026-09-05] FAIL CLOSED on unowned sessions in multi-user mode.
+        # Formely unowned chats were readable by every user; now denied unless
+        # the caller provably owns them. Reclaimed on first user activity.
         if not session_owner:
+            if self._supabase_webui_auth_enabled():
+                return _http_error(404, "session not found")
             return None
         # Fail closed in Supabase mode: an unverifiable or mismatched owner is
         # denied so a user can never read another user's chat history.

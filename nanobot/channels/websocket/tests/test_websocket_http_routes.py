@@ -530,18 +530,18 @@ async def test_session_automations_route_lists_local_triggers(
 
 
 @pytest.mark.asyncio
-async def test_scheduled_feedback_session_visible_to_authenticated_webui_user(
+async def test_unowned_session_is_fail_closed_and_never_leaks_across_users(
     bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression: scheduled/cron/poll feedback (an owner-less delivery session)
-    must stay visible to an authenticated WebUI user in Supabase mode, while
-    another user's OWNED session remains hidden (no cross-user leakage).
+    """Security regression: an owner-less WebUI session must NOT be public.
 
-    Prior to the fix the fail-closed owner check treated an owner-less session
-    as if it belonged to no one and returned 404 / hid it — so the scheduled
-    task feedback a user asked for never appeared. An owner-less session is a
-    bot/background delivery, not another user's private chat, so it must not be
-    hidden from an authenticated caller."""
+    [FIX 2026-09-05] Previously an unowned session was treated as
+"bot/background delivery" and shown to / readable by every authenticated
+user — that is the root cause of users seeing each other's chats (most live
+chats had no owner stamp). In Supabase (multi-user) mode an owner-less
+session is anonymous/unassigned and must be hidden from the sidebar and
+denied on reads for every caller. It is reclaimed only via
+claim-on-first-activity (new_chat / message)."""
     # Force Supabase (multi-user) webui auth mode.
     monkeypatch.setenv("SUPABASE_WEBUI_AUTH", "true")
 
@@ -575,16 +575,16 @@ async def test_scheduled_feedback_session_visible_to_authenticated_webui_user(
         lambda req: "user-AAAAAAAA",
     )
 
-    # 1) The session list includes the owner's chat AND the owner-less
-    #    scheduled-feedback session, but NOT another user's session.
+    # 1) Sidebar shows ONLY the caller's own owned session; the owner-less
+    #    session and another user's session are both hidden (fail closed).
     payload = handler._sessions_list_payload("user-AAAAAAAA")
     keys = {s["key"] for s in payload["sessions"]}
     assert "websocket:mine" in keys
-    assert "websocket:feedback" in keys
+    assert "websocket:feedback" not in keys
     assert "websocket:theirs" not in keys
 
-    # 2) The owner-less scheduled-feedback thread is now readable (was 404).
-    assert handler._webui_session_access_error(_FakeReq(), "websocket:feedback") is None
+    # 2) The owner-less thread is now denied (fail closed, was public).
+    assert handler._webui_session_access_error(_FakeReq(), "websocket:feedback") is not None
     # 3) The owner's own thread remains readable.
     assert handler._webui_session_access_error(_FakeReq(), "websocket:mine") is None
     # 4) Another user's thread stays denied.
@@ -3881,7 +3881,7 @@ def test_session_owner_reads_persisted_metadata_after_restart(
         ("user-AAAAAAAA", "user-AAAAAAAA", True),   # own chat
         ("user-BBBBBBBB", "user-AAAAAAAA", False),  # another user's chat
         ("user-BBBBBBBB", "", False),               # identity unresolved
-        ("", "user-AAAAAAAA", True),                # unowned background/cron
+        ("", "user-AAAAAAAA", False),               # unowned -> fail closed
     ],
 )
 def test_ws_ownership_gate(
