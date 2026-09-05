@@ -1159,7 +1159,16 @@ class WebSocketChannel(BaseChannel):
             )
             if scope is None:
                 return
-            self._workspaces.persist_scope(cid, scope)
+            # [FIX 2026-09-05] Stamp the owning Supabase user so this chat is
+            # not left "unowned" (which would make it visible to every user).
+            # Previously only new_chat/fork stamped the owner, so a chat created
+            # via the per-connection default chat id (or any workspace change)
+            # leaked into every other user's sidebar and was readable by them.
+            self._workspaces.persist_scope(
+                cid,
+                scope,
+                owner_user_id=self._conn_supabase_user.get(connection, ""),
+            )
             # Other clients on the same gateway only need an invalidation; they
             # can reload the authoritative session row without receiving a
             # local project path that belongs to another connection.
@@ -1368,7 +1377,16 @@ class WebSocketChannel(BaseChannel):
                 if session_mentions:
                     metadata["session_mentions"] = session_mentions
             metadata[WORKSPACE_SCOPE_METADATA_KEY] = scope.metadata()
-            self._workspaces.persist_scope(cid, scope)
+            # [FIX 2026-09-05] Stamp the owning Supabase user on the primary
+            # messaging path too. Without this, a WebUI user's first message in
+            # their per-connection default chat never records an owner, leaving
+            # the chat "unowned" and therefore visible to / readable by every
+            # user (the core cross-user chat leak).
+            self._workspaces.persist_scope(
+                cid,
+                scope,
+                owner_user_id=supabase_user,
+            )
             is_webui = metadata.get("webui") is True
             queued_owner = None
             if is_webui and not is_user_shell and builtin_command_starts_agent_turn(content):

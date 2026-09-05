@@ -3917,3 +3917,61 @@ def test_ws_ownership_disabled_in_legacy_mode(
     # No supabase user bound; legacy mode must still allow.
     assert channel._owns_webui_chat(conn, "c1") is True
     assert channel._deny_unless_owner(conn, "c1") is False
+
+
+def test_persist_scope_stamps_owner_durably(
+    tmp_path: Path, bus: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[Bug C] persist_scope() with an owner actually records it.
+
+    The root cause of the cross-user chat leak was that the primary messaging /
+    set_workspace_scope paths called persist_scope() WITHOUT an owner, so a
+    WebUI user's default per-connection chat was never stamped. That left the
+    chat "unowned" and thus visible to / readable by every other user.
+    This regression test ensures the owner survives both in-memory AND on-disk
+    (post-restart) once it is passed to persist_scope(), and that the chat is
+    then gated to the owning user only.
+    """
+    monkeypatch.setenv("SUPABASE_WEBUI_AUTH", "true")
+    monkeypatch.setattr(
+        WebSocketChannel, "_supabase_webui_auth_enabled", staticmethod(lambda: True)
+    )
+    sm = SessionManager(tmp_path)
+    channel = _ch(bus, session_manager=sm, port=_free_port())
+
+    scope = channel._workspaces.default_scope()
+    channel._workspaces.persist_scope("c-new", scope, owner_user_id="user-AAAAAAAA")
+
+    # In-memory owner must be recorded.
+    assert channel._workspaces.session_owner_user_id("c-new") == "user-AAAAAAAA"
+
+    # Owner must survive a restart (only durable JSONL metadata remains).
+    sm.invalidate("websocket:c-new")
+    assert sm.get_cached("websocket:c-new") is None
+    assert channel._workspaces.session_owner_user_id("c-new") == "user-AAAAAAAA"
+
+    # Once owned by another user the chat is denied to a different user and the
+    # owning user is the only one with access.
+    alice = _IsolationConn()
+    bob = _IsolationConn()
+    channel._conn_supabase_user[alice] = "user-AAAAAAAA"
+    channel._conn_supabase_user[bob] = "user-BBBBBBBB"
+    assert channel._owns_webui_chat(alice, "c-new") is True
+    assert channel._owns_webui_chat(bob, "c-new") is False
+
+
+def test_persist_scope_empty_owner_leaves_chat_unowned(tmp_path: Path, bus: MagicMock) -> None:
+    """[Bug C] persist_scope() with no owner must NOT write a bogus owner tag.
+
+    Background/cron chats legitimately have no owner; passing an empty string
+    must not corrupt their "unowned" status (they remain deliverable). The
+    critical audience for this test is that we never stamp an empty owner which
+    would otherwise make a *real user's* chat look background-owned and leaky.
+    """
+    sm = SessionManager(tmp_path)
+    channel = _ch(bus, session_manager=sm, port=_free_port())
+
+    scope = channel._workspaces.default_scope()
+    channel._workspaces.persist_scope("c-bg", scope, owner_user_id="")
+
+    assert channel._workspaces.session_owner_user_id("c-bg") == ""
