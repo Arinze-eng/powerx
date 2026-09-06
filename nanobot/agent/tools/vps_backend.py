@@ -357,7 +357,17 @@ class VPSExecutionBackend:
             root = await self._resolve_workspace(conn)
             remote = self._remote_path(path, root)
             result = await conn.run(f"cat -- {shlex.quote(remote)}", check=False, timeout=30)
-            return str(result.stdout)[-_MAX_RESULT_CHARS:]
+            text = str(result.stdout or "")
+            if len(text) > _MAX_RESULT_CHARS:
+                # Mirror the Novita backend: announce truncation instead of
+                # silently dropping the head of large files.
+                return (
+                    f"[read truncated: file is {len(text)} characters; "
+                    f"showing only the LAST {_MAX_RESULT_CHARS}. Use run with "
+                    "head/sed -n/grep to read earlier sections]\n"
+                    + text[-_MAX_RESULT_CHARS:]
+                )
+            return text or "(empty file)"
         finally:
             conn.close()
             await conn.wait_closed()

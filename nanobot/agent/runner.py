@@ -1585,8 +1585,18 @@ class AgentRunner:
             for member in run:
                 args = member.arguments if isinstance(member.arguments, dict) else {}
                 op = dict(args)
-                op.setdefault("action", "")
+                # A member without an explicit action cannot be represented as
+                # a batch operation; keep it as its own standalone call rather
+                # than poisoning the whole merged batch with an empty action.
+                if not str(op.get("action", "")).strip():
+                    merged.append(member)
+                    continue
                 operations.append(op)
+            if len(operations) < 2:
+                # Nothing mergeable survived; execute members unchanged.
+                merged.extend(run)
+                i = j
+                continue
             batch_call = ToolCallRequest(
                 id=f"batch-{run[0].id}",
                 name="sandbox_batch",
@@ -1634,9 +1644,12 @@ class AgentRunner:
         arguments = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
         if isinstance(arguments, dict):
             action = str(arguments.get("action", "")).strip().lower()
-        # Only 'run'/'write'/'read' style sequential ops are worth batching;
+        # Only 'run'/'write' style sequential ops are worth batching.
+        # 'read' is deliberately NOT policed: the model often needs to inspect
+        # a result between steps, and forcing a batch just to read caused
+        # retry loops when the next action depended on what was read.
         # install/upload/download_url are typically one-off and left alone.
-        if action not in {"run", "write", "read"}:
+        if action not in {"run", "write"}:
             return None
         streak = int(state.get("single_run_streak", 0)) + 1
         state["single_run_streak"] = streak

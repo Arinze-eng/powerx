@@ -801,6 +801,13 @@ class NovitaSandboxTool(Tool):
                 return await backend.read(path)
             if action == "write":
                 content = str(kwargs.get("content") or "")
+                if len(content) > _MAX_CONTENT_CHARS:
+                    return ToolResult.error(
+                        f"content exceeds {_MAX_CONTENT_CHARS} characters. Do NOT retry with the same payload: "
+                        "instead split the file into sequential write ops (first op writes the head, "
+                        'then {"action":"run","command":"cat >> \\"<path>\\" << \'PX_EOF\'\\n...\\nPX_EOF"} '
+                        "appends each following chunk; use a unique heredoc marker)."
+                    )
                 await backend.write(path, content)
                 return f"Wrote {len(content)} characters to {path} in the remote VPS workspace."
             if action == "upload":
@@ -828,12 +835,14 @@ class NovitaSandboxTool(Tool):
                 downloaded = await backend.download(path, destination)
                 tmpfile = await upload_tmpfile_path(downloaded)
                 return (
-                    f"FILE READY FOR DOWNLOAD — give the user THIS link and do NOT "
-                    f"paste the file contents into your reply:\n"
+                    f"Downloaded remote artifact to local path: {downloaded}\n"
+                    "A temporary public download link is also available and expires soon:\n"
                     f"{tmpfile['download_url']}\n"
-                    f"(The file is also saved locally at {downloaded}; you may attach it "
-                    "via the message tool's media parameter for direct delivery. Prefer a "
-                    "single clear download link over dumping raw text.)"
+                    "Give the user this link and do NOT paste the file contents into "
+                    "your reply. The file may also be attached directly via the "
+                    "message tool's media parameter when direct attachment delivery "
+                    "is available. Prefer a single clear download link over dumping "
+                    "raw text."
                 )
             return ToolResult.error("Unknown sandbox action")
         except Exception as exc:
@@ -878,11 +887,29 @@ class NovitaSandboxTool(Tool):
                 path = _safe_path(str(kwargs.get("path") or ""))
                 if action == "read":
                     content = await asyncio.to_thread(sandbox.files.read, path)
-                    return str(content)[-_MAX_RESULT_CHARS:]
+                    text = str(content)
+                    if len(text) > _MAX_RESULT_CHARS:
+                        # Never silently drop the beginning of a large file —
+                        # models assume they saw everything and write broken
+                        # edits. Keep the tail (most relevant for logs) but
+                        # tell the model exactly what is missing and how to
+                        # inspect the rest cheaply.
+                        return (
+                            f"[read truncated: file is {len(text)} characters; "
+                            f"showing only the LAST {_MAX_RESULT_CHARS}. Use "
+                            "action=run with head/sed -n/grep to read earlier "
+                            "sections]\n" + text[-_MAX_RESULT_CHARS:]
+                        )
+                    return text or "(empty file)"
                 if action == "write":
                     content = str(kwargs.get("content") or "")
                     if len(content) > _MAX_CONTENT_CHARS:
-                        return ToolResult.error(f"content exceeds {_MAX_CONTENT_CHARS} characters")
+                        return ToolResult.error(
+                            f"content exceeds {_MAX_CONTENT_CHARS} characters. Do NOT retry with the same payload: "
+                            "instead split the file into sequential write ops (first op writes the head, "
+                            'then {"action":"run","command":"cat >> \\"<path>\\" << \'PX_EOF\'\\n...\\nPX_EOF"} '
+                            "appends each following chunk; use a unique heredoc marker)."
+                        )
                     await asyncio.to_thread(sandbox.files.write, path, content)
                     return f"Wrote {len(content)} characters to {path} in the remote sandbox."
                 if action == "upload":
