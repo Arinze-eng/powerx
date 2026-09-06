@@ -1468,6 +1468,14 @@ class AgentRunner:
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         hook = hook or AgentHook()
         context = context or AgentHookContext(iteration=0, messages=[])
+        # --- Manus-style hard auto-batching ---------------------------------
+        # When the model emits several novita_sandbox operations in ONE turn we
+        # fold them into a single sandbox_batch execution so the whole group is
+        # treated as one unit of work. This keeps the number of *iterations*
+        # (and therefore LLM round-trips / billed steps) flat no matter how many
+        # individual commands the model wanted to run. Only rewrites when the
+        # batch tool is actually available; otherwise behaviour is unchanged.
+        tool_calls = self._coalesce_sandbox_calls(spec, tool_calls)
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
@@ -1530,6 +1538,69 @@ class AgentRunner:
     # code change.
     _BATCH_ENFORCE_AFTER = int(os.environ.get("POWERX_BATCH_ENFORCE_AFTER", "3"))
 
+    def _coalesce_sandbox_calls(
+        self,
+        spec: AgentRunSpec,
+        tool_calls: list[ToolCallRequest],
+    ) -> list[ToolCallRequest]:
+        """Fold runs of >=2 consecutive novita_sandbox calls into one batch.
+
+        The Manus property we want at the runtime level is: *many sandbox
+        operations should not translate into many LLM round-trips*. When the
+        model already emits several sandbox ops in a single assistant turn, we
+        merge each maximal run of them into one synthetic ``sandbox_batch`` call
+        so they execute as a unit and produce one combined tool result. Non-
+        sandbox calls (and lone sandbox calls) pass through untouched. This is a
+        no-op unless the batch tool is registered, so agents without it keep the
+        exact prior behaviour.
+        """
+        if len(tool_calls) < 2:
+            return tool_calls
+        has_batch = bool(getattr(spec.tools, "has", lambda _: False)("sandbox_batch"))
+        if not has_batch:
+            return tool_calls
+
+        merged: list[ToolCallRequest] = []
+        i = 0
+        n = len(tool_calls)
+        while i < n:
+            tc = tool_calls[i]
+            if tc.name != "novita_sandbox":
+                merged.append(tc)
+                i += 1
+                continue
+            # Collect the maximal run of consecutive novita_sandbox calls.
+            run: list[ToolCallRequest] = [tc]
+            j = i + 1
+            while j < n and tool_calls[j].name == "novita_sandbox":
+                run.append(tool_calls[j])
+                j += 1
+            if len(run) == 1:
+                merged.append(tc)
+                i = j
+                continue
+            operations: list[dict[str, Any]] = []
+            for member in run:
+                args = member.arguments if isinstance(member.arguments, dict) else {}
+                op = dict(args)
+                op.setdefault("action", "")
+                operations.append(op)
+            batch_call = ToolCallRequest(
+                id=f"batch-{run[0].id}",
+                name="sandbox_batch",
+                arguments={
+                    "operations": operations,
+                    "stop_on_error": False,
+                },
+            )
+            merged.append(batch_call)
+            logger.debug(
+                "Coalesced {} consecutive novita_sandbox calls into one sandbox_batch",
+                len(run),
+            )
+            i = j
+        return merged
+
     def _batch_enforcement_check(
         self,
         spec: AgentRunSpec,
@@ -1573,10 +1644,13 @@ class AgentRunner:
             f"BATCHING REQUIRED: you have issued {streak} separate novita_sandbox "
             f"'{action}' steps in this task, and each one costs a full model round-trip "
             "and a billed step. Stop doing single commands. Combine the remaining work "
-            "into ONE sandbox_batch call — ideally write a single script (bash/python) "
-            "that performs every step and prints a summary, then run it once inside the "
-            "batch. Chain related shell commands with && instead of splitting them "
-            "across turns. Retry now using sandbox_batch."
+            "into ONE sandbox_batch call. Format it as: "
+            '{"operations": [{"action": "write", "path": "/workspace/setup.sh", '
+            '"content": "<a bash script that does every remaining step and prints a '
+            'summary>"}, {"action": "run", "command": "bash /workspace/setup.sh"}]}. '
+            "Put loops, installs, builds and checks INSIDE that script so the sandbox "
+            "runs them without extra model calls. Chain shell commands with && instead "
+            "of splitting them across turns. Retry now using sandbox_batch."
         )
         event = {
             "name": name,
