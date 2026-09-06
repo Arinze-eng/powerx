@@ -320,7 +320,12 @@ def ensure_file_tool_enabled(config_path: Path) -> bool:
 
 
 def main() -> int:
-    if os.environ.get("RENDER") != "true" or len(sys.argv) != 2:
+    # Previously gated on RENDER=="true", but Render does not always inject that
+    # variable (observed missing on this service), which silently disabled the
+    # whole provider/model migration and left users stuck on a stale model. The
+    # migration is safe to run anywhere as long as it is given a config path and
+    # the LLM_* env vars are present (checked inside _ensure_provider_defaults).
+    if len(sys.argv) != 2:
         return 0
     changed = ensure_render_defaults(Path(sys.argv[1]).expanduser())
     if changed:
