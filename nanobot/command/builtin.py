@@ -242,6 +242,22 @@ async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
 
     async def _do_restart():
         await asyncio.sleep(1)
+        # Re-apply the Render/env config migration before re-execing. /restart
+        # uses os.execv which bypasses entrypoint.sh, so without this a stale
+        # on-disk config.json (e.g. an old Gemini model/preset/fallback) would be
+        # reloaded verbatim and the operator's LLM_* env change would never take
+        # effect until a full container redeploy. We shell out to the same script
+        # the entrypoint runs (if present) so behaviour matches a fresh boot.
+        # Best-effort: never block the restart on a migration error.
+        with suppress(Exception):
+            from nanobot.config.loader import get_config_path
+            for candidate in ("/app/scripts/ensure_render_config.py", "scripts/ensure_render_config.py"):
+                if os.path.exists(candidate):
+                    subprocess.run(
+                        [sys.executable, candidate, str(get_config_path())],
+                        check=False, timeout=20, capture_output=True,
+                    )
+                    break
         argv = [sys.executable, "-m", "nanobot"] + sys.argv[1:]
         mode = ctx.loop.restart_mode or "auto"
         if mode == "auto":
