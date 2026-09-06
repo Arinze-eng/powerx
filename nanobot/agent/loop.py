@@ -183,10 +183,23 @@ class TurnContext:
         return self.session
 
 
+def _force_env_model_enabled() -> bool:
+    """Whether all sessions must use the global env-backed default model.
+
+    Defaults to TRUE for this deployment so that stale per-session pinned model
+    presets (stored in session metadata) cannot make /status flip between models
+    across tasks. Set POWERX_FORCE_ENV_MODEL=0 to restore per-session preset
+    selection (e.g. if you later want users to pick their own model).
+    """
+    raw = os.environ.get("POWERX_FORCE_ENV_MODEL")
+    if raw is None or not raw.strip():
+        return True  # default: env model is authoritative for every session
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
-
     It:
     1. Receives messages from the bus
     2. Builds context with history, memory, skills
@@ -564,6 +577,19 @@ class AgentLoop:
         recover_removed: bool = True,
     ) -> LLMRuntime:
         """Resolve the immutable runtime selected by one session."""
+        # Operator kill-switch: when POWERX_FORCE_ENV_MODEL is set, every session
+        # uses the global env-backed default and any stale per-session pinned
+        # preset is ignored (and cleared). Sessions created while an old model was
+        # active kept their own _nanobot_model_preset, so /status flipped between
+        # DeepSeek (fresh sessions) and Gemini (older pinned sessions) regardless
+        # of global config migrations. This makes the env model authoritative for
+        # ALL sessions until the operator opts out.
+        if _force_env_model_enabled():
+            if SESSION_MODEL_PRESET_METADATA_KEY in session.metadata:
+                session.metadata.pop(SESSION_MODEL_PRESET_METADATA_KEY, None)
+                with suppress(Exception):
+                    self.sessions.save(session)
+            return self.llm_runtime()
         name = model_preset_from_metadata(session.metadata)
         if name is None:
             return self.llm_runtime()

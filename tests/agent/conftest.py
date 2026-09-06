@@ -20,6 +20,19 @@ def cmd_python() -> str:
     return "python" if os.name == "nt" else "python3"
 
 
+@pytest.fixture(autouse=True)
+def _allow_session_model_presets(monkeypatch):
+    """Agent tests exercise per-session model-preset selection.
+
+    Production defaults POWERX_FORCE_ENV_MODEL to on (every session uses the
+    global env-backed model, ignoring stale per-session presets). That would make
+    these tests' session-pinned runtimes resolve to the wrong model, so opt out
+    here and test the per-session feature as designed. Individual tests can still
+    monkeypatch it back on.
+    """
+    monkeypatch.setenv("POWERX_FORCE_ENV_MODEL", "0")
+
+
 def make_provider(
     default_model: str = "test-model",
     *,
