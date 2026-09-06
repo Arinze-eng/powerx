@@ -149,6 +149,17 @@ def _ensure_provider_defaults(data: dict[str, Any]) -> bool:
     if isinstance(existing_fallbacks, list) and existing_fallbacks:
         defaults["fallback_models"] = []
         changed = True
+
+    # A persisted active model_preset name OVERRIDES agents.defaults.model
+    # (see schema: "Active preset name — takes precedence over fields below").
+    # If the operator selected a preset earlier whose model is not the env
+    # model (e.g. a leftover "gemini…" preset), /status keeps showing that
+    # model even after we force defaults.model. When env defines the provider,
+    # drop the active preset selection so the env-backed default actually wins.
+    for preset_key in ("model_preset", "modelPreset"):
+        if preset_key in defaults and defaults.get(preset_key):
+            defaults[preset_key] = None
+            changed = True
     return changed
 
 

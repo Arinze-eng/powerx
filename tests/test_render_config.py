@@ -163,6 +163,34 @@ def test_render_defaults_clear_stale_gemini_fallback(tmp_path: Path, monkeypatch
     assert updated["agents"]["defaults"]["model"] == "custom/${LLM_MODEL}"
 
 
+def test_render_defaults_clear_stale_active_model_preset(tmp_path: Path, monkeypatch) -> None:
+    """A persisted active model_preset (which takes precedence over defaults.model)
+    must be dropped when env defines the provider — otherwise /status keeps showing
+    the preset's model (e.g. gemini) even though defaults.model was forced to env."""
+    config_path = tmp_path / "config.json"
+    original = {
+        "agents": {
+            "defaults": {
+                "model": "custom/deepseek-v4-flash",
+                "provider": "custom",
+                "model_preset": "GeminiFlash",
+            }
+        },
+        "model_presets": {"GeminiFlash": {"model": "custom/gemini-3.1-flash-lite"}},
+        "providers": {"custom": {"apiBase": "${LLM_BASE_URL}", "apiKey": "${LLM_API_KEY}"}},
+    }
+    config_path.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setenv("LLM_BASE_URL", "https://kymaapi.com/v1")
+    monkeypatch.setenv("LLM_API_KEY", "kyma-key")
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-flash")
+
+    assert ensure_render_defaults(config_path) is True
+    updated = json.loads(config_path.read_text(encoding="utf-8"))
+    d = updated["agents"]["defaults"]
+    assert not d.get("model_preset"), f"preset should be cleared, got {d.get('model_preset')}"
+    assert d["model"] == "custom/${LLM_MODEL}"
+
+
 def test_render_defaults_leave_config_untouched_without_env(
     tmp_path: Path, monkeypatch
 ) -> None:
