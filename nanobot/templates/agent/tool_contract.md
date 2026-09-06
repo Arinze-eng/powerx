@@ -84,6 +84,20 @@ possible**:
 - Reserve separate turns for moments where you genuinely need to inspect an
   intermediate result before choosing what to do next.
 
+## File Delivery (return links, not raw dumps)
+
+When you produce or retrieve a file for the user (report, dataset, image, archive,
+generated code bundle, etc.):
+
+- **Do NOT paste the full file contents into your chat reply.** That wastes tokens
+  and is hard to use.
+- Instead call `novita_sandbox` with `action=download_url` (or `sandbox_batch`
+  containing that op) to get a public download link, then give the user that single
+  link — optionally attach the local path via the message tool's media parameter for
+  direct delivery on Telegram/WebUI.
+- Only inline small snippets when the user explicitly asks to see them; default to a
+  link for anything larger than a few lines.
+
 ## Process Execution
 
 - Use `exec` for tests, builds, package commands, git commands, and other process execution.

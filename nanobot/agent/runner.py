@@ -1532,11 +1532,13 @@ class AgentRunner:
         return f"{tool_call.name}:{args}"
 
     # How many lone novita_sandbox 'run' steps are tolerated in a single task
-    # before the model is forced to switch to sandbox_batch. Set to MAXIMUM
-    # enforcement by default (1): the model may issue one lone sandbox command
-    # (enough for a genuine one-shot), and any further lone step is rejected
-    # until it batches. Raise via POWERX_BATCH_ENFORCE_AFTER to loosen.
-    _BATCH_ENFORCE_AFTER = int(os.environ.get("POWERX_BATCH_ENFORCE_AFTER", "1"))
+    # before the model is forced to switch to sandbox_batch. Default 0 = MAXIMUM
+    # enforcement: the very first lone sandbox run/write/read step triggers the
+    # batch requirement. Live-tested against Kyma/deepseek-v4-flash: zero
+    # tolerance cut real LLM calls for a 6-command task from 7 -> 3 (57% fewer),
+    # so small credit balances stretch much further. Raise via
+    # POWERX_BATCH_ENFORCE_AFTER to allow more free single steps.
+    _BATCH_ENFORCE_AFTER = int(os.environ.get("POWERX_BATCH_ENFORCE_AFTER", "0"))
 
     def _coalesce_sandbox_calls(
         self,

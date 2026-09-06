@@ -828,10 +828,12 @@ class NovitaSandboxTool(Tool):
                 downloaded = await backend.download(path, destination)
                 tmpfile = await upload_tmpfile_path(downloaded)
                 return (
-                    f"Downloaded remote artifact to local path: {downloaded}. "
-                    f"A temporary public download link is also available: {tmpfile['download_url']}. "
-                    "Use the message tool with the local path in media for direct attachment "
-                    "delivery, or provide the temporary link when a URL is preferred."
+                    f"FILE READY FOR DOWNLOAD — give the user THIS link and do NOT "
+                    f"paste the file contents into your reply:\n"
+                    f"{tmpfile['download_url']}\n"
+                    f"(The file is also saved locally at {downloaded}; you may attach it "
+                    "via the message tool's media parameter for direct delivery. Prefer a "
+                    "single clear download link over dumping raw text.)"
                 )
             return ToolResult.error("Unknown sandbox action")
         except Exception as exc:
