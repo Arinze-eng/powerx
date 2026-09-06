@@ -65,8 +65,13 @@ TELEGRAM_HTML_MAX_LEN = 4096
 TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
 # Hard Telegram Bot API cap: get_file() cannot download files >= 20 MiB. When a
 # user forwards/sends a larger file, Telegram clips the reported file_size to
-# exactly this ceiling, so size >= this value reliably means "too big to fetch".
+# this value so we can detect it before attempting the doomed download.
 TELEGRAM_BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+# Cumulative reasoning text kept per chat for the live activity card. Long
+# thinking streams (deep-reasoning models) grow unbounded otherwise — on the
+# 512 MB Render plan that alone can push the process into swap and freeze every
+# channel. The card only ever shows the tail, so keep the last N chars.
+LIVE_REASONING_MAX_CHARS = 8_000
 
 
 def _is_telegram_too_big_error(exc: BaseException) -> bool:
@@ -682,6 +687,10 @@ class TelegramChannel(BaseChannel):
         redirect_lib_logging("telegram")
         redirect_lib_logging("httpx", level="WARNING")
 
+        # Sweep leftover downloaded media from previous deploys/uptime once at
+        # boot, before any handler can pile more onto a nearly-full disk.
+        self._cleanup_stale_media()
+
         self._running = True
         backoff = RESTART_BACKOFF_INITIAL_SECONDS
         while self._running:
@@ -883,6 +892,28 @@ class TelegramChannel(BaseChannel):
         # HTTP error statuses count too: the watchdog detects transport stalls,
         # not logical failures.
         self._last_poll_ok = time.monotonic()
+
+    def _prune_stale_buffers(self) -> None:
+        """Drop leaked per-chat buffers so long-lived chats can't grow memory.
+
+        Activity/reasoning/stream buffers are normally cleared at end of turn;
+        aborted or crashed turns leave entries behind. Anything untouched for
+        over an hour belongs to a dead turn and is safe to forget — the next
+        user message simply starts a fresh activity card. Also clears the
+        reasoning stream for chats whose activity buffer already closed (the
+        card's text is no longer shown there).
+        """
+        cutoff = time.monotonic() - 3600.0
+        for chat_key, buf in list(self._activity_bufs.items()):
+            if buf.last_edit < cutoff:
+                self._activity_bufs.pop(chat_key, None)
+                self._reasoning_stream.pop(chat_key, None)
+        for chat_key in list(self._reasoning_stream):
+            if chat_key not in self._activity_bufs:
+                self._reasoning_stream.pop(chat_key, None)
+        for chat_key, buf in list(self._stream_bufs.items()):
+            if getattr(buf, "last_edit", 0.0) < cutoff:
+                self._stream_bufs.pop(chat_key, None)
 
     async def _watch_polling(self) -> bool:
         """Idle until stop(); in polling mode, return True when getUpdates goes stale."""
@@ -1205,7 +1236,13 @@ class TelegramChannel(BaseChannel):
         if not (delta or "").strip():
             return
         chat_key = str(chat_id)
-        self._reasoning_stream[chat_key] = self._reasoning_stream.get(chat_key, "") + delta
+        merged = self._reasoning_stream.get(chat_key, "") + delta
+        # Bound per-chat reasoning memory: keep only the tail that can appear
+        # on the card. Without this a long thinking stream accumulates tens of
+        # MB per chat on the 512 MB free plan and freezes every channel.
+        if len(merged) > LIVE_REASONING_MAX_CHARS:
+            merged = "…" + merged[-(LIVE_REASONING_MAX_CHARS - 1):]
+        self._reasoning_stream[chat_key] = merged
         # Ensure a working message exists so reasoning has a home in the single bubble.
         buf = self._activity_buf(chat_key)
         if not buf.text.startswith("🤖 Working…"):
@@ -1229,6 +1266,9 @@ class TelegramChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
+        # Opportunistically forget leaked per-chat buffers (aborted turns leave
+        # activity/reasoning/stream state behind; on 512 MB it must not pile up).
+        self._prune_stale_buffers()
         app = await self._wait_for_app()
         if app is None:
             self.logger.warning("bot not running")
@@ -2125,7 +2165,12 @@ class TelegramChannel(BaseChannel):
             media_dir = get_media_dir("telegram")
             unique_id = getattr(media_file, "file_unique_id", media_file.file_id)
             file_path = media_dir / f"{unique_id}{ext}"
-            await file.download_to_drive(str(file_path))
+            # Bound the download itself: Telegram's bot server reports the file
+            # as available but streams it slowly; a stalled/huge download used to
+            # hang this handler (and the whole inbound worker for the chat) with
+            # no timeout. 120 s is generous for ~19 MB on Render's links.
+            async with asyncio.timeout(120):
+                await file.download_to_drive(str(file_path))
             path_str = str(file_path)
             if media_type in ("voice", "audio"):
                 transcription = await self.transcribe_audio(file_path)
@@ -2430,6 +2475,10 @@ class TelegramChannel(BaseChannel):
         """Handle incoming messages (text, photos, voice, documents)."""
         if not update.message or not update.effective_user:
             return
+        # Opportunistically evict stale downloaded media so the container disk
+        # never fills up (a full disk makes every file/image download fail and
+        # looks like "the bot froze until I redeploy"). Cheap: one dir scan.
+        self._cleanup_stale_media()
         if not self._running:
             await self._process_message_update(update, context)
             return
@@ -2715,6 +2764,47 @@ class TelegramChannel(BaseChannel):
         for key, pending in list(self._pending_attachments.items()):
             if pending.expires_at <= now:
                 self._discard_pending_attachments(key)
+
+    def _cleanup_stale_media(self) -> None:
+        """Delete channel media files older than ~24 h (bounded by size cap).
+
+        Telegram downloads every inbound photo/document into ``media/telegram``
+        and nothing ever removed them. On Render's free tier the container disk
+        fills up over days; once writes fail, media downloads raise and the bot
+        stops responding to file messages until a redeploy wipes the disk. Files
+        still referenced by an active turn are minutes old, so a 24 h horizon is
+        safe; the newest files are kept even within the horizon when the folder
+        exceeds the cap.
+        """
+        now = time.time()
+        max_age_seconds = 24 * 3600
+        max_total_bytes = 500 * 1024 * 1024
+        try:
+            media_dir = get_media_dir("telegram")
+            entries = [p for p in media_dir.iterdir() if p.is_file()]
+        except OSError:
+            return
+        survivors: list[tuple[float, int, Path]] = []
+        for path in entries:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if now - stat.st_mtime > max_age_seconds:
+                with suppress(OSError):
+                    path.unlink()
+                continue
+            survivors.append((stat.st_mtime, stat.st_size, path))
+        # Enforce the size cap by evicting oldest-first beyond it.
+        survivors.sort()
+        total = sum(size for _, size, _ in survivors)
+        idx = 0
+        while total > max_total_bytes and idx < len(survivors):
+            _, size, path = survivors[idx]
+            with suppress(OSError):
+                path.unlink()
+            total -= size
+            idx += 1
 
     async def _send_attachment_prompt(
         self, *, chat_id: str, metadata: dict[str, Any], media_paths: list[str], context: str,
