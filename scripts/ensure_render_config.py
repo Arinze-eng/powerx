@@ -137,6 +137,18 @@ def _ensure_provider_defaults(data: dict[str, Any]) -> bool:
     if custom.get("apiKey") != "${LLM_API_KEY}":
         custom["apiKey"] = "${LLM_API_KEY}"
         changed = True
+
+    # The env-backed provider is the single source of truth, so any persisted
+    # fallback_models list (e.g. a stale "custom/gemini-3.1-flash-lite" left by
+    # an earlier admin save) must be cleared too. Otherwise FallbackProvider
+    # transparently fails over from DeepSeek to Gemini on the first transient
+    # error, which surfaces as "first call DeepSeek, second call Gemini".
+    # Operators can re-add intentional fallbacks via the model-preset UI; the
+    # boot-time contract here is "env wins, no surprise failover".
+    existing_fallbacks = defaults.get("fallback_models")
+    if isinstance(existing_fallbacks, list) and existing_fallbacks:
+        defaults["fallback_models"] = []
+        changed = True
     return changed
 
 

@@ -113,8 +113,7 @@ def test_render_defaults_env_overrides_stale_admin_provider(
     tmp_path: Path, monkeypatch
 ) -> None:
     """Env-backed provider must win over any persisted value, including a model
-    that was previously saved via the admin panel. This is what stops users from
-    being stuck on a stale model after the operator reconfigures LLM_* env vars."""
+    previously saved via the admin panel."""
     config_path = tmp_path / "config.json"
     original = {
         "agents": {"defaults": {"model": "custom/admin-selected-model"}},
@@ -132,10 +131,36 @@ def test_render_defaults_env_overrides_stale_admin_provider(
 
     assert ensure_render_defaults(config_path) is True
     updated = json.loads(config_path.read_text(encoding="utf-8"))
-    # Env references now take precedence over the stale admin selection.
     assert updated["agents"]["defaults"]["model"] == "custom/${LLM_MODEL}"
     assert updated["providers"]["custom"]["apiBase"] == "${LLM_BASE_URL}"
     assert updated["providers"]["custom"]["apiKey"] == "${LLM_API_KEY}"
+
+
+def test_render_defaults_clear_stale_gemini_fallback(tmp_path: Path, monkeypatch) -> None:
+    """A persisted fallback_models entry (e.g. gemini left by an old admin save)
+    must be cleared when env defines the provider, otherwise FallbackProvider
+    silently fails DeepSeek over to Gemini on transient errors — the exact
+    'first call DeepSeek, second call Gemini' symptom."""
+    config_path = tmp_path / "config.json"
+    original = {
+        "agents": {
+            "defaults": {
+                "model": "custom/deepseek-v4-flash",
+                "provider": "custom",
+                "fallback_models": ["custom/gemini-3.1-flash-lite"],
+            }
+        },
+        "providers": {"custom": {"apiBase": "${LLM_BASE_URL}", "apiKey": "${LLM_API_KEY}"}},
+    }
+    config_path.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setenv("LLM_BASE_URL", "https://kymaapi.com/v1")
+    monkeypatch.setenv("LLM_API_KEY", "kyma-key")
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-flash")
+
+    assert ensure_render_defaults(config_path) is True
+    updated = json.loads(config_path.read_text(encoding="utf-8"))
+    assert updated["agents"]["defaults"]["fallback_models"] == []
+    assert updated["agents"]["defaults"]["model"] == "custom/${LLM_MODEL}"
 
 
 def test_render_defaults_leave_config_untouched_without_env(
