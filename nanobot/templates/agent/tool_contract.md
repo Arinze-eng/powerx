@@ -58,15 +58,22 @@
 
 ## Batched Execution in the Sandbox (cost-critical, ENFORCED)
 
+**GOLDEN RULE — one script, one run.** For ANY task that needs more than a couple
+of sandbox operations, aim for **two model calls total**: (1) emit ONE `sandbox_batch`
+that writes a single self-contained script containing *every* step and runs it, then
+(2) read the summary and reply. The sandbox executes all commands autonomously between
+those two calls — so 60 commands cost the same ~2 calls as 5. Do this regardless of
+which model you are; it is always correct and always cheapest.
+
 Every separate tool turn costs a fresh model call and a billed step. Doing many
 small steps one-at-a-time inside the sandbox multiplies cost linearly. To work
 like an efficient autonomous agent, **collapse related work into as few calls as
 possible**:
 
-- **This is enforced at runtime:** after a few lone `novita_sandbox` run/write/read
-  steps in one task, further single steps are rejected until you switch to
-  `sandbox_batch`. Do not wait to be blocked — batch from the start on any task
-  that needs more than ~3 sandbox operations.
+- **This is enforced at runtime:** after even one lone `novita_sandbox` run/write/read
+  step in a task, further single steps are rejected until you switch to
+  `sandbox_batch`. Do not wait to be blocked — batch from the very first action on any
+  task that needs more than one sandbox operation.
 
 - When coding or running operations in the isolated sandbox, prefer the
   `sandbox_batch` tool over calling `novita_sandbox` repeatedly. A single
