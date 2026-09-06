@@ -285,26 +285,27 @@ def test_render_defaults_do_not_raise_already_higher_values(tmp_path: Path) -> N
     assert defaults["maxToolResultChars"] == 1_000_000
 
 
-def test_render_defaults_disable_telegram_steps(tmp_path: Path) -> None:
-    """Telegram step/progress/reasoning flags are forced OFF on Render.
+def test_render_defaults_enable_telegram_steps(tmp_path: Path) -> None:
+    """Telegram step/progress/reasoning flags are forced ON for Render.
 
-    The operator wants the bot to stop showing steps (the live working-message
-    card, tool hints, per-step progress, and model reasoning). The migration must
-    overwrite the existing on-disk config (which previously forced these to True)
-    with False so the live bot stops showing them on the next deploy/restart.
+    The operator wants the bot to mirror the WebUI experience: every agent
+    step, tool hint and the model's reasoning should be visible as the turn
+    progresses. The migration must overwrite the existing on-disk config
+    (which a previous migration forced to False) with True so the live bot
+    shows steps again on the next deploy/restart.
     """
     config_path = tmp_path / "config.json"
-    # Simulate the live on-disk config that previously had steps enabled.
+    # Simulate the live on-disk config that previously had steps disabled.
     config_path.write_text(
         json.dumps(
             {
                 "channels": {
                     "telegram": {
                         "mode": "polling",
-                        "liveActivity": True,
-                        "sendToolHints": True,
-                        "sendProgress": True,
-                        "showReasoning": True,
+                        "liveActivity": False,
+                        "sendToolHints": False,
+                        "sendProgress": False,
+                        "showReasoning": False,
                     }
                 }
             }
@@ -314,7 +315,7 @@ def test_render_defaults_disable_telegram_steps(tmp_path: Path) -> None:
 
     assert ensure_render_defaults(config_path) is True
     telegram = json.loads(config_path.read_text(encoding="utf-8"))["channels"]["telegram"]
-    assert telegram["liveActivity"] is False
-    assert telegram["sendToolHints"] is False
-    assert telegram["sendProgress"] is False
-    assert telegram["showReasoning"] is False
+    assert telegram["liveActivity"] is True
+    assert telegram["sendToolHints"] is True
+    assert telegram["sendProgress"] is True
+    assert telegram["showReasoning"] is True

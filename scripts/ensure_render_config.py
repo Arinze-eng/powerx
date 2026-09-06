@@ -164,23 +164,22 @@ def _ensure_provider_defaults(data: dict[str, Any]) -> bool:
 
 
 def _ensure_telegram_polling_defaults(data: dict[str, Any]) -> bool:
-    """Force Telegram into pure polling mode and stop step/progress noise on Render.
+    """Force Telegram into pure polling mode and SHOW steps/reasoning on Render.
 
-    The previous default forced streamed step/tool/reasoning events into a single
-    live "working" message (liveActivity) so users saw every step. The operator
-    wants the bot to STOP showing steps, so the migration now hard-pins the
-    progress-affecting flags to False. Setting them False here (rather than just
-    leaving the committed render-config.json) matters because Render keeps a live
-    ``~/.nanobot/config.json`` that already has these set True — this migration
-    runs on every boot (entrypoint) and flips the existing on-disk config so the
-    change takes effect on the next deploy/restart.
+    The operator wants the Telegram bot to mirror the WebUI experience: every
+    agent step, tool hint and the model's reasoning stream should be visible as
+    the turn progresses. These flags are hard-pinned to True here (rather than
+    just relying on the committed render-config.json) because Render keeps a
+    live ``~/.nanobot/config.json`` that may still carry the older False values
+    from the previous migration — this migration runs on every boot (entrypoint)
+    and flips the existing on-disk config so the change takes effect on the
+    next deploy/restart.
 
-    * ``liveActivity``   — the single in-place-edited step/working message.
+    * ``liveActivity``   — consolidate step/tool events into ONE in-place-edited
+      "working" message (no per-step message spam).
     * ``sendToolHints``  — tool-call hints (e.g. ``read_file("...")``).
-    * ``sendProgress``   — per-step progress text (also the fallback that would
-      otherwise spam a separate message per step when liveActivity is off).
+    * ``sendProgress``   — per-step progress text.
     * ``showReasoning``  — the model's 💭 "thinking" block.
-    All are pinned to False so the bot replies with just the final answer.
     """
     channels = data.setdefault("channels", {})
     if not isinstance(channels, dict):
@@ -196,8 +195,8 @@ def _ensure_telegram_polling_defaults(data: dict[str, Any]) -> bool:
     if telegram.get("streaming") is not True:
         telegram["streaming"] = True
         changed = True
-    # Stop showing steps: disable the live activity card, tool/progress events,
-    # and model reasoning on Telegram (the operator wants only the final reply).
+    # Show steps: enable the live activity card, tool/progress events, and
+    # model reasoning on Telegram so the bot mirrors the WebUI step-by-step UX.
     step_flags = (
         ("liveActivity", "live_activity"),
         ("sendToolHints", "send_tool_hints"),
@@ -206,8 +205,8 @@ def _ensure_telegram_polling_defaults(data: dict[str, Any]) -> bool:
     )
     for camel, snake in step_flags:
         current = telegram.get(camel, telegram.get(snake))
-        if current is not False:
-            telegram[camel] = False
+        if current is not True:
+            telegram[camel] = True
             changed = True
     for webhook_key in (
         "webhookUrl",
@@ -297,6 +296,36 @@ def _ensure_high_context_defaults(data: dict[str, Any]) -> bool:
     return changed
 
 
+def _ensure_subagent_concurrency_cap(data: dict[str, Any]) -> bool:
+    """Cap concurrent subagents on Render's free tier (512 MB RAM).
+
+    Each spawned subagent runs its own agent loop with a full tool registry in
+    memory. On the free plan, several concurrent subagents plus Telegram polling
+    and the WebUI gateway can push the process past the memory ceiling, which
+    swaps/thrashes and freezes every channel at once. Pinning
+    ``maxConcurrentSubagents`` to 2 keeps fan-out bounded while still allowing
+    one background task to run alongside a foreground consultation.
+    """
+    agents = data.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        return False
+    defaults = agents.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        return False
+    cap = 2
+    current = defaults.get("maxConcurrentSubagents", defaults.get("max_concurrent_subagents"))
+    try:
+        if current is not None and int(current) <= cap:
+            return False
+    except (TypeError, ValueError):
+        pass
+    # Drop any snake_case twin so the camelCase value unambiguously wins.
+    for key in ("max_concurrent_subagents",):
+        defaults.pop(key, None)
+    defaults["maxConcurrentSubagents"] = cap
+    return True
+
+
 def ensure_render_defaults(config_path: Path) -> bool:
     """Apply attachment and deliberate-execution defaults without clobbering config."""
     data = _load_config(config_path)
@@ -308,6 +337,7 @@ def ensure_render_defaults(config_path: Path) -> bool:
     changed = _ensure_telegram_polling_defaults(data) or changed
     changed = _ensure_deliberate_defaults(data) or changed
     changed = _ensure_high_context_defaults(data) or changed
+    changed = _ensure_subagent_concurrency_cap(data) or changed
     return _write_config(config_path, data) if changed else False
 
 

@@ -32,10 +32,10 @@
       "allowFrom": ["*"],
       "groupPolicy": "mention",
       "streaming": true,
-      "liveActivity": false,
-      "sendToolHints": false,
-      "sendProgress": false,
-      "showReasoning": false
+      "liveActivity": true,
+      "sendToolHints": true,
+      "sendProgress": true,
+      "showReasoning": true
     },
     "websocket": {
       "enabled": true,

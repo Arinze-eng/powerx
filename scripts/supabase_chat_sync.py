@@ -59,6 +59,18 @@ SKIP_DIRS: frozenset[str] = frozenset(
 MAX_SYNC_BYTES = 20 * 1024 * 1024
 # Relative sub-dirs under the runtime data dir that hold chat history.
 SYNC_DIRS: tuple[str, ...] = ("webui", "sessions")
+# Durable agent-memory files under ``workspace/`` that must survive Render's
+# ephemeral disk (SOUL.md / USER.md persona + memory/MEMORY.md long-term
+# memory + memory/history.jsonl append-only log). Synced alongside chats so a
+# redeploy rehydrates the bot's memories instead of starting amnesiac.
+MEMORY_FILES: frozenset[str] = frozenset(
+    {
+        "workspace/SOUL.md",
+        "workspace/USER.md",
+        "workspace/memory/MEMORY.md",
+        "workspace/memory/history.jsonl",
+    }
+)
 
 
 class ChatSync:
@@ -134,8 +146,9 @@ class ChatSync:
     def _iter_chat_files(self):
         """Yield ``(rel_path, file_path)`` for chat history files to sync.
 
-        ``rel_path`` always begins with a managed sub-dir (``webui/`` or
-        ``sessions/``) so it maps to a stable ``chatbackup:`` key.
+        ``rel_path`` always begins with a managed sub-dir (``webui/``,
+        ``sessions/`` or ``workspace/``) so it maps to a stable ``chatbackup:``
+        key.
         """
         for sub in SYNC_DIRS:
             base_dir = self.data_dir / sub
@@ -157,6 +170,17 @@ class ChatSync:
                     except OSError:
                         continue
                     yield rel_path, file_path
+        # Durable agent-memory files (markdown + the append-only jsonl log).
+        for rel_path in sorted(MEMORY_FILES):
+            file_path = self.data_dir / rel_path
+            if not file_path.is_file():
+                continue
+            try:
+                if file_path.stat().st_size > MAX_SYNC_BYTES:
+                    continue
+            except OSError:
+                continue
+            yield rel_path, file_path
 
     @staticmethod
     def _legacy_key(rel_path: str) -> str:
@@ -167,7 +191,7 @@ class ChatSync:
         ``webui/`` namespace so restore writes to the right location and backup
         can dedupe/migrate them.
         """
-        if rel_path.startswith(("webui/", "sessions/")):
+        if rel_path.startswith(("webui/", "sessions/", "workspace/")):
             return rel_path
         return f"webui/{rel_path}"
 
@@ -189,6 +213,10 @@ class ChatSync:
                 content = file_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
+            # Skip empty files: never create cloud rows for not-yet-written
+            # memory files (e.g. history.jsonl before the first Dream cycle).
+            if not content.strip():
+                continue
             local[rel_path] = content
 
         cloud = self._fetch_all()
@@ -198,7 +226,7 @@ class ChatSync:
         legacy_map: dict[str, str] = {}
         for rel_path, content in cloud.items():
             mapped = self._legacy_key(rel_path)
-            if ("/" not in rel_path) or not rel_path.startswith(("webui/", "sessions/")):
+            if ("/" not in rel_path) or not rel_path.startswith(("webui/", "sessions/", "workspace/")):
                 legacy_map[mapped] = rel_path
                 named_cloud.setdefault(mapped, content)
             else:
@@ -253,7 +281,7 @@ class ChatSync:
             named.setdefault(mapped, content)
         removed = 0
         for rel_path in named:
-            if rel_path.startswith(("webui/", "sessions/")) and rel_path not in local_names:
+            if rel_path.startswith(("webui/", "sessions/", "workspace/")) and rel_path not in local_names:
                 # Only remove rows we confidently manage in a known namespace.
                 self._delete(rel_path)
                 removed += 1
