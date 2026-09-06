@@ -223,9 +223,13 @@ def test_provider_signature_tracks_fallback_presets_and_provider_config() -> Non
     assert signature != provider_signature(Config.model_validate(changed_key))
 
 
-def test_provider_snapshot_uses_smallest_fallback_context_window() -> None:
+def test_provider_snapshot_uses_smallest_fallback_context_window(monkeypatch) -> None:
     from nanobot.config.schema import Config
     from nanobot.providers.factory import build_provider_snapshot
+
+    # This deployment disables silent model failover by default; opt back in so
+    # the FallbackProvider wrapping path is exercised.
+    monkeypatch.setenv("POWERX_DISABLE_MODEL_FAILOVER", "0")
 
     config = Config.model_validate({
         "agents": {

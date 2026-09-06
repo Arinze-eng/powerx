@@ -2,13 +2,30 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
+
+from loguru import logger
 
 from nanobot.config.schema import Config, InlineFallbackConfig, ModelPresetConfig, ProviderConfig
 from nanobot.providers.base import GenerationSettings, LLMProvider
 from nanobot.providers.fallback_provider import FallbackProvider
 from nanobot.providers.registry import ProviderSpec, create_dynamic_spec, find_by_name
+
+
+def _model_failover_disabled() -> bool:
+    """Whether silent primary->fallback model switching must be suppressed.
+
+    Defaults to TRUE for this deployment: a transient DeepSeek error should never
+    transparently swap the active model to something else mid-task (that produced
+    the 'DeepSeek for 3 tasks then Gemini' symptom). Set POWERX_DISABLE_MODEL_FAILOVER
+    to 0/false to opt back into normal fallback behaviour.
+    """
+    raw = os.environ.get("POWERX_DISABLE_MODEL_FAILOVER")
+    if raw is None or not raw.strip():
+        return True  # default: no silent failover
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -279,6 +296,18 @@ def make_provider(
     resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
     provider = _make_provider_core(config, preset=resolved, model=model)
     fallback_presets = _resolve_fallback_presets(config, resolved)
+
+    # Kill-switch: by default this deployment never wraps the primary provider
+    # with a FallbackProvider, so the active model cannot silently switch mid-task
+    # (e.g. DeepSeek -> Gemini after the circuit breaker trips on transient
+    # rate-limit/timeout errors). The primary surfaces its own error and the
+    # normal retry path runs instead. Opt back in via POWERX_DISABLE_MODEL_FAILOVER=0.
+    if _model_failover_disabled() and fallback_presets:
+        logger.info(
+            "Model failover disabled; ignoring {} configured fallback(s)",
+            len(fallback_presets),
+        )
+        fallback_presets = []
 
     if fallback_presets:
         provider = FallbackProvider(
