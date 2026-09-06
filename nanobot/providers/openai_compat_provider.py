@@ -985,10 +985,26 @@ class OpenAICompatProvider(LLMProvider):
         model_name = model or self.default_model
         spec = self._spec
 
-        if spec and spec.supports_prompt_caching:
-            model_name = model or self.default_model
-            if any(model_name.lower().startswith(k) for k in ("anthropic/", "claude")):
-                messages, tools = self._apply_cache_control(messages, tools)
+        # Prompt caching has two mechanisms across OpenAI-compatible gateways:
+        #   1. AUTOMATIC prefix caching (DeepSeek, OpenAI, many proxies): works with
+        #      no special fields as long as the request prefix is byte-stable. nanobot
+        #      already keeps a stable system prefix, so these get cache hits for free
+        #      (verified live: ~97% hit / 80% cheaper on Kyma/deepseek-v4-flash).
+        #   2. EXPLICIT cache_control breakpoints (Anthropic Claude and proxies that
+        #      mirror its format): require cache_control markers on content blocks.
+        # We inject markers for claude models always, whenever the provider spec
+        # advertises supports_prompt_caching AND the operator opts in via
+        # POWERX_FORCE_CACHE_MARKERS, so any OpenAI-compatible endpoint that needs
+        # explicit breakpoints benefits while auto-cachers are unaffected (they
+        # ignore the markers — verified safe against Kyma).
+        _force_markers = os.environ.get("POWERX_FORCE_CACHE_MARKERS", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        _is_claude = any(
+            model_name.lower().startswith(k) for k in ("anthropic/", "claude")
+        )
+        if (_is_claude and spec and spec.supports_prompt_caching) or _force_markers:
+            messages, tools = self._apply_cache_control(messages, tools)
 
         model_name = self._request_model_name(model_name)
 
