@@ -1532,11 +1532,11 @@ class AgentRunner:
         return f"{tool_call.name}:{args}"
 
     # How many lone novita_sandbox 'run' steps are tolerated in a single task
-    # before the model is forced to switch to sandbox_batch. Small enough that
-    # genuine one-shot commands still work; low enough to cap cost on multi-step
-    # tasks. Overridable via POWERX_BATCH_ENFORCE_AFTER for tuning without a
-    # code change.
-    _BATCH_ENFORCE_AFTER = int(os.environ.get("POWERX_BATCH_ENFORCE_AFTER", "3"))
+    # before the model is forced to switch to sandbox_batch. Set to MAXIMUM
+    # enforcement by default (1): the model may issue one lone sandbox command
+    # (enough for a genuine one-shot), and any further lone step is rejected
+    # until it batches. Raise via POWERX_BATCH_ENFORCE_AFTER to loosen.
+    _BATCH_ENFORCE_AFTER = int(os.environ.get("POWERX_BATCH_ENFORCE_AFTER", "1"))
 
     def _coalesce_sandbox_calls(
         self,
