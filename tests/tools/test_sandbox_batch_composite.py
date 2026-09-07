@@ -87,8 +87,11 @@ async def test_deploy_uses_env_token_and_returns_url(monkeypatch) -> None:
     )
     assert "[op 0 deploy → ok]" in report
     assert "https://my-site.vercel.app" in report
-    assert len(fake.calls) == 1
-    assert fake.calls[0]["action"] == "run"
+    # deploy now costs 3 sandbox runs internally (build+deploy, protection off, verify)
+    # but still ONE model iteration — and the verify block is in the report.
+    assert len(fake.calls) == 3
+    assert all(c["action"] == "run" for c in fake.calls)
+    assert "[verify]" in report
 
 
 @pytest.mark.asyncio
@@ -160,6 +163,30 @@ async def test_composite_transient_retry_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_verify_op_runs_browser_ua_probe() -> None:
+    def handler(kwargs, n):
+        assert "Mozilla/5.0" in kwargs["command"]  # browser UA, not bare curl
+        return "URL=https://site.vercel.app CODE=200 SIZE=900\n  HTML: yes\n  title: My Quiz"
+
+    tool, fake = _tool_with(handler)
+    report = await tool.execute(
+        operations=[{"action": "verify", "url": "https://site.vercel.app",
+                     "contains": ["My Quiz"], "routes": ["/about"]}]
+    )
+    assert "[op 0 verify → ok]" in report
+    assert "CODE=200" in report
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_verify_requires_url() -> None:
+    tool, fake = _tool_with()
+    report = await tool.execute(operations=[{"action": "verify"}])
+    assert "[op 0 verify → ERR]" in report
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
 async def test_mixed_passthrough_and_composite_order(monkeypatch) -> None:
     monkeypatch.setenv("VERCEL_TOKEN", "vc")
 
@@ -177,5 +204,6 @@ async def test_mixed_passthrough_and_composite_order(monkeypatch) -> None:
         ]
     )
     assert "[sandbox_batch: 3 operation(s), 0 failure(s)]" in report
-    assert [c["action"] for c in fake.calls] == ["write", "read", "run"]
+    # write, read, then deploy's 3 internal runs = 5 sandbox calls total
+    assert [c["action"] for c in fake.calls] == ["write", "read", "run", "run", "run"]
     assert "https://mix.vercel.app" in report

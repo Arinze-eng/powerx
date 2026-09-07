@@ -101,7 +101,7 @@ _ACTIONS_BASE = [
     "run", "read", "write", "upload", "fetch_url",
     "install", "list", "download_url",
 ]
-_ACTIONS_COMPOSITE = ["deploy", "apk_toolchain", "apk_decompile", "apk_build"]
+_ACTIONS_COMPOSITE = ["deploy", "verify", "apk_toolchain", "apk_decompile", "apk_build"]
 
 
 def _normalize_operations(raw: Any) -> list[Any] | None:
@@ -301,10 +301,38 @@ async def _op_deploy(sandbox: "NovitaSandboxTool", op: dict[str, Any]) -> ToolRe
     output = await _run_shell(sandbox, script, _DEPLOY_TIMEOUT)
     url_match = re.search(r"^URL=(https://\S+)", output, re.M)
     if _shell_ok(output) and url_match:
+        live_url = url_match.group(1)
+
+        # 1) Make the deployment genuinely public (kill the SSO auth wall that
+        #    otherwise fools curl checks into reporting a "login page").
+        protection_note = ""
+        keep_protection = str(op.get("keep_protection", "")).lower() in {"1", "true", "yes"}
+        if not keep_protection:
+            prot = await _vercel_disable_protection(sandbox, token, project_name)
+            protection_note = (
+                "\n[protection \u2192 disabled] site is publicly reachable."
+                if prot == "ok"
+                else f"\n[protection \u2192 NOT disabled] visitors may see a Vercel login page; {prot}"
+            )
+
+        # 2) Verify like a real visitor \u2014 browser UA, redirects, HTML markers.
+        verify_report = ""
+        try:
+            verify_op = {
+                "url": live_url,
+                "contains": op.get("expect") or [],
+                "routes": op.get("routes") or [],
+            }
+            verify_report = "\n" + str(await _op_verify(sandbox, verify_op))
+        except Exception as exc:  # verification must never sink a good deploy
+            verify_report = f"\n[verify skipped: {type(exc).__name__}]"
+
         return (
-            f"[deploy → ok] Live at {url_match.group(1)} (project '{project_name}', "
+            f"[deploy \u2192 ok] Live at {live_url} (project '{project_name}', "
             "production). Source mirrored under sandbox path '{p}'.".replace("{p}", path)
-            + "\n" + output[-1200:]
+            + protection_note
+            + verify_report
+            + "\n" + output[-600:]
         )
     return ToolResult.error(
         "deploy failed (transient npm/build issues are retried internally; this is a "
@@ -416,8 +444,87 @@ async def _op_apk_build(sandbox: "NovitaSandboxTool", op: dict[str, Any]) -> Too
     return ToolResult.error("[apk_build failed]\n" + output[-2000:])
 
 
+# ---------------------------------------------------------------------------
+# Vercel helpers shared by deploy + verify
+# ---------------------------------------------------------------------------
+
+async def _vercel_disable_protection(sandbox: "NovitaSandboxTool", token: str, project_name: str) -> str:
+    """Best-effort: turn off Deployment Protection (sso_protection) for a project.
+
+    Freshly deployed projects inherit the team's "Standard Protection", which
+    serves an SSO sign-in page to any request without a browser/Vercel session
+    cookie — including the sandbox's own curl checks and (depending on team
+    settings) real visitors hitting the preview URL. Disabling it makes the
+    deployment genuinely public so verification reflects reality.
+    """
+    script = (
+        _PRELUDE
+        + f"TOK={shlex.quote(token)}\n"
+        + "ensure_node\nhave vercel || npm i -g vercel@latest >/dev/null 2>&1 || fail 'vercel CLI missing'\n"
+        + "TEAM=$(vercel whoami --token \"$TOK\" 2>/dev/null | tr -d '\\n')\n"
+        + f"PROJ_ID=$(vercel project inspect {shlex.quote(project_name)} --token \"$TOK\" --scope \"$TEAM\" 2>/dev/null "
+        "| grep -Eo 'prj_[A-Za-z0-9]+' | head -1)\n"
+        + '[ -n "$PROJ_ID" ] || fail "project id not found"\n'
+        + f"curl -sf -X PATCH \"https://api.vercel.com/v9/projects/$PROJ_ID?teamId=$TEAM\" "
+        "-H \"Authorization: Bearer $TOK\" -H 'Content-Type: application/json' "
+        "-d '{\"ssoProtection\":null,\"passwordProtection\":null}' >/dev/null "
+        "|| fail 'PATCH /v9/projects failed (insufficient token scope?)'\n"
+        + "ok 'protection disabled'\n"
+    )
+    output = await _run_shell(sandbox, script, 240)
+    return "ok" if _shell_ok(output) else output[-300:]
+
+
+async def _op_verify(sandbox: "NovitaSandboxTool", op: dict[str, Any]) -> ToolResult | str:
+    """Smoke-test a deployed site like a real visitor would — in ONE op.
+
+    Fetches with a browser User-Agent, follows redirects, checks HTTP status,
+    content-type, size, presence of HTML markers, optional expected strings,
+    and optionally probes listed internal routes/links. Knows that a Vercel
+    SSO/login page is a protection artifact, NOT a broken deploy.
+    """
+    url = str(op.get("url", "")).strip()
+    if not url.startswith("http"):
+        return ToolResult.error("verify requires a full http(s) url")
+    contains = op.get("contains") or []
+    if isinstance(contains, str):
+        try:
+            contains = json.loads(contains)
+        except (TypeError, ValueError):
+            contains = [contains]
+    if not isinstance(contains, list):
+        contains = []
+    urls_to_check = [url] + [str(u).strip() for u in (op.get("routes") or []) if str(u).strip()]
+    quoted_urls = " ".join(shlex.quote(u) for u in urls_to_check[:8])
+    needles = " ".join(shlex.quote(str(c)) for c in contains[:8])
+    needle_check = (
+        f"for needle in {needles}; do printf '%s' \"$BODY\" | grep -qi -- \"$needle\" "
+        "&& echo \"  contains '$needle': yes\" || echo \"  contains '$needle': NO\"; done\n"
+        if needles else ""
+    )
+    script = (
+        _PRELUDE
+        + "UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36'\n"
+        + f"for U in {quoted_urls}; do\n"
+        + "R=$(curl -sL -A \"$UA\" -w '\\n__CODE__%{http_code} __CT__%{content_type} __SIZE__%{size_download}' \"$U\" | tail -c 40000)\n"
+        + "CODE=$(printf '%s' \"$R\" | grep -o '__CODE__[0-9]*' | tail -1 | cut -c9-)\n"
+        + "BODY=$(printf '%s' \"$R\" | sed 's/__CODE__.*//')\n"
+        + "echo \"URL=$U CODE=$CODE SIZE=$(printf '%s' \"$BODY\" | wc -c)\"\n"
+        + "if printf '%s' \"$BODY\" | grep -qi 'log in to\\|vercel authentication\\|deployments are protected\\|sso'; then "
+        "echo '  NOTE: response looks like a Vercel auth wall (protection artifact, run deploy again or disable protection via dashboard)'; fi\n"
+        + "printf '%s' \"$BODY\" | grep -qi '<html\\|<!doctype' && echo '  HTML: yes' || echo '  HTML: NO (check route/content)'\n"
+        + "printf '%s' \"$BODY\" | grep -qiE 'error|exception' && echo '  WARNING: error-like text present (may be false positive)' \n"
+        + needle_check
+        + "echo \"  title: $(printf '%s' \"$BODY\" | grep -oiE '<title[^>]*>[^<]{1,120}' | head -1 | sed 's/<title[^>]*>//i')\"\n"
+        + "done\n"
+    )
+    output = await _run_shell(sandbox, script, 180)
+    return "[verify]\n" + output[-2500:]
+
+
 _COMPOSITE_HANDLERS = {
     "deploy": _op_deploy,
+    "verify": _op_verify,
     "apk_toolchain": _op_apk_toolchain,
     "apk_decompile": _op_apk_decompile,
     "apk_build": _op_apk_build,
@@ -435,10 +542,13 @@ _COMPOSITE_HANDLERS = {
                 "action (run|read|write|upload|fetch_url|install|list|download_url) "
                 "plus arguments (command, path, url, content, packages, timeout, "
                 "source). POWERFUL COMPOSITE OPS (each = one credit, replaces 5-15 "
-                "model turns): action=deploy {path, project_name, files?} builds & "
-                "ships a real Next.js/Vite/Express/static project to Vercel and "
-                "returns the live URL; action=apk_toolchain installs the APK RE "
-                "stack; action=apk_decompile {apk_path, out?, java_sources?}; "
+                "model turns): action=deploy {path, project_name, files?, expect?, "
+                "routes?} builds & ships a real Next.js/Vite/Express/static project "
+                "to Vercel, DISABLES deployment auth so it is truly public, and "
+                "auto-verifies the live URL like a browser — returns URL + verify "
+                "report; action=verify {url, contains?, routes?} smoke-tests any URL; "
+                "action=apk_toolchain installs the APK RE stack; "
+                "action=apk_decompile {apk_path, out?, java_sources?}; "
                 "action=apk_build {src, out?} rebuilds+signs the edited APK. "
                 "Prefer writing ONE self-contained script (action=write) and "
                 "running it once (action=run) over many tiny run steps."
@@ -463,6 +573,16 @@ _COMPOSITE_HANDLERS = {
                         additional_properties=True,
                     ),
                     "token": StringSchema("Optional Vercel token override (deploy)."),
+                    "keep_protection": BooleanSchema(description="Set true to keep Vercel deployment auth (deploy; default false = make public)."),
+                    "expect": ArraySchema(
+                        StringSchema(),
+                        description="Strings that MUST appear in the deployed page (verify/deploy) — e.g. your <title> text.",
+                    ),
+                    "routes": ArraySchema(
+                        StringSchema(),
+                        description="Extra paths/URLs to smoke-test after deploy (verify), e.g. ['/about', '/api/health'].",
+                    ),
+                    "url": StringSchema("Full http(s) URL to smoke-test (verify)."),
                     "apk_path": StringSchema("Path to the .apk inside the sandbox (apk_decompile)."),
                     "out": StringSchema("Output path (apk_decompile dir / apk_build apk)."),
                     "java_sources": BooleanSchema(description="Also dex2jar for Java-source recovery (apk_decompile)."),
@@ -518,8 +638,9 @@ class SandboxBatchTool(Tool):
             "turn costs a fresh model call, but a batch costs only one. "
             "COMPOSITE OPS collapse whole workflows into one credit: "
             "action=deploy builds AND ships a real web project (Next.js/Vite/"
-            "Express/static) to Vercel and returns the live URL — no separate "
-            "login/install/link/build/deploy turns needed; "
+            "Express/static) to Vercel, disables deployment auth so the URL is "
+            "truly public, and auto-verifies it as a browser would — all in one "
+            "op; action=verify {url} smoke-tests any live URL; "
             "action=apk_toolchain|apk_decompile|apk_build covers full APK "
             "reverse-engineering (unpack smali/resources, edit, rebuild, sign). "
             "BEST PRACTICE for REAL websites (Manus-style, expert quality): "
@@ -533,7 +654,15 @@ class SandboxBatchTool(Tool):
             "(several per batch is fine); 3) action=run `npm install && "
             "npm run build` ONCE to verify compilation; fix errors in the SAME "
             "batch only if independent, otherwise let the report tell you; "
-            "4) action=deploy at the end. For LARGE files do NOT read the whole "
+            "4) action=deploy at the end. DEFINITION OF DONE: a task is not "
+            "finished until you have tested the result like a real user — use "
+            "action=verify (or deploy's built-in verify) and confirm HTTP 200, "
+            "real HTML, your expected content, and key routes. NEVER trust a "
+            "bare curl: Vercel shows an SSO 'sign in' page to cookie-less "
+            "non-browser requests even when the site works perfectly for "
+            "users; deploy now disables that protection automatically, and "
+            "verify uses a browser User-Agent, so a clean verify report means "
+            "the site is genuinely live. For LARGE files do NOT read the whole "
             "file with action=read (output is capped): use action=run with "
             "head/tail/sed/grep to inspect specific sections. Chain related "
             "shell commands with && or ; inside a single run. Set "

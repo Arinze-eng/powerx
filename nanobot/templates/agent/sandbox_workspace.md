@@ -73,8 +73,25 @@ Follow this order; each step is one `sandbox_batch` op and steps can share a bat
 2. `action=write` the source files (design tokens/theme first, then components).
 3. ONE verification op: `{"action":"run","command":"cd <name> && npm install --no-audit --no-fund && npm run build 2>&1 | tail -20"}`.
    Fix errors reported; do not redeploy blind.
-4. `{"action":"deploy","path":"<name>","project_name":"<name>"}` → returns the
-   live Vercel URL. Report that URL to the user verbatim.
+4. `{"action":"deploy","path":"<name>","project_name":"<name>"}` → deploys to
+   production, automatically disables Vercel deployment protection (so the URL
+   is public and testable), then auto-verifies the live site as a browser
+   would. The report contains the URL plus a `[verify]` block — read it.
+
+### Testing deployed sites like a real user (definition of done)
+
+- A task is NOT done when the deploy succeeds — it is done when the LIVE SITE
+  works. Check the verify report: HTTP 200 + `HTML: yes` + your `contains`
+  markers present + key routes (pass `routes:["/about","/api/health"]`) OK.
+- **The #1 false alarm:** a plain `curl` of a fresh Vercel URL can return a
+  "Sign in / Vercel Authentication" page even though the site is perfect for
+  real visitors (cookie-less non-browser requests get blocked by deployment
+  protection). Do NOT report a broken deploy because of that. The `deploy` op
+  now disables protection itself; if you must check manually use
+  `{"action":"verify","url":"..."}` or at minimum a browser User-Agent:
+  `curl -sL -A "Mozilla/5.0 ..." <url>`.
+- If verification genuinely fails (404, error page, missing content), fix the
+  code and re-run only the failed stage (build → deploy); do not redeploy blind.
 
 If `deploy` reports no VERCEL_TOKEN, everything up to step 3 still succeeded —
 tell the user the build is verified and ask the operator to set the token.
