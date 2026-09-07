@@ -73,12 +73,18 @@ async def test_deploy_missing_token_fails_without_backend_call(monkeypatch) -> N
 @pytest.mark.asyncio
 async def test_deploy_uses_env_token_and_returns_url(monkeypatch) -> None:
     monkeypatch.setenv("VERCEL_TOKEN", "vc_test_secret")
-    output = "__PB_OK__ deployed https://my-site.vercel.app\nURL=https://my-site.vercel.app"
 
     def handler(kwargs, n):
-        assert kwargs["action"] == "run"
-        assert "vc_test_secret" not in kwargs["command"] or True  # token written via file echo
-        return output
+        cmd = kwargs["command"]
+        if n == 1:  # build + deploy script
+            assert "vercel deploy --prod" in cmd
+            return "__PB_OK__ deployed https://my-site.vercel.app\nURL=https://my-site.vercel.app"
+        if n == 2:  # protection disable script
+            assert "deploymentProtection" in cmd or "ssoProtection" in cmd
+            return "__PB_OK__ protection disabled via v9 API"
+        # verify probe(s)
+        assert "Mozilla/5.0" in cmd
+        return "FINAL CODE=200 SIZE=812\nHTML: yes"
 
     tool, fake = _tool_with(handler)
     report = await tool.execute(
@@ -91,7 +97,8 @@ async def test_deploy_uses_env_token_and_returns_url(monkeypatch) -> None:
     # but still ONE model iteration — and the verify block is in the report.
     assert len(fake.calls) == 3
     assert all(c["action"] == "run" for c in fake.calls)
-    assert "[verify]" in report
+    assert "live URL probe" in report and "FINAL CODE=200" in report
+    assert "protection \u2192 disabled" in report
 
 
 @pytest.mark.asyncio
@@ -191,8 +198,11 @@ async def test_mixed_passthrough_and_composite_order(monkeypatch) -> None:
     monkeypatch.setenv("VERCEL_TOKEN", "vc")
 
     def handler(kwargs, n):
-        if kwargs["action"] == "run" and "vercel deploy" in kwargs["command"]:
+        cmd = kwargs.get("command", "")
+        if "vercel deploy" in cmd:
             return "__PB_OK__ deployed\nURL=https://mix.vercel.app"
+        if "deploymentProtection" in cmd or "ssoProtection" in cmd:
+            return "__PB_OK__ protection disabled via v9 API"
         return "ok-out"
 
     tool, fake = _tool_with(handler)

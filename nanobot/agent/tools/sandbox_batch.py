@@ -94,6 +94,8 @@ _MIN_STATUS_LINE_CHARS = 90
 _DEPLOY_TIMEOUT = int(os.environ.get("POWERX_BATCH_DEPLOY_TIMEOUT", "900"))
 _APK_TOOLCHAIN_TIMEOUT = int(os.environ.get("POWERX_BATCH_APK_TOOLCHAIN_TIMEOUT", "900"))
 _APK_OP_TIMEOUT = int(os.environ.get("POWERX_BATCH_APK_OP_TIMEOUT", "600"))
+# Total wall-clock for the whole deploy composite (build + protection + verify).
+_DEPLOY_TOTAL_TIMEOUT = int(os.environ.get("POWERX_BATCH_DEPLOY_TOTAL_TIMEOUT", "1500"))
 
 _VERCEL_PROJECT_NAME_RE = re.compile(r"[^a-z0-9._-]+")
 
@@ -315,17 +317,55 @@ async def _op_deploy(sandbox: "NovitaSandboxTool", op: dict[str, Any]) -> ToolRe
                 else f"\n[protection \u2192 NOT disabled] visitors may see a Vercel login page; {prot}"
             )
 
-        # 2) Verify like a real visitor \u2014 browser UA, redirects, HTML markers.
-        verify_report = ""
+        # 2) Verify like a real visitor — DNS-aware. Fresh *.vercel.app names
+        #    can take tens of seconds to resolve from the sandbox's resolver;
+        #    one curl there returns a false negative ("site down/login").
+        verify_lines: list[str] = []
         try:
-            verify_op = {
-                "url": live_url,
-                "contains": op.get("expect") or [],
-                "routes": op.get("routes") or [],
-            }
-            verify_report = "\n" + str(await _op_verify(sandbox, verify_op))
+            ua_probe = (
+                _PRELUDE
+                + "UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36'\n"
+                + "H=" + shlex.quote(live_url.split("/")[2]) + "\n"
+                + "for i in 1 2 3 4 5 6; do\n"
+                + "  getent hosts \"$H\" >/dev/null 2>&1 && break\n"
+                + "  nslookup \"$H\" >/dev/null 2>&1 && break\n"
+                + "  sleep 10\n"
+                + "done\n"
+                + "R=$(curl -sL -A \"$UA\" --max-time 40 -w '\\n__CODE__%{http_code}' "
+                + shlex.quote(live_url) + " | tail -c 30000)\n"
+                + "CODE=$(printf '%s' \"$R\" | grep -o '__CODE__[0-9]*' | tail -1 | cut -c9-)\n"
+                + "BODY=$(printf '%s' \"$R\" | sed 's/__CODE__.*//')\n"
+                + "echo \"FINAL CODE=$CODE SIZE=$(printf '%s' \"$BODY\" | wc -c)\"\n"
+                + "printf '%s' \"$BODY\" | grep -qi '<html\\|<!doctype' && echo 'HTML: yes' || echo 'HTML: NO'\n"
+                + "if printf '%s' \"$BODY\" | grep -qiE 'log in to vercel|vercel authentication|deployments are protected'; then "
+                "echo 'NOTE: auth wall still served — protection may not have propagated yet; re-check in ~1 minute before believing it'; fi\n"
+            )
+            needles = [str(c) for c in (op.get("expect") or [])[:6]]
+            if needles:
+                joined = " ".join(shlex.quote(n) for n in needles)
+                ua_probe += (
+                    "for needle in " + joined + "; do printf '%s' \"$BODY\" | grep -qi -- \"$needle\" "
+                    "&& echo \"contains '$needle': yes\" || echo \"contains '$needle': NO\"; done\n"
+                )
+            probe_out = await _run_shell(sandbox, ua_probe, 240)
+            verify_lines.append("[verify \u2192 live URL probe]")
+            verify_lines.append(probe_out.strip()[-1200:])
+            extra = [str(u).strip() for u in (op.get("routes") or []) if str(u).strip()][:6]
+            if extra:
+                base = live_url.rstrip("/")
+                full = [u if u.startswith("http") else base + ("/" if not u.startswith("/") else "") + u for u in extra]
+                quoted = " ".join(shlex.quote(u) for u in full)
+                route_script = (
+                    _PRELUDE
+                    + "UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36'\n"
+                    + "for U in " + quoted + "; do C=$(curl -sL -A \"$UA\" --max-time 30 -o /dev/null -w '%{http_code}' \"$U\"); "
+                    "echo \"ROUTE $U CODE=$C\"; done\n"
+                )
+                route_out = await _run_shell(sandbox, route_script, 180)
+                verify_lines.append(route_out.strip()[-900:])
         except Exception as exc:  # verification must never sink a good deploy
-            verify_report = f"\n[verify skipped: {type(exc).__name__}]"
+            verify_lines.append(f"[verify skipped: {type(exc).__name__}]")
+        verify_report = "\n" + "\n".join(verify_lines)
 
         return (
             f"[deploy \u2192 ok] Live at {live_url} (project '{project_name}', "
@@ -448,30 +488,55 @@ async def _op_apk_build(sandbox: "NovitaSandboxTool", op: dict[str, Any]) -> Too
 # Vercel helpers shared by deploy + verify
 # ---------------------------------------------------------------------------
 
-async def _vercel_disable_protection(sandbox: "NovitaSandboxTool", token: str, project_name: str) -> str:
-    """Best-effort: turn off Deployment Protection (sso_protection) for a project.
+def _vercel_protection_script(token: str, project_name: str) -> str:
+    """Shell that makes a Vercel project public (kills the SSO auth wall).
 
-    Freshly deployed projects inherit the team's "Standard Protection", which
-    serves an SSO sign-in page to any request without a browser/Vercel session
-    cookie — including the sandbox's own curl checks and (depending on team
-    settings) real visitors hitting the preview URL. Disabling it makes the
-    deployment genuinely public so verification reflects reality.
+    The old implementation relied on `vercel whoami` output as a team id and a
+    single PATCH shape; both broke with real PATs, leaving deployments behind
+    the login page while the site itself worked fine. This version resolves
+    the scope via `vercel ls`, then tries three independent routes:
+      1. v9 projects PATCH (standard scopes)
+      2. v11 deploymentProtection PATCH (dedicated endpoint)
+      3. CLI toggle (newer vercel versions)
+    Emits __PB_OK__ / __PB_WARN__ markers.
     """
-    script = (
+    qname = shlex.quote(project_name)
+    return (
         _PRELUDE
-        + f"TOK={shlex.quote(token)}\n"
-        + "ensure_node\nhave vercel || npm i -g vercel@latest >/dev/null 2>&1 || fail 'vercel CLI missing'\n"
-        + "TEAM=$(vercel whoami --token \"$TOK\" 2>/dev/null | tr -d '\\n')\n"
-        + f"PROJ_ID=$(vercel project inspect {shlex.quote(project_name)} --token \"$TOK\" --scope \"$TEAM\" 2>/dev/null "
-        "| grep -Eo 'prj_[A-Za-z0-9]+' | head -1)\n"
-        + '[ -n "$PROJ_ID" ] || fail "project id not found"\n'
-        + f"curl -sf -X PATCH \"https://api.vercel.com/v9/projects/$PROJ_ID?teamId=$TEAM\" "
+        + "TOK=" + shlex.quote(token) + "\n"
+        + "ensure_node\n"
+        + "have vercel || npm i -g vercel@latest >/dev/null 2>&1 || fail 'vercel CLI missing'\n"
+        + "TEAM=$(vercel ls --token \"$TOK\" 2>/dev/null | grep -oE '@[a-zA-Z0-9._-]+' | head -1)\n"
+        + "SCOPE=\"\"; [ -n \"$TEAM\" ] && SCOPE=\"--scope $TEAM\"\n"
+        + "PID=$(vercel project inspect " + qname + " --token \"$TOK\" $SCOPE 2>/dev/null "
+        "| grep -oE 'prj_[A-Za-z0-9]+' | head -1)\n"
+        + "[ -n \"$PID\" ] || PID=$(curl -sf \"https://api.vercel.com/v9/projects/" + project_name + "$Q\" "
+        "-H \"Authorization: Bearer $TOK\" 2>/dev/null | grep -oE 'prj_[A-Za-z0-9]+' | head -1)\n"
+        + "[ -n \"$PID\" ] || fail 'project id not found'\n"
+        + "Q='?teamId='$TEAM\n"
+        # route 1: v9 PATCH
+        + "curl -sf -X PATCH \"https://api.vercel.com/v9/projects/$PID$Q\" "
         "-H \"Authorization: Bearer $TOK\" -H 'Content-Type: application/json' "
-        "-d '{\"ssoProtection\":null,\"passwordProtection\":null}' >/dev/null "
-        "|| fail 'PATCH /v9/projects failed (insufficient token scope?)'\n"
-        + "ok 'protection disabled'\n"
+        "-d '{\"ssoProtection\":null,\"passwordProtection\":null}' > /tmp/pb-protection.json 2>&1 "
+        "&& ok 'protection disabled via v9 API' || {\n"
+        # route 2: v11 dedicated endpoint
+        + "curl -sf -X PATCH \"https://api.vercel.com/v11/deploymentProtection/projects/$PID\" "
+        "-H \"Authorization: Bearer $TOK\" -H 'Content-Type: application/json' "
+        "-d '{\"enabled\":false,\"exclusions\":[],\"allowedDeploymentUrls\":true}' > /dev/null 2>&1 "
+        "&& ok 'protection disabled via v11 API' || {\n"
+        # route 3: CLI
+        + "vercel deployment-protection configure " + qname + " --disabled --yes --token \"$TOK\" $SCOPE "
+        "> /dev/null 2>&1 "
+        "&& ok 'protection disabled via CLI' "
+        "|| echo '__PB_WARN__ could not disable protection — visitors may see a login page'; }; }\n"
     )
-    output = await _run_shell(sandbox, script, 240)
+
+
+async def _vercel_disable_protection(sandbox: "NovitaSandboxTool", token: str, project_name: str) -> str:
+    """Run the protection-disable script; return 'ok', 'warn: ...' or failure tail."""
+    output = await _run_shell(sandbox, _vercel_protection_script(token, project_name), 300)
+    if "__PB_WARN__" in output:
+        return "warn: " + output.strip().splitlines()[-1][:200]
     return "ok" if _shell_ok(output) else output[-300:]
 
 
@@ -650,7 +715,17 @@ class SandboxBatchTool(Tool):
             "backends) — include design tokens (font pairing, restrained "
             "palette, spacing scale, dark mode) in globals/theme files BEFORE "
             "components, load the web-design skill guidance into the script "
-            "comments you write; 2) action=write the page/component files "
+            "comments you write; "
+            "DESIGN STANDARD (non-negotiable, Manus-grade modern look): "
+            "generous whitespace, strong typographic hierarchy (display font + "
+            "body font pairing), rounded cards with soft layered shadows, subtle "
+            "gradients/glassmorphism accents, smooth micro-interactions (hover "
+            "lift, transitions), consistent 8pt spacing scale, dark-mode-ready "
+            "palette. NEVER: default blue links, Times/Arial body text, table-like "
+            "layouts, centered-only text walls, Bootstrap-looking buttons, cluttered "
+            "headers. Before declaring done, self-review the rendered HTML against "
+            "this bar and iterate on typography/spacing if it looks generic. "
+            "2) action=write the page/component files "
             "(several per batch is fine); 3) action=run `npm install && "
             "npm run build` ONCE to verify compilation; fix errors in the SAME "
             "batch only if independent, otherwise let the report tell you; "
@@ -754,9 +829,14 @@ class SandboxBatchTool(Tool):
             compact = total_len >= _MAX_TOTAL_RESULT_CHARS or budget_exhausted
 
             if handler is not None:
-                op_timeout = _APK_OP_TIMEOUT if action.startswith("apk") else _DEPLOY_TIMEOUT
-                if action == "apk_toolchain":
+                if action == "deploy":
+                    op_timeout = _DEPLOY_TOTAL_TIMEOUT
+                elif action == "verify":
+                    op_timeout = 300
+                elif action == "apk_toolchain":
                     op_timeout = _APK_TOOLCHAIN_TIMEOUT
+                else:
+                    op_timeout = _APK_OP_TIMEOUT
                 executed += 1
                 result: Any = None
                 attempts = 0
