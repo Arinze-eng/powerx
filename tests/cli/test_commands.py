@@ -25,7 +25,6 @@ from nanobot.cli import webui as cli_webui
 from nanobot.cli import webui_support as cli_webui_support
 from nanobot.cli.commands import app
 from nanobot.config.schema import Config
-from nanobot.cron.service import CronJobSkippedError
 from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
 from nanobot.cron.types import CronJob, CronPayload
 from nanobot.cron.webui_metadata import cron_proactive_delivery_metadata
@@ -2833,7 +2832,7 @@ def test_gateway_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: 
     assert seen["cron_store"] == config.workspace_path / "cron" / "jobs.json"
 
 
-def test_gateway_unbound_agent_cron_is_skipped(
+def test_gateway_unbound_agent_cron_runs_general_path(
     monkeypatch, tmp_path: Path
 ) -> None:
     config_file = tmp_path / "instance" / "config.json"
@@ -2882,12 +2881,21 @@ def test_gateway_unbound_agent_cron_is_skipped(
         def save(self, session: _FakeSession) -> None:
             seen["saved_session"] = session
 
+        def list_sessions(self):
+            return []
+
+        def read_session_metadata(self, _key: str):
+            return None
+
     monkeypatch.setattr("nanobot.session.manager.SessionManager", _FakeSessionManager)
 
     class _FakeCron:
         def __init__(self, _store_path: Path) -> None:
             self.on_job = None
             seen["cron"] = self
+
+        def write_run_record(self, run_id: str, record: dict) -> None:
+            return None
 
     class _FakeAgentLoop(_GatewayAgentContractStub):
         @classmethod
@@ -2900,7 +2908,12 @@ def test_gateway_unbound_agent_cron_is_skipped(
             seen["agent"] = self
 
         async def process_direct(self, *_args, **_kwargs):
-            raise AssertionError("unbound cron job must not use process_direct")
+            seen["general_calls"] = seen.get("general_calls", 0) + 1
+
+            class _Resp:
+                content = "stretched"
+
+            return _Resp()
 
         async def submit_cron_turn(self, _msg: InboundMessage):
             raise AssertionError("unbound cron job must not run as a bound cron turn")
@@ -2915,14 +2928,27 @@ def test_gateway_unbound_agent_cron_is_skipped(
             return None
 
     class _StopAfterCronSetup:
+        """Fake ChannelManager that stops the gateway *after* cron.on_job wiring.
+
+        ``enabled_channels`` is read right after ``cron.on_job = on_cron_job``, so
+        raising there guarantees the callback is already attached when we assert.
+        """
+
         def __init__(self, *_args, **_kwargs) -> None:
-            raise _StopGatewayError("stop")
+            self._stop_armed = True
+
+        @property
+        def enabled_channels(self):
+            if self._stop_armed:
+                self._stop_armed = False
+                raise _StopGatewayError("stop")
+            return []
 
     async def _capture_evaluate_response(
         *_args,
         **_kwargs,
     ) -> bool:
-        raise AssertionError("unbound cron job must not be evaluated for delivery")
+        return False
 
     monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
     monkeypatch.setattr("nanobot.cli.gateway_runtime.AgentLoop", _FakeAgentLoop)
@@ -2955,8 +2981,10 @@ def test_gateway_unbound_agent_cron_is_skipped(
         ),
     )
 
-    with pytest.raises(CronJobSkippedError, match="unbound agent cron job"):
-        asyncio.run(cron.on_job(job))
+    # General (unbound) jobs now run through the general execution path so cron
+    # works for ANY task, not just chat-bound reminders.
+    asyncio.run(cron.on_job(job))
+    assert seen.get("general_calls") == 1
 
     bus.publish_outbound.assert_not_awaited()
 

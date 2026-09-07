@@ -20,34 +20,56 @@ from nanobot.cron.types import CronJob, CronJobState, CronSchedule
 from nanobot.session.keys import UNIFIED_SESSION_KEY
 
 _CRON_PARAMETERS = tool_parameters_schema(
-    action=StringSchema("Action to perform", enum=["add", "list", "remove"]),
+    action=StringSchema(
+        "Action to perform",
+        enum=[
+            "add",
+            "list",
+            "remove",
+            "update",
+            "pause",
+            "resume",
+            "run_now",
+            "info",
+        ],
+    ),
     name=StringSchema(
-        "Optional short human-readable label for the job "
-        "(e.g., 'weather-monitor', 'daily-standup'). Defaults to first 30 chars of message."
+        "Short human-readable label for the job (e.g., 'weather-monitor', 'daily-standup'). "
+        "For action='add' it defaults to the first 30 chars of message; for action='update' "
+        "it renames the job identified by job_id."
     ),
     message=StringSchema(
-        "REQUIRED when action='add'. Instruction for the agent to execute when the job triggers "
-        "(e.g., 'Send a reminder to WeChat: xxx' or 'Check system status and report'). "
-        "Not used for action='list' or action='remove'."
+        "Instruction for the agent to execute when the job triggers (e.g., 'Send a reminder "
+        "to WeChat: xxx' or 'Check system status and report'). REQUIRED when action='add'; "
+        "when provided with action='update' it replaces the job's instruction."
     ),
-    every_seconds=IntegerSchema(description="Interval in seconds (for recurring tasks)"),
-    cron_expr=StringSchema("Cron expression like '0 9 * * *' (for scheduled tasks)"),
+    every_seconds=IntegerSchema(
+        description="Interval in seconds (for recurring tasks). Used by add and update.",
+        minimum=1,
+    ),
+    cron_expr=StringSchema(
+        "Cron expression like '0 9 * * *' (for scheduled tasks). Used by add and update."
+    ),
     tz=StringSchema(
         "Optional IANA timezone for cron expressions (e.g. 'America/Vancouver'). "
         "When omitted with cron_expr, the tool's default timezone applies."
     ),
     at=StringSchema(
         "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). "
-        "Naive values use the tool's default timezone."
+        "Naive values use the tool's default timezone. Used by add and update."
     ),
-    job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
+    job_id=StringSchema(
+        "Job ID (obtain via action='list'). REQUIRED when action='remove', and also for "
+        "action='update', 'pause', 'resume', 'run_now', and 'info'."
+    ),
     required=["action"],
     description=(
-        "Action-specific parameters: add requires a non-empty message plus one schedule "
-        "(every_seconds, cron_expr, or at); remove requires job_id; list only needs action. "
-        "Per-action requirements are enforced at runtime (see field descriptions) so the "
-        "top-level schema stays compatible with providers (e.g. OpenAI Codex/Responses) that "
-        "reject oneOf/anyOf/allOf/enum/not at the root of function parameters."
+        "Manage scheduled jobs. add requires a non-empty message plus one schedule "
+        "(every_seconds, cron_expr, or at). update takes job_id plus any fields to change "
+        "(name/message/schedule). pause/resume/remove/run_now/info take job_id. list needs "
+        "only action. Per-action requirements are enforced at runtime so the top-level schema "
+        "stays compatible with providers (e.g. OpenAI Codex/Responses) that reject "
+        "oneOf/anyOf/allOf/enum/not at the root of function parameters."
     ),
 )
 
@@ -120,7 +142,9 @@ class CronTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Schedule reminders and recurring tasks. Actions: add, list, remove. "
+            "Schedule and manage time-based tasks. Actions: add, list, info, update, remove, "
+            "pause, resume, run_now. Supports one-shot ('at'), interval ('every_seconds'), and "
+            "cron-expression ('cron_expr' + optional 'tz') schedules. "
             f"If tz is omitted, cron expressions and naive ISO times default to {self._default_timezone}."
         )
 
@@ -129,8 +153,10 @@ class CronTool(Tool):
         action = params.get("action")
         if action == "add" and not str(params.get("message") or "").strip():
             errors.append("message is required when action='add'")
-        if action == "remove" and not str(params.get("job_id") or "").strip():
-            errors.append("job_id is required when action='remove'")
+        if action in {"remove", "update", "pause", "resume", "run_now", "info"} and not str(
+            params.get("job_id") or ""
+        ).strip():
+            errors.append(f"job_id is required when action='{action}'")
         return errors
 
     async def execute(
@@ -150,8 +176,18 @@ class CronTool(Tool):
             return self._add_job(name, message, every_seconds, cron_expr, tz, at)
         elif action == "list":
             return self._list_jobs()
+        elif action == "info":
+            return self._job_info(job_id)
+        elif action == "update":
+            return self._update_job(job_id, name, message, every_seconds, cron_expr, tz, at)
         elif action == "remove":
             return self._remove_job(job_id)
+        elif action == "pause":
+            return self._set_enabled(job_id, False, "Paused")
+        elif action == "resume":
+            return self._set_enabled(job_id, True, "Resumed")
+        elif action == "run_now":
+            return await self._run_now(job_id)
         return f"Unknown action: {action}"
 
     def _add_job(
@@ -186,30 +222,10 @@ class CronTool(Tool):
                 return err
 
         # Build schedule
-        delete_after = False
-        if every_seconds:
-            schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
-        elif cron_expr:
-            effective_tz = tz or self._default_timezone
-            if err := self._validate_timezone(effective_tz):
-                return err
-            schedule = CronSchedule(kind="cron", expr=cron_expr, tz=effective_tz)
-        elif at:
-            from zoneinfo import ZoneInfo
-
-            try:
-                dt = datetime.fromisoformat(at)
-            except ValueError:
-                return ToolResult.error(f"Error: invalid ISO datetime format '{at}'. Expected format: YYYY-MM-DDTHH:MM:SS")
-            if dt.tzinfo is None:
-                if err := self._validate_timezone(self._default_timezone):
-                    return err
-                dt = dt.replace(tzinfo=ZoneInfo(self._default_timezone))
-            at_ms = int(dt.timestamp() * 1000)
-            schedule = CronSchedule(kind="at", at_ms=at_ms)
-            delete_after = True
-        else:
-            return ToolResult.error("Error: either every_seconds, cron_expr, or at is required")
+        result = self._build_schedule(every_seconds, cron_expr, tz, at)
+        if len(result) == 1:  # error string returned
+            return result[0]
+        schedule, delete_after = result
 
         job = self._cron.add_job(
             name=name or message[:30],
@@ -222,6 +238,140 @@ class CronTool(Tool):
             origin_metadata=origin_metadata,
         )
         return f"Created job '{job.name}' (id: {job.id})"
+
+    def _build_schedule(
+        self,
+        every_seconds: int | None,
+        cron_expr: str | None,
+        tz: str | None,
+        at: str | None,
+    ) -> "tuple[str] | tuple[CronSchedule, bool]":
+        """Build a CronSchedule from one of the timing params.
+
+        Returns ``(schedule, delete_after_run)`` on success, or a single-element
+        tuple containing an error string (to be returned directly by callers).
+        """
+        delete_after = False
+        if every_seconds:
+            schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
+        elif cron_expr:
+            effective_tz = tz or self._default_timezone
+            if err := self._validate_timezone(effective_tz):
+                return (err,)
+            schedule = CronSchedule(kind="cron", expr=cron_expr, tz=effective_tz)
+        elif at:
+            from zoneinfo import ZoneInfo
+
+            try:
+                dt = datetime.fromisoformat(at)
+            except ValueError:
+                return (
+                    f"Error: invalid ISO datetime format '{at}'. Expected format: YYYY-MM-DDTHH:MM:SS",
+                )
+            if dt.tzinfo is None:
+                if err := self._validate_timezone(self._default_timezone):
+                    return (err,)
+                dt = dt.replace(tzinfo=ZoneInfo(self._default_timezone))
+            at_ms = int(dt.timestamp() * 1000)
+            schedule = CronSchedule(kind="at", at_ms=at_ms)
+            delete_after = True
+        else:
+            return ("Error: either every_seconds, cron_expr, or at is required",)
+        return (schedule, delete_after)
+
+    def _update_job(
+        self,
+        job_id: str | None,
+        name: str | None,
+        message: str,
+        every_seconds: int | None,
+        cron_expr: str | None,
+        tz: str | None,
+        at: str | None,
+    ) -> str:
+        if not job_id:
+            return ToolResult.error("Error: cron action='update' requires 'job_id'")
+        has_new_schedule = any([every_seconds, cron_expr, at])
+        if tz and not cron_expr:
+            return ToolResult.error("Error: tz can only be used with cron_expr")
+        if has_new_schedule:
+            result = self._build_schedule(every_seconds, cron_expr, tz, at)
+            if len(result) == 1:
+                return result[0]
+            schedule, delete_after = result  # type: ignore[misc]
+        else:
+            schedule = None
+            delete_after = None
+
+        kwargs: dict[str, Any] = {}
+        if name is not None:
+            kwargs["name"] = name
+        if message:
+            kwargs["message"] = message
+        if schedule is not None:
+            kwargs["schedule"] = schedule
+        if delete_after is not None:
+            kwargs["delete_after_run"] = delete_after
+        if not kwargs:
+            return ToolResult.error(
+                "Error: nothing to update — provide at least one of name, message, "
+                "or a new schedule (every_seconds/cron_expr/at)."
+            )
+
+        result = self._cron.update_job(job_id, **kwargs)
+        if result == "not_found":
+            return f"Job {job_id} not found"
+        if result == "protected":
+            return (
+                f"Cannot update job `{job_id}`. This is a protected system-managed cron job."
+            )
+        job = result
+        return f"Updated job '{job.name}' (id: {job.id})"
+
+    def _set_enabled(self, job_id: str | None, enabled: bool, verb: str) -> str:
+        if not job_id:
+            return ToolResult.error(f"Error: cron action='{verb.lower()}' requires 'job_id'")
+        job = self._cron.enable_job(job_id, enabled)
+        if job is None:
+            return f"Job {job_id} not found"
+        return f"{verb} job '{job.name}' (id: {job.id})"
+
+    async def _run_now(self, job_id: str | None) -> str:
+        if not job_id:
+            return ToolResult.error("Error: cron action='run_now' requires 'job_id'")
+        if self._cron.get_job(job_id) is None:
+            return f"Job {job_id} not found"
+        ran = await self._cron.run_job(job_id, force=True)
+        if not ran:
+            return f"Could not run job {job_id}"
+        # Re-fetch: execution may have advanced state on a freshly loaded store.
+        job = self._cron.get_job(job_id)
+        status = (job.state.last_status if job else None) or "unknown"
+        detail = f" ({job.state.last_error})" if job and job.state.last_error else ""
+        name = job.name if job else job_id
+        return f"Ran job '{name}' (id: {job_id}) — status: {status}{detail}"
+
+    def _job_info(self, job_id: str | None) -> str:
+        if not job_id:
+            return ToolResult.error("Error: cron action='info' requires 'job_id'")
+        job = self._cron.get_job(job_id)
+        if job is None:
+            return f"Job {job_id} not found"
+        lines = [
+            f"Job '{job.name}' (id: {job.id})",
+            f"  Enabled: {job.enabled}",
+            f"  Timing: {self._format_timing(job.schedule)}",
+            f"  Message: {job.payload.message}",
+        ]
+        lines.extend(self._format_state(job.state, job.schedule))
+        if job.state.run_history:
+            recent = job.state.run_history[-5:]
+            hist = ", ".join(
+                f"{r.status}@{self._format_timestamp(r.run_at_ms, self._display_timezone(job.schedule)).split(' ')[0]}"
+                for r in recent
+            )
+            lines.append(f"  Recent runs: {hist}")
+        return "\n".join(lines)
 
     def _format_timing(self, schedule: CronSchedule) -> str:
         """Format schedule as a human-readable timing string."""

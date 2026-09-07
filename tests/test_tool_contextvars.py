@@ -323,9 +323,15 @@ async def test_cron_tool_preserves_thread_scoped_session_key(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cron_tool_no_context_returns_error(tmp_path) -> None:
-    """Without a request context, add should fail with a clear error."""
-    tool = CronTool(CronService(tmp_path / "jobs.json"))
+async def test_cron_tool_no_context_schedules_general_job(tmp_path) -> None:
+    """Without a request context, add must still succeed by binding the job to
+    a stable general session (cron works for any task from any context)."""
+    service = CronService(tmp_path / "jobs.json")
+    tool = CronTool(service)
 
     result = await tool.execute(action="add", message="test", every_seconds=60)
-    assert result == "Error: scheduled cron jobs must be created from a chat session"
+    assert "Created job" in result
+    jobs = service.list_jobs()
+    assert len(jobs) == 1
+    # General fallback binds to a non-chat session rather than refusing.
+    assert jobs[0].payload.session_key
