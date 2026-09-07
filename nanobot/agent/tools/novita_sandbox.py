@@ -686,8 +686,12 @@ class NovitaSandboxTool(Tool):
                     return sandbox
             except Exception:
                 _STORE.remove(key)
+        # Template controls per-sandbox CPU/RAM. The built-in "base" template is
+        # ~1 GB and OOMs on heavy builds (e.g. apktool); "powerx-base-4g" is a
+        # clone configured with 2 vCPU / 4 GB (see scripts/build_novita_template.py).
+        sandbox_template = os.getenv("NOVITA_SANDBOX_TEMPLATE", "powerx-base-4g").strip() or "base"
         sandbox = client.sandbox.create(
-            "base",
+            sandbox_template,
             timeout=min(int(os.getenv("NOVITA_SANDBOX_TIMEOUT", "3600")), 86_400),
             secure=True,
             allow_internet_access=True,
