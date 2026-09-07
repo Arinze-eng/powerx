@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 
+from loguru import logger
+
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tools import image_generation as image_generation_tools
@@ -112,6 +114,15 @@ class ContextBuilder:
 
         parts.append(render_template("agent/tool_contract.md"))
 
+        # Sandbox orientation: tell the model exactly where sandbox files live
+        # (workspace map, APK playbook, web lifecycle) so it never gets lost
+        # mid-task. Only rendered when a sandbox backend is configured usable.
+        sandbox_section = self._build_sandbox_workspace_section(
+            agent_workspace_path=str(self.workspace)
+        )
+        if sandbox_section:
+            parts.append(sandbox_section)
+
         if include_memory:
             memory = self.memory.read_memory()
             if memory and not self._is_template_content(memory, "memory/MEMORY.md"):
@@ -197,6 +208,46 @@ class ContextBuilder:
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
         )
+
+    @staticmethod
+    def _build_sandbox_workspace_section(agent_workspace_path: str = "") -> str:
+        """Render the sandbox orientation map when a sandbox backend is usable.
+
+        Keeps the model from getting lost mid-task (especially long APK
+        decompile/rebuild flows): it always knows which filesystem it is
+        talking to, where projects and toolchain artifacts live, and the
+        exact playbook for each heavy workflow.
+        """
+        try:
+            import os
+
+            from nanobot.config.loader import load_config
+            from nanobot.config.paths import get_config_path
+
+            execution = None
+            try:
+                execution = load_config(get_config_path()).execution
+            except Exception:
+                execution = None
+            backend = getattr(execution, "backend", "novita") if execution else "novita"
+            vps = getattr(execution, "vps", None) if execution else None
+            if backend == "vps":
+                if not (vps and str(getattr(vps, "host", "")).strip()):
+                    return ""  # no usable backend — don't mislead the model
+                sandbox_dir = str(getattr(vps, "workspace_dir", "/workspace") or "/workspace")
+            else:
+                if not os.getenv("NOVITA_API_KEY", "").strip():
+                    return ""
+                sandbox_dir = "/workspace"
+            return render_template(
+                "agent/sandbox_workspace.md",
+                sandbox_backend="Linux VPS over SSH" if backend == "vps" else "Novita Sandbox",
+                sandbox_workspace_dir=sandbox_dir.rstrip("/") or "/workspace",
+                agent_workspace_path=agent_workspace_path or "the gateway host",
+            )
+        except Exception:
+            logger.debug("sandbox workspace section skipped", exc_info=True)
+            return ""
 
     @staticmethod
     def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
