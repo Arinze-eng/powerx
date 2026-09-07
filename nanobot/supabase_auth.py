@@ -168,8 +168,22 @@ class SupabaseAuth:
         if not self.enabled:
             raise SupabaseAuthError("Supabase integration is not configured")
         try:
-            async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
-                response = await client.request(method, f"{self.url}{path}", headers=self._headers(service=service, access_token=access_token), params=params, json=body)
+            # Supabase cold starts surface as connect timeouts or transient
+            # 5xx; a single attempt makes presence writes fail exactly when the
+            # site is busiest. Two quick retries with backoff fix it cheaply.
+            import asyncio as _asyncio
+
+            response = None
+            for attempt in range(3):
+                try:
+                    async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
+                        response = await client.request(method, f"{self.url}{path}", headers=self._headers(service=service, access_token=access_token), params=params, json=body)
+                    if response.status_code < 500 or attempt == 2:
+                        break
+                except httpx.HTTPError:
+                    if attempt == 2:
+                        raise
+                    await _asyncio.sleep(0.8 * (attempt + 1))
         except httpx.HTTPError as exc:
             raise SupabaseAuthError("Supabase request failed") from exc
         if not response.is_success:
@@ -256,6 +270,19 @@ class SupabaseAuth:
                 service=True,
                 body={"p_user": user_id},
             )
+        except SupabaseAuthError:
+            # The RPC is missing or its signature drifted (returns 404). Update
+            # the column directly so presence tracking never silently dies.
+            try:
+                await self._request(
+                    "PATCH",
+                    "/rest/v1/profiles",
+                    service=True,
+                    params={"id": f"eq.{user_id}"},
+                    body={"last_seen_at": self._now()},
+                )
+            except SupabaseAuthError:
+                pass
         except SupabaseAuthError:
             pass
 

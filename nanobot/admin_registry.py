@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from loguru import logger
 from websockets.http11 import Response
 
 from nanobot import dbq_admin, supabase_admin
@@ -696,7 +697,16 @@ def admin_route(
             return http_error(502, str(exc))
     if path == "/api/admin/supabase/webui-questions":
         try:
-            return http_json_response({"ok": True, "questions": supabase_admin.webui_question_history()})
+            questions = supabase_admin.webui_question_history()
+        except Exception as exc:
+            # Presence data must degrade gracefully in the UI instead of the
+            # whole admin panel throwing on one Supabase hiccup.
+            logger.warning("webui question history failed: {}", type(exc).__name__)
+            return http_json_response(
+                {"ok": False, "error": str(exc)[:200], "questions": []}
+            )
+        try:
+            return http_json_response({"ok": True, "questions": questions})
         except supabase_admin.SupabaseAdminError as exc:
             return http_error(502, str(exc))
     if path == "/api/admin/supabase/announcements":

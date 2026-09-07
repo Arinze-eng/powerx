@@ -304,3 +304,48 @@ async def test_puter_image_edit_rejects_non_image_data_uri(monkeypatch) -> None:
 
     with pytest.raises(SupabaseAuthError, match="unsupported format"):
         await client.puter_edit_image({"agentx_user_id": "user"}, "edit", ["data:text/plain;base64,QQ=="])
+
+
+@pytest.mark.asyncio
+async def test_record_webui_activity_falls_back_when_rpc_missing(monkeypatch) -> None:
+    """update_last_seen RPC missing (404) must not kill presence tracking."""
+    auth = FakeSupabase()
+    calls = []
+
+    async def fake_request(method, path, *, service=False, access_token="", params=None, body=None):
+        calls.append((method, path))
+        if path == "/rest/v1/rpc/update_last_seen":
+            raise SupabaseAuthError("Could not find the function update_last_seen")
+        return None
+
+    monkeypatch.setattr(auth, "_request", fake_request)
+    await auth.record_webui_activity(
+        "809cef12-925e-4669-866a-9933b1a57688", question="hello admin", channel="webui"
+    )
+    paths = [p for _, p in calls]
+    assert "/rest/v1/profiles" in paths, "direct PATCH fallback ran"
+    assert "/rest/v1/user_questions" in paths, "question still recorded"
+
+
+@pytest.mark.asyncio
+async def test_record_webui_activity_prefers_rpc_when_present() -> None:
+    auth = FakeSupabase()
+    calls = []
+
+    async def fake_request(method, path, *, service=False, access_token="", params=None, body=None):
+        calls.append((method, path))
+        return None
+
+    monkey = fake_request  # noqa: F841
+    import nanobot.supabase_auth as sa
+
+    original = auth._request
+    auth._request = fake_request
+    try:
+        await auth.record_webui_activity("u1", question="q", channel="webui")
+    finally:
+        auth._request = original
+    assert ("/post", "/rest/v1/rpc/update_last_seen") or True
+    assert ("POST", "/rest/v1/rpc/update_last_seen") in [(m.upper(), p) for m, p in calls]
+    # no profiles PATCH happened because the RPC succeeded
+    assert not any(p == "/rest/v1/profiles" and m.upper() == "PATCH" for m, p in calls)

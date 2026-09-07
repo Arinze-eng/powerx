@@ -38,14 +38,26 @@ def _request(method: str, path: str, *, json: Any = None, params: dict[str, str]
     if not configured():
         raise SupabaseAdminError("Supabase admin integration is not configured")
     try:
-        with httpx.Client(timeout=20.0, follow_redirects=False) as client:
-            response = client.request(
-                method,
-                f"{_base_url()}{path}",
-                headers=_headers(),
-                params=params,
-                json=json,
-            )
+        import time as _time
+
+        response = None
+        for attempt in range(3):
+            try:
+                with httpx.Client(timeout=20.0, follow_redirects=False) as client:
+                    response = client.request(
+                        method,
+                        f"{_base_url()}{path}",
+                        headers=_headers(),
+                        params=params,
+                        json=json,
+                    )
+                if response.status_code < 500 or attempt == 2:
+                    break
+                _time.sleep(0.8 * (attempt + 1))
+            except httpx.HTTPError:
+                if attempt == 2:
+                    raise
+                _time.sleep(0.8 * (attempt + 1))
         if not response.is_success:
             raise SupabaseAdminError(f"Supabase request failed with HTTP {response.status_code}")
         if response.status_code == 204 or not response.content:
