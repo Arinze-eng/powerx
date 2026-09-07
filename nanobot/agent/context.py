@@ -114,6 +114,23 @@ class ContextBuilder:
 
         parts.append(render_template("agent/tool_contract.md"))
 
+        # Fresh-task discipline: models otherwise echo the previous task's
+        # answer into a new request and re-emit finished results verbatim.
+        # Cheap (~200 tokens), static text — placed before the dynamic tail so
+        # it never breaks provider prompt caching.
+        parts.append(
+            "## Answer Discipline (turn boundaries)\n\n"
+            "- Each new user message starts a NEW task unless the user says to "
+            "continue, repeat, or show the previous result again.\n"
+            "- Never paste or restate an earlier task's output, report, code, or "
+            "links as part of the current answer. History is background "
+            "context, not material to echo.\n"
+            "- If the current request was already completed in this conversation "
+            "and nothing changed, reply with one short confirmation plus the "
+            "existing result link — do not regenerate or resend the full result.\n"
+            "- State each fact, URL, and artifact exactly once per answer."
+        )
+
         # Sandbox orientation: tell the model exactly where sandbox files live
         # (workspace map, APK playbook, web lifecycle) so it never gets lost
         # mid-task. Only rendered when a sandbox backend is configured usable.

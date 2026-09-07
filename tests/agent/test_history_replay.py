@@ -84,6 +84,8 @@ async def test_process_message_replays_with_token_budget_only(tmp_path: Path) ->
     assert get_history.call_args.kwargs == {
         "max_tokens": loop._replay_token_budget(loop.llm_runtime()),
         "extend_to_user": False,
+        # Stale per-turn runtime context must never be replayed into new turns.
+        "include_runtime_context": False,
     }
 
 

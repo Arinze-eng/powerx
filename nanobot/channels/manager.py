@@ -655,7 +655,16 @@ class ChannelManager:
 
     @staticmethod
     def _fingerprint_content(content: str) -> str:
-        normalized = " ".join(content.split())
+        # Runtime-context blocks are per-turn metadata, not answer content.
+        # Without this, the same final answer delivered once raw and once with
+        # an appended block would fingerprint differently and both reach the
+        # user as duplicate messages.
+        from nanobot.runtime_context import strip_runtime_context_from_content
+
+        visible = strip_runtime_context_from_content(content)
+        if not isinstance(visible, str):
+            return ""
+        normalized = " ".join(visible.split())
         return hashlib.sha1(normalized.encode("utf-8")).hexdigest() if normalized else ""
 
     def _should_suppress_outbound(self, msg: OutboundMessage) -> bool:

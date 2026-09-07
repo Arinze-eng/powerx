@@ -269,11 +269,16 @@ async def test_runtime_context_is_persisted_as_next_turn_prompt_prefix(tmp_path)
     second_request = provider.chat_with_retry.await_args_list[1].kwargs["messages"]
     first_wire = LLMProvider._sanitize_empty_content(first_request)
     second_wire = LLMProvider._sanitize_empty_content(second_request)
-    assert second_wire[: len(first_wire)] == first_wire
-    assert first_wire[1] == second_wire[1]
-    assert first_wire[0] == second_wire[0]
+    # Prefix stability now holds for the DURABLE part of history only:
+    # per-turn runtime context (skills/goals) is stripped from replayed turns
+    # so stale task metadata cannot leak into new tasks. The live turn still
+    # carries its own blocks.
+    assert second_wire[0] == first_wire[0]
+    assert second_wire[1]["content"] == "first turn $review"
+    assert first_wire[1]["content"].startswith("first turn $review")
     assert "Follow the unique review checklist." not in first_wire[0]["content"]
     assert "Follow the unique review checklist." in first_wire[1]["content"]
+    assert "Follow the unique review checklist." not in str(second_wire)
     assert second_wire[2]["role"] == "assistant"
     assert second_wire[2]["content"] == "first answer"
     assert second_wire[3]["content"].startswith("second turn")

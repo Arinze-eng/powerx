@@ -25,7 +25,9 @@ from nanobot.config.paths import get_legacy_sessions_dir, get_runtime_subdir
 from nanobot.providers.base import ProviderConversationState
 from nanobot.runtime_context import (
     RUNTIME_CONTEXT_HISTORY_META,
+    RUNTIME_CONTEXT_TAG,
     public_history_message,
+    strip_runtime_context_from_content,
 )
 from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY
 from nanobot.utils.helpers import (
@@ -88,6 +90,12 @@ def _sanitize_assistant_replay_text(content: str) -> str:
     in assistant examples they become demonstrations for the model to repeat.
     """
     content = _MESSAGE_TIME_PREFIX_RE.sub("", content, count=1)
+    # An assistant echo of a runtime-context block is per-turn metadata from a
+    # PREVIOUS task — replaying it teaches the model to repeat old results in
+    # new answers. Strip exactly like user rows are stripped during replay.
+    if RUNTIME_CONTEXT_TAG in content:
+        stripped = strip_runtime_context_from_content(content)
+        content = stripped if isinstance(stripped, str) else ""
     lines = [
         line
         for line in content.splitlines()
@@ -269,7 +277,20 @@ class Session:
                 dict,
             )
             if not include_runtime_context:
+                had_marker = isinstance(
+                    message.get(RUNTIME_CONTEXT_HISTORY_META), dict
+                )
                 message = public_history_message(message)
+                # Belt & braces for rows without a durable marker (assistant
+                # echoes, legacy/foreign rows). Never apply to user rows that
+                # carry a real marker: their block was legitimately appended by
+                # the runtime and only belongs in provider replay.
+                if not had_marker or message.get("role") != "user":
+                    stripped_content = strip_runtime_context_from_content(
+                        message.get("content")
+                    )
+                    if stripped_content != message.get("content"):
+                        message = {**message, "content": stripped_content}
             content = message.get("content", "")
             role = message.get("role")
             if role == "assistant" and isinstance(content, str):

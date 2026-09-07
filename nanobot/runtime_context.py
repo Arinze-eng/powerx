@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -243,3 +244,51 @@ def public_history_message(message: Mapping[str, Any]) -> dict[str, Any]:
 def public_history_messages(messages: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Return user-visible copies of persisted messages."""
     return [public_history_message(message) for message in messages]
+
+
+# Pre-compiled patterns for marker-less stripping (replay sanitisation). The
+# tag text is fixed by RUNTIME_CONTEXT_TAG/RUNTIME_CONTEXT_END above; block
+# bodies are bounded (< ~4K) so non-greedy matching is safe.
+_RUNTIME_BLOCK_RE = re.compile(
+    re.escape(RUNTIME_CONTEXT_TAG) + r".*?" + re.escape(RUNTIME_CONTEXT_END) + r"[ \t]*\n*",
+    re.DOTALL,
+)
+# Unterminated tail: a truncated/legacy block that never closed its end tag.
+_RUNTIME_OPEN_RE = re.compile(re.escape(RUNTIME_CONTEXT_TAG) + r".*\Z", re.DOTALL)
+
+
+def strip_runtime_context_from_content(content: Any) -> Any:
+    """Remove runtime-context blocks from message content without a marker.
+
+    Used when replaying history into a NEW model turn: per-turn metadata
+    (timestamps, goals, mentions, quotes) must not leak across turns — the
+    model otherwise treats stale context as part of the current request and
+    repeats previous-task results alongside the new answer. Returns the input
+    unchanged when nothing matches (identity check friendly).
+    """
+    if isinstance(content, str):
+        if RUNTIME_CONTEXT_TAG not in content:
+            return content
+        cleaned = _RUNTIME_BLOCK_RE.sub("", content)
+        cleaned = _RUNTIME_OPEN_RE.sub("", cleaned)
+        return cleaned.strip()
+    if isinstance(content, list):
+        changed = False
+        out: list[Any] = []
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+                and RUNTIME_CONTEXT_TAG in block["text"]
+            ):
+                stripped = strip_runtime_context_from_content(block["text"])
+                new_block = {**block, "text": stripped}
+                if stripped:
+                    out.append(new_block)
+                changed = True
+            else:
+                out.append(block)
+        return out if changed else content
+    return content
+

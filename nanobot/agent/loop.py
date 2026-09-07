@@ -59,11 +59,13 @@ from nanobot.providers.factory import ProviderSnapshot
 from nanobot.runtime_context import (
     RUNTIME_CONTEXT_HISTORY_META,
     RUNTIME_CONTEXT_MESSAGE_META,
+    RUNTIME_CONTEXT_TAG,
     RuntimeContextBlock,
     RuntimeContextProvider,
     append_runtime_context,
     resolve_runtime_context,
     runtime_context_blocks_from_metadata,
+    strip_runtime_context_from_content,
 )
 from nanobot.security.workspace_access import (
     WorkspaceScopeResolver,
@@ -2066,6 +2068,13 @@ class AgentLoop:
         _hist_kwargs: dict[str, Any] = {
             "max_tokens": self._replay_token_budget(runtime),
             "extend_to_user": is_subagent,
+            # Strip per-turn runtime-context blocks (timestamps, goals,
+            # mentions, quotes) from replayed history. They belonged to their
+            # own turn; leaving them in lets the model treat stale task
+            # metadata as current and repeat previous-task results into new
+            # answers. The live turn's blocks are appended separately via
+            # ctx.runtime_context_blocks.
+            "include_runtime_context": False,
         }
         ctx.history = session.get_history(**_hist_kwargs)
         stored_state = session.provider_state
@@ -2348,6 +2357,7 @@ class AgentLoop:
         content: list[object],
         *,
         should_truncate_text: bool = False,
+        strip_assistant_runtime_context: bool = False,
     ) -> list[object]:
         """Strip volatile multimodal payloads before writing session history."""
         filtered: list[object] = []
@@ -2373,6 +2383,14 @@ class AgentLoop:
                 str,
             ):
                 text = cast(str, block_data["text"])
+                # Only sanitize runtime-context echoes in ASSISTANT rows; user
+                # rows are handled by _save_turn (marker-aware) so that a
+                # literal user-authored tag survives untouched.
+                if strip_assistant_runtime_context and RUNTIME_CONTEXT_TAG in text:
+                    stripped = strip_runtime_context_from_content(text)
+                    if not stripped:
+                        continue
+                    text = cast(str, stripped)
                 if should_truncate_text and len(text) > self.max_tool_result_chars:
                     text = truncate_text_fn(text, self.max_tool_result_chars)
                 filtered.append({**block_data, "text": text})
@@ -2443,6 +2461,7 @@ class AgentLoop:
                     filtered = self._sanitize_persisted_blocks(
                         cast(list[object], content),
                         should_truncate_text=True,
+                        strip_assistant_runtime_context=True,
                     )
                     if not filtered:
                         # Preserve the tool_call/result pair after block filtering.
