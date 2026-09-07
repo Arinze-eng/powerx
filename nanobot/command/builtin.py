@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from nanobot import __version__
 from nanobot.bus.events import INBOUND_META_USER_SHELL, OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter, normalize_command_text
+from nanobot.runtime_context import encode_runtime_context_blocks_for_json
 from nanobot.utils.helpers import build_status_content
 from nanobot.utils.restart import set_restart_notice_to_env
 from nanobot.utils.workspace_prompts import initialize_workspace_prompt
@@ -981,7 +982,9 @@ async def cmd_trigger(ctx: CommandContext) -> OutboundMessage:
         chat_id=ctx.msg.chat_id,
         session_key=session_key,
         sender_id="trigger",
-        origin_metadata=dict(ctx.msg.metadata or {}),
+        # Trigger metadata is persisted as JSON; encode channel-produced
+        # RuntimeContextBlock instances so json.dumps never sees them.
+        origin_metadata=encode_runtime_context_blocks_for_json(ctx.msg.metadata or {}),
     )
     command = f'nanobot trigger {trigger.id} "message"'
     return OutboundMessage(

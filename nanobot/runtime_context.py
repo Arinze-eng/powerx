@@ -76,6 +76,49 @@ def webui_quote_runtime_context(metadata: Mapping[str, Any]) -> RuntimeContextBl
     return RuntimeContextBlock(source=WEBUI_QUOTE_SOURCE, content=content)
 
 
+def encode_runtime_context_block(block: RuntimeContextBlock) -> dict[str, str]:
+    """Return a JSON-safe mapping form of one block.
+
+    ``normalize_runtime_context_blocks`` accepts sequence-shaped blocks with
+    ``source``/``content`` keys, so encoded values round-trip losslessly while
+    being safe to persist or send through ``json.dumps``.
+    """
+    return {"source": block.source, "content": block.content}
+
+
+def encode_runtime_context_blocks_for_json(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a shallow copy of channel metadata with runtime-context blocks
+    converted to JSON-serializable dicts.
+
+    Channels inject ``RuntimeContextBlock`` instances into inbound message
+    metadata (``RUNTIME_CONTEXT_INPUT_META``). Downstream persistence paths
+    (cron ``origin_metadata``, trigger stores, transcripts) serialize that
+    metadata with plain ``json.dumps`` / ``dataclasses.asdict`` — neither of
+    which recurses into arbitrary objects inside plain dicts — which raised
+    ``TypeError: Object of type RuntimeContextBlock is not JSON serializable``.
+    Other per-turn internals are dropped; only routing-relevant keys remain.
+    """
+    out: dict[str, Any] = {}
+    for key, value in metadata.items():
+        if key == RUNTIME_CONTEXT_INPUT_META:
+            try:
+                blocks = normalize_runtime_context_blocks(value)
+            except (TypeError, ValueError):
+                continue
+            out[key] = [encode_runtime_context_block(block) for block in blocks]
+        elif isinstance(value, RuntimeContextBlock):
+            out[key] = encode_runtime_context_block(value)
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            items = cast(Sequence[Any], value)
+            if items and all(isinstance(item, RuntimeContextBlock) for item in items):
+                out[key] = [encode_runtime_context_block(item) for item in items]
+            else:
+                out[key] = value
+        else:
+            out[key] = value
+    return out
+
+
 def normalize_runtime_context_blocks(result: RuntimeContextResult) -> list[RuntimeContextBlock]:
     """Return validated, non-empty blocks while preserving provider order."""
     if result is None:
@@ -87,7 +130,19 @@ def normalize_runtime_context_blocks(result: RuntimeContextResult) -> list[Runti
     blocks: list[RuntimeContextBlock] = []
     for block in values:
         if not isinstance(block, RuntimeContextBlock):
-            raise TypeError("runtime context providers must return RuntimeContextBlock values")
+            # Accept the JSON-safe encoded form produced by
+            # ``encode_runtime_context_blocks_for_json`` (e.g. after a cron
+            # job's origin metadata round-trips through the store).
+            if isinstance(cast(object, block), Mapping):
+                source = block.get("source")
+                content = block.get("content")
+                if (
+                    isinstance(source, str)
+                    and isinstance(content, str)
+                ):
+                    block = RuntimeContextBlock(source=source, content=content)
+            if not isinstance(block, RuntimeContextBlock):
+                raise TypeError("runtime context providers must return RuntimeContextBlock values")
         source = block.source.strip()
         content = block.content.strip()
         if not source:

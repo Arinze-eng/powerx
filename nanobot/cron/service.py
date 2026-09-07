@@ -17,6 +17,7 @@ from filelock import FileLock
 from loguru import logger
 
 from nanobot.cron.session_turns import is_bound_cron_job
+from nanobot.runtime_context import encode_runtime_context_blocks_for_json
 from nanobot.cron.types import (
     CronJob,
     CronJobState,
@@ -424,7 +425,15 @@ class CronService:
             ]
         }
 
-        self._atomic_write(self.store_path, json.dumps(data, indent=2, ensure_ascii=False))
+        self._atomic_write(
+            self.store_path,
+            # ``default=str`` is a last-resort guard: origin/channel metadata
+            # copied verbatim from inbound messages can carry arbitrary
+            # objects (e.g. RuntimeContextBlock). A cron store write must
+            # never take down the scheduler; str() degrades gracefully and
+            # callers sanitize metadata before it reaches this point.
+            json.dumps(data, indent=2, ensure_ascii=False, default=str),
+        )
         self._store_dirty = False
 
     @staticmethod
@@ -642,7 +651,14 @@ class CronService:
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             with open(self._action_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"action": action, "params": params}, ensure_ascii=False) + "\n")
+                f.write(
+                    json.dumps(
+                        {"action": action, "params": params},
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    + "\n"
+                )
 
 
     # ========== Public API ==========
@@ -697,11 +713,11 @@ class CronService:
                 deliver=deliver,
                 channel=channel,
                 to=to,
-                channel_meta=channel_meta or {},
+                channel_meta=encode_runtime_context_blocks_for_json(channel_meta or {}),
                 session_key=session_key,
                 origin_channel=origin_channel,
                 origin_chat_id=origin_chat_id,
-                origin_metadata=origin_metadata or {},
+                origin_metadata=encode_runtime_context_blocks_for_json(origin_metadata or {}),
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,

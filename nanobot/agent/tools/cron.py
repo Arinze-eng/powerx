@@ -17,6 +17,7 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronSchedule
+from nanobot.runtime_context import encode_runtime_context_blocks_for_json
 from nanobot.session.keys import UNIFIED_SESSION_KEY
 
 _CRON_PARAMETERS = tool_parameters_schema(
@@ -104,7 +105,13 @@ class CronTool(Tool):
         session_key = (
             raw_key if ctx.session_key == UNIFIED_SESSION_KEY else (ctx.session_key or "")
         )
-        return session_key, ctx.channel or "", ctx.chat_id or "", dict(ctx.metadata or {})
+        # Origin metadata is persisted with the job (cron store JSON, action
+        # log, Supabase sync). Channel-produced RuntimeContextBlock instances
+        # are per-turn model context — not serializable and not useful across
+        # turns — so encode them to plain dicts (keeps replay working after a
+        # store round-trip) before the metadata is stored anywhere.
+        origin_metadata = encode_runtime_context_blocks_for_json(ctx.metadata or {})
+        return session_key, ctx.channel or "", ctx.chat_id or "", origin_metadata
 
     def set_cron_context(self, active: bool) -> Token[bool]:
         """Mark whether the tool is executing inside a cron job callback."""
