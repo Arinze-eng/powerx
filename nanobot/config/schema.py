@@ -132,7 +132,7 @@ class AgentDefaults(Base):
     max_concurrent_subagents: int = Field(default=1, ge=1)
     fail_on_tool_error: bool = True
     max_tool_result_chars: int = 16_000
-    provider_retry_mode: Literal["standard", "persistent"] = "standard"
+    provider_retry_mode: Literal["standard", "persistent", "rate_limit_aware"] = "rate_limit_aware"
     tool_hint_max_length: int = Field(
         default=40,
         ge=20,

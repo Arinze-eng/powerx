@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -316,6 +318,18 @@ class LLMProvider(ABC):
     _PERSISTENT_MAX_DELAY = 60
     _PERSISTENT_IDENTICAL_ERROR_LIMIT = 10
     _RETRY_HEARTBEAT_CHUNK = 30
+
+    # --- rate_limit_aware policy -------------------------------------------
+    # Designed to keep a task running *through* provider rate limits instead of
+    # surfacing them to the user. Unlike "persistent", it does NOT abort on a
+    # burst of identical 429s (a sustained limiter is always identical); it only
+    # gives up when there is genuine evidence of a dead loop. Out-of-credit /
+    # billing errors are terminal and surface immediately (see is_arrearage_*).
+    _RLA_MAX_DELAY = 60.0            # exponential backoff ceiling (seconds)
+    _RLA_JITTER_FRACTION = 0.2       # +/- 20% jitter to avoid thundering herd
+    _RLA_GIVEUP_IDENTICAL_ERRORS = 30   # hard stop only if ALSO no Retry-After AND past min wall time
+    _RLA_GIVEUP_MIN_WALL_S = 900.0      # ~15min of pure waiting before a no-Retry-After spiral ends
+    _RLA_DEFAULT_RETRY_AFTER = 5.0      # assumed window when a retryable 429 omits Retry-After
     _TRANSIENT_ERROR_MARKERS = (
         "429",
         "rate limit",
@@ -1070,25 +1084,85 @@ class LLMProvider(ABC):
             return response.retry_after
         return cls._extract_retry_after(response.content)
 
+    @classmethod
+    def _is_rate_limited(cls, response: LLMResponse) -> bool:
+        """True when a transient error is specifically a rate limit / throttle.
+
+        Used to pick the friendlier "waiting for capacity" heartbeat wording and
+        to decide whether the assumed Retry-After window applies.
+        """
+        status = response.error_status_code
+        if status is not None and int(status) == 429:
+            return True
+        token = cls._normalize_error_token(response.error_code) or ""
+        etype = cls._normalize_error_token(response.error_type) or ""
+        if any(t in token or t in etype for t in (
+            "rate_limit", "too_many_requests", "requests_limit", "overloaded",
+        )):
+            return True
+        content = (response.content or "").lower()
+        return any(marker in content for marker in (
+            "rate limit", "too many requests", "retry after", "try again in",
+            "overloaded", "concurrency limit",
+        ))
+
+    def _compute_delay(
+        self,
+        *,
+        attempt: int,
+        retry_after: float | None,
+        mode: str,
+        base_delays: list[float],
+    ) -> float:
+        """Seconds to wait before the next attempt.
+
+        - ``standard``: fixed ladder (1/2/4s), provider Retry-After wins.
+        - ``persistent``: legacy behaviour — Retry-After + buffer, capped at 60s.
+        - ``rate_limit_aware``: honour a real Retry-After; otherwise exponential
+          backoff with jitter capped at 60s so we stop hammering the limiter.
+        """
+        if retry_after:
+            delay = retry_after + RETRY_AFTER_BUFFER
+        elif mode == "rate_limit_aware":
+            # Exponential backoff from the base ladder, then cap + jitter.
+            base = base_delays[min(attempt - 1, len(base_delays) - 1)]
+            growth = base * (2 ** max(0, attempt - len(base_delays)))
+            delay = min(growth, self._RLA_MAX_DELAY)
+            jitter = delay * self._RLA_JITTER_FRACTION
+            delay = max(0.1, delay + random.uniform(-jitter, jitter))
+            return delay  # already jittered; skip the persistent cap below
+        else:
+            delay = base_delays[min(attempt - 1, len(base_delays) - 1)]
+
+        if mode != "standard":
+            delay = min(delay, self._PERSISTENT_MAX_DELAY)
+        return max(0.1, delay)
+
     async def _sleep_with_heartbeat(
         self,
         delay: float,
         *,
         attempt: int,
-        persistent: bool,
+        mode: str,
+        rate_limited: bool,
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         remaining = max(0.0, delay)
         while remaining > 0:
             if on_retry_wait:
-                kind = "persistent retry" if persistent else "retry"
-                await on_retry_wait(
-                    f"Model request failed, {kind} in {max(1, int(round(remaining)))}s "
-                    f"(attempt {attempt})."
-                )
+                secs = max(1, int(round(remaining)))
+                if rate_limited:
+                    # Friendlier wording: never expose the raw limiter error.
+                    msg = f"Model is rate limited — waiting {secs}s to continue (attempt {attempt})."
+                elif mode == "persistent":
+                    msg = f"Model request failed, persistent retry in {secs}s (attempt {attempt})."
+                else:
+                    msg = f"Model request failed, retry in {secs}s (attempt {attempt})."
+                await on_retry_wait(msg)
             chunk = min(remaining, self._RETRY_HEARTBEAT_CHUNK)
             await asyncio.sleep(chunk)
             remaining -= chunk
+
 
     async def _run_with_retry(
         self,
@@ -1104,11 +1178,17 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         attempt = 0
         delays = list(self._CHAT_RETRY_DELAYS)
-        persistent = retry_mode == "persistent"
+        mode = retry_mode if retry_mode in ("standard", "persistent", "rate_limit_aware") else "standard"
+        persistent = mode == "persistent"
+        rate_limit_aware = mode == "rate_limit_aware"
+        # Wall-clock start for the give-up heuristic; perf_counter so fake/real
+        # sleeps are consistent. Only consulted in rate_limit_aware mode.
+        loop_started_at = time.monotonic()
         last_response: LLMResponse | None = None
         last_error_key: str | None = None
         identical_error_count = 0
         while True:
+
             attempt += 1
             response = await call(**kw)
             if response.finish_reason != "error":
@@ -1180,7 +1260,65 @@ class LLMProvider(ABC):
                     return result
                 return response
 
+            # --- rate_limit_aware: keep waiting through limiter windows -------
+            # Out-of-credit / billing was already handled above (is_transient is
+            # False for those). Here we only ever reach retryable transients.
+            if rate_limit_aware:
+                # A genuine provider promise (header/body Retry-After), not our
+                # assumed default. The death-spiral guard only trips when the
+                # provider never tells us how long to wait AND we have been
+                # waiting a very long time on identical errors.
+                promised = self._extract_retry_after_from_response(response)
+                effective_retry_after = promised
+                if effective_retry_after is None and self._is_rate_limited(response):
+                    # A 429 that omits Retry-After still has a real window; assume
+                    # a short one so we back off instead of hot-looping.
+                    effective_retry_after = self._RLA_DEFAULT_RETRY_AFTER
+                elapsed = time.monotonic() - loop_started_at
+                # Give up ONLY on a genuine death spiral: the provider never sent
+                # a Retry-After, a long run of identical errors, AND substantial
+                # wall time already spent waiting. A normal sustained 429 carries
+                # a Retry-After, so this never trips during ordinary throttling.
+                if (
+                    promised is None
+                    and identical_error_count >= self._RLA_GIVEUP_IDENTICAL_ERRORS
+                    and elapsed >= self._RLA_GIVEUP_MIN_WALL_S
+                ):
+                    logger.warning(
+                        "rate_limit_aware giving up after {} identical errors over {:.0f}s with no Retry-After: {}",
+                        identical_error_count,
+                        elapsed,
+                        (response.content or "")[:120].lower(),
+                    )
+                    if on_retry_exhausted:
+                        await on_retry_exhausted(
+                            "Model kept failing without a retry window; stopping."
+                        )
+                    return response
+                delay = self._compute_delay(
+                    attempt=attempt,
+                    retry_after=effective_retry_after,
+                    mode="rate_limit_aware",
+                    base_delays=delays,
+                )
+
+                logger.warning(
+                    "LLM transient error (rate_limit_aware attempt {}), retrying in {}s: {}",
+                    attempt,
+                    int(round(delay)),
+                    (response.content or "")[:120].lower(),
+                )
+                await self._sleep_with_heartbeat(
+                    delay,
+                    attempt=attempt,
+                    mode="rate_limit_aware",
+                    rate_limited=self._is_rate_limited(response),
+                    on_retry_wait=on_retry_wait,
+                )
+                continue
+
             if persistent and identical_error_count >= self._PERSISTENT_IDENTICAL_ERROR_LIMIT:
+
                 logger.warning(
                     "Stopping persistent retry after {} identical transient errors: {}",
                     identical_error_count,
@@ -1205,10 +1343,12 @@ class LLMProvider(ABC):
                 break
 
             retry_after = self._extract_retry_after_from_response(response)
-            base_delay = delays[min(attempt - 1, len(delays) - 1)]
-            delay = retry_after + RETRY_AFTER_BUFFER if retry_after else base_delay
-            if persistent:
-                delay = min(delay, self._PERSISTENT_MAX_DELAY)
+            delay = self._compute_delay(
+                attempt=attempt,
+                retry_after=retry_after,
+                mode=mode,
+                base_delays=delays,
+            )
 
             logger.warning(
                 "LLM transient error (attempt {}{}), retrying in {}s: {}",
@@ -1220,9 +1360,11 @@ class LLMProvider(ABC):
             await self._sleep_with_heartbeat(
                 delay,
                 attempt=attempt,
-                persistent=persistent,
+                mode=mode,
+                rate_limited=self._is_rate_limited(response),
                 on_retry_wait=on_retry_wait,
             )
+
 
         return last_response if last_response is not None else await call(**kw)  # pyright: ignore[reportUnnecessaryComparison]
 

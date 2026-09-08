@@ -352,7 +352,7 @@ class FallbackProvider(LLMProvider):
                 on_stream_recover=on_stream_recover,
             )
             if (
-                retry_mode != "persistent"
+                retry_mode == "standard"
                 and response.finish_reason == "error"
                 and last_exhausted_message
                 and on_retry_exhausted
@@ -360,18 +360,22 @@ class FallbackProvider(LLMProvider):
                 await on_retry_exhausted(last_exhausted_message)
             return response
 
-        if retry_mode != "persistent":
+        if retry_mode not in ("persistent", "rate_limit_aware"):
             return await _call_chain(**kwargs)
+        # Both long-running modes wrap the whole fallback chain in a single retry
+        # loop so a rate-limited primary keeps being retried before we ever
+        # advance to a fallback candidate.
         return await self._run_with_retry(
             _call_chain,
             dict(kwargs),
             original_messages,
-            retry_mode="persistent",
+            retry_mode=retry_mode,
             on_retry_wait=on_retry_wait,
             on_retry_exhausted=on_retry_exhausted,
             should_retry_guard=persistent_retry_guard,
             on_stream_recover=on_stream_recover,
         )
+
 
     async def chat_stream_with_context(
         self,

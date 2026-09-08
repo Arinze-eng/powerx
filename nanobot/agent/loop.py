@@ -286,7 +286,7 @@ class AgentLoop:
         context_block_limit: int | None = None,
         max_tool_result_chars: int | None = None,
         fail_on_tool_error: bool | None = None,
-        provider_retry_mode: str = "standard",
+        provider_retry_mode: str = "rate_limit_aware",
         tool_hint_max_length: int | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,

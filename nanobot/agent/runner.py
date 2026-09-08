@@ -107,7 +107,7 @@ class AgentRunSpec:
     workspace: Path | None = None
     session_key: str | None = None
     context_block_limit: int | None = None
-    provider_retry_mode: str = "standard"
+    provider_retry_mode: str = "rate_limit_aware"
     progress_callback: ProgressCallback | None = None
     stream_progress_deltas: bool = True
     retry_wait_callback: RetryWaitCallback | None = None
@@ -1108,11 +1108,25 @@ class AgentRunner:
         # timeout for streaming while preserving NANOBOT_LLM_TIMEOUT_S=0 as an
         # opt-out for all LLM wall-clock timeouts.
         is_streaming_request = wants_streaming or wants_progress_streaming
-        outer_timeout_s = (
-            max(300.0, timeout_s * 2)
-            if is_streaming_request and timeout_s is not None
-            else timeout_s
+        # In rate_limit_aware mode the provider owns retry/cooldown waits, so a
+        # legitimate long Retry-After window must not be killed by the turn's
+        # wall-clock budget. Bound only the actual model round-trips and let the
+        # provider loop run as long as it needs (it still stops on real death
+        # spirals). Other modes keep the fixed outer timeout unchanged.
+        rate_limit_aware_mode = (
+            spec.provider_retry_mode == "rate_limit_aware"
         )
+        if rate_limit_aware_mode:
+            # Generous ceiling: per-call timeouts are enforced inside the
+            # provider; this only guards against an unbounded hang.
+            outer_timeout_s = None
+        else:
+            outer_timeout_s = (
+                max(300.0, timeout_s * 2)
+                if is_streaming_request and timeout_s is not None
+                else timeout_s
+            )
+
         request_started_at = time.perf_counter()
         try:
             response = (
