@@ -14,8 +14,8 @@ from nanobot.bus.outbound_events import (
     ProgressEvent,
     RetryWaitEvent,
     StreamDeltaEvent,
-    StreamEndEvent,
     StreamedResponseEvent,
+    StreamEndEvent,
     TurnEndEvent,
 )
 from nanobot.supabase_realtime import (
@@ -378,9 +378,9 @@ async def test_publish_outbound_truncates_long_content() -> None:
 
 
 async def _make_manager_with_fake_publisher():
+    from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
     from nanobot.config.schema import Config
-    from nanobot.bus.queue import MessageBus
 
     config = Config()
     bus = MessageBus()

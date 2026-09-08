@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,7 +17,7 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
 from nanobot.cron.bound_runner import run_bound_cron_job
 from nanobot.cron.service import CronService
-from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+from nanobot.cron.types import CronJob, CronSchedule
 from nanobot.providers.base import GenerationSettings, LLMResponse
 
 

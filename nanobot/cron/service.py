@@ -17,7 +17,6 @@ from filelock import FileLock
 from loguru import logger
 
 from nanobot.cron.session_turns import is_bound_cron_job
-from nanobot.runtime_context import encode_runtime_context_blocks_for_json
 from nanobot.cron.types import (
     CronJob,
     CronJobState,
@@ -26,6 +25,7 @@ from nanobot.cron.types import (
     CronSchedule,
     CronStore,
 )
+from nanobot.runtime_context import encode_runtime_context_blocks_for_json
 from nanobot.utils.run_records import (
     write_run_record as write_automation_run_record,
 )

@@ -13,7 +13,6 @@ from loguru import logger
 
 from nanobot.trading.alpaca_credentials import AlpacaCredentialStore
 
-
 _ALPACA_CONNECT_RE = re.compile(r"^/alpaca\s+(connect|disconnect|status)\b", re.IGNORECASE)
 _API_KEY_RE = re.compile(r"^[A-Za-z0-9]{20}$")
 

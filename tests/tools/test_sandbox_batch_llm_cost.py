@@ -18,19 +18,16 @@ that counts every request, plus the real ``SandboxBatchTool`` and real
 
 from __future__ import annotations
 
-import asyncio
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from agent.runner_helpers import make_run_spec
 
 from nanobot.agent.runner import AgentRunner
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.sandbox_batch import SandboxBatchTool
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-
-from agent.runner_helpers import make_run_spec
 
 
 class CountingProvider(LLMProvider):
@@ -163,6 +160,6 @@ async def test_batch_report_contains_every_op_result_in_order() -> None:
     report = await tool.execute(operations=[_run_op(i) for i in range(5)])
     text = str(report)
     for i in range(5):
-        assert f"out:run" in text
+        assert "out:run" in text
         assert f"[op {i} run → ok]" in text
     assert "5 operation(s), 0 failure(s)" in text

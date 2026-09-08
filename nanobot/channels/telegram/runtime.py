@@ -9,7 +9,7 @@ import re
 import time
 import unicodedata
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, TypeAlias, TypeVar, cast
@@ -34,10 +34,12 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes, Messag
 from telegram.request import BaseRequest, HTTPXRequest
 
 from nanobot.admin_registry import record_telegram_user
+from nanobot.api.api_keys import ApiKeyStore
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.telegram.api_platform import handle_api_command
 from nanobot.channels.telegram.task_mode import deliberate_task_metadata
 from nanobot.command.builtin import build_help_text
 from nanobot.config.paths import get_media_dir
@@ -49,8 +51,6 @@ from nanobot.runtime_context import (
 )
 from nanobot.security.network import validate_url_target
 from nanobot.supabase_auth import SupabaseAuth, SupabaseAuthError
-from nanobot.api.api_keys import ApiKeyStore
-from nanobot.channels.telegram.api_platform import handle_api_command
 from nanobot.trading.alpaca_commands import handle_alpaca_command
 from nanobot.utils.gofile import upload_gofile_stream
 from nanobot.utils.helpers import detect_image_mime, split_message

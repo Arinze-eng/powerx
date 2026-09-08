@@ -105,8 +105,8 @@ from nanobot.webui.session_automations import (
 )
 from nanobot.webui.session_context import session_context_payload
 from nanobot.webui.session_list_index import (
-    WEBUI_SESSION_INDEX_INTERNAL_FIELDS,
     _OWNER_USER_ID_FIELD,
+    WEBUI_SESSION_INDEX_INTERNAL_FIELDS,
     indexed_workspace_scope,
     list_webui_sessions,
 )

@@ -39,7 +39,6 @@ import argparse
 import base64
 import json
 import os
-import sys
 from pathlib import Path
 
 WEBUI_SESSION_OWNER_KEY = "_webui_owner_user_id"

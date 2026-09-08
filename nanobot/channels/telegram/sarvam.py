@@ -7,9 +7,9 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 

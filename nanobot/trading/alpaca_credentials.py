@@ -12,7 +12,6 @@ import os
 from typing import Any
 
 import httpx
-from loguru import logger
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM

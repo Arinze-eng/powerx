@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -23,15 +22,6 @@ from loguru import logger
 
 if TYPE_CHECKING:
     from nanobot.bus.events import OutboundMessage
-    from nanobot.bus.outbound_events import (
-        ProgressEvent,
-        RetryWaitEvent,
-        RuntimeModelUpdatedEvent,
-        StreamDeltaEvent,
-        StreamEndEvent,
-        StreamedResponseEvent,
-        TurnEndEvent,
-    )
 
 _MAX_CONTENT_CHARS = 12_000
 _MAX_METADATA_CHARS = 8_000
@@ -52,8 +42,8 @@ def _event_type(msg: OutboundMessage) -> str:
         RetryWaitEvent,
         RuntimeModelUpdatedEvent,
         StreamDeltaEvent,
-        StreamEndEvent,
         StreamedResponseEvent,
+        StreamEndEvent,
         TurnEndEvent,
     )
 

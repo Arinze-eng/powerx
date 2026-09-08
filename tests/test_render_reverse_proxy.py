@@ -23,12 +23,12 @@ os.environ["TELEGRAM_WEBHOOK_ORIGIN"] = "http://127.0.0.1:8081"
 os.environ["WEBUI_UPSTREAM"] = "http://127.0.0.1:8766"
 os.environ["WEBUI_WS_UPSTREAM"] = "ws://127.0.0.1:8766"
 
+# `scripts` is not a package, so load the proxy module directly from its path.
+import importlib.util
+
 import aiohttp
 import websockets  # client lib for testing
 from aiohttp import web
-
-# `scripts` is not a package, so load the proxy module directly from its path.
-import importlib.util
 
 _proxy_spec = importlib.util.spec_from_file_location(
     "render_reverse_proxy",
@@ -42,7 +42,6 @@ _proxy_spec.loader.exec_module(proxy)
 # ---------------------------------------------------------------------------
 async def tele_handler(request):
     body = await request.read()
-    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     payload = json.dumps({"ok": True, "path": request.path, "body": body.decode()})
     return web.Response(status=200, content_type="application/json", text=payload)
 
@@ -127,7 +126,6 @@ async def main():
     await runner_proxy.cleanup()
     await runner_webui.cleanup()
     await runner_tele.cleanup()
-    ok = all(r[0] not in ("tele-401-wrong", "ws-tunnel-ERR") for r in results)
     return results
 
 

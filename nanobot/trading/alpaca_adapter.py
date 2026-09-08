@@ -10,8 +10,6 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from loguru import logger
-
 if TYPE_CHECKING:
     # Imported lazily inside get_bars; bound here as well so that the string
     # return annotation "pd.DataFrame" resolves under typing.get_type_hints.
@@ -19,12 +17,16 @@ if TYPE_CHECKING:
     import pandas as pd
 
 try:
-    from alpaca.trading.client import TradingClient
-    from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
-    from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
     from alpaca.data.historical.stock import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce  # noqa: F401
+    from alpaca.trading.requests import (  # noqa: F401
+        GetOrdersRequest,
+        LimitOrderRequest,
+        MarketOrderRequest,
+    )
     HAS_ALPACA = True
 except ImportError:  # pragma: no cover
     HAS_ALPACA = False

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from nanobot.trading.alpaca_commands import is_alpaca_command
 
 

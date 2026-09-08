@@ -337,7 +337,6 @@ async def test_record_webui_activity_prefers_rpc_when_present() -> None:
         return None
 
     monkey = fake_request  # noqa: F841
-    import nanobot.supabase_auth as sa
 
     original = auth._request
     auth._request = fake_request

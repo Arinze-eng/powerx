@@ -10,17 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import time
-import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from nanobot.agent.loop import AgentLoop
-from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.cron.bound_runner import run_bound_cron_job
-from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
 from nanobot.cron.types import CronJob, CronPayload, CronSchedule
 from nanobot.providers.base import GenerationSettings, LLMResponse
 
@@ -161,7 +158,6 @@ async def test_poll_watch_delivers_feedback_via_notifier(tmp_path):
     """A triggered market/notify watch must push user-facing feedback through the
     WatchManager notifier (the fix for 'poll runs but no feedback')."""
     from nanobot.trading.polling_engine import (
-        PollResult,
         WatchManager,
         WatchSpec,
         format_poll_feedback,

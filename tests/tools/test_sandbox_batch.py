@@ -15,7 +15,6 @@ import pytest
 from nanobot.agent.tools.base import ToolResult
 from nanobot.agent.tools.sandbox_batch import (
     _MAX_RESULT_CHARS_PER_OP,
-    _MAX_TOTAL_RESULT_CHARS,
     SandboxBatchTool,
 )
 

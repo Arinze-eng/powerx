@@ -24,9 +24,17 @@ try:
         AlpacaExecutionAdapter,
     )
     from nanobot.trading.alpaca_credentials import AlpacaCredentialStore
-    from nanobot.trading.config import AgentConfig, RiskConfig, SessionWindow
-    from nanobot.trading.data_loader import DataUnavailableError, load_pair
     from nanobot.trading.backtest_engine import BacktestEngine
+
+    # Imported to validate that the optional trading extras are usable together;
+    # ruff would otherwise flag them as unused inside this availability probe.
+    from nanobot.trading.config import (
+        AgentConfig,
+        RiskConfig,
+        SessionWindow,
+    )
+    from nanobot.trading.data_loader import DataUnavailableError, load_pair
+    _ = (AgentConfig, RiskConfig, SessionWindow)
     TRADING_AVAILABLE = True
 except ImportError as exc:  # pragma: no cover
     logger.warning("Trading imports unavailable: {}", exc)
@@ -216,7 +224,7 @@ def _analyze_text(adapter: AlpacaExecutionAdapter | None, symbol: str) -> str:
     from nanobot.trading.analyst_agent import AnalystAgent
     from nanobot.trading.scout_agent import ScoutAgent
     from nanobot.trading.strategy_router import StrategyRouter
-    from nanobot.trading.tma_engine import legacy_slope, basket_correlation
+    from nanobot.trading.tma_engine import basket_correlation, legacy_slope
 
     display = symbol.upper()
     # Use a sensible lookback: ~14 months of daily bars.

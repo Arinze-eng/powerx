@@ -8,7 +8,6 @@ from typing import Any
 
 import yaml
 
-
 DEFAULT_PAIRS = ("EURGBP", "EURCAD", "NZDCHF", "CADCHF", "GBPCAD", "GBPCHF")
 
 

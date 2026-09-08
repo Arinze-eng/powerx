@@ -195,6 +195,7 @@ async def test_non_image_file_saved_and_referenced(wired_bridge, monkeypatch, tm
     """A ``type:"file"`` part (xlsx) is decoded to disk and passed as a media path,
     NOT dumped into the prompt text as base64."""
     import base64
+
     from nanobot.config import paths as paths_mod
 
     monkeypatch.setattr("nanobot.api.api_keys.ApiKeyStore", lambda: _AlwaysStore())
@@ -228,6 +229,7 @@ async def test_non_image_file_saved_and_referenced(wired_bridge, monkeypatch, tm
 async def test_image_and_file_mixed_parts(wired_bridge, monkeypatch, tmp_path):
     """Image_url + file parts together produce two media paths and clean text."""
     import base64
+
     from nanobot.config import paths as paths_mod
 
     monkeypatch.setattr("nanobot.api.api_keys.ApiKeyStore", lambda: _AlwaysStore())

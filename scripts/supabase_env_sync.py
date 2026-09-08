@@ -42,7 +42,6 @@ import argparse
 import os
 import shlex
 import sys
-from typing import Any
 
 import httpx
 

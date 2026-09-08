@@ -57,7 +57,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool
 from nanobot.agent.tools.schema import (
@@ -67,7 +67,6 @@ from nanobot.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
-from nanobot.agent.tools.base import tool_parameters
 
 if TYPE_CHECKING:
     pass
@@ -286,7 +285,7 @@ async def _op_deploy(sandbox: "NovitaSandboxTool", op: dict[str, Any]) -> ToolRe
         "npm install --no-audit --no-fund --loglevel=error || fail 'npm install failed'; fi\n"
         + f"vercel link --yes --project {shlex.quote(project_name)} --token \"$(cat $HOME/.vf)\" >/dev/null 2>&1 "
         f"|| vercel project add {shlex.quote(project_name)} --token \"$(cat $HOME/.vf)\" >/dev/null 2>&1 || true\n"
-        + f"BUILD_OUT=$(vercel deploy --prod --yes --token \"$(cat $HOME/.vf)\" 2>&1) || "
+        + "BUILD_OUT=$(vercel deploy --prod --yes --token \"$(cat $HOME/.vf)\" 2>&1) || "
         "{ printf '%s\\n' \"$BUILD_OUT\" | tail -c 3000; fail 'vercel deploy failed'; }\n"
         + "URL=$(printf '%s\\n' \"$BUILD_OUT\" | grep -Eo 'https://[^[:space:]]+' | tail -1)\n"
         + "[ -n \"$URL\" ] || fail 'deploy finished but no URL found'\n"
@@ -420,7 +419,7 @@ async def _op_apk_decompile(sandbox: "NovitaSandboxTool", op: dict[str, Any]) ->
     want_java = bool(op.get("java_sources", True))
     script = (
         _PRELUDE
-        + f"export PATH=\"$HOME/.powerx-tools/bin:$PATH\"\n"
+        + "export PATH=\"$HOME/.powerx-tools/bin:$PATH\"\n"
         + "have apktool || fail 'apktool missing — run apk_toolchain first'\n"
         + f"APK={shlex.quote(apk)}; OUT={shlex.quote(out)}\n"
         + "[ -f \"$APK\" ] || fail \"APK not found at $APK (upload it with action=upload or download_url)\"\n"
@@ -451,7 +450,7 @@ async def _op_apk_build(sandbox: "NovitaSandboxTool", op: dict[str, Any]) -> Too
     keystore = _safe_rel_path(op.get("keystore"), "$HOME/.powerx-tools/debug.keystore")
     script = (
         _PRELUDE
-        + f"export PATH=\"$HOME/.powerx-tools/bin:$PATH\"\n"
+        + "export PATH=\"$HOME/.powerx-tools/bin:$PATH\"\n"
         + "have apktool || fail 'apktool missing — run apk_toolchain first'\n"
         + f"SRC={shlex.quote(src)}; OUT={shlex.quote(out)}; KS={shlex.quote(keystore)}\n"
         + "[ -d \"$SRC\" ] || fail \"decompiled source dir not found: $SRC\"\n"

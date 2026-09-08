@@ -25,6 +25,7 @@ from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.automation_turns import publish_next_deferred_turn
 from nanobot.agent.context import ContextBuilder, PersistedPromptContextResolver
 from nanobot.agent.cron_turns import CronTurnCoordinator
+from nanobot.agent.goal_permission import goal_mutation_permission
 from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
@@ -74,7 +75,6 @@ from nanobot.security.workspace_access import (
 )
 from nanobot.session import turn_continuation
 from nanobot.session.automation_turns import automation_history_overrides
-from nanobot.agent.goal_permission import goal_mutation_permission
 from nanobot.session.goal_state import (
     begin_automatic_goal,
     complete_automatic_goal,
@@ -502,8 +502,8 @@ class AgentLoop:
         allowing callers to override or extend the standard config-derived
         parameters (e.g. ``cron_service``, ``session_manager``).
         """
-        from nanobot.providers.factory import make_provider
         from nanobot.execution_env import apply_render_execution_env
+        from nanobot.providers.factory import make_provider
         config = apply_render_execution_env(config)
         if bus is None:
 

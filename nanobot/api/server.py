@@ -17,9 +17,9 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 from aiohttp import web
 from loguru import logger
 
+from nanobot.api.api_keys import ApiKeyStore, hash_api_key
 from nanobot.api.miniapp import register_miniapp_routes
 from nanobot.api.telegram_auth import miniapp_tokens
-from nanobot.api.api_keys import ApiKeyStore, hash_api_key
 from nanobot.config.paths import get_media_dir
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.media_decode import (
