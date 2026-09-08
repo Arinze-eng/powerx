@@ -2108,7 +2108,7 @@ class AgentLoop:
                     message_metadata=ctx.msg.metadata,
                 )
             ):
-                goal_active, goal_freshly_created = begin_automatic_goal(
+                _goal_active, goal_freshly_created = begin_automatic_goal(
                     session.metadata,
                     ctx.msg.content,
                     allow_replace=True,
@@ -2117,7 +2117,6 @@ class AgentLoop:
                     self.sessions.save(session)
                 ctx.runtime_context_blocks.append(deliberate_runtime_context())
             else:
-                goal_active = False
                 goal_freshly_created = False
             if explicit_goal_requested(ctx.msg.metadata) or goal_freshly_created:
                 # The model may record/complete the sustained objective via the

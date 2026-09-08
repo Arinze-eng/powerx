@@ -8,9 +8,15 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    # Imported lazily inside get_bars; bound here as well so that the string
+    # return annotation "pd.DataFrame" resolves under typing.get_type_hints.
+    # Previously it raised NameError because pd was only bound in the body.
+    import pandas as pd
 
 try:
     from alpaca.trading.client import TradingClient

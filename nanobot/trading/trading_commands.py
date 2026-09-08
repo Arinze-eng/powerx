@@ -318,7 +318,7 @@ def _backtest_text(
     ]
     if trades:
         wins = sum(1 for t in trades if t.r_multiple > 0)
-        losses = sum(1 for t in trades if t.r_multiple <= 0)
+        _losses = sum(1 for t in trades if t.r_multiple <= 0)
         total_r = sum(t.r_multiple for t in trades)
         avg_r = total_r / len(trades) if trades else 0.0
         line.extend([
