@@ -87,7 +87,11 @@ async def handle_webui_fork_chat(
     # [FIX 2026-09-05] Per-user isolation: a user may only fork a chat they own
     # (or an unowned background/cron session). Forking copies the full source
     # transcript, so without this one user could clone another's private history.
-    if channel._deny_unless_owner(connection, str(source_chat_id)):
+    # The owner gate lives on the websocket channel. Duck-typed channels and
+    # embedding hosts may not implement it; calling it unconditionally raised
+    # AttributeError mid-request. Absence means "no owner gate".
+    deny_unless_owner = getattr(channel, "_deny_unless_owner", None)
+    if callable(deny_unless_owner) and deny_unless_owner(connection, str(source_chat_id)):
         await channel.send_webui_protocol_error(connection, "access_denied")
         return
     if isinstance(raw_index, bool) or not isinstance(raw_index, int) or raw_index < 0:

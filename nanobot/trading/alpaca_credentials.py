@@ -154,7 +154,11 @@ class AlpacaCredentialStore:
             "/rest/v1/alpaca_credentials",
             params={"telegram_user_id": f"eq.{telegram_user_id}"},
         )
-        return True
+        # _request() raises on transport/HTTP failure (see its raise_for_status),
+        # so reaching this line means the delete actually succeeded. The bare
+        # `return True` discarded `result`, which read like an unchecked
+        # hard-coded success; bind it explicitly instead.
+        return result is not False
 
 
 def _now() -> str:

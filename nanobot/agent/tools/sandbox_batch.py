@@ -627,7 +627,9 @@ _COMPOSITE_HANDLERS = {
                     ),
                     "command": StringSchema("Shell command for action=run."),
                     "path": StringSchema("Sandbox path (relative resolves under /workspace)."),
-                    "url": StringSchema("Remote HTTPS URL for fetch_url."),
+                    # NOTE: 'url' is declared once below, covering both fetch_url
+                    # (remote URL to download) and verify/deploy (URL to smoke-test).
+                    # A second, duplicate literal here used to silently shadow it.
                     "content": StringSchema("Text content for write."),
                     "packages": StringSchema("Space-separated package names for install."),
                     "timeout": StringSchema("Per-operation timeout in seconds (stringified integer)."),
@@ -645,9 +647,16 @@ _COMPOSITE_HANDLERS = {
                     ),
                     "routes": ArraySchema(
                         StringSchema(),
-                        description="Extra paths/URLs to smoke-test after deploy (verify), e.g. ['/about', '/api/health'].",
+                        description=(
+                            "Extra paths/URLs to smoke-test after deploy (verify), e.g. "
+                            "['/about', 'https://example.com/api/health']. Accepts relative "
+                            "paths or absolute URLs; alternative to the single 'url' field."
+                        ),
                     ),
-                    "url": StringSchema("Full http(s) URL to smoke-test (verify)."),
+                    "url": StringSchema(
+                        "Remote HTTPS URL: the file to download for fetch_url, or the "
+                        "site to smoke-test for verify/deploy. For multiple checks use 'routes'."
+                    ),
                     "apk_path": StringSchema("Path to the .apk inside the sandbox (apk_decompile)."),
                     "out": StringSchema("Output path (apk_decompile dir / apk_build apk)."),
                     "java_sources": BooleanSchema(description="Also dex2jar for Java-source recovery (apk_decompile)."),

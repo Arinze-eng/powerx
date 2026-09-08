@@ -443,8 +443,6 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
 
 async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
     """Manually trigger a Dream consolidation run."""
-    import time
-
     loop = ctx.loop
     msg = ctx.msg
 
