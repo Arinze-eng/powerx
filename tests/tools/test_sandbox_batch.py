@@ -261,14 +261,27 @@ async def test_empty_operations_rejected_cleanly() -> None:
 
 @pytest.mark.asyncio
 async def test_too_many_operations_rejected() -> None:
+    # The ceiling is deliberately high because results are disk-first digests,
+    # so per-op context cost is constant. Exercise the guard against the tool's
+    # own configured limit rather than a hard-coded number.
     tool, fake = _tool_with()
     result = await tool.execute(
-        operations=[{"action": "run", "command": "x"}] * 41
+        operations=[{"action": "run", "command": "x"}] * (tool._max_ops + 1)
     )
     assert isinstance(result, ToolResult)
     assert result.is_error
-    assert "max is 40" in str(result)
-    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_large_batch_within_new_ceiling_is_accepted() -> None:
+    """Regression guard: 41+ ops must NOT be rejected any more."""
+    tool, fake = _tool_with()
+    report = await tool.execute(
+        operations=[{"action": "run", "command": "x"}] * 41
+    )
+    assert not isinstance(report, ToolResult) or not report.is_error
+    assert len(fake.calls) == 41
+    assert "[sandbox_batch: 41 operation(s), 0 failure(s)]" in report
 
 
 @pytest.mark.asyncio

@@ -53,11 +53,17 @@ import json
 import os
 import re
 import shlex
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
+from nanobot.agent.tools.batch_spill import (
+    SPILL_DIRNAME,
+    BatchSpillStore,
+    extract_exit_code,
+)
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool
 from nanobot.agent.tools.schema import (
@@ -72,9 +78,18 @@ if TYPE_CHECKING:
     pass
 
 # Hard ceilings keep a single batch from exploding context or running forever.
-_MAX_OPS = 40
+#
+# With disk-first results (see nanobot.agent.tools.batch_spill) the per-op cost
+# is a constant-size digest rather than the operation's whole stdout, so a large
+# ceiling no longer threatens the context window.  The limit that actually
+# matters now is wall-clock time, guarded per op below.
+_MAX_OPS = 500
 _MAX_RESULT_CHARS_PER_OP = 6_000
 _MAX_TOTAL_RESULT_CHARS = 24_000
+# When spilling to disk works, this is the budget for the *digest* block. It is
+# deliberately generous but bounded: 500 ops x ~120 chars would be 60k, so digests
+# are additionally capped per op by batch_spill._MAX_DIGEST_CHARS.
+_SPILL_RESULT_BUDGET_CHARS = 30_000
 # Wall-clock guard per operation. The backend enforces its own timeout too,
 # but transport-level hangs (SSH stuck mid-stream, sandbox API wedged) have
 # historically blocked batches long past any declared timeout. The guard adds
@@ -632,6 +647,13 @@ _COMPOSITE_HANDLERS = {
                     "content": StringSchema("Text content for write."),
                     "packages": StringSchema("Space-separated package names for install."),
                     "timeout": StringSchema("Per-operation timeout in seconds (stringified integer)."),
+                    "allow_failure": BooleanSchema(
+                        description=(
+                            "Set true on a run op whose non-zero exit is expected "
+                            "(e.g. probing whether a command exists). By default a "
+                            "non-zero [exit=N] counts as a batch failure."
+                        )
+                    ),
                     "source": StringSchema("Local media path to upload."),
                     "project_name": StringSchema("Vercel project name (deploy)."),
                     "files": ObjectSchema(
@@ -691,10 +713,18 @@ class SandboxBatchTool(Tool):
 
     @classmethod
     def create(cls, ctx: ToolContext) -> Tool:
-        return cls()
+        return cls(workspace=ctx.workspace)
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        workspace: str | Path | None = None,
+        max_ops: int = _MAX_OPS,
+    ) -> None:
         self._sandbox = NovitaSandboxTool()
+        self._max_ops = max(1, int(max_ops))
+        # Full operation output is spilled here and replaced by a digest, so the
+        # model pays constant tokens per op instead of paying for every log line.
+        self._spill = BatchSpillStore(workspace)
 
     @property
     def name(self) -> str:
@@ -799,9 +829,9 @@ class SandboxBatchTool(Tool):
             return ToolResult.error(
                 "operations must be a non-empty array of {action, ...} objects"
             )
-        if len(raw_ops) > _MAX_OPS:
+        if len(raw_ops) > self._max_ops:
             return ToolResult.error(
-                f"too many operations ({len(raw_ops)}); max is {_MAX_OPS}. "
+                f"too many operations ({len(raw_ops)}); max is {self._max_ops}. "
                 "Combine steps into a single script instead."
             )
         stop_on_error = kwargs.get("stop_on_error", True)
@@ -815,6 +845,8 @@ class SandboxBatchTool(Tool):
         halted = False
         budget_exhausted = False
         executed = 0
+        # Disk-first storage for operation output (None when no workspace).
+        run = self._spill.begin_run(len(raw_ops)) if self._spill.available else None
 
         for index, raw_op in enumerate(raw_ops):
             op = _normalize_op(raw_op)
@@ -834,7 +866,15 @@ class SandboxBatchTool(Tool):
             # Once the detail budget is gone, still RUN the remaining ops
             # (their side effects matter) but record compact status lines only,
             # so the model always knows the fate of every operation.
-            compact = total_len >= _MAX_TOTAL_RESULT_CHARS or budget_exhausted
+            # Disk-first: when a spill store is available, each op's full output
+            # goes to a file and the model sees only a constant-size digest. That
+            # keeps cost per op flat, so a large batch stays readable instead of
+            # collapsing into status-only lines once a byte budget runs out.
+            # Without a spill store we fall back to the legacy inline budget.
+            spilling = self._spill.available
+            compact = (not spilling) and (
+                total_len >= _MAX_TOTAL_RESULT_CHARS or budget_exhausted
+            )
 
             if handler is not None:
                 if action == "deploy":
@@ -896,10 +936,40 @@ class SandboxBatchTool(Tool):
                     result = ToolResult.error(f"{type(exc).__name__}: {str(exc)[:300]}")
 
             is_err = isinstance(result, ToolResult) and result.is_error
+
+            # A `run` op whose command exits non-zero used to be reported as ok:
+            # failure was keyed only off ToolResult.is_error, and plain-string
+            # backend output never sets it. That let whole batches no-op while
+            # summarising "0 failure(s)". Honour the [exit=N] marker instead.
+            if not is_err and action == "run":
+                exit_code = extract_exit_code(str(result or ""))
+                if exit_code not in (None, 0) and not op.get("allow_failure"):
+                    is_err = True
+
             if is_err:
                 failures += 1
             status = "ERR" if is_err else "ok"
             body = str(result or "(no output)")
+
+            # Decide whether to stop *before* rendering, so no render path
+            # (digest or inline) can skip the halt check.
+            should_halt = is_err and stop_on_error
+
+            if spilling and run is not None:
+                # Full output to disk; the model gets a fixed-size digest whose
+                # verdict accounts for the backend's [exit=N] marker, so a
+                # command that failed without raising still reads as FAILED.
+                digest = self._spill.spill(run, index, action, body)
+                if digest is not None:
+                    chunk = f"[op {index}] {digest}"
+                    lines.append(chunk)
+                    total_len += len(chunk)
+                    if should_halt:
+                        halted = True
+                        break
+                    continue
+                # Spill write failed (disk/permissions): fall through inline.
+
             if len(body) > _MAX_RESULT_CHARS_PER_OP:
                 body = (
                     body[:_MAX_RESULT_CHARS_PER_OP]
@@ -936,7 +1006,7 @@ class SandboxBatchTool(Tool):
                     lines.append(chunk)
                     total_len += len(chunk)
 
-            if is_err and stop_on_error:
+            if should_halt:
                 halted = True
                 break
 
@@ -947,5 +1017,14 @@ class SandboxBatchTool(Tool):
             summary_parts.append("halted early on error")
         if budget_exhausted:
             summary_parts.append("some details omitted to stay within budget")
-        prefix = "[sandbox_batch: " + ", ".join(summary_parts) + "]\n"
+        spill_hint = ""
+        if run is not None:
+            self._spill.finish_run(run, failures)
+            # Appended after the bracketed header so existing assertions on the
+            # "[sandbox_batch: ...]" prefix keep matching verbatim.
+            spill_hint = (
+                f"\nfull logs under {SPILL_DIRNAME}/{run.run_id}/ — read an op's "
+                "file only when its digest says FAILED"
+            )
+        prefix = "[sandbox_batch: " + ", ".join(summary_parts) + "]" + spill_hint + "\n"
         return prefix + "\n\n".join(lines)
