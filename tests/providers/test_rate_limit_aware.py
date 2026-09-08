@@ -201,6 +201,129 @@ async def test_insufficient_quota_semantic_is_terminal(fast_sleep) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Provider OUTAGE (NVIDIA-style 503 "Service temporarily overloaded").
+# Observed live on integrate.api.nvidia.com: intermittent 503s, NO Retry-After.
+# These are not the caller's fault, so they must be waited out indefinitely.
+# ---------------------------------------------------------------------------
+
+def _overloaded():
+    """Exact shape returned by NVIDIA's integrate API."""
+    return LLMResponse(
+        content=(
+            'Error calling OpenAI API: {"error":{"message":"Service temporarily '
+            'overloaded","type":"Service Unavailable","code":503}}'
+        ),
+        finish_reason="error",
+        error_status_code=503,
+        error_type="Service Unavailable",
+        error_code="503",
+    )
+
+
+@pytest.mark.asyncio
+async def test_survives_provider_outage_longer_than_giveup_window(fast_sleep, monkeypatch) -> None:
+    """A sustained outage past the 15-minute rate-limit give-up floor must NOT
+    abort — an outage is server-side and carries no quota window."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+
+    async def _sleep_advancing(delay):
+        fast_sleep.append(float(delay))
+        clock["t"] += 60.0  # pretend each wait burns a minute of wall time
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _sleep_advancing)
+
+    # Way beyond both give-up thresholds: >30 identical errors, >15min elapsed.
+    provider = ScriptedProvider([_overloaded() for _ in range(45)] + [
+        LLMResponse(content="provider recovered", finish_reason="stop"),
+    ])
+
+    response = await provider.chat_with_retry(
+        messages=[{"role": "user", "content": "hi"}],
+        retry_mode="rate_limit_aware",
+    )
+
+    assert response.content == "provider recovered"
+    assert response.finish_reason == "stop"
+    assert provider.calls == 46  # never gave up despite crossing every threshold
+
+
+@pytest.mark.asyncio
+async def test_overload_heartbeat_says_busy_not_rate_limited(monkeypatch) -> None:
+    """Wording matters: don't blame the user for a provider outage."""
+    delays: list[float] = []
+
+    async def _fake_sleep(delay):
+        delays.append(float(delay))
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    provider = ScriptedProvider([_overloaded(), LLMResponse(content="ok", finish_reason="stop")])
+    progress: list[str] = []
+
+    async def _wait(msg: str) -> None:
+        progress.append(msg)
+
+    await provider.chat_with_retry(
+        messages=[{"role": "user", "content": "hi"}],
+        retry_mode="rate_limit_aware",
+        on_retry_wait=_wait,
+    )
+
+    assert progress
+    assert all("busy" in p.lower() for p in progress)
+    assert all("rate limited" not in p.lower() for p in progress)
+    assert all("503" not in p and "overload" not in p.lower() for p in progress)
+
+
+@pytest.mark.asyncio
+async def test_intermittent_failures_recover_like_nvidia_traffic(fast_sleep) -> None:
+    """Mimic the observed pattern: a turn that hits an outage mid-way still
+    completes instead of surfacing the 503 to the user."""
+    # Each "turn" sees: one intermittent 503, then success. Reuse fresh scripts.
+    for _ in range(6):
+        provider = ScriptedProvider([_overloaded(), LLMResponse(content="ok", finish_reason="stop")])
+        r = await provider.chat_with_retry(
+            messages=[{"role": "user", "content": "hi"}],
+            retry_mode="rate_limit_aware",
+        )
+        assert r.finish_reason == "stop"
+        assert r.content == "ok"
+        assert provider.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_two_outages_in_a_row_then_success(fast_sleep) -> None:
+    provider = ScriptedProvider([
+        _overloaded(),
+        _overloaded(),
+        LLMResponse(content="recovered", finish_reason="stop"),
+    ])
+    r = await provider.chat_with_retry(
+        messages=[{"role": "user", "content": "hi"}],
+        retry_mode="rate_limit_aware",
+    )
+    assert r.content == "recovered"
+    assert provider.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_overload_detection_variants() -> None:
+    cases = [
+        LLMResponse(content="x", finish_reason="error", error_status_code=503),
+        LLMResponse(content="x", finish_reason="error", error_status_code=502),
+        LLMResponse(content="Error: Service temporarily overloaded", finish_reason="error"),
+        LLMResponse(content="x", finish_reason="error", error_type="overloaded_error"),
+    ]
+    for c in cases:
+        assert LLMProvider._is_overloaded(c), c
+        assert LLMProvider.is_transient_response(c)
+    # A plain 429 is a limiter, not an outage.
+    assert not LLMProvider._is_overloaded(_rl429())
+    assert LLMProvider._is_rate_limited(_rl429())
+
+
+# ---------------------------------------------------------------------------
 # Death-spiral guard: only trips with no Retry-After AND long wall time.
 # ---------------------------------------------------------------------------
 

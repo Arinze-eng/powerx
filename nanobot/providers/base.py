@@ -572,6 +572,23 @@ class LLMProvider(ABC):
         if kind in cls._TRANSIENT_ERROR_KINDS:
             return True
 
+        # Providers often omit the HTTP status but still give us a structured
+        # error type/code. Without this, Anthropic's ``overloaded_error`` (529)
+        # and similar server-side failures would be surfaced to the user instead
+        # of retried. Non-retryable billing tokens are excluded below.
+        for token in (cls._normalize_error_token(response.error_type),
+                      cls._normalize_error_token(response.error_code)):
+            if not token:
+                continue
+            if token in cls._NON_RETRYABLE_429_ERROR_TOKENS:
+                return False
+            if any(t in token for t in (
+                "overload", "unavailable", "server_error", "internal_error",
+                "bad_gateway", "gateway_timeout", "rate_limit",
+                "too_many_requests", "timeout", "connection",
+            )):
+                return True
+
         return cls._is_transient_error(response.content)
 
     @classmethod
@@ -1084,12 +1101,51 @@ class LLMProvider(ABC):
             return response.retry_after
         return cls._extract_retry_after(response.content)
 
+    # Markers that mean "the *server* has no spare capacity right now". These are
+    # NOT the caller's fault and carry no quota window, so they must be waited out
+    # for as long as it takes (NVIDIA's integrate API returns 503 "Service
+    # temporarily overloaded" with no Retry-After at all).
+    _OVERLOAD_MARKERS = (
+        "overloaded",
+        "temporarily unavailable",
+        "service unavailable",
+        "server is busy",
+        "server busy",
+        "high demand",
+        "try again later",
+        "capacity",
+    )
+
+    @classmethod
+    def _is_overloaded(cls, response: LLMResponse) -> bool:
+        """True for server-side capacity failures (5xx / overload), as opposed to
+        a client-side quota/rate-limit (429).
+
+        Overload responses rarely include Retry-After, so treating them like a
+        rate limit would make ``rate_limit_aware`` give up during a legitimate
+        provider outage. They get an unbounded wait instead.
+        """
+        status = response.error_status_code
+        if status is not None and int(status) >= 500:
+            return True
+        token = cls._normalize_error_token(response.error_code) or ""
+        etype = cls._normalize_error_token(response.error_type) or ""
+        kind = cls._normalize_error_token(response.error_kind) or ""
+        if any(t in token or t in etype or t in kind for t in (
+            "overloaded", "overload", "service_unavailable", "server_error",
+            "bad_gateway", "gateway_timeout", "internal_error",
+        )):
+            return True
+        content = (response.content or "").lower()
+        return any(marker in content for marker in cls._OVERLOAD_MARKERS)
+
     @classmethod
     def _is_rate_limited(cls, response: LLMResponse) -> bool:
         """True when a transient error is specifically a rate limit / throttle.
 
         Used to pick the friendlier "waiting for capacity" heartbeat wording and
-        to decide whether the assumed Retry-After window applies.
+        to decide whether the assumed Retry-After window applies. Server-side
+        overload is reported separately by :meth:`_is_overloaded`.
         """
         status = response.error_status_code
         if status is not None and int(status) == 429:
@@ -1097,13 +1153,13 @@ class LLMProvider(ABC):
         token = cls._normalize_error_token(response.error_code) or ""
         etype = cls._normalize_error_token(response.error_type) or ""
         if any(t in token or t in etype for t in (
-            "rate_limit", "too_many_requests", "requests_limit", "overloaded",
+            "rate_limit", "too_many_requests", "requests_limit",
         )):
             return True
         content = (response.content or "").lower()
         return any(marker in content for marker in (
             "rate limit", "too many requests", "retry after", "try again in",
-            "overloaded", "concurrency limit",
+            "concurrency limit",
         ))
 
     def _compute_delay(
@@ -1144,14 +1200,18 @@ class LLMProvider(ABC):
         *,
         attempt: int,
         mode: str,
-        rate_limited: bool,
+        rate_limited: bool | str,
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         remaining = max(0.0, delay)
         while remaining > 0:
             if on_retry_wait:
                 secs = max(1, int(round(remaining)))
-                if rate_limited:
+                if rate_limited == "overloaded":
+                    # Server-side capacity problem: never expose the raw error,
+                    # and don't imply the user did anything wrong.
+                    msg = f"The model provider is busy — waiting {secs}s and continuing automatically (attempt {attempt})."
+                elif rate_limited:
                     # Friendlier wording: never expose the raw limiter error.
                     msg = f"Model is rate limited — waiting {secs}s to continue (attempt {attempt})."
                 elif mode == "persistent":
@@ -1269,18 +1329,22 @@ class LLMProvider(ABC):
                 # provider never tells us how long to wait AND we have been
                 # waiting a very long time on identical errors.
                 promised = self._extract_retry_after_from_response(response)
+                overloaded = self._is_overloaded(response)
+                rate_limited = self._is_rate_limited(response)
                 effective_retry_after = promised
-                if effective_retry_after is None and self._is_rate_limited(response):
+                if effective_retry_after is None and rate_limited and not overloaded:
                     # A 429 that omits Retry-After still has a real window; assume
                     # a short one so we back off instead of hot-looping.
                     effective_retry_after = self._RLA_DEFAULT_RETRY_AFTER
                 elapsed = time.monotonic() - loop_started_at
-                # Give up ONLY on a genuine death spiral: the provider never sent
-                # a Retry-After, a long run of identical errors, AND substantial
-                # wall time already spent waiting. A normal sustained 429 carries
-                # a Retry-After, so this never trips during ordinary throttling.
+                # Give up ONLY on a genuine rate-limit death spiral: the provider
+                # never sent a Retry-After, a long run of identical errors, AND
+                # substantial wall time already spent waiting. Server-side
+                # OVERLOAD is exempt — an outage is not the caller's fault and
+                # carries no quota window, so we keep waiting it out.
                 if (
-                    promised is None
+                    not overloaded
+                    and promised is None
                     and identical_error_count >= self._RLA_GIVEUP_IDENTICAL_ERRORS
                     and elapsed >= self._RLA_GIVEUP_MIN_WALL_S
                 ):
@@ -1312,7 +1376,7 @@ class LLMProvider(ABC):
                     delay,
                     attempt=attempt,
                     mode="rate_limit_aware",
-                    rate_limited=self._is_rate_limited(response),
+                    rate_limited=("overloaded" if overloaded else rate_limited),
                     on_retry_wait=on_retry_wait,
                 )
                 continue
