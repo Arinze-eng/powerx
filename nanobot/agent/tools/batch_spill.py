@@ -211,7 +211,7 @@ def build_digest(action: str, body: str, rel_path: str) -> str:
     if stripped and _EXIT_RE.fullmatch(stripped[-1].strip()):
         stripped.pop()
 
-    informative = [ln for ln in stripped if _informative(ln)]
+    informative = [ln for ln in stripped if informative_line(ln)]
     if failed:
         detail = _failure_lines(informative or stripped)
     else:
@@ -234,7 +234,7 @@ def build_digest(action: str, body: str, rel_path: str) -> str:
 _NOISE_RE = re.compile(r"^[\s.*=_#\-]*$|\.{3,}\s*$|%\s*$")
 
 
-def _informative(line: str) -> bool:
+def informative_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped or len(stripped) < 3:
         return False

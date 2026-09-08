@@ -305,14 +305,81 @@ class ContextGovernor:
             offset += 1
         return updated
 
+    #: Trailing tool results kept verbatim. Everything older decays to a one-line
+    #: stub, because an agent turn re-sends its entire history on every iteration:
+    #: without decay a 60-step task bills ~31x more input tokens than the
+    #: information actually in play (measured — see docs/CONTEXT_DECAY.md).
+    RECENT_TOOL_RESULTS_KEPT = 6
+
+    #: Ceiling for a decayed stub. Shaped like a verdict so the model can still
+    #: reason about what it did earlier without carrying the payload forward.
+    _STUB_MAX_CHARS = 220
+
+    @classmethod
+    def _aged_out_indices(cls, messages: list[dict[str, Any]]) -> set[int]:
+        """Positions of tool results far enough back to be safe to compress."""
+        tool_positions = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+        if len(tool_positions) <= cls.RECENT_TOOL_RESULTS_KEPT:
+            return set()
+        return set(tool_positions[: -cls.RECENT_TOOL_RESULTS_KEPT])
+
+    @classmethod
+    def _decay_stub(cls, content: Any) -> str | None:
+        """Collapse an old tool result to its load-bearing line(s).
+
+        Returns None when the content is already small or cannot be summarised
+        safely (e.g. non-text payloads), in which case the caller leaves it alone.
+        """
+        if isinstance(content, list):
+            # Multimodal / structured blocks: only flatten pure text parts.
+            from nanobot.utils.helpers import stringify_text_blocks
+
+            text = stringify_text_blocks(cast(list[object], content))
+            if text is None:
+                return None
+        elif isinstance(content, str):
+            text = content
+        else:
+            return None
+
+        if len(text) <= cls._STUB_MAX_CHARS:
+            return None
+
+        from nanobot.agent.tools.batch_spill import extract_exit_code, informative_line
+
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        meaningful = [ln for ln in lines if informative_line(ln)]
+        keep: list[str] = []
+        exit_code = extract_exit_code(text)
+        if exit_code is not None:
+            keep.append(f"exit={exit_code}")
+        if meaningful:
+            # First line usually states intent; the last states the outcome.
+            picked = [meaningful[0]] if len(meaningful) == 1 else [meaningful[0], meaningful[-1]]
+            keep.extend(picked)
+        else:
+            keep.append(f"{len(lines)} line(s)")
+        stub = "[earlier result, condensed] " + " | ".join(keep)
+        return stub[: cls._STUB_MAX_CHARS]
+
     def apply_tool_result_budget(
         self,
         config: ContextGovernanceConfig,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         updated = messages
+        aged = self._aged_out_indices(messages)
         for idx, message in enumerate(messages):
             if message.get("role") != "tool":
+                continue
+            if idx in aged:
+                # Age-decay before normalising: stale output should never be
+                # carried at full size just because it fit under the cap.
+                stub = self._decay_stub(message.get("content"))
+                if stub is not None and stub != message.get("content"):
+                    if updated is messages:
+                        updated = [dict(m) for m in messages]
+                    updated[idx]["content"] = stub
                 continue
             normalized = self.normalize_tool_result(
                 config,
