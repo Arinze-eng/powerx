@@ -50,6 +50,10 @@ _DIGEST_TAIL_LINES = 4
 #: Hard cap on digest characters, independent of operation count.
 _MAX_DIGEST_CHARS = 400
 
+#: Composite ops that already render their own verdict line; re-labelling them
+#: with [ok]/[FAILED] would duplicate the signal in the digest.
+_SELF_DESCRIBING_ACTIONS = frozenset({"retry_until", "foreach", "await"})
+
 _ERROR_MARKERS = (
     "error",
     "failed",
@@ -197,19 +201,25 @@ def build_digest(action: str, body: str, rel_path: str) -> str:
     """
     exit_code = extract_exit_code(body)
     failed = looks_like_failure(action, body, exit_code)
-    verdict = "FAILED" if failed else "ok"
+    # Composite ops render their own "[SATISFIED] kind" line, so prefixing them
+    # with another [ok]/[FAILED] would duplicate the verdict in the digest.
+    self_describing = action in _SELF_DESCRIBING_ACTIONS
+    verdict = "" if self_describing else ("FAILED" if failed else "ok")
 
     stripped = [ln.rstrip() for ln in body.splitlines() if ln.strip()]
     # Drop the echoed exit marker from the quoted tail; it is reported separately.
     if stripped and _EXIT_RE.fullmatch(stripped[-1].strip()):
         stripped.pop()
 
+    informative = [ln for ln in stripped if _informative(ln)]
     if failed:
-        detail = _failure_lines(stripped)
+        detail = _failure_lines(informative or stripped)
     else:
-        detail = stripped[:1]
+        # Prefer the last meaningful line: test runners summarise at the end.
+        detail = [_strip_progress(ln) for ln in (informative[-1:] or stripped[:1])]
+        detail = [ln for ln in detail if ln]
 
-    parts = [f"[{verdict}] {action}"]
+    parts = [f"{action}" if not verdict else f"[{verdict}] {action}"]
     if exit_code is not None:
         parts.append(f"exit={exit_code}")
     if detail:
@@ -217,6 +227,30 @@ def build_digest(action: str, body: str, rel_path: str) -> str:
     parts.append(f"full:{rel_path} ({len(body)} chars)")
     digest = " ".join(parts)
     return digest[:_MAX_DIGEST_CHARS]
+
+
+#: Lines matching this carry no information (pytest progress dots, npm spinners,
+#: pip bars) and would otherwise crowd out the real summary in a digest.
+_NOISE_RE = re.compile(r"^[\s.*=_#\-]*$|\.{3,}\s*$|%\s*$")
+
+
+def _informative(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or len(stripped) < 3:
+        return False
+    return not _NOISE_RE.match(stripped)
+
+
+def _strip_progress(line: str) -> str:
+    """Remove inline progress spam ("... ... 300 passed") from a summary line.
+
+    Test runners emit thousands of status characters on the same physical line as
+    their verdict, so line-level filtering cannot drop them; the verdict survives
+    by keeping only the trailing non-dot segment.
+    """
+    parts = [seg.strip(" .") for seg in re.split(r"\s{2,}|\.{3,}", line)]
+    keep = [seg for seg in parts if len(seg.strip()) > 2]
+    return keep[-1][:200] if keep else ""
 
 
 def _failure_lines(lines: list[str]) -> list[str]:
@@ -229,4 +263,5 @@ def _failure_lines(lines: list[str]) -> list[str]:
         return []
     scored = [ln for ln in lines if any(m in ln.lower() for m in _ERROR_MARKERS)]
     picked = scored[-_DIGEST_TAIL_LINES:] if scored else lines[-_DIGEST_TAIL_LINES:]
-    return [ln[:200] for ln in picked]
+    cleaned = [_strip_progress(ln) or ln[:200] for ln in picked]
+    return [ln for ln in cleaned if ln]

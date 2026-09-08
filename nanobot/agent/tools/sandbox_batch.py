@@ -53,12 +53,22 @@ import json
 import os
 import re
 import shlex
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
+from nanobot.agent.tools.batch_control import (
+    PlanError,
+    StepOutcome,
+    render_report,
+    run_await,
+    run_foreach,
+    run_retry_until,
+    validate_control_flow,
+)
 from nanobot.agent.tools.batch_spill import (
     SPILL_DIRNAME,
     BatchSpillStore,
@@ -69,6 +79,8 @@ from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool
 from nanobot.agent.tools.schema import (
     ArraySchema,
     BooleanSchema,
+    IntegerSchema,
+    NumberSchema,
     ObjectSchema,
     StringSchema,
     tool_parameters_schema,
@@ -117,7 +129,10 @@ _ACTIONS_BASE = [
     "run", "read", "write", "upload", "fetch_url",
     "install", "list", "download_url",
 ]
-_ACTIONS_COMPOSITE = ["deploy", "verify", "apk_toolchain", "apk_decompile", "apk_build"]
+_ACTIONS_CONTROL = ["retry_until", "foreach", "await"]
+_ACTIONS_COMPOSITE = [
+    "deploy", "verify", "apk_toolchain", "apk_decompile", "apk_build",
+] + _ACTIONS_CONTROL
 
 
 def _normalize_operations(raw: Any) -> list[Any] | None:
@@ -601,7 +616,104 @@ async def _op_verify(sandbox: "NovitaSandboxTool", op: dict[str, Any]) -> ToolRe
     return "[verify]\n" + output[-2500:]
 
 
+# ---------------------------------------------------------------------------
+# Control-flow operations: loops, retries and waits that cost no extra
+# LLM round-trips. Each one runs an inner body against the same sandbox and
+# returns a single verdict line, so the model never has to observe
+# intermediate output to decide what happens next.
+# ---------------------------------------------------------------------------
+
+_ERROR_HINTS = ("error", "failed", "exception", "traceback", "panic", "fatal")
+
+
+def _step_outcome(result: Any) -> StepOutcome:
+    """Convert a raw backend result into a structured outcome."""
+    is_err = isinstance(result, ToolResult) and result.is_error
+    text = str(result or "")
+    exit_code = extract_exit_code(text)
+    failed = bool(is_err)
+    if not failed and exit_code not in (None, 0):
+        failed = True
+    if not failed and exit_code is None:
+        tail = text.lower()[-2000:]
+        failed = any(hint in tail for hint in _ERROR_HINTS)
+    return StepOutcome(text=text, exit_code=exit_code, failed=failed)
+
+
+async def _run_body_step(sandbox: "NovitaSandboxTool", step: dict[str, Any]) -> StepOutcome:
+    """Execute one body step of a control-flow op.
+
+    Nested control flow is allowed (bounded by MAX_NEST_DEPTH via validation),
+    which lets a foreach wrap a retry_until — e.g. "for each failing test file,
+    retry it up to N times".
+    """
+    action = str(step.get("action", "")).strip().lower()
+    handler = _COMPOSITE_HANDLERS.get(action)
+    if handler is not None:
+        try:
+            result = await handler(sandbox, step)
+        except PlanError as exc:
+            return StepOutcome(text=f"[plan-error] {exc}", failed=True)
+        return _step_outcome(result)
+    kwargs = {k: v for k, v in step.items() if k != "action"}
+    try:
+        result = await sandbox.execute(action=action, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - mirror the outer loop's behaviour
+        logger.exception("sandbox_batch control-flow step failed", env={"action": action})
+        return StepOutcome(text=f"{type(exc).__name__}: {str(exc)[:300]}", failed=True)
+    return _step_outcome(result)
+
+
+async def _op_retry_until(sandbox: "NovitaSandboxTool", op: dict[str, Any]) -> str:
+    """Repeat ``body`` until ``until`` holds — collapses a fix-and-recheck
+    cycle that would otherwise need one model turn per attempt."""
+    async def runner(step: dict[str, Any]) -> StepOutcome:
+        return await _run_body_step(sandbox, step)
+
+    report = await run_retry_until(op, runner)
+    return render_report(report)
+
+
+async def _op_foreach(sandbox: "NovitaSandboxTool", op: dict[str, Any]) -> str:
+    """Apply ``body`` to every item, substituting {{item}} / {{index}}.
+
+    A codemod across hundreds of files becomes one operation instead of one
+    observation per file.
+    """
+    async def runner(step: dict[str, Any]) -> StepOutcome:
+        return await _run_body_step(sandbox, step)
+
+    async def read_items(path: str) -> list[str]:
+        # Items are read from the sandbox itself, so the model can point at a
+        # generated list (e.g. `git diff --name-only > .targets`) without ever
+        # pulling that list into context.
+        raw = await sandbox.execute(action="read", path=path)
+        text = str(raw or "")
+        return [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+
+    report = await run_foreach(op, runner, read_items=read_items)
+    return render_report(report)
+
+
+async def _op_await(sandbox: "NovitaSandboxTool", op: dict[str, Any]) -> str:
+    """Poll until a condition holds. Waiting costs zero tokens, unlike a
+    model-driven re-check loop."""
+    async def runner(step: dict[str, Any]) -> StepOutcome:
+        return await _run_body_step(sandbox, step)
+
+    def deadline_for(timeout_sec: float) -> float:
+        return time.monotonic() + timeout_sec
+
+    report = await run_await(op, runner, deadline_for_op=deadline_for)
+    return render_report(report)
+
+
+_CONTROL_FLOW_ACTIONS = ("retry_until", "foreach", "await")
+
 _COMPOSITE_HANDLERS = {
+    "retry_until": _op_retry_until,
+    "foreach": _op_foreach,
+    "await": _op_await,
     "deploy": _op_deploy,
     "verify": _op_verify,
     "apk_toolchain": _op_apk_toolchain,
@@ -639,7 +751,9 @@ _COMPOSITE_HANDLERS = {
                         "Operation type",
                         enum=_ACTIONS_BASE + _ACTIONS_COMPOSITE,
                     ),
-                    "command": StringSchema("Shell command for action=run."),
+                    "command": StringSchema(
+                        "Shell command for action=run, or the probe command for action=await."
+                    ),
                     "path": StringSchema("Sandbox path (relative resolves under /workspace)."),
                     # NOTE: 'url' is declared once below, covering both fetch_url
                     # (remote URL to download) and verify/deploy (URL to smoke-test).
@@ -647,6 +761,40 @@ _COMPOSITE_HANDLERS = {
                     "content": StringSchema("Text content for write."),
                     "packages": StringSchema("Space-separated package names for install."),
                     "timeout": StringSchema("Per-operation timeout in seconds (stringified integer)."),
+                    # --- control flow: loops/retries/waits executed inside the
+                    # sandbox, so iterating does not cost one LLM call per pass ---
+                    "body": ArraySchema(
+                        ObjectSchema(
+                            description="One nested operation (same shape as a top-level op).",
+                        ),
+                        description=(
+                            "Operations to repeat (retry_until / foreach). Supports {{item}} "
+                            "and {{index}} placeholders. May itself contain control-flow ops "
+                            "up to 3 levels deep."
+                        ),
+                    ),
+                    "until": StringSchema(
+                        "Condition evaluated after each attempt/poll: 'exit == 0', "
+                        "'contains \'all tests passed\'', 'not_contains FAILED', "
+                        "'elapsed >= 30', or bare 'ok'. Used by retry_until and await."
+                    ),
+                    "max_attempts": IntegerSchema(
+                        description="retry_until: attempts before giving up (default 12, max 200)."
+                    ),
+                    "delay_sec": NumberSchema(description="retry_until: pause between attempts."),
+                    "items": ArraySchema(StringSchema(), description="foreach: values to substitute into {{item}}."),
+                    "items_file": StringSchema(
+                        description=(
+                            "foreach: sandbox path whose non-empty lines are the items. Keeps a "
+                            "large generated target list out of context entirely."
+                        )
+                    ),
+                    "max_items": IntegerSchema(description="foreach: safety ceiling on item count (default 500)."),
+                    "stop_on_error": BooleanSchema(
+                        description="foreach: halt at the first failing item (default true)."
+                    ),
+                    "interval_sec": NumberSchema(description="await: seconds between polls (default 5)."),
+
                     "allow_failure": BooleanSchema(
                         description=(
                             "Set true on a run op whose non-zero exit is expected "
@@ -862,6 +1010,24 @@ class SandboxBatchTool(Tool):
 
             action = str(op.get("action", "")).strip().lower()
             handler = _COMPOSITE_HANDLERS.get(action)
+
+            plan_error: str | None = None
+            if action in _CONTROL_FLOW_ACTIONS:
+                try:
+                    validate_control_flow(op)
+                except PlanError as exc:
+                    plan_error = str(exc)[:300]
+
+            if plan_error is not None:
+                executed += 1
+                result = ToolResult.error(f"invalid {action}: {plan_error}")
+                lines.append(f"[op {index} {action} → ERR]\n{result}")
+                failures += 1
+                total_len += len(lines[-1])
+                if stop_on_error:
+                    halted = True
+                    break
+                continue
 
             # Once the detail budget is gone, still RUN the remaining ops
             # (their side effects matter) but record compact status lines only,
