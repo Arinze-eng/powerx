@@ -1305,6 +1305,11 @@ class AgentLoop:
                 enable_replay_cache=True,
                 enable_deterministic_router=deterministic_router_text is not None,
                 deterministic_router_text=deterministic_router_text,
+                # Zero-call tool middleware: governed UniAbuja lookups get the
+                # short-TTL cache/singleflight treatment and, when the model's
+                # own call returns renderable structured data, the turn ends
+                # without paying for a JSON re-render.
+                tool_middleware=True,
                 provider_state=provider_state,
                 strip_image_content_before_provider=strip_image_content_before_provider,
                 ))

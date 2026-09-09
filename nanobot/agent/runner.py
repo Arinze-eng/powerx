@@ -22,12 +22,14 @@ from nanobot.agent.context_governance import (
 from nanobot.agent.deterministic_router import deterministic_plan, router_enabled
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
+from nanobot.agent.tool_middleware import ToolMiddleware
 from nanobot.agent.task_cache import make_replay_cache, task_fingerprint_text
 from nanobot.agent.tools.registry import (
     ToolRegistry,
     is_tool_error_result,
     is_tool_terminal_result,
 )
+from nanobot.agent.tool_middleware import ToolMiddleware
 from nanobot.providers.base import (
     LLMProvider,
     LLMResponse,
@@ -145,6 +147,12 @@ class AgentRunSpec:
     # The raw user text the deterministic router classifies. Kept as its own
     # field so the loop can pass the pre-runtime-context message exactly.
     deterministic_router_text: str | None = None
+    # Opt-in for the zero-call tool middleware layer (nanobot.agent.tool_middleware):
+    # short-TTL caching + singleflight for slow-changing read-only lookups, and
+    # deterministic post-tool formatting that ends the turn without paying the
+    # model to re-render JSON it never authored. Applies only to governed tool
+    # names; every other call executes exactly as before.
+    tool_middleware: bool = False
 
 
 @dataclass(slots=True)
@@ -164,11 +172,28 @@ class AgentRunResult:
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
 
 
+class _ZeroCallComplete(BaseException):
+    """Control-flow signal: middleware rendered a final answer, end the turn.
+
+    Deliberately BaseException (like asyncio.CancelledError) so the generic
+    ``except Exception`` guards scattered through tool execution cannot swallow
+    it; only the loop's own tool-result handling catches and honours it.
+    """
+
+    def __init__(self, content: str) -> None:
+        super().__init__("zero-call completion")
+        self.content = content
+
+
 class AgentRunner:
     """Run a tool-capable LLM loop without product-layer concerns."""
 
     def __init__(self) -> None:
         self.context_governor = ContextGovernor()
+        # Zero-call tool middleware (short-TTL cache + singleflight for governed
+        # read-only lookups). Per-runner so cached live data never leaks across
+        # unrelated processes, and the in-flight map shares this loop.
+        self.tool_middleware = ToolMiddleware()
 
     @staticmethod
     def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
@@ -568,10 +593,10 @@ class AgentRunner:
                 deterministic_call.name,
                 spec.session_key or "default",
             )
-            tool_result = await spec.tools.execute(
-                deterministic_call.name,
-                deterministic_call.arguments,
-            )
+            # The middleware layer may serve this lookup from the short-TTL live
+            # cache (or collapse it into an in-flight duplicate) so even the
+            # backend round-trip disappears for rapid repeats.
+            tool_result = await self._middleware_execute(spec, deterministic_call)
             text_result = str(tool_result)
             self._append_final_message(messages, text_result)
             final_content = text_result
@@ -700,6 +725,49 @@ class AgentRunner:
                     for tool_call, event in zip(response.tool_calls, new_events)
                     if event.get("status") == "ok"
                 )
+
+                # --- Zero-call middleware completion --------------------------
+                # The model already fetched the data; when the middleware
+                # rendered it into chat text there is nothing left to reason
+                # about. Persist the tool messages + final answer and end the
+                # turn WITHOUT the extra provider call that would only
+                # re-render JSON the model never authored.
+                if isinstance(fatal_error, _ZeroCallComplete):
+                    formatted = fatal_error.content
+                    for tool_call, result in zip(response.tool_calls, results):
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": tool_call.name,
+                                "content": self.context_governor.normalize_tool_result(
+                                    governance_config,
+                                    tool_call.id,
+                                    tool_call.name,
+                                    result,
+                                ),
+                            }
+                        )
+                    self._append_final_message(messages, formatted)
+                    usage["prompt_tokens"] += response.usage.get("prompt_tokens", 0)
+                    usage["completion_tokens"] += response.usage.get("completion_tokens", 0)
+                    usage["middleware_formatted"] = int(
+                        usage.get("middleware_formatted", 0)
+                    ) + 1
+                    stop_reason = "completed"
+                    return AgentRunResult(
+                        final_content=formatted,
+                        messages=messages,
+                        tools_used=tools_used,
+                        usage=usage,
+                        stop_reason=stop_reason,
+                        error=None,
+                        tool_events=tool_events,
+                        had_injections=had_injections,
+                        pending_stream_content=formatted,
+                        provider_state=conversation_state.finish(messages),
+                    )
+
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
                 completed_tool_results: list[dict[str, Any]] = []
@@ -1648,7 +1716,60 @@ class AgentRunner:
             events.append(event)
             if error is not None and fatal_error is None:
                 fatal_error = error
+
+        # --- Zero-call post-tool formatting ---------------------------------
+        # When every call this iteration is a governed read-only UniAbuja
+        # lookup and all succeeded with structured payloads, the answer is
+        # already complete data — render it with pure code and end the turn
+        # instead of paying the model to re-render JSON. Any miss (multi-call,
+        # error verdict, unparseable output) falls through unchanged.
+        if (
+            fatal_error is None
+            and getattr(spec, "tool_middleware", False)
+            and tool_calls
+        ):
+            finalized = self._try_zero_call_finalize(tool_calls, tool_results)
+            if finalized is not None:
+                return results, events, finalized
         return results, events, fatal_error
+
+    def _try_zero_call_finalize(
+        self,
+        tool_calls: list[ToolCallRequest],
+        tool_results: list[tuple[Any, dict[str, str], BaseException | None]],
+    ) -> BaseException | None:
+        """Return a ``_ZeroCallComplete`` sentinel when the turn can end here.
+
+        Conditions are strict on purpose: exactly one tool call, governed by
+        the middleware, successful, and its output deterministically
+        renderable. Everything else keeps today's behaviour (model sees the
+        payload and continues).
+        """
+        if len(tool_calls) != 1 or len(tool_results) != 1:
+            return None
+        call = tool_calls[0]
+        result, _event, error = tool_results[0]
+        if not self.tool_middleware.handles(call) or error is not None:
+            return None
+        if is_tool_error_result(result):
+            # Error verdicts stay in-loop: the model may recover (retry,
+            # explain, ask for a regno) instead of parroting a failure.
+            return None
+        from nanobot.agent.tool_middleware import render_uniabuja_output
+
+        arguments = call.arguments if isinstance(call.arguments, dict) else {}
+        try:
+            formatted = render_uniabuja_output(call.name, arguments, str(result))
+        except Exception:  # pragma: no cover - rendering must never break a turn
+            logger.exception("tool middleware: renderer crashed, falling back to model")
+            return None
+        if not formatted:
+            return None
+        logger.info(
+            "tool middleware: {} formatted with 0 further provider calls",
+            call.name,
+        )
+        return _ZeroCallComplete(formatted)
 
     @staticmethod
     def _tool_fingerprint(tool_call: ToolCallRequest) -> str:
@@ -2059,6 +2180,23 @@ class AgentRunner:
         callback = spec.checkpoint_callback
         if callback is not None:
             await callback(payload)
+
+    async def _middleware_execute(
+        self, spec: AgentRunSpec, tool_call: ToolCallRequest
+    ) -> Any:
+        """Execute *tool_call* through the middleware when the run opts in.
+
+        Fail-open: any problem inside the layer falls back to a plain registry
+        execution so a caching optimisation can never break an answer path.
+        """
+        if getattr(spec, "tool_middleware", False) and self.tool_middleware.handles(tool_call):
+            try:
+                return await self.tool_middleware.execute(spec.tools, tool_call)
+            except Exception:
+                logger.exception(
+                    "Tool middleware failed for {}, executing directly", tool_call.name
+                )
+        return await spec.tools.execute(tool_call.name, tool_call.arguments)
 
     @staticmethod
     def _append_final_message(messages: list[dict[str, Any]], content: str | None) -> None:
