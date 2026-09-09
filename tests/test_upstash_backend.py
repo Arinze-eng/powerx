@@ -132,10 +132,10 @@ def test_execution_env_overlay_for_upstash(monkeypatch):
 
 
 def test_admin_save_roundtrip_upstash(tmp_path, monkeypatch):
-    import nanobot.admin_registry as AR
+    import nanobot.admin_registry as admin_registry
 
     config_path = tmp_path / "config.json"
-    monkeypatch.setattr(AR, "_config_path", lambda: config_path)
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
     payload = {
         "backend": "upstash",
         "upstashApiKey": "box_saved_key",
@@ -145,7 +145,7 @@ def test_admin_save_roundtrip_upstash(tmp_path, monkeypatch):
         "novitaCpuCount": 4,
         "novitaMemoryMb": 8192,
     }
-    response = AR._save_execution_settings(payload, refresh_runtime_config=None)
+    response = admin_registry._save_execution_settings(payload, refresh_runtime_config=None)
     body = json.loads(bytes(response.body).decode())
     assert body["ok"] is True
     assert body["backend"] == "upstash"
@@ -157,9 +157,9 @@ def test_admin_save_roundtrip_upstash(tmp_path, monkeypatch):
 
 
 def test_admin_page_contains_upstash_controls():
-    import nanobot.admin_registry as AR
+    import nanobot.admin_registry as admin_registry
 
-    section = AR._execution_admin_section()
+    section = admin_registry._execution_admin_section()
     for marker in (
         "Upstash Box",
         "upstashApiKey",
@@ -169,3 +169,24 @@ def test_admin_page_contains_upstash_controls():
         "admin.execution.save",
     ):
         assert marker in section
+
+
+def test_execution_section_defers_load_until_admin_websocket_ready():
+    """The execution section must not run adminRequest at parse time.
+
+    The admin WebSocket client (window.nanobotAdminRequest) is assigned by the
+    provider section script which appears later in the page.  If the execution
+    section called its local helper immediately it would throw
+    "adminRequest is not defined" before the socket is ready.  It must poll
+    for window.nanobotAdminRequest instead.
+    """
+    import nanobot.admin_registry as admin_registry
+
+    section = admin_registry._execution_admin_section()
+    # No local helper / no synchronous load call.
+    assert "const adminRequest=" not in section
+    assert "void load().catch(" not in section
+    # Uses the shared window client, deferred until it exists.
+    assert "window.nanobotAdminRequest" in section
+    assert "__execReady" in section
+    assert "typeof window.nanobotAdminRequest==='function'" in section
