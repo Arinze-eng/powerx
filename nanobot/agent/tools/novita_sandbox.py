@@ -47,6 +47,13 @@ _MAX_IMAGE_ANALYSIS_RESULT_CHARS = 16_000
 _WORKSPACE = "/workspace"
 _OCR_DIR = f"{_WORKSPACE}/.nanobot"
 
+#: Automatic Novita sandbox sizing when the admin configured none. The stock
+#: "base" image ships ~486 MB which OOM-kills builds/OCR, so we default every
+#: spawned sandbox to a 2 GB box. Env (NOVITA_SANDBOX_MEMORY_MB / _CPU_COUNT) or
+#: execution.novita_template still override these; see _template_sizing().
+DEFAULT_TEMPLATE_CPU = 2
+DEFAULT_TEMPLATE_MEMORY_MB = 2048
+
 _TELEGRAM_IMAGE_SCRIPT = r'''import json
 import os
 import shutil
@@ -180,6 +187,24 @@ def run_tesseract(image_path, psm):
     return text, [(confidence, len(words))]
 
 
+def describe_image(path):
+    """Best-effort Pillow metadata line for an image (used when OCR is absent).
+
+    Returns "" if Pillow is unavailable or the file can't be opened, so callers
+    treat it as optional enrichment rather than a hard dependency.
+    """
+    if Image is None:
+        return ""
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+            mode = getattr(image, "mode", "?")
+            fmt = getattr(image, "format", "?") or Path(path).suffix.lstrip(".").upper()
+        return f"Image metadata: {fmt} {width}x{height}, mode {mode} (no text extracted)."
+    except Exception:
+        return ""
+
+
 def read_image(path, temp_dir):
     try:
         prepared = Path(temp_dir) / (Path(path).stem + "_prepared.png")
@@ -192,11 +217,13 @@ def read_image(path, temp_dir):
                 candidates.append((confidence, word_count, text, psm))
         if not candidates:
             if not TESSERACT_BINARY:
-                return (
+                detail = (
                     f"File: {Path(path).name}\n"
                     "Tesseract is unavailable on this execution backend; "
                     "an administrator must install tesseract-ocr before image OCR can run."
                 )
+                meta = describe_image(path)
+                return f"{detail}\n{meta}" if meta else detail
             return f"File: {Path(path).name}\nTesseract detected no readable text."
         candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
         confidence, word_count, text, psm = candidates[0]
@@ -349,6 +376,50 @@ def _output(result: Any) -> str:
     if code is not None:
         text += f"\n[exit_code={code}]"
     return text[-_MAX_RESULT_CHARS:] or "(no output)"
+
+
+async def _install_tesseract_resilient(backend: Any) -> bool:
+    """Best-effort tesseract install inside an Upstash Box; never raises.
+
+    The previous approach ran a single combined ``apt-get install -y tesseract-ocr
+    tesseract-ocr-eng`` — on Alpine (``*-alpine`` runtimes) the English-data
+    package does not exist under that name (it ships in the base package), so the
+    whole command exited non-zero and OCR hard-failed even though tesseract could
+    have installed fine. Here we try each candidate package set independently and
+    stop as soon as the binary appears, tolerating partial failures. Returns True
+    when tesseract ends up on PATH.
+    """
+
+    def _probe_ok(rendered: str) -> bool:
+        # run() renders exit codes as "[exit_code=N]"; treat only 0/None as ready.
+        import re as _re
+
+        match = _re.search(r"\[exit_code=(-?\d+)\]", rendered)
+        return match is None or match.group(1) == "0"
+
+    # Ordered candidate groups; first that yields a working binary wins. Debian
+    # apt names first (default python runtime), then Alpine/busybox variants.
+    candidates = [
+        ["tesseract-ocr", "tesseract-ocr-eng"],
+        ["tesseract-ocr"],
+        ["tesseract"],
+    ]
+    for group in candidates:
+        try:
+            await backend.install_packages(group, timeout=600)
+        except Exception as exc:  # noqa: BLE001 - one bad group must not abort others
+            logger.debug("Upstash tesseract install attempt {} failed: {}", group, type(exc).__name__)
+            continue
+        try:
+            probe = await backend.run(
+                "command -v tesseract >/dev/null 2>&1 && printf READY || printf MISSING",
+                timeout=30,
+            )
+        except Exception:
+            continue
+        if "READY" in probe:
+            return True
+    return False
 
 
 @tool_parameters(
@@ -594,18 +665,28 @@ class NovitaSandboxTool(Tool):
         box_reset = False
         try:
             await backend.run(f"mkdir -p {shlex.quote(ocr_dir)} {shlex.quote(f'{root}/telegram-images')}", timeout=60)
+            # Tesseract is optional: the OCR script degrades to Pillow-based
+            # extraction when it is present but tesseract is not, so we must NOT
+            # hard-fail just because the binary could not be installed. Install
+            # attempts are made best-effort and per-package-group so one missing
+            # name (e.g. tesseract-ocr-eng on Alpine, where English data ships in
+            # the base package) does not abort the whole install the way a single
+            # combined "apt/apk add a b c" would.
             probe = await backend.run(
                 "if command -v tesseract >/dev/null 2>&1; then printf READY; else printf MISSING; fi",
                 timeout=30,
             )
             if "READY" not in probe:
-                await backend.install_packages(["tesseract-ocr", "tesseract-ocr-eng"], timeout=600)
+                await _install_tesseract_resilient(backend)
                 probe = await backend.run(
                     "if command -v tesseract >/dev/null 2>&1; then printf READY; else printf MISSING; fi",
                     timeout=30,
                 )
                 if "READY" not in probe:
-                    raise RuntimeError("Tesseract was not available after the Upstash package installation")
+                    logger.warning(
+                        "Upstash Box: tesseract unavailable after install attempts; "
+                        "falling back to Pillow-only image analysis"
+                    )
             await backend.write(script_path, _TELEGRAM_IMAGE_SCRIPT)
             for path, raw in image_paths:
                 suffix = path.suffix.lower() if path.suffix else ".img"
@@ -834,12 +915,16 @@ class NovitaSandboxTool(Tool):
 
     @staticmethod
     def _template_sizing() -> tuple[int, int] | None:
-        """Desired (cpu_count, memory_mb) for Novita sandboxes, if configured.
+        """Desired (cpu_count, memory_mb) for Novita sandboxes.
 
         Priority: NOVITA_SANDBOX_CPU_COUNT + NOVITA_SANDBOX_MEMORY_MB env vars
         (deployment-level), then the admin-saved execution.novita_template
-        config. Returns None when no explicit sizing is requested so the
-        historical template behaviour stays untouched.
+        config. When NEITHER is set we now default to a sane sized box
+        (DEFAULT_TEMPLATE_CPU / DEFAULT_TEMPLATE_MEMORY_MB = 2 vCPU / 2 GB)
+        instead of returning None. Returning None previously let sandboxes fall
+        back to the stock "base" image (~486 MB), which OOM-kills any nontrivial
+        build/OCR. So an admin who loads nothing still gets 2 GB per sandbox;
+        explicit config always overrides this default.
         """
         cpu = memory = None
         try:
@@ -862,9 +947,13 @@ class NovitaSandboxTool(Tool):
                     cpu = int(getattr(template, "cpu_count", 2) or 2)
                 if memory is None:
                     memory = int(getattr(template, "memory_mb", 0) or 0)
+        # Nothing configured anywhere: apply the automatic 2 GB default rather
+        # than dropping to the tiny stock base image.
         if not memory:
-            return None
-        cpu = max(1, min(int(cpu or 2), 8))
+            memory = DEFAULT_TEMPLATE_MEMORY_MB
+        if not cpu:
+            cpu = DEFAULT_TEMPLATE_CPU
+        cpu = max(1, min(int(cpu), 8))
         memory = max(512, min(int(memory), 65_536))
         return cpu, memory
 
@@ -901,25 +990,22 @@ class NovitaSandboxTool(Tool):
             except Exception:
                 return False
 
-        # Never return an alias that does not exist: sandbox.create would fail
-        # and take OCR/execution down with it. Fall back to the stock "base"
-        # image when the legacy sized template was never published on this
-        # account, and log so the admin knows to set a sized template.
-        fallback = "powerx-base-4g"
-        if not _template_exists(fallback):
-            logger.warning(
-                "Novita template '{}' not found on this account; using stock 'base' "
-                "(set NOVITA_SANDBOX_TEMPLATE or configure execution.novita_template "
-                "so sandboxes get the configured RAM)",
-                fallback,
-            )
-            fallback = "base"
+        # Sizing is now ALWAYS resolved (defaults to 2 GB), so the normal path
+        # builds/uses a sized template. We still keep a graceful fallback chain
+        # for accounts where building a custom template is impossible: prefer any
+        # existing powerx sized alias, then the stock "base" image, so task flow
+        # never breaks — but we log loudly because "base" is ~486 MB.
+        def _first_existing(candidates: list[str]) -> str | None:
+            for candidate in candidates:
+                if _template_exists(candidate):
+                    return candidate
+            return None
+
         sizing = self._template_sizing()
-        if sizing is None:
-            return fallback
+        if sizing is None:  # defensive: _template_sizing no longer returns None
+            return _first_existing(["powerx-base-2g-c2", "powerx-base-4g", "base"]) or "base"
+
         alias = self._desired_alias(sizing)
-        if alias == fallback:
-            return alias
         cached = _TEMPLATE_CACHE.get(alias)
         if cached:
             return cached
@@ -930,8 +1016,8 @@ class NovitaSandboxTool(Tool):
             if _template_exists(alias):
                 _TEMPLATE_CACHE[alias] = alias
                 return alias
+            cpu, memory = sizing
             try:
-                cpu, memory = sizing
                 # Clone the built-in "base" image with the requested CPU/RAM so
                 # every sandbox spawned from this template gets exactly that RAM
                 # (same approach as scripts/build_novita_template.py).
@@ -948,8 +1034,13 @@ class NovitaSandboxTool(Tool):
                 _TEMPLATE_CACHE[alias] = built_alias
                 return built_alias
             except Exception as exc:
+                # Building failed. Prefer an already-published sized template over
+                # the tiny stock base image; only use "base" as a last resort.
+                fallback = _first_existing([alias, "powerx-base-2g-c2", "powerx-base-4g"]) or "base"
                 logger.warning(
-                    "Could not build Novita template '{}' ({}); falling back to '{}'",
+                    "Could not build Novita template '{}' ({}); falling back to '{}'. "
+                    "If this is 'base', sandboxes run at ~486 MB — publish a 2 GB "
+                    "template or set NOVITA_SANDBOX_TEMPLATE.",
                     alias,
                     type(exc).__name__,
                     fallback,
