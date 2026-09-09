@@ -47,6 +47,7 @@ import json
 import os
 import re
 import time
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,38 @@ _DEFAULT_TTL_SECONDS = 7 * 24 * 3600  # a week; task plans go stale slowly
 _MAX_PLANS_PER_WORKSPACE = 200
 _MAX_STEPS_PER_PLAN = 16
 _MIN_MEANINGFUL_TASK_CHARS = 10
+
+#: Minimum token-set Jaccard similarity for a fuzzy plan match (#4). High enough
+#: that unrelated tasks don't collide, low enough to absorb filler-word noise.
+PLAN_FUZZY_THRESHOLD = 0.72
+
+#: Common words stripped before comparing templates so "please/the/now" don't
+#: dominate similarity between genuinely different tasks.
+_STOPWORDS = frozenset(
+    {
+        "a", "an", "the", "please", "pls", "now", "can", "you", "i", "to",
+        "for", "of", "in", "on", "my", "me", "and", "do", "does", "is", "it",
+        "this", "that", "would", "could", "should", "just", "then", "with",
+    }
+)
+
+
+def _template_similarity(a: str, b: str) -> float:
+    """Token-set Jaccard of two normalized templates after stopword removal.
+
+    Returns 0..1. Identical content sets -> 1.0; disjoint -> 0.0. Empty on both
+    sides is treated as a perfect match (both were pure stopwords).
+    """
+    ta = {t for t in a.split() if t not in _STOPWORDS}
+    tb = {t for t in b.split() if t not in _STOPWORDS}
+    if not ta and not tb:
+        return 1.0
+    if not ta or not tb:
+        return 0.0
+    inter = len(ta & tb)
+    union = len(ta | tb)
+    return inter / union if union else 0.0
+
 
 
 def plan_cache_enabled() -> bool:
@@ -271,6 +304,7 @@ class PlanCache:
         return self._root / f"{_fingerprint(template)}.json"
 
     def get(self, norm: NormalizedTask) -> StoredPlan | None:
+        """Exact-template lookup (fast path)."""
         path = self._path(norm.template)
         if not path.exists():
             return None
@@ -283,6 +317,55 @@ class PlanCache:
             path.unlink(missing_ok=True)
             return None
         return plan
+
+    def get_fuzzy(self, norm: NormalizedTask) -> StoredPlan | None:
+        """Best-match lookup tolerant of filler-word differences (#4).
+
+        Exact template equality is too brittle: "compile the project in folder
+        7" vs "please compile project folder 7 now" are the SAME task but hash to
+        different templates because of stopword/ordering noise. When the exact
+        path misses we scan stored plans and return the closest one whose token
+        Jaccard similarity clears PLAN_FUZZY_THRESHOLD *and* whose variable count
+        matches (so substitution stays positionally correct). Returns None when
+        nothing is close enough — never replays an unrelated plan.
+        """
+        exact = self.get(norm)
+        if exact is not None:
+            return exact
+        best: StoredPlan | None = None
+        best_score = 0.0
+        try:
+            paths = list(self._root.glob("*.json"))
+        except OSError:
+            return None
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            plan = StoredPlan.from_dict(data)
+            if plan is None or plan.is_expired():
+                with contextlib.suppress(OSError):
+                    path.unlink(missing_ok=True)
+                continue
+            # Variable count must match for positional substitution to be valid.
+            if bool(plan.variables) != bool(norm.variables) or len(plan.variables) != len(
+                norm.variables
+            ):
+                continue
+            score = _template_similarity(norm.template, plan.template)
+            if score > best_score:
+                best_score = score
+                best = plan
+        if best is not None and best_score >= PLAN_FUZZY_THRESHOLD:
+            logger.info(
+                "plan cache: fuzzy-matched '{}' ~ '{}' (similarity {:.2f})",
+                norm.template[:50],
+                best.template[:50],
+                best_score,
+            )
+            return best
+        return None
 
     def put(self, norm: NormalizedTask, steps: list[dict[str, Any]]) -> StoredPlan | None:
         if not plan_is_safe(steps):
@@ -358,4 +441,16 @@ def replayable_for(new_norm: NormalizedTask, plan: StoredPlan) -> bool:
     if not plan.variables:
         # Pure instruction (no variables): always a direct replay candidate.
         return True
+    return len(new_norm.variables) == len(plan.variables)
+
+
+def variables_compatible(new_norm: NormalizedTask, plan: StoredPlan) -> bool:
+    """Positional-substitution safety check for fuzzy-matched plans (#4).
+
+    Unlike replayable_for this does NOT require identical templates — the caller
+    (get_fuzzy) already established similarity. All that matters now is that the
+    variable lists line up so substitute_variables maps old->new correctly:
+    either both empty, or equal counts. A count mismatch would misalign fill-ins
+    and could produce a wrong command, so we refuse it and fall back to the model.
+    """
     return len(new_norm.variables) == len(plan.variables)

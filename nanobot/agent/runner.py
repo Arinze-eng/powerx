@@ -30,6 +30,7 @@ from nanobot.agent.plan_cache import (
     plan_is_safe,
     replayable_for,
     substitute_variables,
+    variables_compatible,
 )
 from nanobot.agent.task_cache import make_replay_cache, task_fingerprint_text
 from nanobot.agent.tools.registry import (
@@ -2269,8 +2270,8 @@ class AgentRunner:
         incompatible plan therefore never produces a wrong answer — at worst it
         costs one wasted sandbox attempt before the model takes over.
         """
-        plan = plan_cache.get(norm)
-        if plan is None or not replayable_for(norm, plan):
+        plan = plan_cache.get_fuzzy(norm)
+        if plan is None or not variables_compatible(norm, plan):
             return None
         steps = substitute_variables(plan.steps, plan.variables, norm.variables)
         # Re-validate after substitution: swapping values must not smuggle in an

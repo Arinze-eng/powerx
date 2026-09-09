@@ -954,6 +954,96 @@ class AgentLoop:
             return UNIFIED_SESSION_KEY
         return msg.session_key
 
+    @staticmethod
+    def _coalesce_window_seconds() -> float:
+        """Debounce window (seconds) for merging rapid same-session messages (#5).
+
+        Users often fire several short messages ("do X", "also Y", "thanks") that
+        would each trigger a separate paid LLM turn. Within this window we merge
+        them into ONE turn. Default 0.4s — long enough to catch fast follow-ups,
+        short enough to be imperceptible. Env POWERX_MESSAGE_COALESCE_MS overrides;
+        0 disables batching entirely.
+        """
+        raw = os.getenv("POWERX_MESSAGE_COALESCE_MS", "").strip()
+        if raw == "":
+            return 0.4
+        try:
+            ms = int(raw)
+        except ValueError:
+            return 0.4
+        return max(0.0, min(ms, 3000)) / 1000.0
+
+    async def _coalesce_same_session(
+        self,
+        first: InboundMessage,
+        effective_key: str,
+    ) -> InboundMessage:
+        """Merge queued same-session user messages arriving within the debounce
+        window into *first*, returning one combined message (one model turn).
+
+        Only plain user text from the same channel/chat is merged; commands,
+        non-user-input messages, or messages for other sessions are left in the
+        bus untouched so they still route normally. Fail-open: any surprise just
+        returns *first* unchanged. This is pure cost optimization — worst case a
+        message is processed on its own as it always was.
+        """
+        window = self._coalesce_window_seconds()
+        if window <= 0 or not first.is_user_input:
+            return first
+        # Never batch commands or priority/control messages.
+        if first.channel != "system" and self.commands.is_dispatchable_command(
+            first.content.strip()
+        ):
+            return first
+
+        parts: list[str] = [first.content]
+        media = list(first.media or [])
+        merged_count = 1
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + window
+        deferred: list[InboundMessage] = []
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                nxt = await asyncio.wait_for(self.bus.consume_inbound(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            except Exception:
+                break
+            same_session = self._effective_session_key(nxt) == effective_key
+            mergeable = (
+                same_session
+                and nxt.is_user_input
+                and (
+                    nxt.channel == "system"
+                    or not self.commands.is_dispatchable_command(nxt.content.strip())
+                )
+            )
+            if mergeable:
+                parts.append(nxt.content)
+                media.extend(nxt.media or [])
+                merged_count += 1
+                continue
+            # Not mergeable: park it so we can restore bus order afterwards.
+            deferred.append(nxt)
+            # Once we hit a foreign message, stop merging (respect arrival order).
+            break
+        # Restore everything we pulled past the merge point, in original order.
+        for item in deferred:
+            await self.bus.publish_inbound(item)
+        if merged_count == 1:
+            return first
+        merged_content = "\n".join(p for p in parts if p and p.strip())
+        logger.info(
+            "batching {} same-session messages into one turn ({})",
+            merged_count,
+            effective_key[:40],
+        )
+        return dataclasses.replace(first, content=merged_content, media=media)
+
+
     def _remember_unified_session_route(
         self,
         session: Session,
@@ -977,7 +1067,19 @@ class AgentLoop:
 
     @staticmethod
     def _replay_token_budget(runtime: LLMRuntime) -> int:
-        """Derive a token budget for session history replay from the context window."""
+        """Derive a token budget for session history replay from the context window.
+
+        Two ceilings are applied, whichever is SMALLER wins:
+
+        1. Hard fit limit — what physically leaves room for output + overhead
+           inside the model's true context window.
+        2. Spend limit (NEW) — a fraction of the window (default 35%, env
+           POWERX_REPLAY_BUDGET_RATIO). The hard limit alone let a 128k model
+           resend ~120k tokens of history every turn, which is most of a long
+           chat's bill. Capping replay well below the window makes the
+           consolidator summarize old turns far earlier, cutting repeated
+           input-token cost while leaving short chats untouched.
+        """
         if runtime.context_window_tokens <= 0:
             return 0
         max_output = runtime.generation.max_tokens
@@ -985,8 +1087,36 @@ class AgentLoop:
             reserved_output = int(max_output)
         except (TypeError, ValueError):
             reserved_output = 4096
-        budget = runtime.context_window_tokens - max(1, reserved_output) - 1024
-        return budget if budget > 0 else max(128, runtime.context_window_tokens // 2)
+        fit_budget = runtime.context_window_tokens - max(1, reserved_output) - 1024
+        if fit_budget <= 0:
+            fit_budget = max(128, runtime.context_window_tokens // 2)
+
+        # Spend ceiling: never replay more than a slice of the window just
+        # because it would technically fit. Configurable; disabled at ratio>=1.
+        ratio = AgentLoop._replay_budget_ratio()
+        spend_budget = int(runtime.context_window_tokens * ratio)
+        budget = min(fit_budget, spend_budget) if spend_budget > 0 else fit_budget
+        return max(128, budget)
+
+    @staticmethod
+    def _replay_budget_ratio() -> float:
+        """Fraction of the context window we allow history replay to consume.
+
+        Default 0.35 (compact aggressively to save tokens). Env
+        POWERX_REPLAY_BUDGET_RATIO overrides; values >=1 disable the spend cap
+        (fall back to pure fit-based trimming); invalid values use the default.
+        """
+        raw = os.getenv("POWERX_REPLAY_BUDGET_RATIO", "").strip()
+        if not raw:
+            return 0.35
+        try:
+            value = float(raw)
+        except ValueError:
+            return 0.35
+        if value <= 0:
+            return 0.35
+        return value
+
 
     async def _run_agent_loop(
         self,
@@ -1449,6 +1579,11 @@ class AgentLoop:
                             effective_key,
                         )
                         continue
+                # No active turn for this session yet: opportunistically merge any
+                # rapid same-session follow-ups arriving within a short debounce
+                # window into ONE turn (#5), so "do X" + "also Y" costs one model
+                # round-trip instead of two. Fail-open; disabled at ratio 0.
+                msg = await self._coalesce_same_session(msg, effective_key)
                 # Compute the effective session key before dispatching
                 # This ensures /stop command can find tasks correctly when unified session is enabled
                 task = asyncio.create_task(self._dispatch(msg))
