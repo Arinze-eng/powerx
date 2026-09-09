@@ -59,7 +59,12 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
+from nanobot.agent.tools.base import (
+    TerminalToolResult,
+    Tool,
+    ToolResult,
+    tool_parameters,
+)
 from nanobot.agent.tools.batch_control import (
     PlanError,
     StepOutcome,
@@ -130,6 +135,7 @@ _ACTIONS_BASE = [
     "install", "list", "download_url",
 ]
 _ACTIONS_CONTROL = ["retry_until", "foreach", "await"]
+_ACTIONS_TERMINAL = ["complete"]
 _ACTIONS_COMPOSITE = [
     "deploy", "verify", "apk_toolchain", "apk_decompile", "apk_build",
 ] + _ACTIONS_CONTROL
@@ -710,6 +716,30 @@ async def _op_await(sandbox: "NovitaSandboxTool", op: dict[str, Any]) -> str:
 
 _CONTROL_FLOW_ACTIONS = ("retry_until", "foreach", "await")
 
+_TERMINAL_ACTIONS = ("complete",)
+
+
+async def _op_complete(sandbox: Any, op: dict[str, Any]) -> "TerminalToolResult":
+    """Terminal op: end the turn with a user-facing summary in ONE credit.
+
+    The model appends this as the last operation of a batch after all work is
+    done and verified. The runner sees the terminal flag on the batch result
+    and finishes the turn with ``final_message`` — no extra model call is made
+    to produce a closing answer, so the whole task costs exactly one provider
+    round-trip (the call that emitted the batch).
+
+    ``message`` is the clean user-facing summary; the full op report (including
+    every earlier op's output) is still appended to the conversation history.
+    """
+    message = str(op.get("message") or "").strip()
+    if not message:
+        raise PlanError("complete requires a non-empty 'message' summarizing the result")
+    return TerminalToolResult(
+        f"[complete] {message}",
+        final_message=message,
+    )
+
+
 _COMPOSITE_HANDLERS = {
     "retry_until": _op_retry_until,
     "foreach": _op_foreach,
@@ -719,6 +749,7 @@ _COMPOSITE_HANDLERS = {
     "apk_toolchain": _op_apk_toolchain,
     "apk_decompile": _op_apk_decompile,
     "apk_build": _op_apk_build,
+    "complete": _op_complete,
 }
 
 
@@ -741,6 +772,9 @@ _COMPOSITE_HANDLERS = {
                 "action=apk_toolchain installs the APK RE stack; "
                 "action=apk_decompile {apk_path, out?, java_sources?}; "
                 "action=apk_build {src, out?} rebuilds+signs the edited APK. "
+                "ALWAYS finish a task with action=complete {message} as the LAST "
+                "op — it ends the turn with your summary in the SAME credit, so "
+                "you never spend a second round-trip on a closing answer. "
                 "Prefer writing ONE self-contained script (action=write) and "
                 "running it once (action=run) over many tiny run steps."
             ),
@@ -749,7 +783,7 @@ _COMPOSITE_HANDLERS = {
                 properties={
                     "action": StringSchema(
                         "Operation type",
-                        enum=_ACTIONS_BASE + _ACTIONS_COMPOSITE,
+                        enum=_ACTIONS_BASE + _ACTIONS_COMPOSITE + _ACTIONS_TERMINAL,
                     ),
                     "command": StringSchema(
                         "Shell command for action=run, or the probe command for action=await."
@@ -801,6 +835,24 @@ _COMPOSITE_HANDLERS = {
                             "(e.g. probing whether a command exists). By default a "
                             "non-zero [exit=N] counts as a batch failure."
                         )
+                    ),
+                    "retries": IntegerSchema(
+                        description=(
+                            "Silent in-sandbox retries for this op when it fails "
+                            "(default 0). Each retry runs inside the same batch, so "
+                            "a flaky command never costs an extra LLM round-trip. "
+                            "Combine with 'match' for retry-until-success."
+                        )
+                    ),
+                    "match": StringSchema(
+                        description=(
+                            "For retried ops: substring that MUST appear in the output "
+                            "for the op to count as success (e.g. 'build succeeded'). "
+                            "Empty/omitted = any exit-0 result succeeds."
+                        )
+                    ),
+                    "message": StringSchema(
+                        description="User-facing final summary for action=complete (required there)."
                     ),
                     "source": StringSchema("Local media path to upload."),
                     "project_name": StringSchema("Vercel project name (deploy)."),
@@ -993,6 +1045,7 @@ class SandboxBatchTool(Tool):
         halted = False
         budget_exhausted = False
         executed = 0
+        terminal_message: str | None = None
         # Disk-first storage for operation output (None when no workspace).
         run = self._spill.begin_run(len(raw_ops)) if self._spill.available else None
 
@@ -1087,19 +1140,54 @@ class SandboxBatchTool(Tool):
                         call_kwargs.pop("timeout", None)
                 op_timeout = self._op_declared_timeout(call_kwargs)
                 executed += 1
+                # Silent in-sandbox retries: a flaky or failing op is re-run
+                # HERE so the model never spends a billed round-trip on it.
+                # 'retries' = extra attempts after the first (capped at 10);
+                # 'match' (when set) must appear in the output for success.
                 try:
-                    result = await self._run_op_guarded(call_kwargs, op_timeout)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "sandbox_batch op {} ({}) exceeded wall-clock guard ({}s)",
-                        index, action, op_timeout + _OP_GUARD_GRACE_SECONDS,
+                    retries = int(str(op.get("retries") or "0").strip())
+                except (TypeError, ValueError):
+                    retries = 0
+                retries = max(0, min(retries, 10))
+                match = str(op.get("match") or "").strip()
+                result: Any = None
+                for attempt in range(retries + 1):
+                    try:
+                        result = await self._run_op_guarded(call_kwargs, op_timeout)
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "sandbox_batch op {} ({}) exceeded wall-clock guard ({}s)",
+                            index, action, op_timeout + _OP_GUARD_GRACE_SECONDS,
+                        )
+                        result = ToolResult.error(
+                            f"timed out after {op_timeout + _OP_GUARD_GRACE_SECONDS}s wall-clock guard"
+                        )
+                    except Exception as exc:  # defensive: never crash the whole batch
+                        logger.exception("sandbox_batch op {} failed", index)
+                        result = ToolResult.error(f"{type(exc).__name__}: {str(exc)[:300]}")
+                    text = str(result or "")
+                    failed = isinstance(result, ToolResult) and result.is_error
+                    if not failed and action == "run":
+                        exit_code = extract_exit_code(text)
+                        if exit_code not in (None, 0) and not op.get("allow_failure"):
+                            failed = True
+                    if not failed and match and match not in text:
+                        failed = True
+                    if not failed or attempt >= retries:
+                        break
+                    logger.info(
+                        "sandbox_batch op {} ({}) failed on attempt {}/{} — silent retry",
+                        index, action, attempt + 1, retries + 1,
                     )
+                    await asyncio.sleep(min(2 * (attempt + 1), 8))
+                if failed:
+                    # The retry loop's verdict is authoritative: a plain-string
+                    # result with no [exit=N] marker (e.g. match never satisfied)
+                    # would otherwise read as ok. Surface it as a real error so
+                    # the batch counts the failure and stop_on_error can halt.
                     result = ToolResult.error(
-                        f"timed out after {op_timeout + _OP_GUARD_GRACE_SECONDS}s wall-clock guard"
+                        f"failed after {min(retries + 1, 11)} attempt(s): {text[:200]}"
                     )
-                except Exception as exc:  # defensive: never crash the whole batch
-                    logger.exception("sandbox_batch op {} failed", index)
-                    result = ToolResult.error(f"{type(exc).__name__}: {str(exc)[:300]}")
 
             is_err = isinstance(result, ToolResult) and result.is_error
 
@@ -1116,6 +1204,12 @@ class SandboxBatchTool(Tool):
                 failures += 1
             status = "ERR" if is_err else "ok"
             body = str(result or "(no output)")
+
+            # Terminal op (action=complete): the task is done. Capture the
+            # user-facing message so execute() returns a terminal result and
+            # the runner ends the turn WITHOUT another provider round-trip.
+            if isinstance(result, TerminalToolResult):
+                terminal_message = result.final_message or str(result)
 
             # Decide whether to stop *before* rendering, so no render path
             # (digest or inline) can skip the halt check.
@@ -1175,12 +1269,17 @@ class SandboxBatchTool(Tool):
             if should_halt:
                 halted = True
                 break
+            if terminal_message is not None:
+                # complete is terminal: never run further ops.
+                break
 
         summary_parts = [f"{len(raw_ops)} operation(s)", f"{failures} failure(s)"]
         if halted and executed < len(raw_ops):
             summary_parts.append(f"{len(raw_ops) - executed} op(s) not executed")
         if halted:
             summary_parts.append("halted early on error")
+        if terminal_message is not None:
+            summary_parts.append("task complete")
         if budget_exhausted:
             summary_parts.append("some details omitted to stay within budget")
         spill_hint = ""
@@ -1193,4 +1292,7 @@ class SandboxBatchTool(Tool):
                 "file only when its digest says FAILED"
             )
         prefix = "[sandbox_batch: " + ", ".join(summary_parts) + "]" + spill_hint + "\n"
-        return prefix + "\n\n".join(lines)
+        report = prefix + "\n\n".join(lines)
+        if terminal_message is not None:
+            return TerminalToolResult(report, final_message=terminal_message)
+        return report

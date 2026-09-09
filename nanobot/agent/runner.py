@@ -21,7 +21,12 @@ from nanobot.agent.context_governance import (
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
-from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
+from nanobot.agent.task_cache import make_replay_cache, task_fingerprint_text
+from nanobot.agent.tools.registry import (
+    ToolRegistry,
+    is_tool_error_result,
+    is_tool_terminal_result,
+)
 from nanobot.providers.base import (
     LLMProvider,
     LLMResponse,
@@ -127,6 +132,10 @@ class AgentRunSpec:
     # toward sandbox_batch once it clearly needs multi-step work. Mutable dict
     # (not slots-blocked) so _run_tool can bump counters across iterations.
     batch_enforcement_state: dict[str, int] = field(default_factory=dict)
+    # When True, an identical task (same user text) that was completed recently
+    # replays its stored final answer with ZERO provider calls. Enabled in the
+    # agent loop; tests opt in explicitly.
+    enable_replay_cache: bool = False
 
 
 @dataclass(slots=True)
@@ -500,6 +509,39 @@ class AgentRunner:
             messages=messages,
             state=provider_state,
         )
+
+        # --- Zero-call replay: identical task already completed recently -----
+        # Fingerprint the user's task text; an exact repeat (same wording, same
+        # workspace) served from disk costs ZERO provider calls and ZERO credit
+        # steps. Only consulted when the run opts in via enable_replay_cache.
+        replay_cache = None
+        replay_task_text = ""
+        cached_replay: str | None = None
+        if spec.enable_replay_cache:
+            replay_cache = make_replay_cache(spec.workspace)
+            replay_task_text = task_fingerprint_text(spec.initial_messages)
+            if replay_cache is not None and replay_task_text:
+                cached_replay = replay_cache.get(replay_task_text)
+        if cached_replay is not None:
+            logger.info(
+                "replaying identical task from cache for {} (0 provider calls)",
+                spec.session_key or "default",
+            )
+            self._append_final_message(messages, cached_replay)
+            final_content = cached_replay
+            stop_reason = "completed"
+            return AgentRunResult(
+                final_content=final_content,
+                messages=messages,
+                tools_used=[],
+                usage={"prompt_tokens": 0, "completion_tokens": 0, "replayed": 1},
+                stop_reason=stop_reason,
+                error=None,
+                tool_events=[],
+                had_injections=False,
+                pending_stream_content=cached_replay,
+                provider_state=conversation_state.finish(messages),
+            )
         governance_config = ContextGovernanceConfig(
             provider=spec.runtime.provider,
             model=spec.runtime.model,
@@ -673,6 +715,26 @@ class AgentRunner:
                 )
                 empty_content_retries = 0
                 length_recovery_parts.clear()
+
+                # --- Zero-extra-call terminal completion --------------------
+                # When a tool result declares the task complete (terminal=True,
+                # e.g. sandbox_batch action=complete), the turn ENDS here: the
+                # tool already produced the user-facing final answer, so the
+                # usual "ask the model again for a closing message" round-trip
+                # is skipped entirely. One provider call for the whole task.
+                terminal_final: str | None = None
+                for result in results:
+                    if is_tool_terminal_result(result):
+                        terminal_final = getattr(result, "final_message", None) or str(result)
+                        break
+                if terminal_final is not None:
+                    final_content = terminal_final
+                    self._append_final_message(messages, final_content)
+                    context.final_content = final_content
+                    context.stop_reason = "completed"
+                    await hook.after_iteration(context)
+                    break
+
                 # Checkpoint 1: drain injections after tools, before next LLM call
                 _drained, injection_cycles = await self._try_drain_injections(
                     spec, messages, None, injection_cycles,
@@ -919,6 +981,16 @@ class AgentRunner:
             else:
                 final_content = terminal_content
             self._append_final_message(messages, terminal_content)
+
+        # Store the completed answer so an identical future task replays with
+        # zero provider calls. Only meaningful, successful completions are kept.
+        if (
+            replay_cache is not None
+            and replay_task_text
+            and stop_reason == "completed"
+            and final_content
+        ):
+            replay_cache.put(replay_task_text, final_content)
 
         return AgentRunResult(
             final_content=final_content,

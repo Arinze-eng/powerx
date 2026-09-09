@@ -1288,8 +1288,9 @@ class AgentLoop:
                     session_metadata=session_metadata,
                     message_metadata=metadata,
                 ),
-                    provider_state=provider_state,
-                    strip_image_content_before_provider=strip_image_content_before_provider,
+                enable_replay_cache=True,
+                provider_state=provider_state,
+                strip_image_content_before_provider=strip_image_content_before_provider,
                 ))
         finally:
             turn_scope_stack.close()

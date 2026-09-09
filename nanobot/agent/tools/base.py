@@ -145,15 +145,52 @@ class ToolResult(str):
     """String-compatible tool output with structured status."""
 
     is_error: bool
+    terminal: bool = False
 
-    def __new__(cls, content: str, *, is_error: bool = False) -> ToolResult:
+    def __new__(cls, content: str, *, is_error: bool = False, terminal: bool = False) -> ToolResult:
         obj = str.__new__(cls, content)
         obj.is_error = is_error
+        obj.terminal = terminal
         return obj
 
+    def __deepcopy__(self, memo: dict[int, Any]) -> "ToolResult":
+        new = type(self)(str(self), is_error=self.is_error, terminal=self.terminal)
+        memo[id(self)] = new
+        return new
+
     @classmethod
-    def error(cls, content: str) -> ToolResult:
-        return cls(content, is_error=True)
+    def error(cls, content: str, *, terminal: bool = False) -> ToolResult:
+        return cls(content, is_error=True, terminal=terminal)
+
+
+class TerminalToolResult(ToolResult):
+    """A tool result that ENDS the agent turn with a user-facing final answer.
+
+    The runner treats any tool result with ``terminal=True`` as a declaration
+    that the task is complete: it stops the iteration loop immediately and uses
+    ``final_message`` as the assistant's final content — no further model call
+    is made to produce a closing answer. This is how ``sandbox_batch``'s
+    ``complete`` op collapses an N-op task into ONE provider round-trip (the
+    call that emitted the batch) instead of two (batch + final answer).
+
+    ``final_message`` is the clean user-facing summary the tool wants the user
+    to see; ``str(result)`` remains the full technical report appended to the
+    conversation history for the model's future reference.
+    """
+
+    final_message: str
+
+    def __new__(cls, content: str, *, final_message: str) -> "TerminalToolResult":
+        obj = str.__new__(cls, content)
+        obj.is_error = False
+        obj.terminal = True
+        obj.final_message = final_message
+        return obj
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "TerminalToolResult":
+        new = type(self)(str(self), final_message=self.final_message)
+        memo[id(self)] = new
+        return new
 
 
 class Tool(ABC):

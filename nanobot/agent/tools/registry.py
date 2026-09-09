@@ -16,6 +16,11 @@ def is_tool_error_result(result: Any) -> bool:
     return isinstance(result, ToolResult) and result.is_error
 
 
+def is_tool_terminal_result(result: Any) -> bool:
+    """True when a tool result declares the task complete (terminal=True)."""
+    return bool(getattr(result, "terminal", False))
+
+
 class ToolRegistry:
     """
     Registry for agent tools.
