@@ -171,14 +171,15 @@ def test_admin_page_contains_upstash_controls():
         assert marker in section
 
 
-def test_execution_section_defers_load_until_admin_websocket_ready():
-    """The execution section must not run adminRequest at parse time.
+def test_execution_section_loads_via_get_fetch_not_socket():
+    """The execution section must load settings via a plain GET fetch.
 
-    The admin WebSocket client (window.nanobotAdminRequest) is assigned by the
-    provider section script which appears later in the page.  If the execution
-    section called its local helper immediately it would throw
-    "adminRequest is not defined" before the socket is ready.  It must poll
-    for window.nanobotAdminRequest instead.
+    The admin WebSocket client (window.nanobotAdminRequest) only handles
+    allowlisted mutation actions (save/test). Routing the initial read through
+    the socket as 'admin.execution.get' would return "unknown WebUI mutation
+    action", so the section reads settings with a GET fetch to
+    /api/admin/execution-settings (the same pattern the provider section uses
+    for /api/admin/provider-settings). Save/test still go through the socket.
     """
     import nanobot.admin_registry as admin_registry
 
@@ -186,11 +187,14 @@ def test_execution_section_defers_load_until_admin_websocket_ready():
     # No local helper / no synchronous load call.
     assert "const adminRequest=" not in section
     assert "void load().catch(" not in section
-    # Uses the shared window client, deferred until it exists.
-    assert "window.nanobotAdminRequest" in section
+    # Load uses a GET fetch, never the mutation socket.
+    assert "fetch('/api/admin/execution-settings'" in section
+    assert "admin.execution.get" not in section
+    # Save/test still use the shared window client, deferred until it exists.
+    assert "window.nanobotAdminRequest('admin.execution.save'" in section
+    assert "window.nanobotAdminRequest('admin.execution.test'" in section
     assert "__execReady" in section
     assert "typeof window.nanobotAdminRequest==='function'" in section
-    assert "saved=await window.nanobotAdminRequest('admin.execution.get')" in section
     assert "adminRequest('admin.execution.get')" not in section
     assert "adminRequest('admin.execution.save'" not in section
     assert "adminRequest('admin.execution.test'" not in section
