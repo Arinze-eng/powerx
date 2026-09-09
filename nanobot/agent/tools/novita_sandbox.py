@@ -570,8 +570,14 @@ class NovitaSandboxTool(Tool):
         *,
         config: Any,
         session_key: str,
+        _retry_on_failure: bool = True,
     ) -> str:
-        """Tesseract OCR for Telegram images inside an Upstash Box."""
+        """Tesseract OCR for Telegram images inside an Upstash Box.
+
+        Mirrors the Novita path: installs (tesseract + Pillow) are allowed inside
+        the box, Tesseract gets the same generous 90s timeout, and a failure
+        retries once against a fresh box before degrading gracefully.
+        """
         from nanobot.agent.tools.upstash_backend import upstash_box_name
 
         backend = UpstashExecutionBackend(config, box_name=upstash_box_name(session_key or "telegram"))
@@ -580,6 +586,7 @@ class NovitaSandboxTool(Tool):
         remote_paths: list[str] = []
         manifest_path = f"{ocr_dir}/telegram_image_manifest.json"
         script_path = f"{ocr_dir}/telegram_image_ocr.py"
+        box_reset = False
         try:
             await backend.run(f"mkdir -p {shlex.quote(ocr_dir)} {shlex.quote(f'{root}/telegram-images')}", timeout=60)
             probe = await backend.run(
@@ -602,10 +609,10 @@ class NovitaSandboxTool(Tool):
                 await backend.write_bytes(remote_path, raw)
             await backend.write(manifest_path, json.dumps(remote_paths))
             output = await backend.run(
-                "env NANOBOT_OCR_ALLOW_INSTALL=0 NANOBOT_OCR_ALLOW_PILLOW_INSTALL=0 "
-                "NANOBOT_OCR_TIMEOUT_SECONDS=20 "
+                "env NANOBOT_OCR_ALLOW_INSTALL=1 NANOBOT_OCR_ALLOW_PILLOW_INSTALL=1 "
+                "NANOBOT_OCR_TIMEOUT_SECONDS=90 "
                 f"python3 {shlex.quote(script_path)} {shlex.quote(manifest_path)}",
-                timeout=90,
+                timeout=180,
             )
             stdout = output.split("\n[stderr]", 1)[0].strip()
             parsed: Any | None = None
@@ -627,9 +634,21 @@ class NovitaSandboxTool(Tool):
             return str(parsed["content"]).strip()[:_MAX_IMAGE_ANALYSIS_RESULT_CHARS]
         except Exception as exc:
             logger.warning("Upstash Box Tesseract OCR failed: {}", type(exc).__name__)
+            if _retry_on_failure:
+                box_reset = True
+                box_id = _UPSTASH_STORE.sandbox_id(session_key or "telegram")
+                with suppress(Exception):
+                    await backend.reset(box_id)
+                _UPSTASH_STORE.remove(session_key or "telegram")
+                return await self._analyze_telegram_images_upstash(
+                    image_paths,
+                    config=config,
+                    session_key=session_key,
+                    _retry_on_failure=False,
+                )
             return "[Upstash Box Tesseract OCR failed.]"
         finally:
-            if remote_paths:
+            if remote_paths and not box_reset:
                 with suppress(Exception):
                     await backend.run(
                         "rm -f " + " ".join(shlex.quote(path) for path in remote_paths)
