@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from nanobot.providers.base import GenerationSettings, LLMProvider
@@ -40,19 +41,32 @@ class LLMRuntime:
         """Capture provider defaults without retaining mutable generation state."""
         defaults = GenerationSettings()
         generation = getattr(provider, "generation", defaults)
+        configured_max_tokens = getattr(generation, "max_tokens", defaults.max_tokens)
+        # Auto-derive the TRUE context window for admin-loaded models instead of
+        # trusting the 200k config default. This is what makes history compaction
+        # actually fire on small-window models, stopping long chats from silently
+        # re-sending (and paying for) their whole history every turn. Honours any
+        # deliberate admin override; only fills in when the value is untouched.
+        from nanobot.utils.model_windows import auto_tune_runtime
+
+        snapshot_for_tuning = SimpleNamespace(
+            context_window_tokens=context_window_tokens,
+            generation=SimpleNamespace(max_tokens=configured_max_tokens),
+        )
+        tuned_window, tuned_max_output = auto_tune_runtime(model, snapshot_for_tuning)
         return cls(
             provider=provider,
             model=model,
             generation=GenerationSettings(
                 temperature=getattr(generation, "temperature", defaults.temperature),
-                max_tokens=getattr(generation, "max_tokens", defaults.max_tokens),
+                max_tokens=tuned_max_output,
                 reasoning_effort=getattr(
                     generation,
                     "reasoning_effort",
                     defaults.reasoning_effort,
                 ),
             ),
-            context_window_tokens=context_window_tokens,
+            context_window_tokens=tuned_window,
             model_preset=model_preset,
             snapshot_signature=snapshot_signature,
         )
