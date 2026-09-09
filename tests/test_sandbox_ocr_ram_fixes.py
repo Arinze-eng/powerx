@@ -244,6 +244,52 @@ class TestInstallTesseractResilient:
         assert ok is True  # recovered on a later group despite first raising
 
 
+class TestStoreTracksTemplate:
+    """The real reason a sandbox stayed 486MB after deploy: the persisted index
+    reused an old base-template box without checking its sizing."""
+
+    def test_set_records_template(self, tmp_path) -> None:
+        from nanobot.agent.tools.novita_sandbox import _SandboxStore
+
+        store = _SandboxStore(tmp_path / "novita_sandboxes.json")
+
+        class _Box:
+            sandbox_id = "sbx-123"
+
+            def is_running(self):
+                return True
+
+        store.set("tg:1", _Box(), template="powerx-base-2g-c2")
+        assert store.sandbox_id("tg:1") == "sbx-123"
+        assert store.template_for("tg:1") == "powerx-base-2g-c2"
+
+    def test_roundtrip_persistence(self, tmp_path) -> None:
+        from nanobot.agent.tools.novita_sandbox import _SandboxStore
+
+        path = tmp_path / "novita_sandboxes.json"
+
+        class _Box:
+            sandbox_id = "sbx-9"
+
+        s1 = _SandboxStore(path)
+        s1.set("tg:2", _Box(), template="powerx-base-2g-c2")
+        # New instance (simulates process restart) reloads ids AND templates.
+        s2 = _SandboxStore(path)
+        assert s2.sandbox_id("tg:2") == "sbx-9"
+        assert s2.template_for("tg:2") == "powerx-base-2g-c2"
+
+    def test_legacy_index_format_loads_ids_unknown_template(self, tmp_path) -> None:
+        from nanobot.agent.tools.novita_sandbox import _SandboxStore
+
+        path = tmp_path / "novita_sandboxes.json"
+        # Old format was just {key: id}.
+        path.write_text(json.dumps({"tg:3": "sbx-old"}), encoding="utf-8")
+        store = _SandboxStore(path)
+        assert store.sandbox_id("tg:3") == "sbx-old"
+        # Unknown template => treated as stale so it gets recreated at 2GB once.
+        assert store.template_for("tg:3") is None
+
+
 class TestOcrScriptDegradesGracefully:
     def test_script_parses_and_has_describe_image(self) -> None:
         ast.parse(_TELEGRAM_IMAGE_SCRIPT)

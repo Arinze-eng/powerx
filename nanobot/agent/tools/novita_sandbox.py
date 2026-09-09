@@ -258,17 +258,35 @@ print(json.dumps({"content": content}, ensure_ascii=False))
 class _SandboxStore:
     """In-memory handles with a small disk index so sessions can resume after a restart."""
 
-    def __init__(self) -> None:
+    def __init__(self, index_path: Path | None = None) -> None:
         self._lock = threading.RLock()
         self._handles: dict[str, Any] = {}
         self._ids: dict[str, str] = {}
+        # session key -> template alias that sandbox was created from. Lets us
+        # detect a sizing change (old base box vs new 2 GB target) and rebuild
+        # instead of reusing an undersized running instance forever.
+        self._templates: dict[str, str] = {}
         self._locks: dict[str, asyncio.Lock] = {}
-        path = os.getenv("NANOBOT_DATA_DIR", "").strip()
-        self._index_path = Path(path).expanduser() / "novita_sandboxes.json" if path else Path.home() / ".nanobot" / "novita_sandboxes.json"
+        if index_path is not None:
+            self._index_path = index_path
+        else:
+            path = os.getenv("NANOBOT_DATA_DIR", "").strip()
+            self._index_path = Path(path).expanduser() / "novita_sandboxes.json" if path else Path.home() / ".nanobot" / "novita_sandboxes.json"
         try:
             raw = json.loads(self._index_path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
-                self._ids = {str(k): str(v) for k, v in raw.items() if v}
+                if "ids" in raw or "templates" in raw:
+                    ids_raw = raw.get("ids") or {}
+                    tmpl_raw = raw.get("templates") or {}
+                    if isinstance(ids_raw, dict):
+                        self._ids = {str(k): str(v) for k, v in ids_raw.items() if v}
+                    if isinstance(tmpl_raw, dict):
+                        self._templates = {str(k): str(v) for k, v in tmpl_raw.items() if v}
+                else:
+                    # Legacy format: the whole file WAS the id map. Rebuild under
+                    # the new schema on next write; treat every entry as unknown
+                    # template so it gets recreated once at the new sizing.
+                    self._ids = {str(k): str(v) for k, v in raw.items() if v}
         except (OSError, ValueError):
             pass
 
@@ -280,16 +298,22 @@ class _SandboxStore:
         with self._lock:
             return self._handles.get(key)
 
-    def set(self, key: str, sandbox: Any) -> None:
+    def set(self, key: str, sandbox: Any, *, template: str | None = None) -> None:
         sandbox_id = str(getattr(sandbox, "sandbox_id", "") or getattr(sandbox, "id", ""))
         with self._lock:
             self._handles[key] = sandbox
             if sandbox_id:
                 self._ids[key] = sandbox_id
+                if template:
+                    # Remember which template this sandbox came from so a later
+                    # sizing change (e.g. base -> 2 GB) forces a rebuild instead
+                    # of silently reusing an undersized running box.
+                    self._templates[key] = template
                 try:
                     self._index_path.parent.mkdir(parents=True, exist_ok=True)
                     tmp = self._index_path.with_suffix(".tmp")
-                    tmp.write_text(json.dumps(self._ids, indent=2), encoding="utf-8")
+                    payload = {"ids": self._ids, "templates": self._templates}
+                    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
                     tmp.replace(self._index_path)
                 except OSError:
                     logger.warning("Could not persist Novita sandbox index")
@@ -298,12 +322,19 @@ class _SandboxStore:
         with self._lock:
             return self._ids.get(key)
 
+    def template_for(self, key: str) -> str | None:
+        """Template alias the persisted sandbox for *key* was created from."""
+        with self._lock:
+            return self._templates.get(key)
+
     def remove(self, key: str) -> None:
         with self._lock:
             self._handles.pop(key, None)
             self._ids.pop(key, None)
+            self._templates.pop(key, None)
             try:
-                self._index_path.write_text(json.dumps(self._ids, indent=2), encoding="utf-8")
+                payload = {"ids": self._ids, "templates": self._templates}
+                self._index_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             except OSError:
                 pass
 
@@ -1049,24 +1080,39 @@ class NovitaSandboxTool(Tool):
                 return fallback
 
     def _get_or_create(self, key: str) -> Any:
+        client = self._client()
+        # Resolve the target template up front so we can tell whether an existing
+        # (in-memory or persisted) sandbox matches the CURRENT sizing. Before
+        # this change a stale base-template box (~486 MB) was reused forever even
+        # after the 2 GB default shipped, because reconnect never checked which
+        # template it came from. A mismatch now forces a fresh create.
+        sandbox_template = self._resolve_template(client)
+
+        def _matches_sizing(stored_template: str | None) -> bool:
+            # Unknown provenance (legacy index / pre-fix handle): assume stale so
+            # it gets recreated once at the correct size, then tracked properly.
+            return stored_template == sandbox_template
+
         sandbox = _STORE.get(key)
         if sandbox is not None:
             try:
-                if sandbox.is_running():
+                if sandbox.is_running() and _matches_sizing(_STORE.template_for(key)):
                     return sandbox
             except Exception:
                 pass
-        client = self._client()
+            # Wrong-sized or dead handle: drop it (and its id) before recreating.
+            _STORE.remove(key)
         sandbox_id = _STORE.sandbox_id(key)
         if sandbox_id:
             try:
                 sandbox = client.sandbox.connect(sandbox_id)
-                if sandbox.is_running():
-                    _STORE.set(key, sandbox)
+                if sandbox.is_running() and _matches_sizing(_STORE.template_for(key)):
+                    _STORE.set(key, sandbox, template=sandbox_template)
                     return sandbox
+                # Connected but undersized/unknown template: don't reuse it.
+                _STORE.remove(key)
             except Exception:
                 _STORE.remove(key)
-        sandbox_template = self._resolve_template(client)
         sandbox = client.sandbox.create(
             sandbox_template,
             timeout=min(int(os.getenv("NOVITA_SANDBOX_TIMEOUT", "3600")), 86_400),
@@ -1096,7 +1142,7 @@ class NovitaSandboxTool(Tool):
             except Exception:
                 pass
             raise last_error
-        _STORE.set(key, sandbox)
+        _STORE.set(key, sandbox, template=sandbox_template)
         return sandbox
 
     @staticmethod
