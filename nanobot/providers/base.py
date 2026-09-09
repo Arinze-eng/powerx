@@ -802,6 +802,167 @@ class LLMProvider(ABC):
                         found = True
         return found
 
+    @staticmethod
+    def _describe_exception(exc: Exception) -> str:
+        """Render an exception's message without ever raising.
+
+        ``str(exc)`` can itself blow up (properties/``__str__`` on third-party
+        error objects), and that must not turn a handled provider failure into a
+        crash inside our own error handler.
+        """
+        try:
+            text = str(exc)
+        except Exception:
+            text = ""
+        if not text:
+            return f"<{type(exc).__name__}>"
+        return text
+
+    @classmethod
+    def _extract_error_metadata(cls, e: Exception) -> dict[str, Any]:
+        """Best-effort structured error metadata from any provider exception.
+
+        Lives on the base class so every provider (and the generic safe-call
+        wrappers) can use it. OpenAI-compatible providers override this with a
+        richer version; subclasses must stay tolerant because callers feed it
+        arbitrary exceptions. Never raises: metadata is strictly optional and
+        must not mask the underlying error.
+        """
+        meta: dict[str, Any] = {
+            "error_status_code": None,
+            "error_kind": None,
+            "error_type": None,
+            "error_code": None,
+            "error_retry_after_s": None,
+            "error_should_retry": None,
+        }
+
+        def _safe(obj, name, default=None):
+            try:
+                return getattr(obj, name, default)
+            except Exception:
+                return default
+
+        response = _safe(e, "response")
+        headers = _safe(response, "headers") if response is not None else None
+
+        status_code = _safe(e, "status_code")
+        if status_code is None and response is not None:
+            status_code = _safe(response, "status_code")
+        if status_code is not None:
+            try:
+                meta["error_status_code"] = int(status_code)
+            except (TypeError, ValueError):
+                pass
+
+        payload = (
+            _safe(e, "body")
+            or _safe(e, "doc")
+            or (_safe(response, "text") if response is not None else None)
+        )
+        if payload is None and response is not None:
+            response_json = _safe(response, "json")
+            if callable(response_json):
+                try:
+                    payload = response_json()
+                except Exception:
+                    payload = None
+        error_type, error_code = cls._extract_error_type_code(payload)
+        meta["error_type"] = error_type
+        meta["error_code"] = error_code
+
+        if headers is not None:
+            meta["error_retry_after_s"] = cls._extract_retry_after_from_headers(headers)
+            try:
+                raw = headers.get("x-should-retry")
+            except Exception:
+                raw = None
+            if isinstance(raw, str):
+                lowered = raw.strip().lower()
+                if lowered == "true":
+                    meta["error_should_retry"] = True
+                elif lowered == "false":
+                    meta["error_should_retry"] = False
+
+        error_name = type(e).__name__.lower()
+        if "timeout" in error_name:
+            meta["error_kind"] = "timeout"
+        elif "connection" in error_name:
+            meta["error_kind"] = "connection"
+
+        return meta
+
+    def _exception_to_error_response(self, exc: Exception) -> LLMResponse:
+        """Turn an escaping exception into an LLMResponse *with* metadata.
+
+        ``chat()`` normally funnels provider errors through its own handler,
+        which attaches status code / error type / Retry-After. But exceptions
+        raised outside that path (client construction, request building, hooks,
+        third-party SDK bugs) used to collapse into a bare message string — so
+        a 404 lost its status code and every decision keyed off it (billing vs
+        transient vs permanent) had to fall back to text sniffing.
+
+        This reuses the same extractor when the exception looks like an HTTP
+        error, then repairs the common case where the status only appears in
+        the rendered message (e.g. "Error code: 404 - {...}").
+        """
+        content = f"Error calling LLM: {self._describe_exception(exc)}"
+        try:
+            kwargs = self._extract_error_metadata(exc)
+        except Exception:  # pragma: no cover - defensive; base impl is tolerant
+            kwargs = {}
+
+        # Only keep meaningful extracted fields; never let extraction invent a
+        # body we do not have.
+        meta = {k: v for k, v in kwargs.items() if v is not None}
+
+        # Fallback: recover a status/type/code from the message text itself.
+        if meta.get("error_status_code") is None:
+            recovered = self._recover_status_from_message(str(exc))
+            if recovered is not None:
+                meta["error_status_code"] = recovered
+
+        retry_after = meta.pop("error_retry_after_s", None)
+        response = LLMResponse(
+            content=content,
+            finish_reason="error",
+            **meta,
+        )
+        if retry_after is not None:
+            response.retry_after = retry_after
+        return response
+
+    @staticmethod
+    def _recover_status_from_message(text: str) -> int | None:
+        """Best-effort HTTP status recovery from free-form error text.
+
+        Handles shapes seen in the wild:
+          "Error code: 404 - {...}", "429 Too Many Requests", "HTTP 503"
+        Deliberately conservative: requires an explicit code marker so ordinary
+        numbers in prose are never mistaken for statuses.
+        """
+        lowered = text.lower()
+        patterns = (
+            r"error\s*code:\s*([1-5]\d{2})",
+            r"\bhttp\s*(?:status)?\s*(?:code)?[:\s]+([1-5]\d{2})",
+            r"\bstatus(?:\s*code)?[:\s]+([1-5]\d{2})",
+            r"[\"']code[\"']\s*:\s*([1-5]\d{2})",
+        )
+        for pat in patterns:
+            m = re.search(pat, lowered)
+            if m:
+                try:
+                    code = int(m.group(1))
+                except ValueError:
+                    continue
+                if 100 <= code <= 599:
+                    return code
+        # Leading bare status ("429 Too Many Requests", "503 Service Unavailable")
+        m = re.match(r"\s*([1-5]\d{2})\s+[a-z]", lowered)
+        if m:
+            return int(m.group(1))
+        return None
+
     async def _safe_chat(self, **kwargs: Any) -> LLMResponse:
         """Call chat() and convert unexpected exceptions to error responses."""
         try:
@@ -815,7 +976,8 @@ class LLMProvider(ABC):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+            return self._exception_to_error_response(exc)
+
 
     async def chat_stream(
         self,
@@ -889,7 +1051,7 @@ class LLMProvider(ABC):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+            return self._exception_to_error_response(exc)
 
     async def chat_stream_with_retry(
         self,
