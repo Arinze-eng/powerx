@@ -190,3 +190,7 @@ def test_execution_section_defers_load_until_admin_websocket_ready():
     assert "window.nanobotAdminRequest" in section
     assert "__execReady" in section
     assert "typeof window.nanobotAdminRequest==='function'" in section
+    assert "saved=await window.nanobotAdminRequest('admin.execution.get')" in section
+    assert "adminRequest('admin.execution.get')" not in section
+    assert "adminRequest('admin.execution.save'" not in section
+    assert "adminRequest('admin.execution.test'" not in section
