@@ -23,6 +23,14 @@ from nanobot.agent.deterministic_router import deterministic_plan, router_enable
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
 from nanobot.agent.tool_middleware import ToolMiddleware
+from nanobot.agent.plan_cache import (
+    make_plan_cache,
+    normalize_task,
+    plan_cache_enabled,
+    plan_is_safe,
+    replayable_for,
+    substitute_variables,
+)
 from nanobot.agent.task_cache import make_replay_cache, task_fingerprint_text
 from nanobot.agent.tools.registry import (
     ToolRegistry,
@@ -153,6 +161,11 @@ class AgentRunSpec:
     # model to re-render JSON it never authored. Applies only to governed tool
     # names; every other call executes exactly as before.
     tool_middleware: bool = False
+    # Opt-in for the zero-call TASK PLAN cache (nanobot.agent.plan_cache): a task
+    # whose tool-step plan was learned once replays its sandbox steps directly on
+    # any structurally-identical repeat, with ZERO provider calls. Fail-open —
+    # an unlearned, expired, or failing plan falls back to the normal LLM path.
+    enable_plan_cache: bool = False
 
 
 @dataclass(slots=True)
@@ -515,6 +528,10 @@ class AgentRunner:
     ) -> AgentRunResult:
         final_content: str | None = None
         tools_used: list[str] = []
+        # Ordered (name, arguments) of every tool the model actually chose this
+        # run, captured so a successful completion can be stored as a replayable
+        # task PLAN for zero-LLM repeats (see nanobot.agent.plan_cache).
+        recorded_steps: list[dict[str, Any]] = []
         usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
         error: str | None = None
         stop_reason = "completed"
@@ -576,6 +593,27 @@ class AgentRunner:
                 pending_stream_content=cached_replay,
                 provider_state=conversation_state.finish(messages),
             )
+
+        # --- Zero-call TASK PLAN replay: same task shape, sandbox re-runs ----
+        # The model solved a structurally-identical task before; replay its
+        # recorded tool steps directly in the sandbox with ZERO provider calls.
+        # Only consulted when the run opts in via enable_plan_cache. Any step
+        # failing or producing nothing falls through to the normal LLM path
+        # (which will relearn and overwrite the plan) — never a wrong answer.
+        plan_cache = None
+        plan_norm = None
+        if spec.enable_plan_cache and plan_cache_enabled():
+            plan_cache = make_plan_cache(spec.workspace)
+            # Fingerprint the user's own task text (same source the replay cache
+            # uses) regardless of whether that layer is enabled for this run.
+            plan_task_text = replay_task_text or task_fingerprint_text(spec.initial_messages)
+            plan_norm = normalize_task(plan_task_text)
+            if plan_cache is not None and plan_norm is not None:
+                replayed = await self._try_plan_replay(
+                    spec, plan_cache, plan_norm, messages, conversation_state
+                )
+                if replayed is not None:
+                    return replayed
 
         # --- Zero-call deterministic router: rule answers read-only asks -------
         # A fresh, unambiguous UniAbuja lookup (status, announcements, my own
@@ -725,6 +763,20 @@ class AgentRunner:
                     for tool_call, event in zip(response.tool_calls, new_events)
                     if event.get("status") == "ok"
                 )
+                # Capture the concrete steps taken this iteration so a clean
+                # completion can be distilled into a replayable plan. Only
+                # successful calls are recorded — a failed step is not part of a
+                # trustworthy recipe.
+                for tool_call, event in zip(response.tool_calls, new_events):
+                    if event.get("status") == "ok":
+                        recorded_steps.append(
+                            {
+                                "name": tool_call.name,
+                                "arguments": tool_call.arguments
+                                if isinstance(tool_call.arguments, dict)
+                                else {},
+                            }
+                        )
 
                 # --- Zero-call middleware completion --------------------------
                 # The model already fetched the data; when the middleware
@@ -1105,6 +1157,26 @@ class AgentRunner:
             and final_content
         ):
             replay_cache.put(replay_task_text, final_content)
+
+        # Store the successful step sequence as a replayable PLAN so a future
+        # task of the same SHAPE re-runs in the sandbox with zero LLM calls.
+        # Requires: plan caching on, a meaningful normalized task, at least one
+        # recorded step, and every step safe to replay (no side-effecting tools).
+        if (
+            plan_cache is not None
+            and plan_norm is not None
+            and stop_reason == "completed"
+            and final_content
+            and recorded_steps
+            and plan_is_safe(recorded_steps)
+        ):
+            stored = plan_cache.put(plan_norm, recorded_steps)
+            if stored is not None:
+                logger.info(
+                    "plan cache: stored {}-step plan for '{}' (0-call replay ready)",
+                    len(recorded_steps),
+                    plan_norm.template[:60],
+                )
 
         return AgentRunResult(
             final_content=final_content,
@@ -2180,6 +2252,98 @@ class AgentRunner:
         callback = spec.checkpoint_callback
         if callback is not None:
             await callback(payload)
+
+    async def _try_plan_replay(
+        self,
+        spec: AgentRunSpec,
+        plan_cache: Any,
+        norm: Any,
+        messages: list[dict[str, Any]],
+        conversation_state: Any,
+    ) -> AgentRunResult | None:
+        """Replay a learned task PLAN with ZERO provider calls, or fall through.
+
+        Returns an ``AgentRunResult`` only when every recorded step re-executes
+        successfully and yields non-empty output; otherwise returns None so the
+        normal LLM path runs (and can relearn/overwrite the plan). A stale or
+        incompatible plan therefore never produces a wrong answer — at worst it
+        costs one wasted sandbox attempt before the model takes over.
+        """
+        plan = plan_cache.get(norm)
+        if plan is None or not replayable_for(norm, plan):
+            return None
+        steps = substitute_variables(plan.steps, plan.variables, norm.variables)
+        # Re-validate after substitution: swapping values must not smuggle in an
+        # unsafe action (e.g. a variable that turns 'run' into 'upload').
+        if not plan_is_safe(steps):
+            return None
+
+        results: list[Any] = []
+        events: list[dict[str, str]] = []
+        for index, step in enumerate(steps):
+            tool = spec.tools.get(step["name"])
+            if tool is None:
+                logger.info("plan cache: tool {} missing, falling back to model", step["name"])
+                return None
+            try:
+                result = await spec.tools.execute(step["name"], dict(step["arguments"]))
+            except Exception:
+                logger.exception("plan cache: replay step failed, falling back to model")
+                return None
+            if is_tool_error_result(result):
+                logger.info("plan cache: replay step errored, falling back to model")
+                return None
+            text = str(result).strip()
+            if not text:
+                return None
+            results.append(text)
+            events.append({"name": step["name"], "status": "ok"})
+            # Mirror history so the session transcript shows the work happened.
+            call_id = f"plan-replay-{index}"
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": step["name"],
+                                "arguments": json.dumps(step["arguments"]),
+                            },
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": step["name"],
+                    "content": text,
+                }
+            )
+
+        final_content = results[-1]
+        self._append_final_message(messages, final_content)
+        logger.info(
+            "plan cache: replayed {}-step plan for '{}' (0 provider calls)",
+            len(steps),
+            norm.template[:60],
+        )
+        return AgentRunResult(
+            final_content=final_content,
+            messages=messages,
+            tools_used=[s["name"] for s in steps],
+            usage={"prompt_tokens": 0, "completion_tokens": 0, "plan_replayed": 1},
+            stop_reason="completed",
+            error=None,
+            tool_events=events,
+            had_injections=False,
+            pending_stream_content=final_content,
+            provider_state=conversation_state.finish(messages),
+        )
 
     async def _middleware_execute(
         self, spec: AgentRunSpec, tool_call: ToolCallRequest

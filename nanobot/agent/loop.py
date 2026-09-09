@@ -1310,6 +1310,11 @@ class AgentLoop:
                 # own call returns renderable structured data, the turn ends
                 # without paying for a JSON re-render.
                 tool_middleware=True,
+                # Zero-call task plan cache: a coding/task the model solved once
+                # replays its sandbox steps directly on any same-shape repeat, so
+                # routine user tasks stop spending LLM credits (only exceptions
+                # re-engage the model). Fail-open by design.
+                enable_plan_cache=True,
                 provider_state=provider_state,
                 strip_image_content_before_provider=strip_image_content_before_provider,
                 ))
