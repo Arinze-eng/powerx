@@ -234,6 +234,46 @@ if TYPE_CHECKING:
     from nanobot.triggers.local_store import LocalTriggerStore
     from nanobot.webui.settings_services import WebUISettingsServices
 
+def _deployment_identity() -> dict[str, Any]:
+    """Build the /api/version payload: running commit + enabled cost layers.
+
+    Read-only, no secrets/PII. git_sha prefers GIT_SHA/COMMIT_SHA env (CI build
+    arg) and falls back to the committed BUILD_SHA marker so a plain COPY build
+    still self-identifies. cost_layers shows whether each zero-call layer is on,
+    letting you confirm a push actually rebuilt vs restarted an old image.
+    """
+    from nanobot import __version__
+
+    git_sha = os.environ.get("GIT_SHA") or os.environ.get("COMMIT_SHA") or ""
+    if not git_sha:
+        try:
+            root = Path(__file__).resolve().parents[2]
+            marker = root / "BUILD_SHA"
+            if marker.exists():
+                git_sha = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    cost_layers: dict[str, bool] = {}
+    try:
+        from nanobot.agent import plan_cache as _pc
+        from nanobot.agent import tool_middleware as _tm
+        from nanobot.agent.deterministic_router import router_enabled as _router_enabled
+
+        cost_layers = {
+            "plan_cache": bool(_pc.plan_cache_enabled()),
+            "tool_middleware": bool(_tm.middleware_enabled()),
+            "deterministic_router": bool(_router_enabled()),
+        }
+    except Exception:  # pragma: no cover - identity must never 500
+        pass
+    return {
+        "app": "powerx",
+        "version": __version__,
+        "git_sha": git_sha or "unknown",
+        "cost_layers": cost_layers,
+    }
+
+
 def _decode_api_key(raw_key: str) -> str | None:
     key = unquote(raw_key)
     _api_key_re = re.compile(r"^[A-Za-z0-9_:.-]{1,128}$")
@@ -508,6 +548,12 @@ class GatewayHTTPHandler:
         request: WsRequest,
         got: str,
     ) -> Any | None:
+        # Public deployment identity (no auth): confirms which build is live and
+        # which zero-call cost layers are enabled. Mirrors /version on the API
+        # server but reachable through the webui front door (/api/version).
+        if got == "/api/version":
+            return _http_json_response(_deployment_identity())
+
         # Admin dashboard and user registry
         admin_response = admin_route(
             request,
