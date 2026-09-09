@@ -10,13 +10,16 @@ import asyncio
 import contextlib
 import hmac
 import json as _json
+import os
 import time
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 
 from aiohttp import web
 from loguru import logger
 
+from nanobot import __version__
 from nanobot.api.api_keys import ApiKeyStore, hash_api_key
 from nanobot.api.miniapp import register_miniapp_routes
 from nanobot.api.telegram_auth import miniapp_tokens
@@ -476,6 +479,43 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
+async def handle_version(request: web.Request) -> web.Response:
+    """GET /version — deployment identity + which zero-call cost layers are live.
+
+    Lets you confirm *which commit* is actually serving traffic (the reason a
+    push 'looked' deployed but might not have rebuilt), and see at a glance that
+    the plan cache / tool middleware / deterministic router are enabled in this
+    build. Read-only; no secrets, no PII.
+    """
+    from nanobot.agent import plan_cache as _pc
+    from nanobot.agent import tool_middleware as _tm
+    from nanobot.agent.deterministic_router import router_enabled as _router_enabled
+
+    git_sha = os.environ.get("GIT_SHA") or os.environ.get("COMMIT_SHA") or ""
+    if not git_sha:
+        # Fall back to a committed marker so even a plain `COPY .` build reports
+        # something meaningful (refreshed by scripts/stamp_build.py on each push).
+        try:
+            root = Path(__file__).resolve().parents[2]
+            marker = root / "BUILD_SHA"
+            if marker.exists():
+                git_sha = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    return web.json_response(
+        {
+            "app": "powerx",
+            "version": __version__,
+            "git_sha": git_sha or "unknown",
+            "cost_layers": {
+                "plan_cache": _pc.plan_cache_enabled(),
+                "tool_middleware": _tm.middleware_enabled(),
+                "deterministic_router": bool(_router_enabled()),
+            },
+        }
+    )
+
+
 async def handle_api_docs(request: web.Request) -> web.Response:
     """GET /v1/api-docs — plain-text integration docs for the public API."""
     from nanobot.channels.telegram.api_platform import render_docs
@@ -524,7 +564,7 @@ def create_app(
         # browser's gofile.io result. Both only hand off an in-memory record.
         # /app serves the chat page; /app/token mints a short-lived bearer from
         # validated initData — neither carries the api_key itself.
-        if request.path in ("/health", "/upload", "/upload/complete", "/app", "/app/token", "/v1/api-docs"):
+        if request.path in ("/health", "/version", "/upload", "/upload/complete", "/app", "/app/token", "/v1/api-docs"):
             return await handler(request)
         auth = request.headers.get("Authorization", "")
         supplied = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
@@ -558,6 +598,7 @@ def create_app(
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/v1/api-docs", handle_api_docs)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/version", handle_version)
 
     # Telegram Mini App routes (large file upload via gofile.io).
     register_miniapp_routes(app)

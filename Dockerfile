@@ -42,6 +42,9 @@ RUN mkdir -p nanobot && touch nanobot/__init__.py && \
 
 # Copy the full source and install
 COPY nanobot/ nanobot/
+# Deployment identity: lets GET /version report the running commit even when the
+# image is built with plain COPY (no .git). Overridden by GIT_SHA env if CI sets it.
+COPY BUILD_SHA ./BUILD_SHA
 COPY scripts/install_channel_dependencies.py scripts/
 COPY scripts/ensure_render_config.py scripts/
 COPY scripts/render_reverse_proxy.py scripts/

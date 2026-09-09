@@ -18,6 +18,55 @@ class CreditExhaustedError(SupabaseAuthError):
     """Raised before a model iteration when the user cannot pay for another step."""
 
 
+def log_cost_meter(
+    *,
+    channel: str,
+    session_key: str | None,
+    charged_steps: int,
+    usage: dict[str, Any] | None,
+    stop_reason: str | None,
+) -> None:
+    """Emit one structured line per turn: credits spent + zero-call savings.
+
+    Billing is 1 credit per LLM iteration (``before_iteration``). The zero-call
+    layers (plan cache, tool middleware, deterministic router, replay cache)
+    answer *before* an iteration happens, so they never charge — this meter makes
+    that visible in logs / metrics so you can watch real spend instead of
+    guessing. Never raises: observability must not break a paid turn.
+    """
+    try:
+        usage = usage or {}
+
+        def _as_int(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        served_by = "llm"
+        if usage.get("plan_replayed"):
+            served_by = "plan_cache"
+        elif usage.get("deterministic"):
+            served_by = "deterministic_router"
+        elif usage.get("middleware_formatted"):
+            served_by = "tool_middleware"
+        elif usage.get("replay_cache"):
+            served_by = "replay_cache"
+        logger.bind(cost=True).info(
+            "COST_METER channel={} session={} llm_calls={} served_by={} "
+            "prompt_tokens={} completion_tokens={} stop={}",
+            channel,
+            (session_key or "-")[:40],
+            _as_int(charged_steps),
+            served_by,
+            _as_int(usage.get("prompt_tokens")),
+            _as_int(usage.get("completion_tokens")),
+            stop_reason or "-",
+        )
+    except Exception:  # pragma: no cover - metering is best-effort only
+        logger.debug("cost meter failed to emit (ignored)", exc_info=True)
+
+
 class SupabaseCreditHook(AgentHook):
     """Charge one existing Supabase cloud step before every Telegram model iteration."""
 
@@ -25,6 +74,10 @@ class SupabaseCreditHook(AgentHook):
         super().__init__(reraise=True)
         self._context = context
         self._supabase = SupabaseAuth()
+        # LLM iterations actually charged this turn (== credits spent). Zero-call
+        # layers answer before any iteration, so a 0 here means the task cost you
+        # nothing. Reported by log_cost_meter in after_run.
+        self.charged_steps = 0
 
     async def _resolve_account(self) -> dict[str, Any] | None:
         """Look up the Telegram account for this turn (used by API-bridge turns)."""
@@ -75,6 +128,16 @@ class SupabaseCreditHook(AgentHook):
                 f"Credit exhausted or unavailable for this step: {str(exc)[:400]} "
                 "Please add credit before using the agent again."
             ) from exc
+        self.charged_steps += 1
+
+    async def after_run(self, context: AgentRunHookContext) -> None:
+        log_cost_meter(
+            channel=self._context.channel,
+            session_key=self._context.session_key or self._context.chat_id,
+            charged_steps=self.charged_steps,
+            usage=context.usage,
+            stop_reason=context.stop_reason,
+        )
 
 
 def create_supabase_credit_hook(context: AgentTurnHookContext) -> AgentHook | None:
@@ -138,6 +201,13 @@ class ApiCreditHook(AgentHook):
         self.charged_steps += 1
 
     async def after_run(self, context: AgentRunHookContext) -> None:
+        log_cost_meter(
+            channel="api",
+            session_key=self._context.session_key or self._context.chat_id,
+            charged_steps=self.charged_steps,
+            usage=context.usage,
+            stop_reason=context.stop_reason,
+        )
         await self._log_request(status="success", error=None)
 
     async def on_error(self, context: AgentRunHookContext) -> None:
