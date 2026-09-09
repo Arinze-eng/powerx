@@ -461,8 +461,9 @@ async def test_vps_ocr_uploads_telegram_image_bytes_and_returns_result(
     assert uploads == [("telegram", uploads[0][1], b"telegram-image-bytes")]
     assert uploads[0][1].startswith(f"{workspace}/telegram-images/")
     assert any(
-        "NANOBOT_OCR_ALLOW_INSTALL=0" in command
-        and "NANOBOT_OCR_ALLOW_PILLOW_INSTALL=0" in command
+        "NANOBOT_OCR_ALLOW_INSTALL=1" in command
+        and "NANOBOT_OCR_ALLOW_PILLOW_INSTALL=1" in command
+        and "NANOBOT_OCR_TIMEOUT_SECONDS=90" in command
         for command in commands
     )
 

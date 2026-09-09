@@ -527,10 +527,10 @@ class NovitaSandboxTool(Tool):
                 await backend.upload("telegram", remote_path, raw)
             await backend.write(manifest_path, json.dumps(remote_paths))
             output = await backend.run(
-                "env NANOBOT_OCR_ALLOW_INSTALL=0 NANOBOT_OCR_ALLOW_PILLOW_INSTALL=0 "
-                "NANOBOT_OCR_TIMEOUT_SECONDS=20 "
+                "env NANOBOT_OCR_ALLOW_INSTALL=1 NANOBOT_OCR_ALLOW_PILLOW_INSTALL=1 "
+                "NANOBOT_OCR_TIMEOUT_SECONDS=90 "
                 f"python3 {shlex.quote(script_path)} {shlex.quote(manifest_path)}",
-                timeout=45,
+                timeout=180,
                 cwd=root,
             )
             stdout = output.split("\n[stderr]", 1)[0].strip()
@@ -581,6 +581,11 @@ class NovitaSandboxTool(Tool):
         from nanobot.agent.tools.upstash_backend import upstash_box_name
 
         backend = UpstashExecutionBackend(config, box_name=upstash_box_name(session_key or "telegram"))
+        # Reuse the persisted box id (if any) so ensure_box verifies that exact
+        # box instead of listing every box in the account on each OCR run.
+        stored_id = _UPSTASH_STORE.sandbox_id(session_key or "telegram")
+        if stored_id:
+            backend.last_box_id = stored_id
         root = backend.workspace
         ocr_dir = f"{root}/.nanobot"
         remote_paths: list[str] = []
@@ -888,7 +893,27 @@ class NovitaSandboxTool(Tool):
         explicit = os.getenv("NOVITA_SANDBOX_TEMPLATE", "").strip()
         if explicit:
             return explicit
+
+        def _template_exists(template_alias: str) -> bool:
+            """True when the alias exists on this Novita account (never raises)."""
+            try:
+                return bool(client.template.alias_exists(template_alias))
+            except Exception:
+                return False
+
+        # Never return an alias that does not exist: sandbox.create would fail
+        # and take OCR/execution down with it. Fall back to the stock "base"
+        # image when the legacy sized template was never published on this
+        # account, and log so the admin knows to set a sized template.
         fallback = "powerx-base-4g"
+        if not _template_exists(fallback):
+            logger.warning(
+                "Novita template '{}' not found on this account; using stock 'base' "
+                "(set NOVITA_SANDBOX_TEMPLATE or configure execution.novita_template "
+                "so sandboxes get the configured RAM)",
+                fallback,
+            )
+            fallback = "base"
         sizing = self._template_sizing()
         if sizing is None:
             return fallback
@@ -902,11 +927,7 @@ class NovitaSandboxTool(Tool):
             cached = _TEMPLATE_CACHE.get(alias)
             if cached:
                 return cached
-            try:
-                exists = client.template.alias_exists(alias)
-            except Exception:
-                exists = False
-            if exists:
+            if _template_exists(alias):
                 _TEMPLATE_CACHE[alias] = alias
                 return alias
             try:
@@ -1122,7 +1143,34 @@ class NovitaSandboxTool(Tool):
         from nanobot.agent.tools.upstash_backend import upstash_box_name
 
         backend = UpstashExecutionBackend(config, box_name=upstash_box_name(key))
+        # Seed the persisted box id (if any) so ensure_box verifies that exact
+        # box directly instead of listing every box in the account on each op.
+        stored_id = _UPSTASH_STORE.sandbox_id(key)
+        if stored_id:
+            backend.last_box_id = stored_id
         return backend
+
+    async def release_upstash_sandbox(self, session_key: str | None = None) -> None:
+        """Kill the session's Upstash box immediately once its task has finished.
+
+        Upstash-only: no-ops for the novita / vps backends so their persistent
+        sandboxes are never affected. Best effort: failures are logged, never
+        raised to the caller.
+        """
+        try:
+            selected_backend, backend_config = self._selected_backend()
+            if selected_backend != "upstash" or backend_config is None:
+                return
+            key = session_key or _session_key()
+            box_id = _UPSTASH_STORE.sandbox_id(key)
+            if not box_id:
+                return
+            backend = self._upstash_backend(backend_config, key)
+            with suppress(Exception):
+                await backend.reset(box_id)
+            _UPSTASH_STORE.remove(key)
+        except Exception:
+            logger.debug("Could not release Upstash box", exc_info=True)
 
     async def _execute_upstash(
         self, action: str, kwargs: dict[str, Any], config: Any, session_key: str

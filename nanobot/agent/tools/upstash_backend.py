@@ -208,9 +208,24 @@ class UpstashExecutionBackend:
                 return
             if asyncio.get_running_loop().time() >= deadline:
                 raise UpstashError(f"Upstash box {box_id} was not ready in time (status={status or 'unknown'})")
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
 
     async def ensure_box(self, session: aiohttp.ClientSession) -> str:
+        # Fast path: verify the exact box we already track (the caller seeds
+        # last_box_id from the persisted store) instead of listing every box in
+        # the account, which is slow on busy accounts and the main startup cost
+        # after a box was killed.
+        if self.last_box_id:
+            box_id = self.last_box_id
+            try:
+                data = await self._request(session, "GET", f"/v2/box/{box_id}", timeout=30)
+                status = str(data.get("status") or "").lower()
+                if status not in {"deleted", "deleting", "error"}:
+                    await self.wait_ready(session, box_id, timeout=90)
+                    return box_id
+            except UpstashError:
+                pass  # stale id — fall through to the list/create path
+            self.last_box_id = ""
         existing = await self.find_box(session)
         if existing is not None:
             box_id = str(existing.get("id") or "")

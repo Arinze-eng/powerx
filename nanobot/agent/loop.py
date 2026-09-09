@@ -1542,6 +1542,10 @@ class AgentLoop:
                             )
                     if not turn_continuation.internal_continuation_pending(msg.metadata):
                         await delivery.idle()
+                        # Upstash-only: a finished task must not leave a paid
+                        # sandbox running — kill the session box immediately.
+                        with suppress(Exception):
+                            await NovitaSandboxTool().release_upstash_sandbox(session_key)
                     await self._publish_next_deferred_automation_turn(session_key)
         finally:
             if pending is None:
