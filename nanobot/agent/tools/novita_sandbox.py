@@ -23,6 +23,7 @@ from nanobot.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
+from nanobot.agent.tools.upstash_backend import UpstashError, UpstashExecutionBackend
 from nanobot.agent.tools.vps_backend import VPSExecutionBackend
 from nanobot.config.paths import get_data_dir, get_workspace_path
 from nanobot.utils.gofile import GoFileError, is_gofile_url, request_file, resolve_gofile_download
@@ -283,6 +284,42 @@ class _SandboxStore:
 _STORE = _SandboxStore()
 
 
+class _UpstashBoxStore(_SandboxStore):
+    """Disk-indexed session → Upstash box id map (no in-process handles needed)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        path = os.getenv("NANOBOT_DATA_DIR", "").strip()
+        base = Path(path).expanduser() if path else Path.home() / ".nanobot"
+        # Point the inherited persistence at a dedicated index file.
+        self._index_path = base / "upstash_boxes.json"
+        try:
+            raw = json.loads(self._index_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self._ids = {str(k): str(v) for k, v in raw.items() if v}
+        except (OSError, ValueError):
+            pass
+
+    def set_id(self, key: str, box_id: str) -> None:
+        """Persist a session → box id mapping without a live handle."""
+        with self._lock:
+            self._ids[key] = str(box_id)
+            try:
+                self._index_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self._index_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(self._ids, indent=2), encoding="utf-8")
+                tmp.replace(self._index_path)
+            except OSError:
+                logger.warning("Could not persist Upstash box index")
+
+
+_UPSTASH_STORE = _UpstashBoxStore()
+
+# Alias cache for dynamically built Novita templates (desired alias → usable alias).
+_TEMPLATE_CACHE: dict[str, str] = {}
+_TEMPLATE_BUILD_LOCK = threading.Lock()
+
+
 def _safe_path(raw: str) -> str:
     value = raw.strip()
     if not value:
@@ -349,8 +386,11 @@ class NovitaSandboxTool(Tool):
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
         execution = getattr(ctx, "execution", None)
-        if execution is not None and getattr(execution, "backend", "novita") == "vps":
+        backend = getattr(execution, "backend", "novita") if execution is not None else "novita"
+        if backend == "vps":
             return bool(getattr(execution.vps, "host", "").strip())
+        if backend == "upstash":
+            return bool(getattr(execution.upstash, "api_key", "").strip())
         return bool(os.getenv("NOVITA_API_KEY", "").strip()) and Novita is not None
 
     @classmethod
@@ -359,9 +399,14 @@ class NovitaSandboxTool(Tool):
 
     def _selected_backend(self) -> tuple[str, Any | None]:
         execution = self._execution_config()
-        if execution is None or getattr(execution, "backend", "novita") != "vps":
+        if execution is None:
             return "novita", None
-        return "vps", getattr(execution, "vps", None)
+        backend = getattr(execution, "backend", "novita")
+        if backend == "vps":
+            return "vps", getattr(execution, "vps", None)
+        if backend == "upstash":
+            return "upstash", getattr(execution, "upstash", None)
+        return "novita", None
 
     def backend_name(self) -> str:
         """Return the active execution backend label without exposing credentials."""
@@ -378,6 +423,8 @@ class NovitaSandboxTool(Tool):
             "Run shell commands, inspect or write project files, list a workspace, "
             "fetch a remote HTTPS file (tmpfiles.org or gofile.io) into the workspace, "
             "download generated artifacts, or reset the current user sandbox. "
+            "When the task is finished and no further work is expected in this session, "
+            "call action=reset so the sandbox is killed automatically for the user. "
             "Use this for all coding, tests, builds, package installs, Git, CI/CD work, "
             "and POLLING / WATCHING / MONITORING tasks; "
             "never use the host shell for user work. "
@@ -517,6 +564,79 @@ class NovitaSandboxTool(Tool):
                         cwd=root,
                     )
 
+    async def _analyze_telegram_images_upstash(
+        self,
+        image_paths: list[tuple[Path, bytes]],
+        *,
+        config: Any,
+        session_key: str,
+    ) -> str:
+        """Tesseract OCR for Telegram images inside an Upstash Box."""
+        from nanobot.agent.tools.upstash_backend import upstash_box_name
+
+        backend = UpstashExecutionBackend(config, box_name=upstash_box_name(session_key or "telegram"))
+        root = backend.workspace
+        ocr_dir = f"{root}/.nanobot"
+        remote_paths: list[str] = []
+        manifest_path = f"{ocr_dir}/telegram_image_manifest.json"
+        script_path = f"{ocr_dir}/telegram_image_ocr.py"
+        try:
+            await backend.run(f"mkdir -p {shlex.quote(ocr_dir)} {shlex.quote(f'{root}/telegram-images')}", timeout=60)
+            probe = await backend.run(
+                "if command -v tesseract >/dev/null 2>&1; then printf READY; else printf MISSING; fi",
+                timeout=30,
+            )
+            if "READY" not in probe:
+                await backend.install_packages(["tesseract-ocr", "tesseract-ocr-eng"], timeout=600)
+                probe = await backend.run(
+                    "if command -v tesseract >/dev/null 2>&1; then printf READY; else printf MISSING; fi",
+                    timeout=30,
+                )
+                if "READY" not in probe:
+                    raise RuntimeError("Tesseract was not available after the Upstash package installation")
+            await backend.write(script_path, _TELEGRAM_IMAGE_SCRIPT)
+            for path, raw in image_paths:
+                suffix = path.suffix.lower() if path.suffix else ".img"
+                remote_path = f"{root}/telegram-images/{uuid4().hex}{suffix}"
+                remote_paths.append(remote_path)
+                await backend.write_bytes(remote_path, raw)
+            await backend.write(manifest_path, json.dumps(remote_paths))
+            output = await backend.run(
+                "env NANOBOT_OCR_ALLOW_INSTALL=0 NANOBOT_OCR_ALLOW_PILLOW_INSTALL=0 "
+                "NANOBOT_OCR_TIMEOUT_SECONDS=20 "
+                f"python3 {shlex.quote(script_path)} {shlex.quote(manifest_path)}",
+                timeout=90,
+            )
+            stdout = output.split("\n[stderr]", 1)[0].strip()
+            parsed: Any | None = None
+            try:
+                parsed = json.loads(stdout)
+            except (TypeError, ValueError):
+                for line in reversed(stdout.splitlines()):
+                    candidate = line.strip()
+                    if not candidate.startswith("{"):
+                        continue
+                    try:
+                        parsed = json.loads(candidate)
+                        break
+                    except ValueError:
+                        continue
+            if not isinstance(parsed, dict) or not str(parsed.get("content") or "").strip():
+                logger.warning("Upstash Box returned no usable Tesseract OCR result")
+                return "[Upstash Box Tesseract OCR returned no readable result.]"
+            return str(parsed["content"]).strip()[:_MAX_IMAGE_ANALYSIS_RESULT_CHARS]
+        except Exception as exc:
+            logger.warning("Upstash Box Tesseract OCR failed: {}", type(exc).__name__)
+            return "[Upstash Box Tesseract OCR failed.]"
+        finally:
+            if remote_paths:
+                with suppress(Exception):
+                    await backend.run(
+                        "rm -f " + " ".join(shlex.quote(path) for path in remote_paths)
+                        + f" {shlex.quote(manifest_path)} {shlex.quote(script_path)}",
+                        timeout=30,
+                    )
+
     async def analyze_telegram_images(
         self,
         image_paths: list[str],
@@ -533,9 +653,29 @@ class NovitaSandboxTool(Tool):
         """
         if not image_paths:
             return ""
-        selected_backend, vps_config = self._selected_backend()
+        selected_backend, backend_config = self._selected_backend()
+        if selected_backend == "upstash":
+            if backend_config is None or not str(backend_config.api_key or "").strip():
+                return "[Upstash Box execution is selected but no API key is configured.]"
+            upstash_images: list[tuple[Path, bytes]] = []
+            for raw_path in image_paths[:_MAX_TELEGRAM_IMAGE_COUNT]:
+                path = Path(raw_path).expanduser().resolve()
+                try:
+                    raw = path.read_bytes()
+                except OSError:
+                    continue
+                if not raw or len(raw) > _MAX_TELEGRAM_IMAGE_BYTES:
+                    continue
+                mime = detect_image_mime(raw) or mimetypes.guess_type(str(path))[0]
+                if mime and mime.startswith("image/"):
+                    upstash_images.append((path, raw))
+            if not upstash_images:
+                return "[No readable Telegram images were available to Upstash Box.]"
+            return await self._analyze_telegram_images_upstash(
+                upstash_images, config=backend_config, session_key=session_key
+            )
         if selected_backend == "vps":
-            if vps_config is None or not str(vps_config.host or "").strip():
+            if backend_config is None or not str(backend_config.host or "").strip():
                 return "[VPS execution is selected but SSH details are not configured.]"
             local_images: list[tuple[Path, bytes]] = []
             for raw_path in image_paths[:_MAX_TELEGRAM_IMAGE_COUNT]:
@@ -551,7 +691,7 @@ class NovitaSandboxTool(Tool):
                     local_images.append((path, raw))
             if not local_images:
                 return "[No readable Telegram images were available to the VPS.]"
-            return await self._analyze_telegram_images_vps(local_images, config=vps_config)
+            return await self._analyze_telegram_images_vps(local_images, config=backend_config)
         if Novita is None:
             return "[Novita Sandbox Tesseract OCR is unavailable in this deployment; the sandbox will install it on first use.]"
         api_key = os.getenv("NOVITA_API_KEY", "").strip()
@@ -668,6 +808,115 @@ class NovitaSandboxTool(Tool):
                 except Exception:
                     logger.debug("Novita Sandbox Tesseract OCR cleanup failed")
 
+    @staticmethod
+    def _template_sizing() -> tuple[int, int] | None:
+        """Desired (cpu_count, memory_mb) for Novita sandboxes, if configured.
+
+        Priority: NOVITA_SANDBOX_CPU_COUNT + NOVITA_SANDBOX_MEMORY_MB env vars
+        (deployment-level), then the admin-saved execution.novita_template
+        config. Returns None when no explicit sizing is requested so the
+        historical template behaviour stays untouched.
+        """
+        cpu = memory = None
+        try:
+            raw_cpu = os.getenv("NOVITA_SANDBOX_CPU_COUNT", "").strip()
+            if raw_cpu:
+                cpu = int(raw_cpu)
+        except ValueError:
+            cpu = None
+        try:
+            raw_memory = os.getenv("NOVITA_SANDBOX_MEMORY_MB", "").strip()
+            if raw_memory:
+                memory = int(raw_memory)
+        except ValueError:
+            memory = None
+        if cpu is None or memory is None:
+            execution = NovitaSandboxTool._execution_config()
+            template = getattr(execution, "novita_template", None) if execution is not None else None
+            if template is not None:
+                if cpu is None:
+                    cpu = int(getattr(template, "cpu_count", 2) or 2)
+                if memory is None:
+                    memory = int(getattr(template, "memory_mb", 0) or 0)
+        if not memory:
+            return None
+        cpu = max(1, min(int(cpu or 2), 8))
+        memory = max(512, min(int(memory), 65_536))
+        return cpu, memory
+
+    @staticmethod
+    def _desired_alias(sizing: tuple[int, int]) -> str:
+        cpu, memory = sizing
+        prefix = "powerx-base"
+        try:
+            execution = NovitaSandboxTool._execution_config()
+            template = getattr(execution, "novita_template", None) if execution is not None else None
+            configured = str(getattr(template, "alias_prefix", "") or "").strip()
+            if configured:
+                prefix = re.sub(r"[^A-Za-z0-9_-]", "-", configured)[:24] or "powerx-base"
+        except Exception:
+            pass
+        return f"{prefix}-{max(1, memory // 1024)}g-c{cpu}"
+
+    def _resolve_template(self, client: Any) -> str:
+        """Pick the Novita template alias honouring the configured RAM/CPU.
+
+        Explicit NOVITA_SANDBOX_TEMPLATE always wins (back-compat). Otherwise,
+        when sizing is configured, reuse an existing template alias, build a
+        custom one once (cached by Upstash-style name), and fall back to the
+        legacy default whenever anything goes wrong so task flow never breaks.
+        """
+        explicit = os.getenv("NOVITA_SANDBOX_TEMPLATE", "").strip()
+        if explicit:
+            return explicit
+        fallback = "powerx-base-4g"
+        sizing = self._template_sizing()
+        if sizing is None:
+            return fallback
+        alias = self._desired_alias(sizing)
+        if alias == fallback:
+            return alias
+        cached = _TEMPLATE_CACHE.get(alias)
+        if cached:
+            return cached
+        with _TEMPLATE_BUILD_LOCK:
+            cached = _TEMPLATE_CACHE.get(alias)
+            if cached:
+                return cached
+            try:
+                exists = client.template.alias_exists(alias)
+            except Exception:
+                exists = False
+            if exists:
+                _TEMPLATE_CACHE[alias] = alias
+                return alias
+            try:
+                cpu, memory = sizing
+                # Clone the built-in "base" image with the requested CPU/RAM so
+                # every sandbox spawned from this template gets exactly that RAM
+                # (same approach as scripts/build_novita_template.py).
+                build_info = client.template.build(
+                    client.template.from_template("base"),
+                    alias=alias,
+                    cpu_count=cpu,
+                    memory_mb=memory,
+                )
+                built_alias = str(getattr(build_info, "alias", "") or alias)
+                logger.info(
+                    "Built Novita sandbox template '{}' ({} vCPU / {} MB)", built_alias, cpu, memory
+                )
+                _TEMPLATE_CACHE[alias] = built_alias
+                return built_alias
+            except Exception as exc:
+                logger.warning(
+                    "Could not build Novita template '{}' ({}); falling back to '{}'",
+                    alias,
+                    type(exc).__name__,
+                    fallback,
+                )
+                _TEMPLATE_CACHE[alias] = fallback
+                return fallback
+
     def _get_or_create(self, key: str) -> Any:
         sandbox = _STORE.get(key)
         if sandbox is not None:
@@ -686,10 +935,7 @@ class NovitaSandboxTool(Tool):
                     return sandbox
             except Exception:
                 _STORE.remove(key)
-        # Template controls per-sandbox CPU/RAM. The built-in "base" template is
-        # ~1 GB and OOMs on heavy builds (e.g. apktool); "powerx-base-4g" is a
-        # clone configured with 2 vCPU / 4 GB (see scripts/build_novita_template.py).
-        sandbox_template = os.getenv("NOVITA_SANDBOX_TEMPLATE", "powerx-base-4g").strip() or "base"
+        sandbox_template = self._resolve_template(client)
         sandbox = client.sandbox.create(
             sandbox_template,
             timeout=min(int(os.getenv("NOVITA_SANDBOX_TIMEOUT", "3600")), 86_400),
@@ -853,13 +1099,132 @@ class NovitaSandboxTool(Tool):
             logger.exception("VPS execution operation failed")
             return ToolResult.error(f"VPS execution error: {type(exc).__name__}: {str(exc)[:500]}")
 
+    def _upstash_backend(self, config: Any, key: str) -> UpstashExecutionBackend:
+        from nanobot.agent.tools.upstash_backend import upstash_box_name
+
+        backend = UpstashExecutionBackend(config, box_name=upstash_box_name(key))
+        return backend
+
+    async def _execute_upstash(
+        self, action: str, kwargs: dict[str, Any], config: Any, session_key: str
+    ) -> ToolResult | str:
+        key = session_key or "unknown"
+        backend = self._upstash_backend(config, key)
+        try:
+            if action == "reset":
+                # Kill the user's sandbox immediately; a fresh box is created on
+                # the next operation. The stored id (if any) is deleted even if
+                # the remote lookup fails, so nothing lingers.
+                box_id = _UPSTASH_STORE.sandbox_id(key)
+                with suppress(Exception):
+                    await backend.reset(box_id)
+                _UPSTASH_STORE.remove(key)
+                return "Upstash Box reset. A new sandbox will be created for the next operation."
+            if action not in {"run", "read", "write", "upload", "fetch_url", "install", "list", "download_url"}:
+                return ToolResult.error("Unknown sandbox action")
+            async with _UPSTASH_STORE.lock_for(key):
+                if action == "run":
+                    command = str(kwargs.get("command") or "").strip()
+                    if not command:
+                        return ToolResult.error("command is required")
+                    timeout = max(1, min(int(kwargs.get("timeout") or 120), _MAX_TIMEOUT))
+                    output = await backend.run(command, timeout=timeout)
+                    if getattr(backend, "last_box_id", ""):
+                        _UPSTASH_STORE.set_id(key, backend.last_box_id)
+                    return output
+                if action == "install":
+                    raw_packages = str(kwargs.get("packages") or "").strip()
+                    packages = [part for part in re.split(r"[\s,]+", raw_packages) if part]
+                    timeout = max(30, min(int(kwargs.get("timeout") or 600), _MAX_TIMEOUT))
+                    result = await backend.install_packages(packages, timeout=timeout)
+                    return f"Upstash Box package installation result:\n{result}"
+                if action == "read":
+                    return await backend.read(str(kwargs.get("path") or ""))
+                if action == "write":
+                    content = str(kwargs.get("content") or "")
+                    if len(content) > _MAX_CONTENT_CHARS:
+                        return ToolResult.error(
+                            f"content exceeds {_MAX_CONTENT_CHARS} characters. Do NOT retry with the same payload: "
+                            "instead split the file into sequential write ops (first op writes the head, "
+                            'then {"action":"run","command":"cat >> \\"<path>\\" << \'PX_EOF\'\\n...\\nPX_EOF"} '
+                            "appends each following chunk; use a unique heredoc marker)."
+                        )
+                    path = str(kwargs.get("path") or "")
+                    await backend.write(path, content)
+                    return f"Wrote {len(content)} characters to {path} in the Upstash workspace."
+                if action == "upload":
+                    source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
+                    if not self._local_attachment_allowed(source):
+                        return ToolResult.error("source must be inside the nanobot media/data directory")
+                    if not source.is_file():
+                        return ToolResult.error("source file does not exist")
+                    if source.stat().st_size > _MAX_UPLOAD_BYTES:
+                        return ToolResult.error("source file exceeds 200 MiB")
+                    path = str(kwargs.get("path") or "")
+                    await backend.write_bytes(path, await asyncio.to_thread(source.read_bytes))
+                    return f"Uploaded {source.name} to {path} in the Upstash workspace."
+                if action == "fetch_url":
+                    url = str(kwargs.get("url") or "").strip()
+                    if not url:
+                        return ToolResult.error("url is required for fetch_url")
+                    parsed = urlparse(url)
+                    if is_gofile_url(url):
+                        try:
+                            resolved = await resolve_gofile_download(url, timeout_seconds=int(kwargs.get("timeout") or 150))
+                        except GoFileError as exc:
+                            return ToolResult.error(f"could not resolve gofile.io link: {exc}")
+                        item = resolved[0]
+                        real_name = re.sub(r"[^A-Za-z0-9._-]", "_", str(item.get("name") or "gofile_file")) or "gofile_file"
+                        try:
+                            data = await request_file(item, timeout_seconds=int(kwargs.get("timeout") or 150))
+                        except GoFileError as exc:
+                            return ToolResult.error(f"could not download gofile.io file: {exc}")
+                        dest = str(kwargs.get("path") or "").strip() or f"{real_name}"
+                        await backend.write_bytes(dest, data)
+                        return f"Fetched remote file to {dest} in the Upstash workspace. Use action=read or run commands to analyze it."
+                    if parsed.scheme != "https" or parsed.netloc != "tmpfiles.org":
+                        return ToolResult.error("url must be an HTTPS tmpfiles.org or gofile.io URL")
+                    dest_path = str(kwargs.get("path") or "").strip()
+                    fetched = await backend.fetch_url(url, dest_path, timeout=int(kwargs.get("timeout") or 150))
+                    return f"Fetched remote file to {fetched} in the Upstash workspace. Use action=read or run commands to analyze it."
+                if action == "list":
+                    return await backend.list(str(kwargs.get("path") or ""))
+                if action == "download_url":
+                    path = str(kwargs.get("path") or "")
+                    destination = self._artifact_destination(path)
+                    downloaded = await backend.download(path, destination)
+                    tmpfile = await upload_tmpfile_path(downloaded)
+                    return (
+                        f"Downloaded remote artifact to local path: {downloaded}\n"
+                        "A temporary public download link is also available and expires soon:\n"
+                        f"{tmpfile['download_url']}\n"
+                        "Give the user this link and do NOT paste the file contents into "
+                        "your reply. The file may also be attached directly via the "
+                        "message tool's media parameter when direct attachment delivery "
+                        "is available. Prefer a single clear download link over dumping "
+                        "raw text."
+                    )
+            return ToolResult.error("Unknown sandbox action")
+        except UpstashError as exc:
+            logger.warning("Upstash Box operation failed: {}", str(exc)[:300])
+            return ToolResult.error(f"Upstash Box error: {str(exc)[:500]}")
+        except Exception as exc:
+            logger.exception("Upstash Box operation failed")
+            return ToolResult.error(f"Upstash Box error: {type(exc).__name__}: {str(exc)[:500]}")
+
     async def execute(self, **kwargs: Any) -> ToolResult | str:
         action = str(kwargs.get("action", "")).strip().lower()
-        selected_backend, vps_config = self._selected_backend()
+        selected_backend, backend_config = self._selected_backend()
         if selected_backend == "vps":
-            if vps_config is None or not str(vps_config.host or "").strip():
+            if backend_config is None or not str(backend_config.host or "").strip():
                 return ToolResult.error("VPS execution is selected but SSH details are not configured")
-            return await self._execute_vps(action, kwargs, vps_config)
+            return await self._execute_vps(action, kwargs, backend_config)
+        if selected_backend == "upstash":
+            if backend_config is None or not str(backend_config.api_key or "").strip():
+                return ToolResult.error("Upstash Box execution is selected but no API key is configured")
+            ctx = current_request_context()
+            session_key = (ctx.session_key or f"{ctx.channel}:{ctx.chat_id}") if ctx is not None else _session_key()
+            return await self._execute_upstash(action, kwargs, backend_config, session_key)
         key = _session_key()
         try:
             if action == "reset":

@@ -248,17 +248,23 @@ class ContextBuilder:
                 execution = None
             backend = getattr(execution, "backend", "novita") if execution else "novita"
             vps = getattr(execution, "vps", None) if execution else None
+            upstash = getattr(execution, "upstash", None) if execution else None
             if backend == "vps":
                 if not (vps and str(getattr(vps, "host", "")).strip()):
                     return ""  # no usable backend — don't mislead the model
                 sandbox_dir = str(getattr(vps, "workspace_dir", "/workspace") or "/workspace")
+            elif backend == "upstash":
+                if not (upstash and str(getattr(upstash, "api_key", "")).strip()):
+                    return ""
+                sandbox_dir = "/workspace/home"
             else:
                 if not os.getenv("NOVITA_API_KEY", "").strip():
                     return ""
                 sandbox_dir = "/workspace"
+            backend_labels = {"vps": "Linux VPS over SSH", "upstash": "Upstash Box"}
             return render_template(
                 "agent/sandbox_workspace.md",
-                sandbox_backend="Linux VPS over SSH" if backend == "vps" else "Novita Sandbox",
+                sandbox_backend=backend_labels.get(backend, "Novita Sandbox"),
                 sandbox_workspace_dir=sandbox_dir.rstrip("/") or "/workspace",
                 agent_workspace_path=agent_workspace_path or "the gateway host",
             )

@@ -116,6 +116,15 @@ _T = TypeVar("_T")
 _SUBAGENT_PROVIDER_TASK_META = "subagent_provider_task_id"
 
 
+def _sandbox_backend_label(backend_name: str) -> str:
+    """Human-readable label for an execution backend name."""
+    return {
+        "novita": "Novita Sandbox",
+        "vps": "Linux VPS over SSH",
+        "upstash": "Upstash Box",
+    }.get(backend_name, "Novita Sandbox")
+
+
 class TurnKind(Enum):
     USER = auto()
     SYSTEM = auto()
@@ -1062,7 +1071,7 @@ class AgentLoop:
                             session_key=active_session_key,
                         )
                         backend_label = (
-                            "Novita Sandbox" if backend_name == "novita" else "Linux VPS over SSH"
+                            _sandbox_backend_label(backend_name)
                         )
                         prefix = (
                             f"[Telegram image analysis from {backend_label} "
@@ -1210,7 +1219,7 @@ class AgentLoop:
         telegram_image_request = (
             channel == "telegram"
             and (
-                (metadata or {}).get("telegram_images_execution_backend") in {"novita", "vps"}
+                (metadata or {}).get("telegram_images_execution_backend") in {"novita", "vps", "upstash"}
                 or LLMProvider._contains_image_content(initial_messages)
                 or (
                     provider_state is not None
@@ -1895,7 +1904,7 @@ class AgentLoop:
             session_key=ctx.session_key,
         )
         image_count = len(image_paths)
-        backend_label = "Novita Sandbox" if backend_name == "novita" else "Linux VPS over SSH"
+        backend_label = _sandbox_backend_label(backend_name)
         prefix = (
             f"[Telegram image analysis from {backend_label} ({image_count} image"
             f"{'s' if image_count != 1 else ''})]\n"
@@ -2130,7 +2139,7 @@ class AgentLoop:
         telegram_image_ocr_turn = (
             ctx.kind is TurnKind.USER
             and ctx.msg.channel == "telegram"
-            and ctx.msg.metadata.get("telegram_images_execution_backend") in {"novita", "vps"}
+            and ctx.msg.metadata.get("telegram_images_execution_backend") in {"novita", "vps", "upstash"}
         )
         if telegram_image_ocr_turn:
             # OCR-only Telegram image turns must not resume provider state from

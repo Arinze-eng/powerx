@@ -37,7 +37,7 @@ def apply_render_execution_env(config: Any) -> Any:
     assigned in memory and are never logged or returned by this module.
     """
     backend = (_env("NANOBOT_EXECUTION_BACKEND") or "").lower()
-    if backend not in {"novita", "vps"}:
+    if backend not in {"novita", "vps", "upstash"}:
         return config
     execution = getattr(config, "execution", None)
     vps = getattr(execution, "vps", None)
@@ -53,8 +53,11 @@ def apply_render_execution_env(config: Any) -> Any:
         str(getattr(vps, field, "") or "").strip()
         for field in ("host", "username", "password", "private_key")
     )
-    explicit_novita = configured_backend == "novita" and vps_configured
-    if not explicit_novita:
+    upstash = getattr(execution, "upstash", None)
+    upstash_configured = bool(str(getattr(upstash, "api_key", "") or "").strip()) if upstash is not None else False
+    explicit_novita = configured_backend == "novita" and (vps_configured or upstash_configured)
+    explicit_vps = configured_backend == "vps" and upstash_configured and backend == "upstash"
+    if not (explicit_novita or explicit_vps):
         execution.backend = backend
 
     values = {
@@ -81,4 +84,22 @@ def apply_render_execution_env(config: Any) -> Any:
         vps.password = password
     if private_key:
         vps.private_key = private_key
+
+    # Upstash Box overlay (used when the deployment selects the Upstash backend).
+    if upstash is not None:
+        api_key = _env("NANOBOT_UPSTASH_API_KEY") or _env("UPSTASH_BOX_API_KEY")
+        if api_key:
+            upstash.api_key = api_key
+        base_url = _env("NANOBOT_UPSTASH_BASE_URL")
+        if base_url:
+            upstash.base_url = base_url
+        runtime = _env("NANOBOT_UPSTASH_RUNTIME")
+        if runtime:
+            upstash.runtime = runtime
+        size = _env("NANOBOT_UPSTASH_SIZE")
+        if size:
+            upstash.size = size
+        ttl = _positive_int(_env("NANOBOT_UPSTASH_TTL"), maximum=86_400)
+        if ttl is not None and ttl >= 60:
+            upstash.ttl_s = ttl
     return config

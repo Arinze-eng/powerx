@@ -316,8 +316,21 @@ def _execution_settings() -> dict[str, Any]:
         config = apply_render_execution_env(load_config(_config_path()))
         execution = config.execution
         vps = execution.vps
+        upstash = getattr(execution, "upstash", None)
+        novita_template = getattr(execution, "novita_template", None)
         return {
             "backend": execution.backend,
+            "upstash": {
+                "base_url": str(getattr(upstash, "base_url", "") or ""),
+                "runtime": str(getattr(upstash, "runtime", "") or "python"),
+                "size": str(getattr(upstash, "size", "") or "small"),
+                "ttl_s": int(getattr(upstash, "ttl_s", 3600) or 3600),
+                "apiKeyConfigured": bool(str(getattr(upstash, "api_key", "") or "").strip()),
+            },
+            "novitaTemplate": {
+                "cpu_count": int(getattr(novita_template, "cpu_count", 2) or 2),
+                "memory_mb": int(getattr(novita_template, "memory_mb", 4096) or 4096),
+            },
             "vps": {
                 "host": vps.host,
                 "port": vps.port,
@@ -354,8 +367,8 @@ def _save_execution_settings(
 ) -> Response:
     try:
         backend_name = _text(payload, "backend", maximum=20).lower() or "novita"
-        if backend_name not in {"novita", "vps"}:
-            raise ValueError("execution backend must be novita or vps")
+        if backend_name not in {"novita", "vps", "upstash"}:
+            raise ValueError("execution backend must be novita, vps, or upstash")
         config_path = _config_path()
         config = apply_render_execution_env(load_config(config_path))
         vps = config.execution.vps
@@ -399,6 +412,40 @@ def _save_execution_settings(
         config.execution.backend = backend_name
         if backend_name == "vps":
             VPSExecutionBackend(vps)._validate()
+        # Upstash Box settings (key is only replaced when a new value is sent).
+        upstash = getattr(config.execution, "upstash", None)
+        if upstash is not None:
+            from nanobot.agent.tools.upstash_backend import (
+                validate_upstash_api_key,
+                validate_upstash_base_url,
+                validate_upstash_runtime,
+                validate_upstash_size,
+            )
+
+            raw_key = _text(payload, "upstashApiKey", maximum=256)
+            if raw_key:
+                upstash.api_key = validate_upstash_api_key(raw_key)
+            raw_base = _text(payload, "upstashBaseUrl", maximum=253)
+            if raw_base:
+                upstash.base_url = validate_upstash_base_url(raw_base)
+            raw_runtime = _text(payload, "upstashRuntime", maximum=20)
+            if raw_runtime:
+                upstash.runtime = validate_upstash_runtime(raw_runtime)
+            raw_size = _text(payload, "upstashSize", maximum=10)
+            if raw_size:
+                upstash.size = validate_upstash_size(raw_size)
+            raw_ttl = payload.get("upstashTtlSeconds")
+            if isinstance(raw_ttl, (int, float)) and 60 <= int(raw_ttl) <= 86_400:
+                upstash.ttl_s = int(raw_ttl)
+        # Novita sandbox sizing (CPU/RAM for auto-built templates).
+        novita_template = getattr(config.execution, "novita_template", None)
+        if novita_template is not None:
+            raw_cpu = payload.get("novitaCpuCount")
+            if isinstance(raw_cpu, (int, float)) and 1 <= int(raw_cpu) <= 8:
+                novita_template.cpu_count = int(raw_cpu)
+            raw_memory = payload.get("novitaMemoryMb")
+            if isinstance(raw_memory, (int, float)) and 512 <= int(raw_memory) <= 65_536:
+                novita_template.memory_mb = int(raw_memory)
         save_config(config, config_path)
         with suppress(OSError):
             os.chmod(config_path, 0o600)
@@ -435,8 +482,8 @@ def _run_vps_test(config: Any) -> dict[str, Any]:
 
 def _execution_test_config(payload: dict[str, Any], config: Any) -> tuple[str, Any]:
     backend_name = _text(payload, "backend", maximum=20).lower() or config.execution.backend
-    if backend_name not in {"novita", "vps"}:
-        raise ValueError("execution backend must be novita or vps")
+    if backend_name not in {"novita", "vps", "upstash"}:
+        raise ValueError("execution backend must be novita, vps, or upstash")
     vps = config.execution.vps.model_copy(deep=True)
     host = _text(payload, "host", maximum=253) or vps.host
     username = _text(payload, "username", maximum=64) or vps.username
@@ -479,6 +526,22 @@ def _test_execution_response(payload: dict[str, Any] | None = None) -> Response:
     try:
         config = apply_render_execution_env(load_config(_config_path()))
         backend_name, vps = _execution_test_config(payload or {}, config)
+        if backend_name == "upstash":
+            from nanobot.agent.tools.upstash_backend import UpstashExecutionBackend
+
+            upstash = config.execution.upstash.model_copy(deep=True)
+            raw_key = _text(payload or {}, "upstashApiKey", maximum=256)
+            if raw_key:
+                upstash.api_key = raw_key
+            raw_base = _text(payload or {}, "upstashBaseUrl", maximum=253)
+            if raw_base:
+                upstash.base_url = raw_base
+            if not str(upstash.api_key or "").strip():
+                return http_error(400, "Upstash API key is required to test the Upstash Box backend")
+            tested = asyncio.run(
+                UpstashExecutionBackend(upstash, box_name="powerx-connection-test").test_connection()
+            )
+            return http_json_response({"ok": bool(tested.get("ok")), "backend": "upstash", **tested})
         if backend_name != "vps":
             return http_json_response({"ok": True, "backend": "novita", "message": "Novita Sandbox is selected."})
         tested = _run_vps_test(vps)
@@ -497,7 +560,7 @@ def _dbq_admin_section() -> str:
 
 
 def _execution_admin_section() -> str:
-    return """<section><h2>Execution backend</h2><p class='hint'>Only administrators can change where sandbox-compatible tasks and Telegram image OCR run. Novita remains the default. SSH secrets are never returned after saving; leave a secret blank to keep it.</p><label>Backend<select id='executionBackend'><option value='novita'>Novita Sandbox</option><option value='vps'>Linux VPS over SSH</option></select></label><label>VPS host<input id='vpsHost' placeholder='vps.example.com or IP address'></label><label>SSH port<input id='vpsPort' type='number' min='1' max='65535' value='22'></label><label>Linux username<input id='vpsUsername' placeholder='administrator'></label><label>Password<input id='vpsPassword' type='password' placeholder='Leave blank to keep current password'></label><label>Private key<textarea id='vpsPrivateKey' rows='6' autocomplete='off' spellcheck='false' placeholder='Paste the full multiline OpenSSH or PEM private key; leave blank to keep current key'></textarea></label><label>Host-key fingerprint<input id='vpsFingerprint' placeholder='SHA256:...'></label><label>Host-key policy<select id='vpsPolicy'><option value='fingerprint'>Require configured fingerprint</option><option value='accept_any'>Accept any host key (less secure)</option></select></label><label>Remote workspace<input id='vpsWorkspace' value='/workspace'></label><label>Connect timeout (seconds)<input id='vpsTimeout' type='number' min='1' max='60' value='15'></label><button id='loadExecution' class='secondary'>Load current settings</button><button id='testExecution'>Test SSH connection</button><button id='saveExecution'>Save execution settings</button><pre id='executionStatus' class='hint'>Secrets are shown only as configured/not configured.</pre></section><script>(()=>{const $=id=>document.getElementById(id);const status=(text,ok=true)=>{$('executionStatus').textContent=text;$('executionStatus').style.color=ok?'#a7f3d0':'#fca5a5';};const load=async()=>{const r=await fetch('/api/admin/execution-settings',{cache:'no-store'});if(!r.ok)throw new Error(`Load failed: ${r.status}`);const v=await r.json();const x=v.vps||{};$('executionBackend').value=v.backend||'novita';$('vpsHost').value=x.host||'';$('vpsPort').value=x.port||22;$('vpsUsername').value=x.username||'';$('vpsFingerprint').value=x.host_key_fingerprint||'';$('vpsPolicy').value=x.host_key_policy||'fingerprint';$('vpsWorkspace').value=x.workspace_dir||'/workspace';$('vpsTimeout').value=x.connect_timeout||15;$('vpsPassword').value='';$('vpsPrivateKey').value='';status(`Loaded. Password configured: ${!!x.passwordConfigured}; private key configured: ${!!x.privateKeyConfigured}.`);};const adminRequest=(action,payload)=>{if(typeof window.nanobotAdminRequest!=='function')throw new Error('Admin connection is not ready');return window.nanobotAdminRequest(action,payload);};const fields=()=>({backend:$('executionBackend').value,host:$('vpsHost').value,port:$('vpsPort').value,username:$('vpsUsername').value,password:$('vpsPassword').value,privateKey:$('vpsPrivateKey').value,hostKeyFingerprint:$('vpsFingerprint').value,hostKeyPolicy:$('vpsPolicy').value,workspaceDir:$('vpsWorkspace').value,connectTimeout:$('vpsTimeout').value});$('loadExecution').onclick=()=>load().catch(e=>status(e.message,false));$('saveExecution').onclick=async()=>{status('Saving...');try{const v=await adminRequest('admin.execution.save',fields());$('vpsPassword').value='';$('vpsPrivateKey').value='';status(`Saved. Active backend: ${v.backend}`);}catch(e){status(e.message,false);}};$('testExecution').onclick=async()=>{status('Testing SSH connection...');try{const v=await adminRequest('admin.execution.test',fields());status(`Connection passed. Platform: ${v.platform||'Novita selected'}; fingerprint: ${v.host_key_fingerprint||'not applicable'}`);}catch(e){status(e.message,false);}};void load().catch(e=>status(e.message,false));})();</script>"""
+    return """<section><h2>Execution backend</h2><p class='hint'>Only administrators can change where sandbox-compatible tasks and Telegram image OCR run. Novita remains the default. Secrets are never returned after saving; leave a secret blank to keep it.</p><label>Backend<select id='executionBackend'><option value='novita'>Novita Sandbox</option><option value='vps'>Linux VPS over SSH</option><option value='upstash'>Upstash Box</option></select></label><label>Upstash API key<input id='upstashApiKey' type='password' placeholder='box_... (leave blank to keep saved key)' autocomplete='off'></label><span id='upstashKeyState' class='hint'></span><label>Upstash base URL<input id='upstashBaseUrl' placeholder='https://us-east-1.box.upstash.com'></label><label>Upstash runtime<select id='upstashRuntime'><option value='python'>python</option><option value='node'>node</option><option value='golang'>golang</option><option value='ruby'>ruby</option><option value='rust'>rust</option></select></label><label>Upstash size<select id='upstashSize'><option value='small'>small (2 vCPU / 4 GB)</option><option value='medium'>medium (4 vCPU / 8 GB)</option><option value='large'>large (8 vCPU / 16 GB)</option></select></label><label>Upstash auto-kill TTL seconds<input id='upstashTtl' type='number' min='60' max='86400' placeholder='3600'></label><label>Novita CPU cores<input id='novitaCpu' type='number' min='1' max='8' placeholder='2'></label><label>Novita memory MB<input id='novitaMemory' type='number' min='512' max='65536' placeholder='4096'></label><p class='hint'>Novita RAM/CPU: sandboxes are spawned from a template built with these values (built automatically once per size). Save to apply.</p><label>VPS host<input id='vpsHost' placeholder='vps.example.com or IP address'></label><label>VPS port<input id='vpsPort' type='number' min='1' max='65535' placeholder='22'></label><label>VPS username<input id='vpsUser' placeholder='ubuntu'></label><label>VPS workspace<input id='vpsWorkspace' placeholder='/workspace'></label><label>VPS password<input id='vpsPassword' type='password' placeholder='leave blank to keep saved' autocomplete='new-password'></label><label>VPS private key<textarea id='vpsPrivateKey' rows='4' placeholder='paste a multiline OpenSSH or PEM private key (leave blank to keep saved)'></textarea></label><label>Host key fingerprint<input id='vpsFingerprint' placeholder='SHA256:...'></label><div class='row'><button id='saveExecution' class='btn primary'>Save</button><button id='testExecution' class='btn'>Test connection</button></div><p id='executionStatus' class='hint'></p><script>(()=>{const $=id=>document.getElementById(id);const status=(t,ok=true)=>{const el=$('executionStatus');el.textContent=t;el.style.color=ok?'#16a34a':'#dc2626';};let saved=null;const load=async()=>{saved=await adminRequest('admin.execution.get');$('executionBackend').value=saved.backend||'novita';if(saved.vps){$('vpsHost').value=saved.vps.host||'';$('vpsPort').value=saved.vps.port||22;$('vpsUser').value=saved.vps.username||'';$('vpsWorkspace').value=saved.vps.workspace_dir||'';$('vpsFingerprint').value=saved.vps.host_key_fingerprint||'';status(`Saved. Active backend: ${saved.backend}`);}const u=saved.upstash||{};$('upstashBaseUrl').value=u.base_url||'';$('upstashRuntime').value=u.runtime||'python';$('upstashSize').value=u.size||'small';$('upstashTtl').value=u.ttl_s||3600;$('upstashKeyState').textContent=u.apiKeyConfigured?'A Upstash API key is saved.':'No Upstash API key saved yet.';const nt=saved.novitaTemplate||{};$('novitaCpu').value=nt.cpu_count||2;$('novitaMemory').value=nt.memory_mb||4096;};const fields=()=>({backend:$('executionBackend').value,host:$('vpsHost').value.trim(),port:Number($('vpsPort').value||22),username:$('vpsUser').value.trim(),workspaceDir:$('vpsWorkspace').value.trim(),hostKeyFingerprint:$('vpsFingerprint').value.trim(),password:$('vpsPassword').value,privateKey:$('vpsPrivateKey').value,upstashApiKey:$('upstashApiKey').value.trim(),upstashBaseUrl:$('upstashBaseUrl').value.trim(),upstashRuntime:$('upstashRuntime').value,upstashSize:$('upstashSize').value,upstashTtlSeconds:Number($('upstashTtl').value||3600),novitaCpuCount:Number($('novitaCpu').value||2),novitaMemoryMb:Number($('novitaMemory').value||4096)});$('saveExecution').onclick=async()=>{status('Saving...');try{const v=await adminRequest('admin.execution.save',fields());saved=v;$('executionBackend').value=v.backend;status(`Saved. Active backend: ${v.backend}`);$('upstashKeyState').textContent=v.upstash&&v.upstash.apiKeyConfigured?'A Upstash API key is saved.':'No Upstash API key saved yet.';$('vpsPassword').value='';$('vpsPrivateKey').value='';$('upstashApiKey').value='';}catch(e){status(e.message,false);}};$('testExecution').onclick=async()=>{const backend=$('executionBackend').value;status(backend==='upstash'?'Testing Upstash Box connection (creates a test box)...':backend==='vps'?'Testing SSH connection...':'Checking backend...');try{const v=await adminRequest('admin.execution.test',fields());if(v.backend==='upstash'){status(`Connection passed. Box: ${v.box_id||''}; platform: ${v.platform||''}`);}else{status(`Connection passed. Platform: ${v.platform||'Novita selected'}; fingerprint: ${v.host_key_fingerprint||'not applicable'}`);}}catch(e){status(e.message,false);}};void load().catch(e=>status(e.message,false));})();</script>"""
 
 
 def _admin_page(rows: list[dict[str, Any]]) -> str:

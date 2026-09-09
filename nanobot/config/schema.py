@@ -406,11 +406,41 @@ class VPSExecutionConfig(Base):
     connect_timeout: int = Field(default=15, ge=1, le=60)
 
 
+class UpstashExecutionConfig(Base):
+    """Administrator-configured Upstash Box target for sandbox-backed execution."""
+
+    api_key: str = Field(default="", repr=False)
+    base_url: str = "https://us-east-1.box.upstash.com"
+    runtime: Literal[
+        "python", "node", "golang", "ruby", "rust",
+        "python-alpine", "node-alpine", "golang-alpine", "ruby-alpine", "rust-alpine",
+    ] = "python"
+    size: Literal["small", "medium", "large"] = "small"
+    # Boxes are deleted automatically after this window even if the agent never
+    # resets, so user sandboxes cannot linger past their task (Upstash TTL).
+    ttl_s: int = Field(default=3600, ge=60, le=86_400)
+
+
+class NovitaTemplateConfig(Base):
+    """Per-deployment Novita sandbox sizing (CPU/RAM).
+
+    When the desired memory/CPU differ from an existing template, a custom
+    template is built once (cached by alias) so every sandbox spawned
+    afterwards gets exactly that RAM/CPU instead of the ~1 GB default.
+    """
+
+    cpu_count: int = Field(default=2, ge=1, le=8)
+    memory_mb: int = Field(default=4096, ge=512, le=65_536)
+    alias_prefix: str = "powerx-base"
+
+
 class ExecutionBackendConfig(Base):
     """Select the remote execution provider used by sandbox-compatible tasks."""
 
-    backend: Literal["novita", "vps"] = "novita"
+    backend: Literal["novita", "vps", "upstash"] = "novita"
     vps: VPSExecutionConfig = Field(default_factory=VPSExecutionConfig)
+    upstash: UpstashExecutionConfig = Field(default_factory=UpstashExecutionConfig)
+    novita_template: NovitaTemplateConfig = Field(default_factory=NovitaTemplateConfig)
 
 
 class ToolsConfig(Base):
