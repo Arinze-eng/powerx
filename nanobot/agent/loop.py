@@ -25,6 +25,7 @@ from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.automation_turns import publish_next_deferred_turn
 from nanobot.agent.context import ContextBuilder, PersistedPromptContextResolver
 from nanobot.agent.cron_turns import CronTurnCoordinator
+from nanobot.agent.deterministic_router import last_user_text
 from nanobot.agent.goal_permission import goal_mutation_permission
 from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
 from nanobot.agent.memory import Consolidator
@@ -1232,6 +1233,19 @@ class AgentLoop:
         )
         if strip_image_content_before_provider is None:
             strip_image_content_before_provider = telegram_image_request
+
+        # --- Deterministic zero-call router (Manus-style cost discipline) -----
+        # Fresh Telegram text asks that unambiguously name a read-only UniAbuja
+        # lookup are answered by the runner with the matching tool and ZERO
+        # provider calls. Gated to plain-text (non-image) Telegram user turns
+        # with no active sustained goal, so visual/OCR work and goal-driven
+        # sessions always keep the full model path.
+        deterministic_router_text: str | None = None
+        if channel == "telegram" and not telegram_image_request and not strip_image_content_before_provider:
+            if session is not None and sustained_goal_active(session.metadata):
+                deterministic_router_text = None
+            else:
+                deterministic_router_text = last_user_text(initial_messages)
         try:
             for scope in turn_scopes or ():
                 turn_scope_stack.enter_context(scope)
@@ -1289,6 +1303,8 @@ class AgentLoop:
                     message_metadata=metadata,
                 ),
                 enable_replay_cache=True,
+                enable_deterministic_router=deterministic_router_text is not None,
+                deterministic_router_text=deterministic_router_text,
                 provider_state=provider_state,
                 strip_image_content_before_provider=strip_image_content_before_provider,
                 ))

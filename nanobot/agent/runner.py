@@ -19,6 +19,7 @@ from nanobot.agent.context_governance import (
     ContextGovernanceConfig,
     ContextGovernor,
 )
+from nanobot.agent.deterministic_router import deterministic_plan, router_enabled
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
 from nanobot.agent.task_cache import make_replay_cache, task_fingerprint_text
@@ -136,6 +137,14 @@ class AgentRunSpec:
     # replays its stored final answer with ZERO provider calls. Enabled in the
     # agent loop; tests opt in explicitly.
     enable_replay_cache: bool = False
+    # When True and ``deterministic_router_text`` names an unambiguous read-only
+    # UniAbuja ask, the run answers it by executing the matching registered tool
+    # directly -- ZERO provider calls. Set by the agent loop for fresh Telegram
+    # user turns (and by tests explicitly); generic runs never consult it.
+    enable_deterministic_router: bool = False
+    # The raw user text the deterministic router classifies. Kept as its own
+    # field so the loop can pass the pre-runtime-context message exactly.
+    deterministic_router_text: str | None = None
 
 
 @dataclass(slots=True)
@@ -540,6 +549,43 @@ class AgentRunner:
                 tool_events=[],
                 had_injections=False,
                 pending_stream_content=cached_replay,
+                provider_state=conversation_state.finish(messages),
+            )
+
+        # --- Zero-call deterministic router: rule answers read-only asks -------
+        # A fresh, unambiguous UniAbuja lookup (status, announcements, my own
+        # questions/records, an explicit regno read) is answered by executing
+        # the SAME registered tool the model would call. No provider round-trip
+        # and no credit step. Only consulted when the run opts in and the text
+        # is present; a None plan or an unregistered tool falls through to the
+        # normal LLM path untouched.
+        deterministic_call: ToolCallRequest | None = None
+        if spec.enable_deterministic_router and router_enabled() and spec.deterministic_router_text:
+            deterministic_call = deterministic_plan(spec.deterministic_router_text)
+        if deterministic_call is not None and spec.tools.get(deterministic_call.name) is not None:
+            logger.info(
+                "deterministic router answering {} for {} (0 provider calls)",
+                deterministic_call.name,
+                spec.session_key or "default",
+            )
+            tool_result = await spec.tools.execute(
+                deterministic_call.name,
+                deterministic_call.arguments,
+            )
+            text_result = str(tool_result)
+            self._append_final_message(messages, text_result)
+            final_content = text_result
+            stop_reason = "completed"
+            return AgentRunResult(
+                final_content=final_content,
+                messages=messages,
+                tools_used=[deterministic_call.name],
+                usage={"prompt_tokens": 0, "completion_tokens": 0, "deterministic": 1},
+                stop_reason=stop_reason,
+                error=None,
+                tool_events=[],
+                had_injections=False,
+                pending_stream_content=text_result,
                 provider_state=conversation_state.finish(messages),
             )
         governance_config = ContextGovernanceConfig(
