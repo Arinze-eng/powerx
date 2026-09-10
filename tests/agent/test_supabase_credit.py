@@ -15,18 +15,28 @@ class FakeSupabase:
     enabled = True
 
     def __init__(self) -> None:
-        self.calls: list[tuple[dict[str, str], str, int]] = []
+        # Per-step charge calls (should now be empty under drain-once).
+        self.step_calls: list[tuple[dict[str, str], str, int]] = []
+        # One-time task drains: (account, task_ref, total_steps).
+        self.task_calls: list[tuple[dict[str, str], str, int]] = []
         self.failure: Exception | None = None
 
     async def charge_step(self, account: dict[str, str], task_ref: str, step_no: int) -> dict[str, object]:
-        self.calls.append((account, task_ref, step_no))
+        self.step_calls.append((account, task_ref, step_no))
+        if self.failure is not None:
+            raise self.failure
+        return {"success": True, "balance": 10}
+
+    async def charge_task(self, account: dict[str, str], task_ref: str, total_steps: int, amount: int = 0) -> dict[str, object]:
+        self.task_calls.append((account, task_ref, total_steps))
         if self.failure is not None:
             raise self.failure
         return {"success": True, "balance": 10}
 
 
 @pytest.mark.asyncio
-async def test_credit_hook_charges_each_telegram_iteration(monkeypatch) -> None:
+async def test_credit_hook_drains_once_at_task_completion(monkeypatch) -> None:
+    """Steps are counted locally (no Supabase call); credit drains ONCE at end."""
     fake = FakeSupabase()
     monkeypatch.setattr(supabase_credit, "SupabaseAuth", lambda: fake)
     hook = supabase_credit.SupabaseCreditHook(AgentTurnHookContext(
@@ -36,12 +46,34 @@ async def test_credit_hook_charges_each_telegram_iteration(monkeypatch) -> None:
         session_key="telegram:42",
         metadata={"supabase_user_id": "user-1"},
     ))
+    run_ctx = SimpleNamespace(usage={}, stop_reason="completed")
     await hook.before_iteration(AgentHookContext(iteration=0, messages=[]))
     await hook.before_iteration(AgentHookContext(iteration=1, messages=[]))
-    assert fake.calls == [
-        ({"agentx_user_id": "user-1"}, "nanobot:telegram:42:7", 1),
+    await hook.after_run(run_ctx)
+    # No per-step draining happened...
+    assert fake.step_calls == []
+    # ...and exactly one lump-sum drain was issued for the whole task.
+    assert fake.task_calls == [
         ({"agentx_user_id": "user-1"}, "nanobot:telegram:42:7", 2),
     ]
+
+
+@pytest.mark.asyncio
+async def test_credit_hook_makes_no_supabase_call_per_step(monkeypatch) -> None:
+    """before_iteration must never touch Supabase (egress stays flat)."""
+    fake = FakeSupabase()
+    monkeypatch.setattr(supabase_credit, "SupabaseAuth", lambda: fake)
+    hook = supabase_credit.SupabaseCreditHook(AgentTurnHookContext(
+        channel="telegram",
+        chat_id="42",
+        message_id="7",
+        session_key="telegram:42",
+        metadata={"supabase_user_id": "user-1"},
+    ))
+    for i in range(5):
+        await hook.before_iteration(AgentHookContext(iteration=i, messages=[]))
+    assert fake.step_calls == []
+    assert fake.task_calls == []
 
 
 @pytest.mark.asyncio
@@ -54,6 +86,7 @@ async def test_credit_hook_is_inert_for_non_telegram_turns(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_credit_hook_fails_closed_when_balance_is_insufficient(monkeypatch) -> None:
+    """Under drain-once, an unpaid balance surfaces when the task finishes."""
     fake = FakeSupabase()
     fake.failure = SupabaseAuthError("Insufficient credits")
     monkeypatch.setattr(supabase_credit, "SupabaseAuth", lambda: fake)
@@ -64,8 +97,10 @@ async def test_credit_hook_fails_closed_when_balance_is_insufficient(monkeypatch
         session_key="telegram:42",
         metadata={"supabase_user_id": "user-1"},
     ))
+    run_ctx = SimpleNamespace(usage={}, stop_reason="completed")
+    await hook.before_iteration(AgentHookContext(iteration=0, messages=[]))
     with pytest.raises(supabase_credit.CreditExhaustedError, match="Please add credit"):
-        await hook.before_iteration(AgentHookContext(iteration=0, messages=[]))
+        await hook.after_run(run_ctx)
 
 
 @pytest.mark.asyncio

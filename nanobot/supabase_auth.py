@@ -716,3 +716,34 @@ class SupabaseAuth:
         if not isinstance(result, dict) or result.get("success") is not True:
             raise SupabaseAuthError(str((result or {}).get("error") or "Insufficient credits for this step"))
         return result
+
+    async def charge_task(self, account: dict[str, Any], task_ref: str, total_steps: int, amount: int = 0) -> dict[str, Any]:
+        """Drain credits ONCE for an entire finished task (no per-step calls).
+
+        Replaces the per-step ``charge_step`` flow. Reads the user's drain_rate
+        a single time and issues ONE Supabase credit RPC for the whole task,
+        budgeted as ``3 * rate * total_steps``. This keeps egress constant (2
+        calls) no matter how many model iterations the task took.
+        """
+        if not account.get("agentx_user_id"):
+            raise SupabaseAuthError("Use /signup or /signin first")
+        if amount <= 0:
+            rows = await self._request(
+                "GET", "/rest/v1/profiles", service=True,
+                params={"id": f"eq.{account['agentx_user_id']}", "limit": "1", "select": "drain_rate"},
+            )
+            rate = max(1, int(rows[0].get("drain_rate") or 1)) if isinstance(rows, list) and rows else 1
+            amount = 3 * rate
+        total = max(1, int(total_steps))
+        result = await self._request(
+            "POST", "/rest/v1/rpc/consume_cloud_task_step_credits", service=True,
+            body={
+                "p_user": account["agentx_user_id"],
+                "p_amount": max(1, int(amount)) * total,
+                "p_task_ref": task_ref,
+                "p_step_no": total,
+            },
+        )
+        if not isinstance(result, dict) or result.get("success") is not True:
+            raise SupabaseAuthError(str((result or {}).get("error") or "Insufficient credits for this task"))
+        return result

@@ -74,10 +74,12 @@ class SupabaseCreditHook(AgentHook):
         super().__init__(reraise=True)
         self._context = context
         self._supabase = SupabaseAuth()
-        # LLM iterations actually charged this turn (== credits spent). Zero-call
-        # layers answer before any iteration, so a 0 here means the task cost you
-        # nothing. Reported by log_cost_meter in after_run.
+        # Number of solver iterations this turn reached. Credit is drained ONCE
+        # in after_run (rate * iterations) instead of charging per step, so
+        # Supabase egress stays flat (2 calls) regardless of step count.
         self.charged_steps = 0
+        # Resolved once and cached: the user we will drain at task completion.
+        self._account: dict[str, Any] | None = None
 
     async def _resolve_account(self) -> dict[str, Any] | None:
         """Look up the Telegram account for this turn (used by API-bridge turns)."""
@@ -106,31 +108,37 @@ class SupabaseCreditHook(AgentHook):
                 return
         else:
             return
-        metadata = self._context.metadata or {}
-        user_id = metadata.get("supabase_user_id")
-        if not user_id:
-            account = await self._resolve_account()
-            user_id = str(account.get("agentx_user_id")) if account else None
-        if not user_id:
-            raise CreditExhaustedError(
-                "Your Supabase account is not linked. Use /signup or /signin before sending tasks."
-            )
-        step_no = context.iteration + 1
-        task_ref = f"nanobot:{self._context.session_key or self._context.chat_id}:{self._context.message_id or 'turn'}"
-        try:
-            await self._supabase.charge_step(
-                {"agentx_user_id": str(user_id)},
-                task_ref,
-                step_no,
-            )
-        except SupabaseAuthError as exc:
-            raise CreditExhaustedError(
-                f"Credit exhausted or unavailable for this step: {str(exc)[:400]} "
-                "Please add credit before using the agent again."
-            ) from exc
+        # Resolve the paying account ONCE per turn and cache it. No Supabase
+        # RPC happens here: we only count iterations. The actual credit drain
+        # for the whole task happens in after_run (see charge_task), so egress
+        # stays flat instead of one charge request per step.
+        if self._account is None:
+            metadata = self._context.metadata or {}
+            user_id = metadata.get("supabase_user_id")
+            if not user_id:
+                self._account = await self._resolve_account()
+            else:
+                self._account = {"agentx_user_id": str(user_id)}
+            if not self._account or not self._account.get("agentx_user_id"):
+                raise CreditExhaustedError(
+                    "Your Supabase account is not linked. Use /signup or /signin before sending tasks."
+                )
         self.charged_steps += 1
 
     async def after_run(self, context: AgentRunHookContext) -> None:
+        try:
+            # Drain credit ONCE for the whole finished task instead of per step.
+            # _account is guaranteed set whenever charged_steps > 0 (it is cached
+            # in before_iteration before the first increment), so no extra
+            # Supabase lookup is needed here.
+            if self._supabase.enabled and self._account and self.charged_steps > 0:
+                task_ref = f"nanobot:{self._context.session_key or self._context.chat_id}:{self._context.message_id or 'turn'}"
+                await self._supabase.charge_task(self._account, task_ref, self.charged_steps)
+        except SupabaseAuthError as exc:
+            raise CreditExhaustedError(
+                f"Task finished but credit could not be drained: {str(exc)[:400]} "
+                "Please add credit before using the agent again."
+            ) from exc
         log_cost_meter(
             channel=self._context.channel,
             session_key=self._context.session_key or self._context.chat_id,
@@ -171,7 +179,11 @@ class ApiCreditHook(AgentHook):
         super().__init__(reraise=True)
         self._context = context
         self._supabase = SupabaseAuth()
+        # Iterations this turn; credit is drained ONCE in after_run (see
+        # charge_task) rather than charging every step, keeping Supabase egress
+        # flat regardless of task length.
         self.charged_steps = 0
+        self._account: dict[str, Any] | None = None
 
     async def before_iteration(self, context: AgentHookContext) -> None:
         if not self._supabase.enabled:
@@ -182,25 +194,26 @@ class ApiCreditHook(AgentHook):
             raise CreditExhaustedError(
                 "API key is not linked to an AgentX account with credits."
             )
-        step_no = context.iteration + 1
-        task_ref = (
-            f"api:{metadata.get('api_key_id') or 'key'}:"
-            f"{self._context.session_key or self._context.chat_id}"
-        )
-        try:
-            await self._supabase.charge_step(
-                {"agentx_user_id": str(user_id)},
-                task_ref,
-                step_no,
-            )
-        except SupabaseAuthError as exc:
-            raise CreditExhaustedError(
-                f"Credit exhausted or unavailable for this step: {str(exc)[:400]} "
-                "Please add credit before using the API again."
-            ) from exc
+        # Resolve/cache identity once; only count the step here. The actual
+        # credit drain for the whole task happens once in after_run.
+        if self._account is None:
+            self._account = {"agentx_user_id": str(user_id)}
         self.charged_steps += 1
 
     async def after_run(self, context: AgentRunHookContext) -> None:
+        try:
+            metadata = self._context.metadata or {}
+            if self._supabase.enabled and self._account and self.charged_steps > 0:
+                task_ref = (
+                    f"api:{metadata.get('api_key_id') or 'key'}:"
+                    f"{self._context.session_key or self._context.chat_id}"
+                )
+                await self._supabase.charge_task(self._account, task_ref, self.charged_steps)
+        except SupabaseAuthError as exc:
+            raise CreditExhaustedError(
+                f"Task finished but credit could not be drained: {str(exc)[:400]} "
+                "Please add credit before using the API again."
+            ) from exc
         log_cost_meter(
             channel="api",
             session_key=self._context.session_key or self._context.chat_id,
