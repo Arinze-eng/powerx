@@ -86,24 +86,223 @@ class SupabaseAuth:
             "anon_key": self.anon_key,
         }
 
-    async def verify_access_token(self, access_token: str) -> str | None:
-        """Validate an access token against Supabase Auth and return the user id.
+    # ------------------------------------------------------------------
+    # Local JWT verification (egress policy 2026-09-10)
+    # ------------------------------------------------------------------
+    # The auth+secrets-only egress policy means: no REST reads for user
+    # identity on the hot message path. The WebUI session token is a
+    # Supabase-issued JWT — verify it locally (signature via the project's
+    # published JWKS + exp check) and cache results in memory. Falls back to
+    # /auth/v1/user only when local verification cannot be trusted (unknown
+    # kid, key fetch failure). This keeps the security property (only valid
+    # Supabase tokens pass) while reducing per-request egress from ~500 B to
+    # 0 for cached tokens. Set NANOBOT_JWT_LOCAL_VERIFY=false to force remote
+    # verification everywhere.
 
-        Uses Supabase's own ``/auth/v1/user`` endpoint so the backend never has
-        to reproduce the JWT signature. Returns ``None`` when the token is
-        absent or invalid.
+    _JWKS_REFRESH_SECONDS = 24 * 3600.0
+    _jwt_verifiers: dict[str, Any] = {}      # url -> {"jwks": dict, "fetched_at": float}
+    # Verified-token cache: sha256(token) -> ({"id","email"}, exp_epoch).
+    # Class-level so every SupabaseAuth() construction reuses it. Bounded by
+    # TTL (tokens expire ~1 h) plus a hard cap to keep memory tiny.
+    _verified_tokens: dict[str, tuple[dict[str, str], float]] = {}
+    _VERIFIED_CACHE_MAX = 2048
+
+    @classmethod
+    def _verified_cache_key(cls, token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    @classmethod
+    def _verified_cache_get(cls, token: str) -> dict[str, str] | None:
+        import time as _time
+
+        entry = cls._verified_tokens.get(cls._verified_cache_key(token))
+        if not entry:
+            return None
+        result, exp = entry
+        if exp <= _time.time():
+            cls._verified_tokens.pop(cls._verified_cache_key(token), None)
+            return None
+        return dict(result)
+
+    @classmethod
+    def _verified_cache_put(cls, token: str, result: dict[str, str]) -> None:
+        import time as _time
+
+        try:
+            decoded = token.split(".")
+            padded = decoded[1] + "=" * (-len(decoded[1]) % 4)
+            exp = float(json.loads(base64.urlsafe_b64decode(padded)).get("exp") or 0)
+        except Exception:
+            return
+        if exp <= 0:
+            return
+        if len(cls._verified_tokens) >= cls._VERIFIED_CACHE_MAX:
+            # Drop entries that are expired; if still full, clear wholesale
+            # (a cold JWKS fetch is cheap — once/day steady state).
+            now = _time.time()
+            for key in [k for k, (_, e) in cls._verified_tokens.items() if e <= now]:
+                cls._verified_tokens.pop(key, None)
+            if len(cls._verified_tokens) >= cls._VERIFIED_CACHE_MAX:
+                cls._verified_tokens.clear()
+        cls._verified_tokens[cls._verified_cache_key(token)] = (dict(result), exp)
+
+
+    @property
+    def _local_verify_enabled(self) -> bool:
+        return os.getenv("NANOBOT_JWT_LOCAL_VERIFY", "true").lower() not in {
+            "0", "false", "no",
+        }
+
+    def _decode_jwt(self, token: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Decode (not verify) a compact JWS into (header, payload); None if malformed."""
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+
+        def _b64json(chunk: str) -> dict[str, Any]:
+            padded = chunk + "=" * (-len(chunk) % 4)
+            data = json.loads(base64.urlsafe_b64decode(padded.encode()))
+            return data if isinstance(data, dict) else {}
+
+        try:
+            header = _b64json(parts[0])
+            payload = _b64json(parts[1])
+        except Exception:
+            return None
+        return header, payload
+
+    async def _get_jwks(self) -> dict[str, Any] | None:
+        """Fetch (and process-cached) the project's GoTrue JWKS.
+
+        Cached in memory for 24 h; shared across all SupabaseAuth instances via
+        the class-level ``_jwt_verifiers`` map keyed by project URL. A cold
+        fetch costs one small request (~1 KB) once per day.
+        """
+        import time as _time
+
+        entry = self._jwt_verifiers.get(self.url)
+        now = _time.monotonic()
+        if entry and now - entry["fetched_at"] < self._JWKS_REFRESH_SECONDS:
+            return entry["jwks"]
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get(f"{self.url}/auth/v1/.well-known/jwks.json")
+            if not response.is_success:
+                return entry["jwks"] if entry else None
+            jwks = response.json()
+        except (httpx.HTTPError, ValueError):
+            return entry["jwks"] if entry else None
+        if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
+            return entry["jwks"] if entry else None
+        self._jwt_verifiers[self.url] = {"jwks": jwks, "fetched_at": now}
+        return jwks
+
+    async def _verify_locally(self, token: str) -> dict[str, str] | None:
+        """Verify a Supabase access token against the project JWKS.
+
+        Returns ``{"id", "email"}`` on success, ``None`` when the token cannot
+        be verified locally (caller should fall back to the remote check).
+        """
+        import time as _time
+
+        decoded = self._decode_jwt(token)
+        if not decoded:
+            return None
+        header, payload = decoded
+        alg = str(header.get("alg") or "")
+        if alg not in {"RS256", "ES256"}:
+            # HS256 legacy tokens (or anything unexpected) are verified remotely.
+            return None
+        jwks = await self._get_jwks()
+        if not jwks:
+            return None
+        keys = jwks.get("keys") or []
+        kid = header.get("kid")
+        candidates = [k for k in keys if isinstance(k, dict)]
+        if kid:
+            candidates = [k for k in candidates if k.get("kid") == kid] or candidates
+        signing_input = ".".join(token.split(".")[:2]).encode()
+        try:
+            sig = base64.urlsafe_b64decode(token.split(".")[2] + "=" * (-len(token.split(".")[2]) % 4))
+        except Exception:
+            return None
+        verified = False
+        for key in candidates:
+            kty = key.get("kty")
+            try:
+                if kty == "RSA" and alg == "RS256":
+                    from cryptography.hazmat.primitives import hashes
+                    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+                    n = int.from_bytes(base64.urlsafe_b64decode(key["n"] + "=" * 4), "big")
+                    e = int.from_bytes(base64.urlsafe_b64decode(key["e"] + "=" * 4), "big")
+                    public_key = rsa.RSAPublicNumbers(e, n).public_key()
+                    public_key.verify(sig, signing_input, padding.PKCS1v15(), hashes.SHA256())
+                    verified = True
+                    break
+                if kty == "EC" and alg == "ES256":
+                    import hashlib
+
+                    from cryptography.hazmat.primitives.asymmetric import ec, utils as _utils
+
+                    x = int.from_bytes(base64.urlsafe_b64decode(key["x"] + "=" * 4), "big")
+                    y = int.from_bytes(base64.urlsafe_b64decode(key["y"] + "=" * 4), "big")
+                    public_key = ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1()).public_key()
+                    r = int.from_bytes(sig[: len(sig) // 2], "big")
+                    s = int.from_bytes(sig[len(sig) // 2 :], "big")
+                    public_key.verify(
+                        _utils.encode_dss_signature(r, s), signing_input, ec.ECDSA(hashes.SHA256())
+                    )
+                    verified = True
+                    break
+            except Exception:
+                continue
+        if not verified:
+            return None
+        now = _time.time()
+        exp = payload.get("exp")
+        if not isinstance(exp, (int, float)) or exp <= now + 30:
+            return None
+        user_id = str(payload.get("sub") or "")
+        if not user_id:
+            return None
+        email = str(payload.get("email") or "")
+        return {"id": user_id, "email": email}
+
+    async def verify_access_token(self, access_token: str) -> str | None:
+        """Validate an access token and return the user id.
+
+        Prefers local JWKS verification (zero steady-state egress); falls back
+        to Supabase's ``/auth/v1/user`` endpoint whenever local verification
+        cannot be trusted. Returns ``None`` when the token is absent or invalid.
         """
         return (await self.verify_access_token_details(access_token) or {}).get("id")
 
     async def verify_access_token_details(
         self, access_token: str,
     ) -> dict[str, str] | None:
-        """Return ``{"id": ..., "email": ...}`` for a valid access token, else None."""
+        """Return ``{"id": ..., "email": ...}`` for a valid access token, else None.
+
+        Egress policy (2026-09-10): try local JWKS verification + in-memory
+        cache first; only uncached/legacy tokens hit the network.
+        """
         token = (access_token or "").strip()
         if not token:
             return None
         if not self.configured:
             return None
+        # 1) In-memory cache of previously verified tokens (keyed by token hash).
+        cached = self._verified_cache_get(token)
+        if cached is not None:
+            return cached
+        # 2) Local JWKS verification — zero steady-state egress.
+        if self._local_verify_enabled:
+            local = await self._verify_locally(token)
+            if local is not None:
+                self._verified_cache_put(token, local)
+                return local
+        # 3) Remote fallback (HS256 legacy tokens, unknown kid, JWKS cold
+        #    fetch failure). One small request, then cached.
         try:
             async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
                 response = await client.request(
@@ -129,16 +328,57 @@ class SupabaseAuth:
         if not user_id:
             return None
         email = (payload.get("email") or "")
-        return {"id": str(user_id), "email": str(email)}
+        result = {"id": str(user_id), "email": str(email)}
+        # Cache the remote verification so repeat requests are free until the
+        # token expires.
+        self._verified_cache_put(token, result)
+        return result
 
     def verify_access_token_sync(self, access_token: str) -> tuple[str, str]:
         """Synchronous variant returning ``(user_id, email)`` for sync handlers.
 
         Avoids the async plumbing that a synchronous HTTP route cannot await.
+        Egress policy: consults the shared verified-token cache and local JWKS
+        verification first; only uncached legacy tokens hit /auth/v1/user.
         """
         token = (access_token or "").strip()
         if not token or not self.configured:
             return ("", "")
+        cached = self._verified_cache_get(token)
+        if cached is not None:
+            return (cached.get("id", ""), cached.get("email", ""))
+        # Local JWKS path needs an await; run it on a short-lived loop only
+        # when no event loop is already running this frame's caller context.
+        if self._local_verify_enabled:
+            try:
+                import asyncio as _asyncio
+
+                try:
+                    _asyncio.get_running_loop()
+                    in_loop = True
+                except RuntimeError:
+                    in_loop = False
+                if not in_loop:
+                    local = _asyncio.run(self._verify_locally(token))
+                else:
+                    # Called from inside a running loop but must stay sync —
+                    # do the verification inline (JWKS fetch is awaited via a
+                    # dedicated thread).
+                    import threading
+                    box: dict[str, Any] = {}
+
+                    def _worker() -> None:
+                        box["result"] = _asyncio.run(self._verify_locally(token))
+
+                    thread = threading.Thread(target=_worker, daemon=True)
+                    thread.start()
+                    thread.join(timeout=20)
+                    local = box.get("result")
+                if local is not None:
+                    self._verified_cache_put(token, local)
+                    return (local.get("id", ""), local.get("email", ""))
+            except Exception:
+                pass
         try:
             import urllib.request
 
@@ -158,6 +398,8 @@ class SupabaseAuth:
             return ("", "")
         user_id = str(payload.get("id") or "")
         email = str(payload.get("email") or "")
+        if user_id:
+            self._verified_cache_put(token, {"id": user_id, "email": email})
         return (user_id, email)
 
     @property
@@ -264,38 +506,49 @@ class SupabaseAuth:
     ) -> None:
         """Record WebUI user activity for the admin dashboard.
 
-        Updates ``profiles.last_seen_at``, increments ``profiles.questions_count``
-        and records the sanitized user question so admins can see the type of
-        questions webUI users ask. Best-effort: failures never raise into the
-        message bus so the agent keeps working even if Supabase is briefly down.
+        Egress policy (2026-09-10): this used to cost 4-5 Supabase requests per
+        WebUI message (last_seen RPC + question insert + count read + count
+        write). Now it is ONE batched RPC per message, and presence updates are
+        throttled to one per user per hour in-process. If the batched RPC is
+        not deployed yet, falls back to the single cheapest legacy call (the
+        question insert) with presence/counter throttling — never the old
+        5-call path.
         """
+        import time as _time
+
         user_id = (user_id or "").strip()
         if not user_id or not self.enabled:
             return
-        try:
-            await self._request(
-                "POST",
-                "/rest/v1/rpc/update_last_seen",
-                service=True,
-                body={"p_user": user_id},
-            )
-        except SupabaseAuthError:
-            # The RPC is missing or its signature drifted (returns 404). Update
-            # the column directly so presence tracking never silently dies.
+        text = self._sanitize_question(question or "")
+
+        # Throttle cosmetic presence writes: at most once per user per TTL.
+        seen = self._presence_seen.get(user_id, 0.0)
+        touch = _time.time() - seen >= self._PRESENCE_TTL
+        if touch:
+            self._presence_seen[user_id] = _time.time()
+
+        # Preferred: one atomic RPC that does last_seen + question + counter
+        # server-side (zero response payload).
+        if self._batch_rpc_available is not False:
             try:
                 await self._request(
-                    "PATCH",
-                    "/rest/v1/profiles",
+                    "POST",
+                    "/rest/v1/rpc/record_user_activity",
                     service=True,
-                    params={"id": f"eq.{user_id}"},
-                    body={"last_seen_at": self._now()},
+                    body={
+                        "p_user": user_id,
+                        "p_question": text[:4000] if text else None,
+                        "p_category": channel,
+                        "p_touch_presence": touch,
+                    },
                 )
+                self._batch_rpc_available = True
+                return
             except SupabaseAuthError:
-                pass
-        except SupabaseAuthError:
-            pass
+                # 404 => function not deployed; remember and use legacy path.
+                self._batch_rpc_available = False
 
-        text = self._sanitize_question(question or "")
+        # Legacy fallback, trimmed to essentials (best-effort, never raises).
         if text:
             try:
                 await self._request(
@@ -313,38 +566,69 @@ class SupabaseAuth:
                 )
             except SupabaseAuthError:
                 pass
-        try:
-            # Increment the running question counter on the profile
-            # (read current count, then write the incremented value).
-            rows = await self._request(
-                "GET",
-                "/rest/v1/profiles",
-                service=True,
-                params={"id": f"eq.{user_id}", "select": "questions_count", "limit": "1"},
-            )
-            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-                current = int(rows[0].get("questions_count") or 0)
-                patch = {"questions_count": current + 1, "updated_at": self._now()}
+        if touch:
+            try:
                 await self._request(
-                    "PATCH",
-                    "/rest/v1/profiles",
+                    "POST",
+                    "/rest/v1/rpc/update_last_seen",
                     service=True,
-                    params={"id": f"eq.{user_id}"},
-                    body=patch,
+                    body={"p_user": user_id},
                 )
-        except SupabaseAuthError:
-            pass
+            except SupabaseAuthError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Telegram-account read cache (egress policy 2026-09-10)
+    # ------------------------------------------------------------------
+    # ``account_for`` used to run GET + PATCH on EVERY inbound Telegram
+    # message. The row carries auth/crypto blobs needed only for sign-in
+    # flows and token refresh — not for ordinary turns. Steady state now:
+    #   * first sighting per user per process → GET (+ create/update patch)
+    #   * within NANOBOT_ACCOUNT_CACHE_TTL (default 3600 s) → memory hit,
+    #     zero requests, no presence write (last_seen_at is cosmetic)
+    # Mutating flows (sign in/out, token refresh, credential edits) call
+    # ``invalidate_account_cache`` so they always observe fresh rows.
+    _account_cache: dict[int, tuple[dict[str, Any], float]] = {}
+    # Presence-write throttle (record_webui_activity): user -> last write epoch.
+    _presence_seen: dict[str, float] = {}
+    _PRESENCE_TTL = 3600.0
+    # None = untried, True = batched RPC works, False = fall back to legacy.
+    _batch_rpc_available: bool | None = None
+
+    @staticmethod
+    def _account_ttl() -> float:
+        try:
+            return max(60.0, float(os.getenv("NANOBOT_ACCOUNT_CACHE_TTL", "3600")))
+        except ValueError:
+            return 3600.0
+
+    @classmethod
+    def invalidate_account_cache(cls, telegram_user_id: int | None = None) -> None:
+        if telegram_user_id is None:
+            cls._account_cache.clear()
+        else:
+            cls._account_cache.pop(int(telegram_user_id), None)
 
     async def account_for(self, telegram_user_id: int, chat_id: int, *, username: str | None, first_name: str | None, last_name: str | None) -> dict[str, Any]:
+        import time as _time
+
+        cached = self._account_cache.get(int(telegram_user_id))
+        if cached and cached[1] > _time.time():
+            account = dict(cached[0])
+            # Keep the in-memory view fresh for routing without touching the
+            # network; the durable copy syncs on the next TTL expiry.
+            account["chat_id"] = chat_id
+            return account
         rows = await self._request("GET", "/rest/v1/telegram_accounts", service=True, params={"telegram_user_id": f"eq.{telegram_user_id}", "limit": "1", "select": _ACCOUNT_COLUMNS})
         patch = {"chat_id": chat_id, "username": username, "first_name": first_name, "last_name": last_name, "last_seen_at": self._now(), "updated_at": self._now()}
         if isinstance(rows, list) and rows:
             result = await self._request("PATCH", "/rest/v1/telegram_accounts", service=True, params={"telegram_user_id": f"eq.{telegram_user_id}", "select": _ACCOUNT_COLUMNS}, body=patch)
-            return result[0] if isinstance(result, list) and result else {**rows[0], **patch}
-        result = await self._request("POST", "/rest/v1/telegram_accounts", service=True, params={"select": _ACCOUNT_COLUMNS}, body={"telegram_user_id": telegram_user_id, **patch})
-        if isinstance(result, list) and result:
-            return result[0]
-        return {"telegram_user_id": telegram_user_id, **patch}
+            account = result[0] if isinstance(result, list) and result else {**rows[0], **patch}
+        else:
+            result = await self._request("POST", "/rest/v1/telegram_accounts", service=True, params={"select": _ACCOUNT_COLUMNS}, body={"telegram_user_id": telegram_user_id, **patch})
+            account = result[0] if isinstance(result, list) and result else {"telegram_user_id": telegram_user_id, **patch}
+        self._account_cache[int(telegram_user_id)] = (dict(account), _time.time() + self._account_ttl())
+        return account
 
     async def refresh_account(self, telegram_user_id: int) -> dict[str, Any]:
         rows = await self._request("GET", "/rest/v1/telegram_accounts", service=True, params={"telegram_user_id": f"eq.{telegram_user_id}", "limit": "1", "select": _ACCOUNT_COLUMNS})
@@ -371,6 +655,8 @@ class SupabaseAuth:
 
     async def save_state(self, telegram_user_id: int, state: dict[str, Any] | None) -> None:
         await self._request("PATCH", "/rest/v1/telegram_accounts", service=True, params={"telegram_user_id": f"eq.{telegram_user_id}"}, body={"auth_state": state or {}, "updated_at": self._now()})
+        # Mutating flows must never read a stale cached row.
+        self.invalidate_account_cache(telegram_user_id)
 
     async def start_auth(self, account: dict[str, Any], flow: str) -> str:
         if flow not in {"signup", "signin"}:
@@ -415,6 +701,7 @@ class SupabaseAuth:
         profile = await self._request("GET", "/rest/v1/profiles", service=True, params={"id": f"eq.{user_id}", "limit": "1", "select": "novita_user_opt_in,vps_docker_user_opt_in,github_user_opt_in"})
         profile_row = profile[0] if isinstance(profile, list) and profile else {}
         await self._request("PATCH", "/rest/v1/telegram_accounts", service=True, params={"telegram_user_id": f"eq.{int(account['telegram_user_id'])}"}, body={"agentx_user_id": user_id, "auth_email": email, "session_token_ciphertext": enc_access, "session_token_iv": iv_access, "refresh_token_ciphertext": enc_refresh, "refresh_token_iv": iv_refresh, "auth_state": {}, "novita_user_opt_in": profile_row.get("novita_user_opt_in") is True, "vps_docker_user_opt_in": profile_row.get("vps_docker_user_opt_in") is True, "github_user_opt_in": profile_row.get("github_user_opt_in") is True, "updated_at": self._now()})
+        self.invalidate_account_cache(int(account["telegram_user_id"]))
         return f"{'Your AgentX account was created' if flow == 'signup' else 'You are signed in'} successfully as {email}."
 
     async def handle_auth_message(self, account: dict[str, Any], text: str) -> str | None:
@@ -443,6 +730,7 @@ class SupabaseAuth:
         if not self.is_authenticated(account):
             return "You are already signed out. Use /signin again; /signup is disabled for this linked account."
         await self._request("PATCH", "/rest/v1/telegram_accounts", service=True, params={"telegram_user_id": f"eq.{int(account['telegram_user_id'])}"}, body={"session_token_ciphertext": None, "session_token_iv": None, "refresh_token_ciphertext": None, "refresh_token_iv": None, "auth_state": {}, "updated_at": self._now()})
+        self.invalidate_account_cache(int(account["telegram_user_id"]))
         return "You are signed out. Your AgentX account and tasks are preserved. Use /signin to authenticate again."
 
     async def credits(self, account: dict[str, Any]) -> str:
@@ -543,6 +831,8 @@ class SupabaseAuth:
                 "refresh_token_iv": iv_refresh,
             }
         )
+        # Rotated tokens: drop the cached row so later turns re-read fresh state.
+        self.invalidate_account_cache(int(telegram_user_id))
         return access_token
 
     async def session_is_usable(self, account: dict[str, Any]) -> bool:
@@ -714,12 +1004,30 @@ class SupabaseAuth:
             body["model"] = model.strip()[:200]
         return await self._puter_request(account, body)
 
+    # drain_rate is near-static user metadata; caching it removes one profiles
+    # GET from every billed task. TTL keeps it honest if an admin changes it.
+    _drain_rates: dict[str, tuple[int, float]] = {}
+    _DRAIN_RATE_TTL = 300.0
+
+    async def _cached_drain_rate(self, agentx_user_id: str) -> int:
+        import time as _time
+
+        entry = self._drain_rates.get(agentx_user_id)
+        if entry and entry[1] > _time.time():
+            return entry[0]
+        rows = await self._request(
+            "GET", "/rest/v1/profiles", service=True,
+            params={"id": f"eq.{agentx_user_id}", "limit": "1", "select": "drain_rate"},
+        )
+        rate = max(1, int(rows[0].get("drain_rate") or 1)) if isinstance(rows, list) and rows else 1
+        self._drain_rates[agentx_user_id] = (rate, _time.time() + self._DRAIN_RATE_TTL)
+        return rate
+
     async def charge_step(self, account: dict[str, Any], task_ref: str, step_no: int, amount: int = 0) -> dict[str, Any]:
         if not account.get("agentx_user_id"):
             raise SupabaseAuthError("Use /signup or /signin first")
         if amount <= 0:
-            rows = await self._request("GET", "/rest/v1/profiles", service=True, params={"id": f"eq.{account['agentx_user_id']}", "limit": "1", "select": "drain_rate"})
-            rate = max(1, int(rows[0].get("drain_rate") or 1)) if isinstance(rows, list) and rows else 1
+            rate = await self._cached_drain_rate(str(account["agentx_user_id"]))
             amount = 3 * rate
         result = await self._request("POST", "/rest/v1/rpc/consume_cloud_task_step_credits", service=True, body={"p_user": account["agentx_user_id"], "p_amount": max(1, int(amount)), "p_task_ref": task_ref, "p_step_no": max(1, int(step_no))})
         if not isinstance(result, dict) or result.get("success") is not True:
@@ -737,11 +1045,7 @@ class SupabaseAuth:
         if not account.get("agentx_user_id"):
             raise SupabaseAuthError("Use /signup or /signin first")
         if amount <= 0:
-            rows = await self._request(
-                "GET", "/rest/v1/profiles", service=True,
-                params={"id": f"eq.{account['agentx_user_id']}", "limit": "1", "select": "drain_rate"},
-            )
-            rate = max(1, int(rows[0].get("drain_rate") or 1)) if isinstance(rows, list) and rows else 1
+            rate = await self._cached_drain_rate(str(account["agentx_user_id"]))
             amount = 3 * rate
         total = max(1, int(total_steps))
         result = await self._request(
