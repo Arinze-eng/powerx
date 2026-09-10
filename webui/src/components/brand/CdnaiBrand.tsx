@@ -51,7 +51,7 @@ export function CdnaiLogo({
     <span className={cn("inline-flex items-center gap-2.5", className)}>
       <CdnaiMark className={markClassName} />
       {showText ? (
-        <span className="text-lg font-semibold tracking-tight text-foreground">
+        <span className="text-lg font-semibold tracking-tight text-white">
           CDNAI
         </span>
       ) : null}

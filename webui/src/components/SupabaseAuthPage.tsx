@@ -11,8 +11,6 @@ import {
   Sparkles,
 } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { guardSignup } from "@/lib/anti-loot";
 import { CdnaiLogo, CdnaiMark } from "@/components/brand/CdnaiBrand";
 
@@ -71,8 +69,6 @@ export function SupabaseAuthPage({
       setLocalError("Password must be at least 6 characters.");
       return;
     }
-    // Anti-loot guard: block repeated free-credit account creation on the same
-    // browser while still allowing genuinely new users (fresh device / store).
     if (mode === "signup") {
       const guard = guardSignup(cleanEmail);
       if (!guard.allowed) {
@@ -94,22 +90,27 @@ export function SupabaseAuthPage({
 
   const togglePasswordVisibility = () => setPasswordVisible((v) => !v);
 
+  const inputCls =
+    "h-11 w-full rounded-control border border-white/10 bg-white/[0.04] px-3.5 text-sm text-white placeholder:text-white/35 outline-none transition-colors focus:border-[#7C5CFF]/60 focus:bg-white/[0.06] focus:ring-2 focus:ring-[#7C5CFF]/25 disabled:opacity-60";
+
   return (
-    <div className="flex min-h-full w-full flex-col lg:flex-row">
-      {/* Brand panel */}
-      <aside className="relative hidden overflow-hidden bg-gradient-to-br from-[#12101f] via-[#1a1636] to-[#0d2330] p-12 text-white lg:flex lg:w-1/2 lg:flex-col lg:justify-between">
-        <div aria-hidden className="pointer-events-none absolute inset-0">
-          <div className="absolute -left-10 top-10 h-72 w-72 rounded-full bg-[radial-gradient(closest-side,hsl(255_85%_65%/0.4),transparent)] blur-2xl" />
-          <div className="absolute bottom-0 right-0 h-80 w-80 rounded-full bg-[radial-gradient(closest-side,hsl(190_90%_55%/0.35),transparent)] blur-2xl" />
-        </div>
+    <div className="relative flex min-h-full w-full flex-col overflow-hidden bg-[#0b0a14] text-white lg:flex-row">
+      {/* Ambient background glows */}
+      <div aria-hidden className="pointer-events-none absolute inset-0 -z-0">
+        <div className="absolute -left-20 top-[-5%] h-[380px] w-[380px] rounded-full bg-[radial-gradient(closest-side,rgba(124,92,255,0.35),transparent)] blur-2xl" />
+        <div className="absolute bottom-[-10%] right-[-5%] h-[420px] w-[420px] rounded-full bg-[radial-gradient(closest-side,rgba(34,211,238,0.22),transparent)] blur-2xl" />
+      </div>
+
+      {/* Brand panel (desktop) */}
+      <aside className="relative hidden w-1/2 flex-col justify-between p-12 lg:flex">
         <div className="relative">
-          <CdnaiLogo className="[&_span]:text-white" />
+          <CdnaiLogo />
         </div>
         <div className="relative max-w-md">
           <h2 className="text-3xl font-bold leading-tight tracking-tight xl:text-4xl">
             The AI partner that turns goals into finished work.
           </h2>
-          <p className="mt-4 text-white/70">
+          <p className="mt-4 text-white/65">
             Write, build, analyze and automate — CDNAI plans each task, uses the right tools, and
             delivers results you can ship.
           </p>
@@ -124,24 +125,20 @@ export function SupabaseAuthPage({
             ))}
           </ul>
         </div>
-        <div className="relative flex items-center gap-2 text-xs text-white/50">
+        <div className="relative flex items-center gap-2 text-xs text-white/45">
           <ShieldCheck className="h-4 w-4" />
           Your data is encrypted and never sold.
         </div>
       </aside>
 
       {/* Form panel */}
-      <main className="flex flex-1 items-center justify-center px-6 py-12 sm:px-10">
+      <main className="relative z-10 flex flex-1 items-center justify-center px-6 py-12 sm:px-10">
         <div className="w-full max-w-sm">
-          {/* Mobile header */}
+          {/* Mobile brand header */}
           <div className="mb-8 flex items-center justify-between lg:hidden">
             <CdnaiLogo />
             {onBack ? (
-              <button
-                type="button"
-                onClick={onBack}
-                className="inline-flex items-center gap-1.5 rounded-control px-2.5 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-              >
+              <button type="button" onClick={onBack} className="inline-flex items-center gap-1.5 rounded-control px-2.5 py-2 text-sm font-medium text-white/60 transition-colors hover:bg-white/10 hover:text-white">
                 <ArrowLeft className="h-4 w-4" />
                 Back
               </button>
@@ -149,25 +146,21 @@ export function SupabaseAuthPage({
           </div>
 
           {onBack ? (
-            <button
-              type="button"
-              onClick={onBack}
-              className="mb-6 hidden items-center gap-1.5 rounded-control text-sm font-medium text-muted-foreground transition-colors hover:text-foreground lg:inline-flex"
-            >
+            <button type="button" onClick={onBack} className="mb-6 hidden items-center gap-1.5 rounded-control text-sm font-medium text-white/55 transition-colors hover:text-white lg:inline-flex">
               <ArrowLeft className="h-4 w-4" />
               Back to home
             </button>
           ) : null}
 
           <div className="mb-7">
-            <span className="inline-flex items-center gap-1.5 rounded-full border border-border/70 bg-card px-3 py-1 text-xs font-medium text-muted-foreground">
-              <Sparkles className="h-3.5 w-3.5 text-[#7C5CFF]" />
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/5 px-3 py-1 text-xs font-medium text-white/70">
+              <Sparkles className="h-3.5 w-3.5 text-[#a78bff]" />
               {mode === "signin" ? "Welcome back" : "Get started free"}
             </span>
-            <h1 className="mt-4 text-2xl font-bold tracking-tight text-foreground">
+            <h1 className="mt-4 text-2xl font-bold tracking-tight">
               {mode === "signin" ? "Sign in to CDNAI" : "Create your account"}
             </h1>
-            <p className="mt-1.5 text-sm text-muted-foreground">
+            <p className="mt-1.5 text-sm text-white/55">
               {mode === "signin"
                 ? "Access your AI workspace."
                 : "New accounts get free credits to explore."}
@@ -180,139 +173,97 @@ export function SupabaseAuthPage({
 
             {mode === "signup" ? (
               <div className="space-y-1.5">
-                <label className="text-sm font-medium text-foreground" htmlFor="supabase-name">
-                  Name
-                </label>
-                <Input
+                <label className="text-sm font-medium text-white/80" htmlFor="supabase-name">Name</label>
+                <input
                   id="supabase-name"
                   name="name"
                   value={name}
-                  onChange={(e) => {
-                    setName(e.target.value);
-                    setLocalError(null);
-                  }}
+                  onChange={(e) => { setName(e.target.value); setLocalError(null); }}
                   disabled={submitting}
                   placeholder="Your full name"
                   autoComplete="name"
                   autoFocus
-                  className="h-11"
+                  className={inputCls}
                 />
               </div>
             ) : null}
 
             <div className="space-y-1.5">
-              <label className="text-sm font-medium text-foreground" htmlFor="supabase-email">
-                Email
-              </label>
-              <Input
+              <label className="text-sm font-medium text-white/80" htmlFor="supabase-email">Email</label>
+              <input
                 id="supabase-email"
                 name="email"
                 type="email"
                 value={email}
-                onChange={(e) => {
-                  setEmail(e.target.value);
-                  setLocalError(null);
-                }}
+                onChange={(e) => { setEmail(e.target.value); setLocalError(null); }}
                 disabled={submitting}
                 placeholder="you@example.com"
                 autoComplete="email"
                 autoFocus={mode === "signin"}
-                className="h-11"
+                className={inputCls}
               />
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-sm font-medium text-foreground" htmlFor="supabase-password">
-                Password
-              </label>
+              <label className="text-sm font-medium text-white/80" htmlFor="supabase-password">Password</label>
               <div className="relative">
-                <Input
+                <input
                   id="supabase-password"
                   name="password"
                   type={passwordVisible ? "text" : "password"}
                   value={password}
-                  onChange={(e) => {
-                    setPassword(e.target.value);
-                    setLocalError(null);
-                  }}
+                  onChange={(e) => { setPassword(e.target.value); setLocalError(null); }}
                   disabled={submitting}
                   placeholder="••••••••"
                   autoComplete={mode === "signup" ? "new-password" : "current-password"}
-                  className="h-11 pr-10"
+                  className={`${inputCls} pr-10`}
                 />
-                <Button
+                <button
                   type="button"
-                  variant="ghost"
-                  size="icon"
                   disabled={submitting}
                   aria-label={passwordVisible ? "Hide password" : "Show password"}
                   onClick={togglePasswordVisibility}
-                  className="absolute right-1 top-1/2 h-9 w-9 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  className="absolute right-1 top-1/2 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-control text-white/45 transition-colors hover:text-white"
                 >
-                  {passwordVisible ? (
-                    <EyeOff className="h-4 w-4" strokeWidth={1.75} aria-hidden />
-                  ) : (
-                    <Eye className="h-4 w-4" strokeWidth={1.75} aria-hidden />
-                  )}
-                </Button>
+                  {passwordVisible ? <EyeOff className="h-4 w-4" strokeWidth={1.75} /> : <Eye className="h-4 w-4" strokeWidth={1.75} />}
+                </button>
               </div>
             </div>
 
             {localError ? (
-              <p role="alert" className="flex items-start gap-1.5 text-sm text-destructive">
-                <span className="mt-0.5">⚠</span>
+              <p role="alert" className="rounded-control border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
                 {localError}
               </p>
             ) : null}
 
-            <Button
+            <button
               type="submit"
-              className="mt-1 h-11 w-full text-sm font-semibold"
               disabled={submitting}
+              className="mt-1 inline-flex h-11 w-full items-center justify-center rounded-control bg-gradient-to-r from-[#7C5CFF] to-[#22D3EE] text-sm font-semibold text-white shadow-lg shadow-[#7C5CFF]/25 transition-all hover:brightness-110 disabled:opacity-60"
             >
-              {submitting
-                ? "Please wait…"
-                : mode === "signin"
-                  ? "Sign in"
-                  : "Create account"}
-            </Button>
+              {submitting ? "Please wait…" : mode === "signin" ? "Sign in" : "Create account"}
+            </button>
 
             {mode === "signup" ? (
-              <p className="flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
-                <CheckCircle2 className="h-3.5 w-3.5 text-green-500" />
+              <p className="flex items-center justify-center gap-1.5 text-xs text-white/50">
+                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
                 Free credits included · No credit card required
               </p>
             ) : null}
           </form>
 
-          <div className="mt-6 text-center text-sm text-muted-foreground">
+          <div className="mt-6 text-center text-sm text-white/55">
             {mode === "signin" ? (
               <>
                 Don't have an account?{" "}
-                <button
-                  type="button"
-                  disabled={submitting}
-                  onClick={() => {
-                    setMode("signup");
-                    setLocalError(null);
-                  }}
-                  className="font-semibold text-foreground underline-offset-4 hover:underline"
-                >
+                <button type="button" disabled={submitting} onClick={() => { setMode("signup"); setLocalError(null); }} className="font-semibold text-white underline-offset-4 hover:underline">
                   Sign up
                 </button>
               </>
             ) : (
               <>
                 Already have an account?{" "}
-                <button
-                  type="button"
-                  disabled={submitting}
-                  onClick={() => {
-                    setMode("signin");
-                    setLocalError(null);
-                  }}
-                  className="font-semibold text-foreground underline-offset-4 hover:underline"
-                >
+                <button type="button" disabled={submitting} onClick={() => { setMode("signin"); setLocalError(null); }} className="font-semibold text-white underline-offset-4 hover:underline">
                   Sign in
                 </button>
               </>
@@ -320,14 +271,10 @@ export function SupabaseAuthPage({
           </div>
 
           {onPrivacy ? (
-            <div className="mt-8 flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
+            <div className="mt-8 flex items-center justify-center gap-1.5 text-xs text-white/45">
               <CdnaiMark className="h-3.5 w-3.5" />
               Protected by CDNAI ·
-              <button
-                type="button"
-                onClick={onPrivacy}
-                className="font-medium underline-offset-2 hover:underline"
-              >
+              <button type="button" onClick={onPrivacy} className="font-medium underline-offset-2 hover:underline hover:text-white">
                 Privacy Policy
               </button>
             </div>

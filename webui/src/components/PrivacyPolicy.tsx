@@ -124,14 +124,14 @@ const SECTIONS: { title: string; body: React.ReactNode }[] = [
 
 export function PrivacyPolicy({ onBack }: PrivacyPolicyProps) {
   return (
-    <div className="min-h-full w-full bg-background text-foreground">
-      <header className="sticky top-0 z-30 border-b border-border/60 bg-background/80 backdrop-blur-md">
+    <div className="min-h-full w-full bg-[#0b0a14] text-white">
+      <header className="sticky top-0 z-30 border-b border-white/10 bg-[#0b0a14]/85 backdrop-blur-md">
         <div className="mx-auto flex h-16 max-w-3xl items-center justify-between px-5 sm:px-8">
           <CdnaiLogo />
           <button
             type="button"
             onClick={onBack}
-            className="inline-flex items-center gap-1.5 rounded-control px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            className="inline-flex items-center gap-1.5 rounded-control px-3 py-2 text-sm font-medium text-white/60 transition-colors hover:bg-white/10 hover:text-white"
           >
             <ArrowLeft className="h-4 w-4" />
             Back
@@ -141,8 +141,8 @@ export function PrivacyPolicy({ onBack }: PrivacyPolicyProps) {
 
       <main className="mx-auto max-w-3xl px-5 py-14 sm:px-8">
         <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">Privacy Policy</h1>
-        <p className="mt-3 text-sm text-muted-foreground">Last updated: September 2026</p>
-        <p className="mt-6 text-[15px] leading-relaxed text-muted-foreground">
+        <p className="mt-3 text-sm text-white/50">Last updated: September 2026</p>
+        <p className="mt-6 text-[15px] leading-relaxed text-white/65">
           Your privacy matters. This policy describes how CDNAI collects, uses and protects your
           information in plain language.
         </p>
@@ -150,24 +150,24 @@ export function PrivacyPolicy({ onBack }: PrivacyPolicyProps) {
         <div className="mt-10 space-y-9">
           {SECTIONS.map((s) => (
             <section key={s.title}>
-              <h2 className="text-lg font-semibold text-foreground">{s.title}</h2>
-              <div className="mt-2 text-[15px] leading-relaxed text-muted-foreground [&_strong]:text-foreground">
+              <h2 className="text-lg font-semibold text-white">{s.title}</h2>
+              <div className="mt-2 text-[15px] leading-relaxed text-white/60 [&_strong]:text-white">
                 {s.body}
               </div>
             </section>
           ))}
         </div>
 
-        <div className="mt-14 rounded-panel border border-border/70 bg-card p-6 text-sm text-muted-foreground">
+        <div className="mt-14 rounded-panel border border-white/10 bg-white/[0.03] p-6 text-sm text-white/60">
           By continuing to use CDNAI you acknowledge that you have read and understood this Privacy
           Policy.
         </div>
       </main>
 
-      <footer className="border-t border-border/60">
-        <div className="mx-auto flex max-w-3xl items-center justify-between px-5 py-6 text-sm text-muted-foreground sm:px-8">
+      <footer className="border-t border-white/10">
+        <div className="mx-auto flex max-w-3xl items-center justify-between px-5 py-6 text-sm text-white/50 sm:px-8">
           <span>© {new Date().getFullYear()} CDNAI</span>
-          <button type="button" onClick={onBack} className="transition-colors hover:text-foreground">
+          <button type="button" onClick={onBack} className="transition-colors hover:text-white">
             Return to home
           </button>
         </div>
