@@ -484,7 +484,13 @@ class PollingStore:
         rows = await self._request(
             "GET",
             "/rest/v1/polling_watches",
-            params={"select": "*", "order": "created_at.desc", "limit": "50"},
+            params={
+                # Explicit columns (egress fix): select=* shipped large
+                # description/condition text blobs on every list call.
+                "select": "id,label,status,interval_seconds,condition,last_event_at,created_at",
+                "order": "created_at.desc",
+                "limit": "50",
+            },
         )
         return rows if isinstance(rows, list) else []
 
@@ -493,7 +499,9 @@ class PollingStore:
             "GET",
             "/rest/v1/polling_watch_runs",
             params={
-                "select": "*",
+                # Explicit columns (egress fix): skip notify_message blob;
+                # callers only need the run summary fields.
+                "select": "id,watch_id,tick,occurred_at,status,data",
                 "watch_id": f"eq.{watch_id}",
                 "order": "occurred_at.desc",
                 "limit": str(limit),

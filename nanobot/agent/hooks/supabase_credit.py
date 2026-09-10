@@ -89,7 +89,13 @@ class SupabaseCreditHook(AgentHook):
         try:
             rows = await self._supabase._request(  # noqa: SLF001 - read-only lookup
                 "GET", "/rest/v1/telegram_accounts", service=True,
-                params={"telegram_user_id": f"eq.{chat_id}", "limit": "1", "select": "*"},
+                params={
+                    "telegram_user_id": f"eq.{chat_id}",
+                    "limit": "1",
+                    # Explicit columns (egress fix): only the billing identity
+                    # is needed here; avoid shipping crypto/auth blobs per turn.
+                    "select": "agentx_user_id,telegram_user_id",
+                },
             )
             return rows[0] if isinstance(rows, list) and rows else None
         except Exception as exc:

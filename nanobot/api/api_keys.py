@@ -130,7 +130,13 @@ class ApiKeyStore:
     async def find_active_by_hash(self, key_hash: str) -> dict[str, Any] | None:
         rows = await self._request(
             "GET", "/rest/v1/agent_api_keys",
-            params={"key_hash": f"eq.{key_hash}", "is_active": "eq.true", "select": "*"},
+            params={
+                "key_hash": f"eq.{key_hash}",
+                "is_active": "eq.true",
+                # Explicit columns (egress fix): hot path runs on every API
+                # request; never return the key_hash itself.
+                "select": "id,agentx_user_id,telegram_user_id,name,key_prefix,total_requests,last_used_at",
+            },
         )
         if isinstance(rows, list) and rows:
             return rows[0]

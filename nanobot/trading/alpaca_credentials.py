@@ -135,7 +135,8 @@ class AlpacaCredentialStore:
             params={
                 "telegram_user_id": f"eq.{telegram_user_id}",
                 "limit": "1",
-                "select": "*",
+                # Explicit columns (egress fix): only the crypto fields are used.
+                "select": "api_key_ciphertext,api_key_iv,secret_key_ciphertext,secret_key_iv,base_url",
             },
         )
         if not isinstance(rows, list) or not rows:

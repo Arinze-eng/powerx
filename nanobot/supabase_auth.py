@@ -12,6 +12,15 @@ from typing import Any
 import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+# Explicit columns (egress fix): telegram_accounts is fetched on every inbound
+# message. select=* shipped the whole row (crypto/auth blobs, opt-ins) each
+# time; only these fields are ever read back by this module.
+_ACCOUNT_COLUMNS = (
+    "telegram_user_id,agentx_user_id,chat_id,username,first_name,last_name,"
+    "last_seen_at,auth_email,auth_state,pending_attachment,"
+    "session_token_ciphertext,session_token_iv,refresh_token_ciphertext,refresh_token_iv"
+)
+
 
 class SupabaseAuthError(RuntimeError):
     pass
@@ -327,18 +336,18 @@ class SupabaseAuth:
             pass
 
     async def account_for(self, telegram_user_id: int, chat_id: int, *, username: str | None, first_name: str | None, last_name: str | None) -> dict[str, Any]:
-        rows = await self._request("GET", "/rest/v1/telegram_accounts", service=True, params={"telegram_user_id": f"eq.{telegram_user_id}", "limit": "1", "select": "*"})
+        rows = await self._request("GET", "/rest/v1/telegram_accounts", service=True, params={"telegram_user_id": f"eq.{telegram_user_id}", "limit": "1", "select": _ACCOUNT_COLUMNS})
         patch = {"chat_id": chat_id, "username": username, "first_name": first_name, "last_name": last_name, "last_seen_at": self._now(), "updated_at": self._now()}
         if isinstance(rows, list) and rows:
-            result = await self._request("PATCH", "/rest/v1/telegram_accounts", service=True, params={"telegram_user_id": f"eq.{telegram_user_id}", "select": "*"}, body=patch)
+            result = await self._request("PATCH", "/rest/v1/telegram_accounts", service=True, params={"telegram_user_id": f"eq.{telegram_user_id}", "select": _ACCOUNT_COLUMNS}, body=patch)
             return result[0] if isinstance(result, list) and result else {**rows[0], **patch}
-        result = await self._request("POST", "/rest/v1/telegram_accounts", service=True, params={"select": "*"}, body={"telegram_user_id": telegram_user_id, **patch})
+        result = await self._request("POST", "/rest/v1/telegram_accounts", service=True, params={"select": _ACCOUNT_COLUMNS}, body={"telegram_user_id": telegram_user_id, **patch})
         if isinstance(result, list) and result:
             return result[0]
         return {"telegram_user_id": telegram_user_id, **patch}
 
     async def refresh_account(self, telegram_user_id: int) -> dict[str, Any]:
-        rows = await self._request("GET", "/rest/v1/telegram_accounts", service=True, params={"telegram_user_id": f"eq.{telegram_user_id}", "limit": "1", "select": "*"})
+        rows = await self._request("GET", "/rest/v1/telegram_accounts", service=True, params={"telegram_user_id": f"eq.{telegram_user_id}", "limit": "1", "select": _ACCOUNT_COLUMNS})
         if not isinstance(rows, list) or not rows:
             raise SupabaseAuthError("Telegram account not found")
         return rows[0]
