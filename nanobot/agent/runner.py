@@ -167,6 +167,12 @@ class AgentRunSpec:
     # any structurally-identical repeat, with ZERO provider calls. Fail-open —
     # an unlearned, expired, or failing plan falls back to the normal LLM path.
     enable_plan_cache: bool = False
+    # Mutable one-element counter of how many times this run actually hit the
+    # configured LLM provider (every distinct model request, including
+    # finalization and no-tools fallbacks, but NOT internal provider retries).
+    # Mirrors Manus's "API called: N" telemetry so efficiency is observable.
+    # Initialized by _run_core; safe under concurrency because it is per-spec.
+    llm_calls: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -534,6 +540,13 @@ class AgentRunner:
         # task PLAN for zero-LLM repeats (see nanobot.agent.plan_cache).
         recorded_steps: list[dict[str, Any]] = []
         usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
+        # Manus-style cost telemetry: how many times this run really hit the
+        # configured LLM provider. Starts empty (0 visible calls); bumped once per
+        # distinct model request by _request_model / _request_no_tools. Zero-call
+        # replays, plan replays, deterministic-router answers and middleware
+        # hits never touch it, so it honestly mirrors "API called: N".
+        if not spec.llm_calls:
+            spec.llm_calls.append(0)
         error: str | None = None
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
@@ -586,7 +599,7 @@ class AgentRunner:
                 final_content=final_content,
                 messages=messages,
                 tools_used=[],
-                usage={"prompt_tokens": 0, "completion_tokens": 0, "replayed": 1},
+                usage={"prompt_tokens": 0, "completion_tokens": 0, "replayed": 1, "llm_calls": 0},
                 stop_reason=stop_reason,
                 error=None,
                 tool_events=[],
@@ -644,7 +657,7 @@ class AgentRunner:
                 final_content=final_content,
                 messages=messages,
                 tools_used=[deterministic_call.name],
-                usage={"prompt_tokens": 0, "completion_tokens": 0, "deterministic": 1},
+                usage={"prompt_tokens": 0, "completion_tokens": 0, "deterministic": 1, "llm_calls": 0},
                 stop_reason=stop_reason,
                 error=None,
                 tool_events=[],
@@ -807,6 +820,7 @@ class AgentRunner:
                     usage["middleware_formatted"] = int(
                         usage.get("middleware_formatted", 0)
                     ) + 1
+                    usage["llm_calls"] = spec.llm_calls[0] if spec.llm_calls else 0
                     stop_reason = "completed"
                     return AgentRunResult(
                         final_content=formatted,
@@ -1179,6 +1193,7 @@ class AgentRunner:
                     plan_norm.template[:60],
                 )
 
+        usage["llm_calls"] = spec.llm_calls[0] if spec.llm_calls else 0
         return AgentRunResult(
             final_content=final_content,
             messages=messages,
@@ -1387,6 +1402,10 @@ class AgentRunner:
             )
 
         request_started_at = time.perf_counter()
+        # Count this distinct model request (Manus-style "API called: N").
+        # Internal provider retries are handled inside chat_with_retry and do NOT
+        # bump this counter — only a real request to the configured LLM counts.
+        spec.llm_calls[0] += 1
         try:
             response = (
                 await coro if outer_timeout_s is None
@@ -1617,6 +1636,7 @@ class AgentRunner:
             messages,
             tools=None,
         )
+        spec.llm_calls[0] += 1
         return await spec.runtime.provider.chat_with_retry(
             **kwargs,
             provider_context=provider_context,
@@ -2337,7 +2357,7 @@ class AgentRunner:
             final_content=final_content,
             messages=messages,
             tools_used=[s["name"] for s in steps],
-            usage={"prompt_tokens": 0, "completion_tokens": 0, "plan_replayed": 1},
+            usage={"prompt_tokens": 0, "completion_tokens": 0, "plan_replayed": 1, "llm_calls": 0},
             stop_reason="completed",
             error=None,
             tool_events=events,

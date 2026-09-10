@@ -1365,13 +1365,17 @@ class AgentLoop:
             strip_image_content_before_provider = telegram_image_request
 
         # --- Deterministic zero-call router (Manus-style cost discipline) -----
-        # Fresh Telegram text asks that unambiguously name a read-only UniAbuja
-        # lookup are answered by the runner with the matching tool and ZERO
-        # provider calls. Gated to plain-text (non-image) Telegram user turns
-        # with no active sustained goal, so visual/OCR work and goal-driven
-        # sessions always keep the full model path.
+        # Fresh text asks that unambiguously name a rule-resolvable read-only
+        # lookup (account status, own records, announcements, a generic file
+        # search/list over the workspace) are answered by the runner with the
+        # matching tool and ZERO provider calls. Channel-agnostic: Telegram,
+        # the WebUI (channel="webui") and the public API (channel="api") all
+        # hit it, so the web deployment — the surface most users actually use —
+        # stops paying the model for routine lookups too. Gated to plain-text
+        # (non-image) turns with no active sustained goal, so visual/OCR work
+        # and goal-driven sessions always keep the full model path.
         deterministic_router_text: str | None = None
-        if channel == "telegram" and not telegram_image_request and not strip_image_content_before_provider:
+        if not telegram_image_request and not strip_image_content_before_provider:
             if session is not None and sustained_goal_active(session.metadata):
                 deterministic_router_text = None
             else:

@@ -122,6 +122,12 @@ def _chat_completion_response(
             "prompt_tokens": prompt,
             "completion_tokens": completion,
             "total_tokens": total,
+            # Manus-style cost telemetry: how many distinct requests this turn
+            # actually made to the configured LLM (0 for replayed / plan / rule /
+            # middleware-served answers). Mirrors the "API called: N" metric so
+            # efficiency is observable through the same OpenAI-compatible API the
+            # system admin uses to configure the model.
+            "llm_calls": int((usage or {}).get("llm_calls", 0) or 0),
         },
     }
 
@@ -489,6 +495,7 @@ async def handle_version(request: web.Request) -> web.Response:
     """
     from nanobot.agent import plan_cache as _pc
     from nanobot.agent import tool_middleware as _tm
+    from nanobot.agent import task_cache as _rc
     from nanobot.agent.deterministic_router import router_enabled as _router_enabled
 
     git_sha = os.environ.get("GIT_SHA") or os.environ.get("COMMIT_SHA") or ""
@@ -510,6 +517,7 @@ async def handle_version(request: web.Request) -> web.Response:
             "cost_layers": {
                 "plan_cache": _pc.plan_cache_enabled(),
                 "tool_middleware": _tm.middleware_enabled(),
+                "replay_cache": _rc.replay_cache_enabled(),
                 "deterministic_router": bool(_router_enabled()),
             },
         }

@@ -81,6 +81,77 @@ _STATUS_RE = re.compile(
 #: transcript action), so it always falls through to the model.
 _ELIGIBILITY_RE = re.compile(r"eligib\w*", re.IGNORECASE)
 
+# ---------------------------------------------------------------------------
+# Generic read-only workspace lookups (channel-agnostic, tool-registry-validated)
+#
+# These make the model redundant for the *routine* "find me / show me / list /
+# search the file X" asks that Manus handles with command runners - zero API
+# calls. The runner only executes a plan when the named tool is actually
+# registered on the run (spec.tools guard), so a plan that names a tool the
+# admin's agent does not expose simply falls through to the model. Everything
+# here is read-only and scoped to the user's own workspace; nothing here can
+# mutate state or spend money.
+# ---------------------------------------------------------------------------
+
+#: How many literal search terms we are willing to hand to file_search. A long
+#: run of terms almost certainly needs the model's judgement, not a rule.
+_MAX_SEARCH_TERMS = 2
+
+#: Verbs that make an ask *unambiguously* a lookup of a named file/folder.
+_LOOKUP_VERB_RE = re.compile(
+    r"\b(find|search|locate|list|show|display|open|read|view|look at|tell me about|"
+    r"what(\'?s| is)? in|what(\'?s| is)? the contents? of|where is)\b"
+)
+
+#: A lower-case literal run that currently references a real file-ish name.
+#: Conservative: at least one token must end in an extension or contain a dot
+#: or backslash/slash, so "find the python file" becomes a search, while
+#: conversational chatter like "find me a good movie" does not.
+_FILE_NAME_HINT_RE = re.compile(
+    r"[\w.\-\\/]+\.(?:py|js|ts|jsx|tsx|json|md|txt|csv|html|css|yaml|yml|toml|"
+    r"sh|go|rs|java|rb|pdf|docx?|xlsx?|sql|env|lock|cfg|ini|ipynb)\b",
+    re.I,
+)
+#: A bare directory-ish mention (ends in /).
+_FOLDER_HINT_RE = re.compile(r"[\w.\-\\/]+/?$", re.I)
+
+
+def _generic_lookup(text: str, normalized: str) -> ToolCallRequest | None:
+    """Return a generic file/workspace lookup plan, or None (fall through).
+
+    Only fires on unambiguous read-only *specified-file* asks. The returned
+    tool is the SAFEST available (``file_search`` by default) so the runner's
+    registry guard decides whether it exists on this run; if absent it falls
+    through to the model. This keeps the layer generic across whatever
+    OpenAI-compatible tool set the system admin configured.
+    """
+    if not _looks_read_only(normalized):
+        return None
+    if not _LOOKUP_VERB_RE.search(normalized):
+        return None
+    # Must reference a concrete file-ish name, not just speak about "a file".
+    if not _FILE_NAME_HINT_RE.search(normalized):
+        return None
+    # Extract quoted file names first (highest precision), else inline tokens.
+    quoted = re.findall(r"[\"']([^\"']+\.\w+)[\"']", normalized)
+    target = None
+    if quoted:
+        target = quoted[0]
+    else:
+        # Count of distinct file-like terms must stay tiny -> else model.
+        terms = re.findall(r"[\w.\-\\/]+\.\w+\b", normalized)
+        terms = [t.strip() for t in terms if "/" in t or "." in t or t.isalnum()]
+        if not terms or len(terms) > _MAX_SEARCH_TERMS:
+            return None
+        target = terms[-1]  # last is usually the specific thing being found
+    if not target:
+        return None
+    return ToolCallRequest(
+        id="det-file-lookup",
+        name="file_search",
+        arguments={"query": target, "expand_paths": True},
+    )
+
 
 def router_enabled() -> bool:
     """True when the deterministic router may answer turns.
@@ -183,5 +254,13 @@ def deterministic_plan(text: str) -> ToolCallRequest | None:
             name="uniabuja_student",
             arguments={"action": "status"},
         )
+
+    # 5. Generic read-only workspace lookup -- only when nothing more specific
+    # matched AND the ask unambiguously names a concrete file/folder. The
+    # runner's registry guard decides whether ``file_search`` exists on this
+    # run; if not, the turn falls through to the model untouched.
+    generic_call = _generic_lookup(text, normalized)
+    if generic_call is not None:
+        return generic_call
 
     return None
