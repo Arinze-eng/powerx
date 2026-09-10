@@ -13,6 +13,8 @@ import { useTranslation } from "react-i18next";
 import { channelUiPresentation } from "@/channel-plugins/registry";
 import { Sidebar } from "@/components/Sidebar";
 import { SupabaseAuthPage } from "@/components/SupabaseAuthPage";
+import { LandingPage } from "@/components/LandingPage";
+import { PrivacyPolicy } from "@/components/PrivacyPolicy";
 import { CreditBadge } from "@/components/CreditBadge";
 import type { SidebarDeleteItem } from "@/components/ChatList";
 import type { SettingsSectionKey } from "@/components/settings/SettingsView";
@@ -859,6 +861,24 @@ export default function App() {
   const [state, setState] = useState<BootState>({ status: "loading" });
   const bootstrapSecretRef = useRef("");
 
+  // CDNAI marketing routes (hash-based, no router dependency): #/ → landing,
+  // #/login → sign in, #/signup → create account, #/privacy → privacy policy.
+  // The authenticated app renders for any other route once bootstrapped.
+  const [route, setRoute] = useState<string>(() => window.location.hash);
+  useEffect(() => {
+    const onHash = () => setRoute(window.location.hash);
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  const navigate = useCallback((hash: string) => {
+    if (window.location.hash === hash) {
+      setRoute(hash);
+    } else {
+      window.location.hash = hash;
+    }
+    window.scrollTo({ top: 0 });
+  }, []);
+
   // [FIX 2026-09-04] Keep the current Supabase url + anon key in a ref (set on
   // every successful connect) so token refresh can run from any state without
   // TypeScript narrowing problems on the union BootState.
@@ -1273,6 +1293,55 @@ export default function App() {
       </div>
     );
   }
+  // ---- CDNAI marketing routes (shown only while unauthenticated) ----------
+  // A signed-in user (status "ready") always sees the app below. For Supabase-
+  // gated deployments, unauthenticated visitors get the landing page at #/ (or
+  // no hash), plus dedicated login / signup / privacy views. The real Supabase
+  // auth handlers are reused untouched. The legacy token AuthForm (self-hosted
+  // / API-key mode) is NOT intercepted — it renders directly as before.
+  const isMarketingRoute =
+    state.status === "supabase" &&
+    (route === "" ||
+      route === "#" ||
+      route === "#/" ||
+      route === "#/login" ||
+      route === "#/signup" ||
+      route === "#/privacy");
+
+  if (isMarketingRoute) {
+    if (route === "#/privacy") {
+      return <PrivacyPolicy onBack={() => navigate("#/")} />;
+    }
+    if (route === "#/login" || route === "#/signup") {
+      return (
+        <SupabaseAuthPage
+          key={route}
+          supabaseUrl={state.supabaseUrl}
+          anonKey={state.anonKey}
+          failed={state.failed}
+          message={state.message}
+          initialMode={route === "#/signup" ? "signup" : "signin"}
+          onSignIn={(email, password) =>
+            handleSupabaseSignIn(state.supabaseUrl, state.anonKey, email, password)
+          }
+          onSignUp={(name, email, password) =>
+            handleSupabaseSignUp(state.supabaseUrl, state.anonKey, name, email, password)
+          }
+          onBack={() => navigate("#/")}
+          onPrivacy={() => navigate("#/privacy")}
+        />
+      );
+    }
+    // Default marketing route: the landing page.
+    return (
+      <LandingPage
+        onSignIn={() => navigate("#/login")}
+        onSignUp={() => navigate("#/signup")}
+        onPrivacy={() => navigate("#/privacy")}
+      />
+    );
+  }
+
   if (state.status === "auth") {
     return (
       <AuthForm
@@ -1294,6 +1363,7 @@ export default function App() {
         onSignUp={(name, email, password) =>
           handleSupabaseSignUp(state.supabaseUrl, state.anonKey, name, email, password)
         }
+        onPrivacy={() => navigate("#/privacy")}
       />
     );
   }

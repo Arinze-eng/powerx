@@ -3,7 +3,7 @@
     "brand": "nanobot",
     "loading": {
       "connecting": "Connecting to nanobot…",
-      "boot": "Loading nanobot…"
+      "boot": "Loading CDNAI…"
     },
     "error": {
       "title": "Couldn't reach nanobot",
@@ -38,7 +38,7 @@
       "chat": "{{title}} · nanobot"
     },
     "meta": {
-      "description": "nanobot web UI — chat with your nanobot workspace."
+      "description": "CDNAI — the AI work partner that writes, builds, analyzes and automates."
     },
     "pairing": {
       "title": "Pair a chat user",
