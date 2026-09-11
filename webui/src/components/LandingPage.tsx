@@ -59,7 +59,7 @@ export function LandingPage({ onSignIn, onSignUp, onPrivacy }: LandingPageProps)
   };
 
   return (
-    <div className="relative min-h-full w-full overflow-x-hidden bg-[#0b0a14] text-white">
+    <div className="relative h-full w-full overflow-x-hidden overflow-y-auto bg-[#0b0a14] text-white">
       {/* Nav */}
       <header className="sticky top-0 z-40 border-b border-white/10 bg-[#0b0a14]/85 backdrop-blur-md">
         <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-5 sm:px-8">

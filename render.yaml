@@ -36,11 +36,13 @@ services:
       - key: SUPABASE_AUTH_ENABLED
         value: "true"
       - key: SUPABASE_WEBUI_AUTH
-        value: "true"
+        value: "false"
       - key: SUPABASE_GATEWAY_KEY
         sync: false
       - key: NANOBOT_WEB_TOKEN
         generateValue: true
+      - key: NANOBOT_PERSISTENT_DISK
+        value: "true"
       - key: RENDER
         value: "true"
       - key: PORT
