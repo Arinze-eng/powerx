@@ -59,6 +59,31 @@ class UpstashError(RuntimeError):
     """Raised when the Upstash Box API rejects a request."""
 
 
+class UpstashFileNotFound(UpstashError):
+    """Raised when a remote file does not exist.
+
+    Upstash's ``files/read`` endpoint answers *missing* files with an opaque
+    ``HTTP 500 {"error": "Failed to read file"}`` rather than a clean 404, so we
+    translate that shape into a distinct, catchable error. Callers that merely
+    want to know "is there content here?" can treat it as empty instead of a hard
+    failure — this is what previously surfaced to users as "could not write".
+    """
+
+
+# Substrings Upstash uses when a read fails because the target is absent.
+_MISSING_FILE_HINTS = (
+    "failed to read file",
+    "no such file",
+    "not found",
+    "does not exist",
+)
+
+
+def _looks_like_missing_file(detail: str) -> bool:
+    lowered = (detail or "").lower()
+    return any(hint in lowered for hint in _MISSING_FILE_HINTS)
+
+
 def validate_upstash_api_key(raw: str) -> str:
     value = str(raw or "").strip()
     if not value:
@@ -175,6 +200,13 @@ class UpstashExecutionBackend:
                     data = {"raw": text}
                 if resp.status >= 400:
                     detail = str(data.get("error") or data.get("message") or text)[:300]
+                    # Upstash reports *missing* files as an opaque HTTP 500; turn
+                    # that specific shape into a typed, recoverable error so reads
+                    # of not-yet-written paths don't blow up the whole operation.
+                    if resp.status == 500 and _looks_like_missing_file(detail):
+                        raise UpstashFileNotFound(
+                            f"{method} {path}: file not found ({detail})"
+                        )
                     raise UpstashError(f"{method} {path} failed with HTTP {resp.status}: {detail}")
                 return data
         except aiohttp.ClientError as exc:
@@ -294,9 +326,15 @@ class UpstashExecutionBackend:
         target = _safe_path(path, self.workspace)
         async with aiohttp.ClientSession() as session:
             box_id = await self.ensure_box(session)
-            data = await self._request(
-                session, "GET", f"/v2/box/{box_id}/files/read?path={quote(target, safe='')}", timeout=90
-            )
+            try:
+                data = await self._request(
+                    session, "GET", f"/v2/box/{box_id}/files/read?path={quote(target, safe='')}", timeout=90
+                )
+            except UpstashFileNotFound:
+                # A read of a path that was never written is not an error worth
+                # surfacing to the model as a failure — treat it as empty content
+                # so callers (and write-then-read flows) proceed normally.
+                return ""
         if isinstance(data, dict) and "content" in data:
             return _truncate(str(data.get("content") or ""))
         # Not text-decodable server-side: fall back to a base64 dump via exec.
@@ -308,17 +346,39 @@ class UpstashExecutionBackend:
         if len(content) > _MAX_CONTENT_CHARS:
             raise ValueError(f"content exceeds {_MAX_CONTENT_CHARS} characters")
         parent = posixpath.dirname(target)
-        async with aiohttp.ClientSession() as session:
-            box_id = await self.ensure_box(session)
-            if parent and parent != "/":
-                await self._exec(session, box_id, f"mkdir -p {shlex.quote(parent)}", 60)
-            await self._request(
-                session,
-                "POST",
-                f"/v2/box/{box_id}/files/write",
-                body={"path": target, "content": content},
-                timeout=90,
-            )
+        # Two attempts: a cold/expired box can reject the first call with a
+        # transient 5xx or transport error; re-ensuring (which may create a fresh
+        # box) and retrying once recovers those without bothering the user.
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    box_id = await self.ensure_box(session)
+                    if parent and parent != "/":
+                        await self._exec(session, box_id, f"mkdir -p {shlex.quote(parent)}", 60)
+                    await self._request(
+                        session,
+                        "POST",
+                        f"/v2/box/{box_id}/files/write",
+                        body={"path": target, "content": content},
+                        timeout=90,
+                    )
+                # Verify the write actually landed; Upstash occasionally reports
+                # success while the box is mid-restart, which previously surfaced
+                # to users as a silent "could not write".
+                probe = await self.read(target)
+                if probe == "" and content != "":
+                    raise UpstashError("write verification failed (empty read-back)")
+                return
+            except UpstashFileNotFound:
+                return  # empty write to an absent path is fine
+            except UpstashError as exc:
+                last_error = exc
+                # Force ensure_box to re-resolve/create on the next attempt.
+                self.last_box_id = ""
+                await asyncio.sleep(1.5)
+        assert last_error is not None
+        raise last_error
 
     async def write_bytes(self, path: str, data: bytes) -> None:
         target = _safe_path(path, self.workspace)
@@ -371,7 +431,20 @@ class UpstashExecutionBackend:
         try:
             size = int(size_text)
         except ValueError:
-            raise UpstashError("could not determine remote file size") from None
+            # A cold box can answer the first stat with an empty/failed result;
+            # re-ensure the box (recreating if it expired) and try once more
+            # before declaring failure. This is what used to read as
+            # "could not determine remote file size".
+            self.last_box_id = ""
+            await asyncio.sleep(1.5)
+            probe = await self.run(f"stat -c %s {shlex.quote(target)}", timeout=30)
+            size_text = probe.splitlines()[0].strip() if probe else ""
+            try:
+                size = int(size_text)
+            except ValueError:
+                raise UpstashFileNotFound(
+                    f"remote file not found or unreadable: {target}"
+                ) from None
         if size > _MAX_DOWNLOAD_BYTES:
             raise ValueError("remote artifact exceeds 50 MiB")
         encoded = await self.run(f"base64 {shlex.quote(target)}", timeout=120)

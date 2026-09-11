@@ -82,8 +82,8 @@ _FORBIDDEN_ATTR_PREFIXES = ("_class_", "_dict_", "_bases_", "_subclasses_", "_mr
 _BRIDGES: dict[str, tuple[str, list[str]]] = {
     "read_file": ("read_file", ["path"]),
     "write_file": ("write_file", ["path", "content"]),
-    "list_files": ("list_files", ["path"]),
-    "search": ("search", ["query"]),
+    "list_files": ("list_dir", ["path"]),
+    "search": ("web_search", ["query"]),
     "web_fetch": ("web_fetch", ["url"]),
     "exec": ("exec", ["command"]),
 }
@@ -307,6 +307,36 @@ class _Executor:
             raise
         except AttributeError as exc:
             raise PythonCodeError(f"Attribute error: {exc}") from exc
+
+    async def _eval_JoinedStr(self, node: ast.JoinedStr) -> str:
+        # f-strings: concatenate literal parts with evaluated FormattedValues.
+        parts: list[str] = []
+        for val in node.values:
+            if isinstance(val, ast.Constant):
+                parts.append(str(val.value))
+            elif isinstance(val, ast.FormattedValue):
+                rendered = await self.eval(val.value)
+                if val.conversion == ord("r"):
+                    parts.append(repr(rendered))
+                elif val.conversion == ord("s"):
+                    parts.append(str(rendered))
+                elif val.conversion == ord("a"):
+                    parts.append(ascii(rendered))
+                else:
+                    parts.append(format(rendered, "") if val.format_spec is None
+                                 else format(rendered, await self._eval_format_spec(val.format_spec)))
+            else:  # pragma: no cover - defensive
+                parts.append(str(await self.eval(val)))
+        return "".join(parts)
+
+    async def _eval_format_spec(self, spec: ast.expr | None) -> str:
+        if spec is None:
+            return ""
+        return str(await self.eval(spec))
+
+    async def _eval_FormattedValue(self, node: ast.FormattedValue) -> Any:  # pragma: no cover
+        # Only reached if a FormattedValue appears outside a JoinedStr.
+        return await self.eval(node.value)
 
     async def _eval_Call(self, node: ast.Call) -> Any:
         # Bridge tool calls: read_file(...), exec(...) etc. -> awaited locally.

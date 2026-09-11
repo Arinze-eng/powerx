@@ -40,7 +40,7 @@ class _CountingTools:
             return "alpha\nbeta\ngamma"
         if name == "exec":
             return f"ran:{args['command']}"
-        if name == "list_files":
+        if name in ("list_files", "list_dir"):  # bridge maps list_files -> list_dir
             return "a.txt\nb.txt\nc.txt"
         return "ok"
 
@@ -70,6 +70,28 @@ async def test_function_def_and_comprehension() -> None:
     code = "def sq(x):\n    return x * x\nfinal_answer([sq(i) for i in range(5)])"
     result = await run_python_code(code, tool_call=tools)
     assert result == [0, 1, 4, 9, 16]
+
+
+@pytest.mark.asyncio
+async def test_f_strings_work() -> None:
+    """Models use f-strings constantly; JoinedStr must be supported."""
+    tools = _CountingTools()
+    code = 'name="world"\nfinal_answer(f"hello {name} {1+2}")'
+    result = await run_python_code(code, tool_call=tools)
+    assert result == "hello world 3"
+
+
+@pytest.mark.asyncio
+async def test_f_string_with_repr_and_loop() -> None:
+    tools = _CountingTools()
+    code = (
+        "out=[]\n"
+        "for i in range(3):\n"
+        "    out.append(f'item-{i!r}')\n"
+        "final_answer(out)"
+    )
+    result = await run_python_code(code, tool_call=tools)
+    assert result == ["item-0", "item-1", "item-2"]
 
 
 @pytest.mark.asyncio

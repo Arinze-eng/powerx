@@ -198,3 +198,124 @@ def test_execution_section_loads_via_get_fetch_not_socket():
     assert "adminRequest('admin.execution.get')" not in section
     assert "adminRequest('admin.execution.save'" not in section
     assert "adminRequest('admin.execution.test'" not in section
+
+
+# --------------------------------------------------------------------------- #
+# Cold-box / missing-file recovery (the "could not write" fix)                #
+# --------------------------------------------------------------------------- #
+
+from nanobot.agent.tools.upstash_backend import (  # noqa: E402
+    UpstashError,
+    UpstashFileNotFound,
+    _looks_like_missing_file,
+)
+
+
+def test_detects_missing_file_500():
+    assert _looks_like_missing_file("Failed to read file")
+    assert _looks_like_missing_file("no such file or directory")
+    assert not _looks_like_missing_file("rate limit exceeded")
+
+
+@pytest.mark.asyncio
+async def test_read_of_missing_file_returns_empty(monkeypatch):
+    """A read of a never-written path must NOT raise — it returns ''."""
+    backend = UpstashExecutionBackend(_config(), box_name="px-test-1")
+
+    async def fake_ensure(session):
+        return "box-x"
+
+    async def fake_request(session, method, path, **kw):
+        if "files/read" in path:
+            raise UpstashFileNotFound("GET .../files/read: file not found (Failed to read file)")
+        return {}
+
+    monkeypatch.setattr(backend, "ensure_box", fake_ensure)
+    monkeypatch.setattr(backend, "_request", fake_request)
+    result = await backend.read("does-not-exist.txt")
+    assert result == ""
+
+
+@pytest.mark.asyncio
+async def test_write_retries_once_on_transient_error(monkeypatch):
+    """First write attempt fails with a transient UpstashError; second succeeds.
+
+    This models the cold/expired box that rejects the first call — the retry after
+    re-ensuring recovers without surfacing 'could not write' to the user.
+    """
+    backend = UpstashExecutionBackend(_config(), box_name="px-test-1")
+    attempts = {"n": 0}
+
+    async def fake_ensure(session):
+        return "box-x"
+
+    async def fake_exec(session, box_id, cmd, timeout):
+        return {"exit_code": 0, "output": "", "error": ""}
+
+    async def fake_request(session, method, path, **kw):
+        if "files/write" in path:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise UpstashError("POST .../files/write failed with HTTP 500: transient")
+            return {"success": True}
+        return {}
+
+    monkeypatch.setattr(backend, "ensure_box", fake_ensure)
+    monkeypatch.setattr(backend, "_exec", fake_exec)
+    monkeypatch.setattr(backend, "_request", fake_request)
+    # Read-back verification: pretend content is present after successful write.
+    async def fake_read(path):
+        return "hello"
+    monkeypatch.setattr(backend, "read", fake_read)
+    # Avoid real sleep in tests.
+    async def no_sleep(_):
+        return None
+    monkeypatch.setattr("nanobot.agent.tools.upstash_backend.asyncio.sleep", no_sleep)
+
+    await backend.write("out.txt", "hello")
+    assert attempts["n"] == 2  # retried and succeeded
+
+
+@pytest.mark.asyncio
+async def test_write_raises_after_two_failures(monkeypatch):
+    backend = UpstashExecutionBackend(_config(), box_name="px-test-1")
+
+    async def fake_ensure(session):
+        return "box-x"
+
+    async def fake_exec(session, box_id, cmd, timeout):
+        return {"exit_code": 0, "output": "", "error": ""}
+
+    async def always_fail(session, method, path, **kw):
+        if "files/write" in path:
+            raise UpstashError("POST .../files/write failed with HTTP 503: down")
+        return {}
+
+    monkeypatch.setattr(backend, "ensure_box", fake_ensure)
+    monkeypatch.setattr(backend, "_exec", fake_exec)
+    monkeypatch.setattr(backend, "_request", always_fail)
+    async def no_sleep(_):
+        return None
+    monkeypatch.setattr("nanobot.agent.tools.upstash_backend.asyncio.sleep", no_sleep)
+
+    with pytest.raises(UpstashError):
+        await backend.write("out.txt", "data")
+
+
+@pytest.mark.asyncio
+async def test_download_missing_file_clear_error(monkeypatch):
+    """stat failing twice -> UpstashFileNotFound, not the old opaque message."""
+    backend = UpstashExecutionBackend(_config(), box_name="px-test-1")
+
+    async def fake_run(cmd, timeout=120):
+        # stat returns exit_code != 0 with empty size line
+        return "\n[exit_code=1]"
+
+    monkeypatch.setattr(backend, "run", fake_run)
+    async def no_sleep(_):
+        return None
+    monkeypatch.setattr("nanobot.agent.tools.upstash_backend.asyncio.sleep", no_sleep)
+
+    with pytest.raises(UpstashFileNotFound):
+        await backend.download("missing.bin", "/tmp/x")
+
