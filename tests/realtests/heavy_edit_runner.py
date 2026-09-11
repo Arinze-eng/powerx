@@ -133,19 +133,20 @@ class Count(OpenAICompatProvider):
 async def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--key",default="")
     ap.add_argument("--repo",default=str(Path(__file__).parents[1]/"third_repo")); ap.add_argument("--iter",type=int,default=20)
-    ap.add_argument("--task",default="edit")
+    ap.add_argument("--task",default="edit"); ap.add_argument("--base",default="https://integrate.api.nvidia.com/v1"); ap.add_argument("--model",default="nvidia/nemotron-3-super-120b-a12b")
     a=ap.parse_args()
-    if a.key: os.environ["NV_KEY"]=a.key
-    prov=Count(api_key=os.environ["NV_KEY"], api_base="https://integrate.api.nvidia.com/v1", default_model="nvidia/nemotron-3-super-120b-a12b")
+    key = a.key or os.environ.get("NV_KEY") or os.environ.get("API_KEY","")
+    if not key: raise SystemExit("set --key or NV_KEY/API_KEY env")
+    prov=Count(api_key=key, api_base=a.base, default_model=a.model)
     reg=ToolRegistry()
     root=Path(a.repo)
     rd=ReadTool(root); gr=GrepTool(root); wr=WriteTool(root); ex=ExecTool(root)
     for t in (rd,gr,wr,ex): reg.register(t)
     pt=RunPlanTool(); pt.bind_registry(reg); reg.register(pt)
     spec=make_run_spec(prov, initial_messages=[{"role":"user","content":TASKS[a.task]}],
-        model="nvidia/nemotron-3-super-120b-a12b", tools=reg, max_iterations=a.iter,
+        model=a.model, tools=reg, max_iterations=a.iter,
         max_tool_result_chars=15000, workspace=str(root))
-    print("TOOLS:", reg.tool_names, "| TASK:", a.task)
+    print("TOOLS:", reg.tool_names, "| TASK:", a.task, "| MODEL:", a.model, "| base:", a.base)
     res=await AgentRunner().run(spec)
     print("\n==== HEAVY TEST RESULT ====")
     print("stop:", res.stop_reason, "| error:", res.error, "| CALLS:", prov.n)

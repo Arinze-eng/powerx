@@ -65,7 +65,13 @@ class RunPlanTool(Tool):
             "running its 'do' sub-steps per item WITHOUT calling the model again. "
             "Use this INSTEAD of many separate sandbox/read/exec calls whenever a "
             "task needs more than ~2 steps or must loop over files/items. It is far "
-            "cheaper: hundreds of commands still cost one model call."
+            "cheaper: hundreds of commands still cost one model call. "
+            "EDITING RULES (required): edit files ONLY through structured tools "
+            "(write_file / apply_patch) with explicit content — never run inline "
+            "python -c/sed/awk inside an exec step to mutate a file, because that "
+            "is error-prone and mangles files (e.g. collapsing a docstring onto the "
+            "def line). If you must inspect a region first, read it, then re-emit "
+            "the FULL corrected file via write_file/apply_patch."
         )
 
     @property
