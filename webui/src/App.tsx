@@ -1295,20 +1295,15 @@ export default function App() {
   }
   // ---- CDNAI marketing routes (shown only while unauthenticated) ----------
   // A signed-in user (status "ready") always sees the app below. For Supabase-
-  // gated deployments, unauthenticated visitors get the landing page at #/ (or
-  // no hash), plus dedicated login / signup / privacy views. The real Supabase
-  // auth handlers are reused untouched. The legacy token AuthForm (self-hosted
-  // / API-key mode) is NOT intercepted — it renders directly as before.
-  const isMarketingRoute =
-    state.status === "supabase" &&
-    (route === "" ||
-      route === "#" ||
-      route === "#/" ||
-      route === "#/login" ||
-      route === "#/signup" ||
-      route === "#/privacy");
-
-  if (isMarketingRoute) {
+  // gated deployments, EVERY unauthenticated visitor gets the CDNAI marketing
+  // surface — never a bare auth form. Dedicated #/login / #/signup / #/privacy
+  // views render their own screens; any other route (empty, "#/", "#/new",
+  // "#/chat/…", restored restart hashes, etc.) falls back to the landing page
+  // so mobile users who deep-link or get redirected still see the designed
+  // home with sign-in/sign-up tucked into the header/hamburger. The real
+  // Supabase auth handlers are reused untouched. The legacy token AuthForm
+  // (self-hosted / API-key mode) is NOT intercepted — it renders as before.
+  if (state.status === "supabase") {
     if (route === "#/privacy") {
       return <PrivacyPolicy onBack={() => navigate("#/")} />;
     }
@@ -1332,7 +1327,7 @@ export default function App() {
         />
       );
     }
-    // Default marketing route: the landing page.
+    // Default for all other unauthenticated routes: the landing page.
     return (
       <LandingPage
         onSignIn={() => navigate("#/login")}
@@ -1350,23 +1345,7 @@ export default function App() {
       />
     );
   }
-  if (state.status === "supabase") {
-    return (
-      <SupabaseAuthPage
-        supabaseUrl={state.supabaseUrl}
-        anonKey={state.anonKey}
-        failed={state.failed}
-        message={state.message}
-        onSignIn={(email, password) =>
-          handleSupabaseSignIn(state.supabaseUrl, state.anonKey, email, password)
-        }
-        onSignUp={(name, email, password) =>
-          handleSupabaseSignUp(state.supabaseUrl, state.anonKey, name, email, password)
-        }
-        onPrivacy={() => navigate("#/privacy")}
-      />
-    );
-  }
+
   if (state.status === "error") {
     return (
       <div className="flex h-full w-full items-center justify-center px-4 text-center">

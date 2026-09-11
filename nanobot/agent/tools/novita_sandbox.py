@@ -28,8 +28,13 @@ from nanobot.agent.tools.vps_backend import VPSExecutionBackend
 from nanobot.config.paths import get_data_dir, get_workspace_path
 from nanobot.utils.gofile import GoFileError, is_gofile_url, request_file, resolve_gofile_download
 from nanobot.utils.helpers import detect_image_mime
+from nanobot.utils.tmpfiles import TmpfilesError
 from nanobot.utils.tmpfiles import upload_bytes as upload_tmpfile_bytes
 from nanobot.utils.tmpfiles import upload_path as upload_tmpfile_path
+from nanobot.utils.file_share import (
+    FileShareError,
+    upload_artifact_path as upload_shared_artifact,
+)
 
 try:
     from novita_sandbox import Novita
@@ -551,9 +556,11 @@ class NovitaSandboxTool(Tool):
             "in VPS mode, use action=install with a space-separated list of distro package "
             "names; installation is noninteractive and uses root or already-configured "
             "passwordless sudo. Never add repositories, remove packages, or put a sudo "
-            "password in a command. When a finished file should be returned, call "
-            "download_url with its remote workspace path; this downloads the artifact and "
-            "also creates a temporary tmpfiles.org link. Use the local path in the message "
+            "password in a command. When a finished file should be returned to the user, "
+            "ALWAYS call download_url with its remote workspace path; this downloads the "
+            "artifact and publishes a public link automatically — files under ~50 MB go to "
+            "tmpfiles.org, larger files (up to ~200 MB) go to catbox.moe. Give the user that "
+            "link instead of pasting raw file contents. Use the local path in the message "
             "tool's media parameter when direct attachment delivery is available. "
             "For multi-step work, prefer the sandbox_batch tool so many operations "
             "cost one model call instead of one call per step."
@@ -1260,11 +1267,18 @@ class NovitaSandboxTool(Tool):
             if action == "download_url":
                 destination = self._artifact_destination(path)
                 downloaded = await backend.download(path, destination)
-                tmpfile = await upload_tmpfile_path(downloaded)
+                try:
+                    shared = await upload_shared_artifact(downloaded)
+                except (FileShareError, TmpfilesError) as exc:
+                    return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
+                host_label = shared.get("host", "tmpfiles")
+                expiry_note = (
+                    "expires soon" if host_label == "tmpfiles" else "stored permanently"
+                )
                 return (
                     f"Downloaded remote artifact to local path: {downloaded}\n"
-                    "A temporary public download link is also available and expires soon:\n"
-                    f"{tmpfile['download_url']}\n"
+                    f"A public download link ({host_label}) is available and {expiry_note}:\n"
+                    f"{shared['url']}\n"
                     "Give the user this link and do NOT paste the file contents into "
                     "your reply. The file may also be attached directly via the "
                     "message tool's media parameter when direct attachment delivery "
@@ -1397,11 +1411,18 @@ class NovitaSandboxTool(Tool):
                     path = str(kwargs.get("path") or "")
                     destination = self._artifact_destination(path)
                     downloaded = await backend.download(path, destination)
-                    tmpfile = await upload_tmpfile_path(downloaded)
+                    try:
+                        shared = await upload_shared_artifact(downloaded)
+                    except (FileShareError, TmpfilesError) as exc:
+                        return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
+                    host_label = shared.get("host", "tmpfiles")
+                    expiry_note = (
+                        "expires soon" if host_label == "tmpfiles" else "stored permanently"
+                    )
                     return (
                         f"Downloaded remote artifact to local path: {downloaded}\n"
-                        "A temporary public download link is also available and expires soon:\n"
-                        f"{tmpfile['download_url']}\n"
+                        f"A public download link ({host_label}) is available and {expiry_note}:\n"
+                        f"{shared['url']}\n"
                         "Give the user this link and do NOT paste the file contents into "
                         "your reply. The file may also be attached directly via the "
                         "message tool's media parameter when direct attachment delivery "
