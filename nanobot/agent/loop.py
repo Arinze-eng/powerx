@@ -716,6 +716,27 @@ class AgentLoop:
         except Exception:  # pragma: no cover - never let an optional tool break startup
             logger.exception("Failed to register run_plan tool")
 
+        # --- python_code: smolagents-style local AST interpreter -------------
+        # Lets the model emit ONE Python program (loops, branches, data munging,
+        # tool calls) that runs LOCALLY with ZERO extra provider round-trips.
+        # This is the primary LLM-cost saver: a 100-iteration loop costs one call,
+        # not one per iteration. Registered explicitly because it needs a
+        # back-reference to the live registry to bridge sibling tools. Enabled by
+        # default; disable via POWERX_DISABLE_PYTHON_CODE=1 if ever needed.
+        try:
+            import os as _os
+
+            from nanobot.agent.tools.python_code import PythonCodeTool
+
+            if not _os.environ.get("POWERX_DISABLE_PYTHON_CODE"):
+                if not self.tools.has("python_code"):
+                    py_tool = PythonCodeTool()
+                    py_tool.bind_registry(self.tools)
+                    self.tools.register(py_tool)
+                    registered.append("python_code")
+        except Exception:  # pragma: no cover - never let an optional tool break startup
+            logger.exception("Failed to register python_code tool")
+
         # MyTool receives only the explicit runtime-control capability.
         if self.tools_config.my.enable:
             self.tools.register(
