@@ -2032,12 +2032,17 @@ class AgentRunner:
         if state is None:
             return None
         name = tool_call.name
-        # Reward correct behaviour: a batch resets the streak counter.
-        if name == "sandbox_batch":
+        # Reward correct behaviour: a batch/plan call resets the streak counter.
+        if name in {"sandbox_batch", "run_plan"}:
             state["single_run_streak"] = 0
             state["inspection_streak"] = 0
             return None
+        has_run_plan = bool(getattr(spec.tools, "has", lambda _: False)("run_plan"))
         batch_available = bool(getattr(spec.tools, "has", lambda _: False)("sandbox_batch"))
+        # Enforcement is active when EITHER the sandbox_batch OR the cheaper and
+        # more structured run_plan tool is available to consolidate remaining work.
+        enforceable = has_run_plan or batch_available
+        preferred = "run_plan" if has_run_plan else "sandbox_batch"
         # --- Post-nudge runaway-walk guard (Addition 3) ---------------------
         # The classic "check this zip/project" blow-up is a long chain of LONE
         # read/list/grep/exec calls, none of which the sandbox-only rule policed.
@@ -2049,7 +2054,7 @@ class AgentRunner:
         # via POWERX_MAX_LONE_INSPECTIONS (<=0 disables the guard).
         max_lone = int(os.environ.get("POWERX_MAX_LONE_INSPECTIONS", "8"))
         if (
-            batch_available
+            enforceable
             and max_lone > 0
             and state.get("nudged")
             and name in self._BATCH_NUDGE_TOOLS
@@ -2061,14 +2066,16 @@ class AgentRunner:
                     f"BATCHING REQUIRED: you have issued {insp} separate lone "
                     f"'{name}' steps in this task; each costs a full model round-trip. "
                     "Stop walking the workspace one call at a time. Make ONE "
-                    "sandbox_batch call whose script performs ALL remaining "
-                    "inspection/reads/checks in a loop and prints a single combined "
-                    "summary. Retry now using sandbox_batch."
+                    f"{preferred} call that performs ALL remaining "
+                    "inspection/reads/checks — with run_plan use a plan of steps plus "
+                    "a `foreach` over items so they run WITHOUT calling you again; "
+                    "with sandbox_batch put the whole remaining job inside one script. "
+                    f"Retry now using {preferred}."
                 )
                 event = {
                     "name": name,
                     "status": "error",
-                    "detail": "batching required: too many lone inspection steps",
+                    "detail": f"batching required: too many lone inspection steps ({preferred})",
                 }
                 logger.info(
                     "Batching guard blocked lone '{}' (inspection_streak={}) for {}",
@@ -2153,12 +2160,17 @@ class AgentRunner:
             return None
         if tool_call.name not in self._BATCH_NUDGE_TOOLS:
             return None
-        # Only worth nudging if there is a batch tool to move toward.
+        # Only worth nudging if there is a batch tool OR the (cheaper) run_plan
+        # tool to steer toward. run_plan is strictly better than sandbox_batch
+        # for agentic file work (structured steps + foreach loops, no shell
+        # scripting), so if it is registered we prefer to steer there even when
+        # sandbox_batch is absent.
+        has_run_plan = bool(getattr(spec.tools, "has", lambda _: False)("run_plan"))
         batch_available = bool(getattr(spec.tools, "has", lambda _: False)("sandbox_batch"))
-        if not batch_available:
+        if not (has_run_plan or batch_available):
             return None
-        # A whole-turn batch call means the model already behaves well.
-        if tool_call.name == "sandbox_batch":
+        # A whole-turn batch/plan call means the model already behaves well.
+        if tool_call.name in {"sandbox_batch", "run_plan"}:
             return None
         # Don't nag a genuinely one-shot action. Only nudge when the result
         # itself suggests a tree/list worth walking (many lines or file names),

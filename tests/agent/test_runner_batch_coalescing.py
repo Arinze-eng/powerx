@@ -156,6 +156,28 @@ def test_nudge_skipped_when_no_batch_tool_available() -> None:
     assert runner._maybe_inject_batching_nudge(spec, call, "x") is None
 
 
+def test_nudge_fires_when_only_run_plan_available() -> None:
+    """The nudge must fire when run_plan is registered even if sandbox_batch is
+    absent. run_plan is the cheaper/structured path for agentic file work, so the
+    pre-emptive batching tip should still steer toward it. Fix: previously the
+    nudge was hard-gated on sandbox_batch existing, so a harness/agent exposing
+    only file tools + run_plan never got nudged and burned full round-trips."""
+    runner = AgentRunner()
+    # has() returns True ONLY for run_plan, False for everything else.
+    tools = MagicMock()
+    def _has(name: str) -> bool:
+        return name == "run_plan"
+    tools.has.side_effect = _has
+    spec = SimpleNamespace(tools=tools)
+    spec.batch_enforcement_state = {}
+    spec.session_key = "test"
+    big_listing = "\n".join(f"file_{i}.py" for i in range(12))
+    call = ToolCallRequest(id="1", name="list_dir", arguments={"path": "."})
+    nudge = runner._maybe_inject_batching_nudge(spec, call, big_listing)
+    assert nudge is not None
+    assert "run_plan" in nudge
+
+
 def test_nudge_not_applied_to_a_good_batch_call() -> None:
     runner = AgentRunner()
     spec = _spec_with_batch()
