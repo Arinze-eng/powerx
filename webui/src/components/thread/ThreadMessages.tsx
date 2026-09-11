@@ -283,6 +283,7 @@ const ThreadDisplayUnit = memo(function ThreadDisplayUnit({
             isTurnStreaming={isTurnStreaming}
             hasBodyBelow={hasBodyBelow}
             turnLatencyMs={unit.turnLatencyMs}
+            turnUsage={unit.turnUsage}
             startedAtMs={unit.startedAtMs}
             cliApps={cliApps}
             mcpPresets={mcpPresets}

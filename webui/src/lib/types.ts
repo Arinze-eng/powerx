@@ -77,6 +77,10 @@ export interface UIMessage {
   latencyMs?: number;
   /** Client epoch milliseconds when the definitive ``turn_end`` was received. */
   completedAt?: number;
+  /** Per-turn cost counters surfaced from ``turn_end`` usage (e.g.
+   * ``llm_calls`` = distinct model requests hitting the configured LLM).
+   * Lets the UI show "API calls: N" like the Manus task panel. */
+  turnUsage?: Record<string, number>;
   /** Lightweight provenance for proactive assistant messages. */
   source?: UIMessageSource;
   /** Structured provenance for a message delivered by another session. */
@@ -1349,6 +1353,10 @@ export type InboundEvent =
       latency_ms?: number;
       /** Authoritative sustained-goal snapshot for this chat (same shape as ``goal_state`` events). */
       goal_state?: GoalStateWsPayload;
+      /** Per-turn cost/usage counters (e.g. ``llm_calls`` = distinct model
+       * requests that hit the configured LLM, ``deterministic`` = zero-call
+       * resolutions). Mirrors what the backend sends via ``send_turn_end``. */
+      usage?: Record<string, number>;
     } & InboundTurnMetadata)
   | ({
       event: "goal_status";

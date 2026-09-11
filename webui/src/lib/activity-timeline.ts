@@ -5,6 +5,8 @@ export type TurnUnit =
       type: "activity";
       messages: UIMessage[];
       turnLatencyMs?: number;
+      /** Per-turn cost counters (llm_calls, …) from the following assistant answer. */
+      turnUsage?: Record<string, number>;
       startedAtMs?: number;
     }
   | { type: "message"; message: UIMessage };
@@ -209,6 +211,7 @@ function pushActivityUnits(
       type: "activity",
       messages: runMessages,
       turnLatencyMs: activityTurnLatencyMs(runMessages, visibleMessages),
+      turnUsage: activityTurnUsage(runMessages, visibleMessages),
       startedAtMs,
     });
     runMessages = [];
@@ -281,6 +284,27 @@ function activityTurnLatencyMs(activityMessages: UIMessage[], visibleMessages: U
   for (let i = activityMessages.length - 1; i >= 0; i -= 1) {
     const latency = activityMessages[i].latencyMs;
     if (isValidLatency(latency)) return latency;
+  }
+  return undefined;
+}
+
+/**
+ * Resolve the per-turn cost counters (``llm_calls`` etc.) that belong to this
+ * activity run. They are stamped onto the assistant answer that follows the
+ * activity, so scan forward first (nearest following answer), then fall back to
+ * any message carrying them.
+ */
+function activityTurnUsage(
+  activityMessages: UIMessage[],
+  visibleMessages: UIMessage[],
+): Record<string, number> | undefined {
+  for (let i = visibleMessages.length - 1; i >= 0; i -= 1) {
+    const usage = visibleMessages[i].turnUsage;
+    if (usage && Object.keys(usage).length > 0) return usage;
+  }
+  for (let i = activityMessages.length - 1; i >= 0; i -= 1) {
+    const usage = activityMessages[i].turnUsage;
+    if (usage && Object.keys(usage).length > 0) return usage;
   }
   return undefined;
 }

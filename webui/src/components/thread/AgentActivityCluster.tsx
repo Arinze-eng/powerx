@@ -13,6 +13,7 @@ import { useTranslation } from "react-i18next";
 
 import { cliAppInitials, mcpPresetInitials } from "@/components/CliAppMentionText";
 import { ActivityStep } from "@/components/thread/activity/ActivityStep";
+import { TaskStatsPanel } from "@/components/thread/TaskStatsPanel";
 import { coalesceActivityMessages } from "@/components/thread/activity/activity-message-model";
 import {
   compactActivityPath,
@@ -123,6 +124,8 @@ interface AgentActivityClusterProps {
   hasBodyBelow: boolean;
   /** Persisted end-to-end turn latency from the assistant answer, used for history replay. */
   turnLatencyMs?: number;
+  /** Per-turn cost counters (``llm_calls`` etc.) surfaced on the Manus-style stats panel. */
+  turnUsage?: Record<string, number>;
   /** User turn start timestamp for live activity before the first trace/reasoning row. */
   startedAtMs?: number;
   cliApps?: CliAppInfo[];
@@ -139,6 +142,7 @@ export function AgentActivityCluster({
   isTurnStreaming,
   hasBodyBelow,
   turnLatencyMs,
+  turnUsage,
   startedAtMs,
   cliApps = [],
   mcpPresets = [],
@@ -361,6 +365,12 @@ export function AgentActivityCluster({
           />
         ) : null}
       </ThinkingReasoningShell>
+      <TaskStatsPanel
+        className="mt-1.5"
+        messages={activityMessages}
+        active={isTurnStreaming}
+        turnUsage={turnUsage}
+      />
     </div>
   );
 }

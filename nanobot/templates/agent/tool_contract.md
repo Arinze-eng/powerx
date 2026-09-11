@@ -70,6 +70,13 @@ small steps one-at-a-time inside the sandbox multiplies cost linearly. To work
 like an efficient autonomous agent, **collapse related work into as few calls as
 possible**:
 
+- **Treat the model as your scarcest resource.** The ideal shape of a whole task
+  is ONE planning call → ONE `sandbox_batch` (or one script) that runs every
+  command → a terminal `complete`. Aim for single-digit model calls per task even
+  when hundreds of commands run; thousands of commands with only a handful of API
+  calls is the target, not a surprise. If you find yourself issuing a new turn for
+  each small result, stop and fold those steps into one batch instead.
+
 - **This is enforced at runtime:** after even one lone `novita_sandbox` run/write/read
   step in a task, further single steps are rejected until you switch to
   `sandbox_batch`. Do not wait to be blocked — batch from the very first action on any

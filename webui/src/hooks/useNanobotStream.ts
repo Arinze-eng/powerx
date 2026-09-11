@@ -880,10 +880,23 @@ export function useNanobotStream(
             typeof ev.latency_ms === "number" && ev.latency_ms >= 0
               ? Math.round(ev.latency_ms)
               : undefined;
+          // Per-turn cost counters (llm_calls, deterministic, …). The backend
+          // sends these on turn_end; keep only non-negative numbers so the UI
+          // can render an honest "API calls: N" like the Manus task panel.
+          const usageRecord =
+            ev.usage && typeof ev.usage === "object" ? ev.usage : undefined;
+          const turnUsage: Record<string, number> | undefined = usageRecord
+            ? Object.fromEntries(
+                Object.entries(usageRecord).filter(
+                  ([, v]) => typeof v === "number" && Number.isFinite(v) && v >= 0,
+                ),
+              )
+            : undefined;
           finalized = stampLastAssistantCompletion(
             finalized,
             {
               ...(latencyMs !== undefined ? { latencyMs } : {}),
+              ...(turnUsage && Object.keys(turnUsage).length > 0 ? { turnUsage } : {}),
               completedAt,
             },
             ev.turn_id,
