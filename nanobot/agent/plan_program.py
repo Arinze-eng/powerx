@@ -88,9 +88,67 @@ class PlanResult:
         return any(not o.ok for o in self.outputs)
 
 
+#: Canonical failure markers produced by the sandbox runners. The novita/VPS/upstash
+#: backends render a command result with an explicit trailing ``[exit_code=N]`` marker
+#: (see novita_sandbox._output) — a nonzero N is an unambiguous failure regardless of
+#: whether stdout happened to start with "Error:". The plan executor MUST treat that
+#: as an error so a failed command inside a run_plan is reported honestly (and the
+#: model isn't fed a false "0 failures" summary that makes it waste more calls).
+_EXIT_CODE_RE = re.compile(r"(?:^|\D)\[exit_code\s*=\s*(-?\d+)\]")
+#: Common human-readable failure signals worth treating as errors even without the
+#: structured exit-code marker (e.g. host exec backends that don't render one), or
+#: when the error line is ANSI-coloured so the plain "Error:" prefix match misses it.
+_ERR_HINTS = (
+    "command not found",
+    "no such file or directory",
+    "not found",
+    "permission denied",
+    "is not recognized",
+    "failed",
+    # Python tracebacks render as "Traceback (most recent call last):" then
+    # "FileNotFoundError: ..." / "SyntaxError: ..." etc. Catching these keeps a
+    # failed py_compile/unit run from being reported as success.
+    "traceback (most recent call last)",
+    "file not found error",
+    "filenotfounderror",
+)
+
+
 def _is_error_result(result: Any) -> bool:
     text = str(result)
-    return text.lstrip().startswith(("Error:", "error:")) or "[Analyze the error" in text
+    stripped = text.lstrip()
+    if stripped.startswith(("Error:", "error:")) or "[Analyze the error" in text:
+        return True
+    # Some backends prepend ANSI colour codes to an "Error:"/"error:" line; strip
+    # simple ANSI escapes so those still match the prefix rule above.
+    ansi_stripped = _strip_ansi(stripped)
+    if ansi_stripped.startswith(("Error:", "error:")):
+        return True
+    # Canonical sandbox signal: a [exit_code=N] marker with a nonzero N.
+    exit_codes = _EXIT_CODE_RE.findall(text)
+    if exit_codes:
+        return any(code != "0" for code in exit_codes)
+    # Host-exec fallback: heuristic scan for shell/OS failure phrasing. A bare
+    # historic mention in multi-line output is gated to the first few lines so a
+    # file that merely *contains* "failed" far down isn't misclassified. A Python
+    # Traceback is only meaningful when it actually contains a raised exception
+    # line, so the whole text is checked for that one signal.
+    head_lower = [line.lower() for line in stripped.splitlines()[:5] if line.strip()]
+    if any(hint in line for hint in _ERR_HINTS for line in head_lower):
+        return True
+    if "traceback (most recent call last)" in text.lower():
+        return any(sym in text.lower() for sym in ("error:", "exception:", "error\n", "filenotfounderror", "syntaxerror"))
+    return False
+
+
+#: ANSI SGR escape sequences (color/bold reset etc.) that some backends wrap around
+#: error lines, e.g. `\x1b[31mError:\x1b[0m ...`. Stripping them lets the plain
+#: "Error:" prefix rule still match.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 def _interpolate(value: Any, scope: dict[str, Any]) -> Any:

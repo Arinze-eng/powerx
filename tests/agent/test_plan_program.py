@@ -213,6 +213,44 @@ class TestSafetyAndErrors:
         assert res.failed
         assert res.executed_steps == 2  # continued past the error
 
+    def test_sandbox_exit_code_failure_is_detected(self) -> None:
+        """A command result with a nonzero ``[exit_code=N]`` marker is an ERROR.
+
+        The novita/VPS/upstash backends render every command result with a
+        trailing ``[exit_code=N]``. A nonzero N (e.g. ``find`` on a missing path
+        exits 2, ``command not found`` exits 127) must be reported as a failure —
+        the old heuristic only matched a literal "Error:" prefix, so a genuinely
+        failed sandbox command inside a run_plan was marked ok and the plan's
+        "0 failures" summary lied to the model, costing it extra round-trips.
+        """
+        from nanobot.agent.plan_program import _is_error_result
+
+        assert _is_error_result("all good\n[exit_code=0]") is False
+        assert _is_error_result("find: missing: No such file or directory\n[exit_code=2]") is True
+        assert _is_error_result("bash: python3: command not found\n[exit_code=127]") is True
+        assert _is_error_result("\x1b[31mError:\x1b[0m boom") is True
+
+    def test_runaway_sandbox_failure_marks_plan_failed(self) -> None:
+        """End-to-end: a failing sandbox step marks the plan failed via exit-code."""
+        from nanobot.agent.plan_program import _is_error_result
+
+        async def ex(name: str, args: dict[str, Any]) -> str:
+            if name == "exec":
+                return "find: nope: No such file or directory\n[exit_code=2]"
+            return "ok"
+
+        res = asyncio.run(
+            execute_plan(
+                {"steps": [
+                    {"tool": "exec", "args": {"command": "find x"}, "id": "files"},
+                    {"foreach": "$files.split('\\n')", "as": "f", "do": [{"tool": "echo", "args": {}}]},
+                ]},
+                ex,
+            )
+        )
+        assert res.failed
+        assert not res.outputs[0].ok
+
     def test_parse_rejects_garbage(self) -> None:
         with pytest.raises(PlanProgramError):
             parse_plan("not json {")
