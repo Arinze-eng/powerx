@@ -943,6 +943,8 @@ export function useNanobotStream(
         if (ev.kind === "tool_hint" || ev.kind === "progress") {
           const structuredEvents = normalizeToolProgressEvents(ev.tool_events);
           const turn = turnFieldsFromEvent(ev, "activity");
+          const liveCalls =
+            typeof ev.usage?.llm_calls === "number" ? ev.usage.llm_calls : undefined;
           setMessages((prev) => {
             const segmentId = ensureActivitySegmentId();
             const base = prev;
@@ -987,6 +989,7 @@ export function useNanobotStream(
                   : lines[lines.length - 1],
                 toolEvents: mergedEvents,
                 activitySegmentId: last.activitySegmentId ?? segmentId,
+                ...(liveCalls !== undefined ? { liveLlmCalls: liveCalls } : {}),
                 ...turn,
               };
               return [...base.slice(0, -1), merged];
@@ -1001,6 +1004,7 @@ export function useNanobotStream(
                 traces: lines,
                 ...(visibleStructuredEvents.length ? { toolEvents: visibleStructuredEvents } : {}),
                 activitySegmentId: segmentId,
+                ...(liveCalls !== undefined ? { liveLlmCalls: liveCalls } : {}),
                 ...turn,
                 createdAt: Date.now(),
               },

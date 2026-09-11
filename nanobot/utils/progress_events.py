@@ -13,6 +13,10 @@ def on_progress_accepts_tool_events(cb: Callable[..., Any]) -> bool:
     return _on_progress_accepts(cb, "tool_events")
 
 
+def on_progress_accepts_usage(cb: Callable[..., Any]) -> bool:
+    return _on_progress_accepts(cb, "usage")
+
+
 def on_progress_accepts_file_edit_events(cb: Callable[..., Any]) -> bool:
     return _on_progress_accepts(cb, "file_edit_events")
 
@@ -33,8 +37,17 @@ async def invoke_on_progress(
     *,
     tool_hint: bool = False,
     tool_events: list[dict[str, Any]] | None = None,
+    usage: dict[str, int] | None = None,
 ) -> None:
     if tool_events and on_progress_accepts_tool_events(on_progress):
+        if usage is not None and on_progress_accepts_usage(on_progress):
+            await on_progress(
+                content,
+                tool_hint=tool_hint,
+                tool_events=tool_events,
+                usage=usage,
+            )
+            return
         await on_progress(content, tool_hint=tool_hint, tool_events=tool_events)
         return
     await on_progress(content, tool_hint=tool_hint)

@@ -81,6 +81,9 @@ export interface UIMessage {
    * ``llm_calls`` = distinct model requests hitting the configured LLM).
    * Lets the UI show "API calls: N" like the Manus task panel. */
   turnUsage?: Record<string, number>;
+  /** Live count of model requests so far this turn, streamed on activity frames
+   * while the agent runs (before the authoritative ``turnUsage`` arrives). */
+  liveLlmCalls?: number;
   /** Lightweight provenance for proactive assistant messages. */
   source?: UIMessageSource;
   /** Structured provenance for a message delivered by another session. */
@@ -1290,6 +1293,9 @@ export type InboundEvent =
       media?: string[];
       media_urls?: Array<{ url: string; name?: string }>;
       tool_events?: ToolProgressEvent[];
+      /** Live cost telemetry on activity frames (e.g. ``llm_calls`` so far this
+       * turn) so the UI can show an API-call counter ticking up while running. */
+      usage?: Record<string, number>;
       /** Present when the frame is an agent breadcrumb (e.g. tool hint,
        * generic progress line) rather than a conversational reply. */
       kind?: "tool_hint" | "progress" | "reasoning";

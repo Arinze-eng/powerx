@@ -727,6 +727,12 @@ class AgentRunner:
             raw_usage = self._usage_or_estimate(spec, messages_for_model, response)
             context.usage = dict(raw_usage)
             self._accumulate_usage(usage, raw_usage)
+            # Live API-call count: surface how many distinct model requests have
+            # hit the provider SO FAR this turn (this one included), so progress
+            # hooks can stream an honest "API calls: N" while the task runs —
+            # not just at completion. Cost discipline made visible.
+            if spec.llm_calls:
+                context.usage["llm_calls"] = spec.llm_calls[0]
             if reasoning_text and not context.streamed_reasoning:
                 await hook.emit_reasoning(reasoning_text)
                 await hook.emit_reasoning_end()

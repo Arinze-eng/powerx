@@ -57,6 +57,22 @@ class AgentProgressHook(AgentHook):
         return format_tool_hints(tool_calls, max_length=self._tool_hint_max_length)
 
     @staticmethod
+    def _live_usage(context: AgentHookContext) -> dict[str, int] | None:
+        """Return a minimal live usage snapshot for the UI's cost panel.
+
+        Only ``llm_calls`` is streamed mid-turn (the honest count of distinct
+        model requests so far). Token totals are withheld until completion to
+        avoid implying a per-step billing figure the user can't yet trust.
+        Returns ``None`` when no counter is available so older paths are
+        unaffected.
+        """
+        usage = context.usage or {}
+        llm_calls = usage.get("llm_calls")
+        if isinstance(llm_calls, int) and llm_calls >= 0:
+            return {"llm_calls": llm_calls}
+        return None
+
+    @staticmethod
     def _on_progress_accepts(cb: Callable[..., Any], name: str) -> bool:
         try:
             sig = inspect.signature(cb)
@@ -172,6 +188,7 @@ class AgentProgressHook(AgentHook):
                 cast(str, tool_hint),
                 tool_hint=True,
                 tool_events=tool_events,
+                usage=self._live_usage(context),
             )
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
@@ -209,6 +226,7 @@ class AgentProgressHook(AgentHook):
                     "",
                     tool_hint=False,
                     tool_events=tool_events,
+                    usage=self._live_usage(context),
                 )
         u = context.usage or {}
         logger.debug(

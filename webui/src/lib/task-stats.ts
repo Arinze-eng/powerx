@@ -191,9 +191,20 @@ export function computeTaskStats(
   filesCreated = Math.max(filesCreated, editRows);
 
   const usage = options.turnUsage;
-  const apiCalls = usage && typeof usage.llm_calls === "number"
+  let apiCalls = usage && typeof usage.llm_calls === "number"
     ? usage.llm_calls
     : null;
+
+  // While a turn is still streaming, fall back to the highest live count seen
+  // on activity frames so "API calls" ticks up in real time instead of staying
+  // blank until completion.
+  if (apiCalls === null) {
+    for (const message of messages) {
+      if (typeof message.liveLlmCalls === "number") {
+        apiCalls = apiCalls === null ? message.liveLlmCalls : Math.max(apiCalls, message.liveLlmCalls);
+      }
+    }
+  }
 
   return {
     commandsRun,

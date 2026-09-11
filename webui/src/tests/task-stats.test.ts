@@ -91,4 +91,18 @@ describe("computeTaskStats", () => {
     expect(stats.steps).toBe(0);
     expect(stats.apiCalls).toBeNull();
   });
+
+  it("uses the live streamed llm_calls while streaming, before turn_end", () => {
+    const events: ToolProgressEvent[] = [
+      { phase: "start", call_id: "b1", name: "sandbox_batch", arguments: { ops: [{ action: "run" }] } },
+    ];
+    const msg = traceMessage(events);
+    (msg as { liveLlmCalls?: number }).liveLlmCalls = 3;
+    const live = computeTaskStats([msg], { live: true });
+    expect(live.apiCalls).toBe(3);
+
+    // Authoritative turn_end usage wins over the live estimate.
+    const done = computeTaskStats([msg], { live: false, turnUsage: { llm_calls: 5 } });
+    expect(done.apiCalls).toBe(5);
+  });
 });

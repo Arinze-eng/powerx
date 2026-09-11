@@ -1996,6 +1996,10 @@ class WebSocketChannel(BaseChannel):
             payload["latency_ms"] = int(lat)
         if progress_event and progress_event.tool_events:
             payload["tool_events"] = progress_event.tool_events
+        if progress_event and getattr(progress_event, "usage", None):
+            # Live cost telemetry so the UI can show "API calls: N" ticking up
+            # while the task runs, not only after completion.
+            payload["usage"] = progress_event.usage
         agent_ui = msg.metadata.get(OUTBOUND_META_AGENT_UI)
         if agent_ui is not None:
             payload["agent_ui"] = agent_ui

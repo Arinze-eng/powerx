@@ -29,6 +29,7 @@ def build_bus_progress_callback(
         file_edit_events: list[dict[str, Any]] | None = None,
         reasoning: bool = False,
         reasoning_end: bool = False,
+        usage: dict[str, int] | None = None,
     ) -> None:
         await bus.publish_outbound(
             outbound_message_for_event(
@@ -41,6 +42,7 @@ def build_bus_progress_callback(
                     reasoning_end=reasoning_end,
                     tool_events=tool_events,
                     file_edit_events=file_edit_events,
+                    usage=usage,
                 ),
                 metadata=msg.metadata,
             )
@@ -54,6 +56,7 @@ def build_bus_progress_callback(
         file_edit_events: list[dict[str, Any]] | None = None,
         reasoning: bool = False,
         reasoning_end: bool = False,
+        usage: dict[str, int] | None = None,
     ) -> None:
         await _publish_progress(
             content,
@@ -62,6 +65,7 @@ def build_bus_progress_callback(
             file_edit_events=file_edit_events,
             reasoning=reasoning,
             reasoning_end=reasoning_end,
+            usage=usage,
         )
 
     return _bus_progress

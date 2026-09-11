@@ -28,6 +28,7 @@ class ProgressEvent(OutboundEvent):
     stream_id: str | None = None
     tool_events: list[dict[str, Any]] | None = None
     file_edit_events: list[dict[str, Any]] | None = None
+    usage: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
