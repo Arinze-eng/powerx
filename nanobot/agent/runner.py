@@ -22,23 +22,22 @@ from nanobot.agent.context_governance import (
 from nanobot.agent.deterministic_router import deterministic_plan, router_enabled
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
-from nanobot.agent.tool_middleware import ToolMiddleware
 from nanobot.agent.plan_cache import (
     make_plan_cache,
     normalize_task,
     plan_cache_enabled,
     plan_is_safe,
-    replayable_for,
     substitute_variables,
     variables_compatible,
 )
 from nanobot.agent.task_cache import make_replay_cache, task_fingerprint_text
+from nanobot.agent.task_router import task_recipe_plan
+from nanobot.agent.tool_middleware import ToolMiddleware
 from nanobot.agent.tools.registry import (
     ToolRegistry,
     is_tool_error_result,
     is_tool_terminal_result,
 )
-from nanobot.agent.tool_middleware import ToolMiddleware
 from nanobot.providers.base import (
     LLMProvider,
     LLMResponse,
@@ -639,6 +638,17 @@ class AgentRunner:
         deterministic_call: ToolCallRequest | None = None
         if spec.enable_deterministic_router and router_enabled() and spec.deterministic_router_text:
             deterministic_call = deterministic_plan(spec.deterministic_router_text)
+        # --- Generic task recipe router (Manus-style command runner) ---------
+        # When the narrow read-only router has nothing and the user's ask is a
+        # recurring, read-only *coding/workspace* task (bug scan, run tests,
+        # project structure), answer it with a single deterministic command
+        # recipe — ZERO provider calls. The recipe runs where the user's code
+        # lives: the sandbox (sandbox_batch -> Novita/VPS/Upstash) when the run
+        # has one, else the local shell (exec). Fail-open: None falls through.
+        if deterministic_call is None and spec.enable_deterministic_router and spec.deterministic_router_text:
+            recipe_call = task_recipe_plan(spec.deterministic_router_text)
+            if recipe_call is not None:
+                deterministic_call = self._retarget_task_recipe(spec, recipe_call)
         if deterministic_call is not None and spec.tools.get(deterministic_call.name) is not None:
             logger.info(
                 "deterministic router answering {} for {} (0 provider calls)",
@@ -2388,6 +2398,39 @@ class AgentRunner:
                     "Tool middleware failed for {}, executing directly", tool_call.name
                 )
         return await spec.tools.execute(tool_call.name, tool_call.arguments)
+
+    @staticmethod
+    def _retarget_task_recipe(
+        spec: AgentRunSpec, recipe_call: ToolCallRequest
+    ) -> ToolCallRequest | None:
+        """Pick the command runner that actually exists on this run.
+
+        The task router emits recipes targeting ``sandbox_batch`` because that
+        is where the user's project files live (Novita / VPS / Upstash sandbox).
+        When a deployment has no sandbox tool but does expose the local shell,
+        we transparently re-target the same read-only command to ``exec`` so the
+        zero-call answer still works. If neither tool is registered the recipe
+        returns None and the turn falls through to the normal LLM path — never
+        a crash, never a wrong answer.
+        """
+        if spec.tools.get("sandbox_batch") is not None:
+            return recipe_call
+        if spec.tools.get("exec") is None:
+            return None
+        # Flatten the single {action:"run", command} op back into an exec call.
+        operations = recipe_call.arguments.get("operations") or []
+        if isinstance(operations, list) and len(operations) == 1:
+            op = operations[0]
+            if isinstance(op, dict) and str(op.get("action", "")).lower() == "run":
+                command = op.get("command")
+                if isinstance(command, str) and command.strip():
+                    timeout = op.get("timeout")
+                    args: dict[str, Any] = {"command": command}
+                    if isinstance(timeout, int):
+                        args["timeout"] = min(max(timeout, 1), 600)
+                    return ToolCallRequest(id=recipe_call.id, name="exec", arguments=args)
+        return None
+
 
     @staticmethod
     def _append_final_message(messages: list[dict[str, Any]], content: str | None) -> None:
