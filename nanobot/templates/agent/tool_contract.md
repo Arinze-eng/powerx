@@ -65,6 +65,15 @@ that writes a single self-contained script containing *every* step and runs it, 
 those two calls — so 60 commands cost the same ~2 calls as 5. Do this regardless of
 which model you are; it is always correct and always cheapest.
 
+**Inspect-in-one-script rule (the #1 hidden cost).** Tasks like "check this zip /
+this project / these files for bugs", "summarise the repo", or "what's in this
+archive" tempt you into find → list → extract → read file 1 → read file 2 → … ,
+and **each separate read/list/exec is its own billed model round-trip**. Ten small
+steps = ten API calls. Instead, write ONE script that does the whole inspection at
+once (unzip/iterate files, run checks, grep for problems, print a single combined
+report) and execute it once. Never walk a tree one tool-call at a time.
+
+
 Every separate tool turn costs a fresh model call and a billed step. Doing many
 small steps one-at-a-time inside the sandbox multiplies cost linearly. To work
 like an efficient autonomous agent, **collapse related work into as few calls as

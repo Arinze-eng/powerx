@@ -1932,6 +1932,16 @@ class AgentRunner:
     # POWERX_BATCH_ENFORCE_AFTER to allow more free single steps.
     _BATCH_ENFORCE_AFTER = int(os.environ.get("POWERX_BATCH_ENFORCE_AFTER", "0"))
 
+    #: Tools whose lone use signals the model has begun multi-step workspace
+    # work and should be nudged toward a single batched script. Beyond the
+    # sandbox runner this now covers local shell exec and repeated file reads —
+    # the exact shapes that turned "check a zip file" into ~10 billed round-trips
+    # (find → list → unzip → read×5 → summarise), none of which the old
+    # sandbox-only enforcement ever policed.
+    _BATCH_NUDGE_TOOLS = frozenset(
+        {"novita_sandbox", "exec", "read_file", "list_dir", "grep", "find_files"}
+    )
+
     def _coalesce_sandbox_calls(
         self,
         spec: AgentRunSpec,
@@ -2025,14 +2035,53 @@ class AgentRunner:
         # Reward correct behaviour: a batch resets the streak counter.
         if name == "sandbox_batch":
             state["single_run_streak"] = 0
+            state["inspection_streak"] = 0
             return None
+        batch_available = bool(getattr(spec.tools, "has", lambda _: False)("sandbox_batch"))
+        # --- Post-nudge runaway-walk guard (Addition 3) ---------------------
+        # The classic "check this zip/project" blow-up is a long chain of LONE
+        # read/list/grep/exec calls, none of which the sandbox-only rule policed.
+        # Once we've already nudged the model toward batching AND it keeps walking
+        # the tree step-by-step past a generous budget, we reject further lone
+        # inspection calls so the remaining work collapses into one script. The
+        # budget is high (default 8) precisely to avoid breaking legitimate
+        # inspect-then-decide flows — only a genuine runaway trips it. Live-tunable
+        # via POWERX_MAX_LONE_INSPECTIONS (<=0 disables the guard).
+        max_lone = int(os.environ.get("POWERX_MAX_LONE_INSPECTIONS", "8"))
+        if (
+            batch_available
+            and max_lone > 0
+            and state.get("nudged")
+            and name in self._BATCH_NUDGE_TOOLS
+        ):
+            insp = int(state.get("inspection_streak", 0)) + 1
+            state["inspection_streak"] = insp
+            if insp > max_lone:
+                detail = (
+                    f"BATCHING REQUIRED: you have issued {insp} separate lone "
+                    f"'{name}' steps in this task; each costs a full model round-trip. "
+                    "Stop walking the workspace one call at a time. Make ONE "
+                    "sandbox_batch call whose script performs ALL remaining "
+                    "inspection/reads/checks in a loop and prints a single combined "
+                    "summary. Retry now using sandbox_batch."
+                )
+                event = {
+                    "name": name,
+                    "status": "error",
+                    "detail": "batching required: too many lone inspection steps",
+                }
+                logger.info(
+                    "Batching guard blocked lone '{}' (inspection_streak={}) for {}",
+                    name, insp, spec.session_key or "default",
+                )
+                return detail, event
         # Only police lone sandbox run/read/write steps; other tools pass through.
         if name != "novita_sandbox":
             return None
-        batch_available = bool(getattr(spec.tools, "has", lambda _: False)("sandbox_batch"))
         if not batch_available:
             return None
         action = ""
+
         arguments = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
         if isinstance(arguments, dict):
             action = str(arguments.get("action", "")).strip().lower()
@@ -2069,6 +2118,67 @@ class AgentRunner:
             action, streak, spec.session_key or "default",
         )
         return detail, event
+
+    def _maybe_inject_batching_nudge(
+        self,
+        spec: AgentRunSpec,
+        tool_call: ToolCallRequest,
+        result: Any,
+    ) -> str | None:
+        """Return a batching hint to append to a tool result, or None.
+
+        The old enforcement only *reacted*: it let the model burn several lone
+        steps before blocking. For tasks like "check this zip" the model does
+        find → list → unzip → read×5 → summarise, and none of those except the
+        unzip were policed, so it still paid ~10 round-trips. This makes the
+        discipline *pre-emptive*: the first time the model takes a single
+        workspace-inspection step in a task we tack a short, non-blocking note
+        onto that very result telling it to fold all remaining work into one
+        ``sandbox_batch`` script. It never rejects or loops (so no retry churn)
+        — it just re-programs the next decision while the cost is still low.
+
+        Fires at most once per task (guarded by state), only when the batch tool
+        is actually available, and only for tools whose repeated lone use is the
+        problem. Returns the appended text so the caller can splice it in.
+        """
+        if os.environ.get("POWERX_BATCH_NUDGE", "1").strip().lower() not in {
+            "1", "true", "yes", "on",
+        }:
+            return None
+        state = getattr(spec, "batch_enforcement_state", None)
+        if state is None:
+            return None
+        # One nudge per task; don't nag repeatedly.
+        if state.get("nudged"):
+            return None
+        if tool_call.name not in self._BATCH_NUDGE_TOOLS:
+            return None
+        # Only worth nudging if there is a batch tool to move toward.
+        batch_available = bool(getattr(spec.tools, "has", lambda _: False)("sandbox_batch"))
+        if not batch_available:
+            return None
+        # A whole-turn batch call means the model already behaves well.
+        if tool_call.name == "sandbox_batch":
+            return None
+        # Don't nag a genuinely one-shot action. Only nudge when the result
+        # itself suggests a tree/list worth walking (many lines or file names),
+        # i.e. the classic find→list→read×N explosion. A single short answer
+        # ("(empty)", one line) gets left alone so trivial tasks stay clean.
+        text = str(result or "")
+        looks_like_more_work = text.count("\n") >= 3 or len(text) > 240
+        if not looks_like_more_work:
+            return None
+        state["nudged"] = 1
+        return (
+            "\n\n[BATCHING TIP — save credits] You are doing this task one small "
+            "step at a time, and every separate step costs another model round-trip. "
+            "For everything you still need to do, make ONE sandbox_batch call that "
+            "writes a single self-contained script performing ALL remaining steps "
+            "(unzip, scan each file, run checks, collect a summary) and then runs it, "
+            "printing one combined result. Put loops and reads INSIDE that script so "
+            "the sandbox finishes without calling the model again. Do not issue more "
+            "single find/list/read/exec steps."
+        )
 
     async def _run_tool(
         self,
@@ -2210,6 +2320,17 @@ class AgentRunner:
             return result + hint, event, None
 
         await hook.after_execute_tool(context, tool_call, tool, params, result)
+
+        # --- Pre-emptive batching nudge (Addition 1) ------------------------
+        # On the model's first lone workspace-inspection step of a task, splice a
+        # short non-blocking hint onto the result telling it to fold all remaining
+        # work into one sandbox_batch script. This is what stops "check this zip"
+        # from becoming ~10 separate billed round-trips: we re-program the next
+        # decision while the cost is still near zero, instead of only reacting
+        # after several steps have already been paid for.
+        nudge = self._maybe_inject_batching_nudge(spec, tool_call, result)
+        if nudge and isinstance(result, str):
+            result = result + nudge
 
         detail = "" if result is None else str(result)
         detail = detail.replace("\n", " ").strip()

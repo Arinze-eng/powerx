@@ -102,3 +102,138 @@ def test_batch_enforcement_blocks_lone_run_and_batch_resets() -> None:
     batch_call = ToolCallRequest(id="2", name="sandbox_batch", arguments={"operations": []})
     assert runner._batch_enforcement_check(spec, batch_call) is None
     assert spec.batch_enforcement_state["single_run_streak"] == 0
+
+
+# --- Pre-emptive batching nudge (Addition 1) --------------------------------
+
+
+def test_nudge_fires_on_first_lone_inspection_step() -> None:
+    """The first lone workspace step whose result implies more work gets a hint."""
+    runner = AgentRunner()
+    spec = _spec_with_batch()
+    spec.batch_enforcement_state = {}
+    spec.session_key = "test"
+    # A directory listing with many entries => the model is about to walk it one
+    # read per line (the expensive pattern). read_file was previously UNPOLICED.
+    big_listing = "\n".join(f"file_{i}.py" for i in range(12))
+    call = ToolCallRequest(id="1", name="list_dir", arguments={"path": "."})
+    nudge = runner._maybe_inject_batching_nudge(spec, call, big_listing)
+    assert nudge is not None
+    assert "BATCHING TIP" in nudge
+    assert "sandbox_batch" in nudge
+
+
+def test_nudge_does_not_nag_a_short_one_shot_result() -> None:
+    """A trivial single-step answer must NOT get an annoying batching tip."""
+    runner = AgentRunner()
+    spec = _spec_with_batch()
+    spec.batch_enforcement_state = {}
+    spec.session_key = "test"
+    call = ToolCallRequest(id="1", name="read_file", arguments={"path": "a"})
+    assert runner._maybe_inject_batching_nudge(spec, call, "just one line") is None
+
+
+def test_nudge_fires_only_once_per_task() -> None:
+    runner = AgentRunner()
+    spec = _spec_with_batch()
+    spec.batch_enforcement_state = {}
+    spec.session_key = "test"
+    big = "\n".join(f"x{i}" for i in range(8))
+    c1 = ToolCallRequest(id="1", name="exec", arguments={"command": "unzip x.zip"})
+    c2 = ToolCallRequest(id="2", name="exec", arguments={"command": "ls"})
+    assert runner._maybe_inject_batching_nudge(spec, c1, big) is not None
+    # Second step must NOT nag again (guarded by state), even with a big result.
+    assert runner._maybe_inject_batching_nudge(spec, c2, big) is None
+
+
+
+def test_nudge_skipped_when_no_batch_tool_available() -> None:
+    runner = AgentRunner()
+    spec = _spec_with_batch(has_batch=False)
+    spec.batch_enforcement_state = {}
+    spec.session_key = "test"
+    call = ToolCallRequest(id="1", name="read_file", arguments={"path": "a"})
+    assert runner._maybe_inject_batching_nudge(spec, call, "x") is None
+
+
+def test_nudge_not_applied_to_a_good_batch_call() -> None:
+    runner = AgentRunner()
+    spec = _spec_with_batch()
+    spec.batch_enforcement_state = {}
+    spec.session_key = "test"
+    call = ToolCallRequest(
+        id="1", name="sandbox_batch", arguments={"operations": [{"action": "run"}]}
+    )
+    assert runner._maybe_inject_batching_nudge(spec, call, "done") is None
+
+
+def test_nudge_disabled_by_env(monkeypatch) -> None:
+    monkeypatch.setenv("POWERX_BATCH_NUDGE", "0")
+    runner = AgentRunner()
+    spec = _spec_with_batch()
+    spec.batch_enforcement_state = {}
+    spec.session_key = "test"
+    call = ToolCallRequest(id="1", name="read_file", arguments={"path": "a"})
+    assert runner._maybe_inject_batching_nudge(spec, call, "x") is None
+
+
+def test_nudge_covers_the_zip_walk_tools() -> None:
+    """Every tool that made 'check zip' expensive must be on the nudge list."""
+    from nanobot.agent.runner import AgentRunner
+
+    for tool in ("novita_sandbox", "exec", "read_file", "list_dir", "grep", "find_files"):
+        assert tool in AgentRunner._BATCH_NUDGE_TOOLS
+
+
+# --- Post-nudge runaway tree-walk guard (Addition 3) -------------------------
+
+
+def test_runaway_guard_blocks_after_budget_once_nudged() -> None:
+    """After nudging, a long chain of lone reads is eventually blocked into batch."""
+    runner = AgentRunner()
+    spec = _spec_with_batch()
+    spec.batch_enforcement_state = {"nudged": 1}
+    spec.session_key = "test"
+    # First several lone reads are allowed (legit inspect-then-decide)...
+    for _ in range(8):
+        call = ToolCallRequest(id="x", name="read_file", arguments={"path": "a"})
+        assert runner._batch_enforcement_check(spec, call) is None
+    # ...but past the budget it trips and forces batching.
+    call = ToolCallRequest(id="x", name="read_file", arguments={"path": "a"})
+    blocked = runner._batch_enforcement_check(spec, call)
+    assert blocked is not None
+    assert "sandbox_batch" in blocked[0]
+
+
+def test_runaway_guard_inactive_before_nudge() -> None:
+    """Without the prior nudge, many lone reads are never blocked (no false trips)."""
+    runner = AgentRunner()
+    spec = _spec_with_batch()
+    spec.batch_enforcement_state = {}  # no 'nudged' flag
+    spec.session_key = "test"
+    for _ in range(20):
+        call = ToolCallRequest(id="x", name="read_file", arguments={"path": "a"})
+        assert runner._batch_enforcement_check(spec, call) is None
+
+
+def test_runaway_guard_reset_by_a_batch_call() -> None:
+    runner = AgentRunner()
+    spec = _spec_with_batch()
+    spec.batch_enforcement_state = {"nudged": 1, "inspection_streak": 7}
+    spec.session_key = "test"
+    batch = ToolCallRequest(id="b", name="sandbox_batch", arguments={"operations": []})
+    assert runner._batch_enforcement_check(spec, batch) is None
+    assert spec.batch_enforcement_state["inspection_streak"] == 0
+
+
+def test_runaway_guard_disabled_by_env(monkeypatch) -> None:
+    monkeypatch.setenv("POWERX_MAX_LONE_INSPECTIONS", "0")
+    runner = AgentRunner()
+    spec = _spec_with_batch()
+    spec.batch_enforcement_state = {"nudged": 1}
+    spec.session_key = "test"
+    for _ in range(50):
+        call = ToolCallRequest(id="x", name="read_file", arguments={"path": "a"})
+        assert runner._batch_enforcement_check(spec, call) is None
+
+
