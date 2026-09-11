@@ -2052,13 +2052,18 @@ class AgentRunner:
         # budget is high (default 8) precisely to avoid breaking legitimate
         # inspect-then-decide flows — only a genuine runaway trips it. Live-tunable
         # via POWERX_MAX_LONE_INSPECTIONS (<=0 disables the guard).
-        max_lone = int(os.environ.get("POWERX_MAX_LONE_INSPECTIONS", "8"))
+        max_lone = int(os.environ.get("POWERX_MAX_LONE_INSPECTIONS", "6"))
         if (
             enforceable
             and max_lone > 0
-            and state.get("nudged")
             and name in self._BATCH_NUDGE_TOOLS
         ):
+            # Hard consolidation enforcement: past the budget of lone
+            # inspection/work tool calls in this task, block the call and require
+            # ONE run_plan (or sandbox_batch). We deliberately do NOT require the
+            # soft "nudged" flag here: the guard must hold even if the soft nudge
+            # never attached (e.g. the first result was small), so a model that
+            # keeps stepping one call at a time is still forced to consolidate.
             insp = int(state.get("inspection_streak", 0)) + 1
             state["inspection_streak"] = insp
             if insp > max_lone:

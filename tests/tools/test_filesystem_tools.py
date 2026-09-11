@@ -373,6 +373,52 @@ class TestWorkspaceRestriction:
         assert (writable / "ok.txt").read_text(encoding="utf-8") == "allowed"
 
     @pytest.mark.asyncio
+    async def test_write_file_blocks_accidental_truncation(self, tmp_path):
+        """Overwriting a large file with a tiny string must be blocked.
+
+        Real-model testing showed a model can replace a whole file with a small/
+        empty string via write_file (accidentally truncating and destroying it).
+        This guard rejects the overwrite and leaves the original file intact.
+        """
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        target = workspace / "big.txt"
+        target.write_text("line\n" * 400, encoding="utf-8")  # ~2000 chars
+
+        tool = WriteFileTool(workspace=workspace, allowed_dir=workspace)
+        result = await tool.execute(path=str(target), content="tiny")
+
+        assert "DATA-LOSS" in result
+        assert "apply_patch" in result
+        # The original file must NOT have been truncated.
+        assert len(target.read_text(encoding="utf-8")) >= 1900
+
+    @pytest.mark.asyncio
+    async def test_write_file_allows_substantial_rewrite(self, tmp_path):
+        """A full rewrite that still produces a substantial file is allowed."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        target = workspace / "big.txt"
+        target.write_text("line\n" * 100, encoding="utf-8")  # ~500 chars
+
+        tool = WriteFileTool(workspace=workspace, allowed_dir=workspace)
+        result = await tool.execute(path=str(target), content="x" * 600)
+
+        assert "DATA-LOSS" not in result
+        assert "Successfully wrote" in result
+        assert len(target.read_text(encoding="utf-8")) == 600
+
+    @pytest.mark.asyncio
+    async def test_write_file_new_file_unaffected(self, tmp_path):
+        """Creating a brand-new file is never blocked by the truncation guard."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        tool = WriteFileTool(workspace=workspace, allowed_dir=workspace)
+        result = await tool.execute(path=str(workspace / "new.txt"), content="hello")
+        assert "DATA-LOSS" not in result
+        assert "Successfully wrote" in result
+
+    @pytest.mark.asyncio
     async def test_extra_write_allowed_files_allow_only_exact_file(self, tmp_path):
         workspace = tmp_path / "ws"
         workspace.mkdir()

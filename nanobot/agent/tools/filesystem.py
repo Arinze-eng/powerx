@@ -546,6 +546,38 @@ class WriteFileTool(_FsTool):
                 raise ValueError("Unknown content")
             fp = self._resolve_write(path)
             fp.parent.mkdir(parents=True, exist_ok=True)
+            # --- Data-loss guard --------------------------------------------
+            # Real-model testing showed a model can accidentally replace a large
+            # file with a tiny/empty string (e.g. a bad write_file content),
+            # truncating the whole file and destroying it. If we are overwriting
+            # an existing, non-trivial file with content that is drastically
+            # smaller, that is a red flag: block it and route to a patch-style
+            # edit rather than silently destroying data. A genuinely new write or
+            # a full intentional rewrite where the new file is still substantial
+            # is unaffected. Gate is generous (content >= 40% of original, or
+            # either side is tiny) so meaningless toggles aren't rejected.
+            if fp.is_file():
+                try:
+                    old_len = len(fp.read_text(encoding="utf-8"))
+                except Exception:
+                    old_len = 0
+                new_len = len(content)
+                if (
+                    old_len >= 200
+                    and new_len < 200
+                    and new_len < (old_len * 0.4)
+                ):
+                    old_head = fp.read_text(encoding="utf-8", errors="replace")[:400]
+                    return ToolResult.error(
+                        "TO PREVENT DATA-LOSS, this overwrite was blocked: the file "
+                        f"is {old_len} chars but the proposed 'content' is only "
+                        f"{new_len} chars, which looks like an accidental truncation. "
+                        "Do NOT rewrite the whole file to make a small change. Use "
+                        "apply_patch (or edit_file) to surgically replace just the "
+                        "changed region. Here is the start of the existing file so you "
+                        "can craft a correct patch:\n\n"
+                        + old_head
+                    )
             fp.write_text(content, encoding="utf-8")
             self._file_states.record_write(fp)
             return f"Successfully wrote {len(content)} characters to {fp}"

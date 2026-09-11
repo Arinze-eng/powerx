@@ -207,35 +207,48 @@ def test_nudge_covers_the_zip_walk_tools() -> None:
         assert tool in AgentRunner._BATCH_NUDGE_TOOLS
 
 
-# --- Post-nudge runaway tree-walk guard (Addition 3) -------------------------
+# --- Runaway tree-walk guard (hard consolidation enforcement) -----------------
 
 
-def test_runaway_guard_blocks_after_budget_once_nudged() -> None:
-    """After nudging, a long chain of lone reads is eventually blocked into batch."""
+def test_runaway_guard_blocks_after_budget() -> None:
+    """A long chain of lone inspection calls is eventually blocked into a plan/batch.
+
+    Since the guard now enforces by default (no reliance on the soft 'nudged'
+    flag), it trips once the lone-step budget (default 6) is exceeded.
+    """
     runner = AgentRunner()
     spec = _spec_with_batch()
-    spec.batch_enforcement_state = {"nudged": 1}
+    spec.batch_enforcement_state = {}
     spec.session_key = "test"
     # First several lone reads are allowed (legit inspect-then-decide)...
-    for _ in range(8):
+    for _ in range(6):
         call = ToolCallRequest(id="x", name="read_file", arguments={"path": "a"})
         assert runner._batch_enforcement_check(spec, call) is None
-    # ...but past the budget it trips and forces batching.
+    # ...but past the budget it trips and forces consolidation.
     call = ToolCallRequest(id="x", name="read_file", arguments={"path": "a"})
     blocked = runner._batch_enforcement_check(spec, call)
     assert blocked is not None
-    assert "sandbox_batch" in blocked[0]
+    assert "BATCHING REQUIRED" in blocked[0]
+    # With sandbox_batch AND run_plan both available, run_plan is preferred.
+    assert "run_plan" in blocked[0]
 
 
-def test_runaway_guard_inactive_before_nudge() -> None:
-    """Without the prior nudge, many lone reads are never blocked (no false trips)."""
+def test_runaway_guard_blocks_without_prior_nudge() -> None:
+    """The guard must trip even with no 'nudged' flag — hard enforcement.
+
+    Previously the guard required the soft nudge to have fired first, so a model
+    whose first results were small never got nudged and kept paying a full
+    round-trip per lone step. Now the budget alone enforces consolidation.
+    """
     runner = AgentRunner()
     spec = _spec_with_batch()
     spec.batch_enforcement_state = {}  # no 'nudged' flag
     spec.session_key = "test"
-    for _ in range(20):
+    for _ in range(6):
         call = ToolCallRequest(id="x", name="read_file", arguments={"path": "a"})
         assert runner._batch_enforcement_check(spec, call) is None
+    call = ToolCallRequest(id="x", name="read_file", arguments={"path": "a"})
+    assert runner._batch_enforcement_check(spec, call) is not None
 
 
 def test_runaway_guard_reset_by_a_batch_call() -> None:
