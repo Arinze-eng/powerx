@@ -58,6 +58,16 @@
 
 ## Batched Execution in the Sandbox (cost-critical, ENFORCED)
 
+**PREFERRED — `run_plan` (one call runs an entire multi-step task).** When a task
+needs more than ~2 steps or must loop over dynamic data (every file in a zip/dir,
+each item in a list), emit ONE `run_plan` call instead of many individual tool
+calls. Give it a JSON plan: each step names a real tool + args and stores its
+output under `id`; later steps reference `$id`; a `foreach` step iterates a prior
+result (`"$files.split('\n')"` running `do` sub-steps per item) WITHOUT calling
+the model again. This is how you scan 50 files in ONE model call — the loop runs
+deterministically inside the executor. Reserve normal single tool calls for when
+you truly need to see one result before deciding what comes next.
+
 **GOLDEN RULE — one script, one run.** For ANY task that needs more than a couple
 of sandbox operations, aim for **two model calls total**: (1) emit ONE `sandbox_batch`
 that writes a single self-contained script containing *every* step and runs it, then

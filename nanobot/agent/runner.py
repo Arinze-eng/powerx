@@ -2172,12 +2172,12 @@ class AgentRunner:
         return (
             "\n\n[BATCHING TIP — save credits] You are doing this task one small "
             "step at a time, and every separate step costs another model round-trip. "
-            "For everything you still need to do, make ONE sandbox_batch call that "
-            "writes a single self-contained script performing ALL remaining steps "
-            "(unzip, scan each file, run checks, collect a summary) and then runs it, "
-            "printing one combined result. Put loops and reads INSIDE that script so "
-            "the sandbox finishes without calling the model again. Do not issue more "
-            "single find/list/read/exec steps."
+            "For everything you still need to do, make ONE call that runs the whole "
+            "rest of the job deterministically. Prefer the `run_plan` tool: give it a "
+            "plan whose steps include a `foreach` over the file/item list so the loop "
+            "runs WITHOUT calling you again (e.g. find files -> foreach -> read/check "
+            "each). If run_plan is unavailable, use ONE sandbox_batch script instead. "
+            "Do not issue more single find/list/read/exec steps."
         )
 
     async def _run_tool(

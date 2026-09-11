@@ -698,6 +698,24 @@ class AgentLoop:
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)
 
+        # --- run_plan: AgentScript-style deterministic plan execution -------
+        # Registered explicitly (not via auto-discovery) because it needs a
+        # back-reference to the live registry so plan steps can invoke sibling
+        # tools by name. Only offered when a sandbox backend is usable — the
+        # same condition that makes sandbox_batch available — since its whole
+        # value is collapsing many sandbox/file operations into one model call.
+        try:
+            from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool
+            from nanobot.agent.tools.run_plan import RunPlanTool
+
+            if NovitaSandboxTool.enabled(ctx) and not self.tools.has("run_plan"):
+                plan_tool = RunPlanTool()
+                plan_tool.bind_registry(self.tools)
+                self.tools.register(plan_tool)
+                registered.append("run_plan")
+        except Exception:  # pragma: no cover - never let an optional tool break startup
+            logger.exception("Failed to register run_plan tool")
+
         # MyTool receives only the explicit runtime-control capability.
         if self.tools_config.my.enable:
             self.tools.register(
