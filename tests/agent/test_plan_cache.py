@@ -310,7 +310,11 @@ class TestRunnerPlanReplay:
         second = await runner.run(spec2)
         assert provider2.request_count == 0  # NO LLM call at all
         assert second.usage.get("plan_replayed") == 1
-        assert second.final_content == "compiled successfully"  # last step's output
+        # Replay now serves the MODEL'S SYNTHESIZED ANSWER captured at learn
+        # time ("Done: compiled"), not the raw stdout of the last step. That was
+        # the whole bug: repeats used to return a command dump or bail to the
+        # model, so they never got cheaper. The prose summary is what we cache.
+        assert second.final_content == "Done: compiled"
         assert len(sandbox.calls) == 2  # replay re-ran the sandbox step
 
     async def test_replay_substitutes_variable_command(self, tmp_path) -> None:
@@ -431,3 +435,84 @@ class TestRunnerPlanReplay:
         )
         await runner.run(spec2)
         assert provider2.request_count == 2  # behaved exactly as before this change
+
+
+class TestPlanDriftAndAnswer:
+    """The two behaviours that make repeats actually cheaper (the real fix):
+    serve the synthesized answer, and refuse it when the workspace moved."""
+
+    async def test_replay_serves_stored_answer_not_raw_dump(self, tmp_path) -> None:
+        # Learn once; on a same-shape repeat we must get the model's prose
+        # summary back, not the raw stdout of the last sandbox command.
+        sandbox = SandboxStub(output="0 errors found by py_compile")
+        registry = ToolRegistry()
+        registry.register(sandbox)
+        provider = CountingProvider(
+            [_learn_response("python -m py_compile ."), _final_response("No bugs found — code is clean.")]
+        )
+        runner = AgentRunner()
+        spec = make_run_spec(
+            provider,
+            initial_messages=[{"role": "user", "content": "check the python project for bugs"}],
+            model="test-model", tools=registry, max_iterations=5,
+            max_tool_result_chars=8000, workspace=str(tmp_path), enable_plan_cache=True,
+        )
+        await runner.run(spec)
+        provider2 = CountingProvider([_final_response("SHOULD NOT BE CALLED")])
+        spec2 = make_run_spec(
+            provider2,
+            initial_messages=[{"role": "user", "content": "check the python project for bugs"}],
+            model="test-model", tools=registry, max_iterations=5,
+            max_tool_result_chars=8000, workspace=str(tmp_path), enable_plan_cache=True,
+        )
+        second = await runner.run(spec2)
+        assert provider2.request_count == 0
+        assert second.usage.get("plan_replayed") == 1
+        # The polished answer, not the command dump:
+        assert second.final_content == "No bugs found — code is clean."
+
+    async def test_drifted_output_discards_plan_and_relearns(self, tmp_path) -> None:
+        # If a replayed step now produces DIFFERENT output (workspace changed),
+        # the cached answer may be stale -> fall back to the model, never serve
+        # an outdated summary confidently.
+        class ChangingSandbox(SandboxStub):
+            def __init__(self) -> None:
+                super().__init__()
+                self.n = 0
+
+            async def execute(self, **kwargs: Any) -> Any:
+                self.calls.append(dict(kwargs))
+                self.n += 1
+                if self.n == 1:
+                    return "no issues"          # learned state
+                return "3 new bugs introduced"  # drifted state
+
+        sandbox = ChangingSandbox()
+        registry = ToolRegistry()
+        registry.register(sandbox)
+        provider = CountingProvider(
+            [_learn_response("lint ."), _final_response("Looks clean, no bugs.")]
+        )
+        runner = AgentRunner()
+        spec = make_run_spec(
+            provider,
+            initial_messages=[{"role": "user", "content": "scan the repo for any bugs please"}],
+            model="test-model", tools=registry, max_iterations=5,
+            max_tool_result_chars=8000, workspace=str(tmp_path), enable_plan_cache=True,
+        )
+        await runner.run(spec)
+        # Second run: step output differs from what was recorded -> plan discarded.
+        provider2 = CountingProvider(
+            [_learn_response("lint ."), _final_response("Found 3 bugs now.")]
+        )
+        spec2 = make_run_spec(
+            provider2,
+            initial_messages=[{"role": "user", "content": "scan the repo for any bugs please"}],
+            model="test-model", tools=registry, max_iterations=5,
+            max_tool_result_chars=8000, workspace=str(tmp_path), enable_plan_cache=True,
+        )
+        result = await runner.run(spec2)
+        assert provider2.request_count >= 1  # model re-consulted due to drift
+        assert result.usage.get("plan_replayed") is None
+        assert result.final_content == "Found 3 bugs now."
+

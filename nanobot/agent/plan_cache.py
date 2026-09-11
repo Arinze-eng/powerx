@@ -48,7 +48,7 @@ import os
 import re
 import time
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +62,9 @@ _DEFAULT_TTL_SECONDS = 7 * 24 * 3600  # a week; task plans go stale slowly
 _MAX_PLANS_PER_WORKSPACE = 200
 _MAX_STEPS_PER_PLAN = 16
 _MIN_MEANINGFUL_TASK_CHARS = 10
+#: Cap on the synthesized answer stored with a plan. Long enough for any real
+#: summary, short enough to keep the JSON tiny and avoid unbounded disk growth.
+_MAX_ANSWER_CHARS = 24_000
 
 #: Minimum token-set Jaccard similarity for a fuzzy plan match (#4). High enough
 #: that unrelated tasks don't collide, low enough to absorb filler-word noise.
@@ -257,6 +260,23 @@ class StoredPlan:
     steps: list[dict[str, Any]]
     saved_at: float
     ttl_seconds: float = _DEFAULT_TTL_SECONDS
+    #: The model's synthesized final answer for this task, captured at save
+    #: time. On replay we return THIS text rather than the raw stdout of the
+    #: last step — a "check for bugs" answer is the model's prose summary, not
+    #: the dump of `py_compile`. Without it every replay either returned garbage
+    #: or bailed back to the full LLM path, so repeats never got cheaper.
+    final_answer: str = ""
+    #: Cheap signature of the sandbox state the plan was learned against (see
+    #: ``content_signature``). If a later run sees the same signature the world
+    #: has not moved, so the stored answer is still correct and can be served
+    #: WITHOUT re-running any step at all — zero provider calls AND zero
+    #: sandbox calls. A mismatch means files changed; fall through and relearn.
+    content_sig: str = ""
+    #: The concatenated stdout of every step at save time. On replay we compare
+    #: each step's fresh output to this; any divergence means the workspace
+    #: moved under us (a file edited, a test added) and the cached prose answer
+    #: may now be wrong — so we discard the plan and let the model relearn.
+    expected_outputs: list[str] = field(default_factory=list)
 
     def is_expired(self) -> bool:
         return time.time() - self.saved_at > self.ttl_seconds
@@ -272,6 +292,9 @@ class StoredPlan:
             "steps": self.steps,
             "saved_at": self.saved_at,
             "ttl_seconds": self.ttl_seconds,
+            "final_answer": self.final_answer,
+            "content_sig": self.content_sig,
+            "expected_outputs": list(self.expected_outputs),
         }
 
     @classmethod
@@ -281,12 +304,18 @@ class StoredPlan:
             steps = data["steps"]
             if not isinstance(steps, list) or not plan_is_safe(steps):
                 return None
+            expected = data.get("expected_outputs") or []
+            if not isinstance(expected, list):
+                expected = []
             return cls(
                 template=template,
                 variables=list(data.get("variables") or []),
                 steps=steps,
                 saved_at=float(data.get("saved_at") or 0.0),
                 ttl_seconds=float(data.get("ttl_seconds") or _DEFAULT_TTL_SECONDS),
+                final_answer=str(data.get("final_answer") or ""),
+                content_sig=str(data.get("content_sig") or ""),
+                expected_outputs=[str(x) for x in expected],
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -367,7 +396,14 @@ class PlanCache:
             return best
         return None
 
-    def put(self, norm: NormalizedTask, steps: list[dict[str, Any]]) -> StoredPlan | None:
+    def put(
+        self,
+        norm: NormalizedTask,
+        steps: list[dict[str, Any]],
+        final_answer: str = "",
+        content_sig: str = "",
+        expected_outputs: list[str] | None = None,
+    ) -> StoredPlan | None:
         if not plan_is_safe(steps):
             return None
         plan = StoredPlan(
@@ -375,6 +411,9 @@ class PlanCache:
             variables=list(norm.variables),
             steps=steps,
             saved_at=time.time(),
+            final_answer=(final_answer or "")[:_MAX_ANSWER_CHARS],
+            content_sig=content_sig,
+            expected_outputs=[str(x) for x in (expected_outputs or [])][: _MAX_STEPS_PER_PLAN],
         )
         path = self._path(norm.template)
         try:

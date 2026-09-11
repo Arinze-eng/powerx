@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from copy import deepcopy
@@ -93,6 +94,21 @@ _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
+
+
+def _normalize_for_drift(text: str) -> str:
+    """Coarse whitespace normalization for comparing a replayed step's output
+    against what it produced when the plan was learned. We deliberately do NOT
+    normalize volatile tokens (timestamps, PIDs, durations) — those legitimately
+    change run-to-run and would make every replay look "drifted". Instead we
+    compare only on exact content equality after collapsing runs of whitespace;
+    a sandbox command whose real output changed (file edited, test added) will
+    differ in substance and be caught. Commands that merely print a fresh clock
+    value are rare among safe coding steps and, if they drift, simply cost one
+    relearn — never a wrong answer.
+    """
+    return re.sub(r"\s+", " ", text or "").strip()
+
 
 
 def _restore_outer_whitespace(content: str, original: str | None) -> str:
@@ -538,6 +554,10 @@ class AgentRunner:
         # run, captured so a successful completion can be stored as a replayable
         # task PLAN for zero-LLM repeats (see nanobot.agent.plan_cache).
         recorded_steps: list[dict[str, Any]] = []
+        # Parallel to recorded_steps: the stdout each step produced at learn
+        # time. Stored with the plan so replay can detect content drift and
+        # refuse a stale answer (see _try_plan_replay).
+        recorded_outputs: list[str] = []
         usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
         # Manus-style cost telemetry: how many times this run really hit the
         # configured LLM provider. Starts empty (0 visible calls); bumped once per
@@ -796,8 +816,12 @@ class AgentRunner:
                 # Capture the concrete steps taken this iteration so a clean
                 # completion can be distilled into a replayable plan. Only
                 # successful calls are recorded — a failed step is not part of a
-                # trustworthy recipe.
-                for tool_call, event in zip(response.tool_calls, new_events):
+                # trustworthy recipe. We also keep each step's output so replay
+                # can detect content drift (the workspace changed) and refuse to
+                # serve a stale answer.
+                for tool_call, event, result in zip(
+                    response.tool_calls, new_events, results
+                ):
                     if event.get("status") == "ok":
                         recorded_steps.append(
                             {
@@ -807,6 +831,7 @@ class AgentRunner:
                                 else {},
                             }
                         )
+                        recorded_outputs.append(str(result))
 
                 # --- Zero-call middleware completion --------------------------
                 # The model already fetched the data; when the middleware
@@ -1201,7 +1226,12 @@ class AgentRunner:
             and recorded_steps
             and plan_is_safe(recorded_steps)
         ):
-            stored = plan_cache.put(plan_norm, recorded_steps)
+            stored = plan_cache.put(
+                plan_norm,
+                recorded_steps,
+                final_answer=final_content or "",
+                expected_outputs=recorded_outputs[: len(recorded_steps)],
+            )
             if stored is not None:
                 logger.info(
                     "plan cache: stored {}-step plan for '{}' (0-call replay ready)",
@@ -2333,6 +2363,18 @@ class AgentRunner:
             text = str(result).strip()
             if not text:
                 return None
+            # --- Content-aware drift guard ---------------------------------
+            # If we recorded what this step produced when the plan was learned,
+            # compare it now. A different output means the workspace moved under
+            # us (file edited, test added), so the cached prose answer could be
+            # stale — discard the plan and let the model relearn rather than
+            # confidently serve an outdated summary.
+            expected = plan.expected_outputs[index] if index < len(plan.expected_outputs) else ""
+            if expected and _normalize_for_drift(expected) != _normalize_for_drift(text):
+                logger.info(
+                    "plan cache: step {} output drifted, falling back to model", index
+                )
+                return None
             results.append(text)
             events.append({"name": step["name"], "status": "ok"})
             # Mirror history so the session transcript shows the work happened.
@@ -2362,7 +2404,12 @@ class AgentRunner:
                 }
             )
 
-        final_content = results[-1]
+        # Serve the MODEL'S SYNTHESIZED ANSWER captured at save time, not the
+        # raw stdout of the last command. This is the whole point: a "check for
+        # bugs" reply is the prose summary the model wrote, which previously got
+        # thrown away so every repeat re-paid full price. Falls back to the last
+        # step's output only if no answer was stored (older plans).
+        final_content = plan.final_answer.strip() or results[-1]
         self._append_final_message(messages, final_content)
         logger.info(
             "plan cache: replayed {}-step plan for '{}' (0 provider calls)",
