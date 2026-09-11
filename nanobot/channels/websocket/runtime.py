@@ -125,20 +125,6 @@ def _is_routing_assertion_header(value: str) -> bool:
     return normalized in _ROUTING_ASSERTION_HEADERS or normalized.startswith("x-forwarded-")
 
 
-def _persistent_disk_active() -> bool:
-    """True when chat/task history lives on a local persistent volume (Northflank).
-
-    Mirrors ``nanobot.webui.ws_http._persistent_disk_active``. In this mode
-    per-user Supabase chat isolation is disabled so the sidebar reads the real
-    history on the volume (no empty 'New topic' / no hidden sessions).
-    """
-    for key in ("NANOBOT_PERSISTENT_DISK", "NORTHFLANK"):
-        value = os.environ.get(key, "").strip().lower()
-        if value in {"1", "true", "yes", "on"}:
-            return True
-    return False
-
-
 class TrustedProxyAuthConfig(Base):
     """Authentication assertions accepted from explicitly trusted proxy peers."""
 
@@ -462,11 +448,6 @@ class WebSocketChannel(BaseChannel):
     def _supabase_webui_auth_enabled() -> bool:
         """True when WebUI access is gated behind Supabase per-user auth."""
         if os.getenv("SUPABASE_WEBUI_AUTH", "").strip().lower() not in {"1", "true", "yes", "on"}:
-            return False
-        # [FIX 2026-09-11] Northflank / persistent-disk deployments keep chat &
-        # task history on the local volume, so per-user Supabase chat isolation
-        # is disabled there (it hid real history + returned empty sidebar on login).
-        if _persistent_disk_active():
             return False
         try:
             from nanobot.supabase_auth import SupabaseAuth

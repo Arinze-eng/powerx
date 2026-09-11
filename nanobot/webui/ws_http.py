@@ -227,26 +227,6 @@ for _ext, _ctype in _MIME_FIXES.items():
     mimetypes.add_type(_ctype, _ext, strict=True)
 
 
-def _persistent_disk_active() -> bool:
-    """True when chat/task history lives on a local persistent volume.
-
-    [FIX 2026-09-11] Northflank (and any ''NANOBOT_PERSISTENT_DISK'' host) keeps
-    chat + cron history on its persistent volume. In that mode per-user Supabase
-    chat isolation is not wanted: it hid the user's real history behind owner
-    tags and returned an empty sidebar on login. Returning True here forces the
-    WebUI into single-operator local mode. Supabase auth/credits for other
-    channels (Telegram) are unaffected.
-    """
-    for key in ("NANOBOT_PERSISTENT_DISK", "NORTHFLANK"):
-        try:
-            value = os.environ.get(key, "").strip().lower()
-        except Exception:
-            continue
-        if value in {"1", "true", "yes", "on"}:
-            return True
-    return False
-
-
 if TYPE_CHECKING:
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.websocket.runtime import WebSocketConfig
@@ -691,14 +671,6 @@ class GatewayHTTPHandler:
     def _supabase_webui_auth_enabled(self) -> bool:
         """True when the WebUI should gate access behind Supabase auth."""
         if os.getenv("SUPABASE_WEBUI_AUTH", "").lower() not in {"1", "true", "yes", "on"}:
-            return False
-        # [FIX 2026-09-11] Northflank / persistent-disk deployments keep chat &
-        # task history on the local volume. Per-user Supabase chat isolation is
-        # not wanted there — it hid the user's real history behind owner tags and
-        # returned an empty sidebar on login. Force single-operator local mode
-        # whenever the chat data lives on a persistent volume (Northflank) or a
-        # persistent disk is declared.
-        if _persistent_disk_active():
             return False
         try:
             from nanobot.supabase_auth import SupabaseAuth
