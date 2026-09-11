@@ -16,12 +16,21 @@ step-by-step behaviour — never a crash.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from loguru import logger
 
 from nanobot.agent.plan_program import PlanProgramError, execute_plan, parse_plan
 from nanobot.agent.tools.base import Tool, ToolResult
+
+
+def _plan_json_len(plan: dict[str, Any]) -> int:
+    """Serialized size (chars) of a parsed plan, used by the compactness guard."""
+    try:
+        return len(json.dumps(plan, separators=(",", ":"), default=str))
+    except Exception:  # pragma: no cover - serialization should not fail here
+        return 0
 
 
 class RunPlanTool(Tool):
@@ -94,6 +103,31 @@ class RunPlanTool(Tool):
             return ToolResult.error(
                 f"Invalid plan: {exc}. Resubmit a well-formed {{\"steps\": [...]}} "
                 "or fall back to individual tool calls."
+            )
+
+        # --- compactness guard ------------------------------------------------
+        # Empirically (heavy real-model testing) a single plan that is too large —
+        # e.g. embeds a big inline shell/python string, or explodes into far too many
+        # nested steps — can cause the model to blow its output-token budget and return
+        # finish_reason="length", which the runner then merely replays turn after turn
+        # (0 tool commands executed, all calls burned). Catching it here turns that
+        # silent waste into a clear, actionable error the model can recover from in
+        # one cheap retry, instead of N identical oversized replays.
+        # The values are deliberately generous (well above any sane generated plan)
+        # so only genuinely pathological payloads are rejected.
+        text_len = _plan_json_len(plan)
+        step_count = sum(1 for s in plan.get("steps", []))
+        if text_len > 20000 or step_count > 60:
+            logger.warning(
+                "run_plan rejected for size: {:,} chars / {} top-level steps",
+                text_len,
+                step_count,
+            )
+            return ToolResult.error(
+                "Plan is too large to execute safely in one call "
+                f"({text_len:,} chars, {step_count} top-level steps). Split it into "
+                "smaller run_plan calls (batch ~5-10 steps at a time) or fall back to "
+                "normal step-by-step tool calls."
             )
 
         async def _execute(name: str, args: dict[str, Any]) -> Any:

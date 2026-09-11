@@ -330,6 +330,36 @@ def test_run_plan_tool_unbound_registry_is_clean_error() -> None:
     assert "not wired" in str(result).lower() or "error" in str(result).lower()
 
 
+def test_run_plan_tool_rejects_oversized_plan() -> None:
+    """A pathological oversized plan is rejected fast instead of replayed.
+
+    Heavy real-model testing showed a single plan that is too large (e.g. a big
+    inline shell/python string) can push the model over its output-token budget
+    (finish_reason=\"length\"), which the runner then replays turn after turn with
+    0 tools executed. Guarding here turns that silent call-waste into a clear,
+    one-retry error.
+    """
+    from nanobot.agent.tools.run_plan import RunPlanTool
+
+    reg = _MiniRegistry({"exec": None})
+    tool = RunPlanTool()
+    tool.bind_registry(reg)
+    # >60 top-level steps -> rejected on step count.
+    big = {"steps": [{"tool": "exec", "args": {}, "id": f"s{i}"} for i in range(70)]}
+    result = asyncio.run(tool.execute(plan=big))
+    assert "too large" in str(result).lower()
+    # Not bound path is unaffected by the guard (still wiring error).
+    reg2 = _MiniRegistry({})
+    tool2 = RunPlanTool()
+    tool2.bind_registry(reg2)
+    result2 = asyncio.run(tool2.execute(plan=big))
+    assert "too large" in str(result2).lower()
+    # A normal small plan still executes fine (exec side effect not required).
+    small = {"steps": [{"tool": "exec", "args": {"command": "echo hi"}, "id": "r"}]}
+    result3 = asyncio.run(tool.execute(plan=small))
+    assert "too large" not in str(result3).lower()
+
+
 # --- End-to-end through the real AgentRunner --------------------------------
 
 
