@@ -1004,6 +1004,81 @@ class SupabaseAuth:
             body["model"] = model.strip()[:200]
         return await self._puter_request(account, body)
 
+    async def _puter_request_with_jwt(
+        self, access_token: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Call ``puter-admin`` as a specific signed-in user via their live JWT.
+
+        This is the WebUI path. Unlike :meth:`_puter_request`, it does NOT rely
+        on a stored Telegram session/refresh token — webui users have none, which
+        is what produced "Invalid Refresh Token: Refresh Token Not Found". It
+        sends the gateway key in the header and the caller's raw Supabase access
+        JWT as ``user_jwt``, exactly matching how the admin Puter flow works.
+        """
+        gateway_key = os.getenv("SUPABASE_GATEWAY_KEY", "").strip()
+        if not gateway_key:
+            raise SupabaseAuthError("Puter integration is not configured")
+        access_token = (access_token or "").strip()
+        if not access_token:
+            raise SupabaseAuthError(
+                "You must be signed in to use image generation. Please sign in and try again."
+            )
+        try:
+            response = await self._puter_http_request(
+                gateway_key, {**body, "user_jwt": access_token}
+            )
+            payload = response.json()
+        except httpx.HTTPError as exc:
+            raise SupabaseAuthError("Puter request failed") from exc
+        except ValueError as exc:
+            raise SupabaseAuthError("Puter returned invalid JSON") from None
+        if (
+            not response.is_success
+            or not isinstance(payload, dict)
+            or payload.get("ok") is not True
+        ):
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            raise SupabaseAuthError(
+                str(detail or f"Puter request failed with HTTP {response.status_code}")[:500]
+            )
+        return payload
+
+    async def puter_generate_with_jwt(
+        self, access_token: str, action: str, prompt: str, *, model: str = "",
+        seconds: int | None = None,
+    ) -> dict[str, Any]:
+        if action not in {"generate_image", "generate_video"}:
+            raise SupabaseAuthError("Unsupported Puter generation action")
+        prompt = prompt.strip()[:4000]
+        if not prompt:
+            raise SupabaseAuthError("A generation prompt is required")
+        body: dict[str, Any] = {"action": action, "prompt": prompt}
+        if model.strip():
+            body["model"] = model.strip()[:200]
+        if seconds is not None:
+            body["seconds"] = max(4, min(12, int(seconds)))
+        return await self._puter_request_with_jwt(access_token, body)
+
+    async def puter_edit_image_with_jwt(
+        self, access_token: str, prompt: str, input_images: list[str], *, model: str = "",
+    ) -> dict[str, Any]:
+        prompt = prompt.strip()[:4000]
+        if not prompt:
+            raise SupabaseAuthError("An image-edit instruction is required")
+        bounded_images = [str(image).strip() for image in input_images[:3] if str(image).strip()]
+        if not bounded_images:
+            raise SupabaseAuthError("Attach an image to edit")
+        if any(not image.startswith("data:image/") or "," not in image for image in bounded_images):
+            raise SupabaseAuthError("The image attachment has an unsupported format")
+        body: dict[str, Any] = {
+            "action": "edit_image",
+            "prompt": prompt,
+            "input_images": bounded_images,
+        }
+        if model.strip():
+            body["model"] = model.strip()[:200]
+        return await self._puter_request_with_jwt(access_token, body)
+
     # drain_rate is near-static user metadata; caching it removes one profiles
     # GET from every billed task. TTL keeps it honest if an admin changes it.
     _drain_rates: dict[str, tuple[int, float]] = {}

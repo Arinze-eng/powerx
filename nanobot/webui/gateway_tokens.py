@@ -22,6 +22,7 @@ class GatewayTokenStore:
     issued_tokens: dict[str, float] = field(default_factory=dict)
     issued_token_audiences: dict[str, IssuedTokenAudience] = field(default_factory=dict)
     issued_token_users: dict[str, str] = field(default_factory=dict)
+    issued_token_jwts: dict[str, str] = field(default_factory=dict)
     api_tokens: dict[str, float] = field(default_factory=dict)
 
     def check_api_token(self, request: WsRequest) -> bool:
@@ -64,16 +65,32 @@ class GatewayTokenStore:
         self.api_tokens[token_value] = expiry
         return token_value
 
-    def attach_issued_token_user(self, token_value: str, supabase_user_id: str) -> None:
-        """Associate a Supabase user id with an already-issued WebUI token."""
+    def attach_issued_token_user(
+        self, token_value: str, supabase_user_id: str, access_jwt: str = ""
+    ) -> None:
+        """Associate a Supabase user id (and raw access JWT) with an issued token.
+
+        The raw JWT is kept so server-side tools (e.g. the Puter image
+        generate/edit tools) can call ``puter-admin`` as this exact signed-in
+        user without going through the Telegram session-refresh path — which has
+        no stored session for webui users and fails with "Invalid Refresh Token".
+        """
         if token_value and supabase_user_id:
             self.issued_token_users[token_value] = supabase_user_id
+        if token_value and access_jwt:
+            self.issued_token_jwts[token_value] = access_jwt
 
     def consume_issued_token_user(self, token_value: str | None) -> str:
         """Return and drop the Supabase user id bound to an issued token."""
         if not token_value:
             return ""
         return self.issued_token_users.pop(token_value, "")
+
+    def consume_issued_token_jwt(self, token_value: str | None) -> str:
+        """Return and drop the raw Supabase access JWT bound to an issued token."""
+        if not token_value:
+            return ""
+        return self.issued_token_jwts.pop(token_value, "")
 
     def take_issued_token_if_valid(self, token_value: str | None) -> bool:
         return self.take_issued_token_audience(token_value) is not None
@@ -98,6 +115,7 @@ class GatewayTokenStore:
         self.issued_tokens.clear()
         self.issued_token_audiences.clear()
         self.issued_token_users.clear()
+        self.issued_token_jwts.clear()
         self.api_tokens.clear()
 
     def _purge_expired_api_tokens(self) -> None:
@@ -112,6 +130,8 @@ class GatewayTokenStore:
             if now > expiry:
                 self.issued_tokens.pop(token_key, None)
                 self.issued_token_audiences.pop(token_key, None)
+                self.issued_token_users.pop(token_key, None)
+                self.issued_token_jwts.pop(token_key, None)
 
 
 def token_response_payload(token: str, expires_in: Any) -> dict[str, Any]:

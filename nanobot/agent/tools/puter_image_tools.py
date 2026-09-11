@@ -62,6 +62,25 @@ def _webui_user_id() -> str | None:
     return user_id.strip()
 
 
+def _webui_access_token() -> str | None:
+    """Return the signed-in webui user's raw Supabase access JWT for this turn.
+
+    The Puter image tools must act as the exact logged-in user. On the WebUI we
+    have their live access token (captured at WebSocket handshake), so we send it
+    straight to ``puter-admin`` instead of the Telegram session-refresh path —
+    which has no stored session for webui users and fails with
+    "Invalid Refresh Token: Refresh Token Not Found".
+    """
+    ctx = current_request_context()
+    if ctx is None:
+        return None
+    metadata = ctx.metadata or {}
+    token = metadata.get("supabase_access_token")
+    if isinstance(token, str) and token.strip():
+        return token.strip()
+    return None
+
+
 def _save_image(data_url: str, *, mime: str, prompt: str, kind: str) -> dict[str, Any]:
     """Persist a returned Puter image under the media root as an artifact."""
     if not data_url:
@@ -132,6 +151,11 @@ class PuterGenerateImageTool(Tool):
             return ToolResult.error(
                 "Error: You must be signed in to generate images. Please sign in and try again."
             )
+        access_token = _webui_access_token()
+        if not access_token:
+            return ToolResult.error(
+                "Error: Your session has expired. Please sign in again and retry image generation."
+            )
         prompt = (prompt or "").strip()
         if not prompt:
             return ToolResult.error("Error: Please describe the image you want to generate.")
@@ -151,8 +175,8 @@ class PuterGenerateImageTool(Tool):
             )
 
         try:
-            result = await auth.puter_generate(
-                {"agentx_user_id": user_id},
+            result = await auth.puter_generate_with_jwt(
+                access_token,
                 "generate_image",
                 prompt,
                 model=(model or "").strip(),
@@ -249,6 +273,11 @@ class PuterEditImageTool(Tool):
             return ToolResult.error(
                 "Error: You must be signed in to edit images. Please sign in and try again."
             )
+        access_token = _webui_access_token()
+        if not access_token:
+            return ToolResult.error(
+                "Error: Your session has expired. Please sign in again and retry image editing."
+            )
         prompt = (prompt or "").strip()
         if not prompt:
             return ToolResult.error("Error: Please describe how to edit the image.")
@@ -281,8 +310,8 @@ class PuterEditImageTool(Tool):
             )
 
         try:
-            result = await auth.puter_edit_image(
-                {"agentx_user_id": user_id},
+            result = await auth.puter_edit_image_with_jwt(
+                access_token,
                 prompt,
                 input_images,
                 model=(model or "").strip(),

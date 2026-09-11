@@ -404,6 +404,8 @@ class WebSocketChannel(BaseChannel):
         self._admin_connections: set[ServerConnection] = set()
         # connection -> supabase user id bound via a Supabase-gated WebUI token.
         self._conn_supabase_user: dict[ServerConnection, str] = {}
+        # connection -> raw Supabase access JWT (for server-side Puter tools).
+        self._conn_supabase_jwt: dict[ServerConnection, str] = {}
         # Delivery tasks are connection-bound, while operations are keyed only
         # by request_id so reconnect retries join or replay the original work.
         self._webui_request_tasks: dict[
@@ -615,6 +617,7 @@ class WebSocketChannel(BaseChannel):
         self._webui_connections.discard(connection)
         self._admin_connections.discard(connection)
         self._conn_supabase_user.pop(connection, None)
+        self._conn_supabase_jwt.pop(connection, None)
         self._discard_webui_request_lock_if_idle(connection)
 
     def _record_webui_activity_later(self, supabase_user_id: str, content: str) -> None:
@@ -843,6 +846,13 @@ class WebSocketChannel(BaseChannel):
             supabase_user = self._tokens.consume_issued_token_user(token)
             if supabase_user:
                 self._conn_supabase_user[connection] = supabase_user
+            # Retain the raw Supabase access JWT so server-side tools (Puter
+            # image generate/edit) can act as this exact signed-in user without
+            # the Telegram session-refresh path (which has no stored session for
+            # webui users and fails with "Invalid Refresh Token").
+            supabase_jwt = self._tokens.consume_issued_token_jwt(token)
+            if supabase_jwt:
+                self._conn_supabase_jwt[connection] = supabase_jwt
         return audience is not None
 
     # -- Server lifecycle and connection ingress ---------------------------
@@ -1010,6 +1020,9 @@ class WebSocketChannel(BaseChannel):
                 meta: dict[str, Any] = {"remote": getattr(connection, "remote_address", None)}
                 if supabase_user:
                     meta["supabase_user_id"] = supabase_user
+                supabase_jwt = self._conn_supabase_jwt.get(connection, "")
+                if supabase_jwt:
+                    meta["supabase_access_token"] = supabase_jwt
                 await self._handle_message(
                     sender_id=client_id,
                     chat_id=default_chat_id,
@@ -1368,6 +1381,9 @@ class WebSocketChannel(BaseChannel):
             supabase_user = self._conn_supabase_user.get(connection, "")
             if supabase_user:
                 metadata["supabase_user_id"] = supabase_user
+            supabase_jwt = self._conn_supabase_jwt.get(connection, "")
+            if supabase_jwt:
+                metadata["supabase_access_token"] = supabase_jwt
             if envelope.get("webui") is True:
                 metadata["webui"] = True
                 metadata.update(self._transcripts.client_turn_metadata(envelope.get("turn_id")))
@@ -1811,6 +1827,7 @@ class WebSocketChannel(BaseChannel):
         self._webui_connections.clear()
         self._admin_connections.clear()
         self._conn_supabase_user.clear()
+        self._conn_supabase_jwt.clear()
         self._tokens.clear()
         self._temporary_chats.close()
 

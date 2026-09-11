@@ -113,6 +113,21 @@
     @apply h-full;
   }
 
+  /* Mobile viewport-height fix. On iOS Safari / Android Chrome, ``height:
+   * 100%`` on <html> resolves against the *initial* containing block, which can
+   * be taller than the visible viewport (it ignores the collapsing URL bar).
+   * With ``body { overflow: hidden }`` this leaves thread content that sits
+   * just below the fold inside a container the browser thinks already fits — so
+   * the message region never overflows and the user cannot scroll down. Pin the
+   * app root to the *dynamic* viewport height (with a plain-100% fallback for
+   * browsers without dvh support) so the scroll container gets a real bounded
+   * height and scrolling works everywhere. */
+  @supports (height: 100dvh) {
+    #root {
+      height: 100dvh;
+    }
+  }
+
   body {
     @apply bg-background text-foreground font-sans antialiased;
     overflow: hidden;
@@ -632,6 +647,11 @@
      scrolling and internal code-block scroll are unaffected. */
   .thread-viewport-scrollbar {
     overflow-x: hidden;
+    /* Smooth inertial scrolling on iOS and stop scroll-chaining to <body>
+       (which is overflow:hidden) so a flick inside the thread never feels like
+       it "sticks" at the edges. */
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
   }
 
   .thread-viewport {

@@ -745,7 +745,7 @@ class GatewayHTTPHandler:
                     extra_headers=_NO_STORE_HEADERS,
                 )
             token = self.tokens.issue_token(self.config.token_ttl_s, audience="webui")
-            self.tokens.attach_issued_token_user(token, user_id)
+            self.tokens.attach_issued_token_user(token, user_id, access_token)
             # Also mint an API token in Supabase mode. Without it every
             # authenticated HTTP settings / API read (which authenticates via
             # check_api_token against the api_token store) returns 401
