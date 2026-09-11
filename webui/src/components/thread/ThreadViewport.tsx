@@ -748,7 +748,13 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
                 "scroll-auto justify-start overflow-x-hidden px-3 pb-4 pt-4 sm:px-4",
                 "[overflow-anchor:none] [scrollbar-width:none]",
                 "[&::-webkit-scrollbar]:hidden",
-                hasVerticalOverflow ? "overflow-y-auto" : "overflow-hidden",
+                // Always allow vertical scrolling once a conversation exists.
+                // Gating this on the JS-computed hasVerticalOverflow flag made
+                // the thread unscrollable whenever the geometry callback lagged
+                // or mis-measured (notably on mobile). With overflow-y-auto, a
+                // fitting conversation simply shows no scrollbar — identical
+                // look, but never traps the user in a clipped viewport.
+                "overflow-y-auto",
               )}
             >
               <div ref={messageContentRef} className="mx-auto w-full max-w-[49.5rem]">
