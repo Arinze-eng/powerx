@@ -1329,8 +1329,18 @@ class WebSocketChannel(BaseChannel):
                     media_names.append(
                         (safe_filename(name) or None) if isinstance(name, str) else None
                     )
+                # Browser-uploaded file attachments reference tmpfiles.org URLs:
+                # they are remote references, not local media to clean up.
+                remote_media = [
+                    path for path in media_paths
+                    if path.startswith(("https://", "http://"))
+                ]
+                local_media = [
+                    path for path in media_paths
+                    if not path.startswith(("https://", "http://"))
+                ]
                 if temporary_policy is not None:
-                    self._temporary_chats.register_media(connection, cid, media_paths)
+                    self._temporary_chats.register_media(connection, cid, local_media)
 
             # Allow media-only turns (content may be empty when attachments are present).
             if not content.strip() and not media_paths:
@@ -1400,6 +1410,24 @@ class WebSocketChannel(BaseChannel):
                 if is_user_shell
                 else content
             )
+            if remote_media:
+                # The agent needs the tmpfiles.org links in the turn text so it
+                # can fetch the attached files with its web tools — the bytes
+                # never touched this host.
+                note_lines = []
+                for index, path in enumerate(media_paths):
+                    if not path.startswith(("https://", "http://")):
+                        continue
+                    name = media_names[index] if index < len(media_names) else None
+                    note_lines.append(
+                        f"- {name or path.rsplit('/', 1)[-1] or 'file'}: {path}"
+                    )
+                dispatch_content = (
+                    f"{dispatch_content}\n\n"
+                    "[Attached file(s) were uploaded directly to tmpfiles.org; "
+                    "download them with your web tools if you need their contents]\n"
+                    + "\n".join(note_lines)
+                )
             cli_apps = normalize_cli_app_mentions(envelope.get("cli_apps"))
             if cli_apps:
                 metadata["cli_apps"] = cli_apps
@@ -1472,7 +1500,7 @@ class WebSocketChannel(BaseChannel):
                     sender_id=client_id,
                     chat_id=cid,
                     content=dispatch_content,
-                    media=media_paths or None,
+                    media=local_media or None,
                     metadata=metadata,
                     is_dm=False,
                     session_key=(

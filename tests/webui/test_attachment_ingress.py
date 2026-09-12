@@ -9,6 +9,7 @@ import pytest
 
 from nanobot.webui.attachment_ingress import (
     extract_data_url_mime,
+    extract_remote_file_url,
     store_inbound_attachments,
 )
 from nanobot.webui.ingress_policy import AttachmentIngressLimits
@@ -146,3 +147,73 @@ def test_binary_archive_files_are_accepted(tmp_path: Path, mime: str) -> None:
     assert len(paths) == 1
     saved = Path(paths[0])
     assert saved.read_bytes() == b"\x50\x4b\x03\x04 some-blob"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://tmpfiles.org/1234567/report.pdf", "https://tmpfiles.org/1234567/report.pdf"),
+        ("https://tmpfiles.org/dl/1234567/report.pdf", "https://tmpfiles.org/dl/1234567/report.pdf"),
+        ("https://TMPFILES.ORG/123/report.pdf", "https://TMPFILES.ORG/123/report.pdf"),
+        ("http://tmpfiles.org/123/report.pdf", ""),
+        ("https://evil.example/123/report.pdf", ""),
+        ("https://tmpfiles.org.evil.test/123/report.pdf", ""),
+        ("https://tmpfiles.org/", ""),
+        ("https://tmpfiles.org", ""),
+        ("", ""),
+        (123, ""),
+        (None, None),
+    ],
+)
+def test_extract_remote_file_url_allows_only_tmpfiles_https(
+    url: Any,
+    expected: str | None,
+) -> None:
+    assert extract_remote_file_url({"url": url}) == expected
+
+
+def test_extract_remote_file_url_absent_key_is_none() -> None:
+    assert extract_remote_file_url({"data_url": _data_url("image/png", b"x")}) is None
+
+
+def test_store_inbound_tmpfiles_url_persists_nothing(tmp_path: Path) -> None:
+    """Browser-uploaded file attachments arrive as tmpfiles.org URLs: the
+    gateway must not write any bytes to disk — the URL itself is the record."""
+    url = "https://tmpfiles.org/1234567/report.pdf"
+    paths, rejection = store_inbound_attachments(
+        [{"url": url, "name": "report.pdf"}],
+        media_dir=tmp_path,
+        logger=MagicMock(),
+    )
+
+    assert rejection is None
+    assert paths == [url]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_store_inbound_mixed_batch_keeps_local_and_remote(tmp_path: Path) -> None:
+    url = "https://tmpfiles.org/42/bundle.apk"
+    paths, rejection = store_inbound_attachments(
+        [
+            {"url": url, "name": "bundle.apk"},
+            {"data_url": _data_url("image/png", b"png-bytes"), "name": "shot.png"},
+        ],
+        media_dir=tmp_path,
+        logger=MagicMock(),
+    )
+
+    assert rejection is None
+    assert len(paths) == 2
+    assert paths[0] == url
+    assert Path(paths[1]).exists()
+
+
+def test_store_inbound_rejects_untrusted_url_host(tmp_path: Path) -> None:
+    paths, rejection = store_inbound_attachments(
+        [{"url": "https://evil.example/123/mal.pdf", "name": "mal.pdf"}],
+        media_dir=tmp_path,
+        logger=MagicMock(),
+    )
+
+    assert paths == []
+    assert rejection == "malformed"

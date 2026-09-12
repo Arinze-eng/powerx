@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any, Literal, cast
+from urllib.parse import urlparse
 
 from nanobot.utils.media_decode import FileSizeExceeded, save_base64_data_url
 from nanobot.webui.ingress_policy import (
@@ -98,6 +99,34 @@ _UPLOAD_MIME_ALLOWED: frozenset[str] = (
 
 _DATA_URL_MIME_RE = re.compile(r"^data:([^;,]+)(?:;[^,]*)*;base64,", re.DOTALL)
 
+# Host allowlist for browser-side direct uploads. File attachments (pdf, zip,
+# apk, ...) arrive as tmpfiles.org URLs instead of base64 payloads so the file
+# bytes never transit the gateway host. Images/videos keep the data-URL path.
+_REMOTE_FILE_HOSTS = frozenset({"tmpfiles.org"})
+
+
+def extract_remote_file_url(attachment: dict[str, Any]) -> str | None:
+    """Return the validated tmpfiles.org URL for an attachment, if it carries one.
+
+    ``None`` means the attachment does not carry a URL at all; an invalid URL
+    (wrong scheme, untrusted host, empty path) yields ``""`` so the caller can
+    reject the batch.
+    """
+    url = attachment.get("url")
+    if url is None:
+        return None
+    if not isinstance(url, str) or not url:
+        return ""
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc.lower() not in _REMOTE_FILE_HOSTS
+        or not parsed.path
+        or parsed.path == "/"
+    ):
+        return ""
+    return url
+
 
 def extract_data_url_mime(url: Any) -> str | None:
     """Return the normalized MIME from a base64 data URL, else ``None``."""
@@ -127,6 +156,9 @@ def store_inbound_attachments(
     document_count = 0
     for item in media:
         attachment = cast(dict[str, Any], item) if isinstance(item, dict) else None
+        if attachment is not None and extract_remote_file_url(attachment) is not None:
+            document_count += 1
+            continue
         mime = (
             extract_data_url_mime(attachment.get("data_url", ""))
             if attachment is not None
@@ -160,6 +192,14 @@ def store_inbound_attachments(
         if not isinstance(item, dict):
             return abort("malformed")
         attachment = cast(dict[str, Any], item)
+        # Browser-uploaded file attachments arrive as tmpfiles.org URLs: no
+        # bytes to persist, the URL itself is the reference.
+        remote_url = extract_remote_file_url(attachment)
+        if remote_url is not None:
+            if not remote_url:
+                return abort("malformed")
+            paths.append(remote_url)
+            continue
         data_url = attachment.get("data_url")
         if not isinstance(data_url, str) or not data_url:
             return abort("malformed")

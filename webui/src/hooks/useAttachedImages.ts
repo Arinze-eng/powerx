@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { encodeImage, type EncodeFailure } from "@/lib/imageEncode";
+import { TMPFILES_MAX_BYTES, uploadFileToTmpfiles } from "@/lib/tmpfiles";
 import type { WebUIIngressLimits } from "@/lib/types";
 
 /** Lifecycle stages of one attachment:
  *
  * - ``encoding``  — posted to the Worker / read from disk; chip shows a spinner
- * - ``ready``     — ``dataUrl`` available; safe to submit
+ * - ``ready``     — ``dataUrl`` (images/videos) or ``uploadUrl`` (files) available; safe to submit
  * - ``error``     — validation / decode failure; chip shows inline error
  */
 export type AttachmentStatus = "encoding" | "ready" | "error";
@@ -20,8 +21,12 @@ export interface AttachedAttachment {
    * unmount. */
   previewUrl?: string;
   status: AttachmentStatus;
-  /** Populated when ``status === "ready"``. */
+  /** Populated when ``status === "ready"`` (images/videos). */
   dataUrl?: string;
+  /** Remote tmpfiles.org direct URL when ``status === "ready"`` and
+   * ``kind === "file"``. The file bytes are uploaded browser-side and never
+   * touch the gateway host. */
+  uploadUrl?: string;
   /** Size of the final encoded payload (base64 bytes decoded). */
   encodedBytes?: number;
   /** Whether the Worker re-encoded the image to hit the size budget. */
@@ -212,40 +217,6 @@ function uuid(): string {
   return `img-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function bufferToBase64(buf: ArrayBuffer): string {
-  const bytes = new Uint8Array(buf);
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode.apply(
-      null,
-      bytes.subarray(i, i + chunk) as unknown as number[],
-    );
-  }
-  return btoa(binary);
-}
-
-async function encodeFile(file: File, maxFileBytes: number): Promise<{
-  ok: true;
-  dataUrl: string;
-  bytes: number;
-} | {
-  ok: false;
-  reason: AttachmentError;
-}> {
-  if (file.size > maxFileBytes) return { ok: false, reason: "too_large" };
-  try {
-    const buffer = await file.arrayBuffer();
-    return {
-      ok: true,
-      dataUrl: `data:${mimeForFile(file)};base64,${bufferToBase64(buffer)}`,
-      bytes: file.size,
-    };
-  } catch {
-    return { ok: false, reason: "io" };
-  }
-}
-
 function mapEncodeFailure(reason: EncodeFailure["reason"]): AttachmentError {
   switch (reason) {
     case "invalid_mime":
@@ -335,15 +306,17 @@ export function useAttachedImages({
       const payloadBudget = attachmentPayloadBudget(ingressLimits);
       let projectedWireBytes = imagesRef.current.reduce(
         (total, image) => total + (
-          image.dataUrl?.length
-          ?? projectedDataUrlBytes(image.file, image.kind, maxFileBytes)
+          image.kind === "file"
+            ? 512
+            : (image.dataUrl?.length ?? projectedDataUrlBytes(image.file, image.kind, maxFileBytes))
         ),
         0,
       );
       let projectedDecodedBytes = imagesRef.current.reduce(
         (total, image) => total + (
-          image.encodedBytes
-          ?? (image.kind === "image" ? Math.min(image.file.size, maxFileBytes) : image.file.size)
+          image.kind === "file"
+            ? 0
+            : (image.encodedBytes ?? Math.min(image.file.size, maxFileBytes))
         ),
         0,
       );
@@ -358,7 +331,7 @@ export function useAttachedImages({
           rejected.push({ file, reason: "empty_file" });
           continue;
         }
-        if (kind === "file" && file.size > maxFileBytes) {
+        if (kind === "file" && file.size > TMPFILES_MAX_BYTES) {
           rejected.push({ file, reason: "too_large" });
           continue;
         }
@@ -366,12 +339,12 @@ export function useAttachedImages({
           rejected.push({ file, reason: "too_many_attachments" });
           continue;
         }
-        const nextDecodedBytes = kind === "image" ? Math.min(file.size, maxFileBytes) : file.size;
+        const nextDecodedBytes = kind === "file" ? 0 : Math.min(file.size, maxFileBytes);
         if (projectedDecodedBytes + nextDecodedBytes > maxTotalBytes) {
           rejected.push({ file, reason: "total_too_large" });
           continue;
         }
-        const nextWireBytes = projectedDataUrlBytes(file, kind, maxFileBytes);
+        const nextWireBytes = kind === "file" ? 512 : projectedDataUrlBytes(file, kind, maxFileBytes);
         if (payloadBudget !== null && projectedWireBytes + nextWireBytes > payloadBudget) {
           rejected.push({ file, reason: "transport_too_large" });
           continue;
@@ -395,24 +368,40 @@ export function useAttachedImages({
         // Fire the Worker after the commit so chips render first (good INP).
         for (const entry of toAdd) {
           queueMicrotask(() => {
-            const work = entry.kind === "image"
+            const work: Promise<
+              | { ok: true; dataUrl: string; bytes: number; normalized?: boolean }
+              | { ok: true; url: string; bytes: number }
+              | { ok: false; reason: string }
+            > = entry.kind === "image"
               ? encodeImage(entry.file)
-              : encodeFile(entry.file, maxFileBytes);
+              : uploadFileToTmpfiles(entry.file).then((result) =>
+                  result.ok
+                    ? { ok: true as const, url: result.url, bytes: entry.file.size }
+                    : { ok: false as const, reason: result.reason },
+                );
             work.then(
               (result) => {
                 if (result.ok) {
-                  setEntry(entry.id, {
-                    status: "ready",
-                    dataUrl: result.dataUrl,
-                    encodedBytes: result.bytes,
-                    normalized: "normalized" in result ? result.normalized : false,
-                  });
+                  if ("url" in result) {
+                    setEntry(entry.id, {
+                      status: "ready",
+                      uploadUrl: result.url,
+                      encodedBytes: result.bytes,
+                    });
+                  } else {
+                    setEntry(entry.id, {
+                      status: "ready",
+                      dataUrl: result.dataUrl,
+                      encodedBytes: result.bytes,
+                      normalized: "normalized" in result ? result.normalized : false,
+                    });
+                  }
                 } else {
                   setEntry(entry.id, {
                     status: "error",
                     error: entry.kind === "image"
                       ? mapEncodeFailure(result.reason as EncodeFailure["reason"])
-                      : result.reason as AttachmentError,
+                      : (result.reason as AttachmentError),
                   });
                 }
               },

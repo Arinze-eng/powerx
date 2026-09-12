@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
@@ -177,6 +178,12 @@ def signed_media_attachments(
     """Map persisted media paths to WebUI attachment dicts with fresh signed URLs."""
     out: list[dict[str, Any]] = []
     for pstr in paths:
+        # Browser-uploaded file attachments reference tmpfiles.org directly;
+        # they are not local files and need no signing — pass the URL through.
+        if pstr.startswith("https://tmpfiles.org/"):
+            name = Path(urlparse(pstr).path).name or "file"
+            out.append({"kind": media_attachment_kind(name), "url": pstr, "name": name})
+            continue
         path = Path(pstr)
         att = sign_path(path)
         if att is None:

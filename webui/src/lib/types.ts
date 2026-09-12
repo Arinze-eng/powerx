@@ -1415,15 +1415,24 @@ export type InboundEvent =
       turn_id?: string;
     };
 
-/** Base64-encoded file attached to an outbound ``message`` envelope.
+/** Attachment on an outbound ``message`` envelope.
  *
- * ``data_url`` must use a server-whitelisted image, video, or document MIME
- * type. SVG remains rejected on ingress to avoid an embedded-script XSS
- * surface. ``name`` is advisory and is surfaced as the placeholder label when
- * the session is replayed.
+ * Two shapes:
+ * - ``data_url`` — base64 payload using a server-whitelisted image, video, or
+ *   document MIME type. SVG remains rejected on ingress to avoid an
+ *   embedded-script XSS surface.
+ * - ``url`` — remote tmpfiles.org direct URL for file attachments (pdf, zip,
+ *   apk, ...). The browser uploaded the bytes directly to tmpfiles.org, so
+ *   they never transit the gateway host.
+ *
+ * ``name`` is advisory and is surfaced as the placeholder label when the
+ * session is replayed.
  */
 export interface OutboundMedia {
-  data_url: string;
+  /** Base64 payload; required for images/videos, absent for tmpfiles URL
+   * file attachments (``url`` is set instead). */
+  data_url?: string;
+  url?: string;
   name?: string;
 }
 

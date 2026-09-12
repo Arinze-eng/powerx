@@ -305,7 +305,9 @@ interface QueuedPrompt {
 }
 
 interface QueuedPromptImage {
-  dataUrl: string;
+  dataUrl?: string;
+  /** Remote tmpfiles.org direct URL for file-kind queued attachments. */
+  uploadUrl?: string;
   name?: string;
   kind?: AttachmentKind;
 }
@@ -458,16 +460,25 @@ function normalizeQueuedPrompt(item: unknown, index: number): QueuedPrompt | nul
     ? record.images.flatMap((image) => {
         if (!image || typeof image !== "object") return [];
         const candidate = image as Partial<QueuedPromptImage>;
-        if (typeof candidate.dataUrl !== "string" || !candidate.dataUrl.startsWith("data:")) {
+        const hasDataUrl =
+          typeof candidate.dataUrl === "string" && candidate.dataUrl.startsWith("data:");
+        const hasUploadUrl =
+          typeof candidate.uploadUrl === "string"
+          && candidate.uploadUrl.startsWith("https://tmpfiles.org/");
+        if (!hasDataUrl && !hasUploadUrl) {
           return [];
         }
         const kind = candidate.kind === "file" || candidate.kind === "image"
           ? candidate.kind
-          : candidate.dataUrl.startsWith("data:image/")
-            ? "image"
+          : hasDataUrl
+            ? (candidate.dataUrl as string).startsWith("data:image/")
+              ? "image"
+              : "file"
             : "file";
         return [{
-          dataUrl: candidate.dataUrl,
+          ...(hasDataUrl
+            ? { dataUrl: candidate.dataUrl as string }
+            : { uploadUrl: candidate.uploadUrl as string }),
           kind,
           ...(typeof candidate.name === "string" && candidate.name.trim()
             ? { name: candidate.name.trim() }
@@ -534,10 +545,12 @@ function storeQueuedPrompts(storageKey: string, prompts: QueuedPrompt[]): void {
 }
 
 function readyImagesToQueuedImages(
-  images: Array<AttachedImage & { dataUrl: string }>,
+  images: AttachedImage[],
 ): QueuedPromptImage[] {
   return images.map((img) => ({
-    dataUrl: img.dataUrl,
+    ...(img.uploadUrl
+      ? { uploadUrl: img.uploadUrl }
+      : { dataUrl: img.dataUrl as string }),
     kind: img.kind,
     name: img.file.name,
   }));
@@ -546,13 +559,17 @@ function readyImagesToQueuedImages(
 function queuedImagesToSendImages(images?: QueuedPromptImage[]): SendAttachment[] | undefined {
   if (!images?.length) return undefined;
   return images.map((img) => ({
-    media: {
-      data_url: img.dataUrl,
-      ...(img.name ? { name: img.name } : {}),
-    },
+    media: img.uploadUrl
+      ? { url: img.uploadUrl, ...(img.name ? { name: img.name } : {}) }
+      : {
+          data_url: img.dataUrl as string,
+          ...(img.name ? { name: img.name } : {}),
+        },
     preview: {
-      kind: img.kind ?? (img.dataUrl.startsWith("data:image/") ? "image" : "file"),
-      url: img.dataUrl,
+      kind: img.uploadUrl
+        ? "file"
+        : (img.kind ?? ((img.dataUrl as string).startsWith("data:image/") ? "image" : "file")),
+      url: img.uploadUrl ?? (img.dataUrl as string),
       ...(img.name ? { name: img.name } : {}),
     },
   }));
@@ -1061,8 +1078,9 @@ export function ThreadComposer({
   const normalizedQuotedContext = quotedContext?.trim().slice(0, QUEUED_PROMPT_MAX_CHARS) || null;
 
   const readyImages = useMemo(
-    () => images.filter((img): img is AttachedImage & { dataUrl: string } =>
-      img.status === "ready" && typeof img.dataUrl === "string",
+    () => images.filter((img) =>
+      img.status === "ready"
+      && (typeof img.dataUrl === "string" || typeof img.uploadUrl === "string"),
     ),
     [images],
   );
@@ -1918,13 +1936,19 @@ export function ThreadComposer({
     // in sync with whatever the backend actually sees.
     const payload: SendAttachment[] | undefined =
       readyImages.length > 0
-        ? readyImages.map((img) => ({
-            media: {
-              data_url: img.dataUrl,
-              name: img.file.name,
-            },
-            preview: { kind: img.kind, url: img.dataUrl, name: img.file.name },
-          }))
+        ? readyImages.map((img) =>
+            img.uploadUrl
+              ? {
+                  // File attachments point at tmpfiles.org; the bytes were
+                  // uploaded browser-side and never transit the gateway host.
+                  media: { url: img.uploadUrl, name: img.file.name },
+                  preview: { kind: "file", url: img.uploadUrl, name: img.file.name },
+                }
+              : {
+                  media: { data_url: img.dataUrl as string, name: img.file.name },
+                  preview: { kind: img.kind, url: img.dataUrl as string, name: img.file.name },
+                },
+          )
         : undefined;
     const attachedCliApps = activeCliMentionApps.map(cliAppMentionPayload);
     const attachedMcpPresets = activeMcpPresetMentions.map(mcpPresetMentionPayload);
