@@ -154,11 +154,6 @@ class AgentRunSpec:
     # covers the first request, post-tool continuations, and finalization
     # retries, including provider-owned state restored from an earlier turn.
     strip_image_content_before_provider: bool = False
-    # Per-run enforcement state for Manus-style batching. Tracks how many times
-    # the model has issued a single novita_sandbox 'run' step so we can push it
-    # toward sandbox_batch once it clearly needs multi-step work. Mutable dict
-    # (not slots-blocked) so _run_tool can bump counters across iterations.
-    batch_enforcement_state: dict[str, int] = field(default_factory=dict)
     # When True, an identical task (same user text) that was completed recently
     # replays its stored final answer with ZERO provider calls. Enabled in the
     # agent loop; tests opt in explicitly.
@@ -1807,14 +1802,6 @@ class AgentRunner:
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         hook = hook or AgentHook()
         context = context or AgentHookContext(iteration=0, messages=[])
-        # --- Manus-style hard auto-batching ---------------------------------
-        # When the model emits several novita_sandbox operations in ONE turn we
-        # fold them into a single sandbox_batch execution so the whole group is
-        # treated as one unit of work. This keeps the number of *iterations*
-        # (and therefore LLM round-trips / billed steps) flat no matter how many
-        # individual commands the model wanted to run. Only rewrites when the
-        # batch tool is actually available; otherwise behaviour is unchanged.
-        tool_calls = self._coalesce_sandbox_calls(spec, tool_calls)
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
@@ -1923,280 +1910,6 @@ class AgentRunner:
             args = repr(tool_call.arguments)
         return f"{tool_call.name}:{args}"
 
-    # How many lone novita_sandbox 'run' steps are tolerated in a single task
-    # before the model is forced to switch to sandbox_batch. Default 0 = MAXIMUM
-    # enforcement: the very first lone sandbox run/write/read step triggers the
-    # batch requirement. Live-tested against Kyma/deepseek-v4-flash: zero
-    # tolerance cut real LLM calls for a 6-command task from 7 -> 3 (57% fewer),
-    # so small credit balances stretch much further. Raise via
-    # POWERX_BATCH_ENFORCE_AFTER to allow more free single steps.
-    _BATCH_ENFORCE_AFTER = int(os.environ.get("POWERX_BATCH_ENFORCE_AFTER", "0"))
-
-    #: Tools whose lone use signals the model has begun multi-step workspace
-    # work and should be nudged toward a single batched script. Beyond the
-    # sandbox runner this now covers local shell exec and repeated file reads —
-    # the exact shapes that turned "check a zip file" into ~10 billed round-trips
-    # (find → list → unzip → read×5 → summarise), none of which the old
-    # sandbox-only enforcement ever policed.
-    _BATCH_NUDGE_TOOLS = frozenset(
-        {"novita_sandbox", "exec", "read_file", "list_dir", "grep", "find_files"}
-    )
-
-    def _coalesce_sandbox_calls(
-        self,
-        spec: AgentRunSpec,
-        tool_calls: list[ToolCallRequest],
-    ) -> list[ToolCallRequest]:
-        """Fold runs of >=2 consecutive novita_sandbox calls into one batch.
-
-        The Manus property we want at the runtime level is: *many sandbox
-        operations should not translate into many LLM round-trips*. When the
-        model already emits several sandbox ops in a single assistant turn, we
-        merge each maximal run of them into one synthetic ``sandbox_batch`` call
-        so they execute as a unit and produce one combined tool result. Non-
-        sandbox calls (and lone sandbox calls) pass through untouched. This is a
-        no-op unless the batch tool is registered, so agents without it keep the
-        exact prior behaviour.
-        """
-        if len(tool_calls) < 2:
-            return tool_calls
-        has_batch = bool(getattr(spec.tools, "has", lambda _: False)("sandbox_batch"))
-        if not has_batch:
-            return tool_calls
-
-        merged: list[ToolCallRequest] = []
-        i = 0
-        n = len(tool_calls)
-        while i < n:
-            tc = tool_calls[i]
-            if tc.name != "novita_sandbox":
-                merged.append(tc)
-                i += 1
-                continue
-            # Collect the maximal run of consecutive novita_sandbox calls.
-            run: list[ToolCallRequest] = [tc]
-            j = i + 1
-            while j < n and tool_calls[j].name == "novita_sandbox":
-                run.append(tool_calls[j])
-                j += 1
-            if len(run) == 1:
-                merged.append(tc)
-                i = j
-                continue
-            operations: list[dict[str, Any]] = []
-            for member in run:
-                args = member.arguments if isinstance(member.arguments, dict) else {}
-                op = dict(args)
-                # A member without an explicit action cannot be represented as
-                # a batch operation; keep it as its own standalone call rather
-                # than poisoning the whole merged batch with an empty action.
-                if not str(op.get("action", "")).strip():
-                    merged.append(member)
-                    continue
-                operations.append(op)
-            if len(operations) < 2:
-                # Nothing mergeable survived; execute members unchanged.
-                merged.extend(run)
-                i = j
-                continue
-            batch_call = ToolCallRequest(
-                id=f"batch-{run[0].id}",
-                name="sandbox_batch",
-                arguments={
-                    "operations": operations,
-                    "stop_on_error": False,
-                },
-            )
-            merged.append(batch_call)
-            logger.debug(
-                "Coalesced {} consecutive novita_sandbox calls into one sandbox_batch",
-                len(run),
-            )
-            i = j
-        return merged
-
-    def _batch_enforcement_check(
-        self,
-        spec: AgentRunSpec,
-        tool_call: ToolCallRequest,
-    ) -> tuple[str, dict[str, str]] | None:
-        """Return (detail, event) to block a call, or None to allow it.
-
-        Enforces Manus-style batching: once the model has issued more than
-        ``_BATCH_ENFORCE_AFTER`` single ``novita_sandbox`` ``run`` steps in one
-        task, further lone runs are rejected until it uses ``sandbox_batch``.
-        Using ``sandbox_batch`` resets the counter so well-behaved turns pay no
-        penalty. Only active when the batch tool is registered/available.
-        """
-        state = getattr(spec, "batch_enforcement_state", None)
-        if state is None:
-            return None
-        name = tool_call.name
-        # Reward correct behaviour: a batch/plan call resets the streak counter.
-        if name in {"sandbox_batch", "run_plan"}:
-            state["single_run_streak"] = 0
-            state["inspection_streak"] = 0
-            return None
-        has_run_plan = bool(getattr(spec.tools, "has", lambda _: False)("run_plan"))
-        batch_available = bool(getattr(spec.tools, "has", lambda _: False)("sandbox_batch"))
-        # Enforcement is active when EITHER the sandbox_batch OR the cheaper and
-        # more structured run_plan tool is available to consolidate remaining work.
-        enforceable = has_run_plan or batch_available
-        preferred = "run_plan" if has_run_plan else "sandbox_batch"
-        # --- Post-nudge runaway-walk guard (Addition 3) ---------------------
-        # The classic "check this zip/project" blow-up is a long chain of LONE
-        # read/list/grep/exec calls, none of which the sandbox-only rule policed.
-        # Once we've already nudged the model toward batching AND it keeps walking
-        # the tree step-by-step past a generous budget, we reject further lone
-        # inspection calls so the remaining work collapses into one script. The
-        # budget is high (default 8) precisely to avoid breaking legitimate
-        # inspect-then-decide flows — only a genuine runaway trips it. Live-tunable
-        # via POWERX_MAX_LONE_INSPECTIONS (<=0 disables the guard).
-        max_lone = int(os.environ.get("POWERX_MAX_LONE_INSPECTIONS", "6"))
-        if (
-            enforceable
-            and max_lone > 0
-            and name in self._BATCH_NUDGE_TOOLS
-        ):
-            # Hard consolidation enforcement: past the budget of lone
-            # inspection/work tool calls in this task, block the call and require
-            # ONE run_plan (or sandbox_batch). We deliberately do NOT require the
-            # soft "nudged" flag here: the guard must hold even if the soft nudge
-            # never attached (e.g. the first result was small), so a model that
-            # keeps stepping one call at a time is still forced to consolidate.
-            insp = int(state.get("inspection_streak", 0)) + 1
-            state["inspection_streak"] = insp
-            if insp > max_lone:
-                detail = (
-                    f"BATCHING REQUIRED: you have issued {insp} separate lone "
-                    f"'{name}' steps in this task; each costs a full model round-trip. "
-                    "Stop walking the workspace one call at a time. Make ONE "
-                    f"{preferred} call that performs ALL remaining "
-                    "inspection/reads/checks — with run_plan use a plan of steps plus "
-                    "a `foreach` over items so they run WITHOUT calling you again; "
-                    "with sandbox_batch put the whole remaining job inside one script. "
-                    f"Retry now using {preferred}."
-                )
-                event = {
-                    "name": name,
-                    "status": "error",
-                    "detail": f"batching required: too many lone inspection steps ({preferred})",
-                }
-                logger.info(
-                    "Batching guard blocked lone '{}' (inspection_streak={}) for {}",
-                    name, insp, spec.session_key or "default",
-                )
-                return detail, event
-        # Only police lone sandbox run/read/write steps; other tools pass through.
-        if name != "novita_sandbox":
-            return None
-        if not batch_available:
-            return None
-        action = ""
-
-        arguments = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
-        if isinstance(arguments, dict):
-            action = str(arguments.get("action", "")).strip().lower()
-        # Only 'run'/'write' style sequential ops are worth batching.
-        # 'read' is deliberately NOT policed: the model often needs to inspect
-        # a result between steps, and forcing a batch just to read caused
-        # retry loops when the next action depended on what was read.
-        # install/upload/download_url are typically one-off and left alone.
-        if action not in {"run", "write"}:
-            return None
-        streak = int(state.get("single_run_streak", 0)) + 1
-        state["single_run_streak"] = streak
-        if streak <= self._BATCH_ENFORCE_AFTER:
-            return None
-        detail = (
-            f"BATCHING REQUIRED: you have issued {streak} separate novita_sandbox "
-            f"'{action}' steps in this task, and each one costs a full model round-trip "
-            "and a billed step. Stop doing single commands. Combine the remaining work "
-            "into ONE sandbox_batch call. Format it as: "
-            '{"operations": [{"action": "write", "path": "/workspace/setup.sh", '
-            '"content": "<a bash script that does every remaining step and prints a '
-            'summary>"}, {"action": "run", "command": "bash /workspace/setup.sh"}]}. '
-            "Put loops, installs, builds and checks INSIDE that script so the sandbox "
-            "runs them without extra model calls. Chain shell commands with && instead "
-            "of splitting them across turns. Retry now using sandbox_batch."
-        )
-        event = {
-            "name": name,
-            "status": "error",
-            "detail": "batching required: use sandbox_batch",
-        }
-        logger.info(
-            "Batching enforcement blocked lone novita_sandbox '{}' (streak={}) for {}",
-            action, streak, spec.session_key or "default",
-        )
-        return detail, event
-
-    def _maybe_inject_batching_nudge(
-        self,
-        spec: AgentRunSpec,
-        tool_call: ToolCallRequest,
-        result: Any,
-    ) -> str | None:
-        """Return a batching hint to append to a tool result, or None.
-
-        The old enforcement only *reacted*: it let the model burn several lone
-        steps before blocking. For tasks like "check this zip" the model does
-        find → list → unzip → read×5 → summarise, and none of those except the
-        unzip were policed, so it still paid ~10 round-trips. This makes the
-        discipline *pre-emptive*: the first time the model takes a single
-        workspace-inspection step in a task we tack a short, non-blocking note
-        onto that very result telling it to fold all remaining work into one
-        ``sandbox_batch`` script. It never rejects or loops (so no retry churn)
-        — it just re-programs the next decision while the cost is still low.
-
-        Fires at most once per task (guarded by state), only when the batch tool
-        is actually available, and only for tools whose repeated lone use is the
-        problem. Returns the appended text so the caller can splice it in.
-        """
-        if os.environ.get("POWERX_BATCH_NUDGE", "1").strip().lower() not in {
-            "1", "true", "yes", "on",
-        }:
-            return None
-        state = getattr(spec, "batch_enforcement_state", None)
-        if state is None:
-            return None
-        # One nudge per task; don't nag repeatedly.
-        if state.get("nudged"):
-            return None
-        if tool_call.name not in self._BATCH_NUDGE_TOOLS:
-            return None
-        # Only worth nudging if there is a batch tool OR the (cheaper) run_plan
-        # tool to steer toward. run_plan is strictly better than sandbox_batch
-        # for agentic file work (structured steps + foreach loops, no shell
-        # scripting), so if it is registered we prefer to steer there even when
-        # sandbox_batch is absent.
-        has_run_plan = bool(getattr(spec.tools, "has", lambda _: False)("run_plan"))
-        batch_available = bool(getattr(spec.tools, "has", lambda _: False)("sandbox_batch"))
-        if not (has_run_plan or batch_available):
-            return None
-        # A whole-turn batch/plan call means the model already behaves well.
-        if tool_call.name in {"sandbox_batch", "run_plan"}:
-            return None
-        # Don't nag a genuinely one-shot action. Only nudge when the result
-        # itself suggests a tree/list worth walking (many lines or file names),
-        # i.e. the classic find→list→read×N explosion. A single short answer
-        # ("(empty)", one line) gets left alone so trivial tasks stay clean.
-        text = str(result or "")
-        looks_like_more_work = text.count("\n") >= 3 or len(text) > 240
-        if not looks_like_more_work:
-            return None
-        state["nudged"] = 1
-        return (
-            "\n\n[BATCHING TIP — save credits] You are doing this task one small "
-            "step at a time, and every separate step costs another model round-trip. "
-            "For everything you still need to do, make ONE call that runs the whole "
-            "rest of the job deterministically. Prefer the `run_plan` tool: give it a "
-            "plan whose steps include a `foreach` over the file/item list so the loop "
-            "runs WITHOUT calling you again (e.g. find files -> foreach -> read/check "
-            "each). If run_plan is unavailable, use ONE sandbox_batch script instead. "
-            "Do not issue more single find/list/read/exec steps."
-        )
-
     async def _run_tool(
         self,
         spec: AgentRunSpec,
@@ -2241,19 +1954,6 @@ class AgentRunner:
                 "status": "error",
                 "detail": "identical tool call blocked",
             }
-            if spec.fail_on_tool_error:
-                return detail + hint, event, RuntimeError(detail)
-            return detail + hint, event, None
-        # --- Manus-style batching enforcement -----------------------------
-        # Each agent iteration is one LLM call and one billed credit step. A
-        # model that issues many single novita_sandbox 'run' commands pays for
-        # every one of them. Once it has clearly committed to multi-step work,
-        # we reject further lone 'run' calls and require sandbox_batch so the
-        # remaining steps collapse into a single round-trip. Gated on the batch
-        # tool actually being available, so non-sandbox agents are unaffected.
-        enforcement_block = self._batch_enforcement_check(spec, tool_call)
-        if enforcement_block is not None:
-            detail, event = enforcement_block
             if spec.fail_on_tool_error:
                 return detail + hint, event, RuntimeError(detail)
             return detail + hint, event, None
@@ -2337,17 +2037,6 @@ class AgentRunner:
             return result + hint, event, None
 
         await hook.after_execute_tool(context, tool_call, tool, params, result)
-
-        # --- Pre-emptive batching nudge (Addition 1) ------------------------
-        # On the model's first lone workspace-inspection step of a task, splice a
-        # short non-blocking hint onto the result telling it to fold all remaining
-        # work into one sandbox_batch script. This is what stops "check this zip"
-        # from becoming ~10 separate billed round-trips: we re-program the next
-        # decision while the cost is still near zero, instead of only reacting
-        # after several steps have already been paid for.
-        nudge = self._maybe_inject_batching_nudge(spec, tool_call, result)
-        if nudge and isinstance(result, str):
-            result = result + nudge
 
         detail = "" if result is None else str(result)
         detail = detail.replace("\n", " ").strip()
