@@ -50,6 +50,16 @@ _TOKEN_ENV = "VERCEL_TOKEN"
 _MAX_RESULT_CHARS = 16_000
 _DEFAULT_TIMEOUT = 300
 
+_GITIGNORE = """.venv/
+node_modules/
+.vercel/
+.env
+.env.*
+!.env.example
+dist/
+.DS_Store
+"""
+
 
 def _vercel_token() -> str | None:
     token = os.environ.get(_TOKEN_ENV, "").strip()
@@ -92,10 +102,22 @@ def _run_cli(args: list[str], *, input_text: str | None = None, cwd: str | Path 
     return text[: _MAX_RESULT_CHARS] or "(no output)"
 
 
+_VERCEL_URL_RE = re.compile(r"https://[^\s'\"]+\.vercel\.app[^\s'\"]*")
+
+
 def _extract_url(text: str) -> str | None:
-    """Return the first ``https://…`` URL in the CLI output (the deployment URL)."""
-    match = re.search(r"https://[^\s'\"]+", text)
-    return match.group(0).rstrip(".,;)]}") if match else None
+    """Return the Vercel deployment URL from CLI output.
+
+    Prefer an explicit ``.vercel.app`` deployment URL so we never mistake a
+    telemetry, login, or GitHub-link message for the live site. Fall back to
+    the first ``https://`` URL only if no Vercel URL is present.
+    """
+    match = _VERCEL_URL_RE.search(text)
+    if not match:
+        match = re.search(r"https://[^\s'\"]+", text)
+    if not match:
+        return None
+    return match.group(0).rstrip(".,;)]}")
 
 
 @tool_parameters(
@@ -264,6 +286,7 @@ class WebDevTool(Tool):
                 "</html>\n"
             )
             (dest / "vercel.json").write_text('{"framework":null}\n')
+            (dest / ".gitignore").write_text(_GITIGNORE)
         elif kind == "backend":
             dest.mkdir(parents=True, exist_ok=True)
             (dest / "package.json").write_text(
@@ -286,6 +309,7 @@ class WebDevTool(Tool):
                 '{"version":2,"builds":[{"src":"server.js","use":"@vercel/node"}],'
                 '"routes":[{"src":"/(.*)","dest":"server.js"}]}\n'
             )
+            (dest / ".gitignore").write_text(_GITIGNORE)
         else:  # fullstack
             dest.mkdir(parents=True, exist_ok=True)
             (dest / "package.json").write_text(
@@ -315,6 +339,7 @@ class WebDevTool(Tool):
                 "  <title>Fullstack App</title>\n</head>\n<body>\n  <h1>Fullstack App</h1>\n"
                 "  <p>API at <code>/api</code></p>\n</body>\n</html>\n"
             )
+            (dest / ".gitignore").write_text(_GITIGNORE)
 
         return (
             f"Scaffolded a {kind} web project in {dest}.\n"
@@ -326,6 +351,16 @@ class WebDevTool(Tool):
         dest = self._resolve_project_dir(project or ".")
         if not dest.is_dir():
             return ToolResult.error(f"project directory {dest} does not exist")
+        # Link the project first so deploys are deterministic and self-contained.
+        # ``vercel link --project <name>`` creates the project when it does not
+        # exist yet and writes a local ``.vercel`` link. Without this, running
+        # ``vercel deploy`` from inside a git checkout tries to auto-link the
+        # GitHub repository (which needs a GitHub login connection on the
+        # account) and fails loudly before still deploying. Linking first keeps
+        # the agent deploy non-interactive and free of that noise on the very
+        # first run as well as on later redeploys.
+        proj_name = dest.name or "powerx-app"
+        _run_cli(["link", "--yes", "--project", proj_name], cwd=dest, timeout=timeout)
         args = ["deploy"]
         if yes:
             args.append("--yes")

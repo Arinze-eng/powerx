@@ -49,6 +49,7 @@ def test_scaffold_frontend(tmp_path: Path) -> None:
     assert index.exists()
     assert "<title>My Web App</title>" in index.read_text()
     assert (tmp_path / "site-a" / "vercel.json").exists()
+    assert (tmp_path / "site-a" / ".gitignore").exists()
 
 
 def test_scaffold_backend(tmp_path: Path) -> None:
@@ -59,6 +60,7 @@ def test_scaffold_backend(tmp_path: Path) -> None:
     assert pkg.exists()
     assert (tmp_path / "api-a" / "server.js").exists()
     assert "node:http" in (tmp_path / "api-a" / "server.js").read_text()
+    assert (tmp_path / "api-a" / ".gitignore").exists()
 
 
 def test_scaffold_fullstack(tmp_path: Path) -> None:
@@ -67,6 +69,9 @@ def test_scaffold_fullstack(tmp_path: Path) -> None:
     assert not getattr(res, "is_error", False), res
     assert (tmp_path / "app-a" / "index.html").exists()
     assert (tmp_path / "app-a" / "server.js").exists()
+    gitignore = tmp_path / "app-a" / ".gitignore"
+    assert gitignore.exists()
+    assert ".vercel/" in gitignore.read_text()
 
 
 def test_scaffold_rejects_bad_name(tmp_path: Path) -> None:
@@ -87,6 +92,13 @@ def test_extract_url() -> None:
     assert _extract_url("Production      https://demo-abc.vercel.app\nReady") == (
         "https://demo-abc.vercel.app"
     )
+    # A .vercel.app URL is preferred even when another https URL appears first
+    # (e.g. a telemetry or GitHub-link message), so the agent never reports the
+    # wrong URL to the user.
+    assert _extract_url("Login https://vercel.com/login?next=... \nhttps://demo-abc.vercel.app") == (
+        "https://demo-abc.vercel.app"
+    )
+    assert _extract_url("Production https://other.example.com") == "https://other.example.com"
     assert _extract_url("no url here") is None
 
 
