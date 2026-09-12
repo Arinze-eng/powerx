@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import posixpath
 import re
+import shutil
 import shlex
+import subprocess
 from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -27,6 +29,59 @@ _MAX_INSTALL_PACKAGES = 24
 _USERNAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.@-]{0,63}$")
 _PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.:@~=-]{0,127}$")
 _FINGERPRINT_RE = re.compile(r"^(?:SHA256:[A-Za-z0-9+/=]+|MD5:[0-9a-fA-F:]{47})$")
+
+
+_HOSTKEY_TYPES = ("ed25519", "rsa", "ecdsa")
+
+
+def discover_vps_host_keys(host: str, port: int = 22, *, timeout: int = 20) -> list[dict[str, Any]]:
+    """Return the live SSH host key fingerprints of ``host`` without authenticating.
+
+    Uses ``ssh-keyscan`` (ships with openssh-client, installed in the runtime
+    image) to read the server's public host keys during the TCP/kex exchange —
+    no username, password, or private key is required. Each entry is
+    ``{"key_type", "bits", "fingerprint"}`` where fingerprint is the standard
+    ``SHA256:...`` form used by OpenSSH and stored in ``host_key_fingerprint``.
+
+    Raises ValueError on an invalid host/port and RuntimeError when the scan
+    tooling is unavailable or the host cannot be reached, so callers can surface
+    a clear message instead of silently returning nothing.
+    """
+    clean_host = validate_vps_host(str(host))
+    try:
+        clean_port = int(port)
+    except (TypeError, ValueError):
+        raise ValueError("VPS SSH port must be an integer") from None
+    if not 1 <= clean_port <= 65535:
+        raise ValueError("VPS SSH port must be between 1 and 65535")
+    if shutil.which("ssh-keyscan") is None or shutil.which("ssh-keygen") is None:
+        raise RuntimeError(
+            "ssh-keyscan/ssh-keygen are unavailable in this runtime; cannot probe the host key"
+        )
+    types_arg = ",".join(_HOSTKEY_TYPES)
+    # ssh-keyscan prints armored keys; pipe through ssh-keygen for SHA256 fp lines.
+    command = (
+        f"ssh-keyscan -T {int(max(2, min(timeout, 60)))} -p {clean_port} -t {types_arg} "
+        f"{shlex.quote(clean_host)} 2>/dev/null | ssh-keygen -E sha256 -lf - 2>/dev/null"
+    )
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True,
+            timeout=max(5, int(timeout) + 10),
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Host key scan timed out reaching {clean_host}:{clean_port}") from None
+    entries: list[dict[str, Any]] = []
+    for line in (result.stdout or "").splitlines():
+        # Example: "3072 SHA256:xxxx host (RSA)"
+        parts = line.split()
+        if len(parts) < 4 or not parts[1].startswith(("SHA256:", "MD5:")):
+            continue
+        bits = parts[0] if parts[0].isdigit() else ""
+        fingerprint = parts[1]
+        key_type = parts[-1].strip("()").lower()
+        entries.append({"key_type": key_type, "bits": bits, "fingerprint": fingerprint})
+    return entries
 
 # Browser-like User-Agent used when fetching remote files so download hosts
 # return the real artifact instead of an HTML landing page.
@@ -294,6 +349,27 @@ class VPSExecutionBackend:
         finally:
             conn.close()
             await conn.wait_closed()
+
+    def discover_host_keys(self) -> dict[str, Any]:
+        """Probe the configured VPS host key(s) without authenticating.
+
+        Returns the discovered fingerprints plus whether any of them matches the
+        configured ``host_key_fingerprint`` (so an admin can confirm the value
+        they entered actually corresponds to the live server before trusting
+        strict mode). Never sends credentials.
+        """
+        configured = str(self.config.host_key_fingerprint or "").strip()
+        entries = discover_vps_host_keys(self.config.host, self.config.port)
+        fingerprints = [entry["fingerprint"] for entry in entries]
+        matched = bool(configured) and configured in fingerprints
+        return {
+            "ok": bool(entries),
+            "host": str(self.config.host),
+            "port": int(self.config.port),
+            "keys": entries,
+            "configured_fingerprint": configured,
+            "matches": matched,
+        }
 
     async def run(self, command: str, *, timeout: int = 120, cwd: str | None = None) -> str:
         command = command.strip()

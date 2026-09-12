@@ -192,6 +192,7 @@ _WEBUI_MUTATION_PATHS = {
     "admin.provider.save": "/api/admin/provider-settings/save",
     "admin.execution.save": "/api/admin/execution-settings",
     "admin.execution.test": "/api/admin/execution-test",
+    "admin.vps.hostkey": "/api/admin/vps-hostkey",
     "admin.dbq.execute": "/api/admin/dbq/action",
     "admin.dbq.ping": "/api/admin/dbq/status",
     "admin.supabase.action": "/api/admin/supabase/action",
