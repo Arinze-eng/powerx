@@ -5,11 +5,13 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from nanobot.webui.attachment_ingress import (
     extract_data_url_mime,
     extract_remote_file_url,
+    resolve_remote_direct_url,
     store_inbound_attachments,
 )
 from nanobot.webui.ingress_policy import AttachmentIngressLimits
@@ -217,3 +219,75 @@ def test_store_inbound_rejects_untrusted_url_host(tmp_path: Path) -> None:
 
     assert paths == []
     assert rejection == "malformed"
+
+
+# --- resolve_remote_direct_url -------------------------------------------
+#
+# tmpfiles.org page URLs (/<slug>/<file>) serve an HTML viewer; the raw bytes
+# live under /dl/<nonce>/<slug>/<file>, and the nonce is minted per page view
+# and embedded in that HTML. The agent must receive the /dl/ form so it can
+# download with a single GET instead of scraping the viewer page.
+
+_PAGE_URL = "https://tmpfiles.org/wewRPwJIvaJ9/report.pdf"
+_DL_PATH = "/dl/1789235400.3535ca35b2436ac2/wewRPwJIvaJ9/report.pdf"
+
+
+def _client_returning(html: str) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text=html))
+    )
+
+
+@pytest.mark.asyncio
+async def test_page_url_resolves_to_embedded_dl_link(monkeypatch: pytest.MonkeyPatch) -> None:
+    html = f'<a href="https://tmpfiles.org{_DL_PATH}">download</a>'
+    monkeypatch.setattr(
+        "nanobot.webui.attachment_ingress.httpx.AsyncClient",
+        lambda **kwargs: _client_returning(html),
+    )
+
+    resolved = await resolve_remote_direct_url(_PAGE_URL)
+
+    assert resolved == f"https://tmpfiles.org{_DL_PATH}"
+
+
+@pytest.mark.asyncio
+async def test_already_direct_url_passes_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(**kwargs):  # pragma: no cover - must never be used
+        raise AssertionError("must not fetch an already-direct URL")
+
+    monkeypatch.setattr(
+        "nanobot.webui.attachment_ingress.httpx.AsyncClient", _boom
+    )
+
+    direct = f"https://tmpfiles.org{_DL_PATH}"
+    assert await resolve_remote_direct_url(direct) == direct
+
+
+@pytest.mark.asyncio
+async def test_non_tmpfiles_host_is_left_untouched() -> None:
+    url = "https://example.com/file.pdf"
+    assert await resolve_remote_direct_url(url) == url
+
+
+@pytest.mark.asyncio
+async def test_fetch_failure_falls_back_to_original(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(
+        "nanobot.webui.attachment_ingress.httpx.AsyncClient",
+        lambda **kwargs: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    assert await resolve_remote_direct_url(_PAGE_URL) == _PAGE_URL
+
+
+@pytest.mark.asyncio
+async def test_missing_dl_link_falls_back_to_original(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "nanobot.webui.attachment_ingress.httpx.AsyncClient",
+        lambda **kwargs: _client_returning("<html><body>no link here</body></html>"),
+    )
+
+    assert await resolve_remote_direct_url(_PAGE_URL) == _PAGE_URL

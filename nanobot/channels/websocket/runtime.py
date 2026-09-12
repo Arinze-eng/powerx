@@ -66,6 +66,7 @@ from nanobot.session.webui_turns import (
     websocket_turn_wall_started_at,
 )
 from nanobot.utils.helpers import safe_filename
+from nanobot.webui.attachment_ingress import resolve_remote_direct_url
 from nanobot.webui.cli_apps_api import normalize_cli_app_mentions
 from nanobot.webui.forking import handle_webui_fork_chat
 from nanobot.webui.gateway_services import GatewayServices
@@ -1417,20 +1418,27 @@ class WebSocketChannel(BaseChannel):
             )
             if remote_media:
                 # The agent needs the tmpfiles.org links in the turn text so it
-                # can fetch the attached files with its web tools — the bytes
-                # never touched this host.
+                # can fetch the attached files — the bytes never touched this
+                # host. tmpfiles page URLs serve an HTML viewer, so resolve them
+                # to the raw /dl/ download URL first (fast, best-effort) so the
+                # agent can grab the file with a single GET instead of scraping
+                # the viewer page.
+                resolved = await asyncio.gather(
+                    *(resolve_remote_direct_url(url) for url in remote_media),
+                    return_exceptions=True,
+                )
                 note_lines = []
-                for index, path in enumerate(media_paths):
-                    if not path.startswith(("https://", "http://")):
-                        continue
+                for index, url in enumerate(remote_media):
+                    direct = resolved[index] if isinstance(resolved[index], str) else url
                     name = media_names[index] if index < len(media_names) else None
                     note_lines.append(
-                        f"- {name or path.rsplit('/', 1)[-1] or 'file'}: {path}"
+                        f"- {name or direct.rsplit('/', 1)[-1] or 'file'}: {direct}"
                     )
                 dispatch_content = (
                     f"{dispatch_content}\n\n"
-                    "[Attached file(s) were uploaded directly to tmpfiles.org; "
-                    "download them with your web tools if you need their contents]\n"
+                    "[Attached file(s) upload straight to tmpfiles.org; the links "
+                    "below download the raw file bytes directly — fetch each with "
+                    "a single curl/wget, no page extraction needed]\n"
                     + "\n".join(note_lines)
                 )
             cli_apps = normalize_cli_app_mentions(envelope.get("cli_apps"))

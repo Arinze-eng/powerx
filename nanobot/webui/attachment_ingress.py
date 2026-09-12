@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
+import httpx
+
 from nanobot.utils.media_decode import FileSizeExceeded, save_base64_data_url
 from nanobot.webui.ingress_policy import (
     DEFAULT_WEBUI_INGRESS_POLICY,
@@ -125,6 +127,41 @@ def extract_remote_file_url(attachment: dict[str, Any]) -> str | None:
         or parsed.path == "/"
     ):
         return ""
+    return url
+
+
+# A tmpfiles.org page URL serves an HTML viewer, not the file bytes. The raw
+# bytes are only served under ``/dl/<nonce>/<slug>/<file>``, and the nonce is a
+# per-page-view token embedded in the viewer HTML. We fetch that tiny page once
+# and surface the embedded ``/dl/`` link so the agent can download the file with
+# a single GET instead of scraping the viewer page.
+_TMPFILES_DL_RE = re.compile(r"/dl/[^\s\"'>]+")
+
+
+def _is_direct_tmpfiles_url(url: str) -> bool:
+    return urlparse(url).path.split("/")[:2] == ["", "dl"]
+
+
+async def resolve_remote_direct_url(url: str, *, timeout: float = 8.0) -> str:
+    """Resolve a tmpfiles.org page URL to a URL that serves raw file bytes.
+
+    Already-direct ``/dl/`` URLs pass through unchanged. On a network or parse
+    failure the original URL is returned so attachment handling never breaks.
+    """
+    parsed = urlparse(url)
+    if parsed.netloc.lower() not in _REMOTE_FILE_HOSTS or not parsed.path:
+        return url
+    if _is_direct_tmpfiles_url(url):
+        return url
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            match = _TMPFILES_DL_RE.search(response.text)
+        if match is not None:
+            return f"https://tmpfiles.org{match.group(0)}"
+    except Exception:  # noqa: BLE001 - best-effort rewrite, never break sends
+        pass
     return url
 
 
