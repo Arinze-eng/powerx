@@ -126,6 +126,22 @@ def _sandbox_backend_label(backend_name: str) -> str:
     }.get(backend_name, "Novita Sandbox")
 
 
+# Channels whose inbound messages carry *local* image/attachment file paths that
+# the selected execution backend can read directly. The configured LLM may not
+# accept raw image blocks, so uploads on these channels are moved through OCR in
+# the sandbox/VPS/Upstash backend before the model sees the turn. Historically
+# this was hard-coded to ``telegram`` only, which silently dropped every WebUI
+# (websocket) upload to a ``[image: <file>]`` text placeholder — the model then
+# answered "I cannot view images" even though the same image analysed fine on
+# Telegram. Include websocket so browser uploads use the identical OCR pipeline.
+_SANDBOX_IMAGE_OCR_CHANNELS = frozenset({"telegram", "websocket"})
+
+
+def _uses_sandbox_image_ocr(channel: object) -> bool:
+    """Return whether inbound images on ``channel`` should be routed through OCR."""
+    return isinstance(channel, str) and channel in _SANDBOX_IMAGE_OCR_CHANNELS
+
+
 class TurnKind(Enum):
     USER = auto()
     SYSTEM = auto()
@@ -1226,17 +1242,17 @@ class AgentLoop:
             async def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
                 content = pending_msg.content
                 image_paths = list(pending_msg.media or [])
-                if pending_msg.channel == "telegram" and image_paths:
-                    telegram_images = [
+                if _uses_sandbox_image_ocr(pending_msg.channel) and image_paths:
+                    ocr_images = [
                         path
                         for path in image_paths
                         if isinstance(path, str) and path and is_image_file(path)
                     ]
-                    if telegram_images:
+                    if ocr_images:
                         analyzer = NovitaSandboxTool()
                         backend_name = analyzer.backend_name()
                         analysis = await analyzer.analyze_telegram_images(
-                            telegram_images,
+                            ocr_images,
                             content,
                             session_key=active_session_key,
                         )
@@ -1244,9 +1260,9 @@ class AgentLoop:
                             _sandbox_backend_label(backend_name)
                         )
                         prefix = (
-                            f"[Telegram image analysis from {backend_label} "
-                            f"({len(telegram_images)} image"
-                            f"{'s' if len(telegram_images) != 1 else ''})]\n"
+                            f"[Image analysis from {backend_label} "
+                            f"({len(ocr_images)} image"
+                            f"{'s' if len(ocr_images) != 1 else ''})]\n"
                             "The image file was uploaded and inspected by the selected execution backend. "
                             "Do not claim that the image was not received; report the OCR result honestly.\n"
                             f"{analysis.strip()}"
@@ -1257,7 +1273,7 @@ class AgentLoop:
                         ).strip()
                         content = f"{prefix}\n\nUser message: {original}" if original else prefix
                         image_paths = [
-                            path for path in image_paths if path not in telegram_images
+                            path for path in image_paths if path not in ocr_images
                         ]
                 if image_paths:
                     content, image_paths = reference_non_image_attachments(
@@ -1386,8 +1402,8 @@ class AgentLoop:
             )
 
         session_metadata = session.metadata if session is not None else None
-        telegram_image_request = (
-            channel == "telegram"
+        sandbox_image_request = (
+            _uses_sandbox_image_ocr(channel)
             and (
                 (metadata or {}).get("telegram_images_execution_backend") in {"novita", "vps", "upstash"}
                 or LLMProvider._contains_image_content(initial_messages)
@@ -1401,7 +1417,7 @@ class AgentLoop:
             )
         )
         if strip_image_content_before_provider is None:
-            strip_image_content_before_provider = telegram_image_request
+            strip_image_content_before_provider = sandbox_image_request
 
         # --- Deterministic zero-call router (Manus-style cost discipline) -----
         # Fresh text asks that unambiguously name a rule-resolvable read-only
@@ -1414,7 +1430,7 @@ class AgentLoop:
         # (non-image) turns with no active sustained goal, so visual/OCR work
         # and goal-driven sessions always keep the full model path.
         deterministic_router_text: str | None = None
-        if not telegram_image_request and not strip_image_content_before_provider:
+        if not sandbox_image_request and not strip_image_content_before_provider:
             if session is not None and sustained_goal_active(session.metadata):
                 deterministic_router_text = None
             else:
@@ -2027,10 +2043,10 @@ class AgentLoop:
                     paths.append(resolved)
         return paths
 
-    async def _stage_vps_telegram_attachments(self, ctx: TurnContext) -> None:
-        """Stage confirmed Telegram attachments before a VPS-backed model turn."""
+    async def _stage_vps_attachments(self, ctx: TurnContext) -> None:
+        """Stage confirmed channel attachments before a VPS-backed model turn."""
         msg = ctx.msg
-        if ctx.kind is not TurnKind.USER or msg.channel != "telegram" or not msg.media:
+        if ctx.kind is not TurnKind.USER or not _uses_sandbox_image_ocr(msg.channel) or not msg.media:
             return
         analyzer = NovitaSandboxTool()
         if analyzer.backend_name() != "vps":
@@ -2040,7 +2056,7 @@ class AgentLoop:
             for path in msg.media
             if isinstance(path, str) and path and not is_image_file(path)
         ]
-        # Image analysis is already atomic in `_prepare_telegram_images`: it
+        # Image analysis is already atomic in `_prepare_sandbox_images`: it
         # uploads the bytes, runs OCR, and hands only the completed result to
         # the model.  Do not stage images here as ordinary attachments, since
         # exposing a VPS path invites the model to perform a second, manual
@@ -2091,10 +2107,10 @@ class AgentLoop:
             ctx.session_key,
         )
 
-    async def _prepare_telegram_images(self, ctx: TurnContext) -> None:
-        """Move Telegram images through the selected backend before the model sees the turn."""
+    async def _prepare_sandbox_images(self, ctx: TurnContext) -> None:
+        """Move channel images through the selected backend before the model sees the turn."""
         msg = ctx.msg
-        if ctx.kind is not TurnKind.USER or msg.channel != "telegram" or not msg.media:
+        if ctx.kind is not TurnKind.USER or not _uses_sandbox_image_ocr(msg.channel) or not msg.media:
             return
 
         image_paths = [
@@ -2115,7 +2131,7 @@ class AgentLoop:
         image_count = len(image_paths)
         backend_label = _sandbox_backend_label(backend_name)
         prefix = (
-            f"[Telegram image analysis from {backend_label} ({image_count} image"
+            f"[Image analysis from {backend_label} ({image_count} image"
             f"{'s' if image_count != 1 else ''})]\n"
             "The image file was uploaded and inspected by the selected execution backend. "
             "Do not claim that the image was not received; report the OCR result honestly.\n"
@@ -2127,8 +2143,11 @@ class AgentLoop:
         ).strip()
         content = f"{prefix}\n\nUser message: {original}" if original else prefix
         metadata = dict(msg.metadata or {})
+        # Keep the legacy telegram_* keys so downstream provider-state logic and
+        # any external consumers continue to work, and add generic aliases.
         metadata["telegram_images_execution_backend"] = backend_name
         metadata["telegram_images_via_novita_sandbox"] = backend_name == "novita"
+        metadata["images_execution_backend"] = backend_name
         # Both backends receive OCR text rather than raw image blocks. Novita
         # already used this safe OCR-only handoff; VPS must use it too because
         # the configured LLM may not support image input. Never expose an image
@@ -2141,15 +2160,16 @@ class AgentLoop:
             metadata=metadata,
         )
         logger.info(
-            "Telegram image turn routed through {} for session {}",
+            "{} image turn routed through {} for session {}",
+            msg.channel,
             backend_label,
             ctx.session_key,
         )
 
     async def _restore_turn(self, ctx: TurnContext) -> None:
         """Restore checkpoint / pending user turn; reference non-image attachments."""
-        await self._stage_vps_telegram_attachments(ctx)
-        await self._prepare_telegram_images(ctx)
+        await self._stage_vps_attachments(ctx)
+        await self._prepare_sandbox_images(ctx)
         msg = ctx.msg
 
         if ctx.kind is TurnKind.USER and msg.media:
@@ -2345,13 +2365,13 @@ class AgentLoop:
                 await self._resolve_runtime_context_for_turn(ctx)
             )
         staged_provider_state = False
-        telegram_image_ocr_turn = (
+        sandbox_image_ocr_turn = (
             ctx.kind is TurnKind.USER
-            and ctx.msg.channel == "telegram"
+            and _uses_sandbox_image_ocr(ctx.msg.channel)
             and ctx.msg.metadata.get("telegram_images_execution_backend") in {"novita", "vps", "upstash"}
         )
-        if telegram_image_ocr_turn:
-            # OCR-only Telegram image turns must not resume provider state from
+        if sandbox_image_ocr_turn:
+            # OCR-only channel image turns must not resume provider state from
             # an earlier multimodal turn. That state can still contain a raw
             # image block even though the current message was already routed
             # through the selected sandbox/VPS and has no media blocks.
@@ -2415,7 +2435,7 @@ class AgentLoop:
             # prompt assembly and the first model checkpoint.
             self.sessions.save(session)
         ctx.initial_messages = self._build_initial_messages(ctx)
-        if telegram_image_ocr_turn:
+        if sandbox_image_ocr_turn:
             self._strip_telegram_image_blocks(ctx.initial_messages)
 
         if ctx.on_progress is None:

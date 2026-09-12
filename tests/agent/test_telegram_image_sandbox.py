@@ -30,7 +30,7 @@ async def test_telegram_images_are_preprocessed_and_removed_from_model_media(tmp
         ),
     )
 
-    await AgentLoop._prepare_telegram_images(AgentLoop.__new__(AgentLoop), ctx)
+    await AgentLoop._prepare_sandbox_images(AgentLoop.__new__(AgentLoop), ctx)
 
     analyze.assert_awaited_once_with(
         [str(image)],
@@ -65,7 +65,7 @@ async def test_vps_telegram_images_use_ocr_only_and_remove_local_image_reference
         ),
     )
 
-    await AgentLoop._prepare_telegram_images(AgentLoop.__new__(AgentLoop), ctx)
+    await AgentLoop._prepare_sandbox_images(AgentLoop.__new__(AgentLoop), ctx)
 
     analyze.assert_awaited_once_with(
         [str(image)],
@@ -101,7 +101,7 @@ async def test_non_telegram_images_keep_existing_model_media_behavior(tmp_path, 
         ),
     )
 
-    await AgentLoop._prepare_telegram_images(AgentLoop.__new__(AgentLoop), ctx)
+    await AgentLoop._prepare_sandbox_images(AgentLoop.__new__(AgentLoop), ctx)
 
     analyze.assert_not_awaited()
     assert ctx.msg.media == [str(image)]
@@ -128,7 +128,7 @@ async def test_telegram_non_image_attachments_are_not_sent_to_vision_preprocesso
         ),
     )
 
-    await AgentLoop._prepare_telegram_images(AgentLoop.__new__(AgentLoop), ctx)
+    await AgentLoop._prepare_sandbox_images(AgentLoop.__new__(AgentLoop), ctx)
 
     analyze.assert_not_awaited()
     assert ctx.msg.media == [str(document)]
@@ -557,8 +557,8 @@ async def test_vps_image_turn_removes_original_image_after_ocr(tmp_path, monkeyp
     )
     loop = AgentLoop.__new__(AgentLoop)
 
-    await loop._stage_vps_telegram_attachments(ctx)
-    await loop._prepare_telegram_images(ctx)
+    await loop._stage_vps_attachments(ctx)
+    await loop._prepare_sandbox_images(ctx)
 
     stage.assert_not_awaited()
     analyze.assert_awaited_once()
@@ -599,8 +599,8 @@ async def test_vps_mixed_turn_stages_only_non_image_attachments(tmp_path, monkey
     )
 
     loop = AgentLoop.__new__(AgentLoop)
-    await loop._stage_vps_telegram_attachments(ctx)
-    await loop._prepare_telegram_images(ctx)
+    await loop._stage_vps_attachments(ctx)
+    await loop._prepare_sandbox_images(ctx)
 
     stage.assert_awaited_once_with([str(document)], session_key="telegram:mixed")
     analyze.assert_awaited_once()
@@ -639,7 +639,7 @@ async def test_vps_staging_failure_preserves_attachment_context(tmp_path, monkey
         ),
     )
 
-    await AgentLoop._stage_vps_telegram_attachments(AgentLoop.__new__(AgentLoop), ctx)
+    await AgentLoop._stage_vps_attachments(AgentLoop.__new__(AgentLoop), ctx)
 
     assert str(document) in ctx.msg.content
     assert "TimeoutError" in ctx.msg.content
@@ -829,3 +829,94 @@ def test_telegram_ocr_turn_strips_all_image_block_shapes_before_provider() -> No
     assert all(block.get("type") != "image_url" for block in content)
     assert all(block.get("type") != "input_image" for block in content)
     assert any("raw image content was not sent" in block.get("text", "") for block in content)
+
+
+@pytest.mark.asyncio
+async def test_websocket_images_are_preprocessed_by_ocr(tmp_path, monkeypatch) -> None:
+    """Regression: WebUI (websocket) uploads must route through the sandbox OCR.
+
+    Previously the OCR routing was hard-gated on ``channel == "telegram"``, so a
+    browser upload silently degraded to an ``[image: <file>]`` text placeholder
+    and the model answered "I cannot view images". The same image analysed fine
+    on Telegram. This asserts websocket now uses the identical pipeline.
+    """
+    image = tmp_path / "webui-photo.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nminimal")
+    analyze = AsyncMock(return_value="A blue bicycle is visible. Text: RIDE SAFE.")
+    monkeypatch.setattr(NovitaSandboxTool, "analyze_telegram_images", analyze)
+
+    ctx = SimpleNamespace(
+        kind=TurnKind.USER,
+        session_key="websocket:abc",
+        msg=InboundMessage(
+            channel="websocket",
+            sender_id="anon-1",
+            chat_id="abc",
+            content="What this image about",
+            media=[str(image)],
+            metadata={"message_id": 9},
+        ),
+    )
+
+    await AgentLoop._prepare_sandbox_images(AgentLoop.__new__(AgentLoop), ctx)
+
+    analyze.assert_awaited_once_with(
+        [str(image)],
+        "What this image about",
+        session_key="websocket:abc",
+    )
+    # Image removed from model-visible media; OCR text injected instead.
+    assert ctx.msg.media == []
+    assert "A blue bicycle is visible." in ctx.msg.content
+    assert "What this image about" in ctx.msg.content
+    assert "uploaded and inspected" in ctx.msg.content
+    # Label is generic (not "Telegram") for non-telegram channels.
+    assert "[Image analysis from" in ctx.msg.content
+    assert "Telegram" not in ctx.msg.content
+    assert ctx.msg.metadata["images_execution_backend"] == "novita"
+
+
+@pytest.mark.asyncio
+async def test_websocket_vps_image_turn_removes_original_after_ocr(tmp_path, monkeypatch) -> None:
+    image = tmp_path / "webui-photo.jpg"
+    image.write_bytes(b"fake-image-bytes")
+    execution = SimpleNamespace(
+        backend="vps",
+        vps=SimpleNamespace(host="vps.example.test", workspace_dir="/workspace"),
+    )
+    monkeypatch.setattr(NovitaSandboxTool, "_execution_config", staticmethod(lambda: execution))
+    analyze = AsyncMock(return_value="Recognized text: WEBSOCKET VPS OCR 789")
+    monkeypatch.setattr(NovitaSandboxTool, "analyze_telegram_images", analyze)
+
+    ctx = SimpleNamespace(
+        kind=TurnKind.USER,
+        session_key="websocket:vps",
+        msg=InboundMessage(
+            channel="websocket",
+            sender_id="anon-2",
+            chat_id="vps",
+            content=f"[image: {image}]\nRead this",
+            media=[str(image)],
+            metadata={},
+        ),
+    )
+    loop = AgentLoop.__new__(AgentLoop)
+
+    await loop._stage_vps_attachments(ctx)
+    await loop._prepare_sandbox_images(ctx)
+
+    analyze.assert_awaited_once()
+    assert ctx.msg.media == []
+    assert str(image) not in ctx.msg.content
+    assert "WEBSOCKET VPS OCR 789" in ctx.msg.content
+    assert ctx.msg.metadata["telegram_images_execution_backend"] == "vps"
+
+
+def test_sandbox_image_ocr_channel_predicate() -> None:
+    from nanobot.agent.loop import _uses_sandbox_image_ocr
+
+    assert _uses_sandbox_image_ocr("telegram") is True
+    assert _uses_sandbox_image_ocr("websocket") is True
+    assert _uses_sandbox_image_ocr("api") is False
+    assert _uses_sandbox_image_ocr("discord") is False
+    assert _uses_sandbox_image_ocr(None) is False
