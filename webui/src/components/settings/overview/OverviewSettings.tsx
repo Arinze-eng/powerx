@@ -10,7 +10,6 @@ import {
   ImageIcon,
   Loader2,
   Mic,
-  Server,
   type LucideIcon,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -45,7 +44,6 @@ import { useClient } from "@/providers/ClientProvider";
 
 export function OverviewSettings({
   settings,
-  requiresRestart,
   onSelectSection,
   showBrandLogos,
 }: {
@@ -115,19 +113,7 @@ export function OverviewSettings({
       ? tx("settings.values.configured", "Configured")
       : tx("settings.values.notConfigured", "Not configured")
   }`;
-  const isNativeHost = (settings.surface ?? settings.runtime_surface) === "native";
   const workspaceCaption = shortWorkspacePath(settings.runtime.workspace_path);
-  const runtimeTitle = isNativeHost
-    ? tx("settings.rows.engine", "Engine")
-    : tx("settings.rows.gateway", "Gateway");
-  const runtimeValue = isNativeHost
-    ? tx("settings.values.privateEngine", "Private engine")
-    : `${settings.runtime.gateway_host}:${settings.runtime.gateway_port}`;
-  const runtimeCaption = isNativeHost
-    ? tx("settings.values.unixSocket", "Unix socket")
-    : requiresRestart
-      ? tx("settings.values.restartPending", "Restart pending")
-      : tx("settings.values.ready", "Ready");
   return (
     <div className="space-y-7">
       <ProfileSettings />
@@ -187,13 +173,6 @@ export function OverviewSettings({
       <section>
         <SettingsSectionTitle>{tx("settings.sections.system", "System")}</SettingsSectionTitle>
         <SettingsGroup>
-          <OverviewListRow
-            icon={Server}
-            title={runtimeTitle}
-            value={runtimeValue}
-            caption={runtimeCaption}
-            onClick={() => onSelectSection("runtime")}
-          />
           <OverviewListRow
             icon={HardDrive}
             title={tx("settings.overview.workspace", "Workspace")}

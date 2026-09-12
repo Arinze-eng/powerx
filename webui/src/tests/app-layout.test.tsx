@@ -2629,11 +2629,11 @@ describe("App layout", () => {
     expect(screen.getByText("BSAo••••ew20")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("unsaved-brave-key")).not.toBeInTheDocument();
 
-    // "System" was removed from the settings navigation; it is still reachable
-    // from the Overview "System" card (row titled "Gateway"). Navigate there to
-    // keep validating the runtime view rendering.
+    // The settings nav no longer exposes "System", and the Overview "System"
+    // card's Gateway row was removed; the Workspace row still routes to the
+    // runtime section, so use it to keep validating the runtime view rendering.
     fireEvent.click(within(settingsNav).getByRole("button", { name: "Overview" }));
-    fireEvent.click(screen.getByText("Gateway"));
+    fireEvent.click(screen.getByText("Workspace"));
     expect(screen.queryByText("Regional")).not.toBeInTheDocument();
     expect(screen.getByText("Timezone")).toBeInTheDocument();
     expect(
