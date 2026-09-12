@@ -1303,6 +1303,11 @@ class WebSocketChannel(BaseChannel):
             raw_media = envelope.get("media")
             media_paths: list[str] = []
             media_names: list[str | None] = []
+            # Track which attachments are remote (tmpfiles.org) references vs.
+            # locally-stored media. Initialized up-front so text-only turns
+            # (raw_media is None) still resolve these names below.
+            remote_media: list[str] = []
+            local_media: list[str] = []
             if raw_media is not None:
                 if not isinstance(raw_media, list):
                     await self._send_event(
