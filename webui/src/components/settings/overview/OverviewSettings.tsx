@@ -6,7 +6,6 @@ import {
   ChevronRight,
   ExternalLink,
   Globe2,
-  HardDrive,
   ImageIcon,
   Loader2,
   Mic,
@@ -39,7 +38,6 @@ import type {
 import { providerBrand, providerDisplayLabel } from "@/lib/provider-brand";
 import type { SettingsPayload } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { shortWorkspacePath } from "@/lib/workspace";
 import { useClient } from "@/providers/ClientProvider";
 
 export function OverviewSettings({
@@ -113,7 +111,6 @@ export function OverviewSettings({
       ? tx("settings.values.configured", "Configured")
       : tx("settings.values.notConfigured", "Not configured")
   }`;
-  const workspaceCaption = shortWorkspacePath(settings.runtime.workspace_path);
   return (
     <div className="space-y-7">
       <ProfileSettings />
@@ -166,19 +163,6 @@ export function OverviewSettings({
             caption={voiceCaption}
             showBrandLogos={showBrandLogos}
             onClick={() => onSelectSection("voice")}
-          />
-        </SettingsGroup>
-      </section>
-
-      <section>
-        <SettingsSectionTitle>{tx("settings.sections.system", "System")}</SettingsSectionTitle>
-        <SettingsGroup>
-          <OverviewListRow
-            icon={HardDrive}
-            title={tx("settings.overview.workspace", "Workspace")}
-            value={tx("settings.values.defaultWorkspace", "Default workspace")}
-            caption={workspaceCaption}
-            onClick={() => onSelectSection("runtime")}
           />
         </SettingsGroup>
       </section>
