@@ -1,0 +1,65 @@
+name: Run Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_command:
+        description: 'Shell command that runs the test suite'
+        required: true
+        default: ''
+      language:
+        description: 'language of project (python/node/go and optional version, e.g. python-3.11, node-20, go-1.22)'
+        required: true
+        default: 'node-20'
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up language
+        run: |
+          LANG_INPUT='${{ inputs.language }}'
+          case "$LANG_INPUT" in
+            python-*) echo "::set-output name=tool::py"; VER="${LANG_INPUT#python-}";;
+            node-*)  echo "::set-output name=tool::node"; VER="${LANG_INPUT#node-}";;
+            go-*)    echo "::set-output name=tool::go";  VER="${LANG_INPUT#go-}";;
+            java-*)  echo "::set-output name=tool::java"; VER="${LANG_INPUT#java-}";;
+            *)       echo "Unknown language $LANG_INPUT"; exit 1;;
+          esac
+          echo "chosen=$LANG_INPUT ver=$VER" >> "$GITHUB_OUTPUT"
+        id: lang
+        shell: bash
+
+      - uses: actions/setup-python@v5
+        if: steps.lang.outputs.tool == 'py'
+        with:
+          python-version: "${{ steps.lang.outputs.ver || '3.11' }}"
+
+      - uses: actions/setup-node@v4
+        if: steps.lang.outputs.tool == 'node'
+        with:
+          node-version: "${{ steps.lang.outputs.ver || '20' }}"
+
+      - uses: actions/setup-go@v5
+        if: steps.lang.outputs.tool == 'go'
+        with:
+          go-version: "${{ steps.lang.outputs.ver || '1.22' }}"
+
+      - uses: actions/setup-java@v4
+        if: steps.lang.outputs.tool == 'java'
+        with:
+          distribution: temurin
+          java-version: "${{ steps.lang.outputs.ver || '17' }}"
+
+      - name: Install deps + run tests
+        run: |
+          if [ -f package.json ]; then npm install || true; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt --quiet || true; fi
+          if [ -f go.mod ]; then go mod download || true; fi
+          ${{ inputs.test_command }}
+        shell: bash
