@@ -1,0 +1,63 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      gradle_task:
+        description: 'Gradle task to run (e.g. assembleDebug, assembleRelease)'
+        required: false
+        default: 'assembleDebug'
+      java_version:
+        description: 'JDK version for the build'
+        required: false
+        default: '17'
+      module:
+        description: 'Gradle module path if multi-module (e.g. app)'
+        required: false
+        default: ''
+      artifact_glob:
+        description: 'Glob for APK outputs relative to repo root'
+        required: false
+        default: '**/*.apk'
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version || '17' }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Grant + run Gradle build
+        run: |
+          if [ -f gradlew ]; then chmod +x gradlew; CMD="./gradlew"; else CMD="gradle"; fi
+          if [ -f "$CMD" ] && [ -x "$CMD" ]; then
+            if [ -n "${{ inputs.module }}" ]; then
+              "$CMD" "${{ inputs.module }}:${{ inputs.gradle_task }}"
+            else
+              "$CMD" "${{ inputs.gradle_task }}"
+            fi
+          elif command -v gradle >/dev/null; then
+            gradle "${{ inputs.gradle_task }}"
+          else
+            echo "No gradle wrapper or gradle installed"; exit 1
+          fi
+        shell: bash
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: ${{ inputs.artifact_glob || '**/*.apk' }}
+          if-no-files-found: error
+          retention-days: 2
