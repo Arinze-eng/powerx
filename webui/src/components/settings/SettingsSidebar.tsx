@@ -10,7 +10,6 @@ import {
   MessageCircle,
   Mic,
   Palette,
-  Server,
   ShieldCheck,
   SlidersHorizontal,
   type LucideIcon,
@@ -39,7 +38,7 @@ const SETTINGS_NAV_ITEMS: Array<{ key: SettingsSectionKey; icon: LucideIcon; fal
   { key: "voice", icon: Mic, fallback: "Voice" },
   { key: "browser", icon: Globe2, fallback: "Web" },
   { key: "channels", icon: MessageCircle, fallback: "Channels" },
-  { key: "runtime", icon: Server, fallback: "System" },
+  // "System" (runtime) intentionally hidden from the settings navigation.
   { key: "advanced", icon: ShieldCheck, fallback: "Security" },
 ];
 
