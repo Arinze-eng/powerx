@@ -96,18 +96,24 @@ Deno.serve(async (req) => {
 
     /** Check whether a transaction has already been claimed (by tx_ref or id). */
     async function findExistingClaim(txRef: string, transactionId?: string | null) {
-      if (txRef) {
+      // Identity of a Flutterwave payment is the NUMERIC transaction id, which is
+      // unique per payment. A static Payment Page reuses one tx_ref across many
+      // payments, so matching on tx_ref alone would wrongly lock out later payers.
+      // Therefore: if we have a concrete transaction_id, trust ONLY that for the
+      // duplicate check; fall back to tx_ref only when no transaction_id exists.
+      if (transactionId) {
         const resp = await supabaseQuery(
-          `/rest/v1/payment_claims?tx_ref=eq.${encodeURIComponent(txRef)}&select=id,user_id,status,tx_ref&limit=1`,
+          `/rest/v1/payment_claims?flutterwave_transaction_id=eq.${encodeURIComponent(transactionId)}&select=id,user_id,status,tx_ref&limit=1`,
         );
         if (resp.ok) {
           const rows = await resp.json();
           if (Array.isArray(rows) && rows.length > 0) return rows[0];
         }
+        return null;
       }
-      if (transactionId) {
+      if (txRef) {
         const resp = await supabaseQuery(
-          `/rest/v1/payment_claims?flutterwave_transaction_id=eq.${encodeURIComponent(transactionId)}&select=id,user_id,status,tx_ref&limit=1`,
+          `/rest/v1/payment_claims?tx_ref=eq.${encodeURIComponent(txRef)}&select=id,user_id,status,tx_ref&limit=1`,
         );
         if (resp.ok) {
           const rows = await resp.json();

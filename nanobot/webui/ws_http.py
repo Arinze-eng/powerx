@@ -1518,6 +1518,8 @@ class GatewayHTTPHandler:
             return self._handle_announcements(request)
         if got == "/api/announcements/read":
             return await self._handle_announcements_mark_read(request)
+        if got == "/api/webui/pay-link":
+            return await self._handle_pay_link(request)
         return None
 
     def _handle_commands(self, request: WsRequest) -> Response:
@@ -1560,6 +1562,47 @@ class GatewayHTTPHandler:
             return _http_json_response({"ok": True, "read": False})
         except Exception as exc:
             return _http_error(502, f"could not mark read: {type(exc).__name__}")
+
+    async def _handle_pay_link(self, request: WsRequest) -> Response:
+        """Mint a unique, single-use Flutterwave Payment Link for a package.
+
+        Fixes tx_ref collisions from the shared static Payment Page: each call
+        returns its own ``tx_ref`` (embedding the amount cents) so no two
+        payments can ever collide on the pay-verify idempotency key. Falls back
+        to the static page URL if link creation is unavailable.
+        """
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        payload = _mutation_payload(request) or _request_query(request)
+        slug = str(payload.get("slug") or "").strip()[:64]
+        email = str(self._supabase_user_email_for_request(request) or "").strip()[:200]
+        try:
+            from nanobot.supabase_auth import SupabaseAuth
+
+            packages = {p["slug"]: p for p in SupabaseAuth.payment_packages()}
+            pkg = packages.get(slug)
+            if pkg is None:
+                return _http_error(400, "Unknown payment package.")
+            auth_cfg = SupabaseAuth()
+            result = await auth_cfg.create_payment_link(
+                amount_usd=pkg["amount_usd"],
+                description=f"{pkg['name']} — {pkg['credits']} credits",
+                email=email or None,
+            )
+            if result.get("ok"):
+                return _http_json_response({
+                    "ok": True,
+                    "link": result["link"],
+                    "tx_ref": result["tx_ref"],
+                    "package": pkg,
+                })
+            # Provider rejected / not configured → caller may fall back to static URL.
+            return _http_json_response({
+                "ok": False,
+                "error": result.get("error") or "Could not create payment link.",
+            })
+        except Exception as exc:
+            return _http_error(502, f"pay-link unavailable: {type(exc).__name__}")
 
     def _webui_session_access_error(
         self,
@@ -1617,6 +1660,21 @@ class GatewayHTTPHandler:
                 return ""
             uid, _email = SupabaseAuth().verify_access_token_sync(access_token)
             return uid or ""
+        except Exception:
+            return ""
+
+    def _supabase_user_email_for_request(self, request: WsRequest) -> str:
+        """Best-effort resolution of the signed-in user's email for a pay link."""
+        try:
+            from nanobot.supabase_auth import SupabaseAuth
+
+            access_token = _case_insensitive_header(
+                getattr(request, "headers", {}), "X-Nanobot-Auth"
+            ).strip()
+            if not access_token:
+                return ""
+            _uid, email = SupabaseAuth().verify_access_token_sync(access_token)
+            return email or ""
         except Exception:
             return ""
 

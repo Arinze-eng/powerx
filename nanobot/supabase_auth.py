@@ -887,6 +887,80 @@ class SupabaseAuth:
         ])
         return "\n".join(lines)
 
+    # ------------------------------------------------------------------
+    # Per-payment unique links (fixes Flutterwave Pages tx_ref collisions)
+    # ------------------------------------------------------------------
+    # A static Flutterwave *Payment Page* (https://flutterwave.com/pay/<slug>)
+    # hands every payer the SAME auto-generated ``tx_ref`` (``Rave-Pages<id>``),
+    # so two different users paying through one link collide on the idempotency
+    # key in pay-verify: whoever verifies first permanently blocks the other.
+    # The fix is to mint a UNIQUE tx_ref per payment. We embed the package
+    # amount (in cents) into the ref using the format the Edge Function already
+    # self-validates — ``txn_<unix_ts>_<rand>_<amountCents>`` — and create a
+    # dedicated Flutterwave *Payment Link* for it via the v3 API. Each link is
+    # single-use by construction, so refs can never be reused across payments.
+
+    @staticmethod
+    def _new_tx_ref(amount_usd: float) -> str:
+        """Build a collision-free, self-describing transaction reference."""
+        import secrets as _secrets
+        import time as _time
+
+        amount_cents = int(round(float(amount_usd) * 100))
+        ts = int(_time.time())
+        rand = _secrets.token_hex(4)
+        return f"txn_{ts}_{rand}_{amount_cents}"
+
+    async def create_payment_link(
+        self, amount_usd: float, description: str = "AgentX credits", email: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a unique single-use Flutterwave Payment Link for ``amount_usd``.
+
+        Returns ``{"ok": True, "link": "<url>", "tx_ref": "<unique ref>"}`` or
+        ``{"ok": False, "error": "..."}``. Requires the ``FLWS_SECRET_KEY`` env
+        var (same secret pay-verify uses). Never raises for provider errors —
+        callers get a structured result so the UI can fall back gracefully.
+        """
+        secret_key = os.getenv("FLWS_SECRET_KEY", "").strip()
+        if not secret_key:
+            return {"ok": False, "error": "Payments are not configured (missing FLWS_SECRET_KEY)."}
+        try:
+            amount_cents = int(round(float(amount_usd) * 100))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Invalid payment amount."}
+        if amount_cents <= 0:
+            return {"ok": False, "error": "Invalid payment amount."}
+        tx_ref = self._new_tx_ref(amount_usd)
+        payload: dict[str, Any] = {
+            "amount": round(amount_cents / 100, 2),
+            "currency": "USD",
+            "tx_ref": tx_ref,
+            "title": description[:120] or "AgentX credits",
+            "description": description[:200] or "Credit purchase",
+            "meta": {"source": "nanobot", "tx_ref": tx_ref},
+            "customizations": {"title": "AgentX", "content": description[:120] or "Buy credits"},
+        }
+        if email:
+            payload["customer"] = {"email": email[:200]}
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    "https://api.flutterwave.com/v3/payment-links",
+                    headers={"Authorization": f"Bearer {secret_key}"},
+                    json=payload,
+                )
+            data = resp.json() if resp.status_code < 500 else {}
+        except Exception as exc:  # network / parse failure → caller falls back
+            return {"ok": False, "error": f"Could not create payment link: {exc}"}
+        if isinstance(data, dict) and data.get("status") == "success":
+            link = ((data.get("data") or {}).get("link")) or ""
+            if link:
+                return {"ok": True, "link": link, "tx_ref": tx_ref}
+        return {
+            "ok": False,
+            "error": (data.get("message") if isinstance(data, dict) else None) or "Failed to create payment link.",
+        }
+
     async def verify_payment(
         self, account: dict[str, Any], tx_ref: str, transaction_id: str | None = None,
     ) -> dict[str, Any]:

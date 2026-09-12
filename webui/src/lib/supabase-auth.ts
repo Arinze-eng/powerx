@@ -318,14 +318,38 @@ export async function verifyPayment(
       "/functions/v1/pay-verify",
       { method: "POST", body: JSON.stringify(body) },
     );
-    if (!res.ok) {
-      return { ok: false, error: `Payment verification failed (HTTP ${res.status})` };
+    // Always try to read the JSON body first — the Edge Function returns a
+    // human-readable `error` even on non-2xx statuses (e.g. 409 already-claimed,
+    // 400 amount mismatch), which is far more useful than a bare HTTP code.
+    let payload:
+      | VerifyPaymentResult
+      | { credits?: number; pkg?: string; error?: string; alreadyClaimed?: boolean }
+      | null = null;
+    try {
+      payload = (await res.json()) as typeof payload;
+    } catch {
+      payload = null;
     }
-    const payload = (await res.json()) as VerifyPaymentResult | { credits?: number; pkg?: string } | null;
+    if (!res.ok) {
+      const fnError = (payload as { error?: string } | null)?.error;
+      if (res.status === 409) {
+        // Idempotency guard: this payment was already credited. Not an error state.
+        return {
+          ok: false,
+          error:
+            fnError ||
+            "This payment has already been credited to your account.",
+        };
+      }
+      return {
+        ok: false,
+        error: fnError || `Payment verification failed (HTTP ${res.status})`,
+      };
+    }
     if (!payload || (payload as VerifyPaymentResult).ok !== true) {
       return {
         ok: false,
-        error: (payload as { error?: string })?.error || "Payment verification failed",
+        error: (payload as unknown as { error?: string })?.error || "Payment verification failed",
       };
     }
     return { ok: true, credits: (payload as { credits?: number }).credits, pkg: (payload as { pkg?: string }).pkg };
