@@ -88,38 +88,33 @@ uname -m                            # x86_64 vs aarch64 -> pick right asset
 ```
 If `sudo -n true` succeeds, apt may still work (`sudo apt-get update`). Otherwise skip straight to the ladder. Always persist env by appending exports to `~/.bashrc` AND re-exporting in each exec call (exec sessions may not reload rc files).
 
-## ⛔ Building distributable artifacts: APK / EXE / iPA / DEB → GitHub Actions, NOT here
+## ⛔ HARD RULE — NEVER build APK / EXE / iPA / DEB here
 
-If the user wants a **shippable Android APK, Windows EXE, iOS/iPad IPA, or .deb** built from
-their project source, **do not attempt it in the sandbox**. Use the **`github-actions-build`
-skill** instead — it creates a throwaway repo on the dedicated build account, pushes the
-project, runs the right GitHub Action (which has the real Android SDK / Xcode / Windows /
-dpkg toolchains), watches the run, fixes errors, downloads the artifact, then deletes the repo.
-The sandbox lacks those toolchains, so local attempts stall and waste steps. This skill stays
-responsible only for installing *toolchains/packages* to get a local dev environment working
-(e.g. compiling a small Linux utility, running tests locally, scaffolding a Flutter project so
-the user can inspect it before shipping).
+Building a **shippable Android APK, Windows EXE, iOS/iPad IPA, or .deb** from project source is
+**FORBIDDEN in the sandbox — no exceptions.** This includes:
 
-### When local Android/Flutter setup IS still useful (compile-check only)
-You may install a JDK + Android command-line tools + Flutter purely to **verify code compiles**
-or to let the user run things locally — but the actual release APK/EXE/IPA/DEB is produced by
-GitHub Actions, never shipped from the sandbox. Quick reference for that optional setup:
+- Installing JDK / Gradle / Android SDK / Android command-line tools / Flutter / Xcode /
+  CocoaPods / PyInstaller / dpkg toolchains in the sandbox **to build or ship** any of these
+  artifacts.
+- Running `./gradlew`, `gradle`, `flutter build`, `xcodebuild`, `pyinstaller`, `dpkg-deb`, or
+  equivalent in the sandbox to produce a deliverable artifact.
 
-```bash
-# JDK via SDKMAN (no root)
-curl -s "https://get.sdkman.io?rcupdate=false" | bash && source "$HOME/.sdkman/bin/sdkman-init.sh"
-sdk install java 17.0.12-tem && sdk use java 17.0.12-tem
-# Android cmdline-tools: download zip from Google's distribution page, lay out as
-#   $ANDROID_SDK_ROOT/cmdline-tools/latest/bin, then `yes | sdkmanager --licenses`.
-# Flutter: tarball into $HOME, add to PATH, `flutter doctor`.
-```
-For anything beyond a compile check (a real signed/shippable binary), switch to
-`github-actions-build`.
+Such artifacts **MUST** go through the **`github-actions-build`** skill / the `build_artifact`
+tool (GitHub Actions runners, which have the real Android SDK / Xcode / Windows toolchains).
+If that tool is unavailable, **refuse** the build and tell the user the operator must configure
+`GITHUB_BUILD_TOKEN` on the backend — never fall back to sandbox building.
+
+This skill stays responsible ONLY for:
+- Installing user-space toolchains/packages to get a local **dev environment** working
+  (e.g. compiling a small Linux utility, running tests locally, installing language managers),
+  and
+- Preparing/scaffolding a project so the user can inspect it **before** it is shipped by
+  GitHub Actions. A local JDK/Flutter install is never a substitute for the shipped artifact.
 
 ### Other native/package targets
 Windows `.exe`, iOS `.ipa`, and `.deb` are likewise **GitHub Actions only** (windows-latest,
 macos-latest, ubuntu-latest runners respectively). Static Linux binaries and Go/Rust/C cross-
-compilation for *local* use remain fine here.
+compilation for genuinely local, non-deliverable helper use remain fine here.
 
 ## Persistence & hygiene
 - Every install goes under `$HOME` or `/tmp` (never `/usr` unless writable).

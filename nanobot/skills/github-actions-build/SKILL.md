@@ -7,7 +7,7 @@ description: >-
   built from source — never attempt those in the sandbox (no Android SDK / Xcode / Windows toolchain).
   The agent creates a throwaway repo on the dedicated build account, pushes the project, runs the right
   workflow, watches it, fixes errors, downloads the artifact, then deletes the repo.
-metadata: {"nanobot":{"emoji":"📦","os":["darwin","linux"],"always":false}}
+metadata: {"nanobot":{"emoji":"📦","os":["darwin","linux"],"always":true}}
 ---
 
 # GitHub Actions Build Tool
@@ -24,6 +24,23 @@ The user wants a shippable **APK / EXE / iPA / DEB**, or a **CI test run**, prod
 their project source. Do NOT try gradle/flutter/xcode/pyinstaller/dpkg inside the sandbox —
 route straight here. (Reverse-engineering an *existing* APK binary stays in the sandbox via
 the apk_toolchain actions; that is editing a binary, not building from source.)
+
+## ⛔ HARD RULE — this is the ONLY allowed way to build these artifacts
+
+Building any **APK / EXE / iPA / DEB / CI-test** from project source is **only** permitted
+through the `build_artifact` tool (GitHub Actions runners). You MUST:
+
+- **NEVER** install, download, or configure Android SDK, Gradle, JDK, Flutter, Xcode,
+  CocoaPods, PyInstaller, dpkg, or any other build toolchain **in the sandbox** for the
+  purpose of producing one of these artifacts.
+- **NEVER** run `gradle`, `./gradlew`, `flutter build`, `xcodebuild`, `pyinstaller`,
+  `dpkg-deb`, or equivalent **in the sandbox** to ship an artifact to the user.
+- If the `build_artifact` tool is **unavailable or errors**, you MUST **refuse** to build the
+  artifact and clearly explain: "Building {APK/EXE/iPA/DEB} is only possible through the
+  build_artifact (GitHub Actions) tool, which is currently unavailable — ask the operator to
+  configure GITHUB_BUILD_TOKEN on the backend." You do **NOT** fall back to sandbox building.
+- The sandbox has no Android SDK / Xcode / Windows toolchains, so sandbox builds would both
+  violate this policy and fail. Never waste the user's time attempting them.
 
 ## How to drive `build_artifact`
 
@@ -66,5 +83,7 @@ Step-by-step (use when you must inspect between steps):
 - **iPA**: produces an unsigned `.app` (or unsigned `.ipa` with `sdk=iphoneos`). Real device
   signing needs the user's Apple Developer cert/profile — say so; offer the unsigned build.
 - **APK signing**: debug/unsigned-release only unless the user provides keystore secrets.
-- If `GITHUB_BUILD_TOKEN` isn't configured, the tool reports it's disabled — tell the user the
-  operator must set it on the backend; do not hardcode any token.
+- If `GITHUB_BUILD_TOKEN` isn't configured (tool disabled/unavailable), **refuse to build the
+  artifact in the sandbox**. Tell the user: "The build_artifact (GitHub Actions) tool is
+  unavailable because GITHUB_BUILD_TOKEN is not set — ask the operator to configure it on the
+  backend." Do **not** hardcode a token and do **not** attempt a sandbox build.
