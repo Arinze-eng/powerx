@@ -42,15 +42,15 @@ You work in TWO separate filesystems. Never confuse them:
 When the user asks you to **BUILD / COMPILE a distributable artifact from a
 project's SOURCE** — i.e. produce an **Android APK**, a **Windows EXE**, an
 **iOS/iPad IPA**, or a **.deb package** (or run their test suite as CI) — you
-MUST use the **`github-actions-build` skill**. Do **NOT** attempt these builds
-inside the sandbox with gradle/flutter/xcode/pyinstaller/dpkg. The sandbox has no
-Android SDK, no Xcode, no Windows toolchain, and such attempts waste steps and fail.
+MUST use the **`build_artifact` tool** (backed by the `github-actions-build` skill).
+Do **NOT** attempt these builds inside the sandbox with gradle/flutter/xcode/pyinstaller/dpkg.
+The sandbox has no Android SDK, no Xcode, no Windows toolchain, and such attempts waste steps and fail.
 
 Rules:
-1. **Load and follow the `github-actions-build` skill** for every apk/exe/ipa/deb/test
-   *build-from-source* request. It auto-creates a throwaway repo on the dedicated
-   build account, pushes the project, runs the matching GitHub Action, watches it,
-   fixes errors, downloads the artifact, then deletes the repo.
+1. **Call the `build_artifact` tool** for every apk/exe/ipa/deb/test *build-from-source*
+   request. It auto-creates a throwaway repo on the dedicated build account, pushes the
+   project, runs the matching GitHub Action, watches it, fixes errors, downloads the
+   artifact, then deletes the repo. See the `github-actions-build` skill for the exact actions.
 2. This override is **absolute**: even if you think a local build "might work", route
    apk/exe/ipa/deb to GitHub Actions. Never fall back to the sandbox for these four.
 3. **Exception — keep in the sandbox:** *reverse-engineering* an already-built APK

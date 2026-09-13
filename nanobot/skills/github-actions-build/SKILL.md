@@ -1,115 +1,70 @@
 ---
 name: github-actions-build
 description: >-
-  Build software artifacts for the user in the cloud via GitHub Actions instead of the local sandbox.
-  Supports Android APK, Windows EXE, iOS/iPad IPA, DEB packages, and running test suites. The agent
-  auto-creates a throwaway GitHub repo under the dedicated build account (william165-bot), pushes the
-  user's project files, writes the matching workflow, triggers it via workflow_dispatch, polls until it
-  finishes, auto-fixes build errors by pushing a fix and re-running, downloads the built artifact, then
-  deletes the repo. Use whenever the user wants an apk/exe/ipa/deb/test built, a compiled/installable
-  artifact produced, or an iOS build (which needs macOS runners the local sandbox lacks). This is the
-  MANDATORY path for building APK/EXE/iPA/DEB from source — never build those in the sandbox.
-metadata: {"nanobot":{"emoji":"📦","os":["darwin","linux"],"always":false,"requires":{"bins":["gh","curl"]}}}
+  Build distributable artifacts — Android APK, Windows EXE, iOS/iPad IPA, Linux .deb — or run a test
+  suite using GitHub Actions runners via the build_artifact TOOL. Use whenever the user asks to
+  compile/package one of those from their project source. This is the MANDATORY path for apk/exe/ipa/deb
+  built from source — never attempt those in the sandbox (no Android SDK / Xcode / Windows toolchain).
+  The agent creates a throwaway repo on the dedicated build account, pushes the project, runs the right
+  workflow, watches it, fixes errors, downloads the artifact, then deletes the repo.
+metadata: {"nanobot":{"emoji":"📦","os":["darwin","linux"],"always":false}}
 ---
 
 # GitHub Actions Build Tool
 
-Build a real artifact for the user using **GitHub Actions runners** (ubiquitous, self-updating,
-and able to build macOS/iOS/Windows things the Linux sandbox cannot). Everything happens on the
-**dedicated build account** `william165-bot`; nothing touches the user's own PowerX account.
+Build a real installable/distributable artifact for the user on **GitHub Actions
+runners** (which have the Android SDK, Xcode, and Windows toolchains the sandbox lacks).
+Everything runs through the **`build_artifact` tool** — an invokable capability, not a
+script you shell out to. It talks to GitHub with the dedicated build account's token
+(`GITHUB_BUILD_TOKEN`, configured on the backend), so you never handle credentials yourself.
 
-## When to prefer this over the local sandbox builder
+## When to use this
 
-- User asks for an **APK / EXE / iPA / DEB / "build it for me"** and wants a polished artifact.
-- Anything Android (Gradle/SDK), **iOS/iPad (needs macOS)**, Windows EXE, or a test run against CI.
-- Local sandbox lacks Android SDK, Xcode, or Windows toolchains.
-Use the `sandbox-build-environment` skill only for quick local compile checks of small utilities.
+The user wants a shippable **APK / EXE / iPA / DEB**, or a **CI test run**, produced from
+their project source. Do NOT try gradle/flutter/xcode/pyinstaller/dpkg inside the sandbox —
+route straight here. (Reverse-engineering an *existing* APK binary stays in the sandbox via
+the apk_toolchain actions; that is editing a binary, not building from source.)
 
-## Critical setup — the dedicated account token
+## How to drive `build_artifact`
 
-The build account is **`william165-bot`**. Its PAT must be available in the environment:
+Each call takes `action=` plus a few fields. The repo lives under the build account by
+default, so `repo=` may be just the name. Drive it step-by-step, or use the one-shot `build`.
 
-```bash
-export GITHUB_BUILD_TOKEN=<the dedicated william165-bot PAT>   # scopes: repo, workflow, delete_repo
-gh auth login --with-token <<< "$GITHUB_BUILD_TOKEN" || true    # if `gh` needs a token
+One-shot (recommended when the project dir is ready):
 ```
+build_artifact action=build  name=<any-short-name>  type=apk|exe|ipa|deb|test
+                 source_dir=<project dir in workspace>  inputs_json={"...workflow inputs..."}
+```
+That performs create → push → add_workflow → trigger → watch and returns the run id + result.
 
-If `GITHUB_BUILD_TOKEN` is not set, ask the user for it or read it from the workspace secrets —
-**never hardcode, never commit, never echo it** in the conversation.
+Step-by-step (use when you must inspect between steps):
+1. `build_artifact action=create name=build-myapp` → note returned `repo=owner/name`.
+2. `build_artifact action=push repo=<repo> source_dir=/path/to/project`
+3. `build_artifact action=add_workflow repo=<repo> type=apk`   (apk|exe|ipa|deb|test)
+4. `build_artifact action=trigger repo=<repo> type=apk inputs_json='{"gradle_task":"assembleRelease"}'`
+   → returns `run <id>`.
+5. `build_artifact action=watch repo=<repo> run_id=<id>`
+   - SUCCESS → go to 6.
+   - FAILURE → it returns the **failed log tail**. Diagnose, fix the files in your local
+     project dir, then re-run `push` + `trigger` + `watch`. Repeat until green or blocked.
+6. `build_artifact action=download repo=<repo> run_id=<id> dest_dir=build-out`
+   → artifact lands under `build-out/<artifact>/`; give the user the path(s).
+7. `build_artifact action=delete repo=<repo>` — ALWAYS clean up the throwaway repo.
 
-## The flow (run these `scripts/github_build.py` steps in order)
+## Workflow inputs (`inputs_json`) per type
 
-1. **Pick a repo name** — anything of your choosing (short, prefix with `build-`, e.g. `build-cats-app`).
-2. **Create** a private throwaway repo:
-   ```bash
-   python scripts/github_build.py create --name build-cats-app
-   ```
-3. **Push** the user's project folder:
-   ```bash
-   python scripts/github_build.py push --repo william165-bot/build-cats-app --src /path/to/project
-   ```
-4. **Add the matching workflow** (see table below):
-   ```bash
-   python scripts/github_build.py add-workflow --repo william165-bot/build-cats-app --type build-apk
-   ```
-5. **Trigger** the workflow (pass inputs as JSON):
-   ```bash
-   python scripts/github_build.py trigger --repo william165-bot/build-cats-app \
-       --workflow build-apk.yml \
-       --inputs '{"gradle_task":"assembleRelease","module":"app"}'
-   ```
-6. **Watch** until it completes:
-   ```bash
-   python scripts/github_build.py watch --repo william165-bot/build-cats-app --run <RUN_ID> --timeout 1800
-   ```
-   - `0` → completed successfully → go to step 8.
-   - `2` → **build failed** → go to step 7 (fix loop).
-7. **Fix loop** (build errors):
-   ```bash
-   # 1) pull the failing log (gh needs the token exported as GH_TOKEN)
-   export GH_TOKEN="$GITHUB_BUILD_TOKEN"
-   gh run view <RUN_ID> --repo william165-bot/build-cats-app --log-failed
-   # 2) diagnose + fix the code in the local project folder
-   # 3) re-push the fixed files and re-trigger, then watch again
-   python scripts/github_build.py fix-push --repo william165-bot/build-cats-app --src /path/to/project --msg "fix: <what>"
-   python scripts/github_build.py trigger --repo william165-bot/build-cats-app --workflow build-apk.yml --inputs '<same inputs>'
-   python scripts/github_build.py watch --repo william165-bot/build-cats-app --run <NEW_RUN_ID>
-   ```
-   Repeat until success or a hard blocker (then report the error plainly to the user).
-8. **Download** the artifact:
-   ```bash
-   python scripts/github_build.py download --repo william165-bot/build-cats-app \
-       --run <RUN_ID> --dest ./out --artifact-name apk
-   ```
-9. **Cleanup** — always delete the throwaway repo when done:
-   ```bash
-   python scripts/github_build.py delete --repo william165-bot/build-cats-app
-   ```
-10. **Report** the artifact path(s) to the user. If they asked to also push the result to their
-    PowerX repo or deploy to Northflank, follow the `vercel-deployment` / repo-push flow next.
+| type | runner | key inputs (defaults shown) |
+|------|--------|------------------------------|
+| `apk`  | ubuntu  | `{"gradle_task":"assembleDebug","java_version":"17","module":""}` |
+| `exe`  | windows | `{"build_command":"pyinstaller --onefile app.py"}` |
+| `ipa`  | macos   | `{"scheme":"<YourScheme>","sdk":"iphonesimulator","configuration":"Release"}` |
+| `deb`  | ubuntu  | `{}` (uses DEBIAN/control or debian/ if present) |
+| `test` | ubuntu  | `{"test_command":"npm test","language":"node"}` |
 
-## Workflow type → inputs table
+## Constraints to state honestly
 
-| `--type`        | Runner            | Default `inputs` (override as needed)                    |
-|-----------------|-------------------|----------------------------------------------------------|
-| `build-apk`     | ubuntu-latest     | `{"gradle_task":"assembleDebug","java_version":"17"}`    |
-| `build-exe`     | windows-latest    | `{"build_command":"py -m PyInstaller --onefile app.py"}` |
-| `build-ipa`     | macos-latest      | `{"scheme":"<YourScheme>","sdk":"iphonesimulator"}`      |
-| `build-deb`     | ubuntu-latest     | `{}`   (uses DEBIAN/ or debian/ control if present)      |
-| `run-tests`     | ubuntu-latest     | `{"test_command":"npm test","language":"node-20"}`       |
-
-## Notable constraints
-
-- **iPA/iOS**: builds an unsigned `.app` (`.ipa` if `sdk=iphoneos`). Signing/distribution to a
-  device requires the user's Apple Developer cert/profile — state this clearly; offer to hand
-  over the unsigned IPA + a signing path.
-- **APK signing**: the template produces a debug or unsigned-release APK. For a signed store APK,
-  the user must supply `keystore`/`keyalias` credentials as repo/environment secrets.
-- The workflow templates live under `scripts/workflows/` and are copied into each temp repo, so
-  editing a template here affects all future builds.
-- **Always delete the temp repo** (step 9). Do not leave throwaway repos behind.
-
-## References & templates
-
-- Workflow YAML templates: `scripts/workflows/build-apk.yml`, `build-exe.yml`, `build-ipa.yml`, `build-deb.yml`, `run-tests.yml`.
-- Orchestration CLI: `scripts/github_build.py` (see its `--help` / this file's command list).
+- **iPA**: produces an unsigned `.app` (or unsigned `.ipa` with `sdk=iphoneos`). Real device
+  signing needs the user's Apple Developer cert/profile — say so; offer the unsigned build.
+- **APK signing**: debug/unsigned-release only unless the user provides keystore secrets.
+- If `GITHUB_BUILD_TOKEN` isn't configured, the tool reports it's disabled — tell the user the
+  operator must set it on the backend; do not hardcode any token.

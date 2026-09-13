@@ -36,6 +36,6 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `database-development` | Schema design, SQL/migrations, Prisma/Drizzle/Supabase, pooling, env credentials |
 | `fullstack-development` | Wire frontend + backend + DB into one deployable app; CRUD walkthrough |
 | `vercel-deployment` | Deploy via Vercel CLI (`web_dev`): scaffold/deploy/set_env/domains/logs/troubleshooting |
-| `github-actions-build` | Cloud artifact builder: auto-create throwaway repo → push project → trigger GitHub Action → build APK/EXE/iPA/DEB/tests → watch & auto-fix errors → download artifact → delete repo (dedicated build account) |
+| `github-actions-build` | Cloud artifact builder via the `build_artifact` tool: auto-create throwaway repo → push project → trigger GitHub Action → build APK/EXE/iPA/DEB/tests → watch & auto-fix errors → download artifact → delete repo (dedicated build account) |
 | `poll` | Real-time polling & vigilance: watch anything over time and react — live trading or any repeated non-trading task |
 | `alpaca-hackathon` | ICT/SMC + TMA + HMM five-cluster trading strategy playbook (backing the `alpaca_trade` tool) |
