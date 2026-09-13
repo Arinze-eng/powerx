@@ -32,8 +32,19 @@ export interface TaskStats {
 
 const SANDBOX_TOOL_NAMES = new Set(["novita_sandbox"]);
 const BATCH_TOOL_NAMES = new Set(["sandbox_batch"]);
-const EXEC_TOOL_NAMES = new Set(["exec", "bash", "shell", "process", "run_command"]);
-const WEB_FETCH_TOOL_NAMES = new Set(["web_fetch", "fetch_url"]);
+const EXEC_TOOL_NAMES = new Set([
+  "exec",
+  "bash",
+  "shell",
+  "process",
+  "run_command",
+  "python_code",
+  "run_cli_app",
+  "build_artifact",
+  "web_dev",
+]);
+const WEB_FETCH_TOOL_NAMES = new Set(["web_fetch", "fetch_url", "browser"]);
+const RUN_PLAN_TOOL_NAME = "run_plan";
 const FILE_WRITE_TOOLS = new Set([
   "write_file",
   "edit_file",
@@ -95,6 +106,56 @@ function batchWriteCount(args: Record<string, unknown>): number {
     if (action === "write" || action === "upload") writes += 1;
   }
   return writes;
+}
+
+interface PlanOpCounts {
+  commands: number;
+  files: number;
+  pages: number;
+  steps: number;
+}
+
+/** Classify one plan step (recursing into ``parallel`` blocks) into op counts. */
+function planStepCounts(step: unknown, counts: PlanOpCounts): void {
+  if (!step || typeof step !== "object") return;
+  const record = step as Record<string, unknown>;
+  const nested = record.parallel;
+  if (Array.isArray(nested)) {
+    for (const child of nested) planStepCounts(child, counts);
+    return;
+  }
+  const tool = typeof record.tool === "string" ? record.tool : "";
+  if (!tool) return;
+  counts.steps += 1;
+  // Nested run_plan steps execute real sub-plans; count them as commands so
+  // every executed operation shows up even when the model nests plans.
+  if (EXEC_TOOL_NAMES.has(tool) || tool === RUN_PLAN_TOOL_NAME) counts.commands += 1;
+  else if (FILE_WRITE_TOOLS.has(tool)) counts.files += 1;
+  else if (WEB_FETCH_TOOL_NAMES.has(tool)) counts.pages += 1;
+}
+
+/**
+ * Count the operations a ``run_plan`` call will deterministically execute.
+ * Plan sub-steps run inside one tool call and never emit their own progress
+ * events, so the plan payload itself is the only accurate source for the
+ * live counters (0 extra API calls — pure local parsing).
+ */
+function runPlanOpCounts(args: Record<string, unknown>): PlanOpCounts {
+  const counts: PlanOpCounts = { commands: 0, files: 0, pages: 0, steps: 0 };
+  const plan = args.plan ?? args.steps;
+  const rawSteps =
+    plan && typeof plan === "object" && !Array.isArray(plan)
+      ? (plan as Record<string, unknown>).steps
+      : plan;
+  if (Array.isArray(rawSteps)) {
+    for (const step of rawSteps) planStepCounts(step, counts);
+  }
+  if (counts.steps === 0) {
+    // Unparseable plan: still one deterministic execution batch.
+    counts.steps = 1;
+    counts.commands = 1;
+  }
+  return counts;
 }
 
 function collectToolEvents(messages: UIMessage[]): ToolProgressEvent[] {
@@ -175,6 +236,16 @@ export function computeTaskStats(
     } else if (BATCH_TOOL_NAMES.has(name)) {
       commandsRun += batchCommandCount(args);
       filesCreated += batchWriteCount(args);
+    } else if (name === RUN_PLAN_TOOL_NAME) {
+      // One model call runs the whole plan deterministically; expand its
+      // steps into real per-operation counts instead of a single step. The
+      // generic per-event step increment below already counted this call,
+      // so replace it with the plan's real step count.
+      const ops = runPlanOpCounts(args);
+      steps += Math.max(ops.steps - 1, 0);
+      commandsRun += ops.commands;
+      filesCreated += ops.files;
+      pagesViewed += ops.pages;
     } else if (EXEC_TOOL_NAMES.has(name)) {
       commandsRun += 1;
     } else if (FILE_WRITE_TOOLS.has(name)) {

@@ -434,8 +434,62 @@ async def test_upload_bytes_sends_expiry_zero(tmp_path: Path, monkeypatch: pytes
     monkeypatch.setattr(onlyfiles_mod.aiohttp, "ClientSession", FakeSession)
     result = await onlyfiles_mod.upload_bytes(b"payload", filename="report.pdf")
     assert result["url"] == "https://onlyfiles.com/abc/report.pdf"
+    assert captured["url"] == "https://api.onlyfiles.com/v1/upload"
     fields = str(getattr(captured["form"], "_fields", captured["form"]))
-    assert "expiry" in fields and "'0'" in fields  # expiry=0: never expires
+    assert "expire" in fields and "'0'" in fields  # expire=0: never expires per API docs
+
+
+async def test_file_info_parses_metadata_and_404(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import nanobot.utils.onlyfiles as onlyfiles_mod
+
+    class FakeResponse:
+        def __init__(self, status, body):
+            self.status = status
+            self._body = body
+
+        async def text(self):
+            return self._body
+
+    class FakeGetCtx:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class FakeSession:
+        def __init__(self, resp, **kw):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def get(self, url):
+            captured["url"] = url
+            return FakeGetCtx(self._resp)
+
+    captured: dict = {}
+    ok = FakeResponse(
+        200,
+        json.dumps({"status": True, "data": {"file": {"id": "abc", "name": "report.pdf"}}}),
+    )
+    monkeypatch.setattr(onlyfiles_mod.aiohttp, "ClientSession", lambda *a, **kw: FakeSession(ok))
+    info = await onlyfiles_mod.file_info("abc")
+    assert captured["url"] == "https://api.onlyfiles.com/v1/file/abc/info"
+    assert info == {"file": {"id": "abc", "name": "report.pdf"}}
+
+    gone = FakeResponse(404, json.dumps({"status": False, "error": {"message": "not found", "type": "api", "code": 8}}))
+    monkeypatch.setattr(onlyfiles_mod.aiohttp, "ClientSession", lambda *a, **kw: FakeSession(gone))
+    assert await onlyfiles_mod.file_info("abc") is None
+
+    with pytest.raises(onlyfiles_mod.OnlyFilesError):
+        await onlyfiles_mod.file_info("")
 
 
 async def test_upload_and_remember_reuses_url_without_reupload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

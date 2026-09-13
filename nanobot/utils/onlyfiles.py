@@ -1,12 +1,16 @@
 """Minimal onlyfiles.com transfer helpers for VPS input and artifact delivery.
 
-Replaces the previous tmpfiles.org integration. onlyfiles exposes the *same*
-endpoint shape — ``POST /api/v1/upload`` with a single ``file`` multipart field —
-but its success payload differs slightly, so this module parses it here and hands
-callers the exact same return contract the rest of the codebase already expects:
-``{"url": <page url>, "download_url": <direct link>}``.
+Implements the documented onlyfiles API (https://onlyfiles.com/api):
 
-Response shape observed from ``https://onlyfiles.com/api/v1/upload``::
+* ``POST https://api.onlyfiles.com/v1/upload`` — multipart upload with a
+  single ``file`` field and an ``expire`` field (seconds 60-172800, or
+  ``0`` to keep the file forever; default 86400 = 24h).
+* ``GET https://api.onlyfiles.com/v1/file/{id}/info`` — liveness/metadata
+  probe (HTTP 404 + ``status: false`` for a missing file).
+
+This module parses the success payload and hands callers the exact same
+return contract the rest of the codebase already expects:
+``{"url": <page url>, "download_url": <direct link>}``.
 
     {
       "status": true,
@@ -39,7 +43,8 @@ from loguru import logger
 
 from nanobot.config.paths import get_persistent_data_dir
 
-ONLYFILES_UPLOAD_URL = "https://onlyfiles.com/api/v1/upload"
+ONLYFILES_UPLOAD_URL = "https://api.onlyfiles.com/v1/upload"
+ONLYFILES_FILE_INFO_URL = "https://api.onlyfiles.com/v1/file/{id}/info"
 ONLYFILES_HOST = "onlyfiles.com"
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # onlyfiles hard limit (~100 MiB)
 _DEFAULT_TIMEOUT_SECONDS = 90
@@ -77,6 +82,21 @@ def _extract_page_url(payload: dict[str, Any]) -> str:
     return page_url
 
 
+def _extract_error(payload: dict[str, Any]) -> str | None:
+    """Human-readable message from the documented error envelope, if any."""
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = str(error.get("message") or "").strip()
+        etype = str(error.get("type") or "").strip()
+        code = error.get("code")
+        bits = [b for b in (message, etype) if b]
+        if code is not None:
+            bits.append(f"code={code}")
+        if bits:
+            return ": ".join(bits)
+    return None
+
+
 async def upload_bytes(
     data: bytes,
     *,
@@ -98,9 +118,11 @@ async def upload_bytes(
         filename=safe_filename,
         content_type=content_type or "application/octet-stream",
     )
-    # expiry=0: no expiry — the upload is permanent so the URL can be stored
-    # in persistent memory and referenced by the AI indefinitely.
-    form.add_field("expiry", str(_ONLYFILES_EXPIRY))
+    # expire=0 per the docs: the file is kept FOREVER, so the returned URL is
+    # permanent and can be stored in memory and re-referenced indefinitely.
+    # (Field name is `expire`, not `expiry` — the wrong name is silently
+    # ignored and the 24h default applies.)
+    form.add_field("expire", str(_ONLYFILES_EXPIRY))
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(ONLYFILES_UPLOAD_URL, data=form) as response:
@@ -114,10 +136,43 @@ async def upload_bytes(
     except (TypeError, ValueError):
         raise OnlyFilesError("onlyfiles returned invalid JSON") from None
     if not isinstance(payload, dict) or payload.get("status") is not True:
-        raise OnlyFilesError("onlyfiles did not accept the upload")
+        detail = _extract_error(payload) if isinstance(payload, dict) else None
+        raise OnlyFilesError(detail or "onlyfiles did not accept the upload")
     page_url = _extract_page_url(payload)
     # No separate raw-download route exists for slug links; the page URL is the link.
     return {"url": page_url, "download_url": page_url}
+
+
+async def file_info(file_id: str, *, timeout_seconds: int = 20) -> dict[str, Any] | None:
+    """Probe the documented info endpoint; None when the file is gone.
+
+    ``file_id`` is the slug segment of a stored URL (``https://onlyfiles.com
+    /<id>/<name>`` -> ``<id>``). A missing file responds with HTTP 404 and
+    ``status: false``; any other failure raises OnlyFilesError.
+    """
+    clean = str(file_id or "").strip().strip("/")
+    if not clean:
+        raise OnlyFilesError("file_info requires a file id")
+    url = ONLYFILES_FILE_INFO_URL.format(id=clean)
+    timeout = aiohttp.ClientTimeout(total=max(5, int(timeout_seconds)))
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                raw = await response.text()
+                status = response.status
+    except aiohttp.ClientError as exc:
+        raise OnlyFilesError(f"onlyfiles info request failed: {type(exc).__name__}") from None
+    try:
+        payload = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        payload = {}
+    if status == 404:
+        return None
+    if not isinstance(payload, dict) or payload.get("status") is not True:
+        detail = _extract_error(payload) if isinstance(payload, dict) else None
+        raise OnlyFilesError(detail or f"onlyfiles info failed with HTTP {status}")
+    data = payload.get("data")
+    return data if isinstance(data, dict) else {}
 
 
 async def upload_path(
@@ -216,8 +271,10 @@ async def upload_and_remember(
 
     Same content uploaded again (in this process or after a restart — the
     store lives on the Northflank persistent disk) returns the remembered
-    URL without a network call, so the AI can always reference prior
-    uploads. Raises OnlyFilesError exactly like ``upload_path`` on failure.
+    URL without a network call. Because expire=0 makes uploads permanent,
+    the remembered URL is trusted WITHOUT a liveness probe (a probe would
+    cost an API call per reuse); use ``file_info`` explicitly when a stored
+    link must be verified. Raises OnlyFilesError like ``upload_path``.
     """
     source = Path(path).expanduser()
     try:

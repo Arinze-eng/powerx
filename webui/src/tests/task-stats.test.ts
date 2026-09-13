@@ -84,6 +84,54 @@ describe("computeTaskStats", () => {
     expect(stats.filesCreated).toBe(1);
   });
 
+  it("counts every registered execution tool as a command", () => {
+    const events: ToolProgressEvent[] = [
+      { phase: "end", call_id: "p1", name: "python_code", arguments: { code: "print(1)" } },
+      { phase: "end", call_id: "c1", name: "run_cli_app", arguments: { app: "deploy" } },
+      { phase: "end", call_id: "b1", name: "build_artifact", arguments: {} },
+      { phase: "end", call_id: "w1", name: "web_dev", arguments: {} },
+      { phase: "end", call_id: "br1", name: "browser", arguments: { url: "https://x" } },
+    ];
+    const stats = computeTaskStats([traceMessage(events)]);
+    expect(stats.steps).toBe(5);
+    expect(stats.commandsRun).toBe(4); // python_code + run_cli_app + build_artifact + web_dev
+    expect(stats.pagesViewed).toBe(1); // browser navigated one page
+  });
+
+  it("expands a run_plan call into its deterministic per-step counts", () => {
+    const plan = {
+      steps: [
+        { id: "a", tool: "exec", args: { command: "make build" } },
+        {
+          id: "p",
+          parallel: [
+            { id: "f", tool: "web_fetch", args: { url: "https://x" } },
+            { id: "w", tool: "write_file", args: { path: "out.txt" } },
+          ],
+        },
+        { id: "z", tool: "python_code", args: { code: "1+1" } },
+      ],
+      output: "$a",
+    };
+    const events: ToolProgressEvent[] = [
+      { phase: "end", call_id: "rp1", name: "run_plan", arguments: { plan } },
+    ];
+    const stats = computeTaskStats([traceMessage(events)]);
+    expect(stats.steps).toBe(4); // a + f + w + z (parallel children counted individually)
+    expect(stats.commandsRun).toBe(2); // exec + python_code
+    expect(stats.filesCreated).toBe(1); // write_file
+    expect(stats.pagesViewed).toBe(1); // web_fetch
+  });
+
+  it("falls back to one deterministic batch for an unparseable run_plan", () => {
+    const events: ToolProgressEvent[] = [
+      { phase: "end", call_id: "rp2", name: "run_plan", arguments: {} },
+    ];
+    const stats = computeTaskStats([traceMessage(events)]);
+    expect(stats.steps).toBe(1);
+    expect(stats.commandsRun).toBe(1);
+  });
+
   it("returns empty stats for no activity", () => {
     const stats = computeTaskStats([]);
     expect(stats.commandsRun).toBe(0);
