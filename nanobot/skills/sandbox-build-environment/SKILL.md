@@ -1,6 +1,12 @@
 ---
 name: sandbox-build-environment
-description: Set up toolchains and install packages in restricted sandboxes where apt-get/sudo fail — user-local fallbacks (pip, conda, npm -g to prefix, tarballs, SDKMAN, standalone binaries) plus building APKs (Flutter/native Android), Windows exes, static Linux binaries. Use whenever an install or build fails due to missing root/apt.
+description: >-
+  Set up toolchains and install packages in restricted sandboxes where apt-get/sudo fail — user-local
+  fallbacks (pip, conda, npm -g to prefix, tarballs, SDKMAN, standalone binaries) plus compiling small
+  local utilities/static Linux binaries. Use whenever an install or build fails due to missing root/apt.
+  NOTE that building distributable APK/EXE/iPA/DEB artifacts from a project's source is NOT done here —
+  that MUST use the `github-actions-build` skill (GitHub Actions runners), since the sandbox lacks
+  Android SDK, Xcode, and Windows toolchains.
 metadata: {"nanobot":{"emoji":"🧰","os":["darwin","linux"],"always":false}}
 ---
 
@@ -82,72 +88,38 @@ uname -m                            # x86_64 vs aarch64 -> pick right asset
 ```
 If `sudo -n true` succeeds, apt may still work (`sudo apt-get update`). Otherwise skip straight to the ladder. Always persist env by appending exports to `~/.bashrc` AND re-exporting in each exec call (exec sessions may not reload rc files).
 
-## Building an APK (Android app) without root
+## ⛔ Building distributable artifacts: APK / EXE / iPA / DEB → GitHub Actions, NOT here
 
-APK builds need three things, all installable user-local: a **JDK**, the **Android SDK
-(command-line tools)**, and the framework (**Flutter** or Gradle for native). No emulator,
-no Android Studio required.
+If the user wants a **shippable Android APK, Windows EXE, iOS/iPad IPA, or .deb** built from
+their project source, **do not attempt it in the sandbox**. Use the **`github-actions-build`
+skill** instead — it creates a throwaway repo on the dedicated build account, pushes the
+project, runs the right GitHub Action (which has the real Android SDK / Xcode / Windows /
+dpkg toolchains), watches the run, fixes errors, downloads the artifact, then deletes the repo.
+The sandbox lacks those toolchains, so local attempts stall and waste steps. This skill stays
+responsible only for installing *toolchains/packages* to get a local dev environment working
+(e.g. compiling a small Linux utility, running tests locally, scaffolding a Flutter project so
+the user can inspect it before shipping).
 
-### 1. JDK (SDKMAN or tarball)
+### When local Android/Flutter setup IS still useful (compile-check only)
+You may install a JDK + Android command-line tools + Flutter purely to **verify code compiles**
+or to let the user run things locally — but the actual release APK/EXE/IPA/DEB is produced by
+GitHub Actions, never shipped from the sandbox. Quick reference for that optional setup:
+
 ```bash
+# JDK via SDKMAN (no root)
 curl -s "https://get.sdkman.io?rcupdate=false" | bash && source "$HOME/.sdkman/bin/sdkman-init.sh"
 sdk install java 17.0.12-tem && sdk use java 17.0.12-tem
-java -version
+# Android cmdline-tools: download zip from Google's distribution page, lay out as
+#   $ANDROID_SDK_ROOT/cmdline-tools/latest/bin, then `yes | sdkmanager --licenses`.
+# Flutter: tarball into $HOME, add to PATH, `flutter doctor`.
 ```
+For anything beyond a compile check (a real signed/shippable binary), switch to
+`github-actions-build`.
 
-### 2. Android SDK — command line tools only (no sudo)
-Download the zip from Google's distribution page (check the current build number there),
-then lay it out exactly as `sdkmanager` expects (`cmdline-tools/latest/bin`):
-```bash
-export ANDROID_SDK_ROOT="$HOME/android-sdk"
-mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-cd /tmp && curl -fLO https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-unzip -q commandlinetools-linux-*_latest.zip
-mv cmdline-tools "$ANDROID_SDK_ROOT/cmdline-tools/latest"
-export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
-yes | sdkmanager --licenses > /dev/null 2>&1 || true
-sdkmanager "platform-tools" "build-tools;34.0.0" "platforms;android-34"
-```
-(Older layout note: the archive extracts to a `cmdline-tools/` folder that must be renamed
-to `latest` inside `$ANDROID_SDK_ROOT/cmdline-tools/`, or `sdkmanager` won't find itself.)
-
-### 3a. Flutter app → release APK
-```bash
-cd ~ && curl -fLO https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_3.29.3-stable.tar.xz
-tar -xf flutter_linux_*-stable.tar.xz -C "$HOME"
-export PATH="$HOME/flutter/bin:$PATH"
-flutter doctor                # confirm Android toolchain ✓
-flutter config --no-analytics
-cd /path/to/app && flutter pub get
-flutter build apk --release   # output: build/app/outputs/flutter-apk/app-release.apk
-```
-Use `--debug` for faster iteration, `--split-per-abi` for smaller per-arch APKs.
-
-### 3b. Native Android app → APK
-```bash
-cd /path/to/project && ./gradlew assembleRelease    # uses SDKMAN gradle or wrapper
-# output: app/build/outputs/apk/release/app-release.apk
-```
-If there's no gradle wrapper: `sdk install gradle 8.7` (SDKMAN) then `gradle assembleRelease`.
-
-### APK troubleshooting
-- **"SDK location not found"** → export `ANDROID_SDK_ROOT`/`ANDROID_HOME` AND write
-  `sdk.dir=$HOME/android-sdk` into the project's `local.properties`.
-- **License errors** → rerun `yes | sdkmanager --licenses`.
-- **Java version mismatch** → Flutter/AGP want JDK 17; `sdk use java 17.0.12-tem`.
-- **No space** → point SDK/Gradle caches somewhere big:
-  `export GRADLE_USER_HOME=/tmp/gradle ANDROID_SDK_ROOT=/tmp/android-sdk`.
-- **Timeout on big downloads** → run the download with `yield_time_ms` background exec and
-  poll, or `curl -C -` to resume.
-
-## Other build targets (same philosophy)
-
-- **Windows `.exe` from Linux**: cross-compile with MinGW-w64 (`x86_64-w64-mingw32-gcc`) —
-  install via a portable toolchain or `pip install ziglang` then `zig cc -target x86_64-windows-gnu`;
-  Rust: `rustup target add x86_64-pc-windows-gnu` (mingw libs) or `-msvc` via Docker-free `cargo-xwin`.
-- **Static Linux binary** (runs anywhere): prefer musl/static linking — Rust `cargo build --target x86_64-unknown-linux-musl`, Go `CGO_ENABLED=0 go build` (already static), C with `gcc -static`.
-- **Python → exe**: `pip install pyinstaller && pyinstaller --onefile app.py`.
-- **Docker unavailable**: most CI images forbid it — build natively with the steps above instead.
+### Other native/package targets
+Windows `.exe`, iOS `.ipa`, and `.deb` are likewise **GitHub Actions only** (windows-latest,
+macos-latest, ubuntu-latest runners respectively). Static Linux binaries and Go/Rust/C cross-
+compilation for *local* use remain fine here.
 
 ## Persistence & hygiene
 - Every install goes under `$HOME` or `/tmp` (never `/usr` unless writable).

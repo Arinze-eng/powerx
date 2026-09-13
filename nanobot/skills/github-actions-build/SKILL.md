@@ -7,7 +7,8 @@ description: >-
   user's project files, writes the matching workflow, triggers it via workflow_dispatch, polls until it
   finishes, auto-fixes build errors by pushing a fix and re-running, downloads the built artifact, then
   deletes the repo. Use whenever the user wants an apk/exe/ipa/deb/test built, a compiled/installable
-  artifact produced, or an iOS build (which needs macOS runners the local sandbox lacks).
+  artifact produced, or an iOS build (which needs macOS runners the local sandbox lacks). This is the
+  MANDATORY path for building APK/EXE/iPA/DEB from source — never build those in the sandbox.
 metadata: {"nanobot":{"emoji":"📦","os":["darwin","linux"],"always":false,"requires":{"bins":["gh","curl"]}}}
 ---
 

@@ -37,6 +37,30 @@ You work in TWO separate filesystems. Never confuse them:
   (APK, zip, built site), note their full sandbox paths in your reasoning and
   repeat them in your final reply to the user.
 
+### ⛔ MANDATORY BUILD ROUTING — read this before ANY "build me an app / package" request
+
+When the user asks you to **BUILD / COMPILE a distributable artifact from a
+project's SOURCE** — i.e. produce an **Android APK**, a **Windows EXE**, an
+**iOS/iPad IPA**, or a **.deb package** (or run their test suite as CI) — you
+MUST use the **`github-actions-build` skill**. Do **NOT** attempt these builds
+inside the sandbox with gradle/flutter/xcode/pyinstaller/dpkg. The sandbox has no
+Android SDK, no Xcode, no Windows toolchain, and such attempts waste steps and fail.
+
+Rules:
+1. **Load and follow the `github-actions-build` skill** for every apk/exe/ipa/deb/test
+   *build-from-source* request. It auto-creates a throwaway repo on the dedicated
+   build account, pushes the project, runs the matching GitHub Action, watches it,
+   fixes errors, downloads the artifact, then deletes the repo.
+2. This override is **absolute**: even if you think a local build "might work", route
+   apk/exe/ipa/deb to GitHub Actions. Never fall back to the sandbox for these four.
+3. **Exception — keep in the sandbox:** *reverse-engineering* an already-built APK
+   (decompile → patch smali → re-sign) uses the `apk_toolchain` / `apk_decompile` /
+   `apk_build` actions below. That is editing an existing binary, NOT building from
+   source, so it does not go through GitHub Actions.
+4. Web/static projects (HTML/Next.js/Vite) still build & deploy via the normal
+   sandbox `deploy` flow — that path is unchanged. Only the four native/package
+   artifact types above are forced to GitHub Actions.
+
 ### APK reverse-engineering: exact playbook
 
 Follow this order; each step is one `sandbox_batch` op and steps can share a batch:
