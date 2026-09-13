@@ -88,7 +88,7 @@ def test_max_message_bytes_default_supports_multi_image_frame() -> None:
     assert default >= 33 * 1024 * 1024
     # Upper bound 40 MB matches plan
     with pytest.raises(Exception):
-        WebSocketConfig(max_message_bytes=41_943_040 + 1)
+        WebSocketConfig(max_message_bytes=536_870_912 + 1)
 
 
 # -- _dispatch_envelope message branch + media --------------------------------
@@ -402,7 +402,7 @@ async def test_message_rejected_when_too_many_total_attachments(tmp_path) -> Non
 async def test_message_rejected_on_oversize_payload(tmp_path) -> None:
     channel = _make_channel()
     mock_conn = AsyncMock()
-    oversized = b"x" * (29 * 1024 * 1024)  # > 28 MB attachment policy limit
+    oversized = b"x" * (101 * 1024 * 1024)  # > 100 MB attachment policy limit
     envelope = {
         "type": "message",
         "chat_id": "abc123",

@@ -43,10 +43,20 @@ def test_broadcast_announcement_deduplicates_chats_and_reports_failures(monkeypa
     ]
 
 
-def test_broadcast_announcement_requires_telegram_configuration(monkeypatch) -> None:
+def test_broadcast_announcement_persists_even_without_telegram(monkeypatch) -> None:
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-    with pytest.raises(supabase_admin.SupabaseAdminError, match="not configured"):
-        supabase_admin.broadcast_announcement("Title", "Message")
+    calls: list[tuple[str, str]] = []
+
+    def request(method: str, path: str, *, json=None, params=None):
+        calls.append((method, path))
+        return None
+
+    monkeypatch.setattr(supabase_admin, "_request", request)
+    result = supabase_admin.broadcast_announcement("Title", "Message")
+    assert result["ok"] is True
+    assert result["total"] == 0
+    assert result["sent"] == 0
+    assert calls == [("POST", "/rest/v1/announcements")]
 
 
 def test_latest_active_announcement_none_when_unconfigured(monkeypatch) -> None:

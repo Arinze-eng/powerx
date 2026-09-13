@@ -369,9 +369,6 @@ def broadcast_announcement(title: Any, message: Any) -> dict[str, Any]:
     safe_message = str(message or "").strip()[:_ANNOUNCEMENT_MAX_CHARS]
     if not safe_message:
         raise SupabaseAdminError("announcement message is required")
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        raise SupabaseAdminError("Telegram broadcast is not configured")
 
     body: dict[str, Any] = {
         "title": safe_title,
@@ -383,9 +380,13 @@ def broadcast_announcement(title: Any, message: Any) -> dict[str, Any]:
         body["created_by"] = _uuid(admin_id)
     _request("POST", "/rest/v1/announcements", json=body)
 
-    text = _telegram_announcement_text(safe_title, safe_message)
-    recipients = _announcement_chat_ids()
-    sent = sum(_send_telegram_announcement(token, chat_id, text) for chat_id in recipients)
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    recipients: list[int] = []
+    sent = 0
+    if token:
+        text = _telegram_announcement_text(safe_title, safe_message)
+        recipients = _announcement_chat_ids()
+        sent = sum(_send_telegram_announcement(token, chat_id, text) for chat_id in recipients)
     failed = len(recipients) - sent
     return {
         "ok": True,

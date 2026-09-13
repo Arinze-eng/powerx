@@ -60,8 +60,8 @@ export type AttachmentError =
   | "io";                // file read failed at the browser layer
 
 export const MAX_ATTACHMENTS_PER_MESSAGE = 4;
-export const MAX_ATTACHMENT_BYTES = 28 * 1024 * 1024;
-export const MAX_TOTAL_ATTACHMENT_BYTES = 28 * 1024 * 1024;
+export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+export const MAX_TOTAL_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 
 /** MIME whitelist — mirrors the server's and the ``<input accept>`` attr. */
 const ACCEPTED_IMAGE_MIMES: ReadonlySet<string> = new Set([

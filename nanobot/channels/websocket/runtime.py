@@ -212,11 +212,10 @@ class WebSocketConfig(Base):
     websocket_requires_token: bool = True
     allow_from: list[str] = Field(default_factory=lambda: ["*"])
     streaming: bool = True
-    # Default 40 MB (the WebSocket protocol ceiling). Supports large single
-    # files (e.g. zip / apk archives up to ~28 MB decoded → ~37 MB base64) plus
-    # envelope framing. Keeping the ceiling at 40 MB bounds memory per frame
-    # without opening a DoS avenue.
-    max_message_bytes: int = Field(default=41_943_040, ge=1024, le=41_943_040)
+    # Default 141 MB. Carries a full policy-valid message: one 100 MB attachment
+    # encoded as base64 (~136.7 MB) plus message text and envelope framing, with
+    # headroom. The ceiling bounds memory per frame without opening a DoS avenue.
+    max_message_bytes: int = Field(default=141_000_000, ge=1024, le=536_870_912)
     ping_interval_s: float = Field(default=20.0, ge=5.0, le=300.0)
     ping_timeout_s: float = Field(default=20.0, ge=5.0, le=300.0)
     ssl_certfile: str = ""
