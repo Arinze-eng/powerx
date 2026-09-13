@@ -59,7 +59,12 @@ def apply_render_execution_env(config: Any) -> Any:
     daytona_configured = bool(str(getattr(daytona, "api_key", "") or "").strip()) if daytona is not None else False
     explicit_novita = configured_backend == "novita" and (vps_configured or upstash_configured or daytona_configured)
     explicit_vps = configured_backend == "vps" and upstash_configured and backend == "upstash"
-    if not (explicit_novita or explicit_vps):
+    # A saved Daytona/Upstash admin choice (config already holds that backend's
+    # API key) is authoritative too — the durable env default must not stomp it
+    # on every config load, otherwise the admin's selection silently reverts.
+    explicit_daytona = configured_backend == "daytona" and daytona_configured
+    explicit_upstash = configured_backend == "upstash" and upstash_configured
+    if not (explicit_novita or explicit_vps or explicit_daytona or explicit_upstash):
         execution.backend = backend
 
     values = {

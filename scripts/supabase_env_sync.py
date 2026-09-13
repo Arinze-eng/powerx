@@ -77,6 +77,15 @@ RUNTIME_KEYS: tuple[str, ...] = (
     # WebUI upstream (used by the reverse-proxy wiring)
     "WEBUI_UPSTREAM",
     "WEBUI_WS_UPSTREAM",
+    # GitHub Actions artifact builds (build_artifact tool auth)
+    "GITHUB_BUILD_TOKEN",
+    # Daytona sandbox backend (execution provider chosen in admin settings)
+    "NANOBOT_DAYTONA_API_KEY",
+    "NANOBOT_DAYTONA_API_URL",
+    "NANOBOT_DAYTONA_SNAPSHOT",
+    "NANOBOT_DAYTONA_DOMAIN_ALLOW_LIST",
+    "NANOBOT_DAYTONA_NETWORK_ALLOW_LIST",
+    "NANOBOT_DAYTONA_TTL_MINUTES",
 )
 
 # Storage prefix for runtime config keys. Using a prefix avoids clashing with

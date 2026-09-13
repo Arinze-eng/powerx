@@ -26,7 +26,7 @@ services:
       - key: ADMIN_PASSWORD
         sync: false
       - key: SUPABASE_URL
-        value: https://nisqfdwvwjbejgeurbol.supabase.co
+        value: https://mitrbmjxriqvfacaefvg.supabase.co
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: SUPABASE_ANON_KEY
