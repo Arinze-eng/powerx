@@ -421,6 +421,18 @@ class UpstashExecutionConfig(Base):
     ttl_s: int = Field(default=3600, ge=60, le=86_400)
 
 
+class DaytonaExecutionConfig(Base):
+    """Administrator-configured Daytona target for sandbox-backed execution."""
+
+    api_key: str = Field(default="", repr=False)
+    api_url: str = "https://app.daytona.io/api"
+    snapshot: str = "daytona-small"
+    domain_allow_list: str = ""
+    network_allow_list: str = "0.0.0.0/0"
+    ttl_minutes: int = Field(default=60, ge=5, le=43_200)
+    auto_stop_minutes: int = Field(default=0, ge=0, le=10_080)
+
+
 class NovitaTemplateConfig(Base):
     """Per-deployment Novita sandbox sizing (CPU/RAM).
 
@@ -437,9 +449,10 @@ class NovitaTemplateConfig(Base):
 class ExecutionBackendConfig(Base):
     """Select the remote execution provider used by sandbox-compatible tasks."""
 
-    backend: Literal["novita", "vps", "upstash"] = "novita"
+    backend: Literal["novita", "vps", "upstash", "daytona"] = "novita"
     vps: VPSExecutionConfig = Field(default_factory=VPSExecutionConfig)
     upstash: UpstashExecutionConfig = Field(default_factory=UpstashExecutionConfig)
+    daytona: DaytonaExecutionConfig = Field(default_factory=DaytonaExecutionConfig)
     novita_template: NovitaTemplateConfig = Field(default_factory=NovitaTemplateConfig)
 
 

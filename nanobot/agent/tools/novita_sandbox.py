@@ -18,6 +18,7 @@ from loguru import logger
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext, current_request_context
+from nanobot.agent.tools.daytona_backend import DaytonaError, DaytonaExecutionBackend
 from nanobot.agent.tools.schema import (
     IntegerSchema,
     StringSchema,
@@ -26,15 +27,17 @@ from nanobot.agent.tools.schema import (
 from nanobot.agent.tools.upstash_backend import UpstashError, UpstashExecutionBackend
 from nanobot.agent.tools.vps_backend import VPSExecutionBackend
 from nanobot.config.paths import get_data_dir, get_workspace_path
+from nanobot.utils.file_share import (
+    FileShareError,
+)
+from nanobot.utils.file_share import (
+    upload_artifact_path as upload_shared_artifact,
+)
 from nanobot.utils.gofile import GoFileError, is_gofile_url, request_file, resolve_gofile_download
 from nanobot.utils.helpers import detect_image_mime
 from nanobot.utils.onlyfiles import OnlyFilesError
 from nanobot.utils.onlyfiles import upload_bytes as upload_onlyfile_bytes
 from nanobot.utils.onlyfiles import upload_path as upload_onlyfile_path
-from nanobot.utils.file_share import (
-    FileShareError,
-    upload_artifact_path as upload_shared_artifact,
-)
 
 try:
     from novita_sandbox import Novita
@@ -378,6 +381,38 @@ class _UpstashBoxStore(_SandboxStore):
 
 _UPSTASH_STORE = _UpstashBoxStore()
 
+
+class _DaytonaSandboxStore(_SandboxStore):
+    """Disk-indexed session → Daytona sandbox id map (no in-process handles needed)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        path = os.getenv("NANOBOT_DATA_DIR", "").strip()
+        base = Path(path).expanduser() if path else Path.home() / ".nanobot"
+        # Point the inherited persistence at a dedicated index file.
+        self._index_path = base / "daytona_sandboxes.json"
+        try:
+            raw = json.loads(self._index_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self._ids = {str(k): str(v) for k, v in raw.items() if v}
+        except (OSError, ValueError):
+            pass
+
+    def set_id(self, key: str, sandbox_id: str) -> None:
+        """Persist a session → sandbox id mapping without a live handle."""
+        with self._lock:
+            self._ids[key] = str(sandbox_id)
+            try:
+                self._index_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self._index_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(self._ids, indent=2), encoding="utf-8")
+                tmp.replace(self._index_path)
+            except OSError:
+                logger.warning("Could not persist Daytona sandbox index")
+
+
+_DAYTONA_STORE = _DaytonaSandboxStore()
+
 # Alias cache for dynamically built Novita templates (desired alias → usable alias).
 _TEMPLATE_CACHE: dict[str, str] = {}
 _TEMPLATE_BUILD_LOCK = threading.Lock()
@@ -498,6 +533,8 @@ class NovitaSandboxTool(Tool):
             return bool(getattr(execution.vps, "host", "").strip())
         if backend == "upstash":
             return bool(getattr(execution.upstash, "api_key", "").strip())
+        if backend == "daytona":
+            return bool(getattr(execution.daytona, "api_key", "").strip())
         return bool(os.getenv("NOVITA_API_KEY", "").strip()) and Novita is not None
 
     @classmethod
@@ -513,6 +550,8 @@ class NovitaSandboxTool(Tool):
             return "vps", getattr(execution, "vps", None)
         if backend == "upstash":
             return "upstash", getattr(execution, "upstash", None)
+        if backend == "daytona":
+            return "daytona", getattr(execution, "daytona", None)
         return "novita", None
 
     def backend_name(self) -> str:
@@ -673,6 +712,103 @@ class NovitaSandboxTool(Tool):
                         cwd=root,
                     )
 
+    async def _analyze_telegram_images_daytona(
+        self,
+        image_paths: list[tuple[Path, bytes]],
+        *,
+        config: Any,
+        session_key: str,
+        _retry_on_failure: bool = True,
+    ) -> str:
+        """Tesseract OCR for Telegram images inside a Daytona sandbox.
+
+        Mirrors the Upstash path: installs (tesseract + Pillow) are allowed inside
+        the sandbox, Tesseract gets the same generous 90s timeout, and a failure
+        retries once against a fresh sandbox before degrading gracefully.
+        """
+        from nanobot.agent.tools.daytona_backend import daytona_sandbox_name
+
+        backend = DaytonaExecutionBackend(config, sandbox_name=daytona_sandbox_name(session_key or "telegram"))
+        # Reuse the persisted sandbox id (if any) so ensure_sandbox verifies that
+        # exact sandbox instead of re-resolving it by name on each OCR run.
+        stored_id = _DAYTONA_STORE.sandbox_id(session_key or "telegram")
+        if stored_id:
+            backend.last_sandbox_id = stored_id
+        root = backend.workspace
+        ocr_dir = f"{root}/.nanobot"
+        remote_paths: list[str] = []
+        manifest_path = f"{ocr_dir}/telegram_image_manifest.json"
+        script_path = f"{ocr_dir}/telegram_image_ocr.py"
+        try:
+            await backend.run(f"mkdir -p {shlex.quote(ocr_dir)} {shlex.quote(f'{root}/telegram-images')}", timeout=60)
+            # Tesseract is optional: the OCR script degrades to Pillow-based
+            # extraction when it is present but tesseract is not, so we must NOT
+            # hard-fail just because the binary could not be installed. Install
+            # attempts are made best-effort and per-package-group so one missing
+            # name (e.g. tesseract-ocr-eng on Alpine, where English data ships in
+            # the base package) does not abort the whole install the way a single
+            # combined "apt/apk add a b c" would.
+            probe = await backend.run(
+                "if command -v tesseract >/dev/null 2>&1; then printf READY; else printf MISSING; fi",
+                timeout=30,
+            )
+            if "READY" not in probe:
+                await _install_tesseract_resilient(backend)
+                probe = await backend.run(
+                    "if command -v tesseract >/dev/null 2>&1; then printf READY; else printf MISSING; fi",
+                    timeout=30,
+                )
+                if "READY" not in probe:
+                    logger.warning(
+                        "Daytona sandbox: tesseract unavailable after install attempts; "
+                        "falling back to Pillow-only image analysis"
+                    )
+            await backend.write(script_path, _TELEGRAM_IMAGE_SCRIPT)
+            for path, raw in image_paths:
+                suffix = path.suffix.lower() if path.suffix else ".img"
+                remote_path = f"{root}/telegram-images/{uuid4().hex}{suffix}"
+                remote_paths.append(remote_path)
+                await backend.write_bytes(remote_path, raw)
+            await backend.write(manifest_path, json.dumps(remote_paths))
+            output = await backend.run(
+                "env NANOBOT_OCR_ALLOW_INSTALL=1 NANOBOT_OCR_ALLOW_PILLOW_INSTALL=1 "
+                "NANOBOT_OCR_TIMEOUT_SECONDS=90 "
+                f"python3 {shlex.quote(script_path)} {shlex.quote(manifest_path)}",
+                timeout=180,
+            )
+            stdout = output.split("\n[stderr]", 1)[0].strip()
+            parsed: Any | None = None
+            try:
+                parsed = json.loads(stdout)
+            except (TypeError, ValueError):
+                for line in reversed(stdout.splitlines()):
+                    candidate = line.strip()
+                    if not candidate.startswith("{"):
+                        continue
+                    try:
+                        parsed = json.loads(candidate)
+                        break
+                    except ValueError:
+                        continue
+            if not isinstance(parsed, dict) or not str(parsed.get("content") or "").strip():
+                logger.warning("Daytona sandbox returned no usable Tesseract OCR result")
+                return "[Daytona sandbox Tesseract OCR returned no readable result.]"
+            return str(parsed["content"]).strip()[:_MAX_IMAGE_ANALYSIS_RESULT_CHARS]
+        except Exception as exc:
+            logger.warning("Daytona sandbox Tesseract OCR failed: {}", type(exc).__name__)
+            if _retry_on_failure:
+                sandbox_id = _DAYTONA_STORE.sandbox_id(session_key or "telegram")
+                with suppress(Exception):
+                    await backend.reset(sandbox_id)
+                _DAYTONA_STORE.remove(session_key or "telegram")
+                return await self._analyze_telegram_images_daytona(
+                    image_paths,
+                    config=config,
+                    session_key=session_key,
+                    _retry_on_failure=False,
+                )
+            return "[Daytona sandbox Tesseract OCR failed.]"
+
     async def _analyze_telegram_images_upstash(
         self,
         image_paths: list[tuple[Path, bytes]],
@@ -797,6 +933,26 @@ class NovitaSandboxTool(Tool):
         if not image_paths:
             return ""
         selected_backend, backend_config = self._selected_backend()
+        if selected_backend == "daytona":
+            if backend_config is None or not str(backend_config.api_key or "").strip():
+                return "[Daytona execution is selected but no API key is configured.]"
+            daytona_images: list[tuple[Path, bytes]] = []
+            for raw_path in image_paths[:_MAX_TELEGRAM_IMAGE_COUNT]:
+                path = Path(raw_path).expanduser().resolve()
+                try:
+                    raw = path.read_bytes()
+                except OSError:
+                    continue
+                if not raw or len(raw) > _MAX_TELEGRAM_IMAGE_BYTES:
+                    continue
+                mime = detect_image_mime(raw) or mimetypes.guess_type(str(path))[0]
+                if mime and mime.startswith("image/"):
+                    daytona_images.append((path, raw))
+            if not daytona_images:
+                return "[No readable Telegram images were available to Daytona.]"
+            return await self._analyze_telegram_images_daytona(
+                daytona_images, config=backend_config, session_key=session_key
+            )
         if selected_backend == "upstash":
             if backend_config is None or not str(backend_config.api_key or "").strip():
                 return "[Upstash Box execution is selected but no API key is configured.]"
@@ -1301,15 +1457,37 @@ class NovitaSandboxTool(Tool):
             backend.last_box_id = stored_id
         return backend
 
-    async def release_upstash_sandbox(self, session_key: str | None = None) -> None:
-        """Kill the session's Upstash box immediately once its task has finished.
+    def _daytona_backend(self, config: Any, key: str) -> DaytonaExecutionBackend:
+        from nanobot.agent.tools.daytona_backend import daytona_sandbox_name
 
-        Upstash-only: no-ops for the novita / vps backends so their persistent
-        sandboxes are never affected. Best effort: failures are logged, never
-        raised to the caller.
+        backend = DaytonaExecutionBackend(config, sandbox_name=daytona_sandbox_name(key))
+        # Seed the persisted sandbox id (if any) so ensure_sandbox verifies that
+        # exact sandbox directly instead of re-resolving it by name each op.
+        stored_id = _DAYTONA_STORE.sandbox_id(key)
+        if stored_id:
+            backend.last_sandbox_id = stored_id
+        return backend
+
+    async def release_upstash_sandbox(self, session_key: str | None = None) -> None:
+        """Kill the session's ephemeral sandbox (Daytona / Upstash) once its task has finished.
+
+        Daytona and Upstash sandboxes are billed while they exist, so a finished
+        task must not leave one running. No-ops for the novita / vps backends so
+        their persistent sandboxes are never affected. Best effort: failures are
+        logged, never raised to the caller.
         """
         try:
             selected_backend, backend_config = self._selected_backend()
+            if selected_backend == "daytona" and backend_config is not None:
+                key = session_key or _session_key()
+                sandbox_id = _DAYTONA_STORE.sandbox_id(key)
+                if not sandbox_id:
+                    return
+                backend = self._daytona_backend(backend_config, key)
+                with suppress(Exception):
+                    await backend.reset(sandbox_id)
+                _DAYTONA_STORE.remove(key)
+                return
             if selected_backend != "upstash" or backend_config is None:
                 return
             key = session_key or _session_key()
@@ -1321,7 +1499,131 @@ class NovitaSandboxTool(Tool):
                 await backend.reset(box_id)
             _UPSTASH_STORE.remove(key)
         except Exception:
-            logger.debug("Could not release Upstash box", exc_info=True)
+            logger.debug("Could not release sandbox", exc_info=True)
+
+    async def _execute_daytona(
+        self, action: str, kwargs: dict[str, Any], config: Any, session_key: str
+    ) -> ToolResult | str:
+        key = session_key or "unknown"
+        backend = self._daytona_backend(config, key)
+        try:
+            if action == "reset":
+                # Kill the user's sandbox immediately; a fresh sandbox is created
+                # on the next operation. The stored id (if any) is deleted even
+                # if the remote lookup fails, so nothing lingers.
+                sandbox_id = _DAYTONA_STORE.sandbox_id(key)
+                with suppress(Exception):
+                    await backend.reset(sandbox_id)
+                _DAYTONA_STORE.remove(key)
+                return "Daytona sandbox reset. A new sandbox will be created for the next operation."
+            if action not in {"run", "read", "write", "upload", "fetch_url", "install", "list", "download_url"}:
+                return ToolResult.error("Unknown sandbox action")
+            async with _DAYTONA_STORE.lock_for(key):
+                if action == "run":
+                    command = str(kwargs.get("command") or "").strip()
+                    if not command:
+                        return ToolResult.error("command is required")
+                    timeout = max(1, min(int(kwargs.get("timeout") or 120), _MAX_TIMEOUT))
+                    output = await backend.run(command, timeout=timeout)
+                    if getattr(backend, "last_sandbox_id", ""):
+                        _DAYTONA_STORE.set_id(key, backend.last_sandbox_id)
+                    return output
+                if action == "install":
+                    raw_packages = str(kwargs.get("packages") or "").strip()
+                    packages = [part for part in re.split(r"[\s,]+", raw_packages) if part]
+                    timeout = max(30, min(int(kwargs.get("timeout") or 600), _MAX_TIMEOUT))
+                    result = await backend.install_packages(packages, timeout=timeout)
+                    return f"Daytona sandbox package installation result:\n{result}"
+                if action == "read":
+                    return await backend.read(str(kwargs.get("path") or ""))
+                if action == "write":
+                    content = str(kwargs.get("content") or "")
+                    if len(content) > _MAX_CONTENT_CHARS:
+                        return ToolResult.error(
+                            f"content exceeds {_MAX_CONTENT_CHARS} characters. Do NOT retry with the same payload: "
+                            "instead split the file into sequential write ops (first op writes the head, "
+                            'then {"action":"run","command":"cat >> \\"<path>\\" << \'PX_EOF\'\\n...\\nPX_EOF"} '
+                            "appends each following chunk; use a unique heredoc marker)."
+                        )
+                    path = str(kwargs.get("path") or "")
+                    await backend.write(path, content)
+                    if getattr(backend, "last_sandbox_id", ""):
+                        _DAYTONA_STORE.set_id(key, backend.last_sandbox_id)
+                    return f"Wrote {len(content)} characters to {path} in the Daytona workspace."
+                if action == "upload":
+                    source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
+                    if not self._local_attachment_allowed(source):
+                        return ToolResult.error("source must be inside the nanobot media/data directory")
+                    if not source.is_file():
+                        return ToolResult.error("source file does not exist")
+                    if source.stat().st_size > _MAX_UPLOAD_BYTES:
+                        return ToolResult.error("source file exceeds 200 MiB")
+                    path = str(kwargs.get("path") or "")
+                    await backend.write_bytes(path, await asyncio.to_thread(source.read_bytes))
+                    if getattr(backend, "last_sandbox_id", ""):
+                        _DAYTONA_STORE.set_id(key, backend.last_sandbox_id)
+                    return f"Uploaded {source.name} to {path} in the Daytona workspace."
+                if action == "fetch_url":
+                    url = str(kwargs.get("url") or "").strip()
+                    if not url:
+                        return ToolResult.error("url is required for fetch_url")
+                    parsed = urlparse(url)
+                    if is_gofile_url(url):
+                        try:
+                            resolved = await resolve_gofile_download(url, timeout_seconds=int(kwargs.get("timeout") or 150))
+                        except GoFileError as exc:
+                            return ToolResult.error(f"could not resolve gofile.io link: {exc}")
+                        item = resolved[0]
+                        real_name = re.sub(r"[^A-Za-z0-9._-]", "_", str(item.get("name") or "gofile_file")) or "gofile_file"
+                        try:
+                            data = await request_file(item, timeout_seconds=int(kwargs.get("timeout") or 150))
+                        except GoFileError as exc:
+                            return ToolResult.error(f"could not download gofile.io file: {exc}")
+                        dest = str(kwargs.get("path") or "").strip() or f"{real_name}"
+                        await backend.write_bytes(dest, data)
+                        if getattr(backend, "last_sandbox_id", ""):
+                            _DAYTONA_STORE.set_id(key, backend.last_sandbox_id)
+                        return f"Fetched remote file to {dest} in the Daytona workspace. Use action=read or run commands to analyze it."
+                    if parsed.scheme != "https" or parsed.netloc != "onlyfiles.com":
+                        return ToolResult.error("url must be an HTTPS onlyfiles.com or gofile.io URL")
+                    dest_path = str(kwargs.get("path") or "").strip()
+                    fetched = await backend.fetch_url(url, dest_path, timeout=int(kwargs.get("timeout") or 150))
+                    if getattr(backend, "last_sandbox_id", ""):
+                        _DAYTONA_STORE.set_id(key, backend.last_sandbox_id)
+                    return f"Fetched remote file to {fetched} in the Daytona workspace. Use action=read or run commands to analyze it."
+                if action == "list":
+                    return await backend.list(str(kwargs.get("path") or ""))
+                if action == "download_url":
+                    path = str(kwargs.get("path") or "")
+                    destination = self._artifact_destination(path)
+                    downloaded = await backend.download(path, destination)
+                    if getattr(backend, "last_sandbox_id", ""):
+                        _DAYTONA_STORE.set_id(key, backend.last_sandbox_id)
+                    try:
+                        shared = await upload_shared_artifact(downloaded)
+                    except (FileShareError, OnlyFilesError) as exc:
+                        return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
+                    host_label = shared.get("host", "onlyfiles")
+                    expiry_note = (
+                        "expires soon" if host_label == "onlyfiles" else "stored permanently"
+                    )
+                    return (
+                        f"Downloaded remote artifact to local path: {downloaded}\n"
+                        f"A public download link ({host_label}) is available and {expiry_note}:\n"
+                        f"{shared['url']}\n"
+                        "Give the user this link and do NOT paste the file contents into "
+                        "your reply. The file may also be attached directly via the "
+                        "message tool's media parameter when direct attachment delivery "
+                        "is available. Prefer a single clear download link over dumping "
+                        "raw text."
+                    )
+            return ToolResult.error("Unknown sandbox action")
+        except DaytonaError as exc:
+            logger.warning("Daytona sandbox operation failed: {}", str(exc)[:300])
+            return ToolResult.error(f"Daytona sandbox error: {str(exc)[:500]}")
+        except Exception as exc:
+            logger.exception("Daytona sandbox operation failed")
+            return ToolResult.error(f"Daytona sandbox error: {type(exc).__name__}: {str(exc)[:500]}")
 
     async def _execute_upstash(
         self, action: str, kwargs: dict[str, Any], config: Any, session_key: str
@@ -1444,6 +1746,12 @@ class NovitaSandboxTool(Tool):
             if backend_config is None or not str(backend_config.host or "").strip():
                 return ToolResult.error("VPS execution is selected but SSH details are not configured")
             return await self._execute_vps(action, kwargs, backend_config)
+        if selected_backend == "daytona":
+            if backend_config is None or not str(backend_config.api_key or "").strip():
+                return ToolResult.error("Daytona execution is selected but no API key is configured")
+            ctx = current_request_context()
+            session_key = (ctx.session_key or f"{ctx.channel}:{ctx.chat_id}") if ctx is not None else _session_key()
+            return await self._execute_daytona(action, kwargs, backend_config, session_key)
         if selected_backend == "upstash":
             if backend_config is None or not str(backend_config.api_key or "").strip():
                 return ToolResult.error("Upstash Box execution is selected but no API key is configured")

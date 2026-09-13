@@ -37,7 +37,7 @@ def apply_render_execution_env(config: Any) -> Any:
     assigned in memory and are never logged or returned by this module.
     """
     backend = (_env("NANOBOT_EXECUTION_BACKEND") or "").lower()
-    if backend not in {"novita", "vps", "upstash"}:
+    if backend not in {"novita", "vps", "upstash", "daytona"}:
         return config
     execution = getattr(config, "execution", None)
     vps = getattr(execution, "vps", None)
@@ -55,7 +55,9 @@ def apply_render_execution_env(config: Any) -> Any:
     )
     upstash = getattr(execution, "upstash", None)
     upstash_configured = bool(str(getattr(upstash, "api_key", "") or "").strip()) if upstash is not None else False
-    explicit_novita = configured_backend == "novita" and (vps_configured or upstash_configured)
+    daytona = getattr(execution, "daytona", None)
+    daytona_configured = bool(str(getattr(daytona, "api_key", "") or "").strip()) if daytona is not None else False
+    explicit_novita = configured_backend == "novita" and (vps_configured or upstash_configured or daytona_configured)
     explicit_vps = configured_backend == "vps" and upstash_configured and backend == "upstash"
     if not (explicit_novita or explicit_vps):
         execution.backend = backend
@@ -102,4 +104,25 @@ def apply_render_execution_env(config: Any) -> Any:
         ttl = _positive_int(_env("NANOBOT_UPSTASH_TTL"), maximum=86_400)
         if ttl is not None and ttl >= 60:
             upstash.ttl_s = ttl
+
+    # Daytona overlay (used when the deployment selects the Daytona backend).
+    if daytona is not None:
+        api_key = _env("NANOBOT_DAYTONA_API_KEY") or _env("DAYTONA_API_KEY")
+        if api_key:
+            daytona.api_key = api_key
+        api_url = _env("NANOBOT_DAYTONA_API_URL")
+        if api_url:
+            daytona.api_url = api_url
+        snapshot = _env("NANOBOT_DAYTONA_SNAPSHOT")
+        if snapshot:
+            daytona.snapshot = snapshot
+        domain_list = _env("NANOBOT_DAYTONA_DOMAIN_ALLOW_LIST")
+        if domain_list:
+            daytona.domain_allow_list = domain_list
+        network_list = _env("NANOBOT_DAYTONA_NETWORK_ALLOW_LIST")
+        if network_list:
+            daytona.network_allow_list = network_list
+        ttl_minutes = _positive_int(_env("NANOBOT_DAYTONA_TTL_MINUTES"), maximum=43_200)
+        if ttl_minutes is not None and ttl_minutes >= 5:
+            daytona.ttl_minutes = ttl_minutes
     return config

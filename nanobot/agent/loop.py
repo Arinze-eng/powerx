@@ -123,6 +123,7 @@ def _sandbox_backend_label(backend_name: str) -> str:
         "novita": "Novita Sandbox",
         "vps": "Linux VPS over SSH",
         "upstash": "Upstash Box",
+        "daytona": "Daytona Sandbox",
     }.get(backend_name, "Novita Sandbox")
 
 
@@ -1405,7 +1406,7 @@ class AgentLoop:
         sandbox_image_request = (
             _uses_sandbox_image_ocr(channel)
             and (
-                (metadata or {}).get("telegram_images_execution_backend") in {"novita", "vps", "upstash"}
+                (metadata or {}).get("telegram_images_execution_backend") in {"novita", "vps", "upstash", "daytona"}
                 or LLMProvider._contains_image_content(initial_messages)
                 or (
                     provider_state is not None
@@ -2368,7 +2369,7 @@ class AgentLoop:
         sandbox_image_ocr_turn = (
             ctx.kind is TurnKind.USER
             and _uses_sandbox_image_ocr(ctx.msg.channel)
-            and ctx.msg.metadata.get("telegram_images_execution_backend") in {"novita", "vps", "upstash"}
+            and ctx.msg.metadata.get("telegram_images_execution_backend") in {"novita", "vps", "upstash", "daytona"}
         )
         if sandbox_image_ocr_turn:
             # OCR-only channel image turns must not resume provider state from

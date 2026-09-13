@@ -249,6 +249,7 @@ class ContextBuilder:
             backend = getattr(execution, "backend", "novita") if execution else "novita"
             vps = getattr(execution, "vps", None) if execution else None
             upstash = getattr(execution, "upstash", None) if execution else None
+            daytona = getattr(execution, "daytona", None) if execution else None
             if backend == "vps":
                 if not (vps and str(getattr(vps, "host", "")).strip()):
                     return ""  # no usable backend — don't mislead the model
@@ -257,11 +258,15 @@ class ContextBuilder:
                 if not (upstash and str(getattr(upstash, "api_key", "")).strip()):
                     return ""
                 sandbox_dir = "/workspace/home"
+            elif backend == "daytona":
+                if not (daytona and str(getattr(daytona, "api_key", "")).strip()):
+                    return ""
+                sandbox_dir = "/home/daytona"
             else:
                 if not os.getenv("NOVITA_API_KEY", "").strip():
                     return ""
                 sandbox_dir = "/workspace"
-            backend_labels = {"vps": "Linux VPS over SSH", "upstash": "Upstash Box"}
+            backend_labels = {"vps": "Linux VPS over SSH", "upstash": "Upstash Box", "daytona": "Daytona Sandbox"}
             return render_template(
                 "agent/sandbox_workspace.md",
                 sandbox_backend=backend_labels.get(backend, "Novita Sandbox"),
