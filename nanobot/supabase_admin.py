@@ -276,6 +276,46 @@ _TELEGRAM_MESSAGE_MAX = 4096
 _ANNOUNCEMENT_MAX_CHARS = 3800
 
 
+def latest_active_announcement() -> dict[str, Any] | None:
+    """Return the newest active announcement for public display, or None.
+
+    Reads the ``announcements`` table (written by ``broadcast_announcement``)
+    filtered to ``is_active = true``, newest first. Only the fields safe to show
+    on a public landing page are returned. Returns None when Supabase is not
+    configured or nothing is active, so callers can treat "no announcement" as a
+    normal empty state rather than an error.
+    """
+    if not configured():
+        return None
+    try:
+        rows = _request(
+            "GET",
+            "/rest/v1/announcements",
+            params={
+                "select": "id,title,message,created_at",
+                "is_active": "eq.true",
+                "order": "created_at.desc",
+                "limit": "1",
+            },
+        )
+    except SupabaseAdminError:
+        # Table may not exist yet or transient failure — degrade gracefully.
+        return None
+    data = rows if isinstance(rows, list) else []
+    if not data or not isinstance(data[0], dict):
+        return None
+    row = data[0]
+    message = str(row.get("message") or "").strip()
+    if not message:
+        return None
+    return {
+        "id": str(row.get("id") or ""),
+        "title": str(row.get("title") or "Announcement").strip() or "Announcement",
+        "message": message[:_ANNOUNCEMENT_MAX_CHARS],
+        "created_at": row.get("created_at"),
+    }
+
+
 def _announcement_chat_ids() -> list[int]:
     rows = _request(
         "GET",

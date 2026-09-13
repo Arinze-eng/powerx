@@ -14,6 +14,7 @@ import { channelUiPresentation } from "@/channel-plugins/registry";
 import { Sidebar } from "@/components/Sidebar";
 import { SupabaseAuthPage } from "@/components/SupabaseAuthPage";
 import { LandingPage } from "@/components/LandingPage";
+import { AnnouncementDialog } from "@/components/AnnouncementDialog";
 import { PrivacyPolicy } from "@/components/PrivacyPolicy";
 import { CreditBadge } from "@/components/CreditBadge";
 import type { SidebarDeleteItem } from "@/components/ChatList";
@@ -1424,6 +1425,7 @@ export default function App() {
           onNativeEngineRestart={handleNativeEngineRestart}
         />
       </ClientProvider>
+      <AnnouncementDialog />
     </SupabaseUserContext.Provider>
   );
 }

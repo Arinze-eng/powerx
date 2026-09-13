@@ -263,6 +263,54 @@ async def test_bootstrap_returns_token_for_localhost(
 
 
 @pytest.mark.asyncio
+async def test_announcement_route_returns_active_public_without_auth(
+    bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nanobot import supabase_admin
+
+    monkeypatch.setattr(
+        supabase_admin,
+        "latest_active_announcement",
+        lambda: {
+            "id": "ann-1",
+            "title": "Maintenance",
+            "message": "Down at 9pm UTC",
+            "created_at": "2026-09-13T00:00:00Z",
+        },
+    )
+    channel = _ch(bus, port=29910)
+    server_task = asyncio.create_task(channel.start())
+    try:
+        # Public route: no bearer token required.
+        resp = await _http_get("http://127.0.0.1:29910/webui/announcement")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["announcement"]["title"] == "Maintenance"
+        assert body["announcement"]["message"] == "Down at 9pm UTC"
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_announcement_route_null_when_none_configured(
+    bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nanobot import supabase_admin
+
+    monkeypatch.setattr(supabase_admin, "latest_active_announcement", lambda: None)
+    channel = _ch(bus, port=29911)
+    server_task = asyncio.create_task(channel.start())
+    try:
+        resp = await _http_get("http://127.0.0.1:29911/webui/announcement")
+        assert resp.status_code == 200
+        assert resp.json() == {"announcement": None}
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
 async def test_sessions_list_requires_bearer_token(
     bus: MagicMock, tmp_path: Path
 ) -> None:

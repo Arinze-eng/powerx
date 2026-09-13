@@ -554,6 +554,18 @@ class GatewayHTTPHandler:
         if got == "/api/version":
             return _http_json_response(_deployment_identity())
 
+        # Public announcement banner (no auth): the newest active admin
+        # announcement, shown as a dialog on the landing page / AI section.
+        # Returns {announcement: null} when nothing is configured or active.
+        if got == "/webui/announcement":
+            from nanobot.supabase_admin import latest_active_announcement
+
+            try:
+                payload = {"announcement": latest_active_announcement()}
+            except Exception:  # pragma: no cover - defensive; never break the SPA
+                payload = {"announcement": None}
+            return _http_json_response(payload)
+
         # Admin dashboard and user registry
         admin_response = admin_route(
             request,

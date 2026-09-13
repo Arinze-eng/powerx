@@ -8,18 +8,23 @@ import {
   CheckCircle2,
   Code2,
   FileText,
+  Gauge,
   Image as ImageIcon,
   Lock,
   Menu,
   MessageSquare,
+  Rocket,
   Search,
+  Smartphone,
   Sparkles,
   Users,
+  Workflow,
   X,
   Zap,
 } from "lucide-react";
 
 import { CdnaiLogo, CdnaiMark } from "@/components/brand/CdnaiBrand";
+import { AnnouncementDialog } from "@/components/AnnouncementDialog";
 
 type LandingPageProps = {
   onSignIn: () => void;
@@ -44,6 +49,41 @@ const STEPS = [
   { title: "Get results, fast", body: "Review deliverables, refine with follow-ups, and ship. Everything stays in your workspace." },
 ];
 
+// Headline capabilities the agent is tuned for — shown as a dedicated showcase band.
+const CAPABILITIES = [
+  {
+    icon: Search,
+    accent: "from-[#7C5CFF] to-[#6aa8ff]",
+    title: "Deep research",
+    body: "Gathers live, verified information from across the web and returns sourced, fact-checked answers — never guesses.",
+  },
+  {
+    icon: Smartphone,
+    accent: "from-[#22D3EE] to-[#3ee0f5]",
+    title: "Build APK · iPA · EXE with ease",
+    body: "Turn any project into a real installable app. Android APK, iOS/iPad IPA and Windows EXE are compiled on cloud CI runners automatically.",
+  },
+  {
+    icon: Code2,
+    accent: "from-[#a78bff] to-[#7C5CFF]",
+    title: "Coding efficiency",
+    body: "Writes, refactors and debugs production code fast — scaffolding whole projects, wiring APIs and fixing bugs in fewer steps.",
+  },
+  {
+    icon: Workflow,
+    accent: "from-[#6aa8ff] to-[#22D3EE]",
+    title: "Autonomous task execution",
+    body: "Give it a goal and walk away. It plans multi-step work, picks the right tools, runs them end-to-end and reports back when done.",
+  },
+  {
+    icon: Gauge,
+    accent: "from-[#3ee0f5] to-[#a78bff]",
+    title: "Math solved with 98% accuracy",
+    body: "From arithmetic to calculus, statistics and proofs — step-by-step reasoning that gets it right, benchmarked at 98% accuracy.",
+  },
+];
+
+
 const NAV_LINKS = [
   { href: "#features", label: "Features" },
   { href: "#how", label: "How it works" },
@@ -60,6 +100,7 @@ export function LandingPage({ onSignIn, onSignUp, onPrivacy }: LandingPageProps)
 
   return (
     <div className="relative h-full w-full overflow-x-hidden overflow-y-auto bg-[#0b0a14] text-white">
+      <AnnouncementDialog />
       {/* Nav */}
       <header className="sticky top-0 z-40 border-b border-white/10 bg-[#0b0a14]/85 backdrop-blur-md">
         <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-5 sm:px-8">
@@ -208,6 +249,46 @@ export function LandingPage({ onSignIn, onSignUp, onPrivacy }: LandingPageProps)
         </div>
       </section>
 
+      {/* Capabilities — headline strengths of the agent */}
+      <section id="capabilities" className="relative mx-auto max-w-6xl scroll-mt-20 px-5 py-16 sm:px-8 sm:py-20 lg:py-24">
+        <div aria-hidden className="pointer-events-none absolute inset-0 -z-0 overflow-hidden">
+          <div className="absolute left-[10%] top-[10%] h-[320px] w-[320px] rounded-full bg-[radial-gradient(closest-side,rgba(124,92,255,0.22),transparent)] blur-2xl" />
+          <div className="absolute right-[8%] bottom-[6%] h-[300px] w-[300px] rounded-full bg-[radial-gradient(closest-side,rgba(34,211,238,0.20),transparent)] blur-2xl" />
+        </div>
+        <div className="relative mx-auto max-w-2xl text-center">
+          <span className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/5 px-3.5 py-1.5 text-xs font-medium text-white/70 backdrop-blur">
+            <Rocket className="h-3.5 w-3.5 text-[#3ee0f5]" />
+            What CDNAI does best
+          </span>
+          <h2 className="mt-5 text-3xl font-bold tracking-tight sm:text-4xl">Five things it nails every time</h2>
+          <p className="mt-4 text-white/60">The capabilities the agent is tuned for — researched, engineered and benchmarked.</p>
+        </div>
+
+        <div className="relative mt-12 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+          {CAPABILITIES.map((c) => (
+            <div
+              key={c.title}
+              className="group relative overflow-hidden rounded-panel border border-white/10 bg-white/[0.03] p-6 transition-all hover:-translate-y-1 hover:border-white/20 hover:bg-white/[0.06]"
+            >
+              <div aria-hidden className={`pointer-events-none absolute -right-8 -top-8 h-24 w-24 rounded-full bg-gradient-to-br ${c.accent} opacity-20 blur-2xl transition-opacity group-hover:opacity-40`} />
+              <div className={`inline-flex h-12 w-12 items-center justify-center rounded-control bg-gradient-to-br ${c.accent} text-white shadow-lg`}>
+                <c.icon className="h-6 w-6" />
+              </div>
+              <h3 className="mt-4 text-lg font-semibold">{c.title}</h3>
+              <p className="mt-2 text-sm leading-relaxed text-white/55">{c.body}</p>
+            </div>
+          ))}
+          {/* Highlight stat card to balance the 5-item grid on wide screens */}
+          <div className="relative flex flex-col justify-center overflow-hidden rounded-panel border border-white/10 bg-gradient-to-br from-[#1a1636] via-[#241a4d] to-[#0d2330] p-6">
+            <div className="text-5xl font-black tracking-tight">
+              <span className="bg-gradient-to-r from-[#a78bff] via-[#6aa8ff] to-[#3ee0f5] bg-clip-text text-transparent">98%</span>
+            </div>
+            <p className="mt-2 text-sm font-medium text-white/70">math accuracy, measured</p>
+            <p className="mt-1 text-xs leading-relaxed text-white/45">Step-by-step reasoning across arithmetic, algebra, calculus and statistics.</p>
+          </div>
+        </div>
+      </section>
+
       {/* Features */}
       <section id="features" className="relative mx-auto max-w-6xl scroll-mt-20 px-5 py-16 sm:px-8 sm:py-20 lg:py-28">
         <div className="mx-auto max-w-2xl text-center">
@@ -217,7 +298,6 @@ export function LandingPage({ onSignIn, onSignUp, onPrivacy }: LandingPageProps)
 
         {/* Mobile: horizontal snap-scroll cards. Desktop: responsive grid. */}
         <div
-          id="capabilities"
           className="mt-10 flex snap-x snap-mandatory gap-4 overflow-x-auto pb-4 sm:scroll-pl-8 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden md:grid md:grid-cols-2 md:gap-5 md:overflow-visible md:pb-0 lg:grid-cols-4 lg:mt-14"
         >
           {FEATURES.map((f) => (
