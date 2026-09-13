@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { encodeImage, type EncodeFailure } from "@/lib/imageEncode";
-import { TMPFILES_MAX_BYTES, uploadFileToTmpfiles } from "@/lib/tmpfiles";
+import { ONLYFILES_MAX_BYTES, uploadFileToOnlyFiles } from "@/lib/onlyfiles";
 import type { WebUIIngressLimits } from "@/lib/types";
 
 /** Lifecycle stages of one attachment:
@@ -23,7 +23,7 @@ export interface AttachedAttachment {
   status: AttachmentStatus;
   /** Populated when ``status === "ready"`` (images/videos). */
   dataUrl?: string;
-  /** Remote tmpfiles.org direct URL when ``status === "ready"`` and
+  /** Remote onlyfiles.com direct URL when ``status === "ready"`` and
    * ``kind === "file"``. The file bytes are uploaded browser-side and never
    * touch the gateway host. */
   uploadUrl?: string;
@@ -331,7 +331,7 @@ export function useAttachedImages({
           rejected.push({ file, reason: "empty_file" });
           continue;
         }
-        if (kind === "file" && file.size > TMPFILES_MAX_BYTES) {
+        if (kind === "file" && file.size > ONLYFILES_MAX_BYTES) {
           rejected.push({ file, reason: "too_large" });
           continue;
         }
@@ -374,7 +374,7 @@ export function useAttachedImages({
               | { ok: false; reason: string }
             > = entry.kind === "image"
               ? encodeImage(entry.file)
-              : uploadFileToTmpfiles(entry.file).then((result) =>
+              : uploadFileToOnlyFiles(entry.file).then((result) =>
                   result.ok
                     ? { ok: true as const, url: result.url, bytes: entry.file.size }
                     : { ok: false as const, reason: result.reason },

@@ -9,11 +9,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ThreadComposer } from "@/components/thread/ThreadComposer";
 import type { EncodeResponse } from "@/lib/imageEncode";
-import { TMPFILES_MAX_BYTES, type TmpfilesUploadResult } from "@/lib/tmpfiles";
+import { ONLYFILES_MAX_BYTES, type OnlyFilesUploadResult } from "@/lib/onlyfiles";
 import type { WebUIIngressLimits } from "@/lib/types";
 
 const encodeImage = vi.fn<(file: File) => Promise<EncodeResponse>>();
-const uploadFileToTmpfiles = vi.fn<(file: File) => Promise<TmpfilesUploadResult>>();
+const uploadFileToOnlyFiles = vi.fn<(file: File) => Promise<OnlyFilesUploadResult>>();
 
 vi.mock("@/lib/imageEncode", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/imageEncode")>();
@@ -23,11 +23,11 @@ vi.mock("@/lib/imageEncode", async (importOriginal) => {
   };
 });
 
-vi.mock("@/lib/tmpfiles", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/tmpfiles")>();
+vi.mock("@/lib/onlyfiles", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/onlyfiles")>();
   return {
     ...actual,
-    uploadFileToTmpfiles: (file: File) => uploadFileToTmpfiles(file),
+    uploadFileToOnlyFiles: (file: File) => uploadFileToOnlyFiles(file),
   };
 });
 
@@ -55,8 +55,8 @@ function resolveReady(file: File): EncodeResponse {
   };
 }
 
-function resolveTmpfilesReady(file: File): TmpfilesUploadResult {
-  return { ok: true, url: `https://tmpfiles.org/12345/${file.name}` };
+function resolveOnlyFilesReady(file: File): OnlyFilesUploadResult {
+  return { ok: true, url: `https://onlyfiles.com/abc123/${file.name}` };
 }
 
 function ingressLimits({
@@ -86,8 +86,8 @@ function ingressLimits({
 
 beforeEach(() => {
   encodeImage.mockReset();
-  uploadFileToTmpfiles.mockReset();
-  uploadFileToTmpfiles.mockImplementation(async (file) => resolveTmpfilesReady(file));
+  uploadFileToOnlyFiles.mockReset();
+  uploadFileToOnlyFiles.mockImplementation(async (file) => resolveOnlyFilesReady(file));
   let id = 0;
   // Tests never read the preview URL contents so a stable blob: stub is fine.
   if (!(globalThis.URL as unknown as { createObjectURL?: unknown }).createObjectURL) {
@@ -133,7 +133,7 @@ describe("ThreadComposer — attachments", () => {
     expect(images[0].media.name).toBe("a.png");
   });
 
-  it("attaches a picked PDF and uploads it to tmpfiles on send", async () => {
+  it("attaches a picked PDF and uploads it to onlyfiles on send", async () => {
     const file = pdfFile();
     const onSend = vi.fn();
 
@@ -157,18 +157,18 @@ describe("ThreadComposer — attachments", () => {
     fireEvent.keyDown(textarea, { key: "Enter" });
 
     expect(encodeImage).not.toHaveBeenCalled();
-    expect(uploadFileToTmpfiles).toHaveBeenCalledTimes(1);
+    expect(uploadFileToOnlyFiles).toHaveBeenCalledTimes(1);
     const [content, attachments] = onSend.mock.calls[0];
     expect(content).toBe("summarize");
     expect(attachments).toHaveLength(1);
-    expect(attachments[0].media.url).toBe("https://tmpfiles.org/12345/report.pdf");
+    expect(attachments[0].media.url).toBe("https://onlyfiles.com/abc123/report.pdf");
     expect(attachments[0].media.data_url).toBeUndefined();
     expect(attachments[0].media.name).toBe("report.pdf");
     expect(attachments[0].preview.kind).toBe("file");
   });
 
   it.each(["application/vnd.ms-excel", "image/png"])(
-    "sends extension-detected documents as tmpfiles file attachments when the browser reports %s",
+    "sends extension-detected documents as onlyfiles file attachments when the browser reports %s",
     async (browserMime) => {
       const file = csvFile("report.csv", browserMime);
       const onSend = vi.fn();
@@ -193,7 +193,7 @@ describe("ThreadComposer — attachments", () => {
       fireEvent.keyDown(textarea, { key: "Enter" });
 
       const [, attachments] = onSend.mock.calls[0];
-      expect(attachments[0].media.url).toBe("https://tmpfiles.org/12345/report.csv");
+      expect(attachments[0].media.url).toBe("https://onlyfiles.com/abc123/report.csv");
       expect(attachments[0].preview.kind).toBe("file");
       expect(encodeImage).not.toHaveBeenCalled();
     },
@@ -221,7 +221,7 @@ describe("ThreadComposer — attachments", () => {
   });
 
   it("rejects an oversized document before adding a chip", async () => {
-    const file = pdfFile("oversized.pdf", TMPFILES_MAX_BYTES + 1);
+    const file = pdfFile("oversized.pdf", ONLYFILES_MAX_BYTES + 1);
 
     render(<ThreadComposer onSend={vi.fn()} />);
 
@@ -241,7 +241,7 @@ describe("ThreadComposer — attachments", () => {
   it("reports a transport limit separately from attachment policy", async () => {
     // Images still ride the WS frame as base64 data URLs, so only they are
     // bounded by the transport budget — file attachments leave as short
-    // tmpfiles.org URLs instead.
+    // onlyfiles.com URLs instead.
     const first = pngFile("first.png", 400 * 1024);
     const second = pngFile("second.png", 400 * 1024);
     encodeImage.mockImplementation(async (file) => resolveReady(file));
@@ -272,7 +272,7 @@ describe("ThreadComposer — attachments", () => {
 
   it("enforces the decoded attachment-total policy independently", async () => {
     // The decoded-total budget covers images/videos persisted on the gateway;
-    // file attachments live on tmpfiles.org and don't count against it.
+    // file attachments live on onlyfiles.com and don't count against it.
     const first = pngFile("first.png", 400 * 1024);
     const second = pngFile("second.png", 400 * 1024);
     encodeImage.mockImplementation(async (file) => resolveReady(file));

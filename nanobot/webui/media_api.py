@@ -178,9 +178,9 @@ def signed_media_attachments(
     """Map persisted media paths to WebUI attachment dicts with fresh signed URLs."""
     out: list[dict[str, Any]] = []
     for pstr in paths:
-        # Browser-uploaded file attachments reference tmpfiles.org directly;
+        # Browser-uploaded file attachments reference onlyfiles.com directly;
         # they are not local files and need no signing — pass the URL through.
-        if pstr.startswith("https://tmpfiles.org/"):
+        if pstr.startswith("https://onlyfiles.com/"):
             name = Path(urlparse(pstr).path).name or "file"
             out.append({"kind": media_attachment_kind(name), "url": pstr, "name": name})
             continue

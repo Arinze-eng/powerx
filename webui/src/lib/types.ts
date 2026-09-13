@@ -1421,15 +1421,15 @@ export type InboundEvent =
  * - ``data_url`` — base64 payload using a server-whitelisted image, video, or
  *   document MIME type. SVG remains rejected on ingress to avoid an
  *   embedded-script XSS surface.
- * - ``url`` — remote tmpfiles.org direct URL for file attachments (pdf, zip,
- *   apk, ...). The browser uploaded the bytes directly to tmpfiles.org, so
+ * - ``url`` — remote onlyfiles.com direct URL for file attachments (pdf, zip,
+ *   apk, ...). The browser uploaded the bytes directly to onlyfiles.com, so
  *   they never transit the gateway host.
  *
  * ``name`` is advisory and is surfaced as the placeholder label when the
  * session is replayed.
  */
 export interface OutboundMedia {
-  /** Base64 payload; required for images/videos, absent for tmpfiles URL
+  /** Base64 payload; required for images/videos, absent for onlyfiles URL
    * file attachments (``url`` is set instead). */
   data_url?: string;
   url?: string;

@@ -35,10 +35,10 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
-# Hosts whose URLs the VPS ``fetch_url`` may download. tmpfiles.org is the
+# Hosts whose URLs the VPS ``fetch_url`` may download. onlyfiles.com is the
 # established transfer host; ``gofile.io`` (and its ``*.gofile.io`` upload
 # servers) is used by the Telegram Mini App for large files (100 MB+).
-_ALLOWED_FETCH_HOSTS = {"tmpfiles.org", "gofile.io"}
+_ALLOWED_FETCH_HOSTS = {"onlyfiles.com", "gofile.io"}
 
 
 def _is_allowed_fetch_host(host: str) -> bool:
@@ -409,9 +409,9 @@ class VPSExecutionBackend:
             await conn.wait_closed()
 
     async def fetch_url(self, url: str, remote_path: str, *, timeout: int = 150) -> str:
-        """Fetch a validated tmpfiles.org or gofile.io URL into the VPS workspace.
+        """Fetch a validated onlyfiles.com or gofile.io URL into the VPS workspace.
 
-        tmpfiles.org links are downloaded directly. gofile.io ``/d/<code>``
+        onlyfiles.com links are downloaded directly. gofile.io ``/d/<code>``
         shares are resolved through the GoFile API first to obtain the real
         direct-download link, then that link is fetched on the VPS so we never
         write an HTML landing page to disk.
@@ -422,7 +422,7 @@ class VPSExecutionBackend:
             raise ValueError("remote fetch URL must be HTTPS")
         if not _is_allowed_fetch_host(parsed.netloc) or not parsed.path:
             raise ValueError(
-                "remote fetch URL must be an HTTPS tmpfiles.org or gofile.io URL"
+                "remote fetch URL must be an HTTPS onlyfiles.com or gofile.io URL"
             )
         configured = self._configured_workspace(self.config)
         _safe_remote_path(remote_path, configured)
@@ -479,7 +479,7 @@ class VPSExecutionBackend:
                         "VPS could not fetch the gofile.io upload (resolved link "
                         "did not return a direct binary download)"
                     )
-                raise RuntimeError("VPS could not fetch the tmpfiles.org upload")
+                raise RuntimeError("VPS could not fetch the onlyfiles.com upload")
             return remote
         finally:
             conn.close()

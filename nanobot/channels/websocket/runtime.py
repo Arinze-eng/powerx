@@ -1304,7 +1304,7 @@ class WebSocketChannel(BaseChannel):
             raw_media = envelope.get("media")
             media_paths: list[str] = []
             media_names: list[str | None] = []
-            # Track which attachments are remote (tmpfiles.org) references vs.
+            # Track which attachments are remote (onlyfiles.com) references vs.
             # locally-stored media. Initialized up-front so text-only turns
             # (raw_media is None) still resolve these names below.
             remote_media: list[str] = []
@@ -1335,7 +1335,7 @@ class WebSocketChannel(BaseChannel):
                     media_names.append(
                         (safe_filename(name) or None) if isinstance(name, str) else None
                     )
-                # Browser-uploaded file attachments reference tmpfiles.org URLs:
+                # Browser-uploaded file attachments reference onlyfiles.com URLs:
                 # they are remote references, not local media to clean up.
                 remote_media = [
                     path for path in media_paths
@@ -1417,9 +1417,9 @@ class WebSocketChannel(BaseChannel):
                 else content
             )
             if remote_media:
-                # The agent needs the tmpfiles.org links in the turn text so it
+                # The agent needs the onlyfiles.com links in the turn text so it
                 # can fetch the attached files — the bytes never touched this
-                # host. tmpfiles page URLs serve an HTML viewer, so resolve them
+                # host. onlyfiles page URLs serve an HTML viewer, so resolve them
                 # to the raw /dl/ download URL first (fast, best-effort) so the
                 # agent can grab the file with a single GET instead of scraping
                 # the viewer page.
@@ -1436,7 +1436,7 @@ class WebSocketChannel(BaseChannel):
                     )
                 dispatch_content = (
                     f"{dispatch_content}\n\n"
-                    "[Attached file(s) upload straight to tmpfiles.org; the links "
+                    "[Attached file(s) upload straight to onlyfiles.com; the links "
                     "below download the raw file bytes directly — fetch each with "
                     "a single curl/wget, no page extraction needed]\n"
                     + "\n".join(note_lines)

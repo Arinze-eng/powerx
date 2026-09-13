@@ -52,7 +52,7 @@ _ALLOWED_SIZES = {"small", "medium", "large"}
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 
 # Hosts whose URLs fetch_url may download (mirrors the VPS backend policy).
-_ALLOWED_FETCH_HOSTS = {"tmpfiles.org", "gofile.io"}
+_ALLOWED_FETCH_HOSTS = {"onlyfiles.com", "gofile.io"}
 
 
 class UpstashError(RuntimeError):
@@ -409,7 +409,7 @@ class UpstashExecutionBackend:
         host = (parsed.netloc or "").lower()
         allowed = parsed.scheme == "https" and (host in _ALLOWED_FETCH_HOSTS or host.endswith(".gofile.io"))
         if not allowed:
-            raise ValueError("url must be an HTTPS tmpfiles.org or gofile.io URL")
+            raise ValueError("url must be an HTTPS onlyfiles.com or gofile.io URL")
         dest = _safe_path(dest_path, self.workspace)
         command = (
             f"mkdir -p {shlex.quote(posixpath.dirname(dest))} && "

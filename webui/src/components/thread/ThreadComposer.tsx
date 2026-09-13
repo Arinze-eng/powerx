@@ -306,7 +306,7 @@ interface QueuedPrompt {
 
 interface QueuedPromptImage {
   dataUrl?: string;
-  /** Remote tmpfiles.org direct URL for file-kind queued attachments. */
+  /** Remote onlyfiles.com direct URL for file-kind queued attachments. */
   uploadUrl?: string;
   name?: string;
   kind?: AttachmentKind;
@@ -464,7 +464,7 @@ function normalizeQueuedPrompt(item: unknown, index: number): QueuedPrompt | nul
           typeof candidate.dataUrl === "string" && candidate.dataUrl.startsWith("data:");
         const hasUploadUrl =
           typeof candidate.uploadUrl === "string"
-          && candidate.uploadUrl.startsWith("https://tmpfiles.org/");
+          && candidate.uploadUrl.startsWith("https://onlyfiles.com/");
         if (!hasDataUrl && !hasUploadUrl) {
           return [];
         }
@@ -1939,7 +1939,7 @@ export function ThreadComposer({
         ? readyImages.map((img) =>
             img.uploadUrl
               ? {
-                  // File attachments point at tmpfiles.org; the bytes were
+                  // File attachments point at onlyfiles.com; the bytes were
                   // uploaded browser-side and never transit the gateway host.
                   media: { url: img.uploadUrl, name: img.file.name },
                   preview: { kind: "file", url: img.uploadUrl, name: img.file.name },

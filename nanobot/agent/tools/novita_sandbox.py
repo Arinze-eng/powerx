@@ -28,9 +28,9 @@ from nanobot.agent.tools.vps_backend import VPSExecutionBackend
 from nanobot.config.paths import get_data_dir, get_workspace_path
 from nanobot.utils.gofile import GoFileError, is_gofile_url, request_file, resolve_gofile_download
 from nanobot.utils.helpers import detect_image_mime
-from nanobot.utils.tmpfiles import TmpfilesError
-from nanobot.utils.tmpfiles import upload_bytes as upload_tmpfile_bytes
-from nanobot.utils.tmpfiles import upload_path as upload_tmpfile_path
+from nanobot.utils.onlyfiles import OnlyFilesError
+from nanobot.utils.onlyfiles import upload_bytes as upload_onlyfile_bytes
+from nanobot.utils.onlyfiles import upload_path as upload_onlyfile_path
 from nanobot.utils.file_share import (
     FileShareError,
     upload_artifact_path as upload_shared_artifact,
@@ -468,7 +468,7 @@ async def _install_tesseract_resilient(backend: Any) -> bool:
         ),
         command=StringSchema("Command to run inside the remote sandbox"),
         path=StringSchema("Sandbox path, relative paths resolve under /workspace"),
-        url=StringSchema("Remote HTTPS URL to fetch into the sandbox (tmpfiles.org or gofile.io)"),
+        url=StringSchema("Remote HTTPS URL to fetch into the sandbox (onlyfiles.com or gofile.io)"),
         content=StringSchema("Text content for write"),
         timeout=IntegerSchema(description="Command timeout in seconds", minimum=1, maximum=_MAX_TIMEOUT),
         source=StringSchema("Local media path to upload into the remote sandbox"),
@@ -528,7 +528,7 @@ class NovitaSandboxTool(Tool):
         return (
             "Use the configured isolated execution backend for coding and operations. "
             "Run shell commands, inspect or write project files, list a workspace, "
-            "fetch a remote HTTPS file (tmpfiles.org or gofile.io) into the workspace, "
+            "fetch a remote HTTPS file (onlyfiles.com or gofile.io) into the workspace, "
             "download generated artifacts, or reset the current user sandbox. "
             "When the task is finished and no further work is expected in this session, "
             "call action=reset so the sandbox is killed automatically for the user. "
@@ -551,7 +551,7 @@ class NovitaSandboxTool(Tool):
             "When the user message contains an [Attachment: local path], use the upload "
             "action first with that exact source path and a safe destination under /workspace "
             "before running or reading the uploaded file remotely. In VPS mode, upload "
-            "the local file through tmpfiles.org, then fetch it into the VPS workspace with "
+            "the local file through onlyfiles.com, then fetch it into the VPS workspace with "
             "curl before using the staged path. If a required Linux command is missing "
             "in VPS mode, use action=install with a space-separated list of distro package "
             "names; installation is noninteractive and uses root or already-configured "
@@ -559,7 +559,7 @@ class NovitaSandboxTool(Tool):
             "password in a command. When a finished file should be returned to the user, "
             "ALWAYS call download_url with its remote workspace path; this downloads the "
             "artifact and publishes a public link automatically — files under ~50 MB go to "
-            "tmpfiles.org, larger files (up to ~200 MB) go to catbox.moe. Give the user that "
+            "onlyfiles.com, larger files (up to ~200 MB) go to catbox.moe. Give the user that "
             "link instead of pasting raw file contents. Use the local path in the message "
             "tool's media parameter when direct attachment delivery is available. "
             "For multi-step work, prefer the sandbox_batch tool so many operations "
@@ -575,7 +575,7 @@ class NovitaSandboxTool(Tool):
                 "command": {"type": "string"},
                 "packages": {"type": "string", "description": "Space-separated Linux distro package names to install in VPS mode."},
                 "path": {"type": "string"},
-                "url": {"type": "string", "description": "Remote HTTPS URL to fetch into the sandbox (tmpfiles.org or gofile.io)."},
+                "url": {"type": "string", "description": "Remote HTTPS URL to fetch into the sandbox (onlyfiles.com or gofile.io)."},
                 "content": {"type": "string"},
                 "timeout": {"type": "integer", "minimum": 1, "maximum": _MAX_TIMEOUT},
                 "source": {"type": "string"},
@@ -632,7 +632,7 @@ class NovitaSandboxTool(Tool):
                 suffix = path.suffix.lower() if path.suffix else ".img"
                 remote_path = f"{root}/telegram-images/{uuid4().hex}{suffix}"
                 remote_paths.append(remote_path)
-                await upload_tmpfile_bytes(raw, filename=path.name, content_type=detect_image_mime(raw))
+                await upload_onlyfile_bytes(raw, filename=path.name, content_type=detect_image_mime(raw))
                 await backend.upload("telegram", remote_path, raw)
             await backend.write(manifest_path, json.dumps(remote_paths))
             output = await backend.run(
@@ -1198,7 +1198,7 @@ class NovitaSandboxTool(Tool):
                 raise ValueError("Telegram attachment exceeds 200 MiB")
             safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", source.name)[:120] or "attachment.bin"
             remote = f"{root}/telegram-attachments/{uuid4().hex}-{safe_name}"
-            await upload_tmpfile_path(source)
+            await upload_onlyfile_path(source)
             await backend.upload("telegram", remote, await asyncio.to_thread(source.read_bytes))
             staged.append((str(source), remote))
         return staged
@@ -1252,9 +1252,9 @@ class NovitaSandboxTool(Tool):
                     return ToolResult.error("source file does not exist")
                 if source.stat().st_size > _MAX_UPLOAD_BYTES:
                     return ToolResult.error("source file exceeds 200 MiB")
-                await upload_tmpfile_path(source)
+                await upload_onlyfile_path(source)
                 await backend.upload(str(source), path, await asyncio.to_thread(source.read_bytes))
-                return f"Uploaded {source.name} via tmpfiles.org to {path} in the remote VPS workspace."
+                return f"Uploaded {source.name} via onlyfiles.com to {path} in the remote VPS workspace."
             if action == "fetch_url":
                 url = str(kwargs.get("url") or "").strip()
                 if not url:
@@ -1269,11 +1269,11 @@ class NovitaSandboxTool(Tool):
                 downloaded = await backend.download(path, destination)
                 try:
                     shared = await upload_shared_artifact(downloaded)
-                except (FileShareError, TmpfilesError) as exc:
+                except (FileShareError, OnlyFilesError) as exc:
                     return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
-                host_label = shared.get("host", "tmpfiles")
+                host_label = shared.get("host", "onlyfiles")
                 expiry_note = (
-                    "expires soon" if host_label == "tmpfiles" else "stored permanently"
+                    "expires soon" if host_label == "onlyfiles" else "stored permanently"
                 )
                 return (
                     f"Downloaded remote artifact to local path: {downloaded}\n"
@@ -1400,8 +1400,8 @@ class NovitaSandboxTool(Tool):
                         dest = str(kwargs.get("path") or "").strip() or f"{real_name}"
                         await backend.write_bytes(dest, data)
                         return f"Fetched remote file to {dest} in the Upstash workspace. Use action=read or run commands to analyze it."
-                    if parsed.scheme != "https" or parsed.netloc != "tmpfiles.org":
-                        return ToolResult.error("url must be an HTTPS tmpfiles.org or gofile.io URL")
+                    if parsed.scheme != "https" or parsed.netloc != "onlyfiles.com":
+                        return ToolResult.error("url must be an HTTPS onlyfiles.com or gofile.io URL")
                     dest_path = str(kwargs.get("path") or "").strip()
                     fetched = await backend.fetch_url(url, dest_path, timeout=int(kwargs.get("timeout") or 150))
                     return f"Fetched remote file to {fetched} in the Upstash workspace. Use action=read or run commands to analyze it."
@@ -1413,11 +1413,11 @@ class NovitaSandboxTool(Tool):
                     downloaded = await backend.download(path, destination)
                     try:
                         shared = await upload_shared_artifact(downloaded)
-                    except (FileShareError, TmpfilesError) as exc:
+                    except (FileShareError, OnlyFilesError) as exc:
                         return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
-                    host_label = shared.get("host", "tmpfiles")
+                    host_label = shared.get("host", "onlyfiles")
                     expiry_note = (
-                        "expires soon" if host_label == "tmpfiles" else "stored permanently"
+                        "expires soon" if host_label == "onlyfiles" else "stored permanently"
                     )
                     return (
                         f"Downloaded remote artifact to local path: {downloaded}\n"
@@ -1524,12 +1524,12 @@ class NovitaSandboxTool(Tool):
                         return ToolResult.error("url is required for fetch_url")
                     parsed_url = urlparse(url)
                     allowed = parsed_url.scheme == "https" and (
-                        parsed_url.netloc in {"tmpfiles.org", "gofile.io"}
+                        parsed_url.netloc in {"onlyfiles.com", "gofile.io"}
                         or parsed_url.netloc.endswith(".gofile.io")
                     )
                     if not allowed:
                         return ToolResult.error(
-                            "url must be an HTTPS tmpfiles.org or gofile.io URL"
+                            "url must be an HTTPS onlyfiles.com or gofile.io URL"
                         )
                     dest = _safe_path(str(kwargs.get("path") or "") or (
                         f"{_WORKSPACE}/{re.sub(r'[^A-Za-z0-9._-]', '_', parsed_url.path.rstrip('/').split('/')[-1] or 'download.bin')}"

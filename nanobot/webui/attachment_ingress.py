@@ -102,13 +102,13 @@ _UPLOAD_MIME_ALLOWED: frozenset[str] = (
 _DATA_URL_MIME_RE = re.compile(r"^data:([^;,]+)(?:;[^,]*)*;base64,", re.DOTALL)
 
 # Host allowlist for browser-side direct uploads. File attachments (pdf, zip,
-# apk, ...) arrive as tmpfiles.org URLs instead of base64 payloads so the file
+# apk, ...) arrive as onlyfiles.com URLs instead of base64 payloads so the file
 # bytes never transit the gateway host. Images/videos keep the data-URL path.
-_REMOTE_FILE_HOSTS = frozenset({"tmpfiles.org"})
+_REMOTE_FILE_HOSTS = frozenset({"onlyfiles.com"})
 
 
 def extract_remote_file_url(attachment: dict[str, Any]) -> str | None:
-    """Return the validated tmpfiles.org URL for an attachment, if it carries one.
+    """Return the validated onlyfiles.com URL for an attachment, if it carries one.
 
     ``None`` means the attachment does not carry a URL at all; an invalid URL
     (wrong scheme, untrusted host, empty path) yields ``""`` so the caller can
@@ -130,20 +130,20 @@ def extract_remote_file_url(attachment: dict[str, Any]) -> str | None:
     return url
 
 
-# A tmpfiles.org page URL serves an HTML viewer, not the file bytes. The raw
-# bytes are only served under ``/dl/<nonce>/<slug>/<file>``, and the nonce is a
-# per-page-view token embedded in the viewer HTML. We fetch that tiny page once
+# An onlyfiles.com page URL serves an HTML viewer, not the file bytes. The raw
+# bytes are only served under ``/dl/<ts.nonce>/<id>/<file>``, and that token is a
+# per-page-view link embedded in the viewer HTML. We fetch that tiny page once
 # and surface the embedded ``/dl/`` link so the agent can download the file with
 # a single GET instead of scraping the viewer page.
-_TMPFILES_DL_RE = re.compile(r"/dl/[^\s\"'>]+")
+_ONLYFILES_DL_RE = re.compile(r"/dl/[^\s\"'>]+")
 
 
-def _is_direct_tmpfiles_url(url: str) -> bool:
+def _is_direct_onlyfiles_url(url: str) -> bool:
     return urlparse(url).path.split("/")[:2] == ["", "dl"]
 
 
 async def resolve_remote_direct_url(url: str, *, timeout: float = 8.0) -> str:
-    """Resolve a tmpfiles.org page URL to a URL that serves raw file bytes.
+    """Resolve an onlyfiles.com page URL to a URL that serves raw file bytes.
 
     Already-direct ``/dl/`` URLs pass through unchanged. On a network or parse
     failure the original URL is returned so attachment handling never breaks.
@@ -151,15 +151,15 @@ async def resolve_remote_direct_url(url: str, *, timeout: float = 8.0) -> str:
     parsed = urlparse(url)
     if parsed.netloc.lower() not in _REMOTE_FILE_HOSTS or not parsed.path:
         return url
-    if _is_direct_tmpfiles_url(url):
+    if _is_direct_onlyfiles_url(url):
         return url
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             response = await client.get(url)
             response.raise_for_status()
-            match = _TMPFILES_DL_RE.search(response.text)
+            match = _ONLYFILES_DL_RE.search(response.text)
         if match is not None:
-            return f"https://tmpfiles.org{match.group(0)}"
+            return f"https://onlyfiles.com{match.group(0)}"
     except Exception:  # noqa: BLE001 - best-effort rewrite, never break sends
         pass
     return url
@@ -229,7 +229,7 @@ def store_inbound_attachments(
         if not isinstance(item, dict):
             return abort("malformed")
         attachment = cast(dict[str, Any], item)
-        # Browser-uploaded file attachments arrive as tmpfiles.org URLs: no
+        # Browser-uploaded file attachments arrive as onlyfiles.com URLs: no
         # bytes to persist, the URL itself is the reference.
         remote_url = extract_remote_file_url(attachment)
         if remote_url is not None:
