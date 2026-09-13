@@ -1261,10 +1261,38 @@ class NovitaSandboxTool(Tool):
             # it gets recreated once at the correct size, then tracked properly.
             return stored_template == sandbox_template
 
+        def _try_resume(sandbox: Any) -> bool:
+            # A timed-out box is PAUSED (lifecycle on_timeout=pause), not dead:
+            # its filesystem is intact on Novita's side. Try to resume it and
+            # wait for it to come back before ever falling through to create,
+            # which would start from a fresh template and wipe the workspace.
+            import time as _time
+
+            try:
+                if sandbox.is_running():
+                    return True
+            except Exception:
+                return False
+            resume = getattr(sandbox, "resume", None)
+            if callable(resume):
+                try:
+                    resume()
+                except Exception:
+                    pass
+            deadline = _time.time() + 90
+            while _time.time() < deadline:
+                try:
+                    if sandbox.is_running():
+                        return True
+                except Exception:
+                    return False
+                _time.sleep(3)
+            return False
+
         sandbox = _STORE.get(key)
         if sandbox is not None:
             try:
-                if sandbox.is_running() and _matches_sizing(_STORE.template_for(key)):
+                if _matches_sizing(_STORE.template_for(key)) and _try_resume(sandbox):
                     return sandbox
             except Exception:
                 pass
@@ -1274,7 +1302,7 @@ class NovitaSandboxTool(Tool):
         if sandbox_id:
             try:
                 sandbox = client.sandbox.connect(sandbox_id)
-                if sandbox.is_running() and _matches_sizing(_STORE.template_for(key)):
+                if _matches_sizing(_STORE.template_for(key)) and _try_resume(sandbox):
                     _STORE.set(key, sandbox, template=sandbox_template)
                     return sandbox
                 # Connected but undersized/unknown template: don't reuse it.

@@ -112,7 +112,14 @@ MAX_DOMAIN_ALLOW_LIST_ENTRIES = 100
 
 # States in which a Daytona sandbox is ready for toolbox commands.
 _READY_STATES = {"started", "running", "healthy", "ready", "active"}
-_TERMINAL_STATES = {"deleted", "deleting", "error", "failed", "stopped", "archived"}
+# States from which a sandbox can be STARTED again with its filesystem intact
+# (Daytona auto-stops sandboxes after ``autoStopInterval`` of inactivity and
+# archives them after longer inactivity; both preserve the disk). These must
+# NEVER be treated as terminal: doing so makes ensure_sandbox create a fresh
+# sandbox from the snapshot and silently wipe the user's whole workspace
+# mid-task (the "files disappear during compilation" bug).
+_RESUMABLE_STATES = {"stopped", "archived"}
+_TERMINAL_STATES = {"deleted", "deleting", "error", "failed"}
 
 
 class DaytonaError(RuntimeError):
@@ -347,6 +354,22 @@ class DaytonaExecutionBackend:
 
     # --------------------------------------------------------------- lifecycle
 
+    async def _start_sandbox(self, session: aiohttp.ClientSession, sandbox_id_or_name: str) -> None:
+        """Start a stopped/archived sandbox, PRESERVING its filesystem.
+
+        Daytona keeps the sandbox disk when it auto-stops (autoStopInterval)
+        or archives it, so starting the existing sandbox restores the user's
+        workspace exactly as it was. Recreating instead wipes everything.
+        """
+        try:
+            await self._platform_request(
+                session, "POST", f"/sandbox/{quote(sandbox_id_or_name, safe='')}/start", timeout=90
+            )
+        except DaytonaError as exc:
+            detail = str(exc)
+            if "409" not in detail and "already" not in detail.lower():
+                raise
+
     async def find_sandbox(self, session: aiohttp.ClientSession) -> dict[str, Any] | None:
         """Fetch sandbox metadata by name if it exists and is not terminated."""
         data = await self._platform_request(session, "GET", f"/sandbox/{quote(self.sandbox_name, safe='')}", timeout=30)
@@ -360,6 +383,7 @@ class DaytonaExecutionBackend:
     async def wait_ready(self, session: aiohttp.ClientSession, sandbox_id_or_name: str, timeout: int = 180) -> dict[str, Any]:
         """Poll until the sandbox is in a started/ready state and toolboxProxyUrl is present."""
         deadline = asyncio.get_running_loop().time() + timeout
+        started_once = False
         while True:
             data = await self._platform_request(
                 session, "GET", f"/sandbox/{quote(sandbox_id_or_name, safe='')}", timeout=30
@@ -379,6 +403,15 @@ class DaytonaExecutionBackend:
                     else:
                         self._toolbox_url = toolbox
                     return data
+                # A stopped/archived sandbox still owns its disk: start it and
+                # keep polling instead of giving up (which used to cascade into
+                # a fresh create that wiped the workspace).
+                if state in _RESUMABLE_STATES and not started_once:
+                    started_once = True
+                    await self._start_sandbox(session, sandbox_id_or_name)
+                    if asyncio.get_running_loop().time() >= deadline:
+                        deadline = asyncio.get_running_loop().time() + 90
+                    continue
                 if state in _TERMINAL_STATES:
                     reason = data.get("errorReason") or state
                     raise DaytonaError(f"Daytona sandbox entered failed state: {reason}")
@@ -396,6 +429,8 @@ class DaytonaExecutionBackend:
                 if isinstance(data, dict):
                     state = str(data.get("state") or "").lower()
                     if state not in _TERMINAL_STATES:
+                        # Resumable states (stopped/archived) are handled inside
+                        # wait_ready, which starts the sandbox and keeps its disk.
                         ready = await self.wait_ready(session, self.last_sandbox_id, timeout=90)
                         self.last_sandbox_id = str(ready.get("id") or self.last_sandbox_id)
                         return self.last_sandbox_id

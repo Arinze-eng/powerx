@@ -231,13 +231,40 @@ class UpstashExecutionBackend:
             return box
         return None
 
+    # Upstash keeps a box's filesystem when it stops/expires (idle timeout);
+    # restarting the existing box preserves it. Recreating from a template
+    # wipes the workspace, so restart must always be tried first.
+    _RESUMABLE_STATUSES = {"stopped", "paused", "suspended", "expired", "sleeping"}
+
+    async def _restart_box(self, session: aiohttp.ClientSession, box_id: str) -> None:
+        """Best-effort restart of a stopped box, preserving its filesystem."""
+        last_exc: Exception | None = None
+        for path in (f"/v2/box/{box_id}/restart", f"/v2/box/{box_id}/start"):
+            try:
+                await self._request(session, "POST", path, timeout=90)
+                return
+            except UpstashError as exc:
+                detail = str(exc)
+                if "404" in detail or "409" in detail or "already" in detail.lower():
+                    continue
+                last_exc = exc
+        if last_exc is not None:
+            raise last_exc
+
     async def wait_ready(self, session: aiohttp.ClientSession, box_id: str, timeout: int = 120) -> None:
         deadline = asyncio.get_running_loop().time() + timeout
+        restarted = False
         while True:
             data = await self._request(session, "GET", f"/v2/box/{box_id}", timeout=30)
             status = str(data.get("status") or "").lower()
             if status in {"running", "idle", "ready", "active"}:
                 return
+            if status in self._RESUMABLE_STATUSES and not restarted:
+                restarted = True
+                await self._restart_box(session, box_id)
+                if asyncio.get_running_loop().time() >= deadline:
+                    deadline = asyncio.get_running_loop().time() + 90
+                continue
             if asyncio.get_running_loop().time() >= deadline:
                 raise UpstashError(f"Upstash box {box_id} was not ready in time (status={status or 'unknown'})")
             await asyncio.sleep(1)
