@@ -32,7 +32,6 @@ import base64
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -209,7 +208,11 @@ _WORKFLOW_FILE = {"apk": "build-apk.yml", "exe": "build-exe.yml", "ipa": "build-
 
 
 def _curl(method: str, path: str, *, body: str | None = None, accept: str = "application/vnd.github+json") -> tuple[int, str]:
-    """Raw GitHub REST call. Returns (http_status, response_body)."""
+    """Raw GitHub REST call. Returns (http_status, response_body).
+
+    Retries transient failures (HTTP 5xx with empty body / exit-level errors)
+    a couple of times before giving up.
+    """
     tok = _token() or ""
     url = f"{_API}{path}"
     cmd = ["curl", "-s", "-w", "\n%{http_code}", "-X", method,
@@ -217,17 +220,29 @@ def _curl(method: str, path: str, *, body: str | None = None, accept: str = "app
     if body is not None:
         cmd += ["-H", "Content-Type: application/json", "-d", body]
     cmd.append(url)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    out = r.stdout
-    # last line is the status code
-    nl = out.rfind("\n")
-    if nl == -1:
-        return (0, out)
-    payload, code = out[:nl], out[nl + 1:].strip()
-    try:
-        return (int(code), payload)
-    except ValueError:
-        return (0, out)
+    out = ""
+    for attempt in range(3):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            out = r.stdout
+        except subprocess.TimeoutExpired:
+            out = ""
+        # last line is the status code
+        nl = out.rfind("\n")
+        if nl == -1:
+            status, payload = 0, out
+        else:
+            payload, code = out[:nl], out[nl + 1:].strip()
+            try:
+                status = int(code)
+            except ValueError:
+                status, payload = 0, out
+        # retry only transient conditions: no status, or 5xx
+        if status and status < 500:
+            return (status, payload)
+        if attempt < 2:
+            time.sleep(4)
+    return (status, payload)
 
 
 def _repo_slug(repo: str) -> str:
@@ -458,7 +473,17 @@ class BuildArtifactTool(Tool):
             except Exception:
                 raise ValueError("inputs_json must be valid JSON")
         body = json.dumps({"ref": "main", "inputs": json.loads(inputs)})
-        code, resp = _curl("POST", f"/repos/{repo}/actions/workflows/{wf}/dispatches", body=body)
+        # A freshly pushed workflow file takes a few seconds to register on the
+        # default branch; dispatching too early returns 404. Retry briefly.
+        code, resp = 0, ""
+        for _attempt in range(8):
+            code, resp = _curl("POST", f"/repos/{repo}/actions/workflows/{wf}/dispatches", body=body)
+            if code == 204:
+                break
+            if code == 404:
+                time.sleep(6)
+                continue
+            return ToolResult.error(f"trigger failed HTTP {code}: {resp[:400]}")
         if code != 204:
             return ToolResult.error(f"trigger failed HTTP {code}: {resp[:400]}")
         # fetch newest run id
