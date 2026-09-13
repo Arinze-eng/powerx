@@ -289,7 +289,16 @@ class DaytonaExecutionBackend:
                 state = str(data.get("state") or "").lower()
                 toolbox = str(data.get("toolboxProxyUrl") or data.get("toolbox_proxy_url") or "").rstrip("/")
                 if (state in _READY_STATES or state == "started") and toolbox:
-                    self._toolbox_url = toolbox
+                    # The Daytona toolbox proxy routes requests per sandbox:
+                    # `{toolboxProxyUrl}/{sandboxId}`. The sandbox ID must be
+                    # part of the base URL so the proxy can identify the target
+                    # container and validate the Bearer token (without the ID
+                    # the proxy rejects with 401 "Bearer token is invalid").
+                    real_id = str(data.get("id") or sandbox_id_or_name)
+                    if real_id and not toolbox.rstrip("/").endswith(f"/{real_id}"):
+                        self._toolbox_url = f"{toolbox}/{real_id}"
+                    else:
+                        self._toolbox_url = toolbox
                     return data
                 if state in _TERMINAL_STATES:
                     reason = data.get("errorReason") or state
