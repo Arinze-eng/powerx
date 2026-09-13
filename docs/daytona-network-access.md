@@ -25,12 +25,14 @@ sandbox created with an explicit `domainAllowList` reaches every listed domain.
    `domainAllowList` verbatim.
 2. **`domain_allow_list: "*"`** or a **custom `network_allow_list`** (non-default
    CIDR) is sent as `networkAllowList` (open CIDR).
-3. **Nothing configured** sends a comprehensive built-in `DEFAULT_DOMAIN_ALLOW_LIST`
-   covering: PyPI/npm/Go/Crates/Ruby/Maven registries, GitHub/GitLab, all major AI
-   provider APIs (OpenAI, Anthropic, Gemini, DeepSeek, Groq, Mistral, xAI,
-   Together, Fireworks, Perplexity, Cohere, HuggingFace), search engines, Ubuntu/Debian
-   mirrors, container registries, Telegram/Discord/Slack APIs, file-sharing hosts,
-   and connectivity diagnostics endpoints.
+3. **Nothing configured** sends a built-in `DEFAULT_DOMAIN_ALLOW_LIST` (85 domains —
+   Daytona rejects any allow list with more than **100** domains with HTTP 400, so
+   custom lists must stay under that cap) covering: PyPI/npm/Go/Crates/Ruby/Maven
+   registries, GitHub/GitLab, all major AI provider APIs (OpenAI, Anthropic, Gemini,
+   DeepSeek, Groq, Mistral, xAI, Together, Fireworks, Perplexity, Cohere,
+   HuggingFace), search engines, Ubuntu/Debian mirrors, container registries,
+   Telegram/Discord/Slack APIs, file-sharing hosts, and connectivity diagnostics
+   endpoints.
 
 ## Fetch tool allowlist
 

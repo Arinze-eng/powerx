@@ -74,39 +74,41 @@ DEFAULT_FETCH_ALLOW_HOSTS: tuple[str, ...] = (
 
 # Broad default domain allowlist used when no custom allowlist is provided.
 # Daytona sandboxes need an explicit domain allowlist to reach arbitrary hosts
-# (an open CIDR alone only unlocks essential services). This list unlocks
-# package registries, AI providers, GitHub, distro mirrors, search, and web tools.
+# (an open CIDR alone only unlocks essential services).
+# HARD LIMIT: Daytona accepts at most 100 domains per allow list (HTTP 400 above
+# that), so this list is capped at 85 to leave headroom for user overrides.
 DEFAULT_DOMAIN_ALLOW_LIST: str = (
-    # Python & package registries
+    # Package registries (12)
     "pypi.org,*.pypi.org,files.pythonhosted.org,"
-    "registry.npmjs.org,npmjs.org,*.npmjs.org,yarnpkg.com,*.yarnpkg.com,"
-    "proxy.golang.org,golang.org,*.golang.org,pkg.go.dev,"
-    "crates.io,*.crates.io,static.crates.io,"
-    "rubygems.org,*.rubygems.org,repo1.maven.org,packagist.org,"
-    # GitHub & repositories
-    "github.com,*.github.com,*.githubusercontent.com,ghcr.io,codeload.github.com,gitlab.com,*.gitlab.com,"
-    # AI providers & APIs
+    "registry.npmjs.org,npmjs.org,proxy.golang.org,golang.org,"
+    "crates.io,static.crates.io,rubygems.org,repo1.maven.org,packagist.org,"
+    # GitHub / repos (6)
+    "github.com,codeload.github.com,*.githubusercontent.com,ghcr.io,gitlab.com,*.gitlab.com,"
+    # AI providers (30)
     "openai.com,*.openai.com,oaiusercontent.com,*.oaiusercontent.com,"
-    "anthropic.com,*.anthropic.com,claude.ai,"
-    "googleapis.com,*.googleapis.com,gemini.google.com,ai.google.dev,"
+    "anthropic.com,*.anthropic.com,"
+    "googleapis.com,*.googleapis.com,ai.google.dev,gemini.google.com,"
     "deepseek.com,*.deepseek.com,openrouter.ai,groq.com,*.groq.com,"
     "mistral.ai,*.mistral.ai,x.ai,api.x.ai,together.ai,api.together.xyz,"
     "fireworks.ai,perplexity.ai,*.perplexity.ai,cohere.com,api.cohere.com,"
-    "huggingface.co,*.huggingface.co,hf.co,cdn-lfs.huggingface.co,"
-    # Search, web & knowledge
+    "huggingface.co,*.huggingface.co,hf.co,"
+    # Search & knowledge (9)
     "google.com,*.google.com,gstatic.com,*.gstatic.com,"
     "duckduckgo.com,*.duckduckgo.com,bing.com,*.bing.com,"
-    "wikipedia.org,*.wikipedia.org,wikimedia.org,*.wikimedia.org,"
-    # Linux distributions & container registries
+    "wikipedia.org,"
+    # Distro & container mirrors (8)
     "archive.ubuntu.com,security.ubuntu.com,*.ubuntu.com,deb.debian.org,*.debian.org,"
-    "docker.io,*.docker.io,gcr.io,*.gcr.io,registry-1.docker.io,quay.io,*.quay.io,"
-    # Daytona platform & connectivity diagnostics
+    "docker.io,registry-1.docker.io,quay.io,"
+    # Diagnostics & platform (7)
     "daytona.io,*.daytona.io,example.com,httpbin.org,api.ipify.org,ifconfig.me,ipinfo.io,"
-    # Messaging platforms
-    "telegram.org,api.telegram.org,*.telegram.org,discord.com,*.discord.com,slack.com,*.slack.com,"
-    # File sharing & drops
-    "onlyfiles.com,gofile.io,*.gofile.io,filebin.net,0x0.st,transfer.sh,bashupload.com,temp.sh,pixeldrain.com,*.pixeldrain.com,catbox.moe,litterbox.catbox.moe,file.io"
+    # Messaging (6)
+    "api.telegram.org,*.telegram.org,discord.com,*.discord.com,slack.com,*.slack.com,"
+    # File drops (8)
+    "onlyfiles.com,gofile.io,*.gofile.io,filebin.net,0x0.st,transfer.sh,bashupload.com,temp.sh"
 )
+
+# Daytona's documented cap for a sandbox domain allow list.
+MAX_DOMAIN_ALLOW_LIST_ENTRIES = 100
 
 # States in which a Daytona sandbox is ready for toolbox commands.
 _READY_STATES = {"started", "running", "healthy", "ready", "active"}
@@ -417,10 +419,12 @@ class DaytonaExecutionBackend:
             "ttlMinutes": self.ttl_minutes,
         }
         # Network egress policy:
-        # 1. Explicit custom domain list (except "*") -> send domainAllowList.
+        # 1. Explicit custom domain list (except "*") -> send domainAllowList,
+        #    capped at MAX_DOMAIN_ALLOW_LIST_ENTRIES (Daytona 400s above 100).
         # 2. Wildcard "*" or explicit custom CIDR != default -> send networkAllowList (open CIDR).
-        # 3. Default (nothing configured) -> comprehensive DEFAULT_DOMAIN_ALLOW_LIST so
-        #    package installs, AI APIs, GitHub, search, and web tools work out of the box.
+        # 3. Default (nothing configured) -> DEFAULT_DOMAIN_ALLOW_LIST (85 domains,
+        #    under the 100 cap) so package installs, AI APIs, GitHub, search, and
+        #    web tools work out of the box.
         if self.domain_allow_list and self.domain_allow_list != "*":
             body["domainAllowList"] = self.domain_allow_list
         elif self.domain_allow_list == "*" or (self.network_allow_list and self.network_allow_list != "0.0.0.0/0"):
