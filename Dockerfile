@@ -91,5 +91,13 @@ ENV PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1
 # Gateway health endpoint and optional WebUI/WebSocket channel ports
 EXPOSE 18790 8765
 
+# Resolve the nanobot package from the freshly-copied source tree at /app/nanobot
+# rather than the (potentially stale) copy baked into site-packages by the
+# `uv pip install .` step, so code changes inside nanobot/ always take effect on
+# the next deployment. sys.path[0] is /app/.venv/bin when the `nanobot` console
+# script runs, so without this, the installed site-packages copy would shadow the
+# source at /app/nanobot.
+ENV PYTHONPATH=/app
+
 ENTRYPOINT ["entrypoint.sh"]
 CMD ["gateway"]
