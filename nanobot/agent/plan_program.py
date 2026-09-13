@@ -22,10 +22,18 @@ A plan looks like::
         {"id": "scan", "foreach": "$files.split('\\n')", "as": "f", "do": [
             {"tool": "read_file", "args": {"path": "$f"}, "id": "body"},
             {"tool": "exec", "args": {"command": "python3 -m py_compile $f"}}
+        ]},
+        {"parallel": [
+            {"id": "lint", "tool": "exec", "args": {"command": "ruff check ."}},
+            {"id": "tests", "tool": "exec", "args": {"command": "pytest -q"}}
         ]}
       ],
       "output": "Scan complete"
     }
+
+The ``parallel`` construct runs its branches CONCURRENTLY (LLM-compiler
+style): N independent tool calls land in the wall-clock time of the
+slowest branch, with zero extra provider calls.
 
 Design guarantees:
 * Deterministic & safe: only registered tools run; a hard cap bounds total
@@ -39,6 +47,7 @@ Design guarantees:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
@@ -73,6 +82,9 @@ class StepOutcome:
     arguments: dict[str, Any]
     result: Any
     ok: bool
+    #: The plan's step ``id`` (when given) so parallel branches can publish
+    #: their results back into the parent scope after ``gather``.
+    id: str | None = None
 
 
 @dataclass(slots=True)
@@ -257,6 +269,41 @@ async def _run_block(
                 # to avoid accidental cross-iteration leakage.
             continue
 
+        # --- Parallel construct (LLM-compiler fan-out) -----------------------
+        # {"parallel": [step, step, ...]} runs independent steps CONCURRENTLY
+        # via asyncio.gather — N tool calls in the wall-clock time of the
+        # slowest one, still zero provider calls. Each branch is a normal
+        # leaf step; step ids are published into the parent scope after the
+        # gather so downstream steps can reference $branch results.
+        if "parallel" in raw:
+            branches = raw["parallel"]
+            if not isinstance(branches, list) or not branches:
+                raise PlanProgramError("parallel requires a non-empty list of steps")
+            if budget[0] + len(branches) > MAX_EXECUTED_STEPS:
+                raise PlanProgramError(
+                    f"plan exceeded the {MAX_EXECUTED_STEPS}-step safety cap; aborting"
+                )
+
+            async def _run_branch(branch: Any) -> list[StepOutcome]:
+                branch_outcomes: list[StepOutcome] = []
+                # Each branch runs in a child scope so concurrent branches
+                # cannot stomp each other's variables mid-flight.
+                await _run_block([branch], dict(scope), execute, branch_outcomes, budget, depth + 1)
+                return branch_outcomes
+
+            gathered = await asyncio.gather(
+                *(_run_branch(branch) for branch in branches),
+                return_exceptions=True,
+            )
+            for item in gathered:
+                if isinstance(item, BaseException):
+                    raise PlanProgramError(f"parallel branch failed: {item}") from item
+                for outcome in item:
+                    outcomes.append(outcome)
+                    if outcome.id:
+                        scope[outcome.id] = str(outcome.result)
+            continue
+
         # --- Leaf tool step -------------------------------------------------
         tool_name = raw.get("tool")
         if not isinstance(tool_name, str) or not tool_name:
@@ -274,12 +321,53 @@ async def _run_block(
         result = await execute(tool_name, args)
         budget[0] += 1
         ok = not _is_error_result(result)
-        outcomes.append(StepOutcome(name=tool_name, arguments=args, result=result, ok=ok))
-
         step_id = raw.get("id")
+        outcomes.append(
+            StepOutcome(
+                name=tool_name,
+                arguments=args,
+                result=result,
+                ok=ok,
+                id=step_id if isinstance(step_id, str) and step_id else None,
+            )
+        )
+
         if isinstance(step_id, str) and step_id:
             # Expose the step's textual output for later $refs / foreach.split.
             scope[step_id] = str(result)
+
+
+async def fan_out(
+    calls: list[tuple[str, dict[str, Any]]],
+    execute: ToolExecutor,
+) -> list[StepOutcome]:
+    """LLM-compiler fan-out/fan-in: run N independent tool calls at once.
+
+    One round-trip's wall clock, zero sequential waiting, zero provider
+    calls — the caller passes ``(tool_name, args)`` pairs and gets every
+    outcome back in call order.
+    """
+    if not calls:
+        return []
+
+    async def _one(tool_name: str, args: dict[str, Any]) -> StepOutcome:
+        result = await execute(tool_name, args)
+        return StepOutcome(name=tool_name, arguments=args, result=result, ok=not _is_error_result(result))
+
+    gathered = await asyncio.gather(
+        *(_one(name, args) for name, args in calls),
+        return_exceptions=True,
+    )
+    results: list[StepOutcome] = []
+    for index, item in enumerate(gathered):
+        if isinstance(item, BaseException):
+            name, args = calls[index]
+            results.append(
+                StepOutcome(name=name, arguments=args, result=f"Error: {item}", ok=False)
+            )
+        else:
+            results.append(item)
+    return results
 
 
 def parse_plan(arguments: Any) -> dict[str, Any]:

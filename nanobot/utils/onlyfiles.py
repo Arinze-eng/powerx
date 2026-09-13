@@ -27,17 +27,26 @@ code treated opaque-slug tmpfiles links.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
+from loguru import logger
+
+from nanobot.config.paths import get_persistent_data_dir
 
 ONLYFILES_UPLOAD_URL = "https://onlyfiles.com/api/v1/upload"
 ONLYFILES_HOST = "onlyfiles.com"
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # onlyfiles hard limit (~100 MiB)
 _DEFAULT_TIMEOUT_SECONDS = 90
+#: Uploads are permanent: expiry 0 means the file NEVER expires, so the
+#: returned URL stays valid forever and can be stored and re-referenced by
+#: the AI at any time without re-uploading the same bytes.
+_ONLYFILES_EXPIRY = 0
 
 
 class OnlyFilesError(RuntimeError):
@@ -89,6 +98,9 @@ async def upload_bytes(
         filename=safe_filename,
         content_type=content_type or "application/octet-stream",
     )
+    # expiry=0: no expiry — the upload is permanent so the URL can be stored
+    # in persistent memory and referenced by the AI indefinitely.
+    form.add_field("expiry", str(_ONLYFILES_EXPIRY))
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(ONLYFILES_UPLOAD_URL, data=form) as response:
@@ -131,3 +143,98 @@ async def upload_path(
         content_type=content_type,
         timeout_seconds=timeout_seconds,
     )
+
+
+class UploadedUrlMemory:
+    """Persistent content-hash -> uploaded-URL store under the data dir.
+
+    Because uploads have NO expiry, the URL of an already-uploaded file is a
+    permanent fact: a re-request for the same bytes can return the stored
+    URL instead of paying for a second upload (and onlyfiles keeps one
+    canonical copy instead of accumulating duplicates).
+    """
+
+    def __init__(self, root: Path | None = None) -> None:
+        self._path = (root or get_persistent_data_dir("onlyfiles")) / "uploads.json"
+        self._data: dict[str, dict[str, Any]] = {}
+        self._loaded = False
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            if self._path.is_file():
+                payload = json.loads(self._path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    self._data = payload
+        except (OSError, ValueError, TypeError):
+            self._data = {}
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(self._data), encoding="utf-8")
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning("uploaded-url memory save failed: {}", exc)
+
+    @staticmethod
+    def content_fingerprint(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    def lookup(self, data: bytes) -> dict[str, str] | None:
+        """Return the remembered URLs for this exact content, if any."""
+        self._load()
+        entry = self._data.get(self.content_fingerprint(data))
+        if not entry:
+            return None
+        urls = entry.get("urls")
+        if isinstance(urls, dict) and urls.get("url"):
+            return {"url": urls["url"], "download_url": urls.get("download_url", urls["url"])}
+        return None
+
+    def remember(self, data: bytes, filename: str, urls: dict[str, str]) -> bool:
+        """Persist the URL pair for uploaded content. Never raises."""
+        self._load()
+        self._data[self.content_fingerprint(data)] = {
+            "filename": filename,
+            "urls": urls,
+            "ts": time.time(),
+        }
+        self._save()
+        return True
+
+
+async def upload_and_remember(
+    path: str | Path,
+    *,
+    content_type: str | None = None,
+    timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+    url_memory: UploadedUrlMemory | None = None,
+) -> dict[str, str]:
+    """Upload with expiry=0 and persist the URL for zero-reupload recall.
+
+    Same content uploaded again (in this process or after a restart — the
+    store lives on the Northflank persistent disk) returns the remembered
+    URL without a network call, so the AI can always reference prior
+    uploads. Raises OnlyFilesError exactly like ``upload_path`` on failure.
+    """
+    source = Path(path).expanduser()
+    try:
+        data = source.read_bytes()
+        if not data:
+            raise OnlyFilesError("cannot upload an empty file")
+    except OSError as exc:
+        raise OnlyFilesError(f"could not read upload file: {type(exc).__name__}") from None
+    memory = url_memory or UploadedUrlMemory()
+    remembered = memory.lookup(data)
+    if remembered:
+        logger.info("onlyfiles: reusing stored URL for {}", source.name)
+        return remembered
+    result = await upload_path(
+        path,
+        content_type=content_type,
+        timeout_seconds=timeout_seconds,
+    )
+    memory.remember(data, source.name, result)
+    return result

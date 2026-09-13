@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from nanobot.utils.helpers import ensure_dir
@@ -69,3 +70,26 @@ def get_cli_history_path() -> Path:
 def get_legacy_sessions_dir() -> Path:
     """Return the legacy global session directory used for migration fallback."""
     return Path.home() / ".nanobot" / "sessions"
+
+
+def get_persistent_data_dir(namespace: str | None = None) -> Path:
+    """Return the durable storage root for caches, learned plans, and memory.
+
+    Prefers the ``POWERX_DATA_DIR`` environment variable (Northflank mounts
+    the persistent disk volume at ``/data`` by default), falls back to
+    ``/data`` when it exists and is writable, and otherwise defaults to the
+    instance runtime data root so nothing is ever lost silently.
+    """
+    override = (os.environ.get("POWERX_DATA_DIR") or "").strip()
+    if override:
+        base = ensure_dir(Path(override).expanduser())
+    else:
+        candidate = Path("/data")
+        try:
+            if candidate.is_dir() and os.access(candidate, os.W_OK):
+                base = ensure_dir(candidate / "powerx")
+            else:
+                base = get_runtime_subdir("persistent")
+        except OSError:
+            base = get_runtime_subdir("persistent")
+    return ensure_dir(base / namespace) if namespace else base
