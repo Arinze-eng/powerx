@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import os
 import re
@@ -36,6 +37,9 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -210,39 +214,58 @@ _WORKFLOW_FILE = {"apk": "build-apk.yml", "exe": "build-exe.yml", "ipa": "build-
 def _curl(method: str, path: str, *, body: str | None = None, accept: str = "application/vnd.github+json") -> tuple[int, str]:
     """Raw GitHub REST call. Returns (http_status, response_body).
 
-    Retries transient failures (HTTP 5xx with empty body / exit-level errors)
-    a couple of times before giving up.
+    Implemented with the standard-library ``urllib`` so it works even when the
+    ``curl`` binary is not installed in the runtime image.
+    Retries transient failures (5xx / network) a couple of times before giving up.
     """
     tok = _token() or ""
     url = f"{_API}{path}"
-    cmd = ["curl", "-s", "-w", "\n%{http_code}", "-X", method,
-           "-H", f"Authorization: Bearer {tok}", "-H", f"Accept: {accept}"]
+    headers = {"Authorization": f"Bearer {tok}", "Accept": accept}
+    data = None
     if body is not None:
-        cmd += ["-H", "Content-Type: application/json", "-d", body]
-    cmd.append(url)
-    out = ""
+        headers["Content-Type"] = "application/json"
+        data = body.encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    last_status, last_payload = 0, ""
     for attempt in range(3):
+        status, payload = 0, ""
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            out = r.stdout
-        except subprocess.TimeoutExpired:
-            out = ""
-        # last line is the status code
-        nl = out.rfind("\n")
-        if nl == -1:
-            status, payload = 0, out
-        else:
-            payload, code = out[:nl], out[nl + 1:].strip()
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                status = int(resp.status)
+                payload = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code)
             try:
-                status = int(code)
-            except ValueError:
-                status, payload = 0, out
-        # retry only transient conditions: no status, or 5xx
+                payload = exc.read().decode("utf-8", "replace")
+            except Exception:
+                payload = ""
+        except (urllib.error.URLError, TimeoutError, OSError):
+            status, payload = 0, ""
+        last_status, last_payload = status, payload
+        # retry only transient conditions: no status (network), or 5xx
         if status and status < 500:
-            return (status, payload)
+            break
         if attempt < 2:
             time.sleep(4)
-    return (status, payload)
+    return (last_status, last_payload)
+
+
+def _http_download(url: str) -> bytes:
+    """Download a URL to bytes via stdlib urllib (no curl binary needed)."""
+    tok = _token() or ""
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"download failed HTTP {exc.code}: {url}") from None
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"download failed: {exc.reason}") from None
 
 
 def _repo_slug(repo: str) -> str:
@@ -532,29 +555,21 @@ class BuildArtifactTool(Tool):
         return ", ".join(names) if names else "(none)"
 
     def _failed_log_tail(self, repo: str, rid: int) -> str:
-        tok = _token() or ""
         # logs endpoint redirects to a zip; fetch and grep best-effort
-        tmp = Path(tempfile.mkdtemp(prefix="nflog_"))
         try:
-            z = tmp / "logs.zip"
-            subprocess.run(
-                ["curl", "-sL", "-o", str(z), "-H", f"Authorization: Bearer {tok}",
-                 f"{_API}/repos/{repo}/actions/runs/{rid}/logs"],
-                capture_output=True, text=True, timeout=120)
-            if z.exists() and z.stat().st_size > 0:
-                import zipfile
-                txt_lines: list[str] = []
-                with zipfile.ZipFile(z) as zf:
-                    for n in zf.namelist():
-                        if n.endswith(".txt"):
-                            data = zf.read(n).decode("utf-8", "replace").splitlines()
-                            txt_lines += [ln for ln in data if "error" in ln.lower() or "Error" in ln or "FAIL" in ln]
+            logs_url = f"{_API}/repos/{repo}/actions/runs/{rid}/logs"
+            log_bytes = _http_download(logs_url)
+            txt_lines: list[str] = []
+            if log_bytes:
+                zf = zipfile.ZipFile(io.BytesIO(log_bytes))
+                for n in zf.namelist():
+                    if n.endswith(".txt"):
+                        data = zf.read(n).decode("utf-8", "replace").splitlines()
+                        txt_lines += [ln for ln in data if "error" in ln.lower() or "Error" in ln or "FAIL" in ln]
                 tail = "\n".join(txt_lines[-40:]) if txt_lines else "(no obvious error lines; inspect full log via gh)"
                 return tail[:3000]
         except Exception as exc:
             return f"(could not fetch log: {exc})"
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
         return "(no log available)"
 
     def _download(self, kwargs: dict) -> str:
@@ -564,7 +579,6 @@ class BuildArtifactTool(Tool):
             raise ValueError("run_id is required for download")
         dest = self._resolve_dir(str(kwargs.get("dest_dir") or "build-out").strip())
         dest.mkdir(parents=True, exist_ok=True)
-        tok = _token() or ""
         # list artifacts, pick first
         code, resp = _curl("GET", f"/repos/{repo}/actions/runs/{rid}/artifacts")
         if code != 200:
@@ -575,21 +589,15 @@ class BuildArtifactTool(Tool):
         saved: list[str] = []
         for a in arts:
             aid, aname = a["id"], a["name"]
-            zip_path = dest / f"{aname}.zip"
-            subprocess.run(
-                ["curl", "-sL", "-o", str(zip_path), "-H", f"Authorization: Bearer {tok}",
-                 f"{_API}/repos/{repo}/actions/artifacts/{aid}/zip"],
-                capture_output=True, text=True, timeout=300)
+            zf_bytes = _http_download(f"{_API}/repos/{repo}/actions/artifacts/{aid}/zip")
             # unzip
             try:
-                import zipfile
-                with zipfile.ZipFile(zip_path) as zf:
-                    zf.extractall(dest / aname)
+                zf = zipfile.ZipFile(io.BytesIO(zf_bytes))
+                zf.extractall(dest / aname)
                 files = [str(p) for p in (dest / aname).rglob("*") if p.is_file()]
                 saved.append(f"{aname}: {len(files)} file(s) in {dest / aname}")
-                zip_path.unlink(missing_ok=True)
             except Exception as exc:
-                saved.append(f"{aname}: (extract failed: {exc}; zip at {zip_path})")
+                saved.append(f"{aname}: (extract failed: {exc})")
         return "[ok] downloaded:\n" + "\n".join(saved) + f"\nGive the user the artifact path(s) under {dest}."
 
     def _delete(self, kwargs: dict) -> str:

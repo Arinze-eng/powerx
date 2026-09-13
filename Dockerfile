@@ -10,7 +10,7 @@ RUN mkdir -p /app/nanobot/web && npm run build
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates git bubblewrap openssh-client libmagic1 nodejs npm && \
+    apt-get install -y --no-install-recommends ca-certificates curl git bubblewrap openssh-client libmagic1 nodejs npm && \
     rm -rf /var/lib/apt/lists/*
 
 # Install the Vercel CLI globally so the web_dev tool can deploy web apps to
