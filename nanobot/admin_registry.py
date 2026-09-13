@@ -364,6 +364,7 @@ def _execution_settings() -> dict[str, Any]:
                 "snapshot": str(getattr(daytona, "snapshot", "") or "daytona-small"),
                 "domain_allow_list": str(getattr(daytona, "domain_allow_list", "") or ""),
                 "network_allow_list": str(getattr(daytona, "network_allow_list", "") or ""),
+                "fetch_allow_hosts": str(getattr(daytona, "fetch_allow_hosts", "") or ""),
                 "ttl_minutes": int(getattr(daytona, "ttl_minutes", 60) or 60),
                 "auto_stop_minutes": int(getattr(daytona, "auto_stop_minutes", 0) or 0),
                 "apiKeyConfigured": bool(str(getattr(daytona, "api_key", "") or "").strip()),
@@ -485,6 +486,7 @@ def _save_execution_settings(
                 validate_daytona_api_key,
                 validate_daytona_api_url,
                 validate_daytona_domain_allow_list,
+                validate_daytona_fetch_allow_hosts,
                 validate_daytona_network_allow_list,
                 validate_daytona_snapshot,
             )
@@ -504,6 +506,9 @@ def _save_execution_settings(
             raw_network_list = _text(payload, "daytonaNetworkAllowList", maximum=253)
             if raw_network_list:
                 daytona.network_allow_list = validate_daytona_network_allow_list(raw_network_list)
+            raw_fetch_hosts = _text(payload, "daytonaFetchAllowHosts", maximum=2048)
+            if raw_fetch_hosts:
+                daytona.fetch_allow_hosts = validate_daytona_fetch_allow_hosts(raw_fetch_hosts)
             raw_ttl = payload.get("daytonaTtlMinutes")
             if isinstance(raw_ttl, (int, float)) and 5 <= int(raw_ttl) <= 43_200:
                 daytona.ttl_minutes = int(raw_ttl)

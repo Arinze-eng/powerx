@@ -429,6 +429,7 @@ class DaytonaExecutionConfig(Base):
     snapshot: str = "daytona-small"
     domain_allow_list: str = ""
     network_allow_list: str = "0.0.0.0/0"
+    fetch_allow_hosts: str = ""
     ttl_minutes: int = Field(default=60, ge=5, le=43_200)
     auto_stop_minutes: int = Field(default=0, ge=0, le=10_080)
 

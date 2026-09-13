@@ -49,8 +49,64 @@ WORKSPACE = "/home/daytona"
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 
-# Hosts whose URLs fetch_url may download (mirrors VPS/Upstash policy).
-_ALLOWED_FETCH_HOSTS = {"onlyfiles.com", "gofile.io"}
+# Default allowed hosts for sandbox fetch_url (expanded for common registries and mirrors).
+DEFAULT_FETCH_ALLOW_HOSTS: tuple[str, ...] = (
+    "onlyfiles.com",
+    "gofile.io",
+    "*.gofile.io",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "codeload.github.com",
+    "files.pythonhosted.org",
+    "pypi.org",
+    "registry.npmjs.org",
+    "filebin.net",
+    "0x0.st",
+    "transfer.sh",
+    "bashupload.com",
+    "temp.sh",
+    "pixeldrain.com",
+    "*.pixeldrain.com",
+    "catbox.moe",
+    "litterbox.catbox.moe",
+    "file.io",
+)
+
+# Broad default domain allowlist used when no custom allowlist is provided.
+# Daytona sandboxes need an explicit domain allowlist to reach arbitrary hosts
+# (an open CIDR alone only unlocks essential services). This list unlocks
+# package registries, AI providers, GitHub, distro mirrors, search, and web tools.
+DEFAULT_DOMAIN_ALLOW_LIST: str = (
+    # Python & package registries
+    "pypi.org,*.pypi.org,files.pythonhosted.org,"
+    "registry.npmjs.org,npmjs.org,*.npmjs.org,yarnpkg.com,*.yarnpkg.com,"
+    "proxy.golang.org,golang.org,*.golang.org,pkg.go.dev,"
+    "crates.io,*.crates.io,static.crates.io,"
+    "rubygems.org,*.rubygems.org,repo1.maven.org,packagist.org,"
+    # GitHub & repositories
+    "github.com,*.github.com,*.githubusercontent.com,ghcr.io,codeload.github.com,gitlab.com,*.gitlab.com,"
+    # AI providers & APIs
+    "openai.com,*.openai.com,oaiusercontent.com,*.oaiusercontent.com,"
+    "anthropic.com,*.anthropic.com,claude.ai,"
+    "googleapis.com,*.googleapis.com,gemini.google.com,ai.google.dev,"
+    "deepseek.com,*.deepseek.com,openrouter.ai,groq.com,*.groq.com,"
+    "mistral.ai,*.mistral.ai,x.ai,api.x.ai,together.ai,api.together.xyz,"
+    "fireworks.ai,perplexity.ai,*.perplexity.ai,cohere.com,api.cohere.com,"
+    "huggingface.co,*.huggingface.co,hf.co,cdn-lfs.huggingface.co,"
+    # Search, web & knowledge
+    "google.com,*.google.com,gstatic.com,*.gstatic.com,"
+    "duckduckgo.com,*.duckduckgo.com,bing.com,*.bing.com,"
+    "wikipedia.org,*.wikipedia.org,wikimedia.org,*.wikimedia.org,"
+    # Linux distributions & container registries
+    "archive.ubuntu.com,security.ubuntu.com,*.ubuntu.com,deb.debian.org,*.debian.org,"
+    "docker.io,*.docker.io,gcr.io,*.gcr.io,registry-1.docker.io,quay.io,*.quay.io,"
+    # Daytona platform & connectivity diagnostics
+    "daytona.io,*.daytona.io,example.com,httpbin.org,api.ipify.org,ifconfig.me,ipinfo.io,"
+    # Messaging platforms
+    "telegram.org,api.telegram.org,*.telegram.org,discord.com,*.discord.com,slack.com,*.slack.com,"
+    # File sharing & drops
+    "onlyfiles.com,gofile.io,*.gofile.io,filebin.net,0x0.st,transfer.sh,bashupload.com,temp.sh,pixeldrain.com,*.pixeldrain.com,catbox.moe,litterbox.catbox.moe,file.io"
+)
 
 # States in which a Daytona sandbox is ready for toolbox commands.
 _READY_STATES = {"started", "running", "healthy", "ready", "active"}
@@ -130,6 +186,19 @@ def validate_daytona_network_allow_list(raw: str) -> str:
     return ",".join(parts)
 
 
+def validate_daytona_fetch_allow_hosts(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if value == "*":
+        return "*"
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    for p in parts:
+        if p != "*" and not re.fullmatch(r"(\*\.)?[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9]", p):
+            raise ValueError(f"Invalid host in fetch allowlist: {p!r}")
+    return ",".join(parts)
+
+
 def daytona_sandbox_name(session_key: str) -> str:
     """Deterministic, valid sandbox name for a session so sandboxes survive restarts."""
     slug = re.sub(r"[^a-z0-9-]", "-", session_key.lower()).strip("-")[:32] or "session"
@@ -167,6 +236,14 @@ class DaytonaExecutionBackend:
         )
         self.network_allow_list = validate_daytona_network_allow_list(
             str(getattr(config, "network_allow_list", "") or "0.0.0.0/0")
+        )
+        self.fetch_allow_hosts = validate_daytona_fetch_allow_hosts(
+            str(getattr(config, "fetch_allow_hosts", "") or "")
+        )
+        self._fetch_hosts: set[str] = (
+            {h.strip() for h in self.fetch_allow_hosts.split(",") if h.strip()}
+            if self.fetch_allow_hosts
+            else set(DEFAULT_FETCH_ALLOW_HOSTS)
         )
         self.ttl_minutes = max(5, min(int(getattr(config, "ttl_minutes", 60) or 60), 43_200))
         self.auto_stop_minutes = max(0, min(int(getattr(config, "auto_stop_minutes", 0) or 0), 10_080))
@@ -339,10 +416,17 @@ class DaytonaExecutionBackend:
             "labels": {"app": "powerx", "managed-by": "nanobot"},
             "ttlMinutes": self.ttl_minutes,
         }
-        if self.domain_allow_list:
+        # Network egress policy:
+        # 1. Explicit custom domain list (except "*") -> send domainAllowList.
+        # 2. Wildcard "*" or explicit custom CIDR != default -> send networkAllowList (open CIDR).
+        # 3. Default (nothing configured) -> comprehensive DEFAULT_DOMAIN_ALLOW_LIST so
+        #    package installs, AI APIs, GitHub, search, and web tools work out of the box.
+        if self.domain_allow_list and self.domain_allow_list != "*":
             body["domainAllowList"] = self.domain_allow_list
-        elif self.network_allow_list:
-            body["networkAllowList"] = self.network_allow_list
+        elif self.domain_allow_list == "*" or (self.network_allow_list and self.network_allow_list != "0.0.0.0/0"):
+            body["networkAllowList"] = self.network_allow_list or "0.0.0.0/0"
+        else:
+            body["domainAllowList"] = DEFAULT_DOMAIN_ALLOW_LIST
 
         if self.auto_stop_minutes > 0:
             body["autoStopInterval"] = self.auto_stop_minutes
@@ -457,12 +541,26 @@ class DaytonaExecutionBackend:
         command = f"find {shlex.quote(listing_root)} -maxdepth 2 -printf '%y %p\\n' 2>/dev/null | head -200"
         return await self.run(command, timeout=60)
 
+    def _is_host_allowed(self, host: str) -> bool:
+        if "*" in self._fetch_hosts:
+            return True
+        if host in self._fetch_hosts:
+            return True
+        return any(
+            host.endswith("." + pattern[2:])
+            for pattern in self._fetch_hosts
+            if pattern.startswith("*.")
+        )
+
     async def fetch_url(self, url: str, dest_path: str, *, timeout: int = 150) -> str:
         parsed = urlparse(url)
         host = (parsed.netloc or "").lower()
-        allowed = parsed.scheme == "https" and (host in _ALLOWED_FETCH_HOSTS or host.endswith(".gofile.io"))
+        allowed = parsed.scheme in ("https", "http") and self._is_host_allowed(host)
         if not allowed:
-            raise ValueError("url must be an HTTPS onlyfiles.com or gofile.io URL")
+            raise ValueError(
+                f"URL host {host!r} is not in the allowed fetch hosts list. "
+                "Add it to the Daytona fetch_allow_hosts setting or set NANOBOT_DAYTONA_FETCH_ALLOW_HOSTS."
+            )
         dest = _safe_path(dest_path, self.workspace)
         command = (
             f"mkdir -p {shlex.quote(posixpath.dirname(dest))} && "

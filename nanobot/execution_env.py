@@ -133,6 +133,9 @@ def apply_render_execution_env(config: Any) -> Any:
         network_list = _env("NANOBOT_DAYTONA_NETWORK_ALLOW_LIST")
         if network_list:
             daytona.network_allow_list = network_list
+        fetch_hosts = _env("NANOBOT_DAYTONA_FETCH_ALLOW_HOSTS")
+        if fetch_hosts:
+            daytona.fetch_allow_hosts = fetch_hosts
         ttl_minutes = _positive_int(_env("NANOBOT_DAYTONA_TTL_MINUTES"), maximum=43_200)
         if ttl_minutes is not None and ttl_minutes >= 5:
             daytona.ttl_minutes = ttl_minutes

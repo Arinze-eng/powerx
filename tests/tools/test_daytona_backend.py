@@ -235,3 +235,81 @@ async def test_missing_api_key_raises(calls: Any) -> None:  # noqa: ANN401
     backend = DaytonaExecutionBackend(_config(api_key=""), sandbox_name="px-nokey")
     with pytest.raises(DaytonaError):
         await backend.run("echo nope")
+
+
+def test_validate_fetch_allow_hosts() -> None:
+    from nanobot.agent.tools.daytona_backend import validate_daytona_fetch_allow_hosts
+
+    assert validate_daytona_fetch_allow_hosts("") == ""
+    assert validate_daytona_fetch_allow_hosts("*") == "*"
+    assert validate_daytona_fetch_allow_hosts("*.pypi.org, example.com") == "*.pypi.org,example.com"
+    with pytest.raises(ValueError):
+        validate_daytona_fetch_allow_hosts("not a host!")
+
+
+async def test_ensure_sandbox_sends_default_domain_allow_list(calls: Any) -> None:  # noqa: ANN401
+    created_body: dict[str, Any] = {}
+
+    def handler(method: str, url: str, kwargs: dict[str, Any]) -> _Response:
+        if method == "GET" and "/sandbox/px-default" in url:
+            return _Response(status=404, payload={"error": "not found"})
+        if method == "POST" and url.endswith("/sandbox"):
+            created_body.update(kwargs.get("json") or {})
+            return _Response(status=200, payload={"id": "sbx-def"})
+        if method == "GET" and "/sandbox/sbx-def" in url:
+            return _Response(
+                status=200,
+                payload={"id": "sbx-def", "state": "started", "toolboxProxyUrl": "https://tb.example"},
+            )
+        return _Response(status=404, payload={"error": "not found"})
+
+    calls.install(handler)
+    backend = DaytonaExecutionBackend(_config(), sandbox_name="px-default")
+    await backend.ensure_sandbox(_FakeSession(handler))
+    # Default config must send the comprehensive domain allowlist so general
+    # internet (registries, AI APIs, GitHub) is reachable out of the box.
+    assert created_body.get("domainAllowList") == daytona_backend.DEFAULT_DOMAIN_ALLOW_LIST
+    assert "pypi.org" in created_body["domainAllowList"]
+    assert "networkAllowList" not in created_body
+
+
+async def test_ensure_sandbox_wildcard_uses_open_cidr(calls: Any) -> None:  # noqa: ANN401
+    created_body: dict[str, Any] = {}
+
+    def handler(method: str, url: str, kwargs: dict[str, Any]) -> _Response:
+        if method == "GET" and "/sandbox/px-wild" in url:
+            return _Response(status=404, payload={"error": "not found"})
+        if method == "POST" and url.endswith("/sandbox"):
+            created_body.update(kwargs.get("json") or {})
+            return _Response(status=200, payload={"id": "sbx-wild"})
+        if method == "GET" and "/sandbox/sbx-wild" in url:
+            return _Response(
+                status=200,
+                payload={"id": "sbx-wild", "state": "started", "toolboxProxyUrl": "https://tb.example"},
+            )
+        return _Response(status=404, payload={"error": "not found"})
+
+    calls.install(handler)
+    backend = DaytonaExecutionBackend(_config(domain_allow_list="*"), sandbox_name="px-wild")
+    await backend.ensure_sandbox(_FakeSession(handler))
+    assert created_body.get("networkAllowList") == "0.0.0.0/0"
+    assert "domainAllowList" not in created_body
+
+
+async def test_fetch_url_respects_configured_hosts(calls: Any) -> None:  # noqa: ANN401
+    def handler(method: str, url: str, kwargs: dict[str, Any]) -> _Response:
+        if method == "GET" and "/sandbox/" in url:
+            return _Response(status=200, payload={"id": "sbx-f", "state": "started", "toolboxProxyUrl": "https://tb.example"})
+        if method == "POST" and url.endswith("/process/execute"):
+            return _Response(status=200, payload={"exitCode": 0, "result": "42"})
+        return _Response(status=404, payload={"error": "not found"})
+
+    calls.install(handler)
+    backend = DaytonaExecutionBackend(_config(fetch_allow_hosts="example.com,*.example.org"), sandbox_name="px-fetch")
+    assert backend._is_host_allowed("example.com") is True
+    assert backend._is_host_allowed("sub.example.org") is True
+    assert backend._is_host_allowed("example.org") is False
+    assert backend._is_host_allowed("evil.com") is False
+
+    wildcard = DaytonaExecutionBackend(_config(fetch_allow_hosts="*"), sandbox_name="px-fetch2")
+    assert wildcard._is_host_allowed("anything.example") is True
