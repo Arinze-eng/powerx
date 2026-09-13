@@ -57,13 +57,19 @@ def apply_render_execution_env(config: Any) -> Any:
     upstash_configured = bool(str(getattr(upstash, "api_key", "") or "").strip()) if upstash is not None else False
     daytona = getattr(execution, "daytona", None)
     daytona_configured = bool(str(getattr(daytona, "api_key", "") or "").strip()) if daytona is not None else False
+    # explicit_novita guards an admin's deliberate switch BACK to novita; its
+    # marker is another backend's key saved on disk (admin saves persist the
+    # env-overlaid key). Env-provided keys must NOT count here, or the durable
+    # env default could never restore a backend on a fresh instance.
     explicit_novita = configured_backend == "novita" and (vps_configured or upstash_configured or daytona_configured)
-    explicit_vps = configured_backend == "vps" and upstash_configured and backend == "upstash"
-    # A saved Daytona/Upstash admin choice (config already holds that backend's
-    # API key) is authoritative too — the durable env default must not stomp it
-    # on every config load, otherwise the admin's selection silently reverts.
-    explicit_daytona = configured_backend == "daytona" and daytona_configured
-    explicit_upstash = configured_backend == "upstash" and upstash_configured
+    explicit_vps = configured_backend == "vps" and vps_configured
+    # A saved Daytona/Upstash admin choice is authoritative on its own. The API
+    # key may live in the deployment env (synced from Supabase at boot) rather
+    # than in the saved config file, so requiring a key on disk would let the
+    # durable env default stomp the admin's selection on every config load and
+    # silently fall back to the initial sandbox.
+    explicit_daytona = configured_backend == "daytona"
+    explicit_upstash = configured_backend == "upstash"
     if not (explicit_novita or explicit_vps or explicit_daytona or explicit_upstash):
         execution.backend = backend
 

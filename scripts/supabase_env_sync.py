@@ -80,6 +80,7 @@ RUNTIME_KEYS: tuple[str, ...] = (
     # GitHub Actions artifact builds (build_artifact tool auth)
     "GITHUB_BUILD_TOKEN",
     # Daytona sandbox backend (execution provider chosen in admin settings)
+    "NANOBOT_EXECUTION_BACKEND",
     "NANOBOT_DAYTONA_API_KEY",
     "NANOBOT_DAYTONA_API_URL",
     "NANOBOT_DAYTONA_SNAPSHOT",

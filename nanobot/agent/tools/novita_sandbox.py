@@ -527,7 +527,12 @@ class NovitaSandboxTool(Tool):
 
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
-        execution = getattr(ctx, "execution", None)
+        # Prefer the live on-disk config (with the durable env overlay applied)
+        # over the possibly stale ctx snapshot, so a backend the admin saved
+        # moments ago is offered without waiting for a process restart.
+        execution = cls._execution_config()
+        if execution is None:
+            execution = getattr(ctx, "execution", None)
         backend = getattr(execution, "backend", "novita") if execution is not None else "novita"
         if backend == "vps":
             return bool(getattr(execution.vps, "host", "").strip())

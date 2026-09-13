@@ -240,10 +240,14 @@ class ContextBuilder:
 
             from nanobot.config.loader import load_config
             from nanobot.config.paths import get_config_path
+            from nanobot.execution_env import apply_render_execution_env
 
             execution = None
             try:
-                execution = load_config(get_config_path()).execution
+                # Apply the durable env overlay so a backend configured via
+                # environment (Daytona key synced from Supabase at boot) is
+                # reflected here exactly as the sandbox tool sees it.
+                execution = apply_render_execution_env(load_config(get_config_path())).execution
             except Exception:
                 execution = None
             backend = getattr(execution, "backend", "novita") if execution else "novita"
