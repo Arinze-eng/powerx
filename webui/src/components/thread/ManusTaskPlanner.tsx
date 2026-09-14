@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { CheckCircle2, Clock, PlayCircle, AlertCircle, Layers, Cpu, Sliders } from 'lucide-react';
 
 export interface PlanStep {
@@ -16,16 +16,8 @@ interface ManusTaskPlannerProps {
 }
 
 export function ManusTaskPlanner({
-  steps = [
-    { id: '1', title: 'Task Planning & Decomposition', status: 'completed', detail: 'Decomposed into 7 execution steps' },
-    { id: '2', title: 'Context & Window Management', status: 'completed', detail: 'Managed context sliding window' },
-    { id: '3', title: 'User Preference & Learning Store', status: 'running', detail: 'Loading profile & active settings' },
-    { id: '4', title: 'Token Counter & Budget Limits', status: 'pending' },
-    { id: '5', title: 'Streaming Engine & Response Caching', status: 'pending' },
-    { id: '6', title: 'Multi-Step Workflow Execution', status: 'pending' },
-    { id: '7', title: 'Northflank Deployment & Health Verification', status: 'pending' }
-  ],
-  tokenUsage = { estimated_tokens: 1420, max_tokens: 128000, usage_percent: 1.1 }
+  steps,
+  tokenUsage
 }: ManusTaskPlannerProps) {
   const [preferences, setPreferences] = useState({
     autonomousMode: true,
@@ -42,7 +34,7 @@ export function ManusTaskPlanner({
         </div>
         <div className="flex items-center gap-3 text-xs text-muted-foreground">
           <span className="flex items-center gap-1 bg-muted px-2 py-1 rounded-md">
-            <Cpu className="h-3.5 w-3.5" /> Tokens: {tokenUsage.estimated_tokens.toLocaleString()} / {tokenUsage.max_tokens.toLocaleString()} ({tokenUsage.usage_percent}%)
+            <Cpu className="h-3.5 w-3.5" /> Tokens: {tokenUsage ? `${tokenUsage.estimated_tokens.toLocaleString()} / ${tokenUsage.max_tokens.toLocaleString()} (${tokenUsage.usage_percent}%)` : "—"}
           </span>
         </div>
       </div>

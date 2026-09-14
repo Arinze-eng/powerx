@@ -25,6 +25,8 @@ import { ImageLightbox } from "@/components/ImageLightbox";
 import { MarkdownText } from "@/components/MarkdownText";
 import { SlashCommandText } from "@/components/SlashCommandText";
 import { ReasoningRow } from "@/components/thread/activity/ReasoningRow";
+import { manusPlanFromToolEvents } from "@/components/thread/activity/manus-plan-model";
+import { ManusTaskPlanner } from "@/components/thread/ManusTaskPlanner";
 import { UserMessageText } from "@/components/UserMessageText";
 import {
   Tooltip,
@@ -341,6 +343,15 @@ export function MessageBubble({
   );
 
   if (message.kind === "trace") {
+    const plan = manusPlanFromToolEvents(message.toolEvents);
+    if (plan) {
+      return (
+        <div className="space-y-1">
+          <ManusTaskPlanner steps={plan.steps} />
+          <TraceGroup message={message} />
+        </div>
+      );
+    }
     return <TraceGroup message={message} />;
   }
 
