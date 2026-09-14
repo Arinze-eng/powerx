@@ -1567,14 +1567,20 @@ class NovitaSandboxTool(Tool):
                 backend = self._daytona_backend(backend_config, key)
                 if getattr(backend, "persist_workspace", True):
                     # "Perfect sandbox" persistence: a finished task must not
-                    # wipe the user's workspace. Snapshot the workspace into
-                    # the archive sandbox and leave the session sandbox to its
+                    # wipe the user's workspace. Snapshot the workspace in the
+                    # background and leave the session sandbox to its
                     # TTL/auto-stop, so writes/reads keep their state across
-                    # tasks, restarts, and sandbox recreation.
-                    with suppress(Exception):
-                        await asyncio.wait_for(
-                            backend.snapshot_workspace(), timeout=_DAYTONA_SNAPSHOT_BUDGET
-                        )
+                    # tasks, restarts, and sandbox recreation. The task-end
+                    # reply is not blocked by the snapshot.
+                    async def _bg_daytona_snapshot() -> None:
+                        try:
+                            await asyncio.wait_for(
+                                backend.snapshot_workspace(), timeout=_DAYTONA_SNAPSHOT_BUDGET
+                            )
+                        except Exception:
+                            logger.debug("Background Daytona snapshot failed", exc_info=True)
+
+                    asyncio.get_running_loop().create_task(_bg_daytona_snapshot())
                     return
                 with suppress(Exception):
                     await asyncio.wait_for(
@@ -1600,13 +1606,23 @@ class NovitaSandboxTool(Tool):
                 # case (cold-box wait + tar + staged read + archive box create
                 # + upload) could previously block the turn for many minutes on
                 # a cold or wedged box - the "task finished but the Upstash
-                # sandbox hangs" report. The snapshot is best-effort: a missed
-                # one leaves the box (and its workspace) intact and the next
-                # task reuses it via the stored box id.
-                with suppress(Exception):
-                    await asyncio.wait_for(
-                        backend.snapshot_workspace(), timeout=_UPSTASH_SNAPSHOT_BUDGET
-                    )
+                # sandbox hangs" report. Two defenses:
+                #   1. The snapshot runs as a DETACHED background task, so the
+                #      finished task's reply is never delayed by it.
+                #   2. A hard wait_for budget (150s) still bounds the detached
+                #      task so a wedged snapshot cannot linger forever.
+                # The snapshot is best-effort: a missed one leaves the box (and
+                # its workspace) intact and the next task reuses it via the
+                # stored box id.
+                async def _bg_snapshot() -> None:
+                    try:
+                        await asyncio.wait_for(
+                            backend.snapshot_workspace(), timeout=_UPSTASH_SNAPSHOT_BUDGET
+                        )
+                    except Exception:
+                        logger.debug("Background Upstash snapshot failed", exc_info=True)
+
+                asyncio.get_running_loop().create_task(_bg_snapshot())
                 return
             with suppress(Exception):
                 await asyncio.wait_for(

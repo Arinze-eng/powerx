@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -431,6 +432,9 @@ async def test_daytona_release_snapshots_when_persist_enabled(monkeypatch):
     monkeypatch.setattr(ns._DAYTONA_STORE, "sandbox_id", lambda key: "sb-123")
 
     await tool.release_upstash_sandbox(session_key="test-session")
+    # The release snapshot runs as a background task so the turn is never blocked.
+    # Yield control to the event loop so the task executes.
+    await asyncio.sleep(0.01)
     assert snapshotted["done"] is True
     assert reset_called["done"] is False
 

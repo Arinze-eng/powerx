@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -510,6 +511,9 @@ async def test_release_keeps_box_when_persist_enabled(monkeypatch):
     monkeypatch.setattr(tool, "_upstash_backend", lambda config, key: backend)
 
     await tool.release_upstash_sandbox("webui:persist")
+    # The release snapshot runs as a background task so the turn is never blocked.
+    # Yield control to the event loop so the task executes.
+    await asyncio.sleep(0.01)
     assert snapped == [True]
     assert deleted == []
     assert removed == []
