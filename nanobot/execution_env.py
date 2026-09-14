@@ -99,21 +99,29 @@ def apply_render_execution_env(config: Any) -> Any:
         vps.private_key = private_key
 
     # Upstash Box overlay (used when the deployment selects the Upstash backend).
+    # An admin-saved value is authoritative: env vars are durable defaults that
+    # fill in what the config file leaves at its default/empty, but they must
+    # NEVER overwrite a value the admin explicitly saved. Overwriting on every
+    # config load silently reverted admin key/endpoint changes and made the box
+    # fail with stale credentials that read as "the endpoint has changed".
     if upstash is not None:
         api_key = _env("NANOBOT_UPSTASH_API_KEY") or _env("UPSTASH_BOX_API_KEY")
-        if api_key:
+        if api_key and not str(getattr(upstash, "api_key", "") or "").strip():
             upstash.api_key = api_key
         base_url = _env("NANOBOT_UPSTASH_BASE_URL")
-        if base_url:
+        if base_url and str(getattr(upstash, "base_url", "") or "").rstrip("/") in {
+            "",
+            "https://us-east-1.box.upstash.com",
+        }:
             upstash.base_url = base_url
         runtime = _env("NANOBOT_UPSTASH_RUNTIME")
-        if runtime:
+        if runtime and str(getattr(upstash, "runtime", "") or "").strip() in {"", "python"}:
             upstash.runtime = runtime
         size = _env("NANOBOT_UPSTASH_SIZE")
-        if size:
+        if size and str(getattr(upstash, "size", "") or "").strip() in {"", "small"}:
             upstash.size = size
         ttl = _positive_int(_env("NANOBOT_UPSTASH_TTL"), maximum=86_400)
-        if ttl is not None and ttl >= 60:
+        if ttl is not None and (int(getattr(upstash, "ttl_s", 0) or 0)) == 3600:
             upstash.ttl_s = ttl
 
     # Daytona overlay (used when the deployment selects the Daytona backend).

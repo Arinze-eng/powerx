@@ -165,6 +165,13 @@ class UpstashExecutionBackend:
         # Box id resolved by the most recent ensure_box() call (for callers that
         # want to persist the mapping between operations).
         self.last_box_id: str = ""
+        # "Perfect box" persistence: when True (the default) a finished task
+        # must NOT destroy the box. Files written/read through the box persist
+        # for the box lifetime, and the workspace is snapshotted into a
+        # dedicated archive box so a fresh box (after expiry/recreation) is
+        # restored with the session's files. Admins can opt out via
+        # upstashPersistWorkspace in execution settings.
+        self.persist_workspace = bool(getattr(config, "persist_workspace", True))
 
     # ------------------------------------------------------------------ HTTP
 
@@ -207,6 +214,17 @@ class UpstashExecutionBackend:
                     data = {"raw": text}
                 if resp.status >= 400:
                     detail = str(data.get("error") or data.get("message") or text)[:300]
+                    if resp.status in (401, 403):
+                        # A rejected credential is NOT an endpoint problem. Say so
+                        # explicitly: the classic failure mode here was the admin
+                        # rotating the API key and every request then reading as
+                        # "the endpoint has changed or is not correct".
+                        raise UpstashError(
+                            f"Upstash rejected the configured API key (HTTP {resp.status}) for {method} {path}: "
+                            f"{detail}. The Upstash endpoint itself is unchanged; the admin-configured "
+                            "Upstash API key is invalid, expired, or was just rotated. Save the new key "
+                            "in Admin -> Execution settings and retry."
+                        )
                     # Upstash reports *missing* files as an opaque HTTP 500; turn
                     # that specific shape into a typed, recoverable error so reads
                     # of not-yet-written paths don't blow up the whole operation.
@@ -321,12 +339,117 @@ class UpstashExecutionBackend:
             raise UpstashError("Upstash Box create returned no box id")
         await self.wait_ready(session, box_id, timeout=120)
         self.last_box_id = box_id
+        if self.persist_workspace:
+            # A brand-new box is empty. Restore the last workspace snapshot so a
+            # session's files survive box expiry/recreation instead of every
+            # restart starting from a wiped workspace.
+            try:
+                await self.restore_workspace()
+            except Exception:
+                pass  # best-effort: a missing/unreadable snapshot is not fatal
         return box_id
 
     async def delete_box(self, box_id: str) -> None:
-        """Kill the sandbox immediately (used by reset / end-of-task cleanup)."""
+        """Kill the sandbox immediately (used by reset / explicit-wipe cleanup)."""
         async with aiohttp.ClientSession() as session:
             await self._request(session, "DELETE", f"/v2/box/{box_id}", timeout=60)
+
+    # ---------------------------------------------------------------- persist
+
+    _SNAPSHOT_STAGED = ".px-snapshot.tgz"
+    _RESTORE_STAGED = ".px-restore.tgz"
+    _SNAPSHOT_MAX_BYTES = 150 * 1024 * 1024
+
+    def _archive_box_name(self) -> str:
+        """Dedicated long-lived box that stores workspace snapshots."""
+        digest = hashlib.sha256(f"archive:{self.box_name}".encode("utf-8")).hexdigest()[:10]
+        return f"px-archive-{digest}"
+
+    def _archive_backend(self) -> "UpstashExecutionBackend":
+        archive = UpstashExecutionBackend(self.config, box_name=self._archive_box_name())
+        # Snapshots must outlive the ephemeral session boxes, so the archive
+        # box uses the longest TTL the API accepts. It must never snapshot
+        # itself (that would recurse forever).
+        archive.ttl_s = 86_400
+        archive.persist_workspace = False
+        return archive
+
+    async def _read_box_bytes(
+        self, session: aiohttp.ClientSession, box_id: str, path: str
+    ) -> bytes | None:
+        """Read one binary file from a box via the base64 files/read encoding."""
+        target = _safe_path(path, self.workspace)
+        data = await self._request(
+            session,
+            "GET",
+            f"/v2/box/{box_id}/files/read?path={quote(target, safe='')}&encoding=base64",
+            timeout=240,
+        )
+        if isinstance(data, dict) and data.get("content"):
+            try:
+                return base64.b64decode(str(data["content"]), validate=False)
+            except Exception:
+                return None
+        return None
+
+    async def snapshot_workspace(self) -> bool:
+        """Tar the workspace and store the archive in the dedicated archive box.
+
+        Called instead of box deletion when persistence is enabled, so writes
+        and reads made during a task survive task end, agent restarts, and even
+        box recreation (the snapshot is restored when a fresh box is created).
+        Returns True when a snapshot was stored.
+        """
+        if not self.persist_workspace:
+            return False
+        staged = f"{self.workspace}/{self._SNAPSHOT_STAGED}"
+        async with aiohttp.ClientSession() as session:
+            box_id = await self.ensure_box(session)
+            await self._exec(
+                session,
+                box_id,
+                f"rm -f {shlex.quote(staged)} && tar czf {shlex.quote(staged)} "
+                f"-C {shlex.quote(self.workspace)} "
+                f"--exclude=./{self._SNAPSHOT_STAGED} --exclude=./{self._RESTORE_STAGED} . "
+                "2>/dev/null || true",
+                300,
+            )
+            data = await self._read_box_bytes(session, box_id, staged)
+            if not data or len(data) > self._SNAPSHOT_MAX_BYTES:
+                return False
+            archive = self._archive_backend()
+            await archive.ensure_box(session)
+            await archive.write_bytes(f"{archive.workspace}/snapshots/{self.box_name}.tgz", data)
+        return True
+
+    async def restore_workspace(self) -> bool:
+        """Restore the last workspace snapshot from the archive box (best effort)."""
+        if not self.persist_workspace:
+            return False
+        try:
+            archive = self._archive_backend()
+            async with aiohttp.ClientSession() as session:
+                archive_id = await archive.ensure_box(session)
+                data = await archive._read_box_bytes(
+                    session,
+                    archive_id,
+                    f"{archive.workspace}/snapshots/{self.box_name}.tgz",
+                )
+                if not data or len(data) > self._SNAPSHOT_MAX_BYTES:
+                    return False
+                box_id = await self.ensure_box(session)
+                staged = f"{self.workspace}/{self._RESTORE_STAGED}"
+                await self.write_bytes(staged, data)
+                await self._exec(
+                    session,
+                    box_id,
+                    f"tar xzf {shlex.quote(staged)} -C {shlex.quote(self.workspace)} "
+                    f"2>/dev/null || true; rm -f {shlex.quote(staged)}",
+                    300,
+                )
+        except UpstashError:
+            return False
+        return True
 
     # ------------------------------------------------------------------ exec
 

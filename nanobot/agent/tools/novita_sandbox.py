@@ -1562,6 +1562,14 @@ class NovitaSandboxTool(Tool):
             if not box_id:
                 return
             backend = self._upstash_backend(backend_config, key)
+            if getattr(backend, "persist_workspace", True):
+                # "Perfect box" persistence: a finished task must not wipe the
+                # user's workspace. Snapshot the box into the archive box and
+                # leave it running so writes/reads keep their state across
+                # tasks, restarts, and box recreation.
+                with suppress(Exception):
+                    await backend.snapshot_workspace()
+                return
             with suppress(Exception):
                 await backend.reset(box_id)
             _UPSTASH_STORE.remove(key)

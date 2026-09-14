@@ -358,6 +358,7 @@ def _execution_settings() -> dict[str, Any]:
                 "size": str(getattr(upstash, "size", "") or "small"),
                 "ttl_s": int(getattr(upstash, "ttl_s", 3600) or 3600),
                 "apiKeyConfigured": bool(str(getattr(upstash, "api_key", "") or "").strip()),
+                "persistWorkspace": bool(getattr(upstash, "persist_workspace", True)),
             },
             "daytona": {
                 "api_url": str(getattr(daytona, "api_url", "") or ""),
@@ -479,6 +480,9 @@ def _save_execution_settings(
             raw_ttl = payload.get("upstashTtlSeconds")
             if isinstance(raw_ttl, (int, float)) and 60 <= int(raw_ttl) <= 86_400:
                 upstash.ttl_s = int(raw_ttl)
+            raw_persist = payload.get("upstashPersistWorkspace")
+            if isinstance(raw_persist, bool):
+                upstash.persist_workspace = raw_persist
         # Daytona sandbox settings (key is only replaced when a new value is sent).
         daytona = getattr(config.execution, "daytona", None)
         if daytona is not None:

@@ -319,3 +319,236 @@ async def test_download_missing_file_clear_error(monkeypatch):
     with pytest.raises(UpstashFileNotFound):
         await backend.download("missing.bin", "/tmp/x")
 
+
+
+# --------------------------------------------------------------------------- #
+# Admin key rotation ("endpoint has changed" fix)                             #
+# --------------------------------------------------------------------------- #
+
+
+def test_execution_env_preserves_admin_upstash_key(monkeypatch):
+    """A saved admin key must win over the durable env default.
+
+    The overlay used to re-apply the env key on EVERY config load, silently
+    reverting an admin key change and making the box fail with stale
+    credentials that read as "the endpoint has changed".
+    """
+    from nanobot.config.schema import Config
+    from nanobot.execution_env import apply_render_execution_env
+
+    monkeypatch.setenv("NANOBOT_EXECUTION_BACKEND", "upstash")
+    monkeypatch.setenv("UPSTASH_BOX_API_KEY", "box_env_key")
+    monkeypatch.setenv("NANOBOT_UPSTASH_BASE_URL", "https://eu-central-1.box.upstash.com")
+    monkeypatch.setenv("NANOBOT_UPSTASH_SIZE", "medium")
+    monkeypatch.setenv("NANOBOT_UPSTASH_TTL", "7200")
+    config = Config()
+    config.execution.backend = "upstash"
+    config.execution.upstash.api_key = "box_admin_rotated"
+    config.execution.upstash.base_url = "https://ap-south-1.box.upstash.com"
+    config.execution.upstash.size = "large"
+    config.execution.upstash.ttl_s = 9000
+    overlay = apply_render_execution_env(config)
+    assert overlay.execution.upstash.api_key == "box_admin_rotated"
+    assert overlay.execution.upstash.base_url == "https://ap-south-1.box.upstash.com"
+    assert overlay.execution.upstash.size == "large"
+    assert overlay.execution.upstash.ttl_s == 9000
+    # Env still fills the gaps on a fresh config (durable default behaviour).
+    fresh = apply_render_execution_env(Config())
+    assert fresh.execution.upstash.api_key == "box_env_key"
+    assert fresh.execution.upstash.base_url == "https://eu-central-1.box.upstash.com"
+
+
+class _FakeResp:
+    def __init__(self, status: int, text: str = "") -> None:
+        self.status = status
+        self._text = text
+
+    async def text(self):
+        return self._text
+
+    async def read(self):
+        return self._text.encode("utf-8")
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, status: int) -> None:
+        self._status = status
+
+    def request(self, method, url, **kw):
+        return _FakeResp(self._status, '{"error": "unauthorized"}')
+
+
+@pytest.mark.asyncio
+async def test_rejected_key_says_key_not_endpoint():
+    """HTTP 401 must read as a credential problem, never an endpoint problem."""
+    backend = UpstashExecutionBackend(_config(api_key="box_stale"), box_name="px-test-1")
+    with pytest.raises(UpstashError) as exc:
+        await backend._request(_FakeSession(401), "GET", "/v2/box")
+    message = str(exc.value)
+    assert "rejected the configured API key" in message
+    assert "endpoint itself is unchanged" in message
+    with pytest.raises(UpstashError) as exc403:
+        await backend._request(_FakeSession(403), "GET", "/v2/box")
+    assert "rejected the configured API key" in str(exc403.value)
+
+
+# --------------------------------------------------------------------------- #
+# "Perfect box" persistence                                                   #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_snapshot_stores_workspace_in_archive_box(monkeypatch):
+    backend = UpstashExecutionBackend(_config(), box_name="px-test-1")
+    archive_calls: list[str] = []
+
+    archive = SimpleNamespace(
+        ensure_box=None,
+        write_bytes=None,
+        workspace="/workspace/home",
+        box_name="px-archive-x",
+    )
+
+    async def fake_ensure(session):
+        return "box-self"
+
+    async def fake_exec(session, box_id, cmd, timeout):
+        return {"exit_code": 0, "output": "", "error": ""}
+
+    async def fake_read_bytes(session, box_id, path):
+        return b"tarball-bytes"
+
+    async def fake_archive_ensure(session):
+        return "box-archive"
+
+    async def fake_archive_write(path, data):
+        archive_calls.append((path, data))
+        return None
+
+    monkeypatch.setattr(backend, "ensure_box", fake_ensure)
+    monkeypatch.setattr(backend, "_exec", fake_exec)
+    monkeypatch.setattr(backend, "_read_box_bytes", fake_read_bytes)
+    monkeypatch.setattr(backend, "_archive_backend", lambda: archive)
+    monkeypatch.setattr(archive, "ensure_box", fake_archive_ensure)
+    monkeypatch.setattr(archive, "write_bytes", fake_archive_write)
+
+    assert await backend.snapshot_workspace() is True
+    path, data = archive_calls[0]
+    assert path.endswith("/snapshots/px-test-1.tgz")
+    assert data == b"tarball-bytes"
+    # The archive must never snapshot itself (real method, not the stub).
+    real_archive_backend = UpstashExecutionBackend(_config(), box_name="px-test-1")._archive_backend()
+    assert real_archive_backend.persist_workspace is False
+    assert real_archive_backend.ttl_s == 86_400
+    assert real_archive_backend.box_name != backend.box_name
+
+
+@pytest.mark.asyncio
+async def test_ensure_box_restores_snapshot_on_fresh_box(monkeypatch):
+    backend = UpstashExecutionBackend(_config(), box_name="px-test-1")
+    restored: list[bool] = []
+
+    async def fake_restore():
+        restored.append(True)
+        return True
+
+    async def fake_wait_ready(session, box_id, timeout=120):
+        return None
+
+    async def fake_request(session, method, path, **kw):
+        if method == "GET" and path == "/v2/box":
+            return {"boxes": []}
+        if method == "POST" and path == "/v2/box":
+            return {"id": "box-new"}
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    monkeypatch.setattr(backend, "wait_ready", fake_wait_ready)
+    monkeypatch.setattr(backend, "_request", fake_request)
+    monkeypatch.setattr(backend, "restore_workspace", fake_restore)
+    box_id = await backend.ensure_box(_FakeSession(None))
+    assert box_id == "box-new"
+    assert restored == [True]
+
+
+@pytest.mark.asyncio
+async def test_release_keeps_box_when_persist_enabled(monkeypatch):
+    """release_upstash_sandbox must snapshot instead of deleting when persisting."""
+    from nanobot.agent.tools import novita_sandbox as ns
+
+    cfg = SimpleNamespace(
+        backend="upstash",
+        vps=SimpleNamespace(host=""),
+        upstash=_config(),
+        novita_template=None,
+    )
+    tool = ns.NovitaSandboxTool()
+    monkeypatch.setattr(ns.NovitaSandboxTool, "_selected_backend", staticmethod(
+        lambda: ("upstash", cfg.upstash)))
+    monkeypatch.setattr(ns._UPSTASH_STORE, "sandbox_id", lambda key: "box-live")
+    removed: list[str] = []
+    monkeypatch.setattr(ns._UPSTASH_STORE, "remove", lambda key: removed.append(key))
+    snapped: list[bool] = []
+    deleted: list[str] = []
+
+    backend = SimpleNamespace(persist_workspace=True)
+
+    async def fake_snap():
+        snapped.append(True)
+        return True
+
+    async def fake_reset(box_id):
+        deleted.append(box_id)
+
+    backend.snapshot_workspace = fake_snap
+    backend.reset = fake_reset
+    monkeypatch.setattr(tool, "_upstash_backend", lambda config, key: backend)
+
+    await tool.release_upstash_sandbox("webui:persist")
+    assert snapped == [True]
+    assert deleted == []
+    assert removed == []
+
+
+@pytest.mark.asyncio
+async def test_release_still_deletes_when_persist_disabled(monkeypatch):
+    from nanobot.agent.tools import novita_sandbox as ns
+
+    cfg = SimpleNamespace(
+        backend="upstash",
+        vps=SimpleNamespace(host=""),
+        upstash=_config(),
+        novita_template=None,
+    )
+    tool = ns.NovitaSandboxTool()
+    monkeypatch.setattr(ns.NovitaSandboxTool, "_selected_backend", staticmethod(
+        lambda: ("upstash", cfg.upstash)))
+    monkeypatch.setattr(ns._UPSTASH_STORE, "sandbox_id", lambda key: "box-live")
+    removed: list[str] = []
+    monkeypatch.setattr(ns._UPSTASH_STORE, "remove", lambda key: removed.append(key))
+
+    backend = SimpleNamespace(persist_workspace=False)
+
+    async def fake_reset(box_id):
+        backend.deleted = box_id
+
+    backend.reset = fake_reset
+    monkeypatch.setattr(tool, "_upstash_backend", lambda config, key: backend)
+
+    await tool.release_upstash_sandbox("webui:ephemeral")
+    assert backend.deleted == "box-live"
+    assert removed == ["webui:ephemeral"]
+
+
+def test_persist_workspace_defaults_true():
+    from nanobot.config.schema import Config
+
+    assert Config().execution.upstash.persist_workspace is True
+    backend = UpstashExecutionBackend(_config(), box_name="px-test-1")
+    assert backend.persist_workspace is True
+    assert UpstashExecutionBackend(_config(persist_workspace=False), box_name="px-test-1").persist_workspace is False

@@ -419,6 +419,11 @@ class UpstashExecutionConfig(Base):
     # Boxes are deleted automatically after this window even if the agent never
     # resets, so user sandboxes cannot linger past their task (Upstash TTL).
     ttl_s: int = Field(default=3600, ge=60, le=86_400)
+    # "Perfect box" persistence: keep the box (and every file written/read in
+    # it) alive across tasks and restarts. Finished tasks snapshot the
+    # workspace into a dedicated archive box instead of deleting the session
+    # box, and a fresh box is restored from that snapshot.
+    persist_workspace: bool = True
 
 
 class DaytonaExecutionConfig(Base):
