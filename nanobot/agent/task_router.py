@@ -17,7 +17,7 @@ families* a generic user actually asks every day:
 
 Each family is answered by executing ONE deterministic shell command inside the
 configured execution sandbox (Novita / VPS / Upstash — wherever the user's code
-actually lives), via the registered ``sandbox_batch`` tool, falling back to the
+actually lives), via the registered ``novita_sandbox`` tool, falling back to the
 local ``exec`` shell when no sandbox is present. The command's output IS the
 answer: zero provider round-trips, zero credit steps. Everything is read-only
 and fail-open: an ambiguous, write-shaped, image-bearing, over-long, or not-
@@ -29,7 +29,7 @@ Safety is baked in the same way as the existing layers:
 * Only *read-only* command recipes are ever emitted. No rm / no network money /
   no mutation. The commands are plain ``bash`` that list, lint, and run tests —
   each checks for only presence.
-* Recipes only fire when a command runner (sandbox_batch or exec) is registered
+* Recipes only fire when a command runner (novita_sandbox or exec) is registered
   on the run, so a generic agent that exposes neither is untouched.
 * The router consults live env (+ per-run opt-in) so operators (and tests) can
   flip it without a restart.
@@ -157,7 +157,7 @@ def _select_recipe(text: str, normalized: str) -> tuple[str, str] | None:
 
 
 def task_recipe_plan(text: str) -> ToolCallRequest | None:
-    """Return a single ``sandbox_batch`` call that performs *text* with zero
+    """Return a single ``novita_sandbox`` run call that performs *text* with zero
     provider calls, or None to fall through to the normal LLM path.
 
     The returned call runs a read-only shell recipe inside the configured
@@ -182,11 +182,12 @@ def task_recipe_plan(text: str) -> ToolCallRequest | None:
     command, label = recipe
     return ToolCallRequest(
         id=f"task-{label}",
-        name="sandbox_batch",
+        name="novita_sandbox",
         arguments={
-            "stop_on_error": False,
-            # A single `run` op runs the whole recipe inside the sandbox on the
-            # user's own project tree.
-            "operations": [{"action": "run", "command": command, "timeout": 300}],
+            # A single `run` executes the whole recipe inside the sandbox on
+            # the user's own project tree.
+            "action": "run",
+            "command": command,
+            "timeout": 300,
         },
     )

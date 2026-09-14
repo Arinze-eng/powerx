@@ -31,7 +31,6 @@ export interface TaskStats {
 }
 
 const SANDBOX_TOOL_NAMES = new Set(["novita_sandbox"]);
-const BATCH_TOOL_NAMES = new Set(["sandbox_batch"]);
 const EXEC_TOOL_NAMES = new Set([
   "exec",
   "bash",
@@ -75,37 +74,6 @@ function parseArgs(event: ToolProgressEvent): Record<string, unknown> {
     }
   }
   return {};
-}
-
-/** Count how many runnable operations a single ``sandbox_batch`` event performs. */
-function batchCommandCount(args: Record<string, unknown>): number {
-  const ops = args.ops ?? args.operations ?? args.steps;
-  if (!Array.isArray(ops)) return 1;
-  let runs = 0;
-  for (const op of ops) {
-    if (!op || typeof op !== "object") continue;
-    const action = (op as Record<string, unknown>).action;
-    // A "complete" op is the terminal summary, not a command. Reads/lists are
-    // cheap inspection, but they still count as work the system did without a
-    // model call — we count every non-complete op as one step and every
-    // run/install/write op additionally as a command.
-    if (action === "complete") continue;
-    runs += 1;
-  }
-  return Math.max(runs, 0);
-}
-
-function batchWriteCount(args: Record<string, unknown>): number {
-  const ops = args.ops ?? args.operations ?? args.steps;
-  if (!Array.isArray(ops)) return 0;
-  let writes = 0;
-  for (const op of ops) {
-    if (!op || typeof op !== "object") continue;
-    const record = op as Record<string, unknown>;
-    const action = record.action;
-    if (action === "write" || action === "upload") writes += 1;
-  }
-  return writes;
 }
 
 interface PlanOpCounts {
@@ -233,9 +201,6 @@ export function computeTaskStats(
       if (action === "run" || action === "install") commandsRun += 1;
       else if (action === "write" || action === "upload") filesCreated += 1;
       else if (action === "fetch_url") pagesViewed += 1;
-    } else if (BATCH_TOOL_NAMES.has(name)) {
-      commandsRun += batchCommandCount(args);
-      filesCreated += batchWriteCount(args);
     } else if (name === RUN_PLAN_TOOL_NAME) {
       // One model call runs the whole plan deterministically; expand its
       // steps into real per-operation counts instead of a single step. The

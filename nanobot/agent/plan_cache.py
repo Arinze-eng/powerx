@@ -31,7 +31,7 @@ How it works
 Safety rules baked in
 ---------------------
 * Only plans whose steps are ALL safe-to-replay are ever stored or executed:
-  the sandbox coding tools (``novita_sandbox``, ``sandbox_batch``, ``exec``)
+  the sandbox coding tools (``novita_sandbox``, ``exec``)
   plus read-only lookups. Anything that can mutate external state or spend
   money on the user's behalf (message send, DB writes, uploads/downloads,
   submit_question, deploy) is refused as a plan and left to the model.
@@ -114,7 +114,7 @@ def plan_cache_enabled() -> bool:
 
 #: Sandbox / coding tools: these ARE the work the user wants done repeatedly.
 #: Re-running them is exactly the point of the plan cache.
-_CODING_TOOLS: frozenset[str] = frozenset({"novita_sandbox", "sandbox_batch", "exec"})
+_CODING_TOOLS: frozenset[str] = frozenset({"novita_sandbox", "exec"})
 
 #: Read-only lookup tools that are harmless to replay (kept general, not tied
 #: to any single product).
@@ -135,9 +135,6 @@ _SAFE_REPLAY_TOOLS: frozenset[str] = _CODING_TOOLS | _READ_ONLY_TOOLS
 #: must NOT be auto-replayed. 'run'/'read'/'write'/'list'/'reset' are fine.
 _UNSAFE_SANDBOX_ACTIONS: frozenset[str] = frozenset({"upload", "download_url", "fetch_url"})
 
-#: sandbox_batch sub-actions considered unsafe inside a batch operation list.
-_UNSAFE_BATCH_ACTIONS: frozenset[str] = frozenset({"upload", "download_url", "fetch_url"})
-
 
 def _step_is_safe(name: str, args: dict[str, Any]) -> bool:
     """Fine-grained guard beyond the coarse tool whitelist."""
@@ -147,11 +144,6 @@ def _step_is_safe(name: str, args: dict[str, Any]) -> bool:
     if name == "novita_sandbox":
         if action in _UNSAFE_SANDBOX_ACTIONS:
             return False
-    elif name == "sandbox_batch":
-        for op in args.get("operations") or []:
-            if isinstance(op, dict):
-                if str(op.get("action") or "").strip().lower() in _UNSAFE_BATCH_ACTIONS:
-                    return False
     elif name == "uniabuja_student":
         # submit_question mutates state; never replay it silently.
         if action == "submit_question":

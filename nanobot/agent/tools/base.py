@@ -169,9 +169,9 @@ class TerminalToolResult(ToolResult):
     The runner treats any tool result with ``terminal=True`` as a declaration
     that the task is complete: it stops the iteration loop immediately and uses
     ``final_message`` as the assistant's final content — no further model call
-    is made to produce a closing answer. This is how ``sandbox_batch``'s
-    ``complete`` op collapses an N-op task into ONE provider round-trip (the
-    call that emitted the batch) instead of two (batch + final answer).
+    is made to produce a closing answer. This is how a terminal tool result
+    collapses an N-step task into ONE provider round-trip (the call that
+    emitted the final command) instead of two (command + final answer).
 
     ``final_message`` is the clean user-facing summary the tool wants the user
     to see; ``str(result)`` remains the full technical report appended to the

@@ -113,3 +113,7 @@ bridge/node_modules/
 webui/.verify-*
 .venv-test/
 .supabase/
+
+# local tooling / build artifacts
+nflank-cli/
+.venv/

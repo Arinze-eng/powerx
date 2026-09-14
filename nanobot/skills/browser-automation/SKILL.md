@@ -7,14 +7,14 @@ metadata: {"nanobot":{"emoji":"🌐","requires":{"bins":["python3"]}}}
 # Browser Automation in the Sandbox
 
 You drive a real Linux sandbox through the **`novita_sandbox`** tool (actions: `run`, `write`,
-`read`, `install`, `upload`, `download_url`, `list`) and the batch runner **`sandbox_batch`**.
+`read`, `install`, `upload`, `download_url`, `list`).
 Treat it as a desktop you can control with a headless browser. Prefer **Playwright**; fall back to
 **Selenium** only if Playwright cannot be installed. Never claim browsing is unsupported —
 install what you need first.
 
 > How to call: run shell commands via `novita_sandbox(action="run", command="...")`, write files
 > via `novita_sandbox(action="write", path="/workspace/x.py", content="...")`, then execute them.
-> For multi-step flows use `sandbox_batch` so intermediate output stays in the sandbox.
+> For multi-step flows chain commands with `&&` inside one `run` so intermediate output stays in the sandbox.
 
 ## Golden rules
 
@@ -135,11 +135,11 @@ for _ in range(20):
 - `expect(locator).to_have_text(...)` for assertions.
 - Set generous timeouts (`page.set_default_timeout(30000)`) on slow sites.
 
-## Batch many steps cheaply
-Wrap multi-step flows in one `sandbox_batch` op so intermediate output stays in the sandbox and
-you only pull back the final screenshot(s)/extracted JSON — this keeps context small and cuts
-round-trips. Write the script to a file with `novita_sandbox(action="write", ...)`, then run it,
-then read results.
+## Run many steps cheaply
+Chain the whole flow into ONE `run` command (`a && b && c`) — or better, emit one `run_plan` —
+so intermediate output stays in the sandbox and you only pull back the final
+screenshot(s)/extracted JSON. This keeps context small and cuts round-trips. Write the script to
+a file with `novita_sandbox(action="write", ...)`, then run it, then read results.
 
 ## Troubleshooting
 - **Browser won't launch / missing libs:** rerun `playwright install --with-deps chromium`; if

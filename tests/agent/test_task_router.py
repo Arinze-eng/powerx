@@ -35,17 +35,15 @@ class TestTaskRouting:
     def test_bug_check_ask_routes(self) -> None:
         call = task_recipe_plan("check this code for bugs")
         assert call is not None
-        assert call.name == "sandbox_batch"
-        ops = call.arguments["operations"]
-        assert isinstance(ops, list) and len(ops) == 1
-        assert ops[0]["action"] == "run"
-        assert "py_compile" in ops[0]["command"]
+        assert call.name == "novita_sandbox"
+        assert call.arguments["action"] == "run"
+        assert "py_compile" in call.arguments["command"]
         assert call.id == "task-bug-scan"
 
     def test_look_for_issues_routes(self) -> None:
         call = task_recipe_plan("look for issues in the project please")
         assert call is not None
-        assert call.name == "sandbox_batch"
+        assert call.name == "novita_sandbox"
         assert call.id == "task-bug-scan"
 
     def test_review_code_routes(self) -> None:
@@ -56,9 +54,9 @@ class TestTaskRouting:
     def test_run_tests_routes(self) -> None:
         call = task_recipe_plan("run the tests")
         assert call is not None
-        assert call.name == "sandbox_batch"
+        assert call.name == "novita_sandbox"
         assert call.id == "task-run-tests"
-        assert "pytest" in call.arguments["operations"][0]["command"]
+        assert "pytest" in call.arguments["command"]
 
     def test_run_pytest_routes(self) -> None:
         call = task_recipe_plan("please run pytest")
@@ -117,15 +115,15 @@ class TaskRejectingProvider(ProviderBase):
         return "task-test"
 
 
-class StubSandboxBatchTool(Tool):
-    """Minimal stand-in for ``sandbox_batch``: records ops, returns canned report."""
+class StubSandboxTool(Tool):
+    """Minimal stand-in for ``novita_sandbox``: records calls, returns canned output."""
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
     @property
     def name(self) -> str:
-        return "sandbox_batch"
+        return "novita_sandbox"
 
     @property
     def description(self) -> str:
@@ -136,17 +134,17 @@ class StubSandboxBatchTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "operations": {"type": "array"},
-                "stop_on_error": {"type": "boolean"},
+                "action": {"type": "string"},
+                "command": {"type": "string"},
+                "timeout": {"type": "integer"},
             },
-            "required": ["operations"],
+            "required": ["action"],
         }
 
-    async def execute(self, **kwargs: Any) -> Any:
+    async def execute(self, **kwargs: Any) -> Any:  # type: ignore[override]
         self.calls.append(kwargs)
-        ops = kwargs.get("operations") or [{}]
-        cmd = str(ops[0].get("command") or "")[:40]
-        return ToolResult(f"[sandbox_batch: 1 operation(s), 0 failure(s)]\nran: {cmd}")
+        cmd = str(kwargs.get("command") or "")[:40]
+        return ToolResult(f"[novita_sandbox: ran]\nran: {cmd}")
 
 
 class StubExecTool(Tool):
@@ -206,7 +204,7 @@ def _run_spec(provider: TaskRejectingProvider, text: str, *, tools: ToolRegistry
 @pytest.mark.asyncio
 async def test_bug_scan_answered_with_zero_provider_calls_via_sandbox() -> None:
     # Primary path: the recipe runs inside the sandbox where the user's code lives.
-    tool = StubSandboxBatchTool()
+    tool = StubSandboxTool()
     provider = TaskRejectingProvider()
     runner = AgentRunner()
     result = await runner.run(
@@ -217,12 +215,12 @@ async def test_bug_scan_answered_with_zero_provider_calls_via_sandbox() -> None:
     assert result.usage.get("deterministic") == 1
     assert result.usage.get("llm_calls") == 0
     assert result.stop_reason == "completed"
-    assert "py_compile" in tool.calls[0]["operations"][0]["command"]
+    assert "py_compile" in tool.calls[0]["command"]
 
 
 @pytest.mark.asyncio
 async def test_run_tests_answered_with_zero_provider_calls_via_sandbox() -> None:
-    tool = StubSandboxBatchTool()
+    tool = StubSandboxTool()
     provider = TaskRejectingProvider()
     runner = AgentRunner()
     result = await runner.run(
@@ -231,12 +229,12 @@ async def test_run_tests_answered_with_zero_provider_calls_via_sandbox() -> None
 
     assert provider.request_count == 0
     assert result.usage.get("deterministic") == 1
-    assert "pytest" in tool.calls[0]["operations"][0]["command"]
+    assert "pytest" in tool.calls[0]["command"]
 
 
 @pytest.mark.asyncio
 async def test_recipe_falls_back_to_exec_when_no_sandbox_registered() -> None:
-    # No sandbox_batch on this run but exec is present -> the runner re-targets
+    # No novita_sandbox on this run but exec is present -> the runner re-targets
     # the same read-only command to the local shell, still with ZERO LLM calls.
     exec_tool = StubExecTool()
     provider = TaskRejectingProvider()
@@ -252,7 +250,7 @@ async def test_recipe_falls_back_to_exec_when_no_sandbox_registered() -> None:
 
 @pytest.mark.asyncio
 async def test_unrouted_ask_falls_through_when_no_command_tool() -> None:
-    # A routed task but neither sandbox_batch nor exec registered -> must fall
+    # A routed task but neither novita_sandbox nor exec registered -> must fall
     # through untouched to the model, not crash.
     other_registry = ToolRegistry()
 

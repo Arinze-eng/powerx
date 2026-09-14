@@ -95,7 +95,6 @@ class TestSafetyGate:
     def test_coding_steps_are_safe(self) -> None:
         steps = [
             {"name": "novita_sandbox", "arguments": {"action": "run", "command": "ls"}},
-            {"name": "sandbox_batch", "arguments": {"operations": [{"action": "run", "command": "echo hi"}]}},
             {"name": "exec", "arguments": {"command": "pwd"}},
         ]
         assert plan_is_safe(steps)
@@ -148,19 +147,16 @@ class TestSubstitution:
     def test_nested_structures_walked(self) -> None:
         steps = [
             {
-                "name": "sandbox_batch",
+                "name": "novita_sandbox",
                 "arguments": {
-                    "operations": [
-                        {"action": "write", "path": "/tmp/Ada.txt"},
-                        {"action": "run", "command": "cat /tmp/Ada.txt"},
-                    ]
+                    "action": "run",
+                    "command": "cat /tmp/Ada.txt && echo Ada",
                 },
             }
         ]
         out = substitute_variables(steps, ["Ada"], ["Zainab"])
-        ops = out[0]["arguments"]["operations"]
-        assert ops[0]["path"] == "/tmp/Zainab.txt"
-        assert ops[1]["command"] == "cat /tmp/Zainab.txt"
+        cmd = out[0]["arguments"]["command"]
+        assert cmd == "cat /tmp/Zainab.txt && echo Zainab"
 
     def test_replayable_requires_same_template_and_var_count(self) -> None:
         plan_norm = normalize_task("add 3 and 5 together")

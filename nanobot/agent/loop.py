@@ -719,7 +719,7 @@ class AgentLoop:
         # Registered explicitly (not via auto-discovery) because it needs a
         # back-reference to the live registry so plan steps can invoke sibling
         # tools by name. Only offered when a sandbox backend is usable — the
-        # same condition that makes sandbox_batch available — since its whole
+        # same condition that gates sandbox access — since its whole
         # value is collapsing many sandbox/file operations into one model call.
         try:
             from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool

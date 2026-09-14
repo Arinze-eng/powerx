@@ -58,12 +58,12 @@ def _history(n_steps: int, *, payload: str | None = None) -> list[dict[str, Any]
                     {
                         "id": f"c{i}",
                         "type": "function",
-                        "function": {"name": "sandbox_batch", "arguments": "{}"},
+                        "function": {"name": "novita_sandbox", "arguments": "{}"},
                     }
                 ],
             }
         )
-        msgs.append({"role": "tool", "tool_call_id": f"c{i}", "name": "sandbox_batch", "content": body})
+        msgs.append({"role": "tool", "tool_call_id": f"c{i}", "name": "novita_sandbox", "content": body})
     return msgs
 
 

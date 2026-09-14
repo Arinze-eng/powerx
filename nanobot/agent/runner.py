@@ -658,7 +658,7 @@ class AgentRunner:
         # recurring, read-only *coding/workspace* task (bug scan, run tests,
         # project structure), answer it with a single deterministic command
         # recipe — ZERO provider calls. The recipe runs where the user's code
-        # lives: the sandbox (sandbox_batch -> Novita/VPS/Upstash) when the run
+        # lives: the sandbox (novita_sandbox -> Novita/VPS/Upstash) when the run
         # has one, else the local shell (exec). Fail-open: None falls through.
         if deterministic_call is None and spec.enable_deterministic_router and spec.deterministic_router_text:
             recipe_call = task_recipe_plan(spec.deterministic_router_text)
@@ -935,7 +935,7 @@ class AgentRunner:
 
                 # --- Zero-extra-call terminal completion --------------------
                 # When a tool result declares the task complete (terminal=True,
-                # e.g. sandbox_batch action=complete), the turn ENDS here: the
+                # e.g. novita_sandbox terminal result), the turn ENDS here: the
                 # tool already produced the user-facing final answer, so the
                 # usual "ask the model again for a closing message" round-trip
                 # is skipped entirely. One provider call for the whole task.
@@ -2279,7 +2279,7 @@ class AgentRunner:
     ) -> ToolCallRequest | None:
         """Pick the command runner that actually exists on this run.
 
-        The task router emits recipes targeting ``sandbox_batch`` because that
+        The task router emits recipes targeting ``novita_sandbox`` because that
         is where the user's project files live (Novita / VPS / Upstash sandbox).
         When a deployment has no sandbox tool but does expose the local shell,
         we transparently re-target the same read-only command to ``exec`` so the
@@ -2287,22 +2287,20 @@ class AgentRunner:
         returns None and the turn falls through to the normal LLM path — never
         a crash, never a wrong answer.
         """
-        if spec.tools.get("sandbox_batch") is not None:
+        if spec.tools.get("novita_sandbox") is not None:
             return recipe_call
         if spec.tools.get("exec") is None:
             return None
-        # Flatten the single {action:"run", command} op back into an exec call.
-        operations = recipe_call.arguments.get("operations") or []
-        if isinstance(operations, list) and len(operations) == 1:
-            op = operations[0]
-            if isinstance(op, dict) and str(op.get("action", "")).lower() == "run":
-                command = op.get("command")
-                if isinstance(command, str) and command.strip():
-                    timeout = op.get("timeout")
-                    args: dict[str, Any] = {"command": command}
-                    if isinstance(timeout, int):
-                        args["timeout"] = min(max(timeout, 1), 600)
-                    return ToolCallRequest(id=recipe_call.id, name="exec", arguments=args)
+        # Re-target the {action:"run", command} call onto the local shell.
+        args_raw = recipe_call.arguments
+        if isinstance(args_raw, dict) and str(args_raw.get("action", "")).lower() == "run":
+            command = args_raw.get("command")
+            if isinstance(command, str) and command.strip():
+                args: dict[str, Any] = {"command": command}
+                timeout = args_raw.get("timeout")
+                if isinstance(timeout, int):
+                    args["timeout"] = min(max(timeout, 1), 600)
+                return ToolCallRequest(id=recipe_call.id, name="exec", arguments=args)
         return None
 
 

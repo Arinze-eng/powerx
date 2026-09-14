@@ -30,26 +30,25 @@ describe("computeTaskStats", () => {
     expect(stats.filesCreated).toBe(1);
   });
 
-  it("expands sandbox_batch into per-op command counts", () => {
+  it("counts novita_sandbox actions by type", () => {
     const events: ToolProgressEvent[] = [
       {
         phase: "start",
-        call_id: "batch1",
-        name: "sandbox_batch",
-        arguments: {
-          ops: [
-            { action: "write", path: "run.sh" },
-            { action: "run", command: "./run.sh" },
-            { action: "run", command: "echo done" },
-            { action: "complete", summary: "all good" },
-          ],
-        },
+        call_id: "s1",
+        name: "novita_sandbox",
+        arguments: { action: "run", command: "echo done" },
+      },
+      {
+        phase: "start",
+        call_id: "s2",
+        name: "novita_sandbox",
+        arguments: { action: "write", path: "run.sh" },
       },
     ];
     const stats = computeTaskStats([traceMessage(events)]);
-    expect(stats.steps).toBe(1); // one batch invocation
-    expect(stats.commandsRun).toBe(3); // write + 2 runs (complete excluded)
-    expect(stats.filesCreated).toBe(1); // the write op
+    expect(stats.steps).toBe(2);
+    expect(stats.commandsRun).toBe(1); // the run action
+    expect(stats.filesCreated).toBe(1); // the write action
   });
 
   it("reads api calls from turn usage only when authoritative", () => {
@@ -142,7 +141,7 @@ describe("computeTaskStats", () => {
 
   it("uses the live streamed llm_calls while streaming, before turn_end", () => {
     const events: ToolProgressEvent[] = [
-      { phase: "start", call_id: "b1", name: "sandbox_batch", arguments: { ops: [{ action: "run" }] } },
+      { phase: "start", call_id: "b1", name: "novita_sandbox", arguments: { action: "run", command: "true" } },
     ];
     const msg = traceMessage(events);
     (msg as { liveLlmCalls?: number }).liveLlmCalls = 3;

@@ -1,8 +1,8 @@
 """Durable replay cache: an identical task answered once costs ZERO provider
 calls the next time.
 
-Manus-style cost discipline means ``sandbox_batch`` collapses an N-op task
-into ONE provider round-trip. But a *repeated* task - the same coding job
+Manus-style cost discipline means collapsing an N-step task into as few
+provider round-trips as possible. But a *repeated* task - the same coding job
 re-requested, a cron retry, a user re-sending the same build instruction -
 still pays that one call again. This cache fingerprints the task text and
 stores the completed answer; an exact repeat is served straight from disk

@@ -9,6 +9,7 @@ import re
 import shlex
 import threading
 from contextlib import suppress
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -606,7 +607,7 @@ class NovitaSandboxTool(Tool):
             "onlyfiles.com, larger files (up to ~200 MB) go to catbox.moe. Give the user that "
             "link instead of pasting raw file contents. Use the local path in the message "
             "tool's media parameter when direct attachment delivery is available. "
-            "For multi-step work, prefer the sandbox_batch tool so many operations "
+            "For multi-step work, prefer the run_plan tool so many operations "
             "cost one model call instead of one call per step."
         )
 

@@ -345,7 +345,7 @@ class ContextGovernor:
         if len(text) <= cls._STUB_MAX_CHARS:
             return None
 
-        from nanobot.agent.tools.batch_spill import extract_exit_code, informative_line
+        from nanobot.utils.output_digest import extract_exit_code, informative_line
 
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         meaningful = [ln for ln in lines if informative_line(ln)]

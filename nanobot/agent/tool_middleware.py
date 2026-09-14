@@ -1,8 +1,8 @@
 """Zero-call tool middleware: format, cache, and dedupe — no LLM round-trips.
 
 Manus-style cost discipline has three layers already: the deterministic router
-answers unambiguous read-only asks before any provider call, ``sandbox_batch``
-collapses N sandbox ops into one round-trip, and the replay cache serves an
+answers unambiguous read-only asks before any provider call, ``run_plan``
+collapses N tool calls into one round-trip, and the replay cache serves an
 identical *task* from disk. This module adds the fourth layer — everything that
 happens **after** a tool has run should never cost another API call unless it
 genuinely needs reasoning:

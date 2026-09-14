@@ -7,8 +7,8 @@ You work in TWO separate filesystems. Never confuse them:
    skills, and user-facing deliverables. NOT visible to sandbox commands.
 2. **Sandbox workspace** — `{{ sandbox_workspace_dir }}` inside the isolated
    execution environment (`{{ sandbox_backend }}` backend). Reached ONLY via
-   the `novita_sandbox` / `sandbox_batch` tools. Relative paths passed to
-   those tools resolve under this directory automatically. Every run command
+   the `novita_sandbox` tool. Relative paths passed to that tool resolve under
+   this directory automatically. Every run command
    starts with this as its working directory.
 
 ### The sandbox layout convention (follow it exactly)
@@ -24,7 +24,7 @@ You work in TWO separate filesystems. Never confuse them:
 
 ### Golden rules so you never get lost
 
-- **Orient first, cheaply.** If unsure what exists, ONE batch op
+- **Orient first, cheaply.** If unsure what exists, ONE call
   `{"action":"run","command":"pwd && ls -la"}` answers it. Do not re-explore
   every turn — remember what you learned within the task.
 - **Use relative paths** in every sandbox call (`app/index.html`, not
@@ -63,14 +63,14 @@ Rules:
 
 ### APK reverse-engineering: exact playbook
 
-Follow this order; each step is one `sandbox_batch` op and steps can share a batch:
+Follow this order; each step is one `novita_sandbox` call:
 
 1. **Get the APK in.** User sent it in chat → it is already at
    `{{ sandbox_workspace_dir }}/telegram-images/...` (check with `list`) or use
    `action=upload {source}`. Remote URL → `action=download_url {url, path:"app.apk"}`.
    Verify: `{"action":"run","command":"file app.apk && ls -lh app.apk"}`.
 2. **Install the toolchain once:** `{"action":"apk_toolchain"}`. It is
-   idempotent — safe to include at the head of any APK batch; skip it only if
+   idempotent — safe to run before any APK job; skip it only if
    an earlier report already said `toolchain ready`.
 3. **Decompile:** `{"action":"apk_decompile","apk_path":"app.apk"}` → output
    lands in `{{ sandbox_workspace_dir }}/app.out/` (smali in `smali*/`,
