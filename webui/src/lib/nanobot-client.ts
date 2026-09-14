@@ -8,6 +8,7 @@ import type {
   SessionMention,
   SidebarStatePayload,
   GoalStateWsPayload,
+  PlanStateWsPayload,
   WorkspaceScopePayload,
 } from "./types";
 import { createHostWebSocket } from "./runtime";
@@ -216,6 +217,8 @@ export class NanobotClient {
   private static readonly COMPLETED_TURN_FENCE_MAX = 256;
   /** Latest ``goal_state`` snapshot per ``chat_id`` (multi-session isolation). */
   private goalStateByChatId = new Map<string, GoalStateWsPayload>();
+  /** Latest ``plan_state`` snapshot per ``chat_id`` (deterministic plan progress). */
+  private planStateByChatId = new Map<string, PlanStateWsPayload>();
   private pendingNewChat: PendingChatRequest | null = null;
   private pendingTranscriptions = new Map<string, PendingRequest<string>>();
   private pendingSystemCommands = new Map<string, PendingRequest<void>>();
@@ -525,6 +528,16 @@ export class NanobotClient {
     return this.goalStateByChatId.get(chatId);
   }
 
+  /** Last ``plan_state`` payload for *chatId*, if any frame has arrived this connection. */
+  getPlanState(chatId: string): PlanStateWsPayload | undefined {
+    return this.planStateByChatId.get(chatId);
+  }
+
+  /** Forget the stored ``plan_state`` snapshot for *chatId* (e.g. on turn end). */
+  clearPlanState(chatId: string): void {
+    this.planStateByChatId.delete(chatId);
+  }
+
   private advanceRunGeneration(chatId: string, turnId?: string): void {
     this.runGenerationByChatId.set(chatId, this.getRunGeneration(chatId) + 1);
     if (turnId) {
@@ -745,6 +758,10 @@ export class NanobotClient {
     }
     if (ev.event === "turn_end" && ev.goal_state != null && typeof ev.goal_state === "object") {
       this.goalStateByChatId.set(chatId, ev.goal_state);
+      return;
+    }
+    if (ev.event === "plan_state") {
+      this.planStateByChatId.set(chatId, ev.plan);
     }
   }
 
@@ -1471,6 +1488,7 @@ export class NanobotClient {
     this.unsettledRunTurnIdsByChatId.delete(chatId);
     this.canonicalCompletedTurnIdsByChatId.delete(chatId);
     this.goalStateByChatId.delete(chatId);
+    this.planStateByChatId.delete(chatId);
     for (const key of [...this.runStartedAtByTurnKey.keys()]) {
       if (key.startsWith(`${chatId}\u0000`)) this.runStartedAtByTurnKey.delete(key);
     }

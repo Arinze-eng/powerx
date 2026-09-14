@@ -307,6 +307,21 @@ export interface GoalStateWsPayload {
   recap?: string;
 }
 
+/** One step of a live deterministic plan snapshot (`plan_state` events). */
+export interface PlanStepStatusPayload {
+  id: string;
+  text: string;
+  status: "pending" | "running" | "done" | "failed" | string;
+}
+
+/** WebSocket snapshot for deterministic plan progress (`plan_state` events; keyed by ``chat_id``). */
+export interface PlanStateWsPayload {
+  phase: "start" | "step" | "done" | "failed" | string;
+  steps: PlanStepStatusPayload[];
+  executed: number;
+  current?: number;
+}
+
 export interface ToolProgressEvent {
   version?: number;
   phase?: "start" | "end" | "error" | string;
@@ -1376,6 +1391,11 @@ export type InboundEvent =
       event: "goal_state";
       chat_id: string;
       goal_state: GoalStateWsPayload;
+    }
+  | {
+      event: "plan_state";
+      chat_id: string;
+      plan: PlanStateWsPayload;
     }
   | {
       event: "session_updated";

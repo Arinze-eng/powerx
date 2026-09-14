@@ -262,6 +262,8 @@ vi.mock("@/lib/nanobot-client", async (importOriginal) => {
     getRunStartedAt = () => null;
     getRunTurnId = () => null;
     getGoalState = () => undefined;
+    getPlanState = () => undefined;
+    clearPlanState = () => {};
     sendMessage = sendMessageSpy;
     newChat = vi.fn();
     newTemporaryChat = newTemporaryChatSpy;
