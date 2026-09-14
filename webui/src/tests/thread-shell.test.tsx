@@ -117,6 +117,8 @@ function makeClient() {
     canReconcileCanonicalCompletion,
     reconcileCanonicalCompletion,
     getGoalState: (chatId: string) => goalStateByChatId.get(chatId),
+    getPlanState: (chatId: string) => undefined,
+    clearPlanState: (_chatId: string) => {},
     onChat: (chatId: string, handler: (ev: import("@/lib/types").InboundEvent) => void) => {
       let handlers = chatHandlers.get(chatId);
       if (!handlers) {

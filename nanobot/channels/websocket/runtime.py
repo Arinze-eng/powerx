@@ -32,6 +32,7 @@ from nanobot.bus.events import (
 from nanobot.bus.outbound_events import (
     GoalStateSyncEvent,
     GoalStatusEvent,
+    PlanStateSyncEvent,
     ProgressEvent,
     RuntimeModelUpdatedEvent,
     SessionUpdatedEvent,
@@ -1941,7 +1942,8 @@ class WebSocketChannel(BaseChannel):
                 | TurnEndEvent
                 | SessionUpdatedEvent
                 | GoalStatusEvent
-                | GoalStateSyncEvent,
+                | GoalStateSyncEvent
+                | PlanStateSyncEvent,
             ):
                 self.logger.debug("no active subscribers for chat_id={}", msg.chat_id)
             else:
@@ -1967,6 +1969,10 @@ class WebSocketChannel(BaseChannel):
         if isinstance(event, GoalStateSyncEvent):
             if conns:
                 await self.send_goal_state(msg.chat_id, event.goal_state or {"active": False})
+            return
+        if isinstance(event, PlanStateSyncEvent):
+            if conns:
+                await self.send_plan_state(msg.chat_id, event.plan or {})
             return
         if isinstance(event, GoalStatusEvent):
             turn_id = (msg.metadata or {}).get(WEBUI_TURN_METADATA_KEY)
@@ -2284,6 +2290,16 @@ class WebSocketChannel(BaseChannel):
         raw = json.dumps(body, ensure_ascii=False)
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" goal_state ")
+
+    async def send_plan_state(self, chat_id: str, plan: dict[str, Any]) -> None:
+        """Push a live deterministic-plan step snapshot for *chat_id*."""
+        conns = list(self._subs.get(chat_id, ()))
+        if not conns:
+            return
+        body = {"event": "plan_state", "chat_id": chat_id, "plan": plan}
+        raw = json.dumps(body, ensure_ascii=False)
+        for connection in conns:
+            await self._safe_send_to(connection, raw, label=" plan_state ")
 
     async def send_goal_status(
         self,

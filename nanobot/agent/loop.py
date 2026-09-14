@@ -728,6 +728,7 @@ class AgentLoop:
             if NovitaSandboxTool.enabled(ctx) and not self.tools.has("run_plan"):
                 plan_tool = RunPlanTool()
                 plan_tool.bind_registry(self.tools)
+                plan_tool.bind_runtime_events(self.runtime_events)
                 self.tools.register(plan_tool)
                 registered.append("run_plan")
         except Exception:  # pragma: no cover - never let an optional tool break startup

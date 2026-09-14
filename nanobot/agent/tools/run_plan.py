@@ -23,6 +23,8 @@ from loguru import logger
 
 from nanobot.agent.plan_program import PlanProgramError, execute_plan, parse_plan
 from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.agent.tools.context import current_request_context
+from nanobot.bus.runtime_events import PlanStateChanged, RuntimeEventBus, RuntimeEventContext
 
 
 def _plan_json_len(plan: dict[str, Any]) -> int:
@@ -45,11 +47,17 @@ class RunPlanTool(Tool):
     def __init__(self) -> None:
         # Late-bound to the active registry so plan steps can invoke real tools.
         self._registry: Any | None = None
+        # Late-bound runtime-events bus for live plan-progress publishing.
+        self._runtime_events: RuntimeEventBus | None = None
 
     # -- binding ------------------------------------------------------------
     def bind_registry(self, registry: Any) -> None:
         """Attach the live ToolRegistry for this session's executions."""
         self._registry = registry
+
+    def bind_runtime_events(self, runtime_events: RuntimeEventBus | None) -> None:
+        """Attach the runtime-events bus used for live plan-progress updates."""
+        self._runtime_events = runtime_events
 
     @property
     def name(self) -> str:
@@ -145,7 +153,7 @@ class RunPlanTool(Tool):
             return await registry.execute(name, args)
 
         try:
-            result = await execute_plan(plan, _execute)
+            result = await execute_plan(plan, _execute, on_step=self._plan_step_publisher())
         except PlanProgramError as exc:
             logger.info("run_plan aborted, falling back to model: {}", exc)
             return ToolResult.error(
@@ -159,6 +167,36 @@ class RunPlanTool(Tool):
             )
 
         return self._render(result)
+
+    def _plan_step_publisher(self):
+        """Async callback publishing plan step progress as runtime events.
+
+        Returns ``None`` when no bus is bound so plan execution is unaffected.
+        """
+        runtime_events = self._runtime_events
+        if runtime_events is None:
+            return None
+
+        async def _on_step(payload: dict[str, Any]) -> None:
+            rc = current_request_context()
+            if rc is None:
+                return
+            cid = (rc.chat_id or "").strip()
+            if not cid:
+                return
+            await runtime_events.publish(
+                PlanStateChanged(
+                    context=RuntimeEventContext(
+                        channel=rc.channel,
+                        chat_id=cid,
+                        session_key=rc.session_key or f"{rc.channel}:{cid}",
+                        metadata=dict(rc.metadata or {}),
+                    ),
+                    plan=payload,
+                )
+            )
+
+        return _on_step
 
     @staticmethod
     def _render(result: Any) -> Any:
