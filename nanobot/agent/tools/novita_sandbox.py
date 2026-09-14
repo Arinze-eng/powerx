@@ -58,6 +58,8 @@ _MAX_IMAGE_ANALYSIS_RESULT_CHARS = 16_000
 # bounded or a cold/wedged box blocks the finished task's reply for minutes.
 _UPSTASH_SNAPSHOT_BUDGET = 150
 _UPSTASH_RELEASE_RESET_BUDGET = 90
+_DAYTONA_SNAPSHOT_BUDGET = 150
+_DAYTONA_RELEASE_RESET_BUDGET = 90
 _WORKSPACE = "/workspace"
 _OCR_DIR = f"{_WORKSPACE}/.nanobot"
 
@@ -1570,10 +1572,14 @@ class NovitaSandboxTool(Tool):
                     # TTL/auto-stop, so writes/reads keep their state across
                     # tasks, restarts, and sandbox recreation.
                     with suppress(Exception):
-                        await backend.snapshot_workspace()
+                        await asyncio.wait_for(
+                            backend.snapshot_workspace(), timeout=_DAYTONA_SNAPSHOT_BUDGET
+                        )
                     return
                 with suppress(Exception):
-                    await backend.reset(sandbox_id)
+                    await asyncio.wait_for(
+                        backend.reset(sandbox_id), timeout=_DAYTONA_RELEASE_RESET_BUDGET
+                    )
                 _DAYTONA_STORE.remove(key)
                 return
             if selected_backend != "upstash" or backend_config is None:

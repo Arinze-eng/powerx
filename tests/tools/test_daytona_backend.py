@@ -433,3 +433,102 @@ async def test_daytona_release_snapshots_when_persist_enabled(monkeypatch):
     await tool.release_upstash_sandbox(session_key="test-session")
     assert snapshotted["done"] is True
     assert reset_called["done"] is False
+
+
+@pytest.mark.asyncio
+async def test_daytona_error_prefers_message_over_generic_error():
+    """Verify _platform_request surfaces the descriptive message rather than Bad Request."""
+    backend = DaytonaExecutionBackend(_config(), sandbox_name="px-msg-test")
+    session = _FakeSession(
+        handler=lambda method, url, kwargs: _Response(
+            status=400,
+            payload={
+                "statusCode": 400,
+                "error": "Bad Request",
+                "message": "Total disk limit exceeded. Maximum allowed: 30GiB.",
+            },
+        )
+    )
+    with pytest.raises(DaytonaError) as exc_info:
+        await backend._platform_request(session, "POST", "/sandbox", body={})
+    assert "Total disk limit exceeded" in str(exc_info.value)
+    assert "Bad Request" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_ensure_sandbox_reclaims_and_retries_on_disk_limit():
+    """When POST /sandbox fails with disk limit exceeded (400), reap stopped sandboxes and retry."""
+    backend = DaytonaExecutionBackend(_config(), sandbox_name="px-disk-test")
+    deleted: list[str] = []
+    created: list[dict] = []
+    attempt = {"count": 0}
+
+    async def fake_find(session):
+        return None
+
+    async def fake_wait(session, sb_id, timeout=180):
+        backend._toolbox_url = "https://tb.test/sb-retried"
+        return {"id": "sb-retried", "state": "started"}
+
+    async def fake_platform_req(session, method, path, **kw):
+        if method == "GET" and path == f"/sandbox/{backend.sandbox_name}":
+            return None
+        if method == "POST" and path == "/sandbox":
+            attempt["count"] += 1
+            if attempt["count"] == 1:
+                raise DaytonaError("POST /sandbox failed with HTTP 400: Total disk limit exceeded. Maximum allowed: 30GiB.")
+            created.append(kw.get("body", {}))
+            return {"id": "sb-retried"}
+        if method == "GET" and path == "/sandbox":
+            # List of sandboxes in organization
+            return [
+                {"id": "sb-old-1", "name": "px-old-session-1", "state": "stopped", "disk": 10},
+                {"id": "sb-old-2", "name": "px-old-session-2", "state": "stopped", "disk": 10},
+                {"id": "sb-current", "name": "px-disk-test", "state": "creating", "disk": 3},
+            ]
+        if method == "DELETE":
+            deleted.append(path)
+            return {"ok": True}
+        return {}
+
+    monkeypatch_find = fake_find
+    backend.find_sandbox = monkeypatch_find
+    backend._platform_request = fake_platform_req
+    backend.wait_ready = fake_wait
+    backend.restore_workspace = lambda: None
+
+    class _Stub:
+        pass
+
+    sb_id = await backend.ensure_sandbox(_Stub())
+    assert sb_id == "sb-retried"
+    assert attempt["count"] == 2
+    # Two stopped px-* sandboxes must have been deleted to free space
+    assert any("sb-old-1" in d or "px-old-session-1" in d for d in deleted)
+    assert any("sb-old-2" in d or "px-old-session-2" in d for d in deleted)
+    assert not any("px-disk-test" in d for d in deleted)
+
+
+@pytest.mark.asyncio
+async def test_find_sandbox_deletes_terminal_state():
+    """A sandbox in terminal state (deleted/failed/error) must be cleaned up to free disk and name."""
+    backend = DaytonaExecutionBackend(_config(), sandbox_name="px-terminal-test")
+    deleted: list[str] = []
+
+    async def fake_platform_req(session, method, path, **kw):
+        if method == "GET":
+            return {"id": "sb-failed-123", "name": "px-terminal-test", "state": "error"}
+        if method == "DELETE":
+            deleted.append(path)
+            return {"ok": True}
+        return {}
+
+    backend._platform_request = fake_platform_req
+
+    class _Stub:
+        pass
+
+    result = await backend.find_sandbox(_Stub())
+    assert result is None
+    assert any("sb-failed-123" in d for d in deleted)
+

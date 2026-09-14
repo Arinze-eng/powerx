@@ -302,7 +302,11 @@ class DaytonaExecutionBackend:
                 if resp.status == 404:
                     return None
                 if resp.status >= 400:
-                    detail = str(data.get("error") or data.get("message") or text)[:300]
+                    # Daytona returns {"statusCode": 400, "error": "Bad Request", "message": "Total disk limit exceeded..."}
+                    # Prefer the informative 'message' over the generic 'error' status phrase.
+                    msg = data.get("message")
+                    err = data.get("error")
+                    detail = str(msg or err or text)[:300]
                     raise DaytonaError(f"{method} {path} failed with HTTP {resp.status}: {detail}")
                 return data
         except aiohttp.ClientError as exc:
@@ -382,6 +386,12 @@ class DaytonaExecutionBackend:
             return None
         state = str(data.get("state") or "").lower()
         if state in _TERMINAL_STATES:
+            # Clean up the terminal sandbox so its name and disk are freed server-side.
+            target = str(data.get("id") or self.sandbox_name)
+            try:
+                await self._platform_request(session, "DELETE", f"/sandbox/{quote(target, safe='')}", timeout=30)
+            except Exception:
+                pass
             return None
         return data
 
@@ -475,7 +485,28 @@ class DaytonaExecutionBackend:
         if self.auto_stop_minutes > 0:
             body["autoStopInterval"] = self.auto_stop_minutes
 
-        created = await self._platform_request(session, "POST", "/sandbox", body=body, timeout=90)
+        try:
+            created = await self._platform_request(session, "POST", "/sandbox", body=body, timeout=90)
+        except DaytonaError as exc:
+            err_msg = str(exc).lower()
+            if "disk limit" in err_msg or "limit exceeded" in err_msg or "400" in err_msg:
+                # Total disk limit exceeded (30GiB cap) or Bad Request on create:
+                # reap stopped/orphaned sandboxes from earlier sessions and retry.
+                reclaimed = await self.reclaim_orphaned_sandboxes(session)
+                if reclaimed > 0:
+                    created = await self._platform_request(session, "POST", "/sandbox", body=body, timeout=90)
+                else:
+                    raise
+            elif "409" in err_msg or "already exists" in err_msg:
+                # Name conflict: sandbox exists server-side; fetch and wait ready
+                existing_meta = await self._platform_request(session, "GET", f"/sandbox/{quote(self.sandbox_name, safe='')}", timeout=30)
+                if isinstance(existing_meta, dict):
+                    created = existing_meta
+                else:
+                    raise
+            else:
+                raise
+
         if not isinstance(created, dict):
             raise DaytonaError("Daytona sandbox create returned invalid response")
         sandbox_id = str(created.get("id") or self.sandbox_name)
@@ -490,6 +521,45 @@ class DaytonaExecutionBackend:
             except Exception:
                 pass  # best-effort: a missing/unreadable snapshot is not fatal
         return self.last_sandbox_id
+
+    async def reclaim_orphaned_sandboxes(
+        self, session: aiohttp.ClientSession, keep_names: set[str] | None = None
+    ) -> int:
+        """Reap stopped or terminal sandboxes to free up organization disk quota.
+
+        Daytona's 30 GiB account limit counts all stopped sandboxes. When sandboxes
+        accumulate over sessions, this removes inactive ones so new sandboxes can
+        be created without manual intervention.
+        """
+        keep = set(keep_names or ())
+        keep.add(self.sandbox_name)
+        keep.add(self._archive_sandbox_name())
+        deleted_count = 0
+        try:
+            raw = await self._platform_request(session, "GET", "/sandbox", timeout=30)
+            items = (raw.get("items") if isinstance(raw, dict) else raw) if isinstance(raw, (dict, list)) else []
+            if not isinstance(items, list):
+                return 0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "")
+                sid = str(item.get("id") or "")
+                state = str(item.get("state") or "").lower()
+                labels = item.get("labels") or {}
+                is_px = name.startswith("px-") or (isinstance(labels, dict) and labels.get("app") == "powerx")
+                if not is_px or name in keep:
+                    continue
+                if state in (_RESUMABLE_STATES | _TERMINAL_STATES | {"stopped", "archived", "error", "failed"}):
+                    try:
+                        target = sid or name
+                        await self._platform_request(session, "DELETE", f"/sandbox/{quote(target, safe='')}", timeout=30)
+                        deleted_count += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return deleted_count
 
     async def delete_sandbox(self, sandbox_id_or_name: str) -> None:
         """Permanently delete a Daytona sandbox."""
@@ -694,6 +764,8 @@ class DaytonaExecutionBackend:
                 target = str((existing or {}).get("id") or self.sandbox_name)
             if target:
                 await self._platform_request(session, "DELETE", f"/sandbox/{quote(target, safe='')}", timeout=60)
+            # Reclaim any leftover stopped sandboxes to keep the 30 GiB quota free.
+            await self.reclaim_orphaned_sandboxes(session)
 
     # ---------------------------------------------------------------- persist
 
