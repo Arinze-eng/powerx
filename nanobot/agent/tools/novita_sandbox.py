@@ -264,6 +264,38 @@ print(json.dumps({"content": content}, ensure_ascii=False))
 '''
 
 
+class SandboxBusyError(RuntimeError):
+    """Raised when a per-session sandbox lock cannot be acquired in time."""
+
+
+class _BoundedSectionLock:
+    """`async with` adapter that bounds *acquiring* the underlying asyncio.Lock.
+
+    The raw lock is fine once held; the danger is a stuck holder (a hung HTTP
+    call, an OCR run that outlived its budget) making every later sandbox call
+    for the same session queue forever with no error and no output — to the
+    user that reads as "the AI hangs". Acquisition is now capped; on timeout we
+    raise SandboxBusyError so the model gets an actionable message instead.
+    """
+
+    __slots__ = ("_lock", "_timeout")
+
+    def __init__(self, lock: asyncio.Lock, timeout: float) -> None:
+        self._lock = lock
+        self._timeout = timeout
+
+    async def __aenter__(self) -> None:
+        try:
+            await asyncio.wait_for(self._lock.acquire(), timeout=self._timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            raise SandboxBusyError(
+                "another sandbox operation for this session is still running"
+            ) from None
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self._lock.release()
+
+
 class _SandboxStore:
     """In-memory handles with a small disk index so sessions can resume after a restart."""
 
@@ -299,9 +331,10 @@ class _SandboxStore:
         except (OSError, ValueError):
             pass
 
-    def lock_for(self, key: str) -> asyncio.Lock:
+    def lock_for(self, key: str, *, timeout: float = 960.0) -> "_BoundedSectionLock":
         with self._lock:
-            return self._locks.setdefault(key, asyncio.Lock())
+            lock = self._locks.setdefault(key, asyncio.Lock())
+        return _BoundedSectionLock(lock, timeout)
 
     def get(self, key: str) -> Any | None:
         with self._lock:
@@ -1652,6 +1685,11 @@ class NovitaSandboxTool(Tool):
                         "raw text."
                     )
             return ToolResult.error("Unknown sandbox action")
+        except SandboxBusyError:
+            return ToolResult.error(
+                "A previous sandbox operation for this session is still running and did not finish in time. "
+                "Wait a moment, then either retry the same step or reset the sandbox first."
+            )
         except DaytonaError as exc:
             logger.warning("Daytona sandbox operation failed: {}", str(exc)[:300])
             return ToolResult.error(f"Daytona sandbox error: {str(exc)[:500]}")
@@ -1766,6 +1804,11 @@ class NovitaSandboxTool(Tool):
                         "raw text."
                     )
             return ToolResult.error("Unknown sandbox action")
+        except SandboxBusyError:
+            return ToolResult.error(
+                "A previous Upstash Box operation for this session is still running and did not finish in time. "
+                "Wait a moment, then either retry the same step or reset the sandbox first."
+            )
         except UpstashError as exc:
             logger.warning("Upstash Box operation failed: {}", str(exc)[:300])
             return ToolResult.error(f"Upstash Box error: {str(exc)[:500]}")

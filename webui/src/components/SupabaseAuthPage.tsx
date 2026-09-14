@@ -38,7 +38,7 @@ export function SupabaseAuthPage({
   failed?: boolean;
   message?: string;
   onSignIn: (email: string, password: string) => Promise<{ error?: string }>;
-  onSignUp: (name: string, email: string, password: string) => Promise<{ error?: string }>;
+  onSignUp: (name: string, email: string, password: string, referral?: string) => Promise<{ error?: string }>;
   onBack?: () => void;
   onPrivacy?: () => void;
   initialMode?: Mode;
@@ -47,6 +47,7 @@ export function SupabaseAuthPage({
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [referral, setReferral] = useState("");
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState<string | null>(
@@ -80,7 +81,7 @@ export function SupabaseAuthPage({
     setLocalError(null);
     const res =
       mode === "signup"
-        ? await onSignUp(cleanName, cleanEmail, password)
+        ? await onSignUp(cleanName, cleanEmail, password, referral.trim() || undefined)
         : await onSignIn(cleanEmail, password);
     if (res.error) {
       setLocalError(res.error);
@@ -229,6 +230,28 @@ export function SupabaseAuthPage({
                 </button>
               </div>
             </div>
+
+            {mode === "signup" ? (
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium text-white/80" htmlFor="supabase-referral">
+                  Referral code <span className="text-white/40">(optional)</span>
+                </label>
+                <input
+                  id="supabase-referral"
+                  name="referral"
+                  type="text"
+                  value={referral}
+                  onChange={(e) => { setReferral(e.target.value); setLocalError(null); }}
+                  disabled={submitting}
+                  placeholder="friend@gmail.com"
+                  autoComplete="off"
+                  className={inputCls}
+                />
+                <p className="text-xs text-white/40">
+                  Enter your friend&apos;s email as a referral code and get 700 bonus credits. Each code works once.
+                </p>
+              </div>
+            ) : null}
 
             {localError ? (
               <p role="alert" className="rounded-control border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">

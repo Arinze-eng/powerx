@@ -1186,7 +1186,7 @@ export default function App() {
   );
 
   const handleSupabaseSignUp = useCallback(
-    async (url: string, anonKey: string, name: string, email: string, password: string) => {
+    async (url: string, anonKey: string, name: string, email: string, password: string, referral?: string) => {
       // Defense-in-depth: if this browser already holds a signed-in Supabase
       // session, creating another account here would let one person farm the
       // credit sign-up bonus repeatedly. Require sign-out first.
@@ -1206,6 +1206,22 @@ export default function App() {
           return { error: "You already have an active session in this browser. Please sign out first." };
         }
       }
+      // SERVER-side anti-abuse gate: the signup-gate edge function re-checks
+      // this device fingerprint + network server-side, so clearing browser
+      // data cannot bypass the one-account-per-device rule. Fails open, so a
+      // gate outage never blocks a genuine signup.
+      if (url && anonKey) {
+        const { serverGateSignup } = await import("@/lib/anti-loot");
+        const gate = await serverGateSignup(url, anonKey, email, referral);
+        if (!gate.allowed) {
+          setState((current) =>
+            current.status === "supabase"
+              ? { ...current, failed: true, message: gate.reason }
+              : current,
+          );
+          return { error: gate.reason };
+        }
+      }
       const { session, error } = await signUp(url, anonKey, email, password, name);
       if (error || !session) {
         setState((current) =>
@@ -1216,6 +1232,20 @@ export default function App() {
         return { error: error ?? "Sign-up failed" };
       }
       bootstrapWithSupabaseToken(session.access_token, session.user?.email);
+      // Referral claim: a referral code IS the referrer's email; a valid,
+      // still-unused code grants the new account 700 bonus credits. Run AFTER
+      // bootstrap so the profile exists and the session is fully established.
+      if (referral && url && anonKey) {
+        try {
+          const { claimReferral } = await import("@/lib/supabase-auth");
+          const claim = await claimReferral(url, anonKey, session.access_token, referral);
+          if (!claim.ok) {
+            console.warn("Referral claim failed:", claim.error);
+          }
+        } catch (e) {
+          console.warn("Referral claim failed:", e);
+        }
+      }
       return { error: undefined };
     },
     [bootstrapWithSupabaseToken],

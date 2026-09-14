@@ -357,3 +357,37 @@ export async function verifyPayment(
     return { ok: false, error: err instanceof Error ? err.message : "Payment verification failed" };
   }
 }
+/**
+ * Claim the 700-credit referral bonus for a freshly created account.
+ *
+ * A referral code IS the referrer's email address; each code works exactly
+ * once. Must be called right after a successful signUp, with the NEW user's
+ * access token. Server-side (referral-claim edge function) re-validates
+ * everything: single use, no self-referral, brand-new accounts only.
+ */
+export async function claimReferral(
+  url: string,
+  anonKey: string,
+  accessToken: string,
+  referral: string,
+): Promise<{ ok: boolean; credits?: number; error?: string }> {
+  const base = url.replace(/\/+$/, "");
+  try {
+    const resp = await fetch(`${base}/functions/v1/referral-claim`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: anonKey,
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ referral: (referral || "").trim() }),
+    });
+    const data = (await resp.json().catch(() => ({}))) as { ok?: boolean; credits?: number; error?: string };
+    if (!resp.ok || !data.ok) {
+      return { ok: false, error: data.error ?? "Referral claim failed." };
+    }
+    return { ok: true, credits: data.credits };
+  } catch {
+    return { ok: false, error: "Referral claim failed." };
+  }
+}

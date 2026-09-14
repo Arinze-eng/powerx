@@ -207,3 +207,49 @@ export function guardSignup(email: string): AntiLootDecision {
   writeRecord({ fingerprint, createdEmails: [...recent, { email: normalized, at: now }] });
   return { allowed: true };
 }
+/**
+ * SERVER-side signup gate. Mirrors the local guard but the records live in
+ * Supabase (public.signup_attestations), so clearing browser data no longer
+ * resets them: the same device fingerprint and IP are re-checked by the
+ * signup-gate edge function on every signup. Fails OPEN so a gate outage can
+ * never trap a genuine user — Supabase auth remains the final authority.
+ */
+export type ServerGateDecision =
+  | { allowed: true; referralValid?: boolean; referralReason?: string }
+  | { allowed: false; reason: string };
+
+export async function serverGateSignup(
+  supabaseUrl: string,
+  anonKey: string,
+  email: string,
+  referral?: string,
+): Promise<ServerGateDecision> {
+  try {
+    const base = supabaseUrl.replace(/\/+$/, "");
+    const resp = await fetch(`${base}/functions/v1/signup-gate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: anonKey },
+      body: JSON.stringify({
+        email: (email || "").trim(),
+        fingerprint: computeBrowserFingerprint(),
+        referral: (referral || "").trim(),
+      }),
+    });
+    if (!resp.ok) {
+      const data = (await resp.json().catch(() => ({}))) as { reason?: string };
+      if (resp.status === 403 && data.reason) return { allowed: false, reason: data.reason };
+      // Any other failure degrades to "allow" (fail-open).
+      return { allowed: true };
+    }
+    const data = (await resp.json()) as {
+      ok: boolean;
+      reason?: string;
+      referralValid?: boolean;
+      referralReason?: string;
+    };
+    if (!data.ok && data.reason) return { allowed: false, reason: data.reason };
+    return { allowed: true, referralValid: data.referralValid, referralReason: data.referralReason };
+  } catch {
+    return { allowed: true };
+  }
+}

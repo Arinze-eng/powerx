@@ -41,6 +41,13 @@ _MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 _MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 _MAX_TIMEOUT = 900
 
+# Upstash's synchronous exec endpoint is capped at 5 minutes server-side and
+# accepts no timeout parameter. Anything we send must therefore finish well
+# inside that window: we wrap commands with coreutils `timeout` (mirroring the
+# official SDK) and hard-cap the exec budget below the server-side limit. A
+# command killed by the wrapper exits 124, which callers surface verbatim.
+_MAX_SYNC_EXEC_TIMEOUT = 270
+
 # Upstash boxes keep their working files under this workspace root.
 WORKSPACE = "/workspace/home"
 
@@ -211,6 +218,13 @@ class UpstashExecutionBackend:
                 return data
         except aiohttp.ClientError as exc:
             raise UpstashError(f"Upstash Box transport error: {type(exc).__name__}") from None
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            # A wall-clock timeout on ANY Upstash call must surface as a typed
+            # UpstashError (never a bare asyncio.TimeoutError) so callers retry
+            # coherently instead of seeing a foreign exception type.
+            raise UpstashError(
+                f"Upstash Box request timed out (budget={timeout + 30}s)"
+            ) from None
 
     # --------------------------------------------------------------- lifecycle
 
@@ -317,12 +331,20 @@ class UpstashExecutionBackend:
     # ------------------------------------------------------------------ exec
 
     async def _exec(self, session: aiohttp.ClientSession, box_id: str, command: str, timeout: int) -> dict[str, Any]:
+        # Cap the effective budget below Upstash's 5-minute server-side cap and
+        # enforce it INSIDE the box with coreutils `timeout` (the sync endpoint
+        # has no timeout parameter). This is what keeps a runaway or never-
+        # exiting command from holding the HTTP request (and the AI's turn)
+        # open for many minutes: the shell wrapper kills it at the budget and
+        # the endpoint returns promptly with exit code 124.
+        bounded = max(1, min(int(timeout), _MAX_SYNC_EXEC_TIMEOUT))
+        wrapped = f"timeout {bounded} sh -c {shlex.quote(command)}"
         result = await self._request(
             session,
             "POST",
             f"/v2/box/{box_id}/exec",
-            body={"command": ["sh", "-c", command]},
-            timeout=min(timeout, _MAX_TIMEOUT) + 30,
+            body={"command": ["sh", "-c", wrapped]},
+            timeout=bounded + 30,
         )
         return result if isinstance(result, dict) else {"output": str(result)}
 
@@ -489,18 +511,47 @@ class UpstashExecutionBackend:
         cleaned = [item for item in packages if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+_.:@~=-]{0,127}", item)]
         if not cleaned:
             raise ValueError("no valid package names supplied")
-        quoted = " ".join(shlex.quote(item) for item in cleaned)
-        command = (
+
+        def _manager_clause(quoted: str) -> str:
+            return (
+                "if command -v apt-get >/dev/null 2>&1; then apt-get install -y -qq "
+                + quoted
+                + "; elif command -v apk >/dev/null 2>&1; then apk add --no-cache "
+                + quoted
+                + "; elif command -v dnf >/dev/null 2>&1; then dnf install -y "
+                + quoted
+                + "; else echo 'no supported package manager found' >&2; exit 127; fi"
+            )
+
+        # The sync exec endpoint is capped at 5 minutes server-side, so one
+        # giant "apt-get update && apt-get install a b c ..." command could be
+        # killed mid-flight and leave the caller hanging on a partial install.
+        # Instead: refresh the index once (bounded), then install each package
+        # as its own bounded exec and stop at the first real failure. Every
+        # request stays far below the cap, which also keeps long installs from
+        # reading as an infinite hang to the model.
+        per_call = _MAX_SYNC_EXEC_TIMEOUT
+        update_cmd = (
             "export DEBIAN_FRONTEND=noninteractive; "
-            "if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq "
-            + quoted
-            + "; elif command -v apk >/dev/null 2>&1; then apk add --no-cache "
-            + quoted
-            + "; elif command -v dnf >/dev/null 2>&1; then dnf install -y "
-            + quoted
-            + "; else echo 'no supported package manager found' >&2; exit 127; fi"
+            "if command -v apt-get >/dev/null 2>&1; then apt-get update -qq; "
+            "elif command -v apk >/dev/null 2>&1; then true; "
+            "elif command -v dnf >/dev/null 2>&1; then true; "
+            "fi"
         )
-        return await self.run(command, timeout=min(timeout, _MAX_TIMEOUT))
+        chunks: list[str] = []
+        for item in cleaned:
+            chunks.append(_manager_clause(shlex.quote(item)))
+        outputs: list[str] = []
+        update_out = await self.run(update_cmd, timeout=per_call)
+        if "[exit_code=" in update_out and "exit_code=0" not in update_out:
+            return f"Upstash Box package installation result:\n[index refresh]\n{update_out}"
+        for index, clause in enumerate(chunks):
+            out = await self.run(clause, timeout=per_call)
+            outputs.append(f"[{cleaned[index]}]\n{out}")
+            if "[exit_code=" in out and "exit_code=0" not in out:
+                outputs.append("[remaining packages skipped because an install failed]")
+                break
+        return f"Upstash Box package installation result:\n" + "\n".join(outputs)
 
     async def test_connection(self) -> dict[str, Any]:
         async with aiohttp.ClientSession() as session:

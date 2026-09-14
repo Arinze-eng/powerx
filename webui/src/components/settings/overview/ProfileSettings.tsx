@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   BadgeCheck,
   Coins,
@@ -33,6 +33,7 @@ export function ProfileSettings() {
   const { t } = useTranslation();
   const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
 
+  const [referralUsedAt, setReferralUsedAt] = useState<string | null | undefined>(undefined);
   const [txRef, setTxRef] = useState("");
   const [transactionId, setTransactionId] = useState("");
   const [verifying, setVerifying] = useState(false);
@@ -50,6 +51,31 @@ export function ProfileSettings() {
   const credits = user.credits;
   const packages = user.paymentPackages ?? [];
   const paymentUrl = user.paymentUrl ?? "";
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const auth = await import("@/lib/supabase-auth");
+        const token = await auth.getSessionToken(user.supabaseUrl!, user.anonKey!);
+        if (!token || cancelled) return;
+        const base = user.supabaseUrl!.replace(/\/+$/, "");
+        const code = encodeURIComponent((user.email || "").trim().toLowerCase());
+        const resp = await fetch(
+          `${base}/rest/v1/referrals?code=eq.${code}&select=used_at&limit=1`,
+          { headers: { apikey: user.anonKey!, Authorization: `Bearer ${token}` } },
+        );
+        if (!resp.ok || cancelled) return;
+        const rows = (await resp.json()) as { used_at: string | null }[];
+        if (!cancelled) setReferralUsedAt(Array.isArray(rows) && rows.length > 0 ? rows[0].used_at : null);
+      } catch {
+        if (!cancelled) setReferralUsedAt(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user.supabaseUrl, user.anonKey, user.email]);
 
   const handleVerify = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -129,6 +155,43 @@ export function ProfileSettings() {
           </SettingsRow>
         ) : null}
       </SettingsGroup>
+
+      <div className="mt-5">
+        <SettingsSectionTitle>{tx("settings.profile.referral", "Referral")}</SettingsSectionTitle>
+        <SettingsGroup>
+          <SettingsRow
+            title={tx("settings.profile.referralCode", "Your referral code")}
+            description={tx(
+              "settings.profile.referralCodeHint",
+              "Your referral code is your email address. A friend who signs up with it gets 700 bonus credits.",
+            )}
+          >
+            <span className="inline-flex items-center gap-1.5 text-[13px] font-medium text-foreground">
+              <Coins className="h-3.5 w-3.5 text-amber-600 dark:text-amber-300" aria-hidden />
+              <span className="truncate">{user.email || "—"}</span>
+            </span>
+          </SettingsRow>
+          <SettingsRow
+            title={tx("settings.profile.referralStatus", "Code status")}
+            description={tx(
+              "settings.profile.referralStatusHint",
+              "Each referral code works exactly once and cannot be reused after it is used.",
+            )}
+          >
+            <span className="inline-flex items-center gap-1.5 text-[13px] text-muted-foreground">
+              <ShieldCheck className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-300" aria-hidden />
+              {referralUsedAt === undefined
+                ? "…"
+                : referralUsedAt
+                  ? tx(
+                      "settings.profile.referralUsed",
+                      `Used on ${new Date(referralUsedAt).toLocaleDateString()}`,
+                    )
+                  : tx("settings.profile.referralAvailable", "Available — not used yet")}
+            </span>
+          </SettingsRow>
+        </SettingsGroup>
+      </div>
 
       {packages.length ? (
         <div className="mt-5">
