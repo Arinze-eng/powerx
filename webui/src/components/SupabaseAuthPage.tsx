@@ -50,6 +50,7 @@ export function SupabaseAuthPage({
   const [referral, setReferral] = useState("");
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [success, setSuccess] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(
     failed ? (message ?? "Invalid credentials. Please try again.") : null,
   );
@@ -179,7 +180,7 @@ export function SupabaseAuthPage({
                   id="supabase-name"
                   name="name"
                   value={name}
-                  onChange={(e) => { setName(e.target.value); setLocalError(null); }}
+                  onChange={(e) => { setName(e.target.value); setLocalError(null); setSuccess(null); }}
                   disabled={submitting}
                   placeholder="Your full name"
                   autoComplete="name"
@@ -196,7 +197,7 @@ export function SupabaseAuthPage({
                 name="email"
                 type="email"
                 value={email}
-                onChange={(e) => { setEmail(e.target.value); setLocalError(null); }}
+                onChange={(e) => { setEmail(e.target.value); setLocalError(null); setSuccess(null); }}
                 disabled={submitting}
                 placeholder="you@example.com"
                 autoComplete="email"
@@ -251,6 +252,12 @@ export function SupabaseAuthPage({
                   Enter your friend&apos;s email as a referral code and get 700 bonus credits. Each code works once.
                 </p>
               </div>
+            ) : null}
+
+            {success ? (
+              <p role="status" className="rounded-control border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200">
+                {success}
+              </p>
             ) : null}
 
             {localError ? (

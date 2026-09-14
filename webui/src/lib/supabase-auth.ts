@@ -32,7 +32,10 @@ export function getSupabaseClient(url: string, anonKey: string): SupabaseClient 
       auth: {
         persistSession: true,
         autoRefreshToken: true,
-        detectSessionInUrl: false,
+        // When Supabase's verification email lands the user back on this app
+        // (?code=... or #access_token=...), exchange it and open their session
+        // automatically instead of dumping them on the login form.
+        detectSessionInUrl: true,
         storageKey: "nanobot-webui.supabase-session",
       },
     });
@@ -192,18 +195,29 @@ export async function signUp(
   email: string,
   password: string,
   name: string,
-): Promise<{ session?: SessionLike; error?: string }> {
+): Promise<{ session?: SessionLike; error?: string; verifyEmail?: boolean }> {
   const client = getSupabaseClient(url, anonKey);
   ensureAuthListener(client);
   const { data, error } = await client.auth.signUp({
     email,
     password,
-    options: { data: { name: name?.trim() || "Web UI User", role: "user", source: "webui" } },
+    options: {
+      data: { name: name?.trim() || "Web UI User", role: "user", source: "webui" },
+      // After the user clicks the verification link in their email, send them
+      // back here so the app picks the session up and signs them in.
+      emailRedirectTo: `${window.location.origin}/`,
+    },
   });
   if (error) {
     // A confirmed-existing account returns an error-like object in some cases;
     // surface SDK errors.
     return { error: error.message };
+  }
+  if (!data.session && data.user) {
+    // Email confirmation is enabled: the account EXISTS but cannot log in
+    // until the user clicks the verification link. This is SUCCESS, not a
+    // failure — the caller must show "check your email", not "Sign-up failed".
+    return { verifyEmail: true };
   }
   if (data.session) {
     _currentAccessToken = data.session.access_token;

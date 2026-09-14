@@ -1222,14 +1222,27 @@ export default function App() {
           return { error: gate.reason };
         }
       }
-      const { session, error } = await signUp(url, anonKey, email, password, name);
-      if (error || !session) {
+      const { session, error, verifyEmail } = await signUp(url, anonKey, email, password, name);
+      if (error) {
         setState((current) =>
           current.status === "supabase"
-            ? { ...current, failed: true, message: error ?? "Sign-up failed" }
+            ? { ...current, failed: true, message: error }
             : current,
         );
-        return { error: error ?? "Sign-up failed" };
+        return { error };
+      }
+      if (verifyEmail || !session) {
+        // Email confirmation is ON: the account was created and a verification
+        // email was sent. This is a SUCCESS — tell the user to check their
+        // email instead of the old "Sign-up failed" dead end.
+        const notice =
+          "Account created! We sent a verification link to your email. Open it to activate your account, then sign in.";
+        setState((current) =>
+          current.status === "supabase"
+            ? { ...current, failed: false, message: notice }
+            : current,
+        );
+        return { verifyEmail: true };
       }
       bootstrapWithSupabaseToken(session.access_token, session.user?.email);
       // Referral claim: a referral code IS the referrer's email; a valid,
@@ -1298,6 +1311,11 @@ export default function App() {
           void refreshReadyClient(state.client, state.runtimeSurface).catch(() => {
             // best-effort; the periodic refresh and reconnect reauth handle retries
           });
+        } else if (token && state.status !== "ready") {
+          // Email-verification redirect (and any SDK-detected sign-in) lands on
+          // a page that has NOT bootstrapped yet: fire the Supabase bootstrap
+          // here so the verified user goes straight into the app.
+          void bootstrapWithSupabaseToken(token);
         }
         return;
       }
