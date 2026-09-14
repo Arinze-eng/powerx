@@ -429,7 +429,17 @@ class UpstashExecutionBackend:
         try:
             archive = self._archive_backend()
             async with aiohttp.ClientSession() as session:
-                archive_id = await archive.ensure_box(session)
+                # Fast skip: if the archive box does not exist yet, no snapshot
+                # was ever stored. Return WITHOUT creating one — creating a box
+                # here just to learn there is nothing to restore added minutes
+                # to every cold start, which users experienced as "the AI hangs
+                # in the sandbox" on the first command after box recreation.
+                existing_archive = await archive.find_box(session)
+                if existing_archive is None:
+                    return False
+                archive_id = str(existing_archive.get("id") or "")
+                if not archive_id:
+                    return False
                 data = await archive._read_box_bytes(
                     session,
                     archive_id,
@@ -445,7 +455,7 @@ class UpstashExecutionBackend:
                     box_id,
                     f"tar xzf {shlex.quote(staged)} -C {shlex.quote(self.workspace)} "
                     f"2>/dev/null || true; rm -f {shlex.quote(staged)}",
-                    300,
+                    180,
                 )
         except UpstashError:
             return False

@@ -532,8 +532,9 @@ async def _install_tesseract_resilient(backend: Any) -> bool:
         required=["action"],
         additional_properties=None,
         action=StringSchema(
-            "Operation: run, read, write, upload, fetch_url, list, download_url, or reset",
-            enum=["run", "read", "write", "upload", "fetch_url", "list", "download_url", "reset"],
+            "Operation: run, read, write, upload, fetch_url, install, list, download_url, apk_toolchain, apk_decompile, apk_build, or reset",
+            enum=["run", "read", "write", "upload", "fetch_url", "install", "list", "download_url",
+                  "apk_toolchain", "apk_decompile", "apk_build", "reset"],
         ),
         command=StringSchema("Command to run inside the remote sandbox"),
         path=StringSchema("Sandbox path, relative paths resolve under /workspace"),
@@ -541,6 +542,9 @@ async def _install_tesseract_resilient(backend: Any) -> bool:
         content=StringSchema("Text content for write"),
         timeout=IntegerSchema(description="Command timeout in seconds", minimum=1, maximum=_MAX_TIMEOUT),
         source=StringSchema("Local media path to upload into the remote sandbox"),
+        apk_path=StringSchema("APK path inside the sandbox workspace (apk_decompile)"),
+        src=StringSchema("Decompiled APK source dir to rebuild (apk_build)"),
+        out=StringSchema("Output APK path (apk_build)"),
     )
 )
 class NovitaSandboxTool(Tool):
@@ -649,7 +653,7 @@ class NovitaSandboxTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["run", "read", "write", "upload", "fetch_url", "install", "list", "download_url", "reset"]},
+                "action": {"type": "string", "enum": ["run", "read", "write", "upload", "fetch_url", "install", "list", "download_url", "apk_toolchain", "apk_decompile", "apk_build", "reset"]},
                 "command": {"type": "string"},
                 "packages": {"type": "string", "description": "Space-separated Linux distro package names to install in VPS mode."},
                 "path": {"type": "string"},
@@ -657,6 +661,9 @@ class NovitaSandboxTool(Tool):
                 "content": {"type": "string"},
                 "timeout": {"type": "integer", "minimum": 1, "maximum": _MAX_TIMEOUT},
                 "source": {"type": "string"},
+                "apk_path": {"type": "string", "description": "APK path inside the sandbox workspace (apk_decompile)."},
+                "src": {"type": "string", "description": "Decompiled APK source dir to rebuild (apk_build)."},
+                "out": {"type": "string", "description": "Output APK path (apk_build)."},
             },
             "required": ["action"],
         }
@@ -1600,9 +1607,16 @@ class NovitaSandboxTool(Tool):
                     await backend.reset(sandbox_id)
                 _DAYTONA_STORE.remove(key)
                 return "Daytona sandbox reset. A new sandbox will be created for the next operation."
-            if action not in {"run", "read", "write", "upload", "fetch_url", "install", "list", "download_url"}:
+            if action not in {"run", "read", "write", "upload", "fetch_url", "install", "list", "download_url",
+                              "apk_toolchain", "apk_decompile", "apk_build"}:
                 return ToolResult.error("Unknown sandbox action")
             async with _DAYTONA_STORE.lock_for(key):
+                if action == "apk_toolchain":
+                    return await self._apk_toolchain(backend)
+                if action == "apk_decompile":
+                    return await self._apk_decompile(backend, kwargs)
+                if action == "apk_build":
+                    return await self._apk_build(backend, kwargs)
                 if action == "run":
                     command = str(kwargs.get("command") or "").strip()
                     if not command:
@@ -1714,7 +1728,168 @@ class NovitaSandboxTool(Tool):
             logger.exception("Daytona sandbox operation failed")
             return ToolResult.error(f"Daytona sandbox error: {type(exc).__name__}: {str(exc)[:500]}")
 
+    @staticmethod
+    def _upstash_action_budget(action: str, kwargs: dict[str, Any]) -> int:
+        # Hard watchdog: whatever the underlying slow path (cold box, snapshot
+        # restore, a wedged HTTP request), the AI's turn must never block
+        # indefinitely — that is exactly what users reported as "the AI hangs
+        # in the Upstash sandbox". Every action is bounded: run/install get the
+        # caller's timeout plus margin; fixed budgets cover the rest.
+        if action in {"run", "install", "fetch_url"}:
+            try:
+                requested = int(kwargs.get("timeout") or 0)
+            except (TypeError, ValueError):
+                requested = 0
+            default = 600 if action == "install" else 150
+            return max(300, min(max(requested, default), _MAX_TIMEOUT)) + 150
+        return {
+            "reset": 90,
+            "read": 180,
+            "write": 330,
+            "upload": 360,
+            "list": 120,
+            "download_url": 480,
+            "apk_toolchain": 900,
+            "apk_decompile": 780,
+            "apk_build": 780,
+        }.get(action, 240)
+
+    # ---------------------------------------------------------------- apk
+    # In-sandbox APK assemble/disassemble (user-space, NO GitHub Actions):
+    # decompile an EXISTING binary -> patch smali/resources -> rebuild -> sign.
+    # Building apk/exe/ipa/deb from PROJECT SOURCE stays on GitHub Actions via
+    # the build_artifact tool — this toolchain never builds from source.
+
+    _APK_TOOLS_DIR = "$HOME/.powerx-tools"
+    _APK_KEYSTORE_PASS = "powerx123"
+
+    def _apk_env_prefix(self) -> str:
+        root = self._APK_TOOLS_DIR
+        return (
+            f'export JAVA_HOME={root}/jdk; '
+            f'[ -x "$JAVA_HOME/bin/java" ] && export PATH="$JAVA_HOME/bin:$PATH"; '
+            f'BT=$(ls -d {root}/build-tools/android-* 2>/dev/null | head -1); '
+            f'[ -n "$BT" ] && export PATH="$BT:$PATH"; '
+        )
+
+    async def _apk_run(self, backend: Any, step: str, command: str, timeout: int) -> str:
+        out = await backend.run(command, timeout=timeout)
+        if "[exit_code=" in out and "[exit_code=0]" not in out:
+            raise RuntimeError(f"APK {step} failed:\n{out[-1500:]}")
+        return out
+
+    async def _apk_toolchain(self, backend: Any) -> str:
+        """Install the user-space APK toolchain (JDK 17 + apktool + build-tools + keystore)."""
+        root = self._APK_TOOLS_DIR
+        ksp = self._APK_KEYSTORE_PASS
+        await self._apk_run(backend, "prepare", f"mkdir -p {root}/jdk {root}/build-tools", 30)
+        probe = await backend.run(
+            'if command -v java >/dev/null 2>&1 || [ -x "$HOME/.powerx-tools/jdk/bin/java" ]; '
+            "then printf READY; else printf MISSING; fi",
+            timeout=30,
+        )
+        if "READY" not in probe:
+            await self._apk_run(
+                backend,
+                "install JDK",
+                f'curl -fL --max-time 230 -o /tmp/jre.tgz '
+                f'"https://api.adoptium.net/v3/binary/latest/17/ga/linux/x64/jre/hotspot/normal/eclipse" '
+                f'&& tar xzf /tmp/jre.tgz -C {root}/jdk --strip-components=1 && echo JDK_INSTALLED',
+                240,
+            )
+        await self._apk_run(
+            backend,
+            "fetch apktool",
+            f'if [ ! -s {root}/apktool.jar ]; then curl -fL --max-time 200 -o {root}/apktool.jar '
+            f'https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar; fi; '
+            f'ls -lh {root}/apktool.jar',
+            240,
+        )
+        await self._apk_run(
+            backend,
+            "fetch build-tools",
+            f'if ! ls {root}/build-tools/android-*/apksigner >/dev/null 2>&1; then '
+            f'curl -fL --max-time 230 -o /tmp/bt.zip https://dl.google.com/android/repository/build-tools_r34-linux.zip '
+            f'&& cd {root}/build-tools && (unzip -q /tmp/bt.zip 2>/dev/null || python3 -c "import zipfile; '
+            f'zipfile.ZipFile(\'/tmp/bt.zip\').extractall(\'.\')"); fi; '
+            f'ls -d {root}/build-tools/android-*',
+            240,
+        )
+        await self._apk_run(
+            backend,
+            "keystore",
+            f'KS={root}/px.keystore; if [ ! -f "$KS" ]; then '
+            f'({root}/jdk/bin/keytool -genkeypair -keystore "$KS" -alias powerx -keyalg RSA -keysize 2048 '
+            f'-validity 10000 -storepass {ksp} -keypass {ksp} -dname "CN=PowerX" 2>/dev/null '
+            f'|| keytool -genkeypair -keystore "$KS" -alias powerx -keyalg RSA -keysize 2048 -validity 10000 '
+            f'-storepass {ksp} -keypass {ksp} -dname "CN=PowerX"); fi; ls -lh "$KS"',
+            60,
+        )
+        ver = await self._apk_run(
+            backend,
+            "verify",
+            f'{self._apk_env_prefix()} java -jar {root}/apktool.jar --version 2>&1 | tail -1; '
+            f'apksigner --version 2>&1 | tail -1',
+            60,
+        )
+        return "APK toolchain ready in the sandbox ($HOME/.powerx-tools: JDK 17, apktool, Android build-tools, px.keystore).\n" + ver
+
+    async def _apk_decompile(self, backend: Any, kwargs: dict[str, Any]) -> str:
+        """Decompile an existing APK into smali + resources (apktool d)."""
+        root = self._APK_TOOLS_DIR
+        apk = str(kwargs.get("apk_path") or "app.apk").strip()
+        out = str(kwargs.get("out") or "").strip() or (re.sub(r"\.apk$", "", apk) + ".out")
+        guard = f'[ -s {root}/apktool.jar ] || {{ echo APK_TOOLCHAIN_MISSING_RUN_apk_toolchain_FIRST; exit 7; }}; '
+        result = await self._apk_run(
+            backend,
+            "decompile",
+            f'{self._apk_env_prefix()} {guard} java -jar {root}/apktool.jar d -f '
+            f'-o {shlex.quote(out)} {shlex.quote(apk)}',
+            240,
+        )
+        listing = await self._apk_run(backend, "list decompiled tree", f'ls {shlex.quote(out)} | head -12', 30)
+        return f"Decompiled {apk} -> {out}\n{result}\n{listing}"
+
+    async def _apk_build(self, backend: Any, kwargs: dict[str, Any]) -> str:
+        """Rebuild + sign a patched decompiled tree into an installable APK."""
+        root = self._APK_TOOLS_DIR
+        src = str(kwargs.get("src") or "app.out").strip()
+        out = str(kwargs.get("out") or "app-rebuilt.apk").strip()
+        ksp = self._APK_KEYSTORE_PASS
+        await self._apk_run(
+            backend, "build",
+            f'{self._apk_env_prefix()} [ -s {root}/apktool.jar ] || {{ echo APK_TOOLCHAIN_MISSING_RUN_apk_toolchain_FIRST; exit 7; }}; '
+            f'java -jar {root}/apktool.jar b -f {shlex.quote(src)} -o /tmp/px-unsigned.apk',
+            240,
+        )
+        await self._apk_run(backend, "align", f'{self._apk_env_prefix()} zipalign -f 4 /tmp/px-unsigned.apk /tmp/px-aligned.apk', 60)
+        await self._apk_run(
+            backend,
+            "sign",
+            f'{self._apk_env_prefix()} apksigner sign --ks {root}/px.keystore --ks-pass pass:{ksp} '
+            f'--out {shlex.quote(out)} /tmp/px-aligned.apk && apksigner verify {shlex.quote(out)}',
+            60,
+        )
+        listing = await self._apk_run(backend, "verify", f'ls -lh {shlex.quote(out)}', 30)
+        return f"Rebuilt and signed APK: {out}\n{listing}"
+
     async def _execute_upstash(
+        self, action: str, kwargs: dict[str, Any], config: Any, session_key: str
+    ) -> ToolResult | str:
+        budget = self._upstash_action_budget(action, kwargs)
+        try:
+            return await asyncio.wait_for(
+                self._execute_upstash_inner(action, kwargs, config, session_key), timeout=budget
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Upstash sandbox action {} exceeded its {}s budget", action, budget)
+            return ToolResult.error(
+                f"Upstash Box operation timed out after {budget}s (action={action}). The box may be cold or the "
+                "previous operation wedged. Retry once — a warm box usually answers immediately — or reset the "
+                "sandbox with action=reset and retry if it keeps happening."
+            )
+
+    async def _execute_upstash_inner(
         self, action: str, kwargs: dict[str, Any], config: Any, session_key: str
     ) -> ToolResult | str:
         key = session_key or "unknown"
@@ -1729,9 +1904,16 @@ class NovitaSandboxTool(Tool):
                     await backend.reset(box_id)
                 _UPSTASH_STORE.remove(key)
                 return "Upstash Box reset. A new sandbox will be created for the next operation."
-            if action not in {"run", "read", "write", "upload", "fetch_url", "install", "list", "download_url"}:
+            if action not in {"run", "read", "write", "upload", "fetch_url", "install", "list", "download_url",
+                              "apk_toolchain", "apk_decompile", "apk_build"}:
                 return ToolResult.error("Unknown sandbox action")
             async with _UPSTASH_STORE.lock_for(key):
+                if action == "apk_toolchain":
+                    return await self._apk_toolchain(backend)
+                if action == "apk_decompile":
+                    return await self._apk_decompile(backend, kwargs)
+                if action == "apk_build":
+                    return await self._apk_build(backend, kwargs)
                 if action == "run":
                     command = str(kwargs.get("command") or "").strip()
                     if not command:

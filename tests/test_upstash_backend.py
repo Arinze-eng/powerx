@@ -552,3 +552,51 @@ def test_persist_workspace_defaults_true():
     backend = UpstashExecutionBackend(_config(), box_name="px-test-1")
     assert backend.persist_workspace is True
     assert UpstashExecutionBackend(_config(persist_workspace=False), box_name="px-test-1").persist_workspace is False
+
+
+@pytest.mark.asyncio
+async def test_restore_workspace_skips_when_no_archive_box(monkeypatch):
+    """Cold start with no snapshot must NOT create an archive box.
+
+    The old path awaited archive ensure_box (create + wait_ready) inline inside
+    ensure_box, adding minutes to the first command after box recreation —
+    which users saw as "the AI hangs in the sandbox".
+    """
+    import asyncio as _asyncio
+
+    backend = UpstashExecutionBackend(_config(), box_name="px-test-1")
+    assert backend.persist_workspace is True
+
+    class _StubArchive:
+        workspace = "/workspace"
+
+        async def find_box(self, session):
+            return None
+
+        async def ensure_box(self, session):
+            raise AssertionError("archive box must not be created when no snapshot exists")
+
+    monkeypatch.setattr(backend, "_archive_backend", lambda: _StubArchive())
+    assert await backend.restore_workspace() is False
+    assert _asyncio.sleep  # no-op: keeps import used
+
+
+@pytest.mark.asyncio
+async def test_upstash_action_watchdog_bounds_hang(monkeypatch):
+    """A wedged sandbox action must return a bounded error, never hang the turn."""
+    import asyncio
+
+    from nanobot.agent.tools import novita_sandbox as ns
+
+    async def wedged_inner(self, action, kwargs, config, session_key):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(ns.NovitaSandboxTool, "_execute_upstash_inner", wedged_inner)
+    monkeypatch.setattr(
+        ns.NovitaSandboxTool, "_upstash_action_budget", staticmethod(lambda action, kwargs: 1)
+    )
+    tool = object.__new__(ns.NovitaSandboxTool)
+    result = await ns.NovitaSandboxTool._execute_upstash(tool, "list", {}, SimpleNamespace(), "sess")
+    assert isinstance(result, str)
+    assert "timed out" in str(result)
+    assert "action=list" in str(result)
