@@ -347,7 +347,7 @@ class LLMProvider(ABC):
         "速率限制",
         "访问量过大",
     )
-    _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
+    _RETRYABLE_STATUS_CODES = frozenset({404, 408, 409, 429})
     _TRANSIENT_ERROR_KINDS = frozenset({"timeout", "connection"})
     _NON_RETRYABLE_429_ERROR_TOKENS = frozenset({
         "insufficient_quota",
@@ -563,8 +563,29 @@ class LLMProvider(ABC):
 
         if response.error_status_code is not None:
             status = int(response.error_status_code)
+            # A genuine out-of-credit / billing failure is terminal regardless of
+            # the HTTP code it came in under (many gateways hide it behind a 404
+            # or 401 "model unavailable" when the balance is exhausted). Check it
+            # first so it surfaces to the user instead of being retried forever.
+            if cls.is_arrearage_response(response):
+                return False
+            # A genuine authentication failure (invalid / revoked / expired API
+            # key, insufficient access for this model) is also terminal: no
+            # amount of retrying fixes a bad credential, and it must surface to
+            # the user rather than silently burn retries. Only rate limits
+            # (429) and transient server/route errors are retried internally.
+            if status == 401:
+                return False
             if status == 429:
                 return cls._is_retryable_429_response(response)
+            # 404 from an LLM gateway is frequently transient (model route not
+            # yet propagated, load-balancer lag, edge endpoint not registered)
+            # rather than a genuine missing-resource error. Treat it as retryable
+            # so a transient 404 is absorbed internally instead of aborting the
+            # task; the retry ladder still gives up after a bounded number of
+            # attempts. Billing-encoded 404s were already caught above.
+            if status == 404:
+                return True
             if status in cls._RETRYABLE_STATUS_CODES or status >= 500:
                 return True
 

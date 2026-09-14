@@ -94,8 +94,11 @@ async def test_safe_chat_recovers_404_from_message() -> None:
 
     assert response.finish_reason == "error"
     assert response.error_status_code == 404
-    # A missing model is permanent: retrying can never help.
-    assert LLMProvider.is_transient_response(response) is False
+    # A 404 from an LLM gateway is treated as transient (retryable): model
+    # routes not yet propagated, edges not registered, and load-balancer lag
+    # all resolve on retry. The retry ladder still gives up after a bounded
+    # number of attempts, so a genuinely persistent 404 surfaces to the user.
+    assert LLMProvider.is_transient_response(response) is True
 
 
 @pytest.mark.asyncio
@@ -205,4 +208,56 @@ async def test_out_of_credit_via_generic_exception_is_terminal() -> None:
     response = await _provider(_exc)._safe_chat(messages=[])
     assert response.error_status_code == 402
     assert LLMProvider.is_arrearage_response(response) is True
+    assert LLMProvider.is_transient_response(response) is False
+
+
+# ---------------------------------------------------------------------------
+# Strengthened retry policy: 404 transient, but auth/credit always surfaces
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_genuine_404_is_retryable_transient() -> None:
+    """A gateway 404 (model route not yet propagated) must be retried
+    internally instead of aborting the task, per the strengthened policy."""
+    response = LLMResponse(
+        content="Error code: 404 - model not found",
+        finish_reason="error",
+        error_status_code=404,
+    )
+    # 404 is now treated as transient so the runner retries internally.
+    assert LLMProvider.is_transient_response(response) is True
+    # And it is NOT mistaken for an out-of-credit failure.
+    assert LLMProvider.is_arrearage_response(response) is False
+
+
+@pytest.mark.asyncio
+async def test_genuine_401_invalid_credential_is_terminal() -> None:
+    """A bad/expired API key must surface to the user, never retried."""
+    def _exc():
+        e = RuntimeError(
+            "Error code: 401 - {'error': {'message': 'Invalid API key'}}"
+        )
+        e.status_code = 401  # type: ignore[attr-defined]
+        return e
+
+    response = await _provider(_exc)._safe_chat(messages=[])
+    assert response.error_status_code == 401
+    assert LLMProvider.is_transient_response(response) is False
+
+
+@pytest.mark.asyncio
+async def test_no_credit_encoded_as_404_surfaces_terminal() -> None:
+    """Some gateways hide exhausted balance behind a 404; that must still
+    surface to the user (only genuine no-credit is allowed through)."""
+    def _exc():
+        e = RuntimeError(
+            "Error code: 404 - {'error': {'message': 'out of credits', 'code': 404}}"
+        )
+        e.status_code = 404  # type: ignore[attr-defined]
+        return e
+
+    response = await _provider(_exc)._safe_chat(messages=[])
+    assert response.error_status_code == 404
+    assert LLMProvider.is_arrearage_response(response) is True
+    # Arrearage check runs first: a billing-encoded 404 is terminal, not retried.
     assert LLMProvider.is_transient_response(response) is False
