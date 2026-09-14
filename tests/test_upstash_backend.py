@@ -421,7 +421,7 @@ async def test_snapshot_stores_workspace_in_archive_box(monkeypatch):
     async def fake_exec(session, box_id, cmd, timeout):
         return {"exit_code": 0, "output": "", "error": ""}
 
-    async def fake_read_bytes(session, box_id, path):
+    async def fake_read_bytes(session, box_id, path, *, timeout=240):
         return b"tarball-bytes"
 
     async def fake_archive_ensure(session):
@@ -600,3 +600,83 @@ async def test_upstash_action_watchdog_bounds_hang(monkeypatch):
     assert isinstance(result, str)
     assert "timed out" in str(result)
     assert "action=list" in str(result)
+
+
+@pytest.mark.asyncio
+async def test_release_snapshot_wedged_is_bounded(monkeypatch):
+    """The task-end snapshot must never block the finished task's turn.
+
+    Regression for the reported hang: release_upstash_sandbox is awaited INLINE
+    at task end, and a wedged snapshot_workspace used to block the whole turn
+    for minutes on a cold or stuck box.
+    """
+    import asyncio
+
+    from nanobot.agent.tools import novita_sandbox as ns
+
+    cfg = SimpleNamespace(
+        backend="upstash",
+        vps=SimpleNamespace(host=""),
+        upstash=_config(),
+        novita_template=None,
+    )
+    tool = ns.NovitaSandboxTool()
+    monkeypatch.setattr(
+        ns.NovitaSandboxTool, "_selected_backend", staticmethod(lambda: ("upstash", cfg.upstash))
+    )
+    monkeypatch.setattr(ns._UPSTASH_STORE, "sandbox_id", lambda key: "box-live")
+
+    backend = SimpleNamespace(persist_workspace=True)
+
+    async def wedged_snapshot():
+        await asyncio.sleep(30)
+
+    backend.snapshot_workspace = wedged_snapshot
+    monkeypatch.setattr(tool, "_upstash_backend", lambda config, key: backend)
+    monkeypatch.setattr(ns, "_UPSTASH_SNAPSHOT_BUDGET", 1)
+
+    # A wedged snapshot is cancelled at the budget; release still completes.
+    await asyncio.wait_for(tool.release_upstash_sandbox("webui:wedged"), timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_stage_budgets_are_bounded(monkeypatch):
+    """Tar and staged-read budgets inside snapshot_workspace stay bounded."""
+    backend = UpstashExecutionBackend(_config(), box_name="px-budget-1")
+    exec_timeouts: list[int] = []
+    read_timeouts: list[int] = []
+
+    async def fake_ensure(session):
+        return "box-self"
+
+    async def fake_exec(session, box_id, cmd, timeout):
+        exec_timeouts.append(timeout)
+        return {"exit_code": 0, "output": "", "error": ""}
+
+    async def fake_read_bytes(session, box_id, path, *, timeout=240):
+        read_timeouts.append(timeout)
+        return b"tarball"
+
+    archive = SimpleNamespace(
+        ensure_box=None,
+        write_bytes=None,
+        workspace="/workspace/home",
+        box_name="px-archive-x",
+    )
+
+    async def fake_archive_ensure(session):
+        return "box-archive"
+
+    async def fake_archive_write(path, data):
+        return None
+
+    monkeypatch.setattr(backend, "ensure_box", fake_ensure)
+    monkeypatch.setattr(backend, "_exec", fake_exec)
+    monkeypatch.setattr(backend, "_read_box_bytes", fake_read_bytes)
+    monkeypatch.setattr(backend, "_archive_backend", lambda: archive)
+    monkeypatch.setattr(archive, "ensure_box", fake_archive_ensure)
+    monkeypatch.setattr(archive, "write_bytes", fake_archive_write)
+
+    assert await backend.snapshot_workspace() is True
+    assert exec_timeouts and max(exec_timeouts) <= 150
+    assert read_timeouts and max(read_timeouts) <= 120

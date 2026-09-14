@@ -53,6 +53,11 @@ _MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 _MAX_TELEGRAM_IMAGE_BYTES = 12 * 1024 * 1024
 _MAX_TELEGRAM_IMAGE_COUNT = 4
 _MAX_IMAGE_ANALYSIS_RESULT_CHARS = 16_000
+# Upstash task-end release budgets: release_upstash_sandbox is awaited INLINE at
+# task end (the agent turn blocks on it), so every step inside it must be
+# bounded or a cold/wedged box blocks the finished task's reply for minutes.
+_UPSTASH_SNAPSHOT_BUDGET = 150
+_UPSTASH_RELEASE_RESET_BUDGET = 90
 _WORKSPACE = "/workspace"
 _OCR_DIR = f"{_WORKSPACE}/.nanobot"
 
@@ -1583,11 +1588,24 @@ class NovitaSandboxTool(Tool):
                 # user's workspace. Snapshot the box into the archive box and
                 # leave it running so writes/reads keep their state across
                 # tasks, restarts, and box recreation.
+                #
+                # HARD WATCHDOG: this coroutine is awaited INLINE at task end
+                # (the agent turn blocks on it), and snapshot_workspace's worst
+                # case (cold-box wait + tar + staged read + archive box create
+                # + upload) could previously block the turn for many minutes on
+                # a cold or wedged box - the "task finished but the Upstash
+                # sandbox hangs" report. The snapshot is best-effort: a missed
+                # one leaves the box (and its workspace) intact and the next
+                # task reuses it via the stored box id.
                 with suppress(Exception):
-                    await backend.snapshot_workspace()
+                    await asyncio.wait_for(
+                        backend.snapshot_workspace(), timeout=_UPSTASH_SNAPSHOT_BUDGET
+                    )
                 return
             with suppress(Exception):
-                await backend.reset(box_id)
+                await asyncio.wait_for(
+                    backend.reset(box_id), timeout=_UPSTASH_RELEASE_RESET_BUDGET
+                )
             _UPSTASH_STORE.remove(key)
         except Exception:
             logger.debug("Could not release sandbox", exc_info=True)

@@ -375,7 +375,12 @@ class UpstashExecutionBackend:
         return archive
 
     async def _read_box_bytes(
-        self, session: aiohttp.ClientSession, box_id: str, path: str
+        self,
+        session: aiohttp.ClientSession,
+        box_id: str,
+        path: str,
+        *,
+        timeout: int = 120,
     ) -> bytes | None:
         """Read one binary file from a box via the base64 files/read encoding."""
         target = _safe_path(path, self.workspace)
@@ -383,7 +388,7 @@ class UpstashExecutionBackend:
             session,
             "GET",
             f"/v2/box/{box_id}/files/read?path={quote(target, safe='')}&encoding=base64",
-            timeout=240,
+            timeout=timeout,
         )
         if isinstance(data, dict) and data.get("content"):
             try:
@@ -412,9 +417,9 @@ class UpstashExecutionBackend:
                 f"-C {shlex.quote(self.workspace)} "
                 f"--exclude=./{self._SNAPSHOT_STAGED} --exclude=./{self._RESTORE_STAGED} . "
                 "2>/dev/null || true",
-                300,
+                120,
             )
-            data = await self._read_box_bytes(session, box_id, staged)
+            data = await self._read_box_bytes(session, box_id, staged, timeout=90)
             if not data or len(data) > self._SNAPSHOT_MAX_BYTES:
                 return False
             archive = self._archive_backend()
@@ -444,6 +449,7 @@ class UpstashExecutionBackend:
                     session,
                     archive_id,
                     f"{archive.workspace}/snapshots/{self.box_name}.tgz",
+                    timeout=90,
                 )
                 if not data or len(data) > self._SNAPSHOT_MAX_BYTES:
                     return False
