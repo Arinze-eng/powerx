@@ -120,6 +120,53 @@ describe("supabase-auth session stability", () => {
     expect(init.headers.get("Authorization")).toBe(`Bearer ${token}`);
   });
 
+  it("claimReferral posts to the referral-claim edge function with the caller token", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ ok: true, credits: 700 }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await supabaseAuth.claimReferral(
+      "https://proj.supabase.co",
+      "anon-1",
+      "access-token-123",
+      "friend@example.com",
+    );
+
+    expect(result).toEqual({ ok: true, credits: 700 });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://proj.supabase.co/functions/v1/referral-claim",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          apikey: "anon-1",
+          Authorization: "Bearer access-token-123",
+        }),
+      }),
+    );
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    expect(body.referral).toBe("friend@example.com");
+  });
+
+  it("claimReferral surfaces the server error on rejection", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ ok: false, error: "This referral code has already been used. Each code works only once." }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await supabaseAuth.claimReferral(
+      "https://proj.supabase.co",
+      "anon-1",
+      "access-token-123",
+      "used@example.com",
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("already been used");
+  });
+
   it("getSessionToken refreshes when the access token is near expiry", async () => {
     const nearExpiry = Math.floor(Date.now() / 1000) + 10; // expires in 10s → within 60s window
     const refreshSession = vi.fn(async () => ({

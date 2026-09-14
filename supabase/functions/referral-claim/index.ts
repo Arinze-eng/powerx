@@ -93,11 +93,11 @@ Deno.serve(async (req) => {
 
     // ---------- wait for the profile row (created by the signup trigger) ----------
     const profileUrl = `${SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,granted_credits`;
-    let profile: { id: string; granted_credits: number } | null = null;
+    let profile: { id: string; granted_credits: number | null } | null = null;
     for (let attempt = 0; attempt < 20 && !profile; attempt++) {
       const resp = await fetch(profileUrl, { headers: restHeaders });
       if (resp.ok) {
-        const rows = (await resp.json()) as { id: string; granted_credits: number }[];
+        const rows = (await resp.json()) as { id: string; granted_credits: number | null }[];
         if (Array.isArray(rows) && rows.length > 0) profile = rows[0];
       }
       if (!profile) await new Promise((r) => setTimeout(r, 1000));
@@ -107,12 +107,23 @@ Deno.serve(async (req) => {
     }
 
     // ---------- grant 700 credits (compare-and-set for atomicity) ----------
+    // Fresh profiles may have granted_credits as NULL. A plain
+    // `granted_credits=eq.<val>` filter never matches NULL (NULL != NULL in SQL)
+    // and causes every attempt to fail with a 500. We coalesce NULL to 0 and
+    // filter with an or=(is.null,eq.val) predicate so the CAS succeeds whether
+    // the column is NULL or already populated.
     let granted = false;
     for (let attempt = 0; attempt < 5 && !granted; attempt++) {
-      const patch = await fetch(`${SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&granted_credits=eq.${profile.granted_credits}`, {
+      const current = Number.isFinite(Number(profile.granted_credits))
+        ? Number(profile.granted_credits)
+        : 0;
+      const casFilter = profile.granted_credits === null || profile.granted_credits === undefined
+        ? `&or=(granted_credits.is.null,granted_credits.eq.0)`
+        : `&granted_credits=eq.${current}`;
+      const patch = await fetch(`${SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}${casFilter}`, {
         method: "PATCH",
         headers: { ...restHeaders, Prefer: "return=representation" },
-        body: JSON.stringify({ granted_credits: profile.granted_credits + REFERRAL_BONUS_CREDITS }),
+        body: JSON.stringify({ granted_credits: current + REFERRAL_BONUS_CREDITS }),
       });
       const rows = patch.ok ? ((await patch.json()) as { granted_credits: number }[]) : [];
       if (Array.isArray(rows) && rows.length > 0) {
@@ -121,7 +132,7 @@ Deno.serve(async (req) => {
       }
       const reread = await fetch(profileUrl, { headers: restHeaders });
       if (reread.ok) {
-        const rereadRows = (await reread.json()) as { granted_credits: number }[];
+        const rereadRows = (await reread.json()) as { id: string; granted_credits: number | null }[];
         if (Array.isArray(rereadRows) && rereadRows.length > 0) profile = rereadRows[0];
       }
     }
@@ -180,9 +191,11 @@ Deno.serve(async (req) => {
       try {
         const reread = await fetch(profileUrl, { headers: restHeaders });
         if (!reread.ok) return;
-        const rows = (await reread.json()) as { granted_credits: number }[];
+        const rows = (await reread.json()) as { granted_credits: number | null }[];
         if (!Array.isArray(rows) || rows.length === 0) return;
-        const current = rows[0].granted_credits;
+        const current = Number.isFinite(Number(rows[0].granted_credits))
+          ? Number(rows[0].granted_credits)
+          : 0;
         if (current < REFERRAL_BONUS_CREDITS) return;
         await fetch(`${SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&granted_credits=eq.${current}`, {
           method: "PATCH",

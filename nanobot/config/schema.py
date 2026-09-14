@@ -437,6 +437,11 @@ class DaytonaExecutionConfig(Base):
     fetch_allow_hosts: str = ""
     ttl_minutes: int = Field(default=60, ge=5, le=43_200)
     auto_stop_minutes: int = Field(default=0, ge=0, le=10_080)
+    # "Perfect sandbox" persistence: keep workspace files across finished tasks
+    # and sandbox recreation. Finished tasks snapshot the workspace into a
+    # dedicated archive sandbox instead of deleting the session sandbox, and a
+    # freshly created sandbox is restored from that snapshot.
+    persist_workspace: bool = True
 
 
 class NovitaTemplateConfig(Base):

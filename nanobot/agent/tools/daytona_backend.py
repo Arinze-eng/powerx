@@ -260,6 +260,11 @@ class DaytonaExecutionBackend:
         self.workspace = WORKSPACE
         self.last_sandbox_id: str = ""
         self._toolbox_url: str = ""
+        # "Perfect sandbox" persistence (mirrors the Upstash archive-box
+        # design): finished tasks snapshot the workspace into a dedicated
+        # archive sandbox; a freshly created sandbox restores that snapshot so
+        # files survive task end, agent restarts, and TTL reaping.
+        self.persist_workspace = bool(getattr(config, "persist_workspace", True))
 
     # ------------------------------------------------------------------ HTTP
 
@@ -476,6 +481,14 @@ class DaytonaExecutionBackend:
         sandbox_id = str(created.get("id") or self.sandbox_name)
         ready = await self.wait_ready(session, sandbox_id, timeout=180)
         self.last_sandbox_id = str(ready.get("id") or sandbox_id)
+        if self.persist_workspace:
+            # A brand-new sandbox is empty. Restore the last workspace snapshot
+            # so a session's files survive TTL reaping / recreation instead of
+            # every restart starting from a wiped workspace.
+            try:
+                await self.restore_workspace()
+            except Exception:
+                pass  # best-effort: a missing/unreadable snapshot is not fatal
         return self.last_sandbox_id
 
     async def delete_sandbox(self, sandbox_id_or_name: str) -> None:
@@ -673,7 +686,7 @@ class DaytonaExecutionBackend:
         }
 
     async def reset(self, sandbox_id: str | None = None) -> None:
-        """Delete the sandbox immediately."""
+        """Delete the sandbox immediately (explicit wipe / opt-out cleanup)."""
         async with aiohttp.ClientSession() as session:
             target = sandbox_id or ""
             if not target:
@@ -681,3 +694,96 @@ class DaytonaExecutionBackend:
                 target = str((existing or {}).get("id") or self.sandbox_name)
             if target:
                 await self._platform_request(session, "DELETE", f"/sandbox/{quote(target, safe='')}", timeout=60)
+
+    # ---------------------------------------------------------------- persist
+
+    _SNAPSHOT_STAGED = ".px-snapshot.tgz"
+    _RESTORE_STAGED = ".px-restore.tgz"
+    _SNAPSHOT_MAX_BYTES = 150 * 1024 * 1024
+
+    def _archive_sandbox_name(self) -> str:
+        """Dedicated long-lived sandbox that stores workspace snapshots."""
+        digest = hashlib.sha256(f"archive:{self.sandbox_name}".encode("utf-8")).hexdigest()[:10]
+        return f"px-archive-{digest}"
+
+    def _archive_backend(self) -> "DaytonaExecutionBackend":
+        archive = DaytonaExecutionBackend(self.config, sandbox_name=self._archive_sandbox_name())
+        # Snapshots must outlive the ephemeral session sandboxes, so the
+        # archive sandbox uses the longest TTL the config schema accepts and
+        # never stops early. It must never snapshot itself (infinite recurse).
+        archive.ttl_minutes = 43_200
+        archive.auto_stop_minutes = 0
+        archive.persist_workspace = False
+        return archive
+
+    async def _download_bytes(self, session: aiohttp.ClientSession, path: str) -> bytes | None:
+        """Read one file's raw bytes from the sandbox toolbox (None if missing)."""
+        target = _safe_path(path, self.workspace)
+        try:
+            raw = await self._toolbox_request(
+                session,
+                "GET",
+                "/files/download",
+                params={"path": target},
+                timeout=240,
+                raw_response=True,
+            )
+        except (DaytonaFileNotFoundError, DaytonaError):
+            return None
+        return bytes(raw) if isinstance(raw, (bytes, bytearray)) else None
+
+    async def snapshot_workspace(self) -> bool:
+        """Tar the workspace and store the archive in the dedicated archive sandbox.
+
+        Called instead of sandbox deletion when persistence is enabled, so
+        writes and reads made during a task survive task end, agent restarts,
+        and TTL reaping (the snapshot is restored whenever a fresh sandbox is
+        created). Returns True when a snapshot was stored.
+        """
+        if not self.persist_workspace:
+            return False
+        staged = f"{self.workspace}/{self._SNAPSHOT_STAGED}"
+        async with aiohttp.ClientSession() as session:
+            await self.ensure_sandbox(session)
+            await self._exec(
+                session,
+                f"rm -f {shlex.quote(staged)} && tar czf {shlex.quote(staged)} "
+                f"-C {shlex.quote(self.workspace)} "
+                f"--exclude=./{self._SNAPSHOT_STAGED} --exclude=./{self._RESTORE_STAGED} . "
+                "2>/dev/null || true",
+                300,
+            )
+            data = await self._download_bytes(session, staged)
+            if not data or len(data) > self._SNAPSHOT_MAX_BYTES:
+                return False
+            archive = self._archive_backend()
+            await archive.ensure_sandbox(session)
+            await archive.write_bytes(f"{archive.workspace}/snapshots/{self.sandbox_name}.tgz", data)
+        return True
+
+    async def restore_workspace(self) -> bool:
+        """Restore the last workspace snapshot from the archive sandbox (best effort)."""
+        if not self.persist_workspace:
+            return False
+        try:
+            archive = self._archive_backend()
+            async with aiohttp.ClientSession() as session:
+                await archive.ensure_sandbox(session)
+                data = await archive._download_bytes(
+                    session,
+                    f"{archive.workspace}/snapshots/{self.sandbox_name}.tgz",
+                )
+                if not data or len(data) > self._SNAPSHOT_MAX_BYTES:
+                    return False
+                await self.ensure_sandbox(session)
+                staged = f"{self.workspace}/{self._RESTORE_STAGED}"
+                await self.write_bytes(staged, data)
+                await self._exec(
+                    session,
+                    f"tar xzf {shlex.quote(staged)} -C {shlex.quote(self.workspace)} "
+                    f"2>/dev/null || true; rm -f {shlex.quote(staged)}",
+                    300,
+                )
+        except DaytonaError:
+            return False
+        return True

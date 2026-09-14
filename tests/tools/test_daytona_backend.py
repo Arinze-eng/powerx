@@ -133,7 +133,7 @@ def test_schema_accepts_daytona_backend() -> None:
     assert config.daytona.ttl_minutes == 60
 
 
-async def test_ensure_sandbox_creates_with_allowlists(calls: Any) -> None:  # noqa: ANN401
+async def test_ensure_sandbox_creates_with_allowlists(calls: Any, monkeypatch: Any) -> None:  # noqa: ANN401
     created_body: dict[str, Any] = {}
 
     def handler(method: str, url: str, kwargs: dict[str, Any]) -> _Response:
@@ -152,6 +152,13 @@ async def test_ensure_sandbox_creates_with_allowlists(calls: Any) -> None:  # no
 
     calls.install(handler)
     backend = DaytonaExecutionBackend(_config(domain_allow_list="*.pypi.org,example.com"), sandbox_name="px-test")
+
+    # No snapshot exists yet: stub the restore so this test stays focused on
+    # allowlist propagation (restore triggers its own archive-sandbox create).
+    async def _no_restore() -> bool:
+        return False
+
+    monkeypatch.setattr(backend, "restore_workspace", _no_restore)
     sandbox_id = await backend.ensure_sandbox(_FakeSession(handler))
     assert sandbox_id == "sbx-1"
     assert created_body.get("domainAllowList") == "*.pypi.org,example.com"
@@ -313,3 +320,116 @@ async def test_fetch_url_respects_configured_hosts(calls: Any) -> None:  # noqa:
 
     wildcard = DaytonaExecutionBackend(_config(fetch_allow_hosts="*"), sandbox_name="px-fetch2")
     assert wildcard._is_host_allowed("anything.example") is True
+
+
+# --------------------------------------------------------------------------- #
+# Daytona workspace persistence ("perfect sandbox" parity with Upstash)      #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_daytona_archive_backend_properties():
+    backend = DaytonaExecutionBackend(_config(), sandbox_name="px-user-1")
+    archive = backend._archive_backend()
+    assert archive.persist_workspace is False
+    assert archive.ttl_minutes == 43_200
+    assert archive.auto_stop_minutes == 0
+    assert archive.sandbox_name.startswith("px-archive-")
+    assert archive.sandbox_name != backend.sandbox_name
+
+
+@pytest.mark.asyncio
+async def test_daytona_snapshot_stores_workspace_in_archive(monkeypatch):
+    backend = DaytonaExecutionBackend(_config(), sandbox_name="px-user-1")
+    archive = backend._archive_backend()
+    archive_writes: list[tuple[str, bytes]] = []
+
+    async def fake_ensure(session):
+        return "sb-main"
+
+    async def fake_exec(session, cmd, timeout):
+        return {"exitCode": 0, "result": ""}
+
+    async def fake_download_bytes(session, path):
+        return b"daytona-tarball-bytes"
+
+    async def fake_archive_ensure(session):
+        return "sb-archive"
+
+    async def fake_archive_write(path, data):
+        archive_writes.append((path, data))
+        return None
+
+    monkeypatch.setattr(backend, "ensure_sandbox", fake_ensure)
+    monkeypatch.setattr(backend, "_exec", fake_exec)
+    monkeypatch.setattr(backend, "_download_bytes", fake_download_bytes)
+    monkeypatch.setattr(backend, "_archive_backend", lambda: archive)
+    monkeypatch.setattr(archive, "ensure_sandbox", fake_archive_ensure)
+    monkeypatch.setattr(archive, "write_bytes", fake_archive_write)
+
+    assert await backend.snapshot_workspace() is True
+    assert len(archive_writes) == 1
+    path, data = archive_writes[0]
+    assert path.endswith("/snapshots/px-user-1.tgz")
+    assert data == b"daytona-tarball-bytes"
+
+
+@pytest.mark.asyncio
+async def test_daytona_ensure_restores_snapshot_on_fresh_create(monkeypatch):
+    backend = DaytonaExecutionBackend(_config(), sandbox_name="px-user-1")
+    restored = {"count": 0}
+
+    async def fake_find(session):
+        return None  # brand new sandbox
+
+    async def fake_platform_req(session, method, path, **kw):
+        if method == "POST" and path == "/sandbox":
+            return {"id": "sb-fresh"}
+        return {}
+
+    async def fake_wait(session, sb_id, timeout=180):
+        backend._toolbox_url = "https://tb.test/sb-fresh"
+        return {"id": "sb-fresh", "state": "started"}
+
+    async def fake_restore():
+        restored["count"] += 1
+        return True
+
+    monkeypatch.setattr(backend, "find_sandbox", fake_find)
+    monkeypatch.setattr(backend, "_platform_request", fake_platform_req)
+    monkeypatch.setattr(backend, "wait_ready", fake_wait)
+    monkeypatch.setattr(backend, "restore_workspace", fake_restore)
+
+    class _StubSession:
+        pass
+
+    sb_id = await backend.ensure_sandbox(_StubSession())
+    assert sb_id == "sb-fresh"
+    assert restored["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_daytona_release_snapshots_when_persist_enabled(monkeypatch):
+    from nanobot.agent.tools import novita_sandbox as ns
+
+    snapshotted = {"done": False}
+    reset_called = {"done": False}
+
+    class _FakeDaytonaBackend:
+        persist_workspace = True
+
+        async def snapshot_workspace(self):
+            snapshotted["done"] = True
+            return True
+
+        async def reset(self, sb_id):
+            reset_called["done"] = True
+
+    tool = ns.NovitaSandboxTool()
+    monkeypatch.setattr(tool, "_selected_backend", lambda: ("daytona", _config()))
+    monkeypatch.setattr(tool, "_daytona_backend", lambda cfg, key: _FakeDaytonaBackend())
+    monkeypatch.setattr(ns._DAYTONA_STORE, "sandbox_id", lambda key: "sb-123")
+
+    await tool.release_upstash_sandbox(session_key="test-session")
+    assert snapshotted["done"] is True
+    assert reset_called["done"] is False

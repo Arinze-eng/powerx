@@ -1551,6 +1551,15 @@ class NovitaSandboxTool(Tool):
                 if not sandbox_id:
                     return
                 backend = self._daytona_backend(backend_config, key)
+                if getattr(backend, "persist_workspace", True):
+                    # "Perfect sandbox" persistence: a finished task must not
+                    # wipe the user's workspace. Snapshot the workspace into
+                    # the archive sandbox and leave the session sandbox to its
+                    # TTL/auto-stop, so writes/reads keep their state across
+                    # tasks, restarts, and sandbox recreation.
+                    with suppress(Exception):
+                        await backend.snapshot_workspace()
+                    return
                 with suppress(Exception):
                     await backend.reset(sandbox_id)
                 _DAYTONA_STORE.remove(key)

@@ -1180,6 +1180,28 @@ export default function App() {
         return { error: error ?? "Sign-in failed" };
       }
       bootstrapWithSupabaseToken(session.access_token, session.user?.email);
+      // Claim any pending referral code saved during an email-verification signup.
+      if (url && anonKey && typeof window !== "undefined") {
+        const pendingReferral = window.localStorage.getItem("px_pending_referral");
+        if (pendingReferral) {
+          try {
+            const { claimReferral } = await import("@/lib/supabase-auth");
+            const claim = await claimReferral(url, anonKey, session.access_token, pendingReferral);
+            if (claim.ok) {
+              window.localStorage.removeItem("px_pending_referral");
+            } else if (
+              claim.error &&
+              (claim.error.includes("already been used") ||
+                claim.error.includes("brand-new") ||
+                claim.error.includes("own email"))
+            ) {
+              window.localStorage.removeItem("px_pending_referral");
+            }
+          } catch {
+            // best-effort: failures never block sign-in
+          }
+        }
+      }
       return { error: undefined };
     },
     [bootstrapWithSupabaseToken],
@@ -1232,6 +1254,14 @@ export default function App() {
         return { error };
       }
       if (verifyEmail || !session) {
+        // Email confirmation is ON: save the referral code in localStorage so
+        // it can be claimed as soon as the user opens their verification link
+        // and signs in for the first time.
+        if (referral && typeof window !== "undefined") {
+          try {
+            window.localStorage.setItem("px_pending_referral", referral.trim().toLowerCase());
+          } catch {}
+        }
         // Email confirmation is ON: the account was created and a verification
         // email was sent. This is a SUCCESS — tell the user to check their
         // email instead of the old "Sign-up failed" dead end.
@@ -1252,6 +1282,9 @@ export default function App() {
         try {
           const { claimReferral } = await import("@/lib/supabase-auth");
           const claim = await claimReferral(url, anonKey, session.access_token, referral);
+          if (typeof window !== "undefined") {
+            window.localStorage.removeItem("px_pending_referral");
+          }
           if (!claim.ok) {
             console.warn("Referral claim failed:", claim.error);
           }
