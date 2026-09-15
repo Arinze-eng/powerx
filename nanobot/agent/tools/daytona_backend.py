@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import posixpath
 import re
@@ -34,7 +35,7 @@ import shlex
 from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlsplit
 
 import aiohttp
 from loguru import logger
@@ -124,6 +125,32 @@ DEFAULT_DOMAIN_ALLOW_LIST: str = (
 
 # Daytona's documented cap for a sandbox domain allow list.
 MAX_DOMAIN_ALLOW_LIST_ENTRIES = 100
+# Daytona's documented cap for a sandbox CIDR allow list. This is far smaller
+# than the domain cap and crossing it is a hard API 400, not a truncation.
+MAX_NETWORK_ALLOW_LIST_ENTRIES = 10
+
+# Daytona organizations are billed by tier, and Tier 1/Tier 2 orgs are
+# network-restricted at the ORGANIZATION level: the API refuses any sandbox-level
+# domain/CIDR allow list with HTTP 400
+#   "Network access is restricted and cannot be overridden at the sandbox level."
+# Sandboxes may still reach Daytona's essential services (package registries,
+# GitHub, model/LLM endpoints), but no allow list can widen that set at these
+# tiers. The marker is cached per process once Daytona tells us so, because
+# otherwise every single sandbox creation pays a guaranteed-failed create first.
+_network_override_restricted = False
+
+
+def _is_network_override_rejection(detail: str) -> bool:
+    """True when Daytona says sandbox-level network policy cannot be set."""
+    text = str(detail or "").lower()
+    return "network access is restricted" in text or (
+        "cannot be overridden" in text and "network" in text
+    )
+
+
+def daytona_network_override_restricted() -> bool:
+    """Whether Daytona has told us this org cannot set sandbox network policy."""
+    return _network_override_restricted
 
 # States in which a Daytona sandbox is ready for toolbox commands.
 _READY_STATES = {"started", "running", "healthy", "ready", "active"}
@@ -202,12 +229,55 @@ def validate_daytona_network_allow_list(raw: str) -> str:
     value = str(raw or "").strip()
     if not value:
         return "0.0.0.0/0"
-    # Comma-separated CIDRs
+    # Comma-separated IPv4 CIDRs. Daytona documents a hard maximum of TEN
+    # entries for networkAllowList (distinct from the 100 allowed for
+    # domainAllowList) and requires every entry to carry a /prefix, so reject
+    # both violations here instead of letting the API return an opaque 400.
     parts = [p.strip() for p in value.split(",") if p.strip()]
+    if len(parts) > MAX_NETWORK_ALLOW_LIST_ENTRIES:
+        raise ValueError(
+            f"Daytona networkAllowList supports at most {MAX_NETWORK_ALLOW_LIST_ENTRIES} "
+            f"CIDR entries; got {len(parts)}"
+        )
     for p in parts:
         if not re.fullmatch(r"[0-9a-fA-F.:/]+", p):
             raise ValueError(f"Invalid CIDR in network allowlist: {p!r}")
+        if not _is_cidr(p):
+            raise ValueError(
+                f"Daytona networkAllowList entries must be IPv4 CIDR blocks with a "
+                f"/prefix (for example 143.244.209.188/32); got {p!r}"
+            )
     return ",".join(parts)
+
+
+def _is_cidr(value: str) -> bool:
+    """True when *value* is a dotted IPv4 CIDR block (``addr/prefix``)."""
+    try:
+        ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return False
+    return "/" in value
+
+
+def validate_daytona_outbound_proxy_url(raw: str) -> str:
+    """Validate a Daytona ``outboundProxyUrl`` (HTTP/HTTPS, optional auth).
+
+    Routing sandbox egress through an operator-run proxy is the only mechanism
+    Daytona accepts for widening outbound access on a network-restricted
+    (Tier 1/2) organization, so it is configurable in its own right.
+    """
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if len(value) > 512:
+        raise ValueError("Daytona outbound proxy URL is too long")
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise ValueError("Daytona outbound proxy URL is malformed") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Daytona outbound proxy URL must be http(s)://host:port")
+    return value
 
 
 def validate_daytona_fetch_allow_hosts(raw: str) -> str:
@@ -221,6 +291,9 @@ def validate_daytona_fetch_allow_hosts(raw: str) -> str:
         if p != "*" and not re.fullmatch(r"(\*\.)?[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9]", p):
             raise ValueError(f"Invalid host in fetch allowlist: {p!r}")
     return ",".join(parts)
+
+
+_NETWORK_POLICY_KEYS = frozenset({"domainAllowList", "networkAllowList", "networkBlockAll"})
 
 
 def daytona_sandbox_name(session_key: str) -> str:
@@ -270,6 +343,12 @@ class DaytonaExecutionBackend:
         self.fetch_allow_hosts = validate_daytona_fetch_allow_hosts(
             str(getattr(config, "fetch_allow_hosts", "") or "")
         )
+        # Operator-run HTTP(S) egress proxy. On a network-restricted Daytona
+        # organization this is the only lever that widens outbound access, so it
+        # is applied even after the allow-list path has been dropped.
+        self.outbound_proxy_url = validate_daytona_outbound_proxy_url(
+            str(getattr(config, "outbound_proxy_url", "") or "")
+        )
         self._fetch_hosts: set[str] = (
             {h.strip() for h in self.fetch_allow_hosts.split(",") if h.strip()}
             if self.fetch_allow_hosts
@@ -286,6 +365,49 @@ class DaytonaExecutionBackend:
         # archive sandbox; a freshly created sandbox restores that snapshot so
         # files survive task end, agent restarts, and TTL reaping.
         self.persist_workspace = bool(getattr(config, "persist_workspace", True))
+
+    def _network_policy_body(self) -> dict[str, Any]:
+        """Build the sandbox-level network keys to send on create.
+
+        Daytona's rules (https://www.daytona.io/docs/en/network-limits):
+
+        * ``domainAllowList`` (max 100 entries) and ``networkAllowList``
+          (max 10 CIDRs) are MUTUALLY EXCLUSIVE - never send both.
+        * Setting either one is RESTRICTIVE: it replaces Daytona's default
+          policy, so essential services are not granted on top of it.
+        * A network-restricted organization (Tier 1/2) rejects both outright;
+          once Daytona has told us that, stop sending an allow list so every
+          sandbox creation does not begin with a guaranteed-failed request.
+
+        ``outboundProxyUrl`` is orthogonal and is always sent when configured.
+        """
+        body: dict[str, Any] = {}
+        if self.outbound_proxy_url:
+            body["outboundProxyUrl"] = self.outbound_proxy_url
+        if _network_override_restricted:
+            return body
+
+        domain_list = self.domain_allow_list
+        if domain_list == "*":
+            # "*" is the administrator's "allow everything" choice. Daytona
+            # expresses open egress as an IPv4 CIDR allow list, and the two
+            # keys are mutually exclusive, so send the CIDR and nothing else.
+            return {"networkAllowList": "0.0.0.0/0"}
+        if not domain_list:
+            # Nothing configured: ship the curated registry/API allow list so
+            # installs and common integrations work out of the box.
+            domain_list = DEFAULT_DOMAIN_ALLOW_LIST
+        entries = [p.strip() for p in domain_list.split(",") if p.strip()]
+        if len(entries) > MAX_DOMAIN_ALLOW_LIST_ENTRIES:
+            logger.warning(
+                "Daytona domain allow list has {} entries; truncating to the documented "
+                "maximum of {}",
+                len(entries),
+                MAX_DOMAIN_ALLOW_LIST_ENTRIES,
+            )
+            entries = entries[:MAX_DOMAIN_ALLOW_LIST_ENTRIES]
+        body["domainAllowList"] = ",".join(entries)
+        return body
 
     # ------------------------------------------------------------------ HTTP
 
@@ -505,19 +627,13 @@ class DaytonaExecutionBackend:
             "labels": {"app": "powerx", "managed-by": "nanobot"},
             "ttlMinutes": self.ttl_minutes,
         }
-        # Network egress policy:
-        # 1. Explicit custom domain list (except "*") -> send domainAllowList,
-        #    capped at MAX_DOMAIN_ALLOW_LIST_ENTRIES (Daytona 400s above 100).
-        # 2. Wildcard "*" or explicit custom CIDR != default -> send networkAllowList (open CIDR).
-        # 3. Default (nothing configured) -> DEFAULT_DOMAIN_ALLOW_LIST (85 domains,
-        #    under the 100 cap) so package installs, AI APIs, GitHub, search, and
-        #    web tools work out of the box.
-        if self.domain_allow_list and self.domain_allow_list != "*":
-            body["domainAllowList"] = self.domain_allow_list
-        elif self.domain_allow_list == "*" or (self.network_allow_list and self.network_allow_list != "0.0.0.0/0"):
-            body["networkAllowList"] = self.network_allow_list or "0.0.0.0/0"
-        else:
-            body["domainAllowList"] = DEFAULT_DOMAIN_ALLOW_LIST
+        # Network egress policy. Daytona applies these ONLY to newly created
+        # sandboxes, and on a Tier 1/2 organization the API rejects them outright
+        # ("Network access is restricted and cannot be overridden at the sandbox
+        # level"), so the policy is best-effort: a rejection is remembered and the
+        # sandbox is created with Daytona's org default instead of failing.
+        network_body = self._network_policy_body()
+        body.update(network_body)
 
         if self.auto_stop_minutes > 0:
             body["autoStopInterval"] = self.auto_stop_minutes
@@ -526,7 +642,23 @@ class DaytonaExecutionBackend:
             created = await self._platform_request(session, "POST", "/sandbox", body=body, timeout=90)
         except DaytonaError as exc:
             err_msg = str(exc).lower()
-            if "disk limit" in err_msg or "limit exceeded" in err_msg or "400" in err_msg:
+            if _is_network_override_rejection(err_msg) and network_body:
+                # Org-level restriction wins: remember it for this process and
+                # recreate without any sandbox-level network override so the
+                # user still gets a working (essential-services-only) sandbox.
+                global _network_override_restricted  # noqa: PLW0603
+                _network_override_restricted = True
+                logger.warning(
+                    "Daytona org is network-restricted at the organization level; "
+                    "dropping sandbox network policy {} and creating without it. "
+                    "Only Daytona essential services (package registries, GitHub, "
+                    "model endpoints) are reachable. Configure "
+                    "daytona.outbound_proxy_url to widen egress, or raise the org tier.",
+                    sorted(network_body),
+                )
+                body = {k: v for k, v in body.items() if k not in _NETWORK_POLICY_KEYS}
+                created = await self._platform_request(session, "POST", "/sandbox", body=body, timeout=90)
+            elif "disk limit" in err_msg or "limit exceeded" in err_msg or "400" in err_msg:
                 # Total disk limit exceeded (30GiB cap) or Bad Request on create:
                 # reap stopped/orphaned sandboxes from earlier sessions and retry.
                 reclaimed = await self.reclaim_orphaned_sandboxes(session)

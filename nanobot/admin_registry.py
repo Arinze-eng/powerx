@@ -352,6 +352,7 @@ def _execution_settings() -> dict[str, Any]:
         novita_template = getattr(execution, "novita_template", None)
         return {
             "backend": execution.backend,
+            "backendSource": str(getattr(execution, "backend_source", "default") or "default"),
             "upstash": {
                 "base_url": str(getattr(upstash, "base_url", "") or ""),
                 "runtime": str(getattr(upstash, "runtime", "") or "python"),
@@ -369,6 +370,10 @@ def _execution_settings() -> dict[str, Any]:
                 "ttl_minutes": int(getattr(daytona, "ttl_minutes", 60) or 60),
                 "auto_stop_minutes": int(getattr(daytona, "auto_stop_minutes", 0) or 0),
                 "apiKeyConfigured": bool(str(getattr(daytona, "api_key", "") or "").strip()),
+                # Reported as a boolean only: the proxy URL carries credentials.
+                "outboundProxyConfigured": bool(
+                    str(getattr(daytona, "outbound_proxy_url", "") or "").strip()
+                ),
             },
             "novitaTemplate": {
                 "cpu_count": int(getattr(novita_template, "cpu_count", 2) or 2),
@@ -415,11 +420,18 @@ def _save_execution_settings(
         config_path = _config_path()
         config = apply_render_execution_env(load_config(config_path))
         vps = config.execution.vps
-        host = _text(payload, "host", maximum=253)
-        username = _text(payload, "username", maximum=64)
-        fingerprint = _text(payload, "hostKeyFingerprint", maximum=256)
-        policy = _text(payload, "hostKeyPolicy", maximum=20) or "fingerprint"
-        workspace = validate_vps_workspace(_text(payload, "workspaceDir", maximum=256) or "/workspace")
+        # Blank form fields mean "leave as saved", not "clear". The execution
+        # form is shared by every backend, so submitting it while Daytona or
+        # Upstash is selected sends empty VPS fields; assigning those
+        # unconditionally used to wipe a configured VPS host, which then made
+        # the VPS selection look unconfigured and get reverted elsewhere.
+        host = _text(payload, "host", maximum=253) or vps.host
+        username = _text(payload, "username", maximum=64) or vps.username
+        fingerprint = _text(payload, "hostKeyFingerprint", maximum=256) or vps.host_key_fingerprint
+        policy = _text(payload, "hostKeyPolicy", maximum=20) or vps.host_key_policy or "fingerprint"
+        workspace = validate_vps_workspace(
+            _text(payload, "workspaceDir", maximum=256) or vps.workspace_dir or "/workspace"
+        )
         if host:
             host = validate_vps_host(host)
         if username:
@@ -453,6 +465,9 @@ def _save_execution_settings(
         if private_key:
             vps.private_key = private_key
         config.execution.backend = backend_name
+        # Record provenance so this explicit administrator choice is never
+        # reverted by a durable deployment environment value.
+        config.execution.backend_source = "admin"
         if backend_name == "vps":
             VPSExecutionBackend(vps)._validate()
         # Upstash Box settings (key is only replaced when a new value is sent).
@@ -492,6 +507,7 @@ def _save_execution_settings(
                 validate_daytona_domain_allow_list,
                 validate_daytona_fetch_allow_hosts,
                 validate_daytona_network_allow_list,
+                validate_daytona_outbound_proxy_url,
                 validate_daytona_snapshot,
             )
 
@@ -519,6 +535,9 @@ def _save_execution_settings(
             raw_auto_stop = payload.get("daytonaAutoStopMinutes")
             if isinstance(raw_auto_stop, (int, float)) and 0 <= int(raw_auto_stop) <= 10_080:
                 daytona.auto_stop_minutes = int(raw_auto_stop)
+            raw_proxy = _text(payload, "daytonaOutboundProxyUrl", maximum=512)
+            if raw_proxy:
+                daytona.outbound_proxy_url = validate_daytona_outbound_proxy_url(raw_proxy)
         # Novita sandbox sizing (CPU/RAM for auto-built templates).
         novita_template = getattr(config.execution, "novita_template", None)
         if novita_template is not None:

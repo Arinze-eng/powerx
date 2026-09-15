@@ -135,7 +135,10 @@ def test_execution_env_overlay_for_upstash(monkeypatch):
     monkeypatch.setenv("NANOBOT_UPSTASH_SIZE", "medium")
     monkeypatch.setenv("NANOBOT_UPSTASH_TTL", "7200")
     config = apply_render_execution_env(Config())
-    assert config.execution.backend == "upstash"
+    # The overlay restores credentials only. Which backend runs is decided by
+    # the persisted selection (seeded once at boot by ensure_render_config), so
+    # a durable env value can never revert an administrator's choice here.
+    assert config.execution.backend == "novita"
     assert config.execution.upstash.api_key == "box_env_key"
     assert config.execution.upstash.size == "medium"
     assert config.execution.upstash.ttl_s == 7200

@@ -434,6 +434,13 @@ class DaytonaExecutionConfig(Base):
     snapshot: str = "daytona-small"
     domain_allow_list: str = ""
     network_allow_list: str = "0.0.0.0/0"
+    # Daytona bills orgs by tier, and Tier 1/Tier 2 orgs are network-restricted
+    # at the organization level: the API rejects any sandbox-level
+    # domain/network allow list, so an allow list cannot widen egress there.
+    # Routing outbound traffic through an operator-run HTTP(S) proxy is the only
+    # lever Daytona accepts at those tiers, so it is configurable independently.
+    # Format: http://host:port or http://user:pass@host:port.
+    outbound_proxy_url: str = Field(default="", repr=False)
     fetch_allow_hosts: str = ""
     ttl_minutes: int = Field(default=60, ge=5, le=43_200)
     auto_stop_minutes: int = Field(default=0, ge=0, le=10_080)
@@ -461,6 +468,13 @@ class ExecutionBackendConfig(Base):
     """Select the remote execution provider used by sandbox-compatible tasks."""
 
     backend: Literal["novita", "vps", "upstash", "daytona"] = "novita"
+    # Who picked ``backend``. This is recorded instead of inferred from which
+    # credentials happen to sit on disk, so an administrator's explicit choice
+    # can never be silently reverted by a durable deployment environment value.
+    #   "default" - never explicitly picked (template default); boot bootstrap may set it
+    #   "env"     - seeded once at boot from NANOBOT_EXECUTION_BACKEND
+    #   "admin"   - saved from the admin panel; authoritative, never overridden
+    backend_source: Literal["default", "env", "admin"] = "default"
     vps: VPSExecutionConfig = Field(default_factory=VPSExecutionConfig)
     upstash: UpstashExecutionConfig = Field(default_factory=UpstashExecutionConfig)
     daytona: DaytonaExecutionConfig = Field(default_factory=DaytonaExecutionConfig)

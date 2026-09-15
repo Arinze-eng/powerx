@@ -15,6 +15,7 @@ from nanobot.agent.tools.daytona_backend import (
     validate_daytona_api_url,
     validate_daytona_domain_allow_list,
     validate_daytona_network_allow_list,
+    validate_daytona_outbound_proxy_url,
     validate_daytona_snapshot,
 )
 from nanobot.agent.tools.daytona_backend import _safe_path as _dtn_safe_path
@@ -374,6 +375,155 @@ async def test_ensure_sandbox_wildcard_uses_open_cidr(calls: Any) -> None:  # no
     await backend.ensure_sandbox(_FakeSession(handler))
     assert created_body.get("networkAllowList") == "0.0.0.0/0"
     assert "domainAllowList" not in created_body
+
+
+# --------------------------------------------------------------------------
+# Tier 1/2 organizations: Daytona rejects any sandbox-level network override.
+# Sandboxes must still come up instead of failing the user's whole task.
+# --------------------------------------------------------------------------
+
+_TIER_REJECTION = (
+    "POST /sandbox failed with HTTP 400: Network access is restricted and cannot "
+    "be overridden at the sandbox level. Remove domainAllowList from the request."
+)
+
+# Sandbox-level keys Daytona rejects outright on a Tier 1/2 organization.
+_NETWORK_KEYS = {"domainAllowList", "networkAllowList", "networkBlockAll"}
+
+
+@pytest.fixture(autouse=True)
+def _clear_restriction_flag() -> Any:
+    """Each test starts without the process-wide tier-restriction marker set."""
+    previous = daytona_backend._network_override_restricted
+    daytona_backend._network_override_restricted = False
+    yield
+    daytona_backend._network_override_restricted = previous
+
+
+async def test_tier_restricted_org_retries_without_network_policy(calls: Any) -> None:  # noqa: ANN401
+    create_bodies: list[dict[str, Any]] = []
+
+    def handler(method: str, url: str, kwargs: dict[str, Any]) -> _Response:
+        if method == "GET" and "/sandbox/px-tier" in url:
+            return _Response(status=404, payload={"error": "not found"})
+        if method == "POST" and url.endswith("/sandbox"):
+            body = dict(kwargs.get("json") or {})
+            create_bodies.append(body)
+            if "domainAllowList" in body:
+                # Daytona refuses the override, exactly like a Tier 1/2 org.
+                return _Response(status=400, payload={"message": _TIER_REJECTION})
+            return _Response(status=200, payload={"id": "sbx-tier"})
+        if method == "GET" and "/sandbox/sbx-tier" in url:
+            return _Response(
+                status=200,
+                payload={"id": "sbx-tier", "state": "started", "toolboxProxyUrl": "https://tb.example"},
+            )
+        return _Response(status=404, payload={"error": "not found"})
+
+    calls.install(handler)
+    backend = DaytonaExecutionBackend(_config(), sandbox_name="px-tier")
+    sandbox_id = await backend.ensure_sandbox(_FakeSession(handler))
+
+    assert sandbox_id == "sbx-tier"
+    # The session sandbox is created twice: first attempt carries the allow
+    # list and is rejected, the retry drops every network key.
+    session_creates = [b for b in create_bodies if b.get("name") == "px-tier"]
+    assert len(session_creates) == 2
+    assert "domainAllowList" in session_creates[0]
+    retry = session_creates[1]
+    assert not _NETWORK_KEYS & set(retry)
+    assert retry["name"] == "px-tier"
+    # The rejection is remembered so later sandboxes skip the doomed request.
+    assert daytona_backend.daytona_network_override_restricted() is True
+
+
+async def test_restriction_marker_skips_allow_list_entirely(calls: Any) -> None:  # noqa: ANN401
+    create_bodies: list[dict[str, Any]] = []
+
+    def handler(method: str, url: str, kwargs: dict[str, Any]) -> _Response:
+        if method == "GET" and "/sandbox/px-cached" in url:
+            return _Response(status=404, payload={"error": "not found"})
+        if method == "POST" and url.endswith("/sandbox"):
+            create_bodies.append(dict(kwargs.get("json") or {}))
+            return _Response(status=200, payload={"id": "sbx-cached"})
+        if method == "GET" and "/sandbox/sbx-cached" in url:
+            return _Response(
+                status=200,
+                payload={"id": "sbx-cached", "state": "started", "toolboxProxyUrl": "https://tb.example"},
+            )
+        return _Response(status=404, payload={"error": "not found"})
+
+    daytona_backend._network_override_restricted = True
+    calls.install(handler)
+    backend = DaytonaExecutionBackend(_config(), sandbox_name="px-cached")
+    await backend.ensure_sandbox(_FakeSession(handler))
+
+    # No create carries a network key, so none is ever rejected first. The
+    # session sandbox plus the persistence archive sandbox are both expected.
+    assert [b["name"] for b in create_bodies][0] == "px-cached"
+    assert all(not (_NETWORK_KEYS & set(body)) for body in create_bodies)
+
+
+async def test_outbound_proxy_survives_tier_restriction(calls: Any) -> None:  # noqa: ANN401
+    """outboundProxyUrl is accepted at Tier 1/2 and is the only egress lever."""
+    create_bodies: list[dict[str, Any]] = []
+
+    def handler(method: str, url: str, kwargs: dict[str, Any]) -> _Response:
+        if method == "GET" and "/sandbox/px-proxy" in url:
+            return _Response(status=404, payload={"error": "not found"})
+        if method == "POST" and url.endswith("/sandbox"):
+            body = dict(kwargs.get("json") or {})
+            create_bodies.append(body)
+            if "domainAllowList" in body:
+                return _Response(status=400, payload={"message": _TIER_REJECTION})
+            return _Response(status=200, payload={"id": "sbx-proxy"})
+        if method == "GET" and "/sandbox/sbx-proxy" in url:
+            return _Response(
+                status=200,
+                payload={"id": "sbx-proxy", "state": "started", "toolboxProxyUrl": "https://tb.example"},
+            )
+        return _Response(status=404, payload={"error": "not found"})
+
+    calls.install(handler)
+    config = _config(outbound_proxy_url="http://proxy.example.test:3128")
+    backend = DaytonaExecutionBackend(config, sandbox_name="px-proxy")
+    await backend.ensure_sandbox(_FakeSession(handler))
+
+    session_creates = [b for b in create_bodies if b.get("name") == "px-proxy"]
+    assert len(session_creates) == 2
+    # The proxy survives the fallback: it is not one of the rejected keys.
+    retry = session_creates[1]
+    assert retry.get("outboundProxyUrl") == "http://proxy.example.test:3128"
+    assert not {"domainAllowList", "networkAllowList"} & set(retry)
+    # Every sandbox created for this session (archive included) can egress.
+    assert all(b.get("outboundProxyUrl") == "http://proxy.example.test:3128" for b in create_bodies)
+
+
+def test_network_allow_list_caps_and_cidr_shape() -> None:
+    # Up to ten CIDRs are accepted.
+    ten = ",".join(f"10.0.{i}.0/24" for i in range(10))
+    assert validate_daytona_network_allow_list(ten) == ten
+    # Eleven is a hard API 400, so reject it locally.
+    eleven = ",".join(f"10.0.{i}.0/24" for i in range(11))
+    with pytest.raises(ValueError, match="at most 10"):
+        validate_daytona_network_allow_list(eleven)
+    # Daytona requires an explicit /prefix on every entry.
+    with pytest.raises(ValueError, match="CIDR"):
+        validate_daytona_network_allow_list("143.244.209.188")
+
+
+def test_outbound_proxy_validator() -> None:
+    assert (
+        validate_daytona_outbound_proxy_url(" http://user:pass@proxy.test:3128 ")
+        == "http://user:pass@proxy.test:3128"
+    )
+    assert validate_daytona_outbound_proxy_url("") == ""
+    with pytest.raises(ValueError):
+        validate_daytona_outbound_proxy_url("socks5://proxy.test:1080")
+    with pytest.raises(ValueError):
+        validate_daytona_outbound_proxy_url("http://")
+    with pytest.raises(ValueError):
+        validate_daytona_outbound_proxy_url("not a url at all")
 
 
 async def test_fetch_url_respects_configured_hosts(calls: Any) -> None:  # noqa: ANN401

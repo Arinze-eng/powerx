@@ -1,10 +1,14 @@
-"""Durable Render execution-settings overlay.
+"""Durable deployment credential overlay.
 
-Render's free service filesystem is ephemeral and requests may be handled by
-separate service processes.  This module applies explicitly configured
-server-side environment values to the in-memory execution config.  It is
-intentionally a no-op unless ``NANOBOT_EXECUTION_BACKEND`` is set, so local
-config files and the Novita default remain unchanged.
+Render's and Northflank's service filesystem can be ephemeral, and requests may
+be handled by separate service processes.  This module applies explicitly
+configured server-side environment values to the in-memory execution config so
+a wiped platform env self-heals.
+
+It is credential-only by design: it never decides *which* execution backend is
+used.  ``execution.backend`` is a persisted administrator setting (see
+``ExecutionBackendConfig.backend_source``); the one-time seed from
+``NANOBOT_EXECUTION_BACKEND`` happens at boot in ``scripts/ensure_render_config.py``.
 """
 
 from __future__ import annotations
@@ -29,74 +33,64 @@ def _positive_int(value: str | None, *, maximum: int) -> int | None:
 
 
 def apply_render_execution_env(config: Any) -> Any:
-    """Apply optional durable Render execution settings to ``config``.
+    """Apply durable deployment credentials to ``config`` without picking a backend.
 
-    The overlay is activated only when the backend variable explicitly equals
-    ``novita`` or ``vps``.  Empty or malformed optional values are ignored,
-    leaving the validated config-file value in place.  Secret values are only
-    assigned in memory and are never logged or returned by this module.
+    This overlay fills in connection settings (VPS SSH details, Upstash/Daytona
+    API keys) so a platform whose env was wiped can self-heal.  It deliberately
+    never assigns ``execution.backend``: choosing *which* sandbox provider runs
+    is an administrator decision, and rewriting it on every config load used to
+    silently revert a saved selection (picking VPS could come back as Daytona on
+    the next request).  The backend label is seeded once at boot by
+    ``scripts/ensure_render_config.py`` and owned by the admin panel afterwards.
+
+    Empty or malformed optional values are ignored, leaving the validated
+    config-file value in place.  Secret values are only assigned in memory and
+    are never logged or returned by this module.
     """
-    backend = (_env("NANOBOT_EXECUTION_BACKEND") or "").lower()
-    if backend not in {"novita", "vps", "upstash", "daytona"}:
-        return config
     execution = getattr(config, "execution", None)
     vps = getattr(execution, "vps", None)
     if execution is None or vps is None:
         return config
-    configured_backend = str(getattr(execution, "backend", "") or "").lower()
-    # A saved admin choice is authoritative once the config contains VPS
-    # details. This lets the admin switch back to Novita without the old
-    # durable VPS default overriding the choice on every request. On a fresh
-    # Render instance the template has no VPS details, so the durable VPS
-    # environment still restores the selected backend as intended.
-    vps_configured = any(
-        str(getattr(vps, field, "") or "").strip()
-        for field in ("host", "username", "password", "private_key")
-    )
     upstash = getattr(execution, "upstash", None)
-    upstash_configured = bool(str(getattr(upstash, "api_key", "") or "").strip()) if upstash is not None else False
     daytona = getattr(execution, "daytona", None)
-    daytona_configured = bool(str(getattr(daytona, "api_key", "") or "").strip()) if daytona is not None else False
-    # explicit_novita guards an admin's deliberate switch BACK to novita; its
-    # marker is another backend's key saved on disk (admin saves persist the
-    # env-overlaid key). Env-provided keys must NOT count here, or the durable
-    # env default could never restore a backend on a fresh instance.
-    explicit_novita = configured_backend == "novita" and (vps_configured or upstash_configured or daytona_configured)
-    explicit_vps = configured_backend == "vps" and vps_configured
-    # A saved Daytona/Upstash admin choice is authoritative on its own. The API
-    # key may live in the deployment env (synced from Supabase at boot) rather
-    # than in the saved config file, so requiring a key on disk would let the
-    # durable env default stomp the admin's selection on every config load and
-    # silently fall back to the initial sandbox.
-    explicit_daytona = configured_backend == "daytona"
-    explicit_upstash = configured_backend == "upstash"
-    if not (explicit_novita or explicit_vps or explicit_daytona or explicit_upstash):
-        execution.backend = backend
+    # Credential-only overlay: env never changes which backend is selected.
+    if (_env("NANOBOT_EXECUTION_BACKEND") or "").lower() not in {
+        "novita",
+        "vps",
+        "upstash",
+        "daytona",
+    }:
+        return config
 
-    values = {
-        "host": _env("NANOBOT_VPS_HOST"),
-        "username": _env("NANOBOT_VPS_USERNAME"),
-        "host_key_fingerprint": _env("NANOBOT_VPS_FINGERPRINT"),
-        "host_key_policy": (_env("NANOBOT_VPS_HOST_KEY_POLICY") or "").lower() or None,
-        "workspace_dir": _env("NANOBOT_VPS_WORKSPACE"),
-    }
-    for field, value in values.items():
-        if value is not None:
-            setattr(vps, field, value)
+    # Credential-only overlay. An administrator-saved value is always
+    # authoritative: env vars restore what the config file leaves empty or at
+    # its schema default (so a wiped platform self-heals), but they must never
+    # overwrite a value the admin explicitly saved. This mirrors the Upstash
+    # rule below and keeps every provider's settings handled the same way.
+    def _fill(target: Any, field: str, value: str | None) -> None:
+        if not value:
+            return
+        if str(getattr(target, field, "") or "").strip():
+            return
+        setattr(target, field, value)
+
+    _fill(vps, "host", _env("NANOBOT_VPS_HOST"))
+    _fill(vps, "username", _env("NANOBOT_VPS_USERNAME"))
+    _fill(vps, "host_key_fingerprint", _env("NANOBOT_VPS_FINGERPRINT"))
+    _fill(vps, "workspace_dir", _env("NANOBOT_VPS_WORKSPACE"))
+    host_key_policy = (_env("NANOBOT_VPS_HOST_KEY_POLICY") or "").lower()
+    if host_key_policy and str(getattr(vps, "host_key_policy", "") or "") == "fingerprint":
+        vps.host_key_policy = host_key_policy
 
     port = _positive_int(_env("NANOBOT_VPS_PORT"), maximum=65535)
     timeout = _positive_int(_env("NANOBOT_VPS_TIMEOUT"), maximum=60)
-    if port is not None:
+    if port is not None and int(getattr(vps, "port", 22) or 22) == 22:
         vps.port = port
-    if timeout is not None:
+    if timeout is not None and int(getattr(vps, "connect_timeout", 15) or 15) == 15:
         vps.connect_timeout = timeout
 
-    password = os.getenv("NANOBOT_VPS_PASSWORD")
-    private_key = os.getenv("NANOBOT_VPS_PRIVATE_KEY")
-    if password:
-        vps.password = password
-    if private_key:
-        vps.private_key = private_key
+    _fill(vps, "password", os.getenv("NANOBOT_VPS_PASSWORD"))
+    _fill(vps, "private_key", os.getenv("NANOBOT_VPS_PRIVATE_KEY"))
 
     # Upstash Box overlay (used when the deployment selects the Upstash backend).
     # An admin-saved value is authoritative: env vars are durable defaults that
@@ -125,26 +119,24 @@ def apply_render_execution_env(config: Any) -> Any:
             upstash.ttl_s = ttl
 
     # Daytona overlay (used when the deployment selects the Daytona backend).
+    # Same credential-only, fill-blanks rule as VPS and Upstash: an admin-saved
+    # key/endpoint wins, env restores what is missing.
     if daytona is not None:
-        api_key = _env("NANOBOT_DAYTONA_API_KEY") or _env("DAYTONA_API_KEY")
-        if api_key:
-            daytona.api_key = api_key
-        api_url = _env("NANOBOT_DAYTONA_API_URL")
-        if api_url:
-            daytona.api_url = api_url
+        _fill(daytona, "api_key", _env("NANOBOT_DAYTONA_API_KEY") or _env("DAYTONA_API_KEY"))
+        _fill(daytona, "api_url", _env("NANOBOT_DAYTONA_API_URL"))
         snapshot = _env("NANOBOT_DAYTONA_SNAPSHOT")
-        if snapshot:
+        if snapshot and str(getattr(daytona, "snapshot", "") or "") in {"", "daytona-small"}:
             daytona.snapshot = snapshot
-        domain_list = _env("NANOBOT_DAYTONA_DOMAIN_ALLOW_LIST")
-        if domain_list:
-            daytona.domain_allow_list = domain_list
+        _fill(daytona, "domain_allow_list", _env("NANOBOT_DAYTONA_DOMAIN_ALLOW_LIST"))
         network_list = _env("NANOBOT_DAYTONA_NETWORK_ALLOW_LIST")
-        if network_list:
+        if network_list and str(getattr(daytona, "network_allow_list", "") or "").strip() in {
+            "",
+            "0.0.0.0/0",
+        }:
             daytona.network_allow_list = network_list
-        fetch_hosts = _env("NANOBOT_DAYTONA_FETCH_ALLOW_HOSTS")
-        if fetch_hosts:
-            daytona.fetch_allow_hosts = fetch_hosts
+        _fill(daytona, "fetch_allow_hosts", _env("NANOBOT_DAYTONA_FETCH_ALLOW_HOSTS"))
         ttl_minutes = _positive_int(_env("NANOBOT_DAYTONA_TTL_MINUTES"), maximum=43_200)
-        if ttl_minutes is not None and ttl_minutes >= 5:
+        if ttl_minutes is not None and ttl_minutes >= 5 and int(getattr(daytona, "ttl_minutes", 60) or 60) == 60:
             daytona.ttl_minutes = ttl_minutes
+        _fill(daytona, "outbound_proxy_url", _env("NANOBOT_DAYTONA_OUTBOUND_PROXY_URL"))
     return config

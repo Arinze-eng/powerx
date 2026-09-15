@@ -6,12 +6,80 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 _DEFAULT_MAX_TOOL_ITERATIONS = 120
 _LEGACY_DEFAULT_MAX_TOOL_ITERATIONS = 80
 _DEFAULT_REASONING_EFFORT = "max"
 _DEFAULT_RENDER_MODEL = "gemini-3.1-flash-lite"
+
+_VALID_EXECUTION_BACKENDS = ("novita", "vps", "upstash", "daytona")
+# Matches ExecutionBackendConfig.backend default in nanobot/config/schema.py.
+_DEFAULT_EXECUTION_BACKEND = "novita"
+
+
+def _text_field(data: dict[str, Any], key: str) -> str:
+    """Read ``key`` from a JSON object as a normalized lowercase string."""
+    value = data.get(key)
+    return value.strip().lower() if isinstance(value, str) else ""
+
+
+def _is_json_object(value: object) -> TypeGuard[dict[str, Any]]:
+    """True for a decoded JSON object (string keys, arbitrarily typed values)."""
+    return isinstance(value, dict)
+
+
+def _object_field(data: dict[str, Any], key: str) -> dict[str, Any] | None:
+    """Return ``data[key]`` as a mutable nested object, or ``None`` if absent."""
+    value = data.get(key)
+    if not _is_json_object(value):
+        return None
+    return value
+
+
+def _ensure_execution_backend_selection(data: dict[str, Any]) -> bool:
+    """Seed ``execution.backend`` from the deployment env exactly once, at boot.
+
+    This used to run on *every* config load inside
+    ``nanobot.execution_env.apply_render_execution_env``, where a durable
+    platform variable could silently revert the administrator's saved choice on
+    the next request (picking VPS came back as Daytona, and Novita likewise).
+
+    Now the env value only bootstraps a backend nobody has chosen, and
+    ``backend_source`` records who owns the selection:
+
+      * ``admin`` -> the on-disk choice is authoritative; never touched here.
+      * ``env``   -> still owned by the deployment env; safe to re-seed.
+      * ``default``/absent -> fresh instance; adopt the env selection once.
+
+    Configs written before ``backend_source`` existed carry a real backend label
+    but no provenance. A non-default saved label is treated as an administrator
+    selection so upgrading never silently switches a live deployment's provider.
+    """
+    env_backend = (os.getenv("NANOBOT_EXECUTION_BACKEND") or "").strip().lower()
+    if env_backend not in _VALID_EXECUTION_BACKENDS:
+        return False
+
+    execution = _object_field(data, "execution")
+    if execution is None:
+        if env_backend == _DEFAULT_EXECUTION_BACKEND:
+            return False
+        data["execution"] = {"backend": env_backend, "backend_source": "env"}
+        return True
+
+    source = _text_field(execution, "backend_source")
+    saved_backend = _text_field(execution, "backend")
+    if source == "admin":
+        return False
+    if not source and saved_backend and saved_backend != _DEFAULT_EXECUTION_BACKEND:
+        execution["backend_source"] = "admin"
+        return True
+    if saved_backend == env_backend and source == "env":
+        return False
+
+    execution["backend"] = env_backend
+    execution["backend_source"] = "env"
+    return True
 
 
 def _load_config(config_path: Path) -> dict[str, Any] | None:
@@ -338,6 +406,7 @@ def ensure_render_defaults(config_path: Path) -> bool:
     changed = _ensure_deliberate_defaults(data) or changed
     changed = _ensure_high_context_defaults(data) or changed
     changed = _ensure_subagent_concurrency_cap(data) or changed
+    changed = _ensure_execution_backend_selection(data) or changed
     return _write_config(config_path, data) if changed else False
 
 
