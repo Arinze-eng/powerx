@@ -17,6 +17,7 @@ from nanobot.agent.tools.daytona_backend import (
     validate_daytona_network_allow_list,
     validate_daytona_snapshot,
 )
+from nanobot.agent.tools.daytona_backend import _safe_path as _dtn_safe_path
 from nanobot.config.schema import DaytonaExecutionConfig, ExecutionBackendConfig
 
 
@@ -132,6 +133,24 @@ def test_schema_accepts_daytona_backend() -> None:
     assert config.daytona.snapshot == "daytona-small"
     assert config.daytona.network_allow_list == "0.0.0.0/0"
     assert config.daytona.ttl_minutes == 60
+
+
+def test_safe_path_accepts_root_as_workspace() -> None:
+    """The LLM calls list with path="/" to see the sandbox root. That must map
+    to the /home/daytona workspace instead of raising the "must remain inside"
+    ValueError that crashed Daytona sessions on every listing."""
+    assert _dtn_safe_path("/") == "/home/daytona"
+    assert _dtn_safe_path(" / ") == "/home/daytona"
+    assert _dtn_safe_path("/home/daytona") == "/home/daytona"
+    assert _dtn_safe_path("notes.md") == "/home/daytona/notes.md"
+    with pytest.raises(ValueError):
+        _dtn_safe_path("/etc/passwd")
+    with pytest.raises(ValueError):
+        _dtn_safe_path("/home/other/secret")
+    with pytest.raises(ValueError):
+        _dtn_safe_path("../escape")
+    with pytest.raises(ValueError):
+        _dtn_safe_path("")
 
 
 async def test_ensure_sandbox_creates_with_allowlists(calls: Any, monkeypatch: Any) -> None:  # noqa: ANN401

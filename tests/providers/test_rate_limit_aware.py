@@ -221,9 +221,15 @@ def _overloaded():
 
 
 @pytest.mark.asyncio
-async def test_survives_provider_outage_longer_than_giveup_window(fast_sleep, monkeypatch) -> None:
-    """A sustained outage past the 15-minute rate-limit give-up floor must NOT
-    abort — an outage is server-side and carries no quota window."""
+async def test_sustained_overload_does_not_hang_forever(fast_sleep, monkeypatch) -> None:
+    """A *sustained* provider outage must not hang the task forever.
+
+    Short/intermittent overloads are waited out (see
+    test_intermittent_failures_recover_like_nvidia_traffic), but a sustained
+    overload with no Retry-After ever sent must eventually give up and surface
+    a terminal error instead of spinning forever. This is the finite bound that
+    replaces the previous "wait it out indefinitely" behavior.
+    """
     clock = {"t": 0.0}
     monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
 
@@ -233,19 +239,31 @@ async def test_survives_provider_outage_longer_than_giveup_window(fast_sleep, mo
 
     monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _sleep_advancing)
 
-    # Way beyond both give-up thresholds: >30 identical errors, >15min elapsed.
-    provider = ScriptedProvider([_overloaded() for _ in range(45)] + [
-        LLMResponse(content="provider recovered", finish_reason="stop"),
-    ])
+    # 1000 identical overloads: way past the 30-identical-error threshold and
+    # the 1200s overload wall floor. It MUST give up (bounded), not loop forever.
+    provider = ScriptedProvider([_overloaded() for _ in range(1000)])
+
+    exhausted: list[str] = []
+
+    async def _exhausted(msg: str) -> None:
+        exhausted.append(msg)
 
     response = await provider.chat_with_retry(
         messages=[{"role": "user", "content": "hi"}],
         retry_mode="rate_limit_aware",
+        on_retry_exhausted=_exhausted,
     )
 
-    assert response.content == "provider recovered"
-    assert response.finish_reason == "stop"
-    assert provider.calls == 46  # never gave up despite crossing every threshold
+    assert response.finish_reason == "error"
+    # Give-up needs >=30 identical errors AND >=1200s elapsed. With 60s/sleep it
+    # trips at attempt ~20 (elapsed ~19*60=1140s is below; attempt 21 gives
+    # ~1200s). Cap the calls well below 1000 — the loop must NOT spin forever.
+    assert 20 <= provider.calls <= 40
+    assert exhausted  # terminal event fired so the UI can show a friendly stop
+    # The user-facing stop message must not blame the user for a provider outage
+    # nor leak the raw 503.
+    assert all("rate limited" not in m.lower() for m in exhausted)
+    assert all("503" not in m for m in exhausted)
 
 
 @pytest.mark.asyncio

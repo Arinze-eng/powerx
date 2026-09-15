@@ -463,6 +463,12 @@ def _safe_path(raw: str) -> str:
     value = raw.strip()
     if not value:
         raise ValueError("path is required")
+    # The LLM frequently asks to "list /" to see the sandbox root. From its
+    # perspective that means the sandbox workspace, not the container's real
+    # filesystem root. Map a bare "/" to the workspace root so it does not
+    # raise. All other paths outside the workspace remain rejected (secure).
+    if value == "/":
+        return _WORKSPACE
     if not value.startswith("/"):
         value = posixpath.join(_WORKSPACE, value)
     normalized = posixpath.normpath(value)

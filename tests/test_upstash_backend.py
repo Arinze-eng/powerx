@@ -55,10 +55,19 @@ def test_box_names_are_stable_and_valid():
 def test_safe_path_confinement():
     assert _safe_path("notes.md") == "/workspace/home/notes.md"
     assert _safe_path("/workspace/home/a/b.txt") == "/workspace/home/a/b.txt"
+    # A bare "/" is how the LLM asks to "see the sandbox root" — it means the
+    # workspace root, not the container filesystem. It must not raise.
+    assert _safe_path("/") == "/workspace/home"
+    assert _safe_path(" / ") == "/workspace/home"
+    # Trailing-slash root still confined.
     with pytest.raises(ValueError):
         _safe_path("/etc/passwd")
     with pytest.raises(ValueError):
+        _safe_path("/home/other/secret")
+    with pytest.raises(ValueError):
         _safe_path("../escape")
+    with pytest.raises(ValueError):
+        _safe_path("")
 
 
 def test_backend_reads_config_fields():

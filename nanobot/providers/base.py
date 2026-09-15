@@ -328,7 +328,13 @@ class LLMProvider(ABC):
     _RLA_MAX_DELAY = 60.0            # exponential backoff ceiling (seconds)
     _RLA_JITTER_FRACTION = 0.2       # +/- 20% jitter to avoid thundering herd
     _RLA_GIVEUP_IDENTICAL_ERRORS = 30   # hard stop only if ALSO no Retry-After AND past min wall time
-    _RLA_GIVEUP_MIN_WALL_S = 900.0      # ~15min of pure waiting before a no-Retry-After spiral ends
+    _RLA_GIVEUP_MIN_WALL_S = 900.0      # ~15min of pure waiting before a no-Retry-After (rate-limit) spiral ends
+    # Server-side OVERLOAD ("503 Service temporarily overloaded") is NOT the
+    # caller's fault, so it gets MORE headroom than a rate limit — but it must
+    # still be finite. Without this bound a sustained provider outage makes the
+    # task hang forever (no Retry-After ever sent). We wait out short/intermittent
+    # overloads, but a sustained one with no Retry-After eventually gives up.
+    _RLA_GIVEUP_OVERLOAD_MIN_WALL_S = 1200.0  # ~20min of waiting on identical overloads
     _RLA_DEFAULT_RETRY_AFTER = 5.0      # assumed window when a retryable 429 omits Retry-After
     _TRANSIENT_ERROR_MARKERS = (
         "429",
@@ -1520,20 +1526,28 @@ class LLMProvider(ABC):
                     # a short one so we back off instead of hot-looping.
                     effective_retry_after = self._RLA_DEFAULT_RETRY_AFTER
                 elapsed = time.monotonic() - loop_started_at
-                # Give up ONLY on a genuine rate-limit death spiral: the provider
-                # never sent a Retry-After, a long run of identical errors, AND
-                # substantial wall time already spent waiting. Server-side
-                # OVERLOAD is exempt — an outage is not the caller's fault and
-                # carries no quota window, so we keep waiting it out.
+                # Give up on a genuine death spiral: the provider never sent a
+                # Retry-After, a long run of identical errors, AND substantial
+                # wall time already spent waiting. Both rate limits AND server
+                # overloads get bounded here. Overloads receive MORE headroom
+                # (a provider outage legitimately outlasts a quota window) but
+                # they are still finite — otherwise a sustained outage hangs
+                # the task forever with no Retry-After ever sent.
+                give_up_wall = (
+                    self._RLA_GIVEUP_OVERLOAD_MIN_WALL_S
+                    if overloaded
+                    else self._RLA_GIVEUP_MIN_WALL_S
+                )
                 if (
-                    not overloaded
-                    and promised is None
+                    promised is None
                     and identical_error_count >= self._RLA_GIVEUP_IDENTICAL_ERRORS
-                    and elapsed >= self._RLA_GIVEUP_MIN_WALL_S
+                    and elapsed >= give_up_wall
                 ):
+                    kind = "overload" if overloaded else "rate-limit"
                     logger.warning(
-                        "rate_limit_aware giving up after {} identical errors over {:.0f}s with no Retry-After: {}",
+                        "rate_limit_aware giving up after {} identical {} errors over {:.0f}s with no Retry-After: {}",
                         identical_error_count,
+                        kind,
                         elapsed,
                         (response.content or "")[:120].lower(),
                     )
