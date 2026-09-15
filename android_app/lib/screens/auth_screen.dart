@@ -15,6 +15,7 @@ class _AuthScreenState extends State<AuthScreen> {
   final _email = TextEditingController();
   final _password = TextEditingController();
   final _name = TextEditingController();
+  final _referral = TextEditingController();
   bool _isSignUp = false;
   bool _obscure = true;
 
@@ -23,6 +24,7 @@ class _AuthScreenState extends State<AuthScreen> {
     _email.dispose();
     _password.dispose();
     _name.dispose();
+    _referral.dispose();
     super.dispose();
   }
 
@@ -40,7 +42,8 @@ class _AuthScreenState extends State<AuthScreen> {
       return;
     }
     if (_isSignUp) {
-      final ok = await state.signUp(em, pw, _name.text);
+      final ok = await state.signUp(em, pw, _name.text,
+          referral: _referral.text.trim());
       if (ok && mounted) Navigator.of(context).pushReplacementNamed('/home');
     } else {
       await state.signIn(em, pw);
@@ -130,6 +133,19 @@ class _AuthScreenState extends State<AuthScreen> {
                     ),
                   ),
                 ),
+                if (_isSignUp) ...[
+                  const SizedBox(height: 14),
+                  _field(_referral, 'Referral code (optional)',
+                      Icons.card_giftcard, false),
+                  const SizedBox(height: 6),
+                  const Padding(
+                    padding: EdgeInsets.only(left: 4),
+                    child: Text(
+                      "Enter your friend's email as a referral code and get 700 bonus credits. Each code works once.",
+                      style: TextStyle(color: Colors.white38, fontSize: 12),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 26),
                 FilledButton(
                   onPressed: busy ? null : _submit,
@@ -154,7 +170,7 @@ class _AuthScreenState extends State<AuthScreen> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Text(
-                      _isSignUp ? 'Already have an account?' : "New to PowerX?",
+                      _isSignUp ? 'Already have an account?' : 'New to PowerX?',
                       style: const TextStyle(color: Colors.white54),
                     ),
                     TextButton(

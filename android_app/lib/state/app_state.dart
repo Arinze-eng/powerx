@@ -22,6 +22,8 @@ class AppState extends ChangeNotifier {
   static const _kRefresh = 'refresh_token';
   static const _kEmail = 'email';
   static const _kName = 'name';
+  /// Last open chat id so a backgrounded turn can be resumed on reopen.
+  static const _kLastChat = 'last_chat_id';
 
   AppStatus status = AppStatus.loading;
   String? errorMessage;
@@ -38,8 +40,20 @@ class AppState extends ChangeNotifier {
   String? _wsPath;
   NanobotSocket? _socket;
 
+  // Bootstrap-derived profile/billing data
+  String? modelName;
+  String? supabaseUserId;
+  List<PaymentPackage> paymentPackages = const [];
+  String paymentUrl = '';
+
+  // Credits (fetched lazily from Supabase profiles).
+  CreditBundle? credits;
+  bool creditsLoading = false;
+
   List<SessionSummary> sessions = [];
   bool sessionsLoading = false;
+
+  String? lastChatId;
 
   /// Discover Supabase config from the gateway and restore any saved session.
   Future<void> init() async {
@@ -57,6 +71,7 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> _restore() async {
+    lastChatId = await _storage.read(key: _kLastChat);
     final url = await _storage.read(key: _kSbUrl);
     final key = await _storage.read(key: _kSbKey);
     final at = await _storage.read(key: _kAccess);
@@ -74,6 +89,7 @@ class AppState extends ChangeNotifier {
         status = AppStatus.authenticated;
         notifyListeners();
         unawaited(loadSessions());
+        unawaited(refreshCredits());
       } catch (_) {
         // Token likely expired — refresh once.
         try {
@@ -83,6 +99,7 @@ class AppState extends ChangeNotifier {
           status = AppStatus.authenticated;
           notifyListeners();
           unawaited(loadSessions());
+          unawaited(refreshCredits());
         } catch (e) {
           await _clearSession();
           status = AppStatus.unauthenticated;
@@ -110,6 +127,7 @@ class AppState extends ChangeNotifier {
       status = AppStatus.authenticated;
       notifyListeners();
       unawaited(loadSessions());
+      unawaited(refreshCredits());
     } on AuthException catch (e) {
       _fail(e.message);
     } catch (e) {
@@ -118,7 +136,7 @@ class AppState extends ChangeNotifier {
   }
 
   /// Returns true when signed in immediately; false when email confirmation is required.
-  Future<bool> signUp(String em, String pw, String name) async {
+  Future<bool> signUp(String em, String pw, String name, {String? referral}) async {
     if (_auth == null) {
       _fail('Service not initialized');
       return false;
@@ -127,7 +145,7 @@ class AppState extends ChangeNotifier {
     errorMessage = null;
     notifyListeners();
     try {
-      final s = await _auth!.signUp(em.trim(), pw, name);
+      final s = await _auth!.signUp(em.trim(), pw, name, referral: referral);
       if (s == null) {
         status = AppStatus.unauthenticated;
         errorMessage = 'Check your email to confirm your account, then sign in.';
@@ -135,10 +153,16 @@ class AppState extends ChangeNotifier {
         return false;
       }
       await _persist(s);
+      // Redeem the one-time referral bonus right after account creation.
+      final ref = (referral ?? '').trim();
+      if (ref.isNotEmpty) {
+        unawaited(_claimReferral(s.accessToken, ref));
+      }
       await _bootstrapGateway();
       status = AppStatus.authenticated;
       notifyListeners();
       unawaited(loadSessions());
+      unawaited(refreshCredits());
       return true;
     } on AuthException catch (e) {
       _fail(e.message);
@@ -149,11 +173,18 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  Future<void> _claimReferral(String token, String referral) async {
+    try {
+      await _auth?.claimReferral(token, referral);
+    } catch (_) {/* best-effort */}
+  }
+
   Future<void> signOut() async {
     _socket?.close();
     _socket = null;
     await _clearSession();
     sessions = [];
+    credits = null;
     status = AppStatus.unauthenticated;
     notifyListeners();
   }
@@ -175,8 +206,10 @@ class AppState extends ChangeNotifier {
     _apiToken = null;
     _wsToken = null;
     _wsPath = null;
+    lastChatId = null;
     await _storage.delete(key: _kAccess);
     await _storage.delete(key: _kRefresh);
+    await _storage.delete(key: _kLastChat);
   }
 
   /// Exchange the Supabase access token for a gateway WS/REST token.
@@ -188,6 +221,11 @@ class AppState extends ChangeNotifier {
     _apiToken = boot.apiToken;
     _wsToken = boot.token;
     _wsPath = boot.wsPath;
+    modelName = boot.modelName;
+    supabaseUserId = boot.supabaseUserId;
+    paymentPackages = boot.paymentPackages;
+    paymentUrl = boot.paymentUrl;
+    if ((boot.userEmail ?? '').isNotEmpty) email = boot.userEmail;
   }
 
   String get greetingName {
@@ -195,6 +233,36 @@ class AppState extends ChangeNotifier {
     if (n.isNotEmpty) return n.split(RegExp(r'\s+')).first;
     if (email != null && email!.contains('@')) return email!.split('@').first;
     return 'there';
+  }
+
+  // ---- Credits / billing ------------------------------------------------
+
+  Future<void> refreshCredits() async {
+    if (_auth == null || accessToken == null) return;
+    creditsLoading = true;
+    notifyListeners();
+    try {
+      credits = await _auth!.fetchCredits(accessToken!);
+    } catch (_) {
+      // keep previous
+    } finally {
+      creditsLoading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<VerifyPaymentResult> verifyPayment(String txRef, {String? transactionId}) async {
+    if (_auth == null || accessToken == null) {
+      return const VerifyPaymentResult(ok: false, error: 'Please sign in again.');
+    }
+    final res = await _auth!.verifyPayment(accessToken!, txRef, transactionId: transactionId);
+    if (res.ok) await refreshCredits();
+    return res;
+  }
+
+  Future<bool?> referralUsedStatus() async {
+    if (_auth == null || accessToken == null || email == null) return null;
+    return _auth!.referralUsed(accessToken!, email!);
   }
 
   // ---- Sessions ---------------------------------------------------------
@@ -216,6 +284,18 @@ class AppState extends ChangeNotifier {
   Future<List<ThreadTurn>> openSession(SessionSummary s) async {
     if (_apiToken == null) return [];
     return api.fetchThread(_apiToken!, s.key);
+  }
+
+  Future<void> deleteSession(SessionSummary s) async {
+    if (_apiToken == null) return;
+    await api.deleteSession(_apiToken!, s.key);
+    sessions.removeWhere((x) => x.key == s.key);
+    notifyListeners();
+  }
+
+  void rememberChat(String chatId) {
+    lastChatId = chatId;
+    unawaited(_storage.write(key: _kLastChat, value: chatId));
   }
 
   // ---- Chat socket ------------------------------------------------------

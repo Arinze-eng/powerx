@@ -2,7 +2,7 @@ name: powerx_android
 description: "PowerX — native Android client for your self-hosted PowerX AI agent."
 publish_to: 'none'
 
-version: 1.0.0+1
+version: 1.1.0+2
 
 environment:
   sdk: ^3.7.2
@@ -26,6 +26,10 @@ dependencies:
   path_provider: ^2.1.4
   open_filex: ^4.5.0
   intl: ^0.19.0
+  # Pick images / arbitrary files for chat attachments.
+  file_picker: ^8.1.2
+  # Detect MIME types for base64 data-url encoding of images.
+  mime: ^1.0.6
 
 dev_dependencies:
   flutter_test:

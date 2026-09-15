@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import 'config.dart';
 import 'screens/auth_screen.dart';
 import 'screens/home_screen.dart';
+import 'screens/settings_screen.dart';
 import 'state/app_state.dart';
 
 void main() {
@@ -40,6 +41,11 @@ class PowerXApp extends StatelessWidget {
           fontFamily: 'Roboto',
         ),
         home: const _RootGate(),
+        routes: {
+          '/auth': (_) => const AuthScreen(),
+          '/home': (_) => const HomeScreen(),
+          '/settings': (_) => const SettingsScreen(),
+        },
       ),
     );
   }
