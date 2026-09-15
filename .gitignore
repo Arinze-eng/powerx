@@ -117,3 +117,4 @@ webui/.verify-*
 # local tooling / build artifacts
 nflank-cli/
 .venv/
+supabase/.temp/

@@ -40,9 +40,45 @@ class SupabaseAuth {
   ///
   /// [referral] is the referrer's email address; when provided it is stored on
   /// the new user's metadata and later redeemed via [claimReferral].
+  /// [fingerprint] binds the signup to this device: the signup-gate edge
+  /// function blocks a SECOND signup from the same device, server-side.
   Future<SupabaseSession?> signUp(
       String email, String password, String name,
-      {String? referral}) async {
+      {String? referral, String? fingerprint}) async {
+    // Server-side anti-abuse gate BEFORE creating the account. The gate
+    // records a hashed (email, device, ip) attestation and rejects a second
+    // signup from the same device. Fail OPEN on gate unavailability: Supabase
+    // auth remains the final authority and the gate still logged nothing.
+    if (fingerprint != null && fingerprint.isNotEmpty) {
+      try {
+        final gate = await _client.post(
+          _base.replace(path: '/functions/v1/signup-gate'),
+          headers: _headers,
+          body: jsonEncode({
+            'email': email.trim().toLowerCase(),
+            'fingerprint': fingerprint,
+            'platform': 'android',
+            if ((referral ?? '').trim().isNotEmpty)
+              'referral': referral!.trim().toLowerCase(),
+          }),
+        );
+        if (gate.statusCode == 403) {
+          Map<String, dynamic>? body;
+          try {
+            body = jsonDecode(gate.body) as Map<String, dynamic>;
+          } catch (_) {}
+          throw AuthException(
+              (body?['reason'] as String?)?.trim().isNotEmpty == true
+                  ? body!['reason'] as String
+                  : 'Sign-up is limited to one account per device. '
+                      'Please sign in to your existing account instead.');
+        }
+      } on AuthException {
+        rethrow;
+      } catch (_) {
+        // Gate unreachable → fail open; never trap a genuine signup.
+      }
+    }
     final data = <String, dynamic>{
       'name': name.trim().isEmpty ? 'CDNAI User' : name.trim(),
       'role': 'user',

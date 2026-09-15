@@ -9,6 +9,7 @@ import 'package:mime/mime.dart' as mime_lib;
 import 'package:open_filex/open_filex.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../config.dart';
 import '../models.dart';
@@ -39,6 +40,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _loadingHistory = false;
   bool _connected = false;
   final OnlyFilesUploader _uploader = OnlyFilesUploader();
+  Timer? _flushTimer;
 
   ChatMessage? _liveTurn; // assistant bubble for the current (or resumed) turn
 
@@ -114,6 +116,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       final running = status == 'running';
       setState(() => _remoteRunning = running);
       if (running) _ensureLiveTurn(); // replayed running turn → open bubble
+      _updateWakelock();
     };
   }
 
@@ -157,14 +160,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _view = ChatView(
       onDelta: (chunk) {
         _ensureLiveTurn().appendDelta(chunk);
-        if (mounted) setState(() {});
+        _scheduleFlush();
         _scrollToBottom();
       },
       onReasoningDelta: (chunk) {
         final t = _ensureLiveTurn();
         t.reasoning += chunk;
         t.reasoningStreaming = true;
-        if (mounted) setState(() {});
+        _scheduleFlush();
         _scrollToBottom();
       },
       onReasoningEnd: () {
@@ -186,7 +189,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         for (final s in steps) {
           _upsertStep(t, s);
         }
-        if (mounted) setState(() {});
+        _scheduleFlush();
         _scrollToBottom();
       },
       onFinalMessage: (text, media) {
@@ -237,6 +240,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             _stopping = false;
             _remoteRunning = false;
           });
+          _updateWakelock();
           _scrollToBottom();
         }
       },
@@ -254,6 +258,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             _stopping = false;
             _remoteRunning = false;
           });
+          _updateWakelock();
         }
       },
       onUserMessage: (text, turnId) {
@@ -285,15 +290,40 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _scrollToBottom() {
+  void _scrollToBottom({bool force = false}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scroll.hasClients) {
-        _scroll.animateTo(
-          _scroll.position.maxScrollExtent + 120,
-          duration: const Duration(milliseconds: 200),
-          curve: Curves.easeOut,
-        );
-      }
+      if (!_scroll.hasClients) return;
+      final pos = _scroll.position;
+      // Pin to the tail only when the user is already reading it (or when
+      // forced, e.g. right after sending). While a turn streams in and the
+      // user scrolls up to read, the view must NOT jump — that jitter is
+      // what made streaming look like it was "shaking".
+      final nearBottom = pos.maxScrollExtent - pos.pixels < 180;
+      if (!force && !nearBottom) return;
+      pos.animateTo(
+        pos.maxScrollExtent + 120,
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  /// Keep the screen awake while a turn is running — long tasks (up to ~1h)
+  /// must keep streaming with the display on.
+  void _updateWakelock() {
+    if (_busy) {
+      WakelockPlus.enable();
+    } else {
+      WakelockPlus.disable();
+    }
+  }
+
+  /// Coalesces high-frequency streaming deltas into UI rebuilds (~16/s max)
+  /// so the markdown bubble re-renders smoothly instead of on every chunk.
+  void _scheduleFlush() {
+    _flushTimer ??= Timer(const Duration(milliseconds: 60), () {
+      _flushTimer = null;
+      if (mounted) setState(() {});
     });
   }
 
@@ -382,7 +412,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _pending.clear();
       _sending = true;
     });
-    _scrollToBottom();
+    _updateWakelock();
+    _scrollToBottom(force: true);
 
     try {
       _socket ??= await state.ensureSocket();
@@ -421,6 +452,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _flushTimer?.cancel();
+    WakelockPlus.disable();
     WidgetsBinding.instance.removeObserver(this);
     final chatId = _chatId;
     if (chatId != null) _socket?.unlisten(chatId);
@@ -594,7 +627,9 @@ class _Bubble extends StatelessWidget {
                         ),
                       ),
                     ),
-                  if (message.streaming && message.isEmpty)
+                  if (message.streaming &&
+                      message.isEmpty &&
+                      message.activity.isEmpty)
                     const Padding(
                       padding: EdgeInsets.only(top: 2),
                       child: _TypingDots(compact: true),

@@ -77,6 +77,7 @@ Deno.serve(async (req) => {
     const email = String(body?.email || "").trim().toLowerCase();
     const fingerprint = String(body?.fingerprint || "").trim();
     const referral = String(body?.referral || "").trim().toLowerCase();
+    const platform = String(body?.platform || "web").trim().toLowerCase();
     const userAgent = (req.headers.get("user-agent") || "").slice(0, 250);
 
     if (!email || !isEmailLike(email)) {
@@ -124,6 +125,55 @@ Deno.serve(async (req) => {
     // A failed fingerprint lookup must NOT block a genuine signup: the caps
     // below still apply, and auth remains the final authority.
 
+    // ---------- 1b. ANDROID: lifetime one-signup-per-device lock ----------
+    // Native-app signups get a STRICT lock: once a device has created ANY
+    // account, no new account may be created on it again — ever (not just the
+    // 30-day window). Signing in with the existing account is unaffected.
+    // Enforced against BOTH the permanent device_bindings registry and the
+    // signup_attestations history.
+    if (platform === "android") {
+      const bindUrl =
+        `${SUPABASE_URL}/rest/v1/device_bindings?device_hash=eq.${fpHash}` +
+        `&select=email_hash&limit=1`;
+      const bindResp = await fetch(bindUrl, { headers: restHeaders });
+      if (bindResp.ok) {
+        const rows = (await bindResp.json()) as { email_hash: string }[];
+        if (
+          Array.isArray(rows) &&
+          rows.length > 0 &&
+          rows[0].email_hash !== emailHash
+        ) {
+          return json(403, {
+            ok: false,
+            reason:
+              "An account has already been created on this device. " +
+              "Each device can create only one account, so sign-ups from it are closed. " +
+              "Please sign in to your existing account instead.",
+          });
+        }
+      }
+      const lifeUrl =
+        `${SUPABASE_URL}/rest/v1/signup_attestations?fingerprint_hash=eq.${fpHash}` +
+        `&select=email_hash&order=created_at.desc&limit=50`;
+      const lifeResp = await fetch(lifeUrl, { headers: restHeaders });
+      if (lifeResp.ok) {
+        const rows = (await lifeResp.json()) as { email_hash: string }[];
+        if (
+          Array.isArray(rows) &&
+          rows.length > 0 &&
+          !rows.some((r) => r.email_hash === emailHash)
+        ) {
+          return json(403, {
+            ok: false,
+            reason:
+              "A free-credit account was already created on this device. " +
+              "Each device can create only one account. " +
+              "Please sign in to your existing account, or use a different device.",
+          });
+        }
+      }
+    }
+
     // ---------- 2. per-IP / 3. per-subnet caps ----------
     const windowDays = Math.max(IP_WINDOW_DAYS, SUBNET_WINDOW_DAYS);
     if (ipHash || subnetHash) {
@@ -164,8 +214,27 @@ Deno.serve(async (req) => {
         ip_hash: ipHash,
         subnet_hash: subnetHash,
         user_agent: userAgent,
+        platform,
       }),
     });
+
+    // ---------- permanent device binding (android) ----------
+    // The FIRST successful android attestation binds device_hash -> email_hash
+    // forever: every later signup attempt from this device is refused above.
+    if (platform === "android") {
+      await fetch(`${SUPABASE_URL}/rest/v1/device_bindings`, {
+        method: "POST",
+        headers: {
+          ...restHeaders,
+          Prefer: "resolution=merge-duplicates,return=minimal",
+        },
+        body: JSON.stringify({
+          device_hash: fpHash,
+          email_hash: emailHash,
+          platform: "android",
+        }),
+      });
+    }
 
     // ---------- referral pre-check (informational; claim enforces again) ----------
     let referralValid: boolean | undefined;

@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../models.dart';
+import '../services/device_id.dart';
 import '../services/gateway_api.dart';
 import '../services/nanobot_socket.dart';
 import '../services/supabase_auth.dart';
@@ -164,19 +165,38 @@ class AppState extends ChangeNotifier {
       _fail('Service not initialized');
       return false;
     }
+    // Device lock (anti-abuse): one signup per device. Local mirror blocks
+    // instantly even offline; the signup-gate edge function enforces the
+    // same rule server-side against persistent hashed device records.
+    try {
+      if (await DeviceId.instance.signedUpLocally()) {
+        final bound = await DeviceId.instance.boundEmail();
+        if (bound == null || bound != em.trim().toLowerCase()) {
+          _fail('An account has already been created on this device. '
+              'Please sign in to your existing account instead.');
+          return false;
+        }
+      }
+    } catch (_) {/* local mirror is best-effort */}
     status = AppStatus.authenticating;
     errorMessage = null;
     _resetIdentity();
     notifyListeners();
     try {
-      final s = await _auth!.signUp(em.trim(), pw, name, referral: referral);
+      final fp = await DeviceId.instance.fingerprint();
+      final s = await _auth!
+          .signUp(em.trim(), pw, name, referral: referral, fingerprint: fp);
       if (s == null) {
+        // Account created but email confirmation is pending — the device is
+        // now bound either way.
+        unawaited(DeviceId.instance.markSignedUp(em));
         status = AppStatus.unauthenticated;
         errorMessage = 'Check your email to confirm your account, then sign in.';
         notifyListeners();
         return false;
       }
       await _persist(s, overwriteIdentity: true);
+      unawaited(DeviceId.instance.markSignedUp(em));
       final ref = (referral ?? '').trim();
       if (ref.isNotEmpty) {
         unawaited(_claimReferral(s.accessToken, ref));
