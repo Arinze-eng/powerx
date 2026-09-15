@@ -80,6 +80,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         _chatId = widget.session!.chatId;
         state.rememberChat(_chatId!);
         _messages.addAll(history.messages);
+        if (history.activeTurnId != null) {
+          // The server replays the whole in-flight turn's events after attach
+          // (hydrate-after-subscribe). Drop the persisted partials so the
+          // replay rebuilds the bubble without duplicated text.
+          _messages.removeWhere((m) =>
+              m.role == Role.assistant && m.turnId == history.activeTurnId);
+          _remoteRunning = true;
+        }
       } catch (_) {}
       if (mounted) setState(() => _loadingHistory = false);
       await _attachAndWatch();
