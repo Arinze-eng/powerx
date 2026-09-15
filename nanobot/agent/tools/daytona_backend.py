@@ -31,11 +31,13 @@ import json
 import posixpath
 import re
 import shlex
+from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote, urlparse
 
 import aiohttp
+from loguru import logger
 
 _MAX_COMMAND_CHARS = 12_000
 _MAX_CONTENT_CHARS = 120_000
@@ -463,9 +465,25 @@ class DaytonaExecutionBackend:
         existing = await self.find_sandbox(session)
         if existing is not None:
             sandbox_id = str(existing.get("id") or self.sandbox_name)
-            ready = await self.wait_ready(session, sandbox_id, timeout=90)
-            self.last_sandbox_id = str(ready.get("id") or sandbox_id)
-            return self.last_sandbox_id
+            try:
+                ready = await self.wait_ready(session, sandbox_id, timeout=90)
+                self.last_sandbox_id = str(ready.get("id") or sandbox_id)
+                return self.last_sandbox_id
+            except DaytonaError:
+                # A pre-existing sandbox that will not become ready (stuck /
+                # broken) is unusable and would fail every operation forever.
+                # Reclaim it so a fresh sandbox is created instead of letting
+                # the session stay wedged. Workspace loss for this one broken
+                # sandbox is preferable to a hard outage on every tool call.
+                logger.warning(
+                    "reclaiming stuck Daytona sandbox {} that did not become ready",
+                    sandbox_id,
+                )
+                with suppress(Exception):
+                    await self._platform_request(
+                        session, "DELETE", f"/sandbox/{quote(sandbox_id, safe='')}", timeout=30
+                    )
+                self.last_sandbox_id = ""
 
         # Create fresh sandbox
         body: dict[str, Any] = {

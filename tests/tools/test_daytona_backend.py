@@ -186,6 +186,59 @@ async def test_ensure_sandbox_creates_with_allowlists(calls: Any, monkeypatch: A
     assert "networkAllowList" not in created_body
 
 
+async def test_ensure_sandbox_reclaims_stuck_existing_and_recreates(calls: Any, monkeypatch: Any) -> None:  # noqa: ANN401
+    """A pre-existing sandbox that never becomes ready must be reclaimed and a
+    fresh one created, otherwise every sandbox op fails forever against the
+    wedged sandbox (reported as HTTP 400 by the user when running on Daytona)."""
+    created_body: dict[str, Any] = {}
+    deleted: list[str] = []
+
+    def handler(method: str, url: str, kwargs: dict[str, Any]) -> _Response:
+        # find_sandbox resolves the session sandbox by name and returns it.
+        if method == "GET" and "/sandbox/px-stuck" in url:
+            return _Response(
+                status=200,
+                payload={"id": "sbx-stuck", "name": "px-stuck", "state": "creating", "toolboxProxyUrl": ""},
+            )
+        # The born-broken sandbox gets deleted as part of reclaim.
+        if method == "DELETE" and "/sandbox/sbx-stuck" in url:
+            deleted.append(url)
+            return _Response(status=200, payload={"ok": True})
+        # A fresh sandbox is created in its place and becomes ready.
+        if method == "POST" and url.endswith("/sandbox"):
+            created_body.update(kwargs.get("json") or {})
+            return _Response(status=200, payload={"id": "sbx-fresh"})
+        if method == "GET" and "/sandbox/sbx-fresh" in url:
+            return _Response(
+                status=200,
+                payload={"id": "sbx-fresh", "name": "px-stuck", "state": "started", "toolboxProxyUrl": "https://tb.example"},
+            )
+        return _Response(status=404, payload={"error": "not found"})
+
+    calls.install(handler)
+
+    async def _no_restore() -> bool:
+        return False
+
+    backend = DaytonaExecutionBackend(_config(), sandbox_name="px-stuck")
+    monkeypatch.setattr(backend, "restore_workspace", _no_restore)
+
+    async def _stuck_wait_ready(session, sid, timeout=180):
+        # Only the born-broken sandbox never becomes ready; a freshly created
+        # sandbox becomes ready normally.
+        if str(sid) == "sbx-stuck":
+            raise DaytonaError(f"Daytona sandbox {sid} did not become ready in time")
+        return {"id": str(sid), "state": "started", "toolboxProxyUrl": "https://tb.example/sbx-fresh"}
+
+    # The existing sandbox never becomes ready -> ensure_sandbox must reclaim it
+    # (delete) and create a fresh one instead of failing / wedging forever.
+    monkeypatch.setattr(backend, "wait_ready", _stuck_wait_ready)
+
+    sandbox_id = await backend.ensure_sandbox(_FakeSession(handler))
+    assert sandbox_id == "sbx-fresh"
+    assert deleted  # the stuck sandbox was reclaimed via DELETE
+
+
 async def test_run_executes_command_and_renders(calls: Any) -> None:  # noqa: ANN401
     def handler(method: str, url: str, kwargs: dict[str, Any]) -> _Response:
         if method == "GET" and "/sandbox/" in url:
