@@ -228,8 +228,17 @@ class _SessionsDrawer extends StatelessWidget {
                   style: const TextStyle(fontWeight: FontWeight.bold),
                 ),
               ),
-              title: Text(state.displayName ?? state.email ?? 'Signed in',
+              title: Text(state.displayName?.isNotEmpty == true
+                      ? state.displayName!
+                      : (state.email ?? 'Signed in'),
                   maxLines: 1, overflow: TextOverflow.ellipsis),
+              subtitle: state.displayName?.isNotEmpty == true
+                  ? Text(state.email ?? '',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          color: Colors.white38, fontSize: 11.5))
+                  : null,
               trailing: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [

@@ -1,14 +1,17 @@
-/// Build/runtime configuration for the PowerX native client.
+/// Build/runtime configuration for the CDNAI native client (PowerX engine).
 class PowerXConfig {
-  /// Base URL of the deployed PowerX (nanobot) gateway.
+  /// Base URL of the deployed CDNAI (nanobot) gateway.
   /// Override at build time: --dart-define=POWERX_URL=https://your-host
   static const String baseUrl = String.fromEnvironment(
     'POWERX_URL',
     defaultValue: 'https://http--powerx--mxq9vl6k966n.code.run',
   );
 
-  static const String appName = 'PowerX';
+  /// User-visible app name. Keep in sync with pubspec `version` below — the
+  /// Settings > About row is the install-time proof of which build is running.
+  static const String appName = 'CDNAI';
   static const String tagline = 'Your AI Work Partner';
+  static const String appVersion = '1.1.3+5';
 
   /// Normalized base without trailing slash.
   static String get origin {

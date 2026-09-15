@@ -85,7 +85,7 @@ class AppState extends ChangeNotifier {
       }
       await _restore();
     } catch (e) {
-      _fail('Cannot reach PowerX service: $e');
+      _fail('Cannot reach CDNAI service: $e');
     }
   }
 

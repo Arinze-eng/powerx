@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../config.dart';
 import '../models.dart';
 import '../services/supabase_auth.dart';
 import '../state/app_state.dart';
@@ -119,6 +120,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 title: 'Name',
                 value: state.displayName?.isNotEmpty == true
                     ? state.displayName!
+                    : '—',
+              ),
+              const _Divider(),
+              _Row(
+                icon: Icons.fingerprint_rounded,
+                title: 'Account ID',
+                value: state.supabaseUserId != null
+                    ? '${state.supabaseUserId!.substring(0, 8)}…'
                     : '—',
               ),
             ],
@@ -311,6 +320,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 icon: Icons.smart_toy_outlined,
                 title: 'Current model',
                 value: state.modelName ?? 'Not configured',
+              ),
+            ],
+          ),
+          const SizedBox(height: 22),
+          _SectionTitle('About'),
+          _Card(
+            children: [
+              _Row(
+                icon: Icons.info_outline,
+                title: 'App',
+                value: '${PowerXConfig.appName} v${PowerXConfig.appVersion}',
+              ),
+              const _Divider(),
+              _Row(
+                icon: Icons.dns_outlined,
+                title: 'Gateway',
+                value: Uri.parse(PowerXConfig.origin).host,
               ),
             ],
           ),

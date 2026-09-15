@@ -10,6 +10,7 @@ import 'package:open_filex/open_filex.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../config.dart';
 import '../models.dart';
 import '../services/gateway_api.dart';
 import '../services/nanobot_socket.dart';
@@ -438,7 +439,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         title: Stack(
           alignment: Alignment.center,
           children: [
-            const Text('PowerX', style: TextStyle(fontWeight: FontWeight.w800)),
+            const Text(PowerXConfig.appName, style: TextStyle(fontWeight: FontWeight.w800)),
             if (_busy)
               Positioned(
                 right: 0,
@@ -1002,8 +1003,8 @@ class _Composer extends StatelessWidget {
                     style: const TextStyle(color: Colors.white, fontSize: 15),
                     decoration: InputDecoration(
                       hintText: busy
-                          ? (stopping ? 'Stopping task…' : 'PowerX is working…')
-                          : 'Message PowerX…',
+                          ? (stopping ? 'Stopping task…' : 'CDNAI is working…')
+                          : 'Message CDNAI…',
                       hintStyle: const TextStyle(color: Colors.white38),
                       filled: true,
                       fillColor: const Color(0xFF1A2138),

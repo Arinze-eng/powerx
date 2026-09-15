@@ -42,11 +42,18 @@ class _AuthScreenState extends State<AuthScreen> {
       return;
     }
     if (_isSignUp) {
-      final ok = await state.signUp(em, pw, _name.text,
-          referral: _referral.text.trim());
-      if (ok && mounted) Navigator.of(context).pushReplacementNamed('/home');
+      await state.signUp(em, pw, _name.text, referral: _referral.text.trim());
     } else {
       await state.signIn(em, pw);
+    }
+    // RootGate swaps Home/Auth by status; but when this screen is the pushed
+    // '/auth' route (after sign-out from settings) it must be dismissed too,
+    // otherwise the previous account's screens could linger on the stack.
+    if (mounted && state.status == AppStatus.authenticated) {
+      final nav = Navigator.of(context);
+      if (nav.canPop()) {
+        nav.popUntil((route) => route.isFirst);
+      }
     }
   }
 
@@ -170,7 +177,7 @@ class _AuthScreenState extends State<AuthScreen> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Text(
-                      _isSignUp ? 'Already have an account?' : 'New to PowerX?',
+                      _isSignUp ? 'Already have an account?' : 'New to CDNAI?',
                       style: const TextStyle(color: Colors.white54),
                     ),
                     TextButton(

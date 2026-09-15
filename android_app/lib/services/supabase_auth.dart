@@ -44,7 +44,7 @@ class SupabaseAuth {
       String email, String password, String name,
       {String? referral}) async {
     final data = <String, dynamic>{
-      'name': name.trim().isEmpty ? 'PowerX User' : name.trim(),
+      'name': name.trim().isEmpty ? 'CDNAI User' : name.trim(),
       'role': 'user',
       'source': 'android',
     };
