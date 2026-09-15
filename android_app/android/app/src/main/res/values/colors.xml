@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- PowerX brand splash/background — matches Flutter scaffold so there is
+         never a white flash before the app paints its first frame. -->
+    <color name="powerx_splash">#0B1020</color>
+</resources>

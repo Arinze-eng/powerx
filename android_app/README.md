@@ -1,51 +1,55 @@
 # PowerX Android Client
 
-A lightweight **Flutter WebView wrapper** for your self-hosted [PowerX](https://http--powerx--mxq9vl6k966n.code.run/) AI agent (nanobot gateway).
+A **native-feeling** Flutter client for your self-hosted [PowerX](https://http--powerx--mxq9vl6k966n.code.run/) AI agent (nanobot gateway).
 
-## What it does
+## Design: it doesn't look like a web app
 
-- Opens the hosted PowerX WebUI inside a native Android WebView.
-- All authentication (Supabase) and chat happen **inside the web app itself** — the shell just renders it reliably.
-- Handles file downloads from the agent into device storage.
-- External links open in the system browser; back button navigates web history.
-- **No "Tools" section** — this is a single-screen client wired directly to your service.
+The client renders the hosted PowerX WebUI but strips every browser tell so it
+reads as a first-class native app:
+
+- **No browser chrome** — no URL bar, no reload button, no title bar. Edge-to-edge immersive layout.
+- **Branded splash** — a polished PowerX loading screen covers the cold start; no white flash (dark window background matches the app).
+- **No web gestures** — pinch-zoom, double-tap-zoom, pull-to-refresh bounce, long-press context menu, text-selection handles, and drag navigation are all disabled via injected CSS/JS.
+- **Hidden scrollbars**, tap-highlight suppressed, overscroll removed.
+- Chat inputs and message text remain selectable so copying still works.
+- Native back gesture walks web history, then exits cleanly.
+- File downloads from the agent save to device storage with an "Open" snackbar; external links open in the system browser.
+
+All authentication (Supabase) happens inside the hosted WebUI itself — the shell
+just presents it natively.
 
 ## Configuration
 
-The backend URL defaults to:
+Default backend:
 
 ```
 https://http--powerx--mxq9vl6k966n.code.run/
 ```
 
-Override at build time with:
+Override at build time:
 
 ```bash
 flutter build apk --release --dart-define=POWERX_URL=https://your-host
 ```
 
-## Building the APK (GitHub Actions)
+## Building the APK (GitHub Actions only)
 
-APK builds run entirely on **GitHub Actions** — no local Android toolchain required.
+APK builds run entirely on **GitHub Actions** — no local Android toolchain needed.
 
 1. Push changes under `android_app/` to `main`, **or**
-2. Go to **Actions → Build PowerX Android APK → Run workflow** (manual trigger), optionally passing a custom `powerx_url`.
+2. **Actions → Build PowerX Android APK → Run workflow** (optionally pass a custom `powerx_url`).
 
-When the run finishes, download the artifact **`powerx-android-release-apk`** (`app-release.apk`) from the workflow summary page and install it on your device.
+Download the artifact **`powerx-android-release-apk`** (`app-release.apk`) from the workflow summary and install it on your device.
 
-### Local build (optional, for development)
-
-Requires Flutter 3.29+ and the Android SDK:
+### Local build (optional, development only)
 
 ```bash
 cd android_app
 flutter pub get
-flutter build apk --release
-# Output: build/app/outputs/flutter-apk/app-release.apk
+flutter build apk --release   # build/app/outputs/flutter-apk/app-release.apk
 ```
 
 ## Signing
 
-The release build uses the debug signing config so the APK installs immediately
-for personal use. For Play Store distribution, add a real keystore and update
-`android/app/build.gradle.kts`.
+Debug-signed release APK installs immediately for personal use. For Play Store
+distribution, add a real keystore and update `android/app/build.gradle.kts`.
