@@ -25,14 +25,20 @@ sandbox created with an explicit `domainAllowList` reaches every listed domain.
    `domainAllowList` verbatim.
 2. **`domain_allow_list: "*"`** or a **custom `network_allow_list`** (non-default
    CIDR) is sent as `networkAllowList` (open CIDR).
-3. **Nothing configured** sends a built-in `DEFAULT_DOMAIN_ALLOW_LIST` (85 domains —
+3. **Nothing configured** sends a built-in `DEFAULT_DOMAIN_ALLOW_LIST` (99 domains —
    Daytona rejects any allow list with more than **100** domains with HTTP 400, so
    custom lists must stay under that cap) covering: PyPI/npm/Go/Crates/Ruby/Maven
-   registries, GitHub/GitLab, all major AI provider APIs (OpenAI, Anthropic, Gemini,
-   DeepSeek, Groq, Mistral, xAI, Together, Fireworks, Perplexity, Cohere,
-   HuggingFace), search engines, Ubuntu/Debian mirrors, container registries,
-   Telegram/Discord/Slack APIs, file-sharing hosts, and connectivity diagnostics
-   endpoints.
+   registries, runtimes/SDKs/CDNs (Node, Yarn, Bun, Google SDK hosting, jsDelivr,
+   unpkg, esm.sh, Microsoft/LLVM/launchpad apt repos), GitHub/GitLab, all major AI
+   provider APIs (OpenAI, Anthropic, Gemini, DeepSeek, Groq, Mistral, xAI, Together,
+   Fireworks, Perplexity, Cohere, HuggingFace), search engines, Ubuntu/Debian mirrors,
+   container registries, Telegram/Discord/Slack APIs, file-sharing hosts, and
+   connectivity diagnostics endpoints.
+
+Note: an allow list applies to **newly created** sandboxes only — delete an existing
+sandbox (admin reset) so a task picks up the updated policy. Daytona organizations
+on Tier 1/2 cannot override network restrictions at sandbox level; check the
+dashboard tier if a needed domain stays blocked.
 
 ## Fetch tool allowlist
 

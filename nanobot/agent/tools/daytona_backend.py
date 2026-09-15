@@ -72,18 +72,31 @@ DEFAULT_FETCH_ALLOW_HOSTS: tuple[str, ...] = (
     "catbox.moe",
     "litterbox.catbox.moe",
     "file.io",
+    "cdn.jsdelivr.net",
+    "unpkg.com",
+    "esm.sh",
+    "dl.google.com",
+    "storage.googleapis.com",
+    "registry.yarnpkg.com",
+    "nodejs.org",
 )
 
 # Broad default domain allowlist used when no custom allowlist is provided.
 # Daytona sandboxes need an explicit domain allowlist to reach arbitrary hosts
 # (an open CIDR alone only unlocks essential services).
 # HARD LIMIT: Daytona accepts at most 100 domains per allow list (HTTP 400 above
-# that), so this list is capped at 85 to leave headroom for user overrides.
+# that), so this list is capped at 99 to leave headroom for user overrides.
 DEFAULT_DOMAIN_ALLOW_LIST: str = (
     # Package registries (12)
     "pypi.org,*.pypi.org,files.pythonhosted.org,"
     "registry.npmjs.org,npmjs.org,proxy.golang.org,golang.org,"
     "crates.io,static.crates.io,rubygems.org,repo1.maven.org,packagist.org,"
+    # Runtimes, SDKs & CDNs (14)
+    "nodejs.org,deb.nodesource.com,"
+    "registry.yarnpkg.com,yarnpkg.com,bun.sh,"
+    "dl.google.com,storage.googleapis.com,"
+    "cdn.jsdelivr.net,unpkg.com,esm.sh,"
+    "packages.microsoft.com,apt.llvm.org,ppa.launchpad.net,launchpad.net,"
     # GitHub / repos (6)
     "github.com,codeload.github.com,*.githubusercontent.com,ghcr.io,gitlab.com,*.gitlab.com,"
     # AI providers (30)
