@@ -490,3 +490,84 @@ def test_dbq_dashboard_contains_payment_edit_and_full_mapping_controls(monkeypat
         "textarea id='vpsPrivateKey'", "multiline OpenSSH or PEM private key",
     ):
         assert marker in body
+
+
+def test_admin_apk_user_activity_is_protected_and_rendered(monkeypatch) -> None:
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setattr(
+        admin_registry.supabase_admin,
+        "apk_user_activity",
+        lambda: [
+            {
+                "id": "u1",
+                "name": "Ada",
+                "email": "ada@example.com",
+                "last_seen_at": "2026-09-15T09:30:00+00:00",
+                "questions_count": 2,
+                "questions": [
+                    {
+                        "message": "hello",
+                        "category": "apk",
+                        "created_at": "2026-09-15T09:30:00+00:00",
+                    }
+                ],
+            }
+        ],
+    )
+
+    unauthorized = admin_registry.admin_route(
+        SimpleNamespace(path="/api/admin/supabase/apk-users", headers={}),
+        "/api/admin/supabase/apk-users",
+    )
+    assert unauthorized is not None
+    assert unauthorized.status_code == 401
+
+    response = admin_registry.admin_route(
+        _request(path="/api/admin/supabase/apk-users"),
+        "/api/admin/supabase/apk-users",
+    )
+    assert response is not None
+    assert response.status_code == 200
+    payload = json.loads(bytes(response.body).decode())
+    assert payload["ok"] is True
+    assert payload["users"][0]["name"] == "Ada"
+    assert payload["users"][0]["questions"][0]["category"] == "apk"
+
+    dashboard = admin_registry.admin_route(_request(), "/admin")
+    assert dashboard is not None
+    body = bytes(dashboard.body).decode()
+    assert "APK users" in body
+    assert "loadApkUsers" in body
+    assert "apkRows" in body
+
+
+def test_apk_user_activity_groups_questions_per_user(monkeypatch) -> None:
+    import nanobot.supabase_admin as sa
+
+    def fake_request(method, path, **kwargs):
+        if path.endswith("/profiles"):
+            return [
+                {
+                    "id": "u1",
+                    "name": "Ada",
+                    "email": "a@e.com",
+                    "last_seen_at": "2026-09-15T09:30:00+00:00",
+                    "questions_count": 1,
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                }
+            ]
+        return [
+            {
+                "id": "q1",
+                "user_id": "u1",
+                "message": "hi",
+                "category": "apk",
+                "created_at": "2026-09-15T09:30:00+00:00",
+            }
+        ]
+
+    monkeypatch.setattr(sa, "_request", fake_request)
+    users = sa.apk_user_activity()
+    assert len(users) == 1
+    assert users[0]["questions"][0]["message"] == "hi"
+    assert users[0]["questions"][0]["category"] == "apk"

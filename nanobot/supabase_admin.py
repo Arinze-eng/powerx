@@ -183,6 +183,51 @@ def webui_question_history() -> list[dict[str, Any]]:
     return items
 
 
+def apk_user_activity() -> list[dict[str, Any]]:
+    """Per-user last-seen + asked questions for the admin dashboard.
+
+    Mobile (APK) users connect through the same websocket gateway as WebUI
+    users, so both audiences share ``profiles.last_seen_at`` and the
+    ``user_questions`` feed (APK clients tag their rows ``category=apk``).
+    Returns every user newest-last-seen first with their recent questions
+    attached; the admin page renders timestamps in West Africa Time.
+    """
+    profiles = _request(
+        "GET",
+        "/rest/v1/profiles",
+        params={
+            "select": "id,name,email,last_seen_at,questions_count,created_at",
+            "order": "last_seen_at.desc.nullslast",
+            "limit": "500",
+        },
+    )
+    questions = _request(
+        "GET",
+        "/rest/v1/user_questions",
+        params={
+            "select": "id,user_id,message,category,created_at",
+            "order": "created_at.desc",
+            "limit": "500",
+        },
+    )
+    by_user: dict[str, list[dict[str, Any]]] = {}
+    for row in questions if isinstance(questions, list) else []:
+        if isinstance(row, dict):
+            by_user.setdefault(str(row.get("user_id") or ""), []).append({
+                "message": row.get("message"),
+                "category": row.get("category"),
+                "created_at": row.get("created_at"),
+            })
+    result: list[dict[str, Any]] = []
+    for row in profiles if isinstance(profiles, list) else []:
+        if not isinstance(row, dict):
+            continue
+        enriched = dict(row)
+        enriched["questions"] = by_user.get(str(row.get("id") or ""), [])
+        result.append(enriched)
+    return result
+
+
 def announcements() -> list[dict[str, Any]]:
     """Active announcements shown to WebUI users."""
     rows = _request(

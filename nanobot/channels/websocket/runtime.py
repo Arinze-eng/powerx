@@ -404,6 +404,7 @@ class WebSocketChannel(BaseChannel):
         self._admin_connections: set[ServerConnection] = set()
         # connection -> supabase user id bound via a Supabase-gated WebUI token.
         self._conn_supabase_user: dict[ServerConnection, str] = {}
+        self._conn_client: dict[ServerConnection, str] = {}
         # connection -> raw Supabase access JWT (for server-side Puter tools).
         self._conn_supabase_jwt: dict[ServerConnection, str] = {}
         # Delivery tasks are connection-bound, while operations are keyed only
@@ -618,9 +619,16 @@ class WebSocketChannel(BaseChannel):
         self._admin_connections.discard(connection)
         self._conn_supabase_user.pop(connection, None)
         self._conn_supabase_jwt.pop(connection, None)
+        self._conn_client.pop(connection, None)
         self._discard_webui_request_lock_if_idle(connection)
 
-    def _record_webui_activity_later(self, supabase_user_id: str, content: str) -> None:
+    def _activity_channel(self, connection: Any) -> str:
+        """Admin telemetry source for a connection: APK clients send ?client=apk."""
+        return "apk" if self._conn_client.get(connection) == "apk" else "webui"
+
+    def _record_webui_activity_later(
+        self, supabase_user_id: str, content: str, *, connection: Any = None
+    ) -> None:
         """Fire-and-forget record of a WebUI user's activity for the admin view.
 
         Runs in a short-lived background task so a slow Supabase write never
@@ -636,7 +644,7 @@ class WebSocketChannel(BaseChannel):
                 SupabaseAuth().record_webui_activity(
                     user_id,
                     question=content,
-                    channel="webui",
+                    channel=self._activity_channel(connection),
                 )
             )
             task.add_done_callback(self._record_webui_activity_done)
@@ -797,6 +805,9 @@ class WebSocketChannel(BaseChannel):
                 client_id = client_id[:128]
             if not self.is_allowed(client_id):
                 return _http_error(403, "Forbidden")
+            client_hint = (_query_first(query, "client") or "")[:32]
+            if client_hint:
+                self._conn_client[connection] = client_hint
             return self._authorize_websocket_handshake(connection, query, request.headers)
 
         # Everything else goes to the HTTP handler. Keep failures as valid HTTP
@@ -1031,7 +1042,9 @@ class WebSocketChannel(BaseChannel):
                     is_dm=False,
                 )
                 if supabase_user:
-                    self._record_webui_activity_later(supabase_user, content)
+                    self._record_webui_activity_later(
+                        supabase_user, content, connection=connection
+                    )
         except Exception as e:
             self.logger.debug("connection ended: {}", e)
         finally:

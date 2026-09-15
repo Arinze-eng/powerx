@@ -115,7 +115,7 @@ class NanobotSocket {
       var path = tk.wsPath;
       if (!path.startsWith('/')) path = '/$path';
       final uri = Uri.parse(
-          '$wsBase$path?token=${Uri.encodeComponent(tk.token)}');
+          '$wsBase$path?token=${Uri.encodeComponent(tk.token)}&client=apk');
       final ch = IOWebSocketChannel.connect(
         uri,
         pingInterval: const Duration(seconds: 20),
