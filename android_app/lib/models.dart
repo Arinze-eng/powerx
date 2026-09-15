@@ -1,6 +1,8 @@
 /// Data models for the PowerX native client.
 library;
 
+import 'dart:convert';
+
 enum Role { user, assistant }
 
 /// A single in-progress "step" the agent emits while working on a turn —
@@ -24,6 +26,71 @@ class ActivityStep {
   }) : startedAt = startedAt ?? DateTime.now();
 
   bool get isDone => status == 'done' || status == 'error';
+
+  /// Parse one live `tool_events[]` entry (phase start/end/error).
+  static ActivityStep? fromToolEvent(Map<String, dynamic> te,
+      {int order = 0, String fallbackId = ''}) {
+    final phase = (te['phase'] ?? '').toString();
+    final name = (te['name'] ?? te['tool'] ?? '').toString();
+    final callId = (te['call_id'] ?? te['callId'] ?? '').toString();
+    if (name.isEmpty) return null;
+    final detail = summarizeArgs(te['arguments'] ?? te['args']);
+    final status = phase == 'start'
+        ? 'running'
+        : phase == 'error'
+            ? 'error'
+            : 'done';
+    return ActivityStep(
+      id: callId.isNotEmpty
+          ? callId
+          : (fallbackId.isNotEmpty ? fallbackId : '$name-$order'),
+      name: name,
+      detail: detail,
+      status: status,
+      order: order,
+    );
+  }
+
+  /// Parse a pre-rendered trace line like `read_file({"path": "x"})` that the
+  /// persisted transcript stores on role=tool messages.
+  static ActivityStep fromTraceLine(String line,
+      {required String id, int order = 0}) {
+    final m = RegExp(r'^([a-zA-Z0-9_\-\.]+)\((\{.*\})?\)?\s*$').firstMatch(line);
+    if (m != null) {
+      final name = m.group(1)!;
+      var detail = '';
+      final argsJson = m.group(2);
+      if (argsJson != null) {
+        detail = summarizeArgs(_tryDecode(argsJson));
+      }
+      return ActivityStep(
+          id: id, name: name, detail: detail, status: 'done', order: order);
+    }
+    return ActivityStep(
+        id: id, name: line, status: 'done', order: order);
+  }
+
+  static dynamic _tryDecode(String s) {
+    try {
+      // Dart RegExp captured something like {"path": "."} — parse leniently.
+      return jsonDecode(s);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static String summarizeArgs(dynamic args) {
+    if (args is! Map) return '';
+    for (final k in [
+      'path', 'file_path', 'command', 'query', 'url', 'name', 'pattern', 'prompt'
+    ]) {
+      final v = args[k];
+      if (v is String && v.trim().isNotEmpty) {
+        return v.length > 80 ? '${v.substring(0, 77)}…' : v;
+      }
+    }
+    return '';
+  }
 
   String get iconKey {
     final n = name.toLowerCase();
@@ -99,34 +166,95 @@ class PendingAttachment {
 class ChatMessage {
   final String id;
   final Role role;
-  String text;
+  /// Answer text segments — one per streamed answer segment (a turn can
+  /// contain several LLM streams interleaved with tool activity).
+  final List<String> segments = [];
   /// Assistant reasoning / thinking stream (optional).
-  String reasoning;
-  bool streaming;
+  String reasoning = '';
+  bool reasoningStreaming = false;
+  bool streaming = false;
   final DateTime createdAt;
   /// Media paths attached to a message (best-effort display).
-  List<String> media;
+  List<String> media = [];
   /// Ordered activity steps shown while the assistant works on this turn.
-  final List<ActivityStep> activity;
+  final List<ActivityStep> activity = [];
   /// Whether this turn ended with an error breadcrumb.
-  bool hasError;
+  bool hasError = false;
+  /// Cost/effort telemetry stamped on turn_end (llm_calls, prompt_tokens…).
+  Map<String, num>? usage;
+  int? latencyMs;
+  String? turnId;
 
   ChatMessage({
     required this.id,
     required this.role,
-    this.text = '',
+    String text = '',
     this.reasoning = '',
     this.streaming = false,
     DateTime? createdAt,
     List<String>? media,
     List<ActivityStep>? activity,
     this.hasError = false,
-  })  : createdAt = createdAt ?? DateTime.now(),
-        media = media ?? [],
-        activity = activity ?? [];
+    this.usage,
+    this.latencyMs,
+    this.turnId,
+    List<String>? segments,
+  })  : createdAt = createdAt ?? DateTime.now() {
+    if (segments != null) {
+      this.segments.addAll(segments);
+    } else if (text.isNotEmpty) {
+      this.segments.add(text);
+    }
+    this.media = media ?? [];
+    if (activity != null) this.activity.addAll(activity);
+  }
+
+  /// Full answer text across all segments.
+  String get text {
+    if (segments.isEmpty) return '';
+    return segments.join('\n\n');
+  }
+
+  set text(String value) {
+    segments
+      ..clear()
+      ..add(value);
+  }
+
+  /// The segment currently receiving deltas (last one), creating one if needed.
+  String get liveSegment => segments.isEmpty ? '' : segments.last;
+
+  void appendDelta(String chunk) {
+    if (segments.isEmpty) {
+      segments.add('');
+    }
+    segments[segments.length - 1] = segments.last + chunk;
+  }
+
+  /// Finalize the live segment with authoritative stream text (if given) and
+  /// start a fresh segment for any following stream.
+  void endSegment([String? finalText]) {
+    if (segments.isEmpty) {
+      if (finalText != null && finalText.isNotEmpty) segments.add(finalText);
+      return;
+    }
+    if (finalText != null) {
+      // stream_end carries the complete buffered text for the stream.
+      segments[segments.length - 1] = finalText;
+    }
+    segments.add('');
+  }
+
+  void dropEmptyTrailingSegment() {
+    while (segments.isNotEmpty && segments.last.trim().isEmpty) {
+      segments.removeLast();
+    }
+  }
 
   bool get isEmpty =>
-      text.trim().isEmpty && reasoning.trim().isEmpty && activity.isEmpty;
+      text.trim().isEmpty &&
+      reasoning.trim().isEmpty &&
+      activity.isEmpty;
 
   /// Attachments that can be rendered inline (http(s) urls only).
   List<String> get viewableMedia =>
@@ -226,75 +354,177 @@ class PaymentPackage {
 }
 
 /// A persisted turn from /api/sessions/{key}/webui-thread
-class ThreadTurn {
-  final String role; // "user" | "assistant"
-  final String content;
-  final String? reasoning;
-  final List<String> media;
-  /// Intermediate activity breadcrumbs replayed from the transcript.
-  final List<ActivityStep> activity;
+/// One parsed `tool_events[]` / persisted trace entry.
+///
+/// Shared by the live WebSocket parser and the persisted-history parser.
+class ThreadHistory {
+  final List<ChatMessage> messages;
+  final String? activeTurnId;
+  final bool hasPendingToolCalls;
 
-  ThreadTurn({
-    required this.role,
-    required this.content,
-    this.reasoning,
-    this.media = const [],
-    List<ActivityStep>? activity,
-  }) : activity = activity ?? [];
+  ThreadHistory({
+    required this.messages,
+    this.activeTurnId,
+    this.hasPendingToolCalls = false,
+  });
 
-  static List<ThreadTurn> parseWebuiThread(dynamic payload) {
-    final out = <ThreadTurn>[];
-    if (payload is! Map) return out;
-    final turns = payload['turns'];
-    if (turns is! List) {
-      // Some gateways use messages[]
-      final msgs = payload['messages'];
-      if (msgs is List) {
-        for (final m in msgs) {
-          if (m is Map) {
-            final r = (m['role'] ?? '').toString();
-            final c = (m['content'] ?? m['text'] ?? '').toString();
-            if (r == 'user' || r == 'assistant') {
-              out.add(ThreadTurn(role: r, content: c));
+  /// Parse `/api/sessions/{key}/webui-thread` payloads:
+  /// `{schemaVersion, sessionKey, messages:[{role, turnPhase, kind, content,
+  /// reasoning, toolEvents, traces, media, turnId, turnSeq, ...}],
+  /// active_turn_id, has_pending_tool_calls, completed_turn_ids}`.
+  static ThreadHistory parse(dynamic payload) {
+    final out = <ChatMessage>[];
+    if (payload is! Map) return ThreadHistory(messages: out);
+    final raw = payload['messages'];
+    if (raw is! List) {
+      return ThreadHistory(
+        messages: out,
+        activeTurnId: payload['active_turn_id'] as String?,
+        hasPendingToolCalls: payload['has_pending_tool_calls'] == true,
+      );
+    }
+
+    ChatMessage? curAssistant; // assistant bubble accumulating this turn
+    String? curTurnId;
+    var stepOrder = 0;
+
+    void flush() {
+      if (curAssistant != null && !curAssistant!.isEmpty) {
+        curAssistant!.dropEmptyTrailingSegment();
+        curAssistant!.streaming = false;
+        out.add(curAssistant!);
+      }
+      curAssistant = null;
+      curTurnId = null;
+    }
+
+    ChatMessage ensureAssistant(String? turnId, int? seq) {
+      if (curAssistant != null && (turnId == null || curTurnId == turnId)) {
+        return curAssistant!;
+      }
+      flush();
+      curAssistant = ChatMessage(
+        id: 'h-a-${seq ?? out.length}-${DateTime.now().microsecondsSinceEpoch}',
+        role: Role.assistant,
+        turnId: turnId,
+      );
+      curTurnId = turnId;
+      return curAssistant!;
+    }
+
+    for (final item in raw) {
+      if (item is! Map) continue;
+      final m = Map<String, dynamic>.from(item);
+      final role = (m['role'] ?? '').toString();
+      final phase = (m['turnPhase'] ?? '').toString();
+      final kind = (m['kind'] ?? '').toString();
+      final content = (m['content'] ?? '').toString();
+      final turnId = m['turnId'] as String?;
+      final seq = m['turnSeq'] is num ? (m['turnSeq'] as num).toInt() : null;
+      final media = _mediaUrls(m);
+
+      if (role == 'user') {
+        flush();
+        if (content.trim().isNotEmpty || media.isNotEmpty) {
+          out.add(ChatMessage(
+            id: 'h-u-${seq ?? out.length}',
+            role: Role.user,
+            text: content,
+            media: media,
+            turnId: turnId,
+          ));
+        }
+        continue;
+      }
+
+      if (role == 'tool' || (role == 'assistant' && kind == 'trace')) {
+        final t = ensureAssistant(turnId, seq);
+        // Persisted traces carry pre-rendered lines and/or raw tool events.
+        final toolEvents = m['toolEvents'];
+        var added = false;
+        if (toolEvents is List) {
+          for (final te in toolEvents) {
+            if (te is! Map) continue;
+            final step = ActivityStep.fromToolEvent(
+              Map<String, dynamic>.from(te),
+              order: stepOrder++,
+            );
+            if (step != null) {
+              t.activity.add(step);
+              added = true;
             }
           }
         }
-      }
-      return out;
-    }
-    for (final t in turns) {
-      if (t is! Map) continue;
-      final userText = _firstString(t['user']) ?? '';
-      final assistantText = _firstString(t['assistant']) ?? '';
-      final reason = t['reasoning'] is String ? t['reasoning'] as String : null;
-      final media = <String>[];
-      final rawMedia = t['media'];
-      if (rawMedia is List) {
-        for (final m in rawMedia) {
-          if (m is String) media.add(m);
+        final traces = m['traces'];
+        final lines = <String>[];
+        if (traces is List) {
+          lines.addAll(traces.whereType<String>());
+        } else if (content.trim().isNotEmpty) {
+          lines.addAll(content.split('\n').where((l) => l.trim().isNotEmpty));
         }
+        if (lines.isNotEmpty) {
+          for (final line in lines) {
+            t.activity.add(ActivityStep.fromTraceLine(
+                line.trim(), id: 't-$stepOrder', order: stepOrder++));
+          }
+        } else if (!added && kind == 'progress' && content.trim().isEmpty) {
+          // empty progress breadcrumb — skip silently
+        }
+        continue;
       }
-      if (userText.isNotEmpty) {
-        out.add(ThreadTurn(role: 'user', content: userText));
+
+      if (role == 'assistant') {
+        if (phase == 'reasoning' ||
+            (m['reasoning'] is String && (m['reasoning'] as String).isNotEmpty)) {
+          final t = ensureAssistant(turnId, seq);
+          final r = (m['reasoning'] ?? '') as String;
+          if (r.isNotEmpty) t.reasoning = t.reasoning.isEmpty ? r : '${t.reasoning}\n\n$r';
+          if (content.isNotEmpty && r.isEmpty && phase == 'reasoning') {
+            t.reasoning = t.reasoning.isEmpty ? content : '${t.reasoning}\n\n$content';
+          }
+          continue;
+        }
+        // answer / complete / everything else that carries text
+        final t = ensureAssistant(turnId, seq);
+        if (content.trim().isNotEmpty) {
+          t.segments.add(content);
+        }
+        if (media.isNotEmpty) {
+          t.media = [...t.media, ...media.where((u) => !t.media.contains(u))];
+        }
+        final usage = m['usage'] ?? m['turnUsage'];
+        if (usage is Map && t.usage == null) {
+          t.usage = usage.map((k, v) => MapEntry(k.toString(), v is num ? v : num.tryParse('$v') ?? 0));
+        }
+        final lat = m['latencyMs'] ?? m['latency_ms'];
+        if (lat is num && t.latencyMs == null) t.latencyMs = lat.toInt();
+        continue;
       }
-      if (assistantText.isNotEmpty || reason != null) {
-        out.add(ThreadTurn(
-          role: 'assistant',
-          content: assistantText,
-          reasoning: reason,
-          media: media,
-        ));
+    }
+    flush();
+
+    return ThreadHistory(
+      messages: out,
+      activeTurnId: payload['active_turn_id'] as String?,
+      hasPendingToolCalls: payload['has_pending_tool_calls'] == true,
+    );
+  }
+
+  static List<String> _mediaUrls(Map m) {
+    final out = <String>[];
+    for (final field in ['media', 'media_urls', 'mediaAttachments']) {
+      final v = m[field];
+      if (v is! List) continue;
+      for (final e in v) {
+        if (e is String && e.isNotEmpty) {
+          out.add(e);
+        } else if (e is Map) {
+          final u = e['url'] ?? e['full'] ?? e['data_url'];
+          if (u is String && u.isNotEmpty) out.add(u);
+        }
       }
     }
     return out;
   }
-
-  static String? _firstString(dynamic v) {
-    if (v is String) return v;
-    if (v is Map) {
-      final c = v['content'] ?? v['text'];
-      if (c is String) return c;
-    }
-    return null;
-  }
 }
+

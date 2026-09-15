@@ -1,0 +1,337 @@
+// Socket-level integration tests for NanobotSocket against a local WebSocket
+// server that replays the REAL event sequences captured from the live PowerX
+// gateway (see tmp_test/events.jsonl). These lock in the critical protocol
+// semantics that broke earlier builds:
+//   * stream_end is per answer-stream, NOT per turn — the turn only ends on
+//     turn_end / goal_status idle / final message. A coding task emits many.
+//   * tool activity arrives as `message` events with kind=tool_hint/progress
+//     and tool_events[] payloads.
+//   * reasoning streams via reasoning_delta and closes with reasoning_end.
+//   * a final `message` without kind carries the authoritative answer text
+//     and must not be treated as an activity step.
+//   * /stop: server emits goal_status running → idle (no turn_end) and a
+//     standalone final message ("Stopped 1 task(s).") after idle.
+
+@TestOn('vm')
+library;
+
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:powerx_android/models.dart';
+import 'package:powerx_android/services/nanobot_socket.dart';
+import 'package:web_socket_channel/io.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+
+/// A scripted fake gateway: accepts one connection, records inbound frames,
+/// and can push server events on demand.
+class FakeGateway {
+  late final HttpServer _server;
+  WebSocketChannel? _conn;
+  final List<Map<String, dynamic>> inbound = [];
+
+  Future<void> start() async {
+    _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    _server.listen((req) async {
+      if (WebSocketTransformer.isUpgradeRequest(req)) {
+        final socket = await WebSocketTransformer.upgrade(req);
+        final ch = IOWebSocketChannel(socket);
+        _conn = ch;
+        ch.stream.listen((raw) {
+          final frame = jsonDecode(raw as String) as Map<String, dynamic>;
+          inbound.add(frame);
+          _handle(frame);
+        });
+      } else {
+        req.response.statusCode = 404;
+        await req.response.close();
+      }
+    });
+  }
+
+  String get wsUrl => 'ws://${_server.address.host}:${_server.port}';
+
+  int get port => _server.port;
+
+  void _handle(Map<String, dynamic> frame) {
+    switch (frame['type']) {
+      case 'new_chat':
+        send({'event': 'attached', 'chat_id': 'chat-A'});
+        break;
+      case 'attach':
+        final ch = _conn!;
+        ch.sink.add(jsonEncode(
+            {'event': 'attached', 'chat_id': frame['chat_id']}));
+        if (backgroundResume && frame['chat_id'] == resumeChatId) {
+          resumeChatId = null; // fire once
+          // Replay of an in-flight turn for a late joiner (what the real
+          // gateway does via _hydrate_after_subscribe).
+          ch.sink.add(jsonEncode({
+            'event': 'goal_status',
+            'chat_id': frame['chat_id'],
+            'status': 'running',
+          }));
+          ch.sink.add(jsonEncode({
+            'event': 'delta',
+            'chat_id': frame['chat_id'],
+            'text': ' resumed',
+            'stream_id': 's9',
+          }));
+          ch.sink.add(jsonEncode({
+            'event': 'stream_end',
+            'chat_id': frame['chat_id'],
+            'text': 'resumed text',
+            'stream_id': 's9',
+          }));
+          ch.sink.add(jsonEncode({
+            'event': 'turn_end',
+            'chat_id': frame['chat_id'],
+            'usage': {'llm_calls': 5},
+            'latency_ms': 9000,
+          }));
+        }
+        break;
+    }
+  }
+
+  bool backgroundResume = false;
+  String? resumeChatId;
+
+  void send(Map<String, dynamic> ev) => _conn?.sink.add(jsonEncode(ev));
+
+  Future<void> dropConnection() async => _conn?.sink.close();
+
+  Future<void> stop() async {
+    await _conn?.sink.close();
+    await _server.close(force: true);
+  }
+}
+
+/// A ChatView that records everything the socket delivers.
+class Recorder {
+  final List<String> deltas = [];
+  final List<String> reasoningChunks = [];
+  final List<List<ActivityStep>> activityBatches = [];
+  final List<String?> streamEnds = [];
+  final List<TurnSummary> turnEnds = [];
+  final List<String> errors = [];
+  final List<String> finalTexts = [];
+  int reasoningEnds = 0;
+  final List<String> userMessages = [];
+
+  ChatView view() => ChatView(
+        onDelta: (c) => deltas.add(c),
+        onReasoningDelta: (c) => reasoningChunks.add(c),
+        onReasoningEnd: () => reasoningEnds++,
+        onStreamEnd: (t) => streamEnds.add(t),
+        onActivity: (steps) => activityBatches.add(steps),
+        onTurnEnd: (s) => turnEnds.add(s),
+        onError: (d) => errors.add(d),
+        onUserMessage: (t, id) => userMessages.add(t),
+        onFinalMessage: (t, m) => finalTexts.add(t),
+      );
+}
+
+void main() {
+  late FakeGateway gw;
+  late NanobotSocket sock;
+
+  setUp(() async {
+    gw = FakeGateway();
+    await gw.start();
+    sock = NanobotSocket(
+      wsBase: 'ws://127.0.0.1:${gw.port}',
+      tokenProvider: () async => const WsToken('test-token', '/'),
+    );
+  });
+
+  tearDown(() async {
+    sock.close();
+    await gw.stop();
+  });
+
+  test('turn survives multiple stream_end events; closes on turn_end only',
+      () async {
+    await sock.connect();
+    final chatId = await sock.newChat();
+    final rec = Recorder();
+    sock.listen(chatId, rec.view());
+
+    // Real-world sequence: two tool activity breadcrumbs, each followed by an
+    // answer stream with its own stream_end, then a FINAL answer stream,
+    // then one turn_end.
+    sock.sendMessage(chatId, 'do the thing');
+    await pumpEventQueue();
+
+    gw.send({
+      'event': 'goal_status',
+      'chat_id': chatId,
+      'status': 'running',
+    });
+    gw.send({
+      'event': 'reasoning_delta',
+      'chat_id': chatId,
+      'text': 'I will list the dir',
+    });
+    gw.send({'event': 'reasoning_end', 'chat_id': chatId});
+    gw.send({
+      'event': 'message',
+      'chat_id': chatId,
+      'kind': 'tool_hint',
+      'text': '',
+      'tool_events': [
+        {
+          'version': 1,
+          'phase': 'start',
+          'call_id': 'c1',
+          'name': 'list_dir',
+          'arguments': {'path': '.'},
+        },
+        {
+          'version': 1,
+          'phase': 'end',
+          'call_id': 'c1',
+          'name': 'list_dir',
+          'result': '…',
+        },
+      ],
+    });
+    // answer stream 1
+    gw.send({'event': 'delta', 'chat_id': chatId, 'text': 'Working', 'stream_id': 's1'});
+    gw.send({
+      'event': 'stream_end',
+      'chat_id': chatId,
+      'text': 'Working',
+      'stream_id': 's1',
+    });
+    // answer stream 2 (interleaved with tool activity) — the old client would
+    // have DROPPED everything after the first stream_end.
+    gw.send({'event': 'delta', 'chat_id': chatId, 'text': ' and done', 'stream_id': 's2'});
+    gw.send({
+      'event': 'message',
+      'chat_id': chatId,
+      'kind': 'progress',
+      'text': '',
+      'tool_events': [
+        {
+          'version': 1,
+          'phase': 'start',
+          'call_id': 'c2',
+          'name': 'write_file',
+          'arguments': {'path': 'a.txt'},
+        },
+      ],
+    });
+    gw.send({
+      'event': 'stream_end',
+      'chat_id': chatId,
+      'text': ' and done',
+      'stream_id': 's2',
+    });
+    await pumpEventQueue();
+
+    // NOT terminal yet: no turn_end.
+    expect(rec.turnEnds, isEmpty,
+        reason: 'stream_end must not end the turn');
+    expect(rec.deltas, ['Working', ' and done']);
+    expect(rec.streamEnds, ['Working', ' and done']);
+    expect(rec.activityBatches.length, 2);
+    expect(rec.activityBatches[0].first.name, 'list_dir');
+    expect(rec.activityBatches[0].first.status, 'done');
+    expect(rec.reasoningChunks, ['I will list the dir']);
+    expect(rec.reasoningEnds, 1);
+
+    // Now the real terminators.
+    gw.send({
+      'event': 'turn_end',
+      'chat_id': chatId,
+      'usage': {'llm_calls': 3, 'prompt_tokens': 100},
+      'latency_ms': 2500,
+    });
+    await pumpEventQueue();
+    expect(rec.turnEnds.length, 1);
+    expect(rec.turnEnds.single.usage?['llm_calls'], 3);
+    expect(rec.turnEnds.single.latencyMs, 2500);
+
+    // A duplicate idle afterwards must not fire turn_end twice.
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'idle'});
+    await pumpEventQueue();
+    expect(rec.turnEnds.length, 1);
+  });
+
+  test('final message event is authoritative text and ends the turn',
+      () async {
+    await sock.connect();
+    final chatId = await sock.newChat();
+    final rec = Recorder();
+    sock.listen(chatId, rec.view());
+    sock.sendMessage(chatId, 'hello');
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+    gw.send({'event': 'delta', 'chat_id': chatId, 'text': 'par', 'stream_id': 's1'});
+    gw.send({
+      'event': 'message',
+      'chat_id': chatId,
+      'text': 'The full authoritative answer',
+      'media_urls': [
+        {'path': 'p', 'url': 'https://cdn/x.png', 'contentType': 'image/png'}
+      ],
+      'usage': {'llm_calls': 2},
+    });
+    await pumpEventQueue();
+    expect(rec.finalTexts, ['The full authoritative answer']);
+    expect(rec.turnEnds.length, 1);
+  });
+
+  test('cancel path: goal idle ends turn; post-idle stop ack still delivered',
+      () async {
+    await sock.connect();
+    final chatId = await sock.newChat();
+    final rec = Recorder();
+    sock.listen(chatId, rec.view());
+    sock.sendMessage(chatId, 'long task');
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+    gw.send({'event': 'delta', 'chat_id': chatId, 'text': 'streaming…', 'stream_id': 's1'});
+    // /stop: running (system turn), then idle (terminal, NO turn_end),
+    // then the acknowledgement message arrives afterwards.
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'idle'});
+    await pumpEventQueue();
+    expect(rec.turnEnds.length, 1, reason: 'idle must be terminal');
+    gw.send({
+      'event': 'message',
+      'chat_id': chatId,
+      'text': 'Stopped 1 task(s).',
+    });
+    await pumpEventQueue();
+    expect(rec.finalTexts, ['Stopped 1 task(s).']);
+  });
+
+  test('reconnect re-attaches previous chats so background turns resume',
+      () async {
+    await sock.connect();
+    final chatId = await sock.newChat();
+    final rec = Recorder();
+    sock.listen(chatId, rec.view());
+    sock.sendMessage(chatId, 'bg task');
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+    await pumpEventQueue();
+
+    // Configure the fake gateway to replay a running turn for late joiners,
+    // then simulate the network dropping the connection.
+    gw.backgroundResume = true;
+    gw.resumeChatId = chatId;
+    await gw.dropConnection();
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+
+    // The client auto-reconnects (backoff) and re-attaches previous chats;
+    // the replayed running turn must flow into the same recorder.
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while (rec.turnEnds.isEmpty && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    expect(gw.inbound.any((f) => f['type'] == 'attach'), isTrue);
+    expect(rec.deltas.any((d) => d.contains('resumed')), isTrue);
+    expect(rec.turnEnds.any((t) => t.usage?['llm_calls'] == 5), isTrue);
+  });
+}

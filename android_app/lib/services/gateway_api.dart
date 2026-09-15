@@ -13,6 +13,7 @@ class GatewayBootstrap {
   final String apiToken; // REST bearer token
   final String wsPath;
   final bool needsAuth;
+  final int? expiresInSeconds;
   final String? supabaseUrl;
   final String? supabaseAnonKey;
   final String? modelName;
@@ -26,6 +27,7 @@ class GatewayBootstrap {
     required this.apiToken,
     required this.wsPath,
     this.needsAuth = false,
+    this.expiresInSeconds,
     this.supabaseUrl,
     this.supabaseAnonKey,
     this.modelName,
@@ -62,6 +64,8 @@ class GatewayBootstrap {
       apiToken: (j['api_token'] ?? j['token'] ?? '') as String,
       wsPath: (j['ws_path'] ?? '/') as String,
       needsAuth: needsAuth,
+      expiresInSeconds:
+          j['expires_in'] is num ? (j['expires_in'] as num).toInt() : null,
       supabaseUrl: sbUrl,
       supabaseAnonKey: sbKey,
       modelName: j['model_name'] as String?,
@@ -109,10 +113,16 @@ class GatewayApi {
     return GatewayBootstrap.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
   }
 
-  Future<List<SessionSummary>> listSessions(String apiToken) async {
+  Future<List<SessionSummary>> listSessions(String apiToken,
+      {String? supabaseToken}) async {
     final res = await _client.get(
       Uri.parse('$origin/api/sessions'),
-      headers: {'Authorization': 'Bearer $apiToken'},
+      headers: {
+        'Authorization': 'Bearer $apiToken',
+        // Required in Supabase mode: resolves the chat owner for per-user
+        // isolation. Without it the server fails closed with an empty list.
+        if (supabaseToken != null) 'X-Nanobot-Auth': supabaseToken,
+      },
     );
     if (res.statusCode != 200) {
       throw ApiException(res.statusCode, 'Could not load sessions');
@@ -124,25 +134,34 @@ class GatewayApi {
         .toList();
   }
 
-  Future<List<ThreadTurn>> fetchThread(String apiToken, String key) async {
+  Future<ThreadHistory> fetchThread(String apiToken, String key,
+      {String? supabaseToken}) async {
     final url =
         '$origin/api/sessions/${Uri.encodeComponent(key)}/webui-thread?limit=200&direction=latest';
     final res = await _client.get(
       Uri.parse(url),
-      headers: {'Authorization': 'Bearer $apiToken', 'Cache-Control': 'no-store'},
+      headers: {
+        'Authorization': 'Bearer $apiToken',
+        'Cache-Control': 'no-store',
+        if (supabaseToken != null) 'X-Nanobot-Auth': supabaseToken,
+      },
     );
-    if (res.statusCode == 404) return [];
+    if (res.statusCode == 404) return ThreadHistory(messages: []);
     if (res.statusCode != 200) {
       throw ApiException(res.statusCode, 'Could not load conversation');
     }
-    return ThreadTurn.parseWebuiThread(jsonDecode(res.body));
+    return ThreadHistory.parse(jsonDecode(res.body));
   }
 
   /// Delete a session/conversation from the server. Best-effort.
-  Future<void> deleteSession(String apiToken, String key) async {
+  Future<void> deleteSession(String apiToken, String key,
+      {String? supabaseToken}) async {
     final res = await _client.post(
       Uri.parse('$origin/api/sessions/${Uri.encodeComponent(key)}/delete'),
-      headers: {'Authorization': 'Bearer $apiToken'},
+      headers: {
+        'Authorization': 'Bearer $apiToken',
+        if (supabaseToken != null) 'X-Nanobot-Auth': supabaseToken,
+      },
     );
     if (res.statusCode != 200 && res.statusCode != 204) {
       throw ApiException(res.statusCode, 'Could not delete conversation');

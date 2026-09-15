@@ -23,7 +23,7 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final TextEditingController _input = TextEditingController();
   final ScrollController _scroll = ScrollController();
   final List<ChatMessage> _messages = [];
@@ -31,17 +31,44 @@ class _ChatScreenState extends State<ChatScreen> {
 
   String? _chatId;
   NanobotSocket? _socket;
-  bool _sending = false;
+  ChatView? _view;
+  bool _sending = false; // local send in flight
+  bool _remoteRunning = false; // server reports an active turn
+  bool _stopping = false;
   bool _loadingHistory = false;
-  /// True while a server-side turn is running that we are merely observing
-  /// (e.g. resumed after the app was closed) — disables composer send.
-  bool _remoteRunning = false;
+  bool _connected = false;
   final OnlyFilesUploader _uploader = OnlyFilesUploader();
+
+  ChatMessage? _liveTurn; // assistant bubble for the current (or resumed) turn
+
+  bool get _busy => _sending || _remoteRunning;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) => _boot());
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    if (s == AppLifecycleState.resumed) {
+      // The socket auto-reconnects; make sure the token is hot and re-pull
+      // the turn state so a backgrounded task resumes streaming here.
+      final state = context.read<AppState>();
+      state.loadSessions();
+      state.refreshCredits();
+      unawaited(_reattach());
+    }
+  }
+
+  Future<void> _reattach() async {
+    if (_chatId == null) return;
+    try {
+      final sock = await context.read<AppState>().ensureSocket();
+      _socket = sock;
+      await sock.attach(_chatId!);
+    } catch (_) {}
   }
 
   Future<void> _boot() async {
@@ -49,33 +76,36 @@ class _ChatScreenState extends State<ChatScreen> {
     if (widget.session != null) {
       setState(() => _loadingHistory = true);
       try {
-        final turns = await state.openSession(widget.session!);
+        final history = await state.openSession(widget.session!);
         _chatId = widget.session!.chatId;
         state.rememberChat(_chatId!);
-        for (final t in turns) {
-          _messages.add(ChatMessage(
-            id: DateTime.now().microsecondsSinceEpoch.toString(),
-            role: t.role == 'user' ? Role.user : Role.assistant,
-            text: t.content,
-            reasoning: t.reasoning ?? '',
-            media: [...t.media],
-          ));
-        }
+        _messages.addAll(history.messages);
       } catch (_) {}
       if (mounted) setState(() => _loadingHistory = false);
-      // Attach so any still-running background turn streams into this view.
       await _attachAndWatch();
     } else {
-      // Provision a fresh chat immediately so typing feels instant.
       try {
         final sock = await state.ensureSocket();
         _socket = sock;
+        _wireSocket(sock);
         final id = await sock.newChat();
         _chatId = id;
         state.rememberChat(id);
-        _wireGoalStatus(sock);
-      } catch (_) {}
+        _registerView();
+        setState(() => _connected = true);
+      } catch (e) {
+        _toast('Connection error: $e');
+      }
     }
+  }
+
+  void _wireSocket(NanobotSocket sock) {
+    sock.onGoalStatus = (chatId, status) {
+      if (!mounted || chatId != _chatId) return;
+      final running = status == 'running';
+      setState(() => _remoteRunning = running);
+      if (running) _ensureLiveTurn(); // replayed running turn → open bubble
+    };
   }
 
   /// Re-attach to an existing chat and subscribe to live events. If the agent
@@ -86,85 +116,164 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       final sock = await state.ensureSocket();
       _socket = sock;
-      _wireGoalStatus(sock);
+      _wireSocket(sock);
+      _registerView();
       await sock.attach(_chatId!);
-    } catch (_) {}
+      setState(() => _connected = true);
+    } catch (e) {
+      if (mounted) setState(() => _connected = false);
+    }
   }
 
-  void _wireGoalStatus(NanobotSocket sock) {
-    sock.onGoalStatus = (chatId, status) {
-      if (!mounted || chatId != _chatId) return;
-      final running = status == 'running';
-      if (running) {
-        // A remote/background turn is active. Ensure we have a streaming bubble
-        // and a passive observer registered so its events render live.
-        final hasStreaming = _messages.any((m) => m.streaming);
-        if (!hasStreaming) {
-          final assistant = ChatMessage(
-              id: 'r-${DateTime.now().microsecondsSinceEpoch}',
-              role: Role.assistant,
-              streaming: true);
-          setState(() {
-            _remoteRunning = true;
-            _messages.add(assistant);
-          });
-          _registerObserverFor(sock, chatId, assistant);
-        } else {
-          setState(() => _remoteRunning = true);
-        }
-      } else {
-        setState(() => _remoteRunning = false);
-      }
-    };
+  /// Lazily create the assistant bubble that receives live turn events.
+  ChatMessage _ensureLiveTurn() {
+    final existing = _liveTurn;
+    if (existing != null) return existing;
+    final msg = ChatMessage(
+        id: 'live-${DateTime.now().microsecondsSinceEpoch}',
+        role: Role.assistant,
+        streaming: true);
+    setState(() {
+      _messages.add(msg);
+      _liveTurn = msg;
+    });
+    _scrollToBottom();
+    return msg;
   }
 
-  /// Register a passive observer that streams a backgrounded turn into [target].
-  void _registerObserverFor(
-      NanobotSocket sock, String chatId, ChatMessage assistant) {
-    sock.observe(
-      chatId,
+  /// Build the ChatView (reads `_liveTurn` lazily per event) and install it.
+  void _registerView() {
+    final chatId = _chatId;
+    if (chatId == null || _socket == null) return;
+    _view = ChatView(
       onDelta: (chunk) {
-        assistant.text += chunk;
+        _ensureLiveTurn().appendDelta(chunk);
         if (mounted) setState(() {});
         _scrollToBottom();
       },
-      onActivity: (step) {
-        _upsertStep(assistant, step);
+      onReasoningDelta: (chunk) {
+        final t = _ensureLiveTurn();
+        t.reasoning += chunk;
+        t.reasoningStreaming = true;
         if (mounted) setState(() {});
         _scrollToBottom();
       },
-      onDone: (full, media) {
-        assistant.text = full.isNotEmpty ? full : assistant.text;
-        assistant.streaming = false;
-        for (final s in assistant.activity) {
-          if (!s.isDone) s.status = 'done';
+      onReasoningEnd: () {
+        final t = _liveTurn;
+        if (t != null) t.reasoningStreaming = false;
+        if (mounted) setState(() {});
+      },
+      onStreamEnd: (finalText) {
+        final t = _liveTurn;
+        if (t != null) {
+          t.endSegment(finalText);
+          t.dropEmptyTrailingSegment();
+        }
+        if (mounted) setState(() {});
+        _scrollToBottom();
+      },
+      onActivity: (steps) {
+        final t = _ensureLiveTurn();
+        for (final s in steps) {
+          _upsertStep(t, s);
+        }
+        if (mounted) setState(() {});
+        _scrollToBottom();
+      },
+      onFinalMessage: (text, media) {
+        // Authoritative complete answer. Absorb into the live turn if one
+        // exists, else surface as a standalone bubble (e.g. the "/stop"
+        // acknowledgement that arrives after goal_status idle).
+        var turn = _liveTurn;
+        if (turn == null) {
+          if (text.trim().isEmpty && media.isEmpty) return;
+          turn = ChatMessage(
+              id: 'm-${DateTime.now().microsecondsSinceEpoch}',
+              role: Role.assistant,
+              streaming: false);
+          _messages.add(turn);
+        }
+        final t = turn;
+        if (text.trim().isNotEmpty && text.length >= t.text.length) {
+          t.segments
+            ..clear()
+            ..add(text);
         }
         if (media.isNotEmpty) {
-          assistant.media = [
-            ...assistant.media,
-            ...media.where((m) => !assistant.media.contains(m)),
+          t.media = [
+            ...t.media,
+            ...media.where((m) => !t.media.contains(m)),
           ];
         }
+        if (mounted) setState(() {});
+      },
+      onTurnEnd: (summary) {
+        final t = _liveTurn;
+        if (t == null) return;
+        t.streaming = false;
+        t.reasoningStreaming = false;
+        t.dropEmptyTrailingSegment();
+        t.usage = summary.usage ?? t.usage;
+        t.latencyMs = summary.latencyMs ?? t.latencyMs;
+        if (summary.media.isNotEmpty) {
+          t.media = {...t.media, ...summary.media}.toList();
+        }
+        for (final s in t.activity) {
+          if (!s.isDone) s.status = 'done';
+        }
+        _liveTurn = null;
         if (mounted) {
           setState(() {
-            _remoteRunning = false;
             _sending = false;
+            _stopping = false;
+            _remoteRunning = false;
           });
           _scrollToBottom();
         }
       },
       onError: (detail) {
-        assistant.streaming = false;
-        assistant.hasError = true;
-        if (assistant.text.isEmpty) assistant.text = '⚠️ $detail';
+        final t = _ensureLiveTurn();
+        t.streaming = false;
+        t.hasError = true;
+        if (t.text.isEmpty) {
+          t.segments.add('⚠️ $detail');
+        }
+        _liveTurn = null;
         if (mounted) {
           setState(() {
-            _remoteRunning = false;
             _sending = false;
+            _stopping = false;
+            _remoteRunning = false;
           });
         }
       },
+      onUserMessage: (text, turnId) {
+        // Projected user echo / replay after reconnect — dedupe by turnId
+        // when known, else by identical user text in this view.
+        final dup = _messages.any((m) =>
+            m.role == Role.user &&
+            ((turnId != null && m.turnId == turnId) ||
+                (turnId == null && m.text == text)));
+        if (!dup && text.trim().isNotEmpty) {
+          setState(() => _messages.add(ChatMessage(
+              id: 'u-echo-${DateTime.now().microsecondsSinceEpoch}',
+              role: Role.user,
+              text: text,
+              turnId: turnId)));
+          _scrollToBottom();
+        }
+      },
     );
+    _socket!.listen(chatId, _view!);
+  }
+
+  void _upsertStep(ChatMessage msg, ActivityStep incoming) {
+    final idx = msg.activity.indexWhere((s) => s.id == incoming.id);
+    if (idx >= 0) {
+      msg.activity[idx].status = incoming.status;
+    } else {
+      msg.activity.add(incoming);
+    }
   }
 
   void _scrollToBottom() {
@@ -186,19 +295,18 @@ class _ChatScreenState extends State<ChatScreen> {
       final result = await FilePicker.platform.pickFiles(
         allowMultiple: true,
         type: FileType.any,
-        withData: true, // load bytes so images can be base64-encoded
+        withData: true,
       );
       if (result == null || result.files.isEmpty) return;
       for (final f in result.files) {
         final path = f.path;
         if (path == null) continue;
-        final size = f.size;
         final kind = _kindFor(f.name, path);
         final att = PendingAttachment(
           id: 'att-${DateTime.now().microsecondsSinceEpoch}-${f.name}',
           name: f.name,
           kind: kind,
-          sizeBytes: size,
+          sizeBytes: f.size,
           localPath: path,
           status: 'uploading',
         );
@@ -220,7 +328,6 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _prepareAttachment(PendingAttachment att, File file) async {
     try {
       if (att.kind == 'image') {
-        // Images ride inline as base64 data URLs (matches WebUI behaviour).
         final bytes = await file.readAsBytes();
         if (bytes.lengthInBytes > 8 * 1024 * 1024) {
           throw StateError('Image too large (max ~8 MB).');
@@ -228,7 +335,6 @@ class _ChatScreenState extends State<ChatScreen> {
         final mt = mime_lib.lookupMimeType(att.localPath ?? '') ?? 'image/png';
         att.dataUrl = 'data:$mt;base64,${base64Encode(bytes)}';
       } else {
-        // Videos & arbitrary files upload straight to onlyfiles.com.
         att.url = await _uploader.upload(file, name: att.name);
       }
       att.status = 'ready';
@@ -239,16 +345,12 @@ class _ChatScreenState extends State<ChatScreen> {
     if (mounted) setState(() {});
   }
 
-  void _removeAttachment(PendingAttachment att) {
-    setState(() => _pending.remove(att));
-  }
-
-  // ---- Sending ----------------------------------------------------------
+  // ---- Sending / stopping ------------------------------------------------
 
   Future<void> _send() async {
     final text = _input.text.trim();
     final readyMedia = _pending.where((a) => a.isReady).toList();
-    if ((text.isEmpty && readyMedia.isEmpty) || _sending) return;
+    if ((text.isEmpty && readyMedia.isEmpty) || _busy) return;
     if (_pending.any((a) => a.status == 'uploading')) {
       _toast('Wait for attachments to finish uploading.');
       return;
@@ -260,16 +362,6 @@ class _ChatScreenState extends State<ChatScreen> {
     final wireMedia = readyMedia.map((a) => a.toWireMedia()).toList();
 
     setState(() {
-      // Finalize any stale streaming/observer bubble before starting a new turn.
-      for (final m in _messages) {
-        if (m.streaming) {
-          m.streaming = false;
-          for (final s in m.activity) {
-            if (!s.isDone) s.status = 'done';
-          }
-        }
-      }
-      _remoteRunning = false;
       _messages.add(ChatMessage(
           id: 'u-${DateTime.now().microsecondsSinceEpoch}',
           role: Role.user,
@@ -285,71 +377,26 @@ class _ChatScreenState extends State<ChatScreen> {
 
     try {
       _socket ??= await state.ensureSocket();
+      _wireSocket(_socket!);
       _chatId ??= await _socket!.newChat();
       state.rememberChat(_chatId!);
+      _registerView();
     } catch (e) {
       _fail('Connection error: $e');
       return;
     }
 
-    final assistant = ChatMessage(
-        id: 'a-${DateTime.now().microsecondsSinceEpoch}',
-        role: Role.assistant,
-        streaming: true);
-    if (mounted) setState(() => _messages.add(assistant));
-    _scrollToBottom();
-
-    _socket!.sendMessage(
-      _chatId!,
-      text,
-      media: wireMedia.isEmpty ? null : wireMedia,
-      onDelta: (chunk) {
-        assistant.text += chunk;
-        if (mounted) setState(() {});
-        _scrollToBottom();
-      },
-      onActivity: (step) {
-        _upsertStep(assistant, step);
-        if (mounted) setState(() {});
-        _scrollToBottom();
-      },
-      onDone: (full, media) {
-        assistant.text = full.isNotEmpty ? full : assistant.text;
-        assistant.streaming = false;
-        assistant.media = [
-          ...assistant.media,
-          ...media.where((m) => !assistant.media.contains(m)),
-        ];
-        for (final s in assistant.activity) {
-          if (!s.isDone) s.status = 'done';
-        }
-        if (mounted) {
-          setState(() => _sending = false);
-          _scrollToBottom();
-        }
-        // Refresh sidebar sessions so titles/previews update.
-        unawaited(state.loadSessions());
-      },
-      onError: (detail) {
-        assistant.streaming = false;
-        assistant.hasError = true;
-        if (assistant.text.isEmpty) assistant.text = '⚠️ $detail';
-        if (mounted) {
-          setState(() => _sending = false);
-          _scrollToBottom();
-        }
-      },
-    );
+    _ensureLiveTurn();
+    _socket!.sendMessage(_chatId!, text,
+        media: wireMedia.isEmpty ? null : wireMedia);
   }
 
-  void _upsertStep(ChatMessage msg, ActivityStep incoming) {
-    final idx = msg.activity.indexWhere((s) => s.id == incoming.id);
-    if (idx >= 0) {
-      // A later phase for the same call_id updates status (running -> done/error).
-      msg.activity[idx].status = incoming.status;
-    } else {
-      msg.activity.add(incoming);
-    }
+  /// Cancel the running task (server `/stop` slash command).
+  void _stop() {
+    final chatId = _chatId;
+    if (chatId == null || _socket == null || !_busy) return;
+    setState(() => _stopping = true);
+    _socket!.stopTask(chatId);
   }
 
   void _fail(String msg) {
@@ -365,6 +412,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    final chatId = _chatId;
+    if (chatId != null) _socket?.unlisten(chatId);
     _input.dispose();
     _scroll.dispose();
     super.dispose();
@@ -372,20 +422,58 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final showTyping = (_sending || _remoteRunning) && !_hasStreaming;
     return Scaffold(
       backgroundColor: const Color(0xFF0B1020),
       appBar: AppBar(
         backgroundColor: const Color(0xFF0B1020),
         elevation: 0,
-        title: const Text('PowerX', style: TextStyle(fontWeight: FontWeight.w800)),
+        title: Stack(
+          alignment: Alignment.center,
+          children: [
+            const Text('PowerX', style: TextStyle(fontWeight: FontWeight.w800)),
+            if (_busy)
+              Positioned(
+                right: 0,
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1A2138),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const SizedBox(
+                          width: 10,
+                          height: 10,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 1.6, color: Color(0xFF66BB6A))),
+                      const SizedBox(width: 6),
+                      Text(_stopping ? 'stopping…' : 'working…',
+                          style: const TextStyle(
+                              fontSize: 11, color: Colors.white70)),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
         centerTitle: true,
         actions: [
+          if (!_connected)
+            const Padding(
+              padding: EdgeInsets.only(right: 4),
+              child: Tooltip(
+                message: 'Reconnecting…',
+                child: Icon(Icons.cloud_off_rounded,
+                    size: 18, color: Colors.orangeAccent),
+              ),
+            ),
           IconButton(
             icon: const Icon(Icons.settings_outlined),
             tooltip: 'Settings',
-            onPressed: () => Navigator.of(context)
-                .pushNamed('/settings'),
+            onPressed: () => Navigator.of(context).pushNamed('/settings'),
           ),
         ],
       ),
@@ -397,27 +485,24 @@ class _ChatScreenState extends State<ChatScreen> {
                 : ListView.builder(
                     controller: _scroll,
                     padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-                    itemCount: _messages.length + (showTyping ? 1 : 0),
-                    itemBuilder: (_, i) {
-                      if (i >= _messages.length) return const _TypingDots();
-                      return _Bubble(message: _messages[i]);
-                    },
+                    itemCount: _messages.length,
+                    itemBuilder: (_, i) => _Bubble(message: _messages[i]),
                   ),
           ),
           _Composer(
             controller: _input,
-            sending: _sending || _remoteRunning,
+            busy: _busy,
+            stopping: _stopping,
             pending: _pending,
             onPick: _pickFiles,
-            onRemove: _removeAttachment,
+            onRemove: (a) => setState(() => _pending.remove(a)),
             onSend: _send,
+            onStop: _stop,
           ),
         ],
       ),
     );
   }
-
-  bool get _hasStreaming => _messages.any((m) => m.streaming);
 }
 
 class _Bubble extends StatelessWidget {
@@ -432,7 +517,7 @@ class _Bubble extends StatelessWidget {
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 6),
         constraints:
-            BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.86),
+            BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.90),
         decoration: BoxDecoration(
           color: isUser ? const Color(0xFF2E7D32) : const Color(0xFF1A2138),
           borderRadius: BorderRadius.only(
@@ -450,17 +535,20 @@ class _Bubble extends StatelessWidget {
                 children: [
                   if (message.text.isNotEmpty)
                     SelectableText(message.text,
-                        style: const TextStyle(color: Colors.white, fontSize: 15)),
+                        style: const TextStyle(
+                            color: Colors.white, fontSize: 15)),
                   if (message.media.isNotEmpty)
                     Padding(
-                      padding: EdgeInsets.only(top: message.text.isNotEmpty ? 8 : 0),
+                      padding: EdgeInsets.only(
+                          top: message.text.isNotEmpty ? 8 : 0),
                       child: Wrap(
                         spacing: 6,
                         runSpacing: 6,
                         alignment: WrapAlignment.end,
                         children: [
                           for (final m in message.media)
-                            _AttachmentChip(label: _basename(m), url: m),
+                            _AttachmentChip(
+                                label: _basename(m), url: m),
                         ],
                       ),
                     ),
@@ -468,23 +556,40 @@ class _Bubble extends StatelessWidget {
               )
             : Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
                   if (message.activity.isNotEmpty)
-                    _ActivityPanel(steps: message.activity),
-                  MarkdownBody(
-                    data: message.text.isEmpty && message.streaming
-                        ? (message.activity.isEmpty ? '…' : '')
-                        : message.text,
-                    selectable: true,
-                    styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context))
-                        .copyWith(
-                      p: const TextStyle(
-                          color: Colors.white, fontSize: 15, height: 1.35),
-                      codeblockDecoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.35),
-                          borderRadius: BorderRadius.circular(8)),
+                    _ActivityPanel(
+                        steps: message.activity, turnStreaming: message.streaming),
+                  if (message.reasoning.trim().isNotEmpty)
+                    _ThinkingPanel(
+                        reasoning: message.reasoning,
+                        streaming: message.reasoningStreaming),
+                  for (var i = 0; i < message.segments.length; i++)
+                    Padding(
+                      padding: EdgeInsets.only(
+                          top: i == 0 ? 0 : 8),
+                      child: MarkdownBody(
+                        data: message.segments[i],
+                        selectable: true,
+                        styleSheet:
+                            MarkdownStyleSheet.fromTheme(Theme.of(context))
+                                .copyWith(
+                          p: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 15,
+                              height: 1.35),
+                          codeblockDecoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.35),
+                              borderRadius: BorderRadius.circular(8)),
+                        ),
+                      ),
                     ),
-                  ),
+                  if (message.streaming && message.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 2),
+                      child: _TypingDots(compact: true),
+                    ),
                   if (message.viewableMedia.isNotEmpty)
                     Padding(
                       padding: const EdgeInsets.only(top: 8),
@@ -497,17 +602,33 @@ class _Bubble extends StatelessWidget {
                         ],
                       ),
                     ),
-                  if (message.streaming &&
-                      message.text.isEmpty &&
-                      message.activity.isEmpty)
+                  if (!message.streaming && message.hasError)
                     const Padding(
                       padding: EdgeInsets.only(top: 6),
-                      child: _TypingDots(compact: true),
+                      child: Icon(Icons.error_outline,
+                          size: 16, color: Colors.redAccent),
+                    ),
+                  if (!message.streaming && _footer(message) != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text(_footer(message)!,
+                          style: const TextStyle(
+                              color: Colors.white30, fontSize: 11)),
                     ),
                 ],
               ),
       ),
     );
+  }
+
+  static String? _footer(ChatMessage m) {
+    final parts = <String>[];
+    final calls = m.usage?['llm_calls'];
+    if (calls != null && calls > 0) parts.add('API calls: ${calls.toInt()}');
+    if (m.latencyMs != null && m.latencyMs! > 0) {
+      parts.add('${(m.latencyMs! / 1000).toStringAsFixed(1)}s');
+    }
+    return parts.isEmpty ? null : parts.join(' · ');
   }
 
   static String _basename(String path) {
@@ -517,96 +638,43 @@ class _Bubble extends StatelessWidget {
   }
 }
 
-/// Renders the ordered list of tool/activity steps for a turn, collapsing
-/// completed ones behind a summary line like the WebUI's activity timeline.
+/// Ordered list of tool/activity steps for a turn, live-updated.
 class _ActivityPanel extends StatelessWidget {
-  const _ActivityPanel({required this.steps});
+  const _ActivityPanel({required this.steps, required this.turnStreaming});
   final List<ActivityStep> steps;
+  final bool turnStreaming;
 
   @override
   Widget build(BuildContext context) {
-    final running = steps.where((s) => !s.isDone).length;
-    final done = steps.length - running;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
-      decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.22),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.white12),
-      ),
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Row(
-            children: [
-              Icon(
-                running > 0 ? Icons.autorenew : Icons.check_circle_outline,
-                size: 15,
-                color: running > 0 ? const Color(0xFF66BB6A) : Colors.white54,
+          for (final s in steps)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 3),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _StepStatus(status: s.status),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      s.detail.isNotEmpty
+                          ? '${s.name} · ${s.detail}'
+                          : s.name,
+                      style: TextStyle(
+                        color: s.isDone ? Colors.white54 : Colors.white70,
+                        fontSize: 12.5,
+                        decoration: TextDecoration.none,
+                      ),
+                    ),
+                  ),
+                ],
               ),
-              const SizedBox(width: 6),
-              Text(
-                running > 0 ? 'Working · $done/$steps.length steps' : 'Completed · ${steps.length} steps',
-                style: const TextStyle(
-                    color: Colors.white70,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600),
-              ),
-            ],
-          ),
-          const SizedBox(height: 6),
-          for (final s in steps) _StepRow(step: s),
-        ],
-      ),
-    );
-  }
-}
-
-class _StepRow extends StatelessWidget {
-  const _StepRow({required this.step});
-  final ActivityStep step;
-
-  IconData get _icon {
-    switch (step.iconKey) {
-      case 'read':
-        return Icons.description_outlined;
-      case 'write':
-        return Icons.edit_note_rounded;
-      case 'search':
-        return Icons.travel_explore_outlined;
-      case 'run':
-        return Icons.terminal_rounded;
-      case 'image':
-        return Icons.image_outlined;
-      case 'list':
-        return Icons.format_list_bulleted_rounded;
-      default:
-        return Icons.build_outlined;
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final label = step.detail.isNotEmpty ? '${step.name} · ${step.detail}' : step.name;
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(_icon, size: 14, color: Colors.white54),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(color: Colors.white70, fontSize: 12.5),
             ),
-          ),
-          const SizedBox(width: 6),
-          _StepStatus(status: step.status),
         ],
       ),
     );
@@ -619,16 +687,104 @@ class _StepStatus extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (status == 'running') {
-      return const SizedBox(
-        width: 12,
-        height: 12,
-        child: CircularProgressIndicator(strokeWidth: 1.6, color: Color(0xFF66BB6A)),
+      return const Padding(
+        padding: EdgeInsets.only(top: 2),
+        child: SizedBox(
+          width: 12,
+          height: 12,
+          child: CircularProgressIndicator(
+              strokeWidth: 1.6, color: Color(0xFF66BB6A)),
+        ),
       );
     }
     if (status == 'error') {
       return const Icon(Icons.error_outline, size: 14, color: Colors.redAccent);
     }
-    return const Icon(Icons.check, size: 14, color: Color(0xFF66BB6A));
+    return const Icon(Icons.check_circle_outline,
+        size: 14, color: Color(0xFF4CAF50));
+  }
+}
+
+/// Collapsible "Thinking" panel showing the model's reasoning stream,
+/// expanded automatically while it is still streaming.
+class _ThinkingPanel extends StatefulWidget {
+  const _ThinkingPanel({required this.reasoning, required this.streaming});
+  final String reasoning;
+  final bool streaming;
+
+  @override
+  State<_ThinkingPanel> createState() => _ThinkingPanelState();
+}
+
+class _ThinkingPanelState extends State<_ThinkingPanel> {
+  bool? _override; // null = auto (follow streaming state)
+
+  @override
+  void didUpdateWidget(covariant _ThinkingPanel old) {
+    super.didUpdateWidget(old);
+    if (old.streaming && !widget.streaming) {
+      // Collapse automatically when thinking ends (unless user opened it).
+      if (_override == null) setState(() => _override = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final expanded = _override ?? widget.streaming;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.22),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: () => setState(() => _override = !expanded),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+              child: Row(
+                children: [
+                  Icon(
+                    expanded
+                        ? Icons.expand_more_rounded
+                        : Icons.chevron_right_rounded,
+                    size: 18,
+                    color: Colors.white54,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    widget.streaming ? 'Thinking…' : 'Thought',
+                    style: TextStyle(
+                      color: widget.streaming
+                          ? const Color(0xFF9CCC65)
+                          : Colors.white54,
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const Spacer(),
+                  const Icon(Icons.psychology_alt_outlined,
+                      size: 14, color: Colors.white24),
+                ],
+              ),
+            ),
+          ),
+          if (expanded)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
+              child: SelectableText(
+                widget.reasoning.length > 4000
+                    ? '${widget.reasoning.substring(0, 4000)}…'
+                    : widget.reasoning,
+                style: const TextStyle(
+                    color: Colors.white38, fontSize: 12, height: 1.35),
+              ),
+            ),
+        ],
+      ),
+    );
   }
 }
 
@@ -681,9 +837,13 @@ class _MediaLink extends StatelessWidget {
             url,
             errorBuilder: (_, __, ___) =>
                 _AttachmentChip(label: _basename(url), url: url),
-            loadingBuilder: (_, child, prog) =>
-                prog == null ? child : const SizedBox(
-                    width: 120, height: 120, child: Center(child: CircularProgressIndicator(strokeWidth: 2))),
+            loadingBuilder: (_, child, prog) => prog == null
+                ? child
+                : const SizedBox(
+                    width: 120,
+                    height: 120,
+                    child:
+                        Center(child: CircularProgressIndicator(strokeWidth: 2))),
             fit: BoxFit.cover,
             width: 220,
             height: 160,
@@ -768,18 +928,22 @@ class _TypingDotsState extends State<_TypingDots>
 class _Composer extends StatelessWidget {
   const _Composer({
     required this.controller,
-    required this.sending,
+    required this.busy,
+    required this.stopping,
     required this.pending,
     required this.onPick,
     required this.onRemove,
     required this.onSend,
+    required this.onStop,
   });
   final TextEditingController controller;
-  final bool sending;
+  final bool busy;
+  final bool stopping;
   final List<PendingAttachment> pending;
   final VoidCallback onPick;
   final void Function(PendingAttachment) onRemove;
   final VoidCallback onSend;
+  final VoidCallback onStop;
 
   @override
   Widget build(BuildContext context) {
@@ -829,7 +993,9 @@ class _Composer extends StatelessWidget {
                     textInputAction: TextInputAction.newline,
                     style: const TextStyle(color: Colors.white, fontSize: 15),
                     decoration: InputDecoration(
-                      hintText: sending ? 'PowerX is working…' : 'Message PowerX…',
+                      hintText: busy
+                          ? (stopping ? 'Stopping task…' : 'PowerX is working…')
+                          : 'Message PowerX…',
                       hintStyle: const TextStyle(color: Colors.white38),
                       filled: true,
                       fillColor: const Color(0xFF1A2138),
@@ -842,16 +1008,26 @@ class _Composer extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(width: 8),
+                // Send arrow when idle; red stop square while the agent works.
                 Material(
-                  color: const Color(0xFF2E7D32),
+                  color: busy ? Colors.red.shade700 : const Color(0xFF2E7D32),
                   shape: const CircleBorder(),
                   child: InkWell(
                     customBorder: const CircleBorder(),
-                    onTap: sending ? null : onSend,
+                    onTap: busy ? (stopping ? null : onStop) : onSend,
                     child: Padding(
                       padding: const EdgeInsets.all(12),
-                      child: Icon(Icons.arrow_upward_rounded,
-                          color: Colors.white, size: 22),
+                      child: busy
+                          ? (stopping
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                      strokeWidth: 2, color: Colors.white))
+                              : const Icon(Icons.stop_rounded,
+                                  color: Colors.white, size: 22))
+                          : const Icon(Icons.arrow_upward_rounded,
+                              color: Colors.white, size: 22),
                     ),
                   ),
                 ),

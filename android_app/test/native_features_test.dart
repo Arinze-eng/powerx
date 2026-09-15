@@ -4,7 +4,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:powerx_android/models.dart';
 import 'package:powerx_android/services/gateway_api.dart';
-import 'package:powerx_android/services/nanobot_socket.dart';
+
 
 void main() {
   group('ActivityStep', () {
@@ -143,9 +143,9 @@ void main() {
     });
   });
 
-  group('NanobotSocket.parseToolEvent', () {
+  group('ActivityStep.fromToolEvent', () {
     test('start phase -> running step with summarized args', () {
-      final step = NanobotSocket.parseToolEvent({
+      final step = ActivityStep.fromToolEvent({
         'version': 1,
         'phase': 'start',
         'call_id': 'call-9',
@@ -159,35 +159,35 @@ void main() {
     });
 
     test('end phase -> done, error phase -> error', () {
-      final done = NanobotSocket.parseToolEvent(
+      final done = ActivityStep.fromToolEvent(
           {'phase': 'end', 'name': 'web_search', 'call_id': 'c1'})!;
       expect(done.status, 'done');
-      final err = NanobotSocket.parseToolEvent(
+      final err = ActivityStep.fromToolEvent(
           {'phase': 'error', 'name': 'run_command', 'call_id': 'c2'})!;
       expect(err.status, 'error');
     });
 
     test('returns null when name missing', () {
-      expect(NanobotSocket.parseToolEvent({'phase': 'start'}), isNull);
+      expect(ActivityStep.fromToolEvent({'phase': 'start'}), isNull);
     });
 
     test('falls back to name+order id when call_id absent', () {
-      final step = NanobotSocket.parseToolEvent(
+      final step = ActivityStep.fromToolEvent(
           {'phase': 'start', 'name': 'list_dir'}, order: 3)!;
       expect(step.id, 'list_dir-3');
     });
 
     test('summarizeArgs prefers path then command then query', () {
-      expect(NanobotSocket.summarizeArgs({'command': 'ls -la'}), 'ls -la');
+      expect(ActivityStep.summarizeArgs({'command': 'ls -la'}), 'ls -la');
       expect(
-          NanobotSocket.summarizeArgs({'query': 'weather today'}),
+          ActivityStep.summarizeArgs({'query': 'weather today'}),
           'weather today');
-      expect(NanobotSocket.summarizeArgs(null), '');
+      expect(ActivityStep.summarizeArgs(null), '');
     });
 
     test('long arg values are truncated', () {
       final long = 'x' * 100;
-      final out = NanobotSocket.summarizeArgs({'path': long});
+      final out = ActivityStep.summarizeArgs({'path': long});
       expect(out.length, lessThanOrEqualTo(80));
       expect(out.endsWith('…'), isTrue);
     });

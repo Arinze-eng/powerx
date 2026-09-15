@@ -10,8 +10,23 @@ import '../services/supabase_auth.dart';
 
 enum AppStatus { loading, unauthenticated, authenticating, authenticated, error }
 
-/// Central app state: owns auth session, gateway tokens, the chat socket, and
-/// the list of sessions. Persists tokens securely so sign-in survives restarts.
+/// Gateway token TTL is short (300 s observed). Refresh well before expiry,
+/// mirroring the WebUI constants (margin 30 s, minimum delay 5 s).
+const _kTokenRefreshMargin = Duration(seconds: 30);
+const _kTokenRefreshMinDelay = Duration(seconds: 5);
+
+Duration tokenRefreshDelay(Duration remaining) {
+  final margin = remaining ~/ 2 < _kTokenRefreshMargin
+      ? (remaining ~/ 2 < const Duration(seconds: 1)
+          ? const Duration(seconds: 1)
+          : remaining ~/ 2)
+      : _kTokenRefreshMargin;
+  final d = remaining - margin;
+  return d < _kTokenRefreshMinDelay ? _kTokenRefreshMinDelay : d;
+}
+
+/// Central app state: owns the Supabase session, gateway tokens (auto-refresh
+/// because they expire in minutes), the shared chat socket, and sessions.
 class AppState extends ChangeNotifier {
   final GatewayApi api = GatewayApi();
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
@@ -22,7 +37,6 @@ class AppState extends ChangeNotifier {
   static const _kRefresh = 'refresh_token';
   static const _kEmail = 'email';
   static const _kName = 'name';
-  /// Last open chat id so a backgrounded turn can be resumed on reopen.
   static const _kLastChat = 'last_chat_id';
 
   AppStatus status = AppStatus.loading;
@@ -38,6 +52,9 @@ class AppState extends ChangeNotifier {
   String? _apiToken;
   String? _wsToken;
   String? _wsPath;
+  DateTime? _tokenExpiresAt;
+  DateTime? _sbExpiresAt;
+  Timer? _tokenTimer;
   NanobotSocket? _socket;
 
   // Bootstrap-derived profile/billing data
@@ -46,7 +63,6 @@ class AppState extends ChangeNotifier {
   List<PaymentPackage> paymentPackages = const [];
   String paymentUrl = '';
 
-  // Credits (fetched lazily from Supabase profiles).
   CreditBundle? credits;
   bool creditsLoading = false;
 
@@ -54,6 +70,9 @@ class AppState extends ChangeNotifier {
   bool sessionsLoading = false;
 
   String? lastChatId;
+
+  /// Whether the chat socket is currently connected.
+  bool socketConnected = false;
 
   /// Discover Supabase config from the gateway and restore any saved session.
   Future<void> init() async {
@@ -91,10 +110,8 @@ class AppState extends ChangeNotifier {
         unawaited(loadSessions());
         unawaited(refreshCredits());
       } catch (_) {
-        // Token likely expired — refresh once.
         try {
-          final s = await _auth!.refresh(rt);
-          await _persist(s);
+          await _refreshSupabase();
           await _bootstrapGateway();
           status = AppStatus.authenticated;
           notifyListeners();
@@ -153,7 +170,6 @@ class AppState extends ChangeNotifier {
         return false;
       }
       await _persist(s);
-      // Redeem the one-time referral bonus right after account creation.
       final ref = (referral ?? '').trim();
       if (ref.isNotEmpty) {
         unawaited(_claimReferral(s.accessToken, ref));
@@ -182,6 +198,8 @@ class AppState extends ChangeNotifier {
   Future<void> signOut() async {
     _socket?.close();
     _socket = null;
+    _tokenTimer?.cancel();
+    _tokenTimer = null;
     await _clearSession();
     sessions = [];
     credits = null;
@@ -194,10 +212,23 @@ class AppState extends ChangeNotifier {
     refreshToken = s.refreshToken;
     email = s.email ?? email;
     displayName = s.name ?? displayName;
+    if (s.expiresAt != null) {
+      _sbExpiresAt =
+          DateTime.fromMillisecondsSinceEpoch(s.expiresAt! * 1000);
+    }
     await _storage.write(key: _kAccess, value: s.accessToken);
     await _storage.write(key: _kRefresh, value: s.refreshToken);
     if (s.email != null) await _storage.write(key: _kEmail, value: s.email!);
     if (s.name != null) await _storage.write(key: _kName, value: s.name!);
+  }
+
+  /// Refresh the Supabase access token when it is missing or within 5 minutes
+  /// of expiry (it lives ~1 h, the gateway tokens ~5 min).
+  Future<void> _ensureSupabaseFresh() async {
+    final exp = _sbExpiresAt;
+    final needs = exp == null || exp.difference(DateTime.now()) < const Duration(minutes: 5);
+    if (!needs) return;
+    await _refreshSupabase();
   }
 
   Future<void> _clearSession() async {
@@ -206,18 +237,47 @@ class AppState extends ChangeNotifier {
     _apiToken = null;
     _wsToken = null;
     _wsPath = null;
+    _tokenExpiresAt = null;
     lastChatId = null;
     await _storage.delete(key: _kAccess);
     await _storage.delete(key: _kRefresh);
     await _storage.delete(key: _kLastChat);
   }
 
-  /// Exchange the Supabase access token for a gateway WS/REST token.
-  Future<void> _bootstrapGateway() async {
-    final boot = await api.bootstrap(supabaseAccessToken: accessToken);
+  Future<void> _refreshSupabase() async {
+    if (_auth == null || refreshToken == null) return;
+    final s = await _auth!.refresh(refreshToken!);
+    await _persist(s);
+  }
+
+  /// Exchange the (fresh) Supabase access token for gateway WS/REST tokens
+  /// and schedule the next refresh before the short TTL elapses. Concurrent
+  /// callers share one in-flight exchange (no stale-token races).
+  Future<void>? _bootInFlight;
+  Future<void> _bootstrapGateway() {
+    final inFlight = _bootInFlight;
+    if (inFlight != null) return inFlight;
+    final f = _doBootstrap().whenComplete(() => _bootInFlight = null);
+    _bootInFlight = f;
+    return f;
+  }
+
+  Future<void> _doBootstrap() async {
+    await _ensureSupabaseFresh();
+    var boot = await api.bootstrap(supabaseAccessToken: accessToken);
     if (boot.needsAuth || boot.token.isEmpty) {
-      throw Exception('Gateway rejected authentication');
+      // One retry after a forced Supabase refresh (token may have rotated
+      // while the app slept).
+      await _refreshSupabase();
+      boot = await api.bootstrap(supabaseAccessToken: accessToken);
+      if (boot.needsAuth || boot.token.isEmpty) {
+        throw Exception('Gateway rejected authentication');
+      }
     }
+    _applyBoot(boot);
+  }
+
+  void _applyBoot(GatewayBootstrap boot) {
     _apiToken = boot.apiToken;
     _wsToken = boot.token;
     _wsPath = boot.wsPath;
@@ -226,6 +286,45 @@ class AppState extends ChangeNotifier {
     paymentPackages = boot.paymentPackages;
     paymentUrl = boot.paymentUrl;
     if ((boot.userEmail ?? '').isNotEmpty) email = boot.userEmail;
+    // Live server value: expires_in=300. Trust the payload, default to 4 min.
+    final ttl = boot.expiresInSeconds != null && boot.expiresInSeconds! > 30
+        ? boot.expiresInSeconds! - 60
+        : 240;
+    _tokenExpiresAt = DateTime.now().add(Duration(seconds: ttl));
+    _scheduleTokenRefresh();
+  }
+
+  /// Gateway tokens expire in ~5 minutes (observed expires_in=300). Keep them
+  /// hot so history reads, credits, and reconnects never 401 mid-session.
+  void _scheduleTokenRefresh() {
+    _tokenTimer?.cancel();
+    final expires = _tokenExpiresAt;
+    if (expires == null || status != AppStatus.authenticated) return;
+    final remaining = expires.difference(DateTime.now());
+    _tokenTimer = Timer(tokenRefreshDelay(remaining < Duration.zero ? const Duration(seconds: 5) : remaining), () async {
+      if (status != AppStatus.authenticated) return;
+      try {
+        await _refreshSupabase();
+        await _bootstrapGateway();
+        // The next reconnect / REST call picks up fresh tokens automatically.
+        notifyListeners();
+      } catch (_) {
+        // Retry sooner; a persistent failure signs the user out on next REST 401.
+        _tokenTimer = Timer(const Duration(seconds: 20), () {
+          _bootstrapGateway().catchError((_) {});
+        });
+      }
+    });
+  }
+
+  /// Force an immediate token refresh (used after a 401 on REST calls).
+  Future<void> rebootstrap() async {
+    _tokenTimer?.cancel();
+    try {
+      await _refreshSupabase();
+    } catch (_) {}
+    await _bootstrapGateway();
+    notifyListeners();
   }
 
   String get greetingName {
@@ -272,7 +371,14 @@ class AppState extends ChangeNotifier {
     sessionsLoading = true;
     notifyListeners();
     try {
-      sessions = await api.listSessions(_apiToken!);
+      sessions = await api.listSessions(_apiToken!, supabaseToken: accessToken);
+    } on ApiException catch (e) {
+      if (e.status == 401) {
+        await rebootstrap();
+        try {
+          sessions = await api.listSessions(_apiToken!, supabaseToken: accessToken);
+        } catch (_) {}
+      }
     } catch (_) {
       // keep previous list
     } finally {
@@ -281,14 +387,22 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<List<ThreadTurn>> openSession(SessionSummary s) async {
-    if (_apiToken == null) return [];
-    return api.fetchThread(_apiToken!, s.key);
+  Future<ThreadHistory> openSession(SessionSummary s) async {
+    if (_apiToken == null) return ThreadHistory(messages: []);
+    try {
+      return await api.fetchThread(_apiToken!, s.key, supabaseToken: accessToken);
+    } on ApiException catch (e) {
+      if (e.status == 401) {
+        await rebootstrap();
+        return api.fetchThread(_apiToken!, s.key, supabaseToken: accessToken);
+      }
+      rethrow;
+    }
   }
 
   Future<void> deleteSession(SessionSummary s) async {
     if (_apiToken == null) return;
-    await api.deleteSession(_apiToken!, s.key);
+    await api.deleteSession(_apiToken!, s.key, supabaseToken: accessToken);
     sessions.removeWhere((x) => x.key == s.key);
     notifyListeners();
   }
@@ -298,20 +412,36 @@ class AppState extends ChangeNotifier {
     unawaited(_storage.write(key: _kLastChat, value: chatId));
   }
 
-  // ---- Chat socket ------------------------------------------------------
+  // ---- Chat socket (shared, auto-reconnecting) ---------------------------
 
   Future<NanobotSocket> ensureSocket() async {
-    if (_socket != null && _socket!.isOpen) return _socket!;
+    if (_socket != null && _socket!.isConnected) return _socket!;
     if (_wsToken == null || _wsPath == null) {
       await _bootstrapGateway();
     }
-    final sock = NanobotSocket(token: _wsToken!, wsPath: _wsPath!);
-    sock.onDisconnected = () {
-      _socket = null;
+    final sock = _socket ??= NanobotSocket(tokenProvider: () async {
+      // Always hand the socket a FRESH token: gateway tokens are minutes-old
+      // by the time a reconnect happens.
+      await rebootstrap();
+      if (_wsToken == null) throw Exception('No gateway token available');
+      return WsToken(_wsToken!, _wsPath ?? '/');
+    });
+    sock.onConnectionChanged = (connected) {
+      socketConnected = connected;
+      if (connected) {
+        // Re-pull session list & credits opportunistically after reconnect.
+        unawaited(loadSessions());
+      }
       notifyListeners();
     };
-    await sock.connect();
-    _socket = sock;
+    sock.onSessionsChanged = () => unawaited(loadSessions());
+    sock.onModelUpdated = (m) {
+      modelName = m;
+      notifyListeners();
+    };
+    if (!sock.isConnected) {
+      await sock.connect();
+    }
     return sock;
   }
 
@@ -323,6 +453,7 @@ class AppState extends ChangeNotifier {
 
   @override
   void dispose() {
+    _tokenTimer?.cancel();
     _socket?.close();
     super.dispose();
   }
