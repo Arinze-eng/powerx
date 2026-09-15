@@ -4,9 +4,45 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:powerx_android/models.dart';
 import 'package:powerx_android/services/gateway_api.dart';
-
+import 'package:powerx_android/services/supabase_auth.dart';
 
 void main() {
+  group('SupabaseSession (identity fields)', () {
+    test('parses email/name/expires fields from password grant', () {
+      final s = SupabaseSession.fromJson({
+        'access_token': 'at',
+        'refresh_token': 'rt',
+        'expires_in': 3600,
+        'expires_at': 1900000000,
+        'user': {
+          'email': 'me@x.com',
+          'user_metadata': {'name': 'Me'},
+        },
+      });
+      expect(s.email, 'me@x.com');
+      expect(s.name, 'Me');
+      expect(s.expiresIn, 3600);
+      expect(s.expiresAt, 1900000000);
+    });
+
+    test('name is null (not stale) when metadata lacks it', () {
+      // Regression: a second account signed in on the same device must not
+      // inherit the first account's display name — the session object itself
+      // carries null so the app can reset instead of falling back.
+      final s = SupabaseSession.fromJson({
+        'access_token': 'at',
+        'refresh_token': 'rt',
+        'expires_in': 3600,
+        'user': {
+          'email': 'b@x.com',
+          'user_metadata': {'email_verified': true},
+        },
+      });
+      expect(s.email, 'b@x.com');
+      expect(s.name, isNull);
+    });
+  });
+
   group('ActivityStep', () {
     test('maps tool names to icon keys', () {
       expect(ActivityStep(id: '1', name: 'read_file').iconKey, 'read');

@@ -90,6 +90,8 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> _restore() async {
+    // Never let a stale restore mix with a fresh sign-in on the same device.
+    _resetIdentity(wipeStorage: false);
     lastChatId = await _storage.read(key: _kLastChat);
     final url = await _storage.read(key: _kSbUrl);
     final key = await _storage.read(key: _kSbKey);
@@ -118,6 +120,7 @@ class AppState extends ChangeNotifier {
           unawaited(loadSessions());
           unawaited(refreshCredits());
         } catch (e) {
+          _resetIdentity(wipeStorage: false);
           await _clearSession();
           status = AppStatus.unauthenticated;
           notifyListeners();
@@ -136,10 +139,13 @@ class AppState extends ChangeNotifier {
     }
     status = AppStatus.authenticating;
     errorMessage = null;
+    // Hard identity boundary: nothing from a previous account may survive
+    // into this session, even if the new account's payload lacks fields.
+    _resetIdentity();
     notifyListeners();
     try {
       final s = await _auth!.signIn(em.trim(), pw);
-      await _persist(s);
+      await _persist(s, overwriteIdentity: true);
       await _bootstrapGateway();
       status = AppStatus.authenticated;
       notifyListeners();
@@ -160,6 +166,7 @@ class AppState extends ChangeNotifier {
     }
     status = AppStatus.authenticating;
     errorMessage = null;
+    _resetIdentity();
     notifyListeners();
     try {
       final s = await _auth!.signUp(em.trim(), pw, name, referral: referral);
@@ -169,7 +176,7 @@ class AppState extends ChangeNotifier {
         notifyListeners();
         return false;
       }
-      await _persist(s);
+      await _persist(s, overwriteIdentity: true);
       final ref = (referral ?? '').trim();
       if (ref.isNotEmpty) {
         unawaited(_claimReferral(s.accessToken, ref));
@@ -200,26 +207,64 @@ class AppState extends ChangeNotifier {
     _socket = null;
     _tokenTimer?.cancel();
     _tokenTimer = null;
+    _resetIdentity(wipeStorage: false);
     await _clearSession();
-    sessions = [];
-    credits = null;
     status = AppStatus.unauthenticated;
     notifyListeners();
   }
 
-  Future<void> _persist(SupabaseSession s) async {
+  /// Wipe every account-bound field. Called before applying a NEW session
+  /// (sign-in/sign-up), on sign-out, and on failed restore, so switching
+  /// accounts on one device can never show the previous user's name,
+  /// credits, sessions or billing data.
+  void _resetIdentity({bool wipeStorage = true}) {
+    email = null;
+    displayName = null;
+    sessions = [];
+    credits = null;
+    creditsLoading = false;
+    modelName = null;
+    supabaseUserId = null;
+    paymentPackages = const [];
+    paymentUrl = '';
+    lastChatId = null;
+    _apiToken = null;
+    _wsToken = null;
+    _wsPath = null;
+    _tokenExpiresAt = null;
+    _sbExpiresAt = null;
+    if (wipeStorage) {
+      unawaited(_storage.delete(key: _kEmail));
+      unawaited(_storage.delete(key: _kName));
+      unawaited(_storage.delete(key: _kLastChat));
+    }
+  }
+
+  Future<void> _persist(SupabaseSession s,
+      {bool overwriteIdentity = false}) async {
     accessToken = s.accessToken;
     refreshToken = s.refreshToken;
-    email = s.email ?? email;
-    displayName = s.name ?? displayName;
+    if (overwriteIdentity) {
+      // A brand-new sign-in defines the identity — never inherit the old one.
+      email = s.email;
+      displayName = s.name;
+    } else {
+      email = s.email ?? email;
+      displayName = s.name ?? displayName;
+    }
     if (s.expiresAt != null) {
       _sbExpiresAt =
           DateTime.fromMillisecondsSinceEpoch(s.expiresAt! * 1000);
+    } else if (s.expiresIn != null) {
+      _sbExpiresAt =
+          DateTime.now().add(Duration(seconds: s.expiresIn!));
     }
     await _storage.write(key: _kAccess, value: s.accessToken);
     await _storage.write(key: _kRefresh, value: s.refreshToken);
-    if (s.email != null) await _storage.write(key: _kEmail, value: s.email!);
-    if (s.name != null) await _storage.write(key: _kName, value: s.name!);
+    if (email != null) await _storage.write(key: _kEmail, value: email!);
+    if (displayName != null) {
+      await _storage.write(key: _kName, value: displayName!);
+    }
   }
 
   /// Refresh the Supabase access token when it is missing or within 5 minutes
@@ -234,17 +279,23 @@ class AppState extends ChangeNotifier {
   Future<void> _clearSession() async {
     accessToken = null;
     refreshToken = null;
-    _apiToken = null;
-    _wsToken = null;
-    _wsPath = null;
-    _tokenExpiresAt = null;
-    lastChatId = null;
     await _storage.delete(key: _kAccess);
     await _storage.delete(key: _kRefresh);
+    await _storage.delete(key: _kEmail);
+    await _storage.delete(key: _kName);
     await _storage.delete(key: _kLastChat);
   }
 
-  Future<void> _refreshSupabase() async {
+  Future<void>? _refreshInFlight;
+  Future<void> _refreshSupabase() {
+    final inFlight = _refreshInFlight;
+    if (inFlight != null) return inFlight;
+    final f = _doRefreshSupabase().whenComplete(() => _refreshInFlight = null);
+    _refreshInFlight = f;
+    return f;
+  }
+
+  Future<void> _doRefreshSupabase() async {
     if (_auth == null || refreshToken == null) return;
     final s = await _auth!.refresh(refreshToken!);
     await _persist(s);
@@ -278,6 +329,15 @@ class AppState extends ChangeNotifier {
   }
 
   void _applyBoot(GatewayBootstrap boot) {
+    // Defensive: if the gateway resolved a DIFFERENT Supabase user than the
+    // previous bootstrap (identity switch), purge all per-user views first.
+    if (supabaseUserId != null &&
+        boot.supabaseUserId != null &&
+        boot.supabaseUserId != supabaseUserId) {
+      sessions = [];
+      credits = null;
+      lastChatId = null;
+    }
     _apiToken = boot.apiToken;
     _wsToken = boot.token;
     _wsPath = boot.wsPath;

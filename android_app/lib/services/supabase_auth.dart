@@ -250,6 +250,7 @@ class SupabaseSession {
   final String accessToken;
   final String refreshToken;
   final int? expiresAt;
+  final int? expiresIn;
   final String? email;
   final String? name;
 
@@ -257,6 +258,7 @@ class SupabaseSession {
     required this.accessToken,
     required this.refreshToken,
     this.expiresAt,
+    this.expiresIn,
     this.email,
     this.name,
   });
@@ -274,6 +276,7 @@ class SupabaseSession {
       accessToken: j['access_token'] as String,
       refreshToken: j['refresh_token'] as String,
       expiresAt: j['expires_at'] is int ? j['expires_at'] as int : null,
+      expiresIn: j['expires_in'] is num ? (j['expires_in'] as num).toInt() : null,
       email: email,
       name: name,
     );
