@@ -1,29 +1,40 @@
-# PowerX Android Client
+# PowerX Android Client (Native)
 
-A **native-feeling** Flutter client for your self-hosted [PowerX](https://http--powerx--mxq9vl6k966n.code.run/) AI agent (nanobot gateway).
+A **fully native Flutter client** for your self-hosted [PowerX](https://http--powerx--mxq9vl6k966n.code.run/) AI agent (nanobot gateway). No WebView — it speaks directly to the backend's auth + chat APIs and renders a custom native UI.
 
-## Design: it doesn't look like a web app
+## Architecture
 
-The client renders the hosted PowerX WebUI but strips every browser tell so it
-reads as a first-class native app:
+```
+lib/
+├── config.dart                  # Backend URL + WS origin derivation
+├── models.dart                  # ChatMessage, SessionSummary, ThreadTurn parsing
+├── state/app_state.dart         # Auth + bootstrap + sessions + socket orchestration
+├── services/
+│   ├── supabase_auth.dart       # Email/password login & signup via Supabase REST
+│   ├── gateway_api.dart         # /webui/bootstrap, /api/sessions, thread history
+│   └── nanobot_socket.dart      # WebSocket chat protocol (new_chat / message / delta)
+└── screens/
+    ├── auth_screen.dart         # Sign in / sign up
+    ├── home_screen.dart         # Sessions drawer + landing
+    └── chat_screen.dart         # Native bubbles, streaming, markdown composer
+```
 
-- **No browser chrome** — no URL bar, no reload button, no title bar. Edge-to-edge immersive layout.
-- **Branded splash** — a polished PowerX loading screen covers the cold start; no white flash (dark window background matches the app).
-- **No web gestures** — pinch-zoom, double-tap-zoom, pull-to-refresh bounce, long-press context menu, text-selection handles, and drag navigation are all disabled via injected CSS/JS.
-- **Hidden scrollbars**, tap-highlight suppressed, overscroll removed.
-- Chat inputs and message text remain selectable so copying still works.
-- Native back gesture walks web history, then exits cleanly.
-- File downloads from the agent save to device storage with an "Open" snackbar; external links open in the system browser.
+### How it wires to your service
 
-All authentication (Supabase) happens inside the hosted WebUI itself — the shell
-just presents it natively.
+1. **Discover** — `GET /webui/bootstrap` returns the Supabase URL + anon key (nothing baked into the app).
+2. **Auth** — email/password against Supabase (`/auth/v1/token?grant_type=password`). Signup requires email confirmation.
+3. **Exchange** — `GET /webui/bootstrap` with header `X-Nanobot-Auth: <supabase_token>` → gateway WS token + REST api_token + ws_path.
+4. **Sessions** — `GET /api/sessions` (Bearer) lists chats; `GET /api/sessions/{key}/webui-thread` loads history.
+5. **Chat** — WebSocket to `wss://host{ws_path}?token=…`; send `{"type":"new_chat"}` then `{"type":"message","chat_id":…,"content":…,"webui":true}`; stream `delta` → `stream_end` (or final `message`) frames into the UI live.
+
+Tokens persist securely (`flutter_secure_storage`) so sign-in survives restarts; expired tokens auto-refresh once.
 
 ## Configuration
 
 Default backend:
 
 ```
-https://http--powerx--mxq9vl6k966n.code.run/
+https://http--powerx--mxq9vl6k966n.code.run
 ```
 
 Override at build time:
@@ -46,6 +57,7 @@ Download the artifact **`powerx-android-release-apk`** (`app-release.apk`) from 
 ```bash
 cd android_app
 flutter pub get
+flutter test
 flutter build apk --release   # build/app/outputs/flutter-apk/app-release.apk
 ```
 

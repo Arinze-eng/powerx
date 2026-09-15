@@ -1,5 +1,5 @@
 name: powerx_android
-description: "PowerX — Android client for your self-hosted PowerX AI agent (WebView wrapper)."
+description: "PowerX — native Android client for your self-hosted PowerX AI agent."
 publish_to: 'none'
 
 version: 1.0.0+1
@@ -12,16 +12,20 @@ dependencies:
     sdk: flutter
   cupertino_icons: ^1.0.8
 
-  # WebView that loads the hosted PowerX WebUI (nanobot) and handles auth in-page.
-  webview_flutter: ^4.10.0
-  # Full-featured in-app browser engine for opening external links / file downloads.
-  flutter_inappwebview: ^6.1.5
-  # Download generated files from the agent into device storage.
-  path_provider: ^2.1.4
+  # Networking: REST (Supabase auth, sessions, thread history) + WebSocket chat.
   http: ^1.2.2
-  open_filex: ^4.5.0
-  share_plus: ^10.0.0
+  web_socket_channel: ^3.0.1
+  # Secure token storage (session persists across app restarts).
+  flutter_secure_storage: ^9.2.2
+  # Markdown rendering for assistant replies.
+  flutter_markdown: ^0.7.3
+  # State management across screens.
+  provider: ^6.1.2
+  # Open generated files / links.
   url_launcher: ^6.3.0
+  path_provider: ^2.1.4
+  open_filex: ^4.5.0
+  intl: ^0.19.0
 
 dev_dependencies:
   flutter_test:
