@@ -334,4 +334,57 @@ void main() {
     expect(rec.deltas.any((d) => d.contains('resumed')), isTrue);
     expect(rec.turnEnds.any((t) => t.usage?['llm_calls'] == 5), isTrue);
   });
+
+  test('stale idle replay terminates busy state armed from history snapshot',
+      () async {
+    await sock.connect();
+    final chatId = await sock.newChat();
+    final rec = Recorder();
+    sock.listen(chatId, rec.view());
+    // Reproduce the stuck-spinner scenario: the UI armed its busy indicator
+    // from a history snapshot (activeTurnId), but the turn already finished
+    // server-side before the subscribe. The attach replay of goal_status idle
+    // must still terminate the turn exactly once.
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'idle'});
+    await pumpEventQueue();
+    expect(rec.turnEnds.length, 1,
+        reason: 'stale idle must terminate a turn the UI thinks is running');
+    // A second idle (duplicate replay) must NOT fire a second turn_end.
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'idle'});
+    await pumpEventQueue();
+    expect(rec.turnEnds.length, 1, reason: 'duplicate terminal events ignored');
+  });
+
+  test('duplicate turn_end fires onTurnEnd exactly once', () async {
+    await sock.connect();
+    final chatId = await sock.newChat();
+    final rec = Recorder();
+    sock.listen(chatId, rec.view());
+    sock.sendMessage(chatId, 'hello');
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+    await pumpEventQueue();
+    gw.send({'event': 'turn_end', 'chat_id': chatId});
+    await pumpEventQueue();
+    gw.send({'event': 'turn_end', 'chat_id': chatId});
+    await pumpEventQueue();
+    expect(rec.turnEnds.length, 1);
+  });
+
+  test('ChatMessage.artifactPaths derives download-ready file paths', () {
+    final msg = ChatMessage(id: 'm1', role: Role.assistant);
+    expect(msg.artifactPaths, isEmpty);
+    msg.activity.add(ActivityStep(
+        id: 'a1', name: 'write_file', detail: 'reports/summary.md',
+        status: 'done', order: 0));
+    msg.activity.add(ActivityStep(
+        id: 'a2', name: 'write_file', detail: 'reports/summary.md',
+        status: 'done', order: 1)); // duplicate path deduped
+    msg.activity.add(ActivityStep(
+        id: 'a3', name: 'read_file', detail: 'notes.md',
+        status: 'done', order: 2)); // reads are not artifacts
+    msg.activity.add(ActivityStep(
+        id: 'a4', name: 'web_search', detail: 'https://example.com/x',
+        status: 'done', order: 3));
+    expect(msg.artifactPaths, ['reports/summary.md']);
+  });
 }

@@ -259,6 +259,20 @@ class ChatMessage {
   /// Attachments that can be rendered inline (http(s) urls only).
   List<String> get viewableMedia =>
       media.where((m) => m.startsWith('http')).toList();
+
+  /// Distinct file paths this turn wrote/edited (derived from activity
+  /// steps), so the UI can offer them as downloadable artifacts while the
+  /// turn streams and after it completes.
+  List<String> get artifactPaths {
+    final out = <String>[];
+    for (final s in activity) {
+      if (s.iconKey != 'write') continue;
+      final p = s.detail.trim();
+      if (p.isEmpty || p.endsWith('…')) continue; // truncated arg, not a path
+      if (!out.contains(p)) out.add(p);
+    }
+    return out;
+  }
 }
 
 class SessionSummary {

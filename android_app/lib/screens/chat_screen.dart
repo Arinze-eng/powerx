@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:mime/mime.dart' as mime_lib;
 import 'package:open_filex/open_filex.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
@@ -43,6 +44,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Timer? _flushTimer;
 
   ChatMessage? _liveTurn; // assistant bubble for the current (or resumed) turn
+
+  // Watchdog state: tracks the last event seen while a turn is running so a
+  // dead socket / missed terminal event can never leave the green "working…"
+  // indicator rolling forever after the task already finished.
+  DateTime _lastEventAt = DateTime.now();
+  Timer? _silenceTimer;
+  Timer? _stopFallbackTimer;
+  bool _justCompleted = false; // shows the settled "done" check in the pill
+  Timer? _completedFadeTimer;
+
+  /// Max total event silence tolerated while a turn is running before the
+  /// busy state is force-cleared. Generous: real long tasks keep streaming
+  /// deltas/tool hints, so only a genuinely dead stream hits this.
+  static const Duration _silenceTimeout = Duration(seconds: 90);
 
   bool get _busy => _sending || _remoteRunning;
 
@@ -90,6 +105,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           _messages.removeWhere((m) =>
               m.role == Role.assistant && m.turnId == history.activeTurnId);
           _remoteRunning = true;
+          _lastEventAt = DateTime.now();
         }
       } catch (_) {}
       if (mounted) setState(() => _loadingHistory = false);
@@ -113,6 +129,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void _wireSocket(NanobotSocket sock) {
     sock.onGoalStatus = (chatId, status) {
       if (!mounted || chatId != _chatId) return;
+      _touchActivity();
       final running = status == 'running';
       setState(() => _remoteRunning = running);
       if (running) _ensureLiveTurn(); // replayed running turn → open bubble
@@ -159,11 +176,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (chatId == null || _socket == null) return;
     _view = ChatView(
       onDelta: (chunk) {
+        _touchActivity();
         _ensureLiveTurn().appendDelta(chunk);
         _scheduleFlush();
         _scrollToBottom();
       },
       onReasoningDelta: (chunk) {
+        _touchActivity();
         final t = _ensureLiveTurn();
         t.reasoning += chunk;
         t.reasoningStreaming = true;
@@ -176,6 +195,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         if (mounted) setState(() {});
       },
       onStreamEnd: (finalText) {
+        _touchActivity();
         final t = _liveTurn;
         if (t != null) {
           t.endSegment(finalText);
@@ -185,6 +205,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         _scrollToBottom();
       },
       onActivity: (steps) {
+        _touchActivity();
         final t = _ensureLiveTurn();
         for (final s in steps) {
           _upsertStep(t, s);
@@ -193,6 +214,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         _scrollToBottom();
       },
       onFinalMessage: (text, media) {
+        _touchActivity();
         // Authoritative complete answer. Absorb into the live turn if one
         // exists, else surface as a standalone bubble (e.g. the "/stop"
         // acknowledgement that arrives after goal_status idle).
@@ -220,31 +242,41 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         if (mounted) setState(() {});
       },
       onTurnEnd: (summary) {
+        _touchActivity();
+        // Terminal for the turn: ALWAYS terminate the busy state, even when
+        // no live bubble exists (e.g. the turn ran while the screen was
+        // closed). Skipping this is what let the green indicator keep
+        // rolling after the task already completed.
         final t = _liveTurn;
-        if (t == null) return;
-        t.streaming = false;
-        t.reasoningStreaming = false;
-        t.dropEmptyTrailingSegment();
-        t.usage = summary.usage ?? t.usage;
-        t.latencyMs = summary.latencyMs ?? t.latencyMs;
-        if (summary.media.isNotEmpty) {
-          t.media = {...t.media, ...summary.media}.toList();
+        if (t != null) {
+          t.streaming = false;
+          t.reasoningStreaming = false;
+          t.dropEmptyTrailingSegment();
+          t.usage = summary.usage ?? t.usage;
+          t.latencyMs = summary.latencyMs ?? t.latencyMs;
+          if (summary.media.isNotEmpty) {
+            t.media = {...t.media, ...summary.media}.toList();
+          }
+          for (final s in t.activity) {
+            if (!s.isDone) s.status = 'done';
+          }
+          _liveTurn = null;
         }
-        for (final s in t.activity) {
-          if (!s.isDone) s.status = 'done';
-        }
-        _liveTurn = null;
+        _cancelStopFallback();
         if (mounted) {
           setState(() {
             _sending = false;
             _stopping = false;
             _remoteRunning = false;
+            _lastEventAt = DateTime.now();
           });
           _updateWakelock();
+          _flashCompleted();
           _scrollToBottom();
         }
       },
       onError: (detail) {
+        _touchActivity();
         final t = _ensureLiveTurn();
         t.streaming = false;
         t.hasError = true;
@@ -313,8 +345,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void _updateWakelock() {
     if (_busy) {
       WakelockPlus.enable();
+      _startWatchdog();
     } else {
       WakelockPlus.disable();
+      _stopWatchdog();
     }
   }
 
@@ -325,6 +359,77 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _flushTimer = null;
       if (mounted) setState(() {});
     });
+  }
+
+  // ---- Turn watchdog ------------------------------------------------------
+
+  void _touchActivity() {
+    _lastEventAt = DateTime.now();
+  }
+
+  /// While a turn is running, watch for total event silence. If nothing at
+  /// all arrives (dead socket, missed terminal event, background kill) within
+  /// [_silenceTimeout], force-clear the busy state so the green indicator can
+  /// never roll forever after the task is done.
+  void _startWatchdog() {
+    _silenceTimer ??= Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!mounted || !_busy) {
+        _stopWatchdog();
+        return;
+      }
+      final idle = DateTime.now().difference(_lastEventAt);
+      if (idle >= _silenceTimeout) {
+        _forceClearRunning(reason: 'Stream went quiet — task stopped watching.');
+      }
+    });
+  }
+
+  void _stopWatchdog() {
+    _silenceTimer?.cancel();
+    _silenceTimer = null;
+  }
+
+  /// Authoritatively clears the busy state even when no turn_end / goal_status
+  /// idle event arrived (silence timeout, missed event after stop, dead socket).
+  void _forceClearRunning({String? reason}) {
+    if (!mounted) return;
+    final hadLive = _liveTurn != null;
+    final t = _liveTurn;
+    if (t != null) {
+      t.streaming = false;
+      t.reasoningStreaming = false;
+      for (final s in t.activity) {
+        if (!s.isDone) s.status = 'done';
+      }
+      _liveTurn = null;
+    }
+    _cancelStopFallback();
+    _stopWatchdog();
+    setState(() {
+      _sending = false;
+      _stopping = false;
+      _remoteRunning = false;
+      _lastEventAt = DateTime.now();
+    });
+    _updateWakelock();
+    if (hadLive) _scrollToBottom();
+    if (reason != null) _toast(reason);
+  }
+
+  /// Settle the status pill on a STATIC green check after a turn completes.
+  /// It fades away after a few seconds — it never keeps spinning.
+  void _flashCompleted() {
+    _completedFadeTimer?.cancel();
+    if (!mounted) return;
+    setState(() => _justCompleted = true);
+    _completedFadeTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted) setState(() => _justCompleted = false);
+    });
+  }
+
+  void _cancelStopFallback() {
+    _stopFallbackTimer?.cancel();
+    _stopFallbackTimer = null;
   }
 
   // ---- File / image attachment -----------------------------------------
@@ -435,14 +540,64 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void _stop() {
     final chatId = _chatId;
     if (chatId == null || _socket == null || !_busy) return;
+    _touchActivity();
     setState(() => _stopping = true);
     _socket!.stopTask(chatId);
+    // If the server never confirms the cancellation (dead socket, missed
+    // event), clear the busy state locally after a short grace period so the
+    // user is never locked out by a rolling indicator.
+    _cancelStopFallback();
+    _stopFallbackTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted && _busy) {
+        _forceClearRunning(reason: 'Task cancelled.');
+      }
+    });
   }
 
   void _fail(String msg) {
     if (!mounted) return;
     setState(() => _sending = false);
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  /// Resolve the gateway session key for this chat (needed for file access).
+  String? _sessionKeyForChat(AppState state) {
+    final opened = widget.session;
+    if (opened != null && opened.chatId == _chatId) return opened.key;
+    for (final s in state.sessions) {
+      if (s.chatId == _chatId) return s.key;
+    }
+    return null;
+  }
+
+  /// Download a file the assistant created during this turn and hand it to
+  /// the OS viewer. The file lives in the chat's workspace on the gateway;
+  /// its (text) content is fetched through the authenticated file-preview
+  /// endpoint. Binary/large files report a clear failure instead of failing
+  /// silently.
+  Future<void> _openArtifact(String path) async {
+    final state = context.read<AppState>();
+    final key = _sessionKeyForChat(state);
+    if (key == null || state.apiToken == null) {
+      _toast('Reopen this chat from Sessions to download its files.');
+      return;
+    }
+    try {
+      final payload = await state.api.fetchFilePreview(state.apiToken!, key,
+          path: path, supabaseToken: state.accessToken);
+      final content = payload['content'];
+      if (content is! String || content.isEmpty) {
+        throw StateError('file not previewable (binary or too large)');
+      }
+      final name = path.split('/').last;
+      final dir = await getTemporaryDirectory();
+      final file = File(
+          '${dir.path}/${DateTime.now().millisecondsSinceEpoch}-$name');
+      await file.writeAsString(content, flush: true);
+      await OpenFilex.open(file.path);
+    } catch (e) {
+      _toast('Could not download "$path": $e');
+    }
   }
 
   void _toast(String msg) {
@@ -453,6 +608,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     _flushTimer?.cancel();
+    _silenceTimer?.cancel();
+    _stopFallbackTimer?.cancel();
+    _completedFadeTimer?.cancel();
     WakelockPlus.disable();
     WidgetsBinding.instance.removeObserver(this);
     final chatId = _chatId;
@@ -473,32 +631,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           alignment: Alignment.center,
           children: [
             const Text(PowerXConfig.appName, style: TextStyle(fontWeight: FontWeight.w800)),
-            if (_busy)
-              Positioned(
-                right: 0,
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF1A2138),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const SizedBox(
-                          width: 10,
-                          height: 10,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 1.6, color: Color(0xFF66BB6A))),
-                      const SizedBox(width: 6),
-                      Text(_stopping ? 'stopping…' : 'working…',
-                          style: const TextStyle(
-                              fontSize: 11, color: Colors.white70)),
-                    ],
-                  ),
-                ),
-              ),
+            // Fixed-size status slot: occupies the same space whether it is
+            // showing the working spinner, the settled done check, or nothing,
+            // so the title never shifts and the pill never bounces.
+            Positioned(
+              right: 0,
+              child: _StatusPill(
+                  busy: _busy, stopping: _stopping, completed: _justCompleted),
+            ),
           ],
         ),
         centerTitle: true,
@@ -528,7 +668,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     controller: _scroll,
                     padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
                     itemCount: _messages.length,
-                    itemBuilder: (_, i) => _Bubble(message: _messages[i]),
+                    itemBuilder: (_, i) => _Bubble(
+                        message: _messages[i],
+                        onOpenArtifact: (p) => _openArtifact(p)),
                   ),
           ),
           _Composer(
@@ -548,8 +690,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 }
 
 class _Bubble extends StatelessWidget {
-  const _Bubble({required this.message});
+  const _Bubble({required this.message, this.onOpenArtifact});
   final ChatMessage message;
+  final void Function(String path)? onOpenArtifact;
 
   @override
   Widget build(BuildContext context) {
@@ -603,6 +746,13 @@ class _Bubble extends StatelessWidget {
                   if (message.activity.isNotEmpty)
                     _ActivityPanel(
                         steps: message.activity, turnStreaming: message.streaming),
+                  if (message.artifactPaths.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: _FileChips(
+                          paths: message.artifactPaths,
+                          onOpen: onOpenArtifact),
+                    ),
                   if (message.reasoning.trim().isNotEmpty)
                     _ThinkingPanel(
                         reasoning: message.reasoning,
@@ -1175,5 +1325,119 @@ class _PendingTile extends StatelessWidget {
   String _shortName(String n) {
     if (n.length <= 8) return n;
     return '${n.substring(0, 5)}…';
+  }
+}
+
+/// Fixed-size app-bar status slot. It occupies the same space whether it is
+/// showing the working spinner, the settled done check, or nothing, so the
+/// title never shifts and the indicator never bounces. The completion state
+/// is a STATIC check — it settles instead of continuing to spin.
+class _StatusPill extends StatelessWidget {
+  const _StatusPill({
+    required this.busy,
+    required this.stopping,
+    required this.completed,
+  });
+
+  final bool busy;
+  final bool stopping;
+  final bool completed;
+
+  @override
+  Widget build(BuildContext context) {
+    Widget? content;
+    if (busy) {
+      content = _pill(
+        const SizedBox(
+            width: 10,
+            height: 10,
+            child: CircularProgressIndicator(
+                strokeWidth: 1.6, color: Color(0xFF66BB6A))),
+        stopping ? 'stopping…' : 'working…',
+      );
+    } else if (completed) {
+      // Static, non-animating confirmation that the task completed.
+      content = _pill(
+        const Icon(Icons.check_circle, size: 13, color: Color(0xFF66BB6A)),
+        'done',
+      );
+    }
+    return SizedBox(
+      width: 104,
+      height: 24,
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 200),
+        child: content ?? const SizedBox.shrink(key: ValueKey('empty')),
+      ),
+    );
+  }
+
+  Widget _pill(Widget leading, String label) {
+    return Container(
+      key: ValueKey(label),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A2138),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        leading,
+        const SizedBox(width: 6),
+        Text(label,
+            style: const TextStyle(fontSize: 11, color: Colors.white70)),
+      ]),
+    );
+  }
+}
+
+/// File artifacts the assistant created during the turn, shown as chips with
+/// a download affordance. Tapping one fetches the file through the gateway
+/// and hands it to the OS viewer.
+class _FileChips extends StatelessWidget {
+  const _FileChips({required this.paths, required this.onOpen});
+  final List<String> paths;
+  final void Function(String path)? onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 6,
+      runSpacing: 6,
+      children: [
+        for (final p in paths)
+          InkWell(
+            borderRadius: BorderRadius.circular(8),
+            onTap: onOpen == null ? null : () => onOpen!(p),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.35),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.white12),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.insert_drive_file_outlined,
+                      size: 14, color: Color(0xFF66BB6A)),
+                  const SizedBox(width: 5),
+                  Text(_fileBaseName(p),
+                      style:
+                          const TextStyle(color: Colors.white, fontSize: 12)),
+                  const SizedBox(width: 4),
+                  const Icon(Icons.download_rounded,
+                      size: 14, color: Colors.white54),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  static String _fileBaseName(String path) {
+    final clean = path.split('?').first;
+    final segs = clean.split('/');
+    return segs.last.isEmpty ? clean : segs.last;
   }
 }

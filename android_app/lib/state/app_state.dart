@@ -51,6 +51,9 @@ class AppState extends ChangeNotifier {
 
   // Gateway bootstrap material
   String? _apiToken;
+
+  /// Gateway REST token (used for authenticated file downloads from chat).
+  String? get apiToken => _apiToken;
   String? _wsToken;
   String? _wsPath;
   DateTime? _tokenExpiresAt;

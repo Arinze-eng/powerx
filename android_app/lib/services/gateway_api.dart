@@ -167,6 +167,26 @@ class GatewayApi {
       throw ApiException(res.statusCode, 'Could not delete conversation');
     }
   }
+
+  /// Fetch a text preview of a workspace file created during a chat
+  /// (gateway file-preview endpoint, same auth as the session APIs).
+  Future<Map<String, dynamic>> fetchFilePreview(String apiToken, String key,
+      {required String path, String? supabaseToken}) async {
+    final url =
+        '$origin/api/sessions/${Uri.encodeComponent(key)}/file-preview?path=${Uri.encodeQueryComponent(path)}';
+    final res = await _client.get(
+      Uri.parse(url),
+      headers: {
+        'Authorization': 'Bearer $apiToken',
+        'Cache-Control': 'no-store',
+        if (supabaseToken != null) 'X-Nanobot-Auth': supabaseToken,
+      },
+    );
+    if (res.statusCode != 200) {
+      throw ApiException(res.statusCode, 'Could not download file');
+    }
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
 }
 
 /// Direct device -> onlyfiles.com uploads for non-image attachments, mirroring

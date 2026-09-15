@@ -365,7 +365,15 @@ class NanobotSocket {
       {required Map<String, num>? usage, required int? latencyMs}) {
     if (chatId == null) return;
     if (!_activeTurns.remove(chatId)) {
-      // turn_end arriving twice / idle without a live turn: ignore.
+      // Terminal event for a turn we did not think was active. Two cases:
+      // (a) duplicate/late terminal event — already finalized, ignore;
+      // (b) the attach replay of goal_status idle for a turn that finished
+      // between the history fetch and the subscribe. In (b) the UI armed its
+      // busy indicator from that stale history snapshot, so still terminate
+      // it exactly once — otherwise the green indicator rolls forever.
+      if (_finalizedTurns.contains(chatId)) return;
+      _finalizedTurns.add(chatId);
+      _view(chatId)?.onTurnEnd(TurnSummary(usage: usage, latencyMs: latencyMs));
       return;
     }
     _finalizedTurns.add(chatId);
