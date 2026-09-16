@@ -10,6 +10,7 @@ Also houses shared HTTP utility functions used by both this module and
 from __future__ import annotations
 
 import asyncio
+import binascii
 import json
 import mimetypes
 import os
@@ -21,6 +22,11 @@ from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from loguru import logger
+from nanobot.utils.onlyfiles import resolve_raw_url
+from nanobot.webui.media_api import (
+    b64url_decode,
+    verify_onlyfiles_resolver_sig,
+)
 from websockets.datastructures import Headers
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
@@ -601,7 +607,7 @@ class GatewayHTTPHandler:
             return response
 
         # Media routes
-        response = self._dispatch_media_routes(request, got)
+        response = await self._dispatch_media_routes(request, got)
         if response is not None:
             return response
 
@@ -1325,11 +1331,45 @@ class GatewayHTTPHandler:
 
     # -- Media routes -------------------------------------------------------
 
-    def _dispatch_media_routes(self, request: WsRequest, got: str) -> Response | None:
+    async def _dispatch_media_routes(self, request: WsRequest, got: str) -> Response | None:
         m = re.match(r"^/api/media/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)$", got)
         if m:
             return self._handle_media_fetch(m.group(1), m.group(2), request)
+        # Signed onlyfiles resolve-and-download: chat links and transcript chips
+        # point here instead of at an onlyfiles page URL, because a raw /dl/
+        # token expires and a page URL opens an HTML viewer. This mints a fresh
+        # raw link at TAP time and 302s the browser straight at the bytes, so the
+        # download starts immediately on any browser with no viewer page.
+        m = re.match(r"^/api/dl/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)$", got)
+        if m:
+            return await self._handle_onlyfiles_resolve(m.group(1), m.group(2))
         return None
+
+    async def _handle_onlyfiles_resolve(self, sig: str, payload: str) -> Response:
+        """Redirect a signed onlyfiles link to a freshly minted raw download."""
+        secret = getattr(self.media, "secret", None)
+        if not secret or not verify_onlyfiles_resolver_sig(sig, payload, secret=secret):
+            return _http_error(403, "invalid signature")
+        try:
+            url = b64url_decode(payload).decode("utf-8")
+        except (ValueError, binascii.Error, UnicodeDecodeError):
+            return _http_error(400, "invalid payload")
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc.lower() != "onlyfiles.com"
+            or not parsed.path
+        ):
+            return _http_error(400, "unsupported url")
+        raw = await resolve_raw_url(url)
+        if not raw or urlsplit(raw).netloc.lower() != "onlyfiles.com":
+            return _http_error(502, "could not resolve download link")
+        return _http_response(
+            b"",
+            status=302,
+            content_type="text/plain; charset=utf-8",
+            extra_headers=[("Location", raw), ("Cache-Control", "no-store")],
+        )
 
     def _handle_media_fetch(
         self, sig: str, payload: str, request: WsRequest | None = None

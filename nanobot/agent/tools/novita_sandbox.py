@@ -1678,13 +1678,14 @@ class NovitaSandboxTool(Tool):
                 except (FileShareError, OnlyFilesError) as exc:
                     return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
                 host_label = shared.get("host", "onlyfiles")
-                expiry_note = (
-                    "expires soon" if host_label == "onlyfiles" else "stored permanently"
-                )
+                direct = shared.get("download_url") or shared["url"]
+                fallback = shared.get("page_url") or shared["url"]
                 return (
                     f"Downloaded remote artifact to local path: {downloaded}\n"
-                    f"A public download link ({host_label}) is available and {expiry_note}:\n"
-                    f"{shared['url']}\n"
+                    f"Direct-download link ({host_label}) - tap opens the download immediately:\n"
+                    f"{direct}\n"
+                    f"Permanent page link (fallback if the direct link ever stops working):\n"
+                    f"{fallback}\n"
                     "Give the user this link and do NOT paste the file contents into "
                     "your reply. The file may also be attached directly via the "
                     "message tool's media parameter when direct attachment delivery "
@@ -1948,13 +1949,14 @@ class NovitaSandboxTool(Tool):
                     except (FileShareError, OnlyFilesError) as exc:
                         return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
                     host_label = shared.get("host", "onlyfiles")
-                    expiry_note = (
-                        "expires soon" if host_label == "onlyfiles" else "stored permanently"
-                    )
+                    direct = shared.get("download_url") or shared["url"]
+                    fallback = shared.get("page_url") or shared["url"]
                     return (
                         f"Downloaded remote artifact to local path: {downloaded}\n"
-                        f"A public download link ({host_label}) is available and {expiry_note}:\n"
-                        f"{shared['url']}\n"
+                        f"Direct-download link ({host_label}) - tap opens the download immediately:\n"
+                        f"{direct}\n"
+                        f"Permanent page link (fallback if the direct link ever stops working):\n"
+                        f"{fallback}\n"
                         "Give the user this link and do NOT paste the file contents into "
                         "your reply. The file may also be attached directly via the "
                         "message tool's media parameter when direct attachment delivery "
@@ -2124,13 +2126,14 @@ class NovitaSandboxTool(Tool):
                     except (FileShareError, OnlyFilesError) as exc:
                         return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
                     host_label = shared.get("host", "onlyfiles")
-                    expiry_note = (
-                        "expires soon" if host_label == "onlyfiles" else "stored permanently"
-                    )
+                    direct = shared.get("download_url") or shared["url"]
+                    fallback = shared.get("page_url") or shared["url"]
                     return (
                         f"Downloaded remote artifact to local path: {downloaded}\n"
-                        f"A public download link ({host_label}) is available and {expiry_note}:\n"
-                        f"{shared['url']}\n"
+                        f"Direct-download link ({host_label}) - tap opens the download immediately:\n"
+                        f"{direct}\n"
+                        f"Permanent page link (fallback if the direct link ever stops working):\n"
+                        f"{fallback}\n"
                         "Give the user this link and do NOT paste the file contents into "
                         "your reply. The file may also be attached directly via the "
                         "message tool's media parameter when direct attachment delivery "
@@ -2411,13 +2414,14 @@ class NovitaSandboxTool(Tool):
                     except (FileShareError, OnlyFilesError) as exc:
                         return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
                     host_label = shared.get("host", "onlyfiles")
-                    expiry_note = (
-                        "expires soon" if host_label == "onlyfiles" else "stored permanently"
-                    )
+                    direct = shared.get("download_url") or shared["url"]
+                    fallback = shared.get("page_url") or shared["url"]
                     return (
                         f"Downloaded remote artifact to local path: {downloaded}\n"
-                        f"A public download link ({host_label}) is available and {expiry_note}:\n"
-                        f"{shared['url']}\n"
+                        f"Direct-download link ({host_label}) - tap opens the download immediately:\n"
+                        f"{direct}\n"
+                        f"Permanent page link (fallback if the direct link ever stops working):\n"
+                        f"{fallback}\n"
                         "Give the user this link and do NOT paste the file contents into "
                         "your reply. The file may also be attached directly via the "
                         "message tool's media parameter when direct attachment delivery "

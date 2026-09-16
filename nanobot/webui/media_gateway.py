@@ -17,7 +17,9 @@ from nanobot.webui.attachment_ingress import (
 )
 from nanobot.webui.ingress_policy import AttachmentIngressLimits
 from nanobot.webui.media_api import (
+    rewrite_onlyfiles_markdown_links,
     serve_signed_media,
+    sign_onlyfiles_resolver_url,
     sign_or_stage_media_path,
     signed_media_attachments,
 )
@@ -84,16 +86,23 @@ class WebUIMediaGateway:
         *,
         workspace_path: Path | None = None,
     ) -> str:
-        return rewrite_local_markdown_images(
+        rewritten = rewrite_local_markdown_images(
             text,
             workspace_path=workspace_path or self.workspace_path,
             sign_path=self.sign_or_stage_media_path,
+        )
+        # onlyfiles links (page or raw /dl/ form) expire into HTML viewers or
+        # dead tokens; route them through the signed tap-time resolver instead.
+        return rewrite_onlyfiles_markdown_links(
+            rewritten,
+            sign_onlyfiles=lambda url: sign_onlyfiles_resolver_url(url, secret=self.secret),
         )
 
     def augment_transcript_media(self, paths: list[str]) -> list[dict[str, Any]]:
         return signed_media_attachments(
             paths,
             sign_path=self.sign_or_stage_media_path,
+            sign_onlyfiles=lambda url: sign_onlyfiles_resolver_url(url, secret=self.secret),
         )
 
     def augment_transcript_user_media(self, paths: list[str]) -> list[dict[str, Any]]:

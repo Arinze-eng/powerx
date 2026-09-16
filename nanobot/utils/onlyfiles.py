@@ -23,16 +23,21 @@ return contract the rest of the codebase already expects:
       }
     }
 
-The page URL (``url.full``) is the canonical public link. onlyfiles has no clean
-raw-bytes download route for slug ids (its ``/download`` endpoint redirects back
-to the HTML page), so ``download_url`` equals the page URL — mirroring how the old
-code treated opaque-slug tmpfiles links.
+The page URL (``url.full``) is the canonical, PERMANENT public link (uploads use
+``expire=0``), but it serves an HTML viewer — tapping it opens a web page, not a
+download. The raw bytes live under ``/dl/<ts.nonce>/<id>/<file>``, with the
+nonce embedded in the viewer HTML, and that raw token EXPIRES after roughly two
+hours (verified against the live service). So: ``download_url`` is a freshly
+minted raw link that downloads on tap right now, ``url`` is the permanent page
+link to store/share, and :func:`resolve_raw_url` re-mints a raw link at the
+moment of delivery — never persist a raw link.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -44,6 +49,9 @@ from loguru import logger
 from nanobot.config.paths import get_persistent_data_dir
 
 ONLYFILES_UPLOAD_URL = "https://api.onlyfiles.com/v1/upload"
+# Raw bytes live under /dl/<ts.nonce>/<id>/<file>; the token is embedded in the
+# viewer page HTML for the slug URL.
+_ONLYFILES_DL_RE = re.compile(r"/dl/[^\s\"'>]+")
 ONLYFILES_FILE_INFO_URL = "https://api.onlyfiles.com/v1/file/{id}/info"
 ONLYFILES_HOST = "onlyfiles.com"
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # onlyfiles hard limit (~100 MiB)
@@ -80,6 +88,40 @@ def _extract_page_url(payload: dict[str, Any]) -> str:
     # Prefer the full (filename-bearing) link; fall back to the short id link.
     page_url = _public_url(urls.get("full") or urls.get("short"))
     return page_url
+
+
+async def resolve_raw_url(page_url: str, *, timeout_seconds: int = 15) -> str:
+    """Return a raw ``/dl/`` link that serves the file bytes for ``page_url``.
+
+    The ``/dl/`` token is minted per page view and EXPIRES (verified: links minted
+    two hours earlier stop serving bytes), so a raw link must never be stored and
+    handed out later — resolve fresh at the moment of delivery/tap instead.
+
+    A ``/dl/`` URL is re-resolved through its permanent page form, since an
+    expired raw token would otherwise be handed straight back. Returns the input
+    unchanged when it is not a resolvable onlyfiles URL or the fetch fails, so
+    callers always have a safe fallback.
+    """
+    raw = str(page_url or "").strip()
+    parsed = urlparse(raw)
+    if parsed.scheme != "https" or parsed.netloc != ONLYFILES_HOST or not parsed.path:
+        return page_url
+    parts = parsed.path.split("/")
+    if parts[:2] == ["", "dl"]:
+        # /dl/<ts.nonce>/<id>/<file> -> the permanent page form /<id>/<file>.
+        if len(parts) < 4:
+            return page_url
+        raw = f"https://{ONLYFILES_HOST}/" + "/".join(parts[2:])
+    try:
+        timeout = aiohttp.ClientTimeout(total=max(5, min(int(timeout_seconds), 30)))
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(raw, headers={"User-Agent": "Mozilla/5.0"}) as page:
+                if page.status != 200:
+                    return raw
+                match = _ONLYFILES_DL_RE.search(await page.text())
+    except Exception:  # noqa: BLE001 - best-effort; the page URL is the fallback
+        return raw
+    return f"https://{ONLYFILES_HOST}{match.group(0)}" if match is not None else raw
 
 
 def _extract_error(payload: dict[str, Any]) -> str | None:
@@ -139,8 +181,10 @@ async def upload_bytes(
         detail = _extract_error(payload) if isinstance(payload, dict) else None
         raise OnlyFilesError(detail or "onlyfiles did not accept the upload")
     page_url = _extract_page_url(payload)
-    # No separate raw-download route exists for slug links; the page URL is the link.
-    return {"url": page_url, "download_url": page_url}
+    # Mint a raw /dl/ link now so an immediate hand-off downloads on tap. The
+    # token expires, so a link delivered later must be re-resolved with
+    # ``resolve_raw_url`` rather than persisting this raw form.
+    return {"url": page_url, "download_url": await resolve_raw_url(page_url)}
 
 
 async def file_info(file_id: str, *, timeout_seconds: int = 20) -> dict[str, Any] | None:
@@ -287,7 +331,13 @@ async def upload_and_remember(
     remembered = memory.lookup(data)
     if remembered:
         logger.info("onlyfiles: reusing stored URL for {}", source.name)
-        return remembered
+        # The page URL is permanent but its raw /dl/ token expires, so mint a
+        # fresh download link rather than handing back a stale one.
+        stored_page = remembered.get("url") or ""
+        return {
+            "url": stored_page,
+            "download_url": await resolve_raw_url(stored_page),
+        }
     result = await upload_path(
         path,
         content_type=content_type,

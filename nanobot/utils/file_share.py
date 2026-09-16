@@ -4,7 +4,8 @@ When the agent produces a file (PDF, image, archive, dataset…) the user needs 
 link they can actually open — not a raw path inside an ephemeral sandbox. Different
 free hosts fit different sizes:
 
-* ``onlyfiles.com`` — fast, tiny API, hard-caps at ~100 MiB and links expire.
+* ``onlyfiles.com`` — fast, tiny API, hard-caps at ~100 MiB; the page URL is
+  permanent (uploads use expire=0) while raw /dl/ tokens are re-minted at tap time.
 * ``catbox.moe``    — accepts up to ~200 MiB and stores files permanently.
 
 This module picks the right host from the file size, uploads once, and returns a

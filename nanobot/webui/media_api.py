@@ -170,19 +170,100 @@ def media_attachment_kind(name: str) -> str:
     return "file"
 
 
+def sign_onlyfiles_resolver_url(
+    url: str,
+    *,
+    secret: bytes,
+) -> str | None:
+    """Return a signed ``/api/dl/<sig>/<payload>`` resolve-and-download URL.
+
+    The permanent onlyfiles page URL is HMAC-signed the same way local media
+    paths are; the route re-mints a fresh raw ``/dl/`` link at tap time because
+    raw tokens expire. ``None`` when ``url`` is not an onlyfiles.com URL.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.netloc.lower() != "onlyfiles.com" or not parsed.path:
+        return None
+    payload = b64url_encode(url.encode("utf-8"))
+    mac = hmac.new(secret, payload.encode("ascii"), hashlib.sha256).digest()[:16]
+    return f"/api/dl/{b64url_encode(mac)}/{payload}"
+
+
+def verify_onlyfiles_resolver_sig(sig: str, payload: str, *, secret: bytes) -> bool:
+    """Check the HMAC on a signed ``/api/dl/`` resolver URL."""
+    try:
+        provided = b64url_decode(sig)
+    except (ValueError, binascii.Error):
+        return False
+    expected = hmac.new(secret, payload.encode("ascii"), hashlib.sha256).digest()[:16]
+    return hmac.compare_digest(expected, provided)
+
+
+# Two shapes carry an onlyfiles URL into chat text:
+#   1. a markdown inline link/image target  ``](https://onlyfiles.com/...)``
+#   2. a bare URL written as plain text     ``https://onlyfiles.com/...``
+# Shape 1 keeps its label and only swaps the target; shape 2 is wrapped in a
+# markdown link whose label is the original URL so the visible text is unchanged.
+# The raw ``/dl/`` form is matched too because agents sometimes repeat the raw
+# link they were given at ingress — and those tokens expire.
+_ONLYFILES_LINK_TARGET_RE = re.compile(
+    r"\]\((?P<url>https://onlyfiles\.com/[^\s)<>\"']+)\)"
+)
+_ONLYFILES_BARE_URL_RE = re.compile(
+    r"(?<!\]\()(?P<url>https://onlyfiles\.com/[^\s)<>\"']+)(?!\))"
+)
+
+
+def rewrite_onlyfiles_markdown_links(
+    text: str,
+    *,
+    sign_onlyfiles: Callable[[str], str | None],
+) -> str:
+    """Route every onlyfiles.com link in agent text through the resolver.
+
+    Raw ``/dl/`` links embedded in replies expire, and page links open an HTML
+    viewer — so both are swapped for the signed ``/api/dl/`` form, which
+    re-mints a fresh raw link at tap time and 302s the browser straight to the
+    bytes. Bare URLs are wrapped in a markdown link so they stay clickable with
+    the original URL as the visible label. Non-onlyfiles text passes through
+    untouched.
+    """
+    if "onlyfiles.com" not in text:
+        return text
+
+    def swap_target(match: re.Match[str]) -> str:
+        signed = sign_onlyfiles(match.group("url"))
+        return f"]({signed})" if signed else match.group(0)
+
+    def wrap_bare(match: re.Match[str]) -> str:
+        url = match.group("url")
+        signed = sign_onlyfiles(url)
+        return f"[{url}]({signed})" if signed else url
+
+    text = _ONLYFILES_LINK_TARGET_RE.sub(swap_target, text)
+    return _ONLYFILES_BARE_URL_RE.sub(wrap_bare, text)
+
+
 def signed_media_attachments(
     paths: list[str],
     *,
     sign_path: SignedMediaPath,
+    sign_onlyfiles: Callable[[str], str | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Map persisted media paths to WebUI attachment dicts with fresh signed URLs."""
     out: list[dict[str, Any]] = []
     for pstr in paths:
         # Browser-uploaded file attachments reference onlyfiles.com directly;
-        # they are not local files and need no signing — pass the URL through.
+        # they are not local files. The page URL serves an HTML viewer, so route
+        # the chip through the signed resolver to download raw bytes on tap.
         if pstr.startswith("https://onlyfiles.com/"):
             name = Path(urlparse(pstr).path).name or "file"
-            out.append({"kind": media_attachment_kind(name), "url": pstr, "name": name})
+            url = pstr
+            if sign_onlyfiles is not None:
+                signed = sign_onlyfiles(pstr)
+                if signed:
+                    url = signed
+            out.append({"kind": media_attachment_kind(name), "url": url, "name": name})
             continue
         path = Path(pstr)
         att = sign_path(path)
