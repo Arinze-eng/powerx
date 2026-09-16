@@ -85,13 +85,34 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState s) {
     if (s == AppLifecycleState.resumed) {
-      // The socket auto-reconnects; make sure the token is hot and re-pull
-      // the turn state so a backgrounded task resumes streaming here.
+      // Android suspends the isolate while backgrounded, which commonly leaves
+      // a HALF-OPEN socket: isConnected still reports true but writes vanish
+      // and no error ever arrives — the chat simply looks "paused" forever.
+      // Verify liveness first (forcing a clean reconnect when stale) and then
+      // reconcile with the server.
       final state = context.read<AppState>();
       state.loadSessions();
       state.refreshCredits();
-      unawaited(_resync());
+      unawaited(_recoverOnResume());
     }
+  }
+
+  Future<void> _recoverOnResume() async {
+    final chatId = _chatId;
+    if (chatId == null) return;
+    try {
+      final sock = await context.read<AppState>().ensureSocket();
+      _socket = sock;
+      _wireSocket(sock);
+      // Rebuild the connection when it is stale, then re-subscribe.
+      await sock.checkLiveness();
+      await sock.attach(chatId);
+      if (mounted) setState(() => _connected = sock.isConnected);
+      _registerView();
+    } catch (_) {
+      if (mounted) setState(() => _connected = false);
+    }
+    await _resync();
   }
 
   /// Re-establish the socket + subscription and reconcile the transcript with
@@ -112,7 +133,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       setState(() => _connected = sock.isConnected);
 
       // The gateway does not replay accumulated deltas, so pull the thread to
-      // recover anything produced while this screen was not listening.
+      // recover anything produced while this screen was not listening. This
+      // also clears a stale busy pill when the turn finished in the background.
       final session = widget.session;
       if (session != null) {
         final history = await state.openSession(session);
@@ -396,6 +418,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               text: text,
               turnId: turnId)));
           _scrollToBottom();
+        }
+      },
+      onUsage: (usage) {
+        if (usage == null) return;
+        // Attach replay: seed the running turn's footer so credits/usage stay
+        // visible immediately after a resume.
+        final t = _liveTurn;
+        if (t != null) {
+          t.usage = {...?t.usage, ...usage};
+          if (mounted) setState(() {});
         }
       },
     );

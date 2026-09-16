@@ -20,6 +20,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:powerx_android/models.dart';
+import 'package:powerx_android/services/gateway_api.dart';
 import 'package:powerx_android/services/nanobot_socket.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -53,6 +54,13 @@ class FakeGateway {
   String get wsUrl => 'ws://${_server.address.host}:${_server.port}';
 
   int get port => _server.port;
+
+  /// How many `attach` frames the client sent for [chatId] on this connection.
+  /// Used to prove a reconnect genuinely re-subscribes instead of
+  /// short-circuiting on a stale "already attached" flag.
+  int attachCountFor(String chatId) => inbound
+      .where((f) => f['type'] == 'attach' && f['chat_id'] == chatId)
+      .length;
 
   void _handle(Map<String, dynamic> frame) {
     switch (frame['type']) {
@@ -119,6 +127,7 @@ class Recorder {
   final List<String> finalTexts = [];
   int reasoningEnds = 0;
   final List<String> userMessages = [];
+  final List<Map<String, num>> usages = [];
 
   ChatView view() => ChatView(
         onDelta: (c) => deltas.add(c),
@@ -130,6 +139,9 @@ class Recorder {
         onError: (d) => errors.add(d),
         onUserMessage: (t, id) => userMessages.add(t),
         onFinalMessage: (t, m) => finalTexts.add(t),
+        onUsage: (u) {
+          if (u != null) usages.add(u);
+        },
       );
 }
 
@@ -483,5 +495,131 @@ void main() {
     expect(isProtocolFrame(jsonEncode({'event': 'goal_status'})), isTrue);
     expect(isProtocolFrame(jsonEncode({'event': 'delta', 'text': 'x'})), isFalse);
     expect(isProtocolFrame('not json'), isFalse);
+  });
+
+  test('re-subscribes after a drop so a backgrounded turn resumes', () async {
+    // Regression: the confirmed-attach set used to survive a disconnect, so
+    // attach() short-circuited after a reconnect and the client NEVER
+    // re-subscribed — the server never replayed goal_status: running and the
+    // UI sat frozen ("everything stucks after leaving the app").
+    await sock.connect();
+    // Open an EXISTING conversation (the resume path: ChatScreen.attach).
+    const chatId = 'chat-A';
+    await sock.attach(chatId);
+    final rec = Recorder();
+    sock.listen(chatId, rec.view());
+    await pumpEventQueue();
+    final attachesBefore = gw.attachCountFor(chatId);
+    expect(attachesBefore, greaterThanOrEqualTo(1));
+
+    // Background the app: the socket dies without a clean close.
+    await gw.dropConnection();
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+
+    // Come back to the foreground and re-attach (what _recoverOnResume does).
+    await sock.checkLiveness(maxIdle: Duration.zero);
+    await sock.attach(chatId);
+    await pumpEventQueue();
+
+    // The attach must actually reach the server again...
+    expect(gw.attachCountFor(chatId), greaterThan(attachesBefore),
+        reason: 'reconnect must re-subscribe, not short-circuit');
+
+    // ...and the running turn is replayed, so the task visibly resumes.
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running',
+      'started_at': 1000.0});
+    gw.send({'event': 'delta', 'chat_id': chatId, 'text': 'resumed output'});
+    await pumpEventQueue();
+    expect(rec.deltas, contains('resumed output'));
+  });
+
+  test('attach replay of a finished turn ends the stale busy indicator',
+      () async {
+    // A turn can finish between the history fetch and the subscribe. The
+    // replayed idle must still fire turn_end exactly once so the green pill
+    // never rolls forever.
+    await sock.connect();
+    final chatId = await sock.newChat();
+    final rec = Recorder();
+    sock.listen(chatId, rec.view());
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'idle'});
+    await pumpEventQueue();
+    expect(rec.turnEnds.length, 1);
+
+    // Duplicate terminal events must not re-fire it.
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'idle'});
+    await pumpEventQueue();
+    expect(rec.turnEnds.length, 1);
+  });
+
+  test('delete uses the websocket mutation transport, not plain HTTP',
+      () async {
+    // Regression: the HTTP route answers 405 ("WebUI mutations require an
+    // authenticated WebSocket"), which surfaced as an error when deleting a
+    // chat. Delete must go out as a webui_request envelope.
+    await sock.connect();
+    final future = sock.deleteSession('websocket:chat-1');
+    await pumpEventQueue();
+    final frame = gw.inbound.lastWhere(
+        (f) => f['type'] == 'webui_request' && f['action'] == 'session.delete');
+    expect(frame['payload']['key'], 'websocket:chat-1');
+
+    gw.send({
+      'event': 'webui_response',
+      'request_id': frame['request_id'],
+      'ok': true,
+      'result': {'deleted': true},
+    });
+    final result = await future;
+    expect(result.deleted, isTrue);
+  });
+
+  test('a blocked delete is reported with its automation names', () async {
+    await sock.connect();
+    final future = sock.deleteSession('websocket:chat-2');
+    await pumpEventQueue();
+    final frame = gw.inbound.lastWhere(
+        (f) => f['type'] == 'webui_request' && f['action'] == 'session.delete');
+    gw.send({
+      'event': 'webui_response',
+      'request_id': frame['request_id'],
+      'ok': true,
+      'result': {
+        'deleted': false,
+        'blocked_by_automations': true,
+        'automations': [{'id': 'j1', 'name': 'Daily digest'}],
+      },
+    });
+    final result = await future;
+    expect(result.deleted, isFalse);
+    expect(result.blockedByAutomations, isTrue);
+    expect(result.automations, ['Daily digest']);
+  });
+
+  test('a refused mutation surfaces as an ApiException', () async {
+    await sock.connect();
+    final future = sock.deleteSession('websocket:chat-3');
+    await pumpEventQueue();
+    final frame = gw.inbound.lastWhere(
+        (f) => f['type'] == 'webui_request' && f['action'] == 'session.delete');
+    gw.send({
+      'event': 'webui_response',
+      'request_id': frame['request_id'],
+      'ok': false,
+      'error': {'status': 404, 'message': 'session not found'},
+    });
+    await expectLater(
+        future, throwsA(isA<ApiException>().having((e) => e.status, 'status', 404)));
+  });
+
+  test('the client never sends a bare ping frame', () async {
+    // Regression: {"type":"ping"} made the gateway answer
+    // `error: unknown type: 'ping'`, which users saw as an error toast.
+    await sock.connect();
+    final chatId = await sock.newChat();
+    sock.listen(chatId, Recorder().view());
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(gw.inbound.any((f) => f['type'] == 'ping'), isFalse);
+    expect(gw.inbound.every((f) => f['type'] != 'ping'), isTrue);
   });
 }

@@ -3,4 +3,7 @@
     <!-- PowerX brand splash/background — matches Flutter scaffold so there is
          never a white flash before the app paints its first frame. -->
     <color name="powerx_splash">#0B1020</color>
+    <!-- Adaptive launcher icon background: deep blue sampled from the brand
+         mark's gradient so the icon reads correctly on every launcher shape. -->
+    <color name="ic_launcher_background">#1266D6</color>
 </resources>

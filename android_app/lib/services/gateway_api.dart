@@ -216,12 +216,15 @@ class GatewayApi {
 
   /// Delete a session and its transcript from the server.
   ///
-  /// The gateway returns HTTP 200 with `{"deleted": false,
-  /// "blocked_by_automations": true}` when scheduled automations are attached.
-  /// The caller must inspect the payload — treating a 200 as success is what
-  /// made "delete" appear to do nothing while the row bounced back.
+  /// IMPORTANT: the gateway REFUSES plain HTTP mutations on this route and
+  /// answers `405 WebUI mutations require an authenticated WebSocket`
+  /// (see `_is_webui_mutation_path`). That is why "delete" showed an error in
+  /// the app. The supported path is the WebSocket `webui_request` envelope,
+  /// which is what the WebUI itself uses. The socket must therefore be
+  /// connected; [NanobotSocket.deleteSession] performs the real call.
   ///
-  /// [deleteAutomations] force-deletes those attached automations too.
+  /// Kept for callers that have no socket yet: it performs the HTTP attempt so
+  /// the error is explicit rather than silent.
   Future<DeleteSessionResult> deleteSession(
     String apiToken,
     String key, {
@@ -238,6 +241,10 @@ class GatewayApi {
         if (supabaseToken != null) 'X-Nanobot-Auth': supabaseToken,
       },
     );
+    if (res.statusCode == 405) {
+      throw ApiException(
+          405, 'Delete needs the live socket — reconnect and try again.');
+    }
     if (res.statusCode != 200 && res.statusCode != 204) {
       throw ApiException(res.statusCode, 'Could not delete conversation');
     }

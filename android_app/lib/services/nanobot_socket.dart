@@ -8,6 +8,7 @@ import 'package:web_socket_channel/status.dart' as ws_status;
 
 import '../config.dart';
 import '../models.dart';
+import 'gateway_api.dart';
 
 /// Live view callbacks for one chat's turn, mirroring the WebUI's
 /// useNanobotStream semantics. All callbacks run on the UI isolate; the
@@ -32,6 +33,8 @@ class ChatView {
   /// Raw `message` event without kind — authoritative final assistant text
   /// (also used by /stop acknowledgements when no turn is active).
   final void Function(String text, List<String> media) onFinalMessage;
+  /// Usage/credit facts for this chat (attach handshake or turn end).
+  final void Function(Map<String, num>? usage) onUsage;
 
   const ChatView({
     required this.onDelta,
@@ -43,6 +46,7 @@ class ChatView {
     required this.onError,
     required this.onUserMessage,
     required this.onFinalMessage,
+    required this.onUsage,
   });
 }
 
@@ -52,6 +56,20 @@ class TurnSummary {
   final List<String> media;
   final String? turnId;
   const TurnSummary({this.usage, this.latencyMs, this.media = const [], this.turnId});
+}
+
+/// A completed `webui_response` for a socket mutation.
+class _MutationReply {
+  final bool ok;
+  final Map<String, dynamic> result;
+  final int? status;
+  final String? message;
+  const _MutationReply({
+    required this.ok,
+    this.result = const {},
+    this.status,
+    this.message,
+  });
 }
 
 /// Token pair used to (re)establish a connection. [ws] is the gateway WS
@@ -130,8 +148,17 @@ class NanobotSocket {
 
   /// Views (live UI listeners) per attached chat.
   final Map<String, ChatView> _views = {};
-  /// Chat ids attached since connect — re-attached automatically after a
-  /// reconnect so backgrounded turns resume streaming into the same view.
+  /// Chats the UI wants subscribed. Persists across reconnects so a
+  /// backgrounded turn resumes streaming into the same view.
+  final Set<String> _wantedChats = {};
+  /// Chats CONFIRMED subscribed on the CURRENT connection. Cleared whenever
+  /// the socket drops: they are per-connection subscriptions.
+  ///
+  /// This distinction is the fix for "everything stucks after backgrounding":
+  /// previously the confirmed set survived the drop, so the post-reconnect
+  /// `attach()` short-circuited and the client never actually re-subscribed —
+  /// the server never replayed `goal_status: running`, so the UI sat frozen
+  /// with a half-open socket and a dead transcript.
   final Set<String> _attachedChats = {};
   /// Chats with an active turn on the client side.
   final Set<String> _activeTurns = {};
@@ -211,6 +238,9 @@ class NanobotSocket {
     _sub?.cancel();
     _sub = null;
     _channel = null;
+    // Subscriptions are per-connection: forget what was confirmed so the next
+    // attach genuinely re-subscribes and receives the running-turn replay.
+    _attachedChats.clear();
     onConnectionChanged?.call(false);
     _scheduleReconnect();
   }
@@ -227,9 +257,11 @@ class NanobotSocket {
       if (_closedByUser) return;
       try {
         await connect();
-        // Re-attach every chat we had subscribed to. The server replays
-        // goal_status + pending turn events for runs still in flight.
-        for (final cid in _attachedChats.toList()) {
+        // Re-subscribe every chat the UI still cares about. The server replays
+        // goal_status + the running turn's wall clock for runs in flight, which
+        // is what makes a backgrounded task resume instead of staying frozen.
+        for (final cid in _wantedChats.toList()) {
+          _attachedChats.remove(cid);
           _send({'type': 'attach', 'chat_id': cid});
         }
       } catch (_) {
@@ -238,21 +270,62 @@ class NanobotSocket {
     });
   }
 
-  /// Application-level keepalive. Server + proxy may drop an idle socket
-  /// while a long tool call runs with no output; a periodic no-op frame keeps
-  /// both directions warm so the turn never appears to "pause".
+  /// Application-level keepalive.
+  ///
+  /// IMPORTANT: this must NOT send custom frames. The gateway's WS protocol
+  /// only accepts its known envelope types and answers
+  /// `error: unknown type: 'ping'` for anything else — which is exactly the
+  /// "unknown ping" error users saw. Keepalive is handled at the WS protocol
+  /// level by [pingInterval] (control frames are transparent to the server),
+  /// plus a local liveness check that forces a clean reconnect on a zombie
+  /// socket (see [checkLiveness]).
   void _startHeartbeat() {
     _pingTimer?.cancel();
     _pingTimer = Timer.periodic(const Duration(seconds: 25), (_) {
       if (!isConnected) return;
-      _send({'type': 'ping', 'ts': DateTime.now().millisecondsSinceEpoch});
-      // If nothing at all came back for two intervals, the socket is a zombie
-      // (no FIN received): force a clean reconnect so the stream resumes.
+      // The socket claims to be open but nothing has arrived for a long time:
+      // on mobile this is usually a half-open socket after Android suspended
+      // the app (no FIN is ever delivered). Force a reconnect so the turn
+      // resumes instead of the UI appearing frozen.
       if (DateTime.now().difference(_lastInboundAt) >
           const Duration(seconds: 70)) {
         _onDisconnect();
       }
     });
+  }
+
+  /// Verify the socket is genuinely usable, reconnecting if it looks dead.
+  ///
+  /// Called when the app returns to the foreground. Trusting
+  /// [isConnected] alone is unsafe: after a background suspension the TCP
+  /// connection is often half-open, so writes silently vanish and the chat
+  /// looks "paused" with no error at all.
+  Future<bool> checkLiveness({Duration maxIdle = const Duration(seconds: 30)}) async {
+    final ch = _channel;
+    if (ch == null) return false;
+    if (DateTime.now().difference(_lastInboundAt) > maxIdle) {
+      // Stale beyond the idle window → tear down and rebuild from scratch.
+      _stopHeartbeat();
+      await _sub?.cancel();
+      _sub = null;
+      try {
+        ch.sink.close();
+      } catch (_) {}
+      _channel = null;
+      _attachedChats.clear();
+      onConnectionChanged?.call(false);
+      try {
+        await connect();
+        for (final cid in _wantedChats.toList()) {
+          _send({'type': 'attach', 'chat_id': cid});
+        }
+        return isConnected;
+      } catch (_) {
+        _scheduleReconnect();
+        return false;
+      }
+    }
+    return true;
   }
 
   void _stopHeartbeat() {
@@ -319,10 +392,14 @@ class NanobotSocket {
         if (chatId != null) {
           final wasAttached = _attachedChats.contains(chatId);
           _attachedChats.add(chatId);
+          _wantedChats.add(chatId);
           _pendingNewChat.remove(chatId)?.complete(chatId);
           if (!wasAttached) {
             _pendingNewChat.remove('__any__')?.complete(chatId);
           }
+          // Handshake model facts: carries the last known usage for this chat,
+          // so the footer is correct right after a resume.
+          _view(chatId)?.onUsage(_numMap(ev['usage']));
         }
         break;
       case 'delta':
@@ -399,6 +476,9 @@ class NanobotSocket {
       case 'runtime_model_updated':
         final model = ev['model'] as String?;
         if (model != null && model.isNotEmpty) onModelUpdated?.call(model);
+        break;
+      case 'webui_response':
+        _handleWebuiResponse(ev);
         break;
       case 'error':
         final detail = (ev['detail'] ?? 'error') as String;
@@ -566,9 +646,12 @@ class NanobotSocket {
   }
 
   /// Subscribe to an existing chat. Safe to call repeatedly; re-sends the
-  /// frame when the server has not acked it yet (idempotent server-side).
+  /// frame when the server has not acked it on THIS connection (idempotent
+  /// server-side). Re-subscribing after a reconnect is mandatory to receive
+  /// the running-turn replay.
   Future<String> attach(String chatId,
       {Duration timeout = const Duration(seconds: 15)}) async {
+    _wantedChats.add(chatId);
     if (!isConnected) await connect();
     if (_attachedChats.contains(chatId)) return chatId;
     final existing = _pendingNewChat[chatId];
@@ -599,6 +682,7 @@ class NanobotSocket {
   void dropChat(String chatId) {
     _views.remove(chatId);
     _attachedChats.remove(chatId);
+    _wantedChats.remove(chatId);
     _activeTurns.remove(chatId);
     _finalizedTurns.remove(chatId);
     _pendingNewChat.remove(chatId);
@@ -647,6 +731,88 @@ class NanobotSocket {
   /// Whether a turn for [chatId] was active and finalized since [listen].
   bool sawTurnEnd(String chatId) => _finalizedTurns.contains(chatId);
 
+  // ---- WebSocket mutations ----------------------------------------------
+  //
+  // Session deletion and other write actions are NOT reachable over plain
+  // HTTP: the gateway answers 405 and routes them through the authenticated
+  // WebSocket as `{"type":"webui_request","request_id":...,"action":...,
+  // "payload":{...}}`, replying with a `webui_response` corrrelated by
+  // request_id. This mirrors webui/src/lib/api.ts.
+
+  final Map<String, Completer<_MutationReply>> _mutations = {};
+  int _mutationSeq = 0;
+
+  /// Run one allowlisted WebUI mutation over the socket and await its result.
+  Future<Map<String, dynamic>> mutate(
+    String action,
+    Map<String, dynamic> payload, {
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    if (!isConnected) await connect();
+    final requestId = 'apk-${DateTime.now().microsecondsSinceEpoch}-${_mutationSeq++}';
+    final completer = Completer<_MutationReply>();
+    _mutations[requestId] = completer;
+    _send({
+      'type': 'webui_request',
+      'request_id': requestId,
+      'action': action,
+      'payload': payload,
+    });
+    final timer = Timer(timeout, () {
+      final c = _mutations.remove(requestId);
+      if (c != null && !c.isCompleted) {
+        c.completeError(TimeoutException('$action timed out'));
+      }
+    });
+    try {
+      final reply = await completer.future;
+      if (!reply.ok) {
+        throw ApiException(reply.status ?? 500,
+            reply.message ?? 'The server refused $action');
+      }
+      return reply.result;
+    } finally {
+      timer.cancel();
+      _mutations.remove(requestId);
+    }
+  }
+
+  /// Delete a chat session (and optionally its automations) via the socket.
+  ///
+  /// Returns the raw server payload so the caller can distinguish
+  /// "deleted" from "blocked_by_automations" — the gateway answers success
+  /// status for both.
+  Future<DeleteSessionResult> deleteSession(
+    String key, {
+    bool deleteAutomations = false,
+  }) async {
+    final result = await mutate('session.delete', {
+      'key': key,
+      if (deleteAutomations) 'delete_automations': true,
+    });
+    return DeleteSessionResult.fromJson(result);
+  }
+
+  void _handleWebuiResponse(Map<String, dynamic> ev) {
+    final requestId = ev['request_id'] as String?;
+    if (requestId == null) return;
+    final completer = _mutations.remove(requestId);
+    if (completer == null || completer.isCompleted) return;
+    final ok = ev['ok'] == true;
+    Map<String, dynamic> result = const {};
+    final rawResult = ev['result'];
+    if (rawResult is Map) result = Map<String, dynamic>.from(rawResult);
+    int? status;
+    String? message;
+    final err = ev['error'];
+    if (err is Map) {
+      if (err['status'] is num) status = (err['status'] as num).toInt();
+      if (err['message'] is String) message = err['message'] as String;
+    }
+    completer.complete(_MutationReply(
+        ok: ok, result: result, status: status, message: message));
+  }
+
   void close() {
     _closedByUser = true;
     _reconnectTimer?.cancel();
@@ -659,6 +825,7 @@ class NanobotSocket {
     } catch (_) {}
     _channel = null;
     _views.clear();
+    _wantedChats.clear();
     _attachedChats.clear();
     _activeTurns.clear();
     _outbox.clear();

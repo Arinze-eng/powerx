@@ -570,17 +570,18 @@ class AppState extends ChangeNotifier {
 
   /// Delete a conversation for real.
   ///
-  /// The gateway answers 200 with `deleted: false` when automations are
-  /// attached, so the payload decides. On success every trace of the chat is
-  /// purged locally (row, transcript cache, remembered chat id).
+  /// Goes through the authenticated WebSocket (`session.delete` mutation):
+  /// the HTTP route answers 405 by design. The gateway answers OK for both
+  /// "deleted" and "blocked_by_automations", so the payload decides. On
+  /// success every trace of the chat is purged locally (row, transcript cache,
+  /// remembered chat id).
   Future<DeleteSessionResult> deleteSession(SessionSummary s,
       {bool deleteAutomations = false}) async {
-    if (_apiToken == null) {
-      throw ApiException(401, 'Please sign in again.');
-    }
-    final result = await api.deleteSession(_apiToken!, s.key,
-        supabaseToken: accessToken, deleteAutomations: deleteAutomations);
+    final sock = await ensureSocket();
+    final result =
+        await sock.deleteSession(s.key, deleteAutomations: deleteAutomations);
     if (result.deleted) {
+      sock.dropChat(s.chatId);
       sessions.removeWhere((x) => x.key == s.key);
       await chatCache.delete(s.chatId);
       if (lastChatId == s.chatId) {
