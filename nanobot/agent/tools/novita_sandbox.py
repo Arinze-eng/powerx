@@ -1464,6 +1464,45 @@ class NovitaSandboxTool(Tool):
                 _TEMPLATE_CACHE[alias] = fallback
                 return fallback
 
+    def _ensure_workspace(self, sandbox: Any) -> None:
+        """Make sure ``_WORKSPACE`` exists before anything runs with it as cwd.
+
+        The Novita "base" template ships no ``/workspace``: the root listing is
+        ``/root``, ``/code``, ``/home`` and so on. Passing a non-existent
+        directory as ``cwd`` is a hard error, not a fallback::
+
+            InvalidArgumentException: cwd '/workspace' does not exist
+
+        Command execution, file listing and downloads all pass
+        ``cwd=_WORKSPACE``, so a sandbox without it fails every operation until
+        something else happens to create the directory (the Telegram-OCR path
+        does, as a side effect of ``mkdir -p /workspace/.nanobot`` — which is why
+        this presented as an intermittent failure).
+
+        This is idempotent and must run on *every* path that hands a sandbox
+        back, not just fresh creation: a box resumed from ``pause`` or
+        reconnected by id can also be missing the directory.
+        """
+        last_error: Exception | None = None
+        for attempt in range(6):
+            try:
+                sandbox.commands.run(
+                    f"mkdir -p {shlex.quote(_WORKSPACE)}",
+                    cwd="/",
+                    timeout=30,
+                    request_timeout=60,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 - retried below, then re-raised
+                last_error = exc
+                if attempt < 5:
+                    import time
+
+                    time.sleep(3)
+        # A sandbox we cannot prepare is unusable; surface the cause rather than
+        # letting the caller fail later with a confusing cwd error.
+        raise last_error if last_error is not None else RuntimeError("workspace prepare failed")
+
     def _get_or_create(self, key: str) -> Any:
         client = self._client()
         # Resolve the target template up front so we can tell whether an existing
@@ -1510,6 +1549,7 @@ class NovitaSandboxTool(Tool):
         if sandbox is not None:
             try:
                 if _matches_sizing(_STORE.template_for(key)) and _try_resume(sandbox):
+                    self._ensure_workspace(sandbox)
                     return sandbox
             except Exception:
                 pass
@@ -1521,6 +1561,7 @@ class NovitaSandboxTool(Tool):
                 sandbox = client.sandbox.connect(sandbox_id)
                 if _matches_sizing(_STORE.template_for(key)) and _try_resume(sandbox):
                     _STORE.set(key, sandbox, template=sandbox_template)
+                    self._ensure_workspace(sandbox)
                     return sandbox
                 # Connected but undersized/unknown template: don't reuse it.
                 _STORE.remove(key)
@@ -1533,28 +1574,16 @@ class NovitaSandboxTool(Tool):
             allow_internet_access=True,
             lifecycle={"on_timeout": "pause", "auto_resume": True},
         )
-        last_error: Exception | None = None
-        for attempt in range(6):
-            try:
-                sandbox.commands.run(
-                    f"mkdir -p {_WORKSPACE}",
-                    cwd="/",
-                    timeout=30,
-                    request_timeout=60,
-                )
-                last_error = None
-                break
-            except Exception as exc:
-                last_error = exc
-                if attempt < 5:
-                    import time
-                    time.sleep(3)
-        if last_error is not None:
+        try:
+            self._ensure_workspace(sandbox)
+        except Exception:
+            # A freshly created box we cannot prepare is unusable; kill it so a
+            # broken sandbox is not left running (and billing) on Novita.
             try:
                 sandbox.kill()
             except Exception:
                 pass
-            raise last_error
+            raise
         _STORE.set(key, sandbox, template=sandbox_template)
         return sandbox
 
