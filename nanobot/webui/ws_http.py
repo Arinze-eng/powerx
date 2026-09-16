@@ -141,6 +141,7 @@ from nanobot.webui.workspaces import WebUIWorkspaceController
 _SLOW_WEBUI_HTTP_LOG_MS = 1_000
 _WEBUI_MUTATION_PAYLOAD_ATTR = "_nanobot_webui_mutation_payload"
 _WEBUI_MUTATION_REQUEST_ATTR = "_nanobot_webui_mutation_request"
+_WEBUI_MUTATION_SUPABASE_USER_ATTR = "_nanobot_webui_mutation_supabase_user"
 _NO_STORE_HEADERS = [("Cache-Control", "no-store")]
 
 _WEBUI_MUTATION_PATHS = {
@@ -477,8 +478,16 @@ class GatewayHTTPHandler:
         connection: Any,
         action: str,
         payload: dict[str, Any],
+        supabase_user_id: str = "",
     ) -> Response:
-        """Run one explicitly allowlisted mutation for an authenticated WebUI socket."""
+        """Run one explicitly allowlisted mutation for an authenticated WebUI socket.
+
+        ``supabase_user_id`` is the identity the socket authenticated with. The
+        synthetic mutation request inherits the handshake headers, so without
+        this the handler could not resolve the caller (no ``X-Nanobot-Auth`` on
+        the handshake) and the per-user guards fail closed - which is what
+        answered "session not found" when a user deleted its own chat.
+        """
         path = self._webui_mutation_path(action, payload)
         if isinstance(path, Response):
             return path
@@ -504,6 +513,12 @@ class GatewayHTTPHandler:
         )
         setattr(request, _WEBUI_MUTATION_REQUEST_ATTR, True)
         setattr(request, _WEBUI_MUTATION_PAYLOAD_ATTR, dict(payload))
+        if supabase_user_id:
+            setattr(
+                request,
+                _WEBUI_MUTATION_SUPABASE_USER_ATTR,
+                supabase_user_id,
+            )
         response = await self._dispatch_resolved(connection, request, path)
         if isinstance(response, Response):
             return response
@@ -1701,7 +1716,17 @@ class GatewayHTTPHandler:
         return None
 
     def _supabase_user_id_for_request(self, request: WsRequest) -> str:
-        """Best-effort resolution of the supabase user id for a plain HTTP request."""
+        """Best-effort resolution of the supabase user id for a plain HTTP request.
+
+        A socket-mutated request carries the identity the socket authenticated
+        with, which stays authoritative when the client sent no
+        ``X-Nanobot-Auth`` header on the handshake.
+        """
+        connection_user = getattr(
+            request, _WEBUI_MUTATION_SUPABASE_USER_ATTR, ""
+        )
+        if isinstance(connection_user, str) and connection_user.strip():
+            return connection_user.strip()
         try:
             from nanobot.supabase_auth import SupabaseAuth
 

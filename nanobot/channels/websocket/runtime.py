@@ -1762,6 +1762,7 @@ class WebSocketChannel(BaseChannel):
                     connection,
                     action,
                     payload,
+                    supabase_user_id=self._conn_supabase_user.get(connection, ""),
                 )
                 status = response.status_code
                 body = bytes(response.body).decode("utf-8", errors="replace").strip()

@@ -78,7 +78,14 @@ class _MutationReply {
 class WsToken {
   final String token;
   final String wsPath;
-  const WsToken(this.token, this.wsPath);
+
+  /// Signed-in Supabase access token, sent as ``X-Nanobot-Auth`` on the
+  /// handshake. Server-side socket mutations (``session.delete``) authorize
+  /// through the connection's Supabase identity; a handshake without it made
+  /// every delete answer "session not found" even for the caller's own chat.
+  final String? supabaseToken;
+
+  const WsToken(this.token, this.wsPath, {this.supabaseToken});
 }
 
 /// Control frames that arrive on the same socket but are NOT chat events.
@@ -163,6 +170,11 @@ class NanobotSocket {
   /// Chats with an active turn on the client side.
   final Set<String> _activeTurns = {};
   final Set<String> _finalizedTurns = {};
+  /// Last turn that reached a terminal event, per chat. Attach hydration can
+  /// replay ``goal_status: running`` for a chat; a replay whose turn id has
+  /// already finished here is ignored instead of re-opening the live results
+  /// bubble (a finished task "firing" its results again).
+  final Map<String, String> _completedTurnIds = {};
   final Map<String, Completer<String>> _pendingNewChat = {};
   final Random _rng = Random();
 
@@ -202,8 +214,17 @@ class NanobotSocket {
       if (!path.startsWith('/')) path = '/$path';
       final uri = Uri.parse(
           '$wsBase$path?token=${Uri.encodeComponent(tk.token)}&client=apk');
+      // Carry the Supabase identity on the handshake. The gateway authorizes
+      // socket mutations (session.delete) as the connection's user, and the
+      // synthetic mutation request inherits the handshake headers.
+      final headers = <String, dynamic>{};
+      final supabaseToken = tk.supabaseToken;
+      if (supabaseToken != null && supabaseToken.isNotEmpty) {
+        headers['X-Nanobot-Auth'] = supabaseToken;
+      }
       final ch = IOWebSocketChannel.connect(
         uri,
+        headers: headers.isEmpty ? null : headers,
         pingInterval: const Duration(seconds: 20),
         connectTimeout: const Duration(seconds: 20),
       );
@@ -446,6 +467,14 @@ class NanobotSocket {
         final status = ev['status'] as String?;
         if (chatId != null && status != null) {
           if (status == 'running') {
+            final replayTurnId = ev['turn_id'] as String?;
+            if (replayTurnId != null &&
+                replayTurnId.isNotEmpty &&
+                _completedTurnIds[chatId] == replayTurnId) {
+              // Superseded replay of a turn that already ended: ignore it so
+              // reopening a finished task cannot re-fire its results.
+              break;
+            }
             // A turn started server-side (ours or a backgrounded one):
             // mark active so the eventual turn_end/idle closes it exactly once.
             _activeTurns.add(chatId);
@@ -597,6 +626,9 @@ class NanobotSocket {
       List<String> media = const [],
       String? turnId}) {
     if (chatId == null) return;
+    if (turnId != null && turnId.isNotEmpty) {
+      _completedTurnIds[chatId] = turnId;
+    }
     if (!_activeTurns.remove(chatId)) {
       // Terminal event for a turn we did not think was active. Two cases:
       // (a) duplicate/late terminal event — already finalized, ignore;
@@ -685,6 +717,7 @@ class NanobotSocket {
     _wantedChats.remove(chatId);
     _activeTurns.remove(chatId);
     _finalizedTurns.remove(chatId);
+    _completedTurnIds.remove(chatId);
     _pendingNewChat.remove(chatId);
   }
 
@@ -828,6 +861,7 @@ class NanobotSocket {
     _wantedChats.clear();
     _attachedChats.clear();
     _activeTurns.clear();
+    _completedTurnIds.clear();
     _outbox.clear();
   }
 }

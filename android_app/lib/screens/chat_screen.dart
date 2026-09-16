@@ -370,6 +370,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           t.streaming = false;
           t.reasoningStreaming = false;
           t.dropEmptyTrailingSegment();
+          // Adopt the server's canonical turn id: the persisted transcript
+          // carries it, so deduping the cached copy against server history on
+          // the next open actually matches instead of appending the answer
+          // again.
+          if ((t.turnId ?? '').isEmpty &&
+              summary.turnId != null &&
+              summary.turnId!.isNotEmpty) {
+            t.turnId = summary.turnId;
+          }
           t.usage = summary.usage ?? t.usage;
           t.latencyMs = summary.latencyMs ?? t.latencyMs;
           if (summary.media.isNotEmpty) {

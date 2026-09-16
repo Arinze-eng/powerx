@@ -622,7 +622,7 @@ class AppState extends ChangeNotifier {
       // by the time a reconnect happens.
       await rebootstrap();
       if (_wsToken == null) throw Exception('No gateway token available');
-      return WsToken(_wsToken!, _wsPath ?? '/');
+      return WsToken(_wsToken!, _wsPath ?? '/', supabaseToken: accessToken);
     });
     sock.onConnectionChanged = (connected) {
       socketConnected = connected;

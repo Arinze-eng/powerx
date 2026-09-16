@@ -246,7 +246,12 @@ class ChatCache {
 ///  * Cached messages the server does not know about are appended, which
 ///    covers a turn that completed while the app was closed and whose
 ///    transcript write lagged behind the local copy.
-///  * User echoes are de-duplicated by text.
+///  * User echoes are de-duplicated by text, and assistant answers are
+///    de-duplicated by their normalised text: an answer the server already
+///    holds is never appended a second time. Without that, a finished task's
+///    results were re-added to the transcript on every reopen (the "results
+///    keep firing" bug) because the live bubble carries no server turn id
+///    until the turn ends.
 List<ChatMessage> mergeThreadHistory({
   required List<ChatMessage> server,
   required List<ChatMessage> cached,
@@ -260,10 +265,14 @@ List<ChatMessage> mergeThreadHistory({
       if (m.role == Role.user && m.text.trim().isNotEmpty) m.text.trim(),
   };
   final serverAssistantByTurn = <String, ChatMessage>{};
+  final serverAssistantTexts = <String>{};
   for (final m in merged) {
-    if (m.role == Role.assistant && (m.turnId ?? '').isNotEmpty) {
+    if (m.role != Role.assistant) continue;
+    if ((m.turnId ?? '').isNotEmpty) {
       serverAssistantByTurn[m.turnId!] = m;
     }
+    final t = m.text.trim();
+    if (t.isNotEmpty) serverAssistantTexts.add(normalizeAssistantText(t));
   }
 
   for (final c in cached) {
@@ -294,9 +303,19 @@ List<ChatMessage> mergeThreadHistory({
       }
       continue;
     }
-    // Unknown to the server: only keep it when it actually carries content.
+    // Unknown to the server: only keep it when it actually carries content
+    // the server does not already have. Text-level dedupe also protects
+    // answers cached before (or without) a turn id.
     if (c.text.trim().isEmpty && c.reasoning.trim().isEmpty) continue;
+    if (c.text.trim().isNotEmpty &&
+        serverAssistantTexts.contains(normalizeAssistantText(c.text.trim()))) {
+      continue;
+    }
     merged.add(c);
   }
   return merged;
 }
+
+/// Collapse whitespace so two renderings of the same answer compare equal.
+String normalizeAssistantText(String text) =>
+    text.trim().replaceAll(RegExp(r'\s+'), ' ');
