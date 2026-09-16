@@ -115,6 +115,8 @@ type BootState =
       userEmail?: string;
       failed?: boolean;
       message?: string;
+      /** Flutterwave payment page, when the gateway exposes one pre-auth. */
+      paymentUrl?: string;
     }
   | {
       status: "ready";
@@ -1069,6 +1071,7 @@ export default function App() {
                 supabaseUrl: cfg.url,
                 anonKey: cfg.anon_key,
                 failed: !!secret,
+                paymentUrl: boot.supabase?.payment?.payment_url,
               });
               return;
             }
@@ -1410,11 +1413,14 @@ export default function App() {
       );
     }
     // Default for all other unauthenticated routes: the landing page.
+    // The payment page URL is surfaced so the pricing cards can start a real
+    // purchase when the deployment exposes one.
     return (
       <LandingPage
         onSignIn={() => navigate("#/login")}
         onSignUp={() => navigate("#/signup")}
         onPrivacy={() => navigate("#/privacy")}
+        purchaseUrl={state.paymentUrl || undefined}
       />
     );
   }
