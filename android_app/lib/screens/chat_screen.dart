@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:mime/mime.dart' as mime_lib;
 import 'package:open_filex/open_filex.dart';
@@ -14,6 +15,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../config.dart';
 import '../models.dart';
+import '../services/chat_cache.dart';
 import '../services/gateway_api.dart';
 import '../services/nanobot_socket.dart';
 import '../state/app_state.dart';
@@ -45,19 +47,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   ChatMessage? _liveTurn; // assistant bubble for the current (or resumed) turn
 
-  // Watchdog state: tracks the last event seen while a turn is running so a
-  // dead socket / missed terminal event can never leave the green "working…"
-  // indicator rolling forever after the task already finished.
+  // Liveness tracking. A turn is ONLY cleared by an authoritative terminal
+  // event (turn_end / goal_status idle / final message). The previous build
+  // force-cleared the busy state after 90 s of "silence", which cut long,
+  // legitimately quiet tool runs short. Now we distinguish:
+  //   * socket healthy but quiet  → the task is simply still working;
+  //   * socket down               → reconnect is already retrying, so keep the
+  //                                 turn alive and resync when it returns.
   DateTime _lastEventAt = DateTime.now();
-  Timer? _silenceTimer;
-  Timer? _stopFallbackTimer;
+  Timer? _resyncTimer;
+  bool _resyncInFlight = false;
+  Timer? _stopWatchTimer; // bounded grace window after a /stop request
   bool _justCompleted = false; // shows the settled "done" check in the pill
   Timer? _completedFadeTimer;
+  Timer? _cacheTimer; // debounced local transcript persistence
 
-  /// Max total event silence tolerated while a turn is running before the
-  /// busy state is force-cleared. Generous: real long tasks keep streaming
-  /// deltas/tool hints, so only a genuinely dead stream hits this.
-  static const Duration _silenceTimeout = Duration(seconds: 90);
+  /// How long a /stop request may stay unacknowledged before the UI releases
+  /// the composer. The server is authoritative, but a dead socket must not
+  /// lock the user out forever.
+  static const Duration _stopGrace = Duration(seconds: 20);
+
+  /// Minimum gap between scroll-to-bottom animations while streaming. Starting
+  /// a new 180 ms animation on every delta (many per second) is what made the
+  /// chat visibly flicker up and down.
+  static const Duration _scrollThrottle = Duration(milliseconds: 260);
+  DateTime _lastAutoScrollAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   bool get _busy => _sending || _remoteRunning;
 
@@ -76,38 +90,68 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       final state = context.read<AppState>();
       state.loadSessions();
       state.refreshCredits();
-      unawaited(_reattach());
+      unawaited(_resync());
     }
   }
 
-  Future<void> _reattach() async {
-    if (_chatId == null) return;
+  /// Re-establish the socket + subscription and reconcile the transcript with
+  /// the server. Called on resume and whenever the socket comes back, so a
+  /// turn that ran while the screen was closed reappears (with its answer).
+  Future<void> _resync() async {
+    final chatId = _chatId;
+    if (chatId == null || _resyncInFlight) return;
+    _resyncInFlight = true;
     try {
-      final sock = await context.read<AppState>().ensureSocket();
+      final state = context.read<AppState>();
+      final sock = await state.ensureSocket();
       _socket = sock;
-      await sock.attach(_chatId!);
-    } catch (_) {}
+      _wireSocket(sock);
+      _registerView();
+      await sock.attach(chatId);
+      if (!mounted) return;
+      setState(() => _connected = sock.isConnected);
+
+      // The gateway does not replay accumulated deltas, so pull the thread to
+      // recover anything produced while this screen was not listening.
+      final session = widget.session;
+      if (session != null) {
+        final history = await state.openSession(session);
+        if (!mounted) return;
+        _applyServerHistory(history);
+      }
+    } catch (_) {
+      // Offline: keep the transcript we have and let the socket retry.
+    } finally {
+      _resyncInFlight = false;
+    }
   }
 
   Future<void> _boot() async {
     final state = context.read<AppState>();
     if (widget.session != null) {
-      setState(() => _loadingHistory = true);
+      final session = widget.session!;
+      _chatId = session.chatId;
+      state.rememberChat(session.chatId);
+      // Render the local copy FIRST so the screen never flashes empty and
+      // prior answers are visible instantly, then reconcile in background.
+      final cached = await state.chatCache.load(session.chatId);
+      if (mounted && cached.isNotEmpty) {
+        setState(() {
+          _messages
+            ..clear()
+            ..addAll(cached);
+        });
+      } else {
+        setState(() => _loadingHistory = true);
+      }
       try {
-        final history = await state.openSession(widget.session!);
-        _chatId = widget.session!.chatId;
-        state.rememberChat(_chatId!);
-        _messages.addAll(history.messages);
-        if (history.activeTurnId != null) {
-          // The server replays the whole in-flight turn's events after attach
-          // (hydrate-after-subscribe). Drop the persisted partials so the
-          // replay rebuilds the bubble without duplicated text.
-          _messages.removeWhere((m) =>
-              m.role == Role.assistant && m.turnId == history.activeTurnId);
-          _remoteRunning = true;
-          _lastEventAt = DateTime.now();
+        final history = await state.openSession(session);
+        if (mounted) _applyServerHistory(history);
+      } catch (e) {
+        if (mounted) {
+          _toast('Could not load history: $e');
         }
-      } catch (_) {}
+      }
       if (mounted) setState(() => _loadingHistory = false);
       await _attachAndWatch();
     } else {
@@ -126,6 +170,32 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// Install server history without losing anything that was streamed locally.
+  ///
+  /// The previous implementation DELETED the persisted assistant bubble of the
+  /// active turn because it assumed the server replays that turn's deltas on
+  /// attach. It does not (only goal_state/goal_status), so text disappeared.
+  /// We now merge instead, which also repairs answers truncated by app close.
+  void _applyServerHistory(ThreadHistory history) {
+    final merged = mergeThreadHistory(
+      server: history.messages,
+      cached: List<ChatMessage>.from(_messages),
+    );
+    setState(() {
+      _messages
+        ..clear()
+        ..addAll(merged);
+      if (history.activeTurnId != null) {
+        _remoteRunning = true;
+        _lastEventAt = DateTime.now();
+      }
+    });
+    _scheduleCacheWrite();
+    if (history.activeTurnId != null) {
+      _startResyncWatch();
+    }
+  }
+
   void _wireSocket(NanobotSocket sock) {
     sock.onGoalStatus = (chatId, status) {
       if (!mounted || chatId != _chatId) return;
@@ -134,6 +204,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       setState(() => _remoteRunning = running);
       if (running) _ensureLiveTurn(); // replayed running turn → open bubble
       _updateWakelock();
+    };
+    sock.onConnectionChanged = (connected) {
+      if (!mounted) return;
+      setState(() => _connected = connected);
+      if (connected) {
+        // The socket came back: re-attach and reconcile so a turn that ran
+        // while we were disconnected is reflected (and never left "paused").
+        unawaited(_resync());
+      }
+    };
+    sock.onTurnActivity = (chatId) {
+      if (chatId == _chatId) _touchActivity();
+    };
+    sock.onErrorEvent = (chatId, detail) {
+      if (!mounted) return;
+      if (chatId == null || chatId == _chatId) _toast('Error: $detail');
     };
   }
 
@@ -148,7 +234,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _wireSocket(sock);
       _registerView();
       await sock.attach(_chatId!);
-      setState(() => _connected = true);
+      setState(() => _connected = sock.isConnected);
     } catch (e) {
       if (mounted) setState(() => _connected = false);
     }
@@ -273,6 +359,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           _updateWakelock();
           _flashCompleted();
           _scrollToBottom();
+          _scheduleCacheWrite();
         }
       },
       onError: (detail) {
@@ -284,6 +371,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           t.segments.add('⚠️ $detail');
         }
         _liveTurn = null;
+        _cancelStopFallback();
         if (mounted) {
           setState(() {
             _sending = false;
@@ -291,6 +379,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             _remoteRunning = false;
           });
           _updateWakelock();
+          _scheduleCacheWrite();
         }
       },
       onUserMessage: (text, turnId) {
@@ -322,19 +411,32 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// Keep the newest content in view while a turn streams.
+  ///
+  /// Two guards prevent the "chat shakes up and down" jitter:
+  ///  1. Throttle: at most one animation per [_scrollThrottle] window, since
+  ///     deltas arrive many times per second and overlapping 180 ms
+  ///     animations fought each other.
+  ///  2. Only animate when the user is already parked near the bottom — if
+  ///     they scrolled up to read, the view must not be yanked back.
   void _scrollToBottom({bool force = false}) {
+    if (!force) {
+      final now = DateTime.now();
+      if (now.difference(_lastAutoScrollAt) < _scrollThrottle) return;
+    }
+    _lastAutoScrollAt = DateTime.now();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scroll.hasClients) return;
+      if (!mounted || !_scroll.hasClients) return;
       final pos = _scroll.position;
-      // Pin to the tail only when the user is already reading it (or when
-      // forced, e.g. right after sending). While a turn streams in and the
-      // user scrolls up to read, the view must NOT jump — that jitter is
-      // what made streaming look like it was "shaking".
       final nearBottom = pos.maxScrollExtent - pos.pixels < 180;
       if (!force && !nearBottom) return;
+      // Clamp to the real extent: animating past it (the old +120 overshoot)
+      // produced a rubber-band bounce on every frame.
+      final target = pos.maxScrollExtent;
+      if ((pos.pixels - target).abs() < 1) return;
       pos.animateTo(
-        pos.maxScrollExtent + 120,
-        duration: const Duration(milliseconds: 180),
+        target,
+        duration: const Duration(milliseconds: 160),
         curve: Curves.easeOut,
       );
     });
@@ -345,52 +447,73 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void _updateWakelock() {
     if (_busy) {
       WakelockPlus.enable();
-      _startWatchdog();
+      _startResyncWatch();
     } else {
       WakelockPlus.disable();
-      _stopWatchdog();
+      _stopResyncWatch();
+      _scheduleCacheWrite();
     }
   }
 
-  /// Coalesces high-frequency streaming deltas into UI rebuilds (~16/s max)
+  /// Coalesces high-frequency streaming deltas into UI rebuilds (~12/s max)
   /// so the markdown bubble re-renders smoothly instead of on every chunk.
   void _scheduleFlush() {
-    _flushTimer ??= Timer(const Duration(milliseconds: 60), () {
+    _flushTimer ??= Timer(const Duration(milliseconds: 80), () {
       _flushTimer = null;
       if (mounted) setState(() {});
+      _scheduleCacheWrite();
     });
   }
 
-  // ---- Turn watchdog ------------------------------------------------------
+  // ---- Turn liveness, resync & local persistence -------------------------
 
   void _touchActivity() {
     _lastEventAt = DateTime.now();
   }
 
-  /// While a turn is running, watch for total event silence. If nothing at
-  /// all arrives (dead socket, missed terminal event, background kill) within
-  /// [_silenceTimeout], force-clear the busy state so the green indicator can
-  /// never roll forever after the task is done.
-  void _startWatchdog() {
-    _silenceTimer ??= Timer.periodic(const Duration(seconds: 5), (_) {
+  /// Periodic safety net while a turn is running.
+  ///
+  /// It NEVER force-clears a running turn (that is what stopped long tasks
+  /// early). Its only job is to notice that the socket is gone or that we may
+  /// have missed a terminal event while backgrounded, and reconcile with the
+  /// server — the authoritative source of turn state.
+  void _startResyncWatch() {
+    _resyncTimer ??= Timer.periodic(const Duration(seconds: 15), (_) async {
       if (!mounted || !_busy) {
-        _stopWatchdog();
+        _stopResyncWatch();
         return;
       }
-      final idle = DateTime.now().difference(_lastEventAt);
-      if (idle >= _silenceTimeout) {
-        _forceClearRunning(reason: 'Stream went quiet — task stopped watching.');
+      final sock = _socket;
+      final offline = sock == null || !sock.isConnected;
+      // No inbound frame for a while although the socket claims to be up:
+      // verify the turn is genuinely still running instead of assuming.
+      final stale = DateTime.now().difference(_lastEventAt) >
+          const Duration(seconds: 90);
+      if (offline || stale) {
+        await _resync();
       }
     });
   }
 
-  void _stopWatchdog() {
-    _silenceTimer?.cancel();
-    _silenceTimer = null;
+  void _stopResyncWatch() {
+    _resyncTimer?.cancel();
+    _resyncTimer = null;
   }
 
-  /// Authoritatively clears the busy state even when no turn_end / goal_status
-  /// idle event arrived (silence timeout, missed event after stop, dead socket).
+  /// Write the transcript to disk (debounced) so reopening the app always
+  /// shows what was produced, even for a turn that never completed in-view.
+  void _scheduleCacheWrite() {
+    final chatId = _chatId;
+    if (chatId == null) return;
+    _cacheTimer ??= Timer(const Duration(milliseconds: 700), () {
+      _cacheTimer = null;
+      final state = context.read<AppState>();
+      unawaited(state.cacheThread(chatId, List<ChatMessage>.from(_messages)));
+    });
+  }
+
+  /// Clears the busy state after the server failed to confirm a stop. Only
+  /// used for the stop path, where the user explicitly asked to end the turn.
   void _forceClearRunning({String? reason}) {
     if (!mounted) return;
     final hadLive = _liveTurn != null;
@@ -404,7 +527,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _liveTurn = null;
     }
     _cancelStopFallback();
-    _stopWatchdog();
+    _stopResyncWatch();
     setState(() {
       _sending = false;
       _stopping = false;
@@ -428,8 +551,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _cancelStopFallback() {
-    _stopFallbackTimer?.cancel();
-    _stopFallbackTimer = null;
+    _stopWatchTimer?.cancel();
+    _stopWatchTimer = null;
   }
 
   // ---- File / image attachment -----------------------------------------
@@ -516,38 +639,48 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               .toList()));
       _pending.clear();
       _sending = true;
+      _stopping = false;
+      _lastEventAt = DateTime.now();
     });
     _updateWakelock();
     _scrollToBottom(force: true);
+    _scheduleCacheWrite();
 
     try {
       _socket ??= await state.ensureSocket();
       _wireSocket(_socket!);
-      _chatId ??= await _socket!.newChat();
-      state.rememberChat(_chatId!);
+      if (_chatId == null) {
+        _chatId = await _socket!.newChat();
+        state.rememberChat(_chatId!);
+      }
       _registerView();
+      setState(() => _connected = _socket!.isConnected);
     } catch (e) {
       _fail('Connection error: $e');
       return;
     }
 
     _ensureLiveTurn();
+    // Mark the turn before the frame hits the wire so an early terminal event
+    // is still attributed to this turn.
+    _socket!.markUserTurn(_chatId!);
     _socket!.sendMessage(_chatId!, text,
         media: wireMedia.isEmpty ? null : wireMedia);
   }
 
   /// Cancel the running task (server `/stop` slash command).
+  ///
+  /// The server is authoritative: the busy state clears when `goal_status
+  /// idle` / `turn_end` arrives. A bounded grace timer only covers a dead
+  /// socket, so a stop is never "cut" locally while work is still finishing.
   void _stop() {
     final chatId = _chatId;
     if (chatId == null || _socket == null || !_busy) return;
     _touchActivity();
     setState(() => _stopping = true);
     _socket!.stopTask(chatId);
-    // If the server never confirms the cancellation (dead socket, missed
-    // event), clear the busy state locally after a short grace period so the
-    // user is never locked out by a rolling indicator.
     _cancelStopFallback();
-    _stopFallbackTimer = Timer(const Duration(seconds: 5), () {
+    _stopWatchTimer = Timer(_stopGrace, () {
       if (mounted && _busy) {
         _forceClearRunning(reason: 'Task cancelled.');
       }
@@ -571,15 +704,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   /// Download a file the assistant created during this turn and hand it to
-  /// the OS viewer. The file lives in the chat's workspace on the gateway;
-  /// its (text) content is fetched through the authenticated file-preview
-  /// endpoint. Binary/large files report a clear failure instead of failing
-  /// silently.
+  /// the OS viewer.
+  ///
+  /// The gateway exposes a text preview only (binary files answer 415), so we
+  /// surface the REAL reason instead of a generic failure, and never write a
+  /// zero-byte file. Files that cannot be previewed are reported clearly with
+  /// the path, which the agent can still fetch in-chat.
   Future<void> _openArtifact(String path) async {
     final state = context.read<AppState>();
     final key = _sessionKeyForChat(state);
     if (key == null || state.apiToken == null) {
-      _toast('Reopen this chat from Sessions to download its files.');
+      _toast('Reopen this chat from Conversations to download its files.');
       return;
     }
     try {
@@ -587,14 +722,28 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           path: path, supabaseToken: state.accessToken);
       final content = payload['content'];
       if (content is! String || content.isEmpty) {
-        throw StateError('file not previewable (binary or too large)');
+        throw StateError('file is empty or not text-previewable');
       }
       final name = path.split('/').last;
       final dir = await getTemporaryDirectory();
       final file = File(
           '${dir.path}/${DateTime.now().millisecondsSinceEpoch}-$name');
       await file.writeAsString(content, flush: true);
-      await OpenFilex.open(file.path);
+      final result = await OpenFilex.open(file.path);
+      if (result.type != ResultType.done) {
+        _toast('Saved to ${file.path} (no viewer for this type).');
+      }
+    } on ApiException catch (e) {
+      if (e.status == 415) {
+        _toast('"${path.split('/').last}" is binary — ask the agent to send it '
+            'as an attachment to download it.');
+      } else if (e.status == 404) {
+        _toast('File not found in this workspace: $path');
+      } else if (e.status == 403) {
+        _toast('That file is outside this chat\'s workspace.');
+      } else {
+        _toast('Could not download "$path": ${e.message}');
+      }
     } catch (e) {
       _toast('Could not download "$path": $e');
     }
@@ -608,12 +757,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     _flushTimer?.cancel();
-    _silenceTimer?.cancel();
-    _stopFallbackTimer?.cancel();
+    _resyncTimer?.cancel();
+    _stopWatchTimer?.cancel();
     _completedFadeTimer?.cancel();
+    _cacheTimer?.cancel();
+    // Persist the final transcript before leaving so reopening the chat shows
+    // the completed answer immediately.
+    final chatId = _chatId;
+    if (chatId != null) {
+      unawaited(context
+          .read<AppState>()
+          .cacheThread(chatId, List<ChatMessage>.from(_messages)));
+    }
     WakelockPlus.disable();
     WidgetsBinding.instance.removeObserver(this);
-    final chatId = _chatId;
     if (chatId != null) _socket?.unlisten(chatId);
     _input.dispose();
     _scroll.dispose();
@@ -661,6 +818,25 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       ),
       body: Column(
         children: [
+          if (!_connected)
+            Container(
+              width: double.infinity,
+              color: const Color(0xFF3E2723),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+              child: const Row(
+                children: [
+                  Icon(Icons.cloud_off_rounded,
+                      size: 15, color: Colors.orangeAccent),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Reconnecting… your task keeps running on the server.',
+                      style: TextStyle(fontSize: 12, color: Colors.orangeAccent),
+                    ),
+                  ),
+                ],
+              ),
+            ),
           Expanded(
             child: _loadingHistory
                 ? const Center(child: CircularProgressIndicator())
@@ -697,23 +873,42 @@ class _Bubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isUser = message.role == Role.user;
+    final bubble = Container(
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      constraints:
+          BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.90),
+      decoration: BoxDecoration(
+        color: isUser ? const Color(0xFF2E7D32) : const Color(0xFF1A2138),
+        borderRadius: BorderRadius.only(
+          topLeft: const Radius.circular(18),
+          topRight: const Radius.circular(18),
+          bottomLeft: Radius.circular(isUser ? 18 : 6),
+          bottomRight: Radius.circular(isUser ? 6 : 18),
+        ),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      child: _content(context, isUser),
+    );
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 6),
-        constraints:
-            BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.90),
-        decoration: BoxDecoration(
-          color: isUser ? const Color(0xFF2E7D32) : const Color(0xFF1A2138),
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(18),
-            topRight: const Radius.circular(18),
-            bottomLeft: Radius.circular(isUser ? 18 : 6),
-            bottomRight: Radius.circular(isUser ? 6 : 18),
-          ),
-        ),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        child: isUser
+      // Long-press copies the message text — handy for short answers and
+      // error reports on a phone.
+      child: GestureDetector(
+        onLongPress: message.text.trim().isEmpty
+            ? null
+            : () {
+                Clipboard.setData(ClipboardData(text: message.text));
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                    content: Text('Copied to clipboard'),
+                    duration: Duration(seconds: 1)));
+              },
+        child: bubble,
+      ),
+    );
+  }
+
+  Widget _content(BuildContext context, bool isUser) {
+    return isUser
             ? Column(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 mainAxisSize: MainAxisSize.min,
@@ -810,9 +1005,7 @@ class _Bubble extends StatelessWidget {
                               color: Colors.white30, fontSize: 11)),
                     ),
                 ],
-              ),
-      ),
-    );
+              );
   }
 
   static String? _footer(ChatMessage m) {

@@ -85,6 +85,67 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
+/// Outcome of a session delete. The gateway answers 200 even when it refuses
+/// to delete (see [blockedByAutomations]), so the status code alone is not
+/// enough — this captures the real business result.
+class DeleteSessionResult {
+  /// The session/transcript is gone (true) or still present (false).
+  final bool deleted;
+  /// The gateway refused because automations are attached to the session.
+  final bool blockedByAutomations;
+  /// Human-readable names of the blocking automations.
+  final List<String> automations;
+  const DeleteSessionResult({
+    required this.deleted,
+    this.blockedByAutomations = false,
+    this.automations = const [],
+  });
+
+  factory DeleteSessionResult.fromJson(Map<String, dynamic> j) {
+    final names = <String>[];
+    final jobs = j['automations'];
+    if (jobs is List) {
+      for (final job in jobs) {
+        if (job is Map) {
+          final label = (job['name'] ?? job['title'] ?? job['id'] ?? '').toString();
+          if (label.trim().isNotEmpty) names.add(label.trim());
+        }
+      }
+    }
+    return DeleteSessionResult(
+      deleted: j['deleted'] == true,
+      blockedByAutomations: j['blocked_by_automations'] == true,
+      automations: names,
+    );
+  }
+}
+
+/// A scheduled automation attached to a chat session.
+class SessionAutomation {
+  final String id;
+  final String name;
+  final String schedule;
+  final bool enabled;
+  final bool pending;
+  const SessionAutomation({
+    required this.id,
+    required this.name,
+    this.schedule = '',
+    this.enabled = true,
+    this.pending = false,
+  });
+
+  factory SessionAutomation.fromJson(Map<String, dynamic> j) => SessionAutomation(
+        id: (j['id'] ?? j['job_id'] ?? '').toString(),
+        name: (j['name'] ?? j['title'] ?? '').toString(),
+        schedule: (j['schedule'] ?? j['cron'] ?? '').toString(),
+        enabled: j['enabled'] != false,
+        pending: j['pending'] == true,
+      );
+
+  String get displayName => name.trim().isNotEmpty ? name.trim() : 'Automation';
+}
+
 /// Thin REST client for the PowerX gateway surface used by the native app.
 class GatewayApi {
   final http.Client _client;
@@ -153,11 +214,25 @@ class GatewayApi {
     return ThreadHistory.parse(jsonDecode(res.body));
   }
 
-  /// Delete a session/conversation from the server. Best-effort.
-  Future<void> deleteSession(String apiToken, String key,
-      {String? supabaseToken}) async {
+  /// Delete a session and its transcript from the server.
+  ///
+  /// The gateway returns HTTP 200 with `{"deleted": false,
+  /// "blocked_by_automations": true}` when scheduled automations are attached.
+  /// The caller must inspect the payload — treating a 200 as success is what
+  /// made "delete" appear to do nothing while the row bounced back.
+  ///
+  /// [deleteAutomations] force-deletes those attached automations too.
+  Future<DeleteSessionResult> deleteSession(
+    String apiToken,
+    String key, {
+    String? supabaseToken,
+    bool deleteAutomations = false,
+  }) async {
+    final url = Uri.parse(
+        '$origin/api/sessions/${Uri.encodeComponent(key)}/delete'
+        '${deleteAutomations ? '?delete_automations=1' : ''}');
     final res = await _client.post(
-      Uri.parse('$origin/api/sessions/${Uri.encodeComponent(key)}/delete'),
+      url,
       headers: {
         'Authorization': 'Bearer $apiToken',
         if (supabaseToken != null) 'X-Nanobot-Auth': supabaseToken,
@@ -166,10 +241,63 @@ class GatewayApi {
     if (res.statusCode != 200 && res.statusCode != 204) {
       throw ApiException(res.statusCode, 'Could not delete conversation');
     }
+    if (res.body.trim().isEmpty) {
+      return const DeleteSessionResult(deleted: true);
+    }
+    try {
+      final body = jsonDecode(res.body);
+      if (body is Map) {
+        return DeleteSessionResult.fromJson(Map<String, dynamic>.from(body));
+      }
+    } catch (_) {
+      // Non-JSON 200 → treat as success (older gateway builds).
+    }
+    return const DeleteSessionResult(deleted: true);
+  }
+
+  /// Automations (cron jobs / local triggers) attached to a session. Used to
+  /// explain WHY a delete was refused instead of failing silently.
+  Future<List<SessionAutomation>> fetchSessionAutomations(
+    String apiToken,
+    String key, {
+    String? supabaseToken,
+  }) async {
+    final res = await _client.get(
+      Uri.parse('$origin/api/sessions/${Uri.encodeComponent(key)}/automations'),
+      headers: {
+        'Authorization': 'Bearer $apiToken',
+        if (supabaseToken != null) 'X-Nanobot-Auth': supabaseToken,
+      },
+    );
+    if (res.statusCode != 200) {
+      throw ApiException(res.statusCode, 'Could not load automations');
+    }
+    final body = jsonDecode(res.body);
+    if (body is! Map) return const [];
+    final jobs = body['jobs'];
+    if (jobs is! List) return const [];
+    return jobs
+        .whereType<Map>()
+        .map((j) => SessionAutomation.fromJson(Map<String, dynamic>.from(j)))
+        .toList();
+  }
+
+  /// Running gateway build info (`/api/version`). Best-effort: used by
+  /// Settings to show which backend the app is actually talking to.
+  Future<Map<String, dynamic>> fetchVersion() async {
+    final res = await _client.get(Uri.parse('$origin/api/version'));
+    if (res.statusCode != 200) {
+      throw ApiException(res.statusCode, 'Could not load server version');
+    }
+    final body = jsonDecode(res.body);
+    return body is Map ? Map<String, dynamic>.from(body) : const {};
   }
 
   /// Fetch a text preview of a workspace file created during a chat
   /// (gateway file-preview endpoint, same auth as the session APIs).
+  ///
+  /// Throws [ApiException] with the real status so the UI can explain WHY a
+  /// file could not be opened (404 missing, 403 outside workspace, 415 binary).
   Future<Map<String, dynamic>> fetchFilePreview(String apiToken, String key,
       {required String path, String? supabaseToken}) async {
     final url =
@@ -183,7 +311,15 @@ class GatewayApi {
       },
     );
     if (res.statusCode != 200) {
-      throw ApiException(res.statusCode, 'Could not download file');
+      String detail = 'Could not download file';
+      try {
+        final body = jsonDecode(res.body);
+        if (body is Map) {
+          final msg = body['message'] ?? body['error'] ?? body['detail'];
+          if (msg is String && msg.trim().isNotEmpty) detail = msg.trim();
+        }
+      } catch (_) {}
+      throw ApiException(res.statusCode, detail);
     }
     return jsonDecode(res.body) as Map<String, dynamic>;
   }

@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../models.dart';
+import '../services/chat_cache.dart';
 import '../services/device_id.dart';
 import '../services/gateway_api.dart';
 import '../services/nanobot_socket.dart';
@@ -39,6 +41,11 @@ class AppState extends ChangeNotifier {
   static const _kEmail = 'email';
   static const _kName = 'name';
   static const _kLastChat = 'last_chat_id';
+  static const _kSessionCache = 'sessions_cache';
+
+  /// Local transcript persistence so a chat renders instantly and survives a
+  /// backgrounded turn that the gateway does not replay over the socket.
+  final ChatCache chatCache = ChatCache();
 
   AppStatus status = AppStatus.loading;
   String? errorMessage;
@@ -232,6 +239,7 @@ class AppState extends ChangeNotifier {
     _tokenTimer = null;
     _resetIdentity(wipeStorage: false);
     await _clearSession();
+    await chatCache.clearAll();
     status = AppStatus.unauthenticated;
     notifyListeners();
   }
@@ -260,6 +268,8 @@ class AppState extends ChangeNotifier {
       unawaited(_storage.delete(key: _kEmail));
       unawaited(_storage.delete(key: _kName));
       unawaited(_storage.delete(key: _kLastChat));
+      unawaited(_storage.delete(key: _kSessionCache));
+      unawaited(chatCache.clearAll());
     }
   }
 
@@ -450,44 +460,148 @@ class AppState extends ChangeNotifier {
   // ---- Sessions ---------------------------------------------------------
 
   Future<void> loadSessions() async {
-    if (_apiToken == null) return;
+    if (_apiToken == null) {
+      // Before bootstrap completes, show whatever we cached last session so
+      // the drawer is never empty on a cold, offline start.
+      await _restoreSessionCache();
+      return;
+    }
     sessionsLoading = true;
     notifyListeners();
     try {
       sessions = await api.listSessions(_apiToken!, supabaseToken: accessToken);
+      _storeSessionCache(sessions);
     } on ApiException catch (e) {
       if (e.status == 401) {
         await rebootstrap();
         try {
           sessions = await api.listSessions(_apiToken!, supabaseToken: accessToken);
-        } catch (_) {}
+          _storeSessionCache(sessions);
+        } catch (_) {
+          await _restoreSessionCache();
+        }
+      } else {
+        await _restoreSessionCache();
       }
     } catch (_) {
-      // keep previous list
+      // Network blip: keep the previous list, or rehydrate from disk.
+      if (sessions.isEmpty) await _restoreSessionCache();
     } finally {
       sessionsLoading = false;
       notifyListeners();
     }
   }
 
-  Future<ThreadHistory> openSession(SessionSummary s) async {
-    if (_apiToken == null) return ThreadHistory(messages: []);
+  Future<void> _storeSessionCache(List<SessionSummary> rows) async {
     try {
-      return await api.fetchThread(_apiToken!, s.key, supabaseToken: accessToken);
+      final encoded = jsonEncode(rows
+          .map((s) => {
+                'key': s.key,
+                'title': s.title,
+                'preview': s.preview,
+                if (s.updatedAt != null)
+                  'updated_at': s.updatedAt!.toUtc().toIso8601String(),
+              })
+          .toList());
+      await _storage.write(key: _kSessionCache, value: encoded);
+    } catch (_) {}
+  }
+
+  Future<void> _restoreSessionCache() async {
+    if (sessions.isNotEmpty) return;
+    try {
+      final raw = await _storage.read(key: _kSessionCache);
+      if (raw == null || raw.isEmpty) return;
+      final list = jsonDecode(raw);
+      if (list is! List) return;
+      final rows = list
+          .whereType<Map>()
+          .map((r) => SessionSummary.fromJson(Map<String, dynamic>.from(r)))
+          .toList();
+      if (rows.isEmpty) return;
+      sessions = rows;
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Load one conversation. The local cache is returned immediately as
+  /// [ThreadHistory.messages] is merged with the authoritative server copy, so
+  /// reopening the app shows prior answers even when the turn was still
+  /// streaming (the gateway does not replay delta history over the socket).
+  Future<ThreadHistory> openSession(SessionSummary s) async {
+    final cached = await chatCache.load(s.chatId);
+    if (_apiToken == null) {
+      // Not bootstrapped yet: better a cached transcript than a blank screen.
+      return ThreadHistory(messages: cached);
+    }
+    try {
+      final server = await api.fetchThread(_apiToken!, s.key,
+          supabaseToken: accessToken);
+      await _storeSessionCache(sessions);
+      return ThreadHistory(
+        messages: mergeThreadHistory(server: server.messages, cached: cached),
+        activeTurnId: server.activeTurnId,
+        hasPendingToolCalls: server.hasPendingToolCalls,
+      );
     } on ApiException catch (e) {
       if (e.status == 401) {
         await rebootstrap();
-        return api.fetchThread(_apiToken!, s.key, supabaseToken: accessToken);
+        try {
+          final server = await api.fetchThread(_apiToken!, s.key,
+              supabaseToken: accessToken);
+          return ThreadHistory(
+            messages: mergeThreadHistory(server: server.messages, cached: cached),
+            activeTurnId: server.activeTurnId,
+            hasPendingToolCalls: server.hasPendingToolCalls,
+          );
+        } catch (_) {
+          if (cached.isNotEmpty) return ThreadHistory(messages: cached);
+          rethrow;
+        }
       }
+      if (cached.isNotEmpty) return ThreadHistory(messages: cached);
       rethrow;
     }
   }
 
-  Future<void> deleteSession(SessionSummary s) async {
-    if (_apiToken == null) return;
-    await api.deleteSession(_apiToken!, s.key, supabaseToken: accessToken);
-    sessions.removeWhere((x) => x.key == s.key);
-    notifyListeners();
+  /// Persist the current transcript of [chatId] locally (best-effort).
+  Future<void> cacheThread(String chatId, List<ChatMessage> messages) =>
+      chatCache.save(chatId, messages);
+
+  /// Delete a conversation for real.
+  ///
+  /// The gateway answers 200 with `deleted: false` when automations are
+  /// attached, so the payload decides. On success every trace of the chat is
+  /// purged locally (row, transcript cache, remembered chat id).
+  Future<DeleteSessionResult> deleteSession(SessionSummary s,
+      {bool deleteAutomations = false}) async {
+    if (_apiToken == null) {
+      throw ApiException(401, 'Please sign in again.');
+    }
+    final result = await api.deleteSession(_apiToken!, s.key,
+        supabaseToken: accessToken, deleteAutomations: deleteAutomations);
+    if (result.deleted) {
+      sessions.removeWhere((x) => x.key == s.key);
+      await chatCache.delete(s.chatId);
+      if (lastChatId == s.chatId) {
+        lastChatId = null;
+        await _storage.delete(key: _kLastChat);
+      }
+      await _storeSessionCache(sessions);
+      notifyListeners();
+    }
+    return result;
+  }
+
+  /// Automations attached to a chat — explains a blocked delete.
+  Future<List<SessionAutomation>> sessionAutomations(SessionSummary s) async {
+    if (_apiToken == null) return const [];
+    try {
+      return await api.fetchSessionAutomations(_apiToken!, s.key,
+          supabaseToken: accessToken);
+    } catch (_) {
+      return const [];
+    }
   }
 
   void rememberChat(String chatId) {
@@ -523,7 +637,13 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     };
     if (!sock.isConnected) {
-      await sock.connect();
+      try {
+        await sock.connect();
+      } catch (_) {
+        // Offline / gateway down: keep the socket object. Outbound frames are
+        // queued and flushed on the automatic reconnect, so a message typed
+        // during a blip is not lost mid-task.
+      }
     }
     return sock;
   }

@@ -387,4 +387,101 @@ void main() {
         status: 'done', order: 3));
     expect(msg.artifactPaths, ['reports/summary.md']);
   });
+
+  test('a quiet long-running turn is never cut short by the client', () async {
+    await sock.connect();
+    final chatId = await sock.newChat();
+    final rec = Recorder();
+    sock.listen(chatId, rec.view());
+    sock.sendMessage(chatId, 'very long build');
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+    gw.send({'event': 'message', 'chat_id': chatId, 'kind': 'tool_hint',
+      'text': '', 'tool_events': [
+        {'phase': 'start', 'call_id': 'c1', 'name': 'run_command',
+         'arguments': {'command': 'make build'}},
+      ]});
+    await pumpEventQueue();
+
+    // Simulate a long, silent tool run: no events for a long time. The turn
+    // must stay active (the old 90 s watchdog force-cleared it and showed the
+    // task as "cut off" mid-work).
+    await Future<void>.delayed(const Duration(seconds: 2));
+    expect(rec.turnEnds, isEmpty);
+    expect(sock.isTurnActive(chatId), isTrue);
+
+    // The work eventually reports completion.
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'idle'});
+    await pumpEventQueue();
+    expect(rec.turnEnds.length, 1);
+    expect(sock.isTurnActive(chatId), isFalse);
+  });
+
+  test('stop sends /stop without locally cancelling the turn', () async {
+    await sock.connect();
+    final chatId = await sock.newChat();
+    final rec = Recorder();
+    sock.listen(chatId, rec.view());
+    sock.sendMessage(chatId, 'long task');
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+    await pumpEventQueue();
+
+    sock.stopTask(chatId);
+    await pumpEventQueue();
+
+    // The cancel request reached the server...
+    expect(
+        gw.inbound.any((f) => f['type'] == 'message' && f['content'] == '/stop'),
+        isTrue);
+    // ...and the client did NOT assume the turn ended before the server said
+    // so (a server-authoritative stop is what prevents "it just gets cut").
+    expect(rec.turnEnds, isEmpty);
+
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'idle'});
+    await pumpEventQueue();
+    expect(rec.turnEnds.length, 1);
+  });
+
+  test('frames sent while offline are queued and flushed on reconnect',
+      () async {
+    await sock.connect();
+    final chatId = await sock.newChat();
+    await gw.dropConnection();
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+
+    // Dropped while the socket is down: the frame must be buffered, not lost.
+    sock.stopTask(chatId);
+    expect(sock.isConnected, isFalse);
+
+    // The client auto-reconnects and replays the queued frame.
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while (DateTime.now().isBefore(deadline)) {
+      if (gw.inbound.any((f) => f['content'] == '/stop')) break;
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    expect(gw.inbound.any((f) => f['content'] == '/stop'), isTrue);
+  });
+
+  test('an error for a chat without a view is not silently swallowed',
+      () async {
+    await sock.connect();
+    final chatId = await sock.newChat();
+    String? seenChat;
+    String? seenDetail;
+    sock.onErrorEvent = (c, d) {
+      seenChat = c;
+      seenDetail = d;
+    };
+    gw.send({'event': 'error', 'chat_id': chatId, 'detail': 'tool_failed'});
+    await pumpEventQueue();
+    expect(seenChat, chatId);
+    expect(seenDetail, 'tool_failed');
+  });
+
+  test('protocol frames are classified so they never become transcript rows',
+      () {
+    expect(isProtocolFrame(jsonEncode({'event': 'attached'})), isTrue);
+    expect(isProtocolFrame(jsonEncode({'event': 'goal_status'})), isTrue);
+    expect(isProtocolFrame(jsonEncode({'event': 'delta', 'text': 'x'})), isFalse);
+    expect(isProtocolFrame('not json'), isFalse);
+  });
 }

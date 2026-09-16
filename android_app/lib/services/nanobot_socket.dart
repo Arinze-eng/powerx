@@ -50,7 +50,8 @@ class TurnSummary {
   final Map<String, num>? usage;
   final int? latencyMs;
   final List<String> media;
-  const TurnSummary({this.usage, this.latencyMs, this.media = const []});
+  final String? turnId;
+  const TurnSummary({this.usage, this.latencyMs, this.media = const [], this.turnId});
 }
 
 /// Token pair used to (re)establish a connection. [ws] is the gateway WS
@@ -62,8 +63,49 @@ class WsToken {
   const WsToken(this.token, this.wsPath);
 }
 
+/// Control frames that arrive on the same socket but are NOT chat events.
+/// Kept here so the UI layer can filter them out of transcript projection.
+const Set<String> kSocketControlEvents = {
+  'ready',
+  'attached',
+  'session_updated',
+  'sidebar_state_updated',
+  'goal_status',
+  'goal_state',
+  'message_accepted',
+  'turn_model_updated',
+  'runtime_model_updated',
+  'webui_response',
+  'transcription_result',
+  'transcription_error',
+  'pong',
+  'heartbeat',
+};
+
+/// True when [raw] is a protocol/control frame rather than a transcript event.
+bool isProtocolFrame(String raw) {
+  try {
+    final ev = jsonDecode(raw);
+    if (ev is! Map) return false;
+    final event = ev['event'];
+    return event is String && kSocketControlEvents.contains(event);
+  } catch (_) {
+    return false;
+  }
+}
+
 /// Native WebSocket client for the nanobot gateway chat protocol with
 /// automatic reconnect + chat re-attach (mirrors webui/src/lib/nanobot-client).
+///
+/// Reliability contract (why this class is defensive):
+///  * Outbound frames sent while the socket is down are queued and flushed on
+///    (re)connect, so a message typed during a blip is never silently lost.
+///  * A turn is only cleared by an authoritative terminal event
+///    (`turn_end` / `goal_status idle` / final `message`) — never by a local
+///    timer. Long, quiet tool runs therefore never get "cut off".
+///  * Connect/reconnect uses unbounded exponential backoff and application
+///    pings, so the stream survives screen-off, app background and NAT idle
+///    timeouts instead of pausing.
 class NanobotSocket {
   /// Supplies a FRESH gateway token (app re-bootstraps; Supabase token may
   /// itself refresh). Called on initial connect and before every reconnect.
@@ -79,6 +121,12 @@ class NanobotSocket {
   bool _connecting = false;
   int _reconnectAttempts = 0;
   Timer? _reconnectTimer;
+  Timer? _pingTimer;
+  DateTime _lastInboundAt = DateTime.now();
+
+  /// Frames produced while the socket is not writable, replayed on connect.
+  final List<String> _outbox = [];
+  static const int _maxOutbox = 40;
 
   /// Views (live UI listeners) per attached chat.
   final Map<String, ChatView> _views = {};
@@ -99,16 +147,27 @@ class NanobotSocket {
   void Function()? onSessionsChanged;
   /// Model name changed server-side.
   void Function(String model)? onModelUpdated;
+  /// Any turn-level event arrived for a chat (used to keep long tasks warm).
+  void Function(String chatId)? onTurnActivity;
+  /// Server-reported error with no attached view (connection-level).
+  void Function(String? chatId, String detail)? onErrorEvent;
 
   NanobotSocket({required this.tokenProvider, String? wsBase})
       : wsBase = wsBase ?? PowerXConfig.wsOrigin;
 
   bool get isConnected => _channel != null;
 
+  /// Whether a turn is currently believed to be running for [chatId].
+  bool isTurnActive(String chatId) => _activeTurns.contains(chatId);
+
+  /// Timestamp of the last frame received from the server (any kind).
+  DateTime get lastInboundAt => _lastInboundAt;
+
   // ---- connection lifecycle --------------------------------------------
 
   Future<void> connect() async {
     if (_connecting) return;
+    if (isConnected) return;
     _connecting = true;
     try {
       final tk = await tokenProvider();
@@ -119,17 +178,21 @@ class NanobotSocket {
       final ch = IOWebSocketChannel.connect(
         uri,
         pingInterval: const Duration(seconds: 20),
+        connectTimeout: const Duration(seconds: 20),
       );
       await ch.ready;
       _channel = ch;
       _reconnectAttempts = 0;
       _connecting = false;
+      _lastInboundAt = DateTime.now();
       _sub = ch.stream.listen(
         _onData,
         onDone: _onDisconnect,
         onError: (_) => _onDisconnect(),
         cancelOnError: true,
       );
+      _startHeartbeat();
+      await _flushOutbox();
       onConnectionChanged?.call(true);
     } catch (e) {
       _connecting = false;
@@ -144,6 +207,7 @@ class NanobotSocket {
 
   void _onDisconnect() {
     if (_closedByUser) return;
+    _stopHeartbeat();
     _sub?.cancel();
     _sub = null;
     _channel = null;
@@ -154,6 +218,8 @@ class NanobotSocket {
   void _scheduleReconnect() {
     if (_closedByUser || _reconnectTimer != null) return;
     _reconnectAttempts++;
+    // Unbounded, capped at 30 s: a long backgrounded turn must always come
+    // back rather than give up after a handful of attempts.
     final base = min(30, pow(2, min(_reconnectAttempts, 5)).toInt());
     final delay = Duration(seconds: base + _rng.nextInt(2));
     _reconnectTimer = Timer(delay, () async {
@@ -172,13 +238,69 @@ class NanobotSocket {
     });
   }
 
+  /// Application-level keepalive. Server + proxy may drop an idle socket
+  /// while a long tool call runs with no output; a periodic no-op frame keeps
+  /// both directions warm so the turn never appears to "pause".
+  void _startHeartbeat() {
+    _pingTimer?.cancel();
+    _pingTimer = Timer.periodic(const Duration(seconds: 25), (_) {
+      if (!isConnected) return;
+      _send({'type': 'ping', 'ts': DateTime.now().millisecondsSinceEpoch});
+      // If nothing at all came back for two intervals, the socket is a zombie
+      // (no FIN received): force a clean reconnect so the stream resumes.
+      if (DateTime.now().difference(_lastInboundAt) >
+          const Duration(seconds: 70)) {
+        _onDisconnect();
+      }
+    });
+  }
+
+  void _stopHeartbeat() {
+    _pingTimer?.cancel();
+    _pingTimer = null;
+  }
+
   void _send(Map<String, dynamic> frame) {
-    _channel?.sink.add(jsonEncode(frame));
+    final ch = _channel;
+    if (ch == null) {
+      _queueFrame(jsonEncode(frame));
+      return;
+    }
+    try {
+      ch.sink.add(jsonEncode(frame));
+    } catch (_) {
+      _queueFrame(jsonEncode(frame));
+      _onDisconnect();
+    }
+  }
+
+  void _queueFrame(String raw) {
+    // Never drop a user message; drop only stale heartbeats when full.
+    _outbox.add(raw);
+    while (_outbox.length > _maxOutbox) {
+      final idx = _outbox.indexWhere((f) => f.contains('"ping"'));
+      _outbox.removeAt(idx >= 0 ? idx : 0);
+    }
+  }
+
+  Future<void> _flushOutbox() async {
+    if (_outbox.isEmpty) return;
+    final pending = List<String>.from(_outbox);
+    _outbox.clear();
+    for (final raw in pending) {
+      try {
+        _channel?.sink.add(raw);
+      } catch (_) {
+        _outbox.insert(0, raw);
+        break;
+      }
+    }
   }
 
   // ---- inbound events ----------------------------------------------------
 
   void _onData(dynamic raw) {
+    _lastInboundAt = DateTime.now();
     late final Map<String, dynamic> ev;
     try {
       ev = jsonDecode(raw as String) as Map<String, dynamic>;
@@ -204,9 +326,11 @@ class NanobotSocket {
         }
         break;
       case 'delta':
+        onTurnActivity?.call(chatId ?? '');
         _view(chatId)?.onDelta((ev['text'] ?? '') as String);
         break;
       case 'reasoning_delta':
+        onTurnActivity?.call(chatId ?? '');
         _view(chatId)?.onReasoningDelta((ev['text'] ?? '') as String);
         break;
       case 'reasoning_end':
@@ -217,6 +341,15 @@ class NanobotSocket {
         // carry the authoritative buffered `text` for the stream that ended.
         final v = _view(chatId);
         v?.onStreamEnd(ev['text'] is String ? ev['text'] as String : null);
+        break;
+      case 'message_accepted':
+        // Canonical turn ownership for a locally submitted message. The origin
+        // client already rendered the optimistic bubble, so we only adopt the
+        // run state (never echo the text back as a second user bubble).
+        if (chatId != null) {
+          _activeTurns.add(chatId);
+          onTurnActivity?.call(chatId);
+        }
         break;
       case 'message':
         _handleMessageEvent(ev, chatId);
@@ -229,7 +362,8 @@ class NanobotSocket {
             usage: _numMap(ev['usage']),
             latencyMs: ev['latency_ms'] is num
                 ? (ev['latency_ms'] as num).toInt()
-                : null);
+                : null,
+            turnId: ev['turn_id'] as String?);
         break;
       case 'goal_status':
         final status = ev['status'] as String?;
@@ -253,7 +387,9 @@ class NanobotSocket {
       case 'user_message':
         final v = _view(chatId);
         if (v != null) {
-          v.onUserMessage((ev['text'] ?? '') as String, ev['turn_id'] as String?);
+          final text = (ev['text'] ?? '') as String;
+          final turnId = ev['turn_id'] as String?;
+          if (text.isNotEmpty) v.onUserMessage(text, turnId);
           if (ev['starts_turn'] == true || ev['active_turn_id'] != null) {
             _activeTurns.add(chatId!);
           }
@@ -267,7 +403,11 @@ class NanobotSocket {
       case 'error':
         final detail = (ev['detail'] ?? 'error') as String;
         final v = _view(chatId);
-        if (v != null) v.onError(detail);
+        if (v != null) {
+          v.onError(detail);
+        } else {
+          onErrorEvent?.call(chatId, detail);
+        }
         break;
     }
   }
@@ -308,7 +448,10 @@ class NanobotSocket {
             id: 'h-${DateTime.now().microsecondsSinceEpoch}',
             order: order));
       }
-      if (steps.isNotEmpty) v.onActivity(steps);
+      if (steps.isNotEmpty) {
+        onTurnActivity?.call(chatId ?? '');
+        v.onActivity(steps);
+      }
       return;
     }
 
@@ -335,7 +478,11 @@ class NanobotSocket {
     final usage = _numMap(ev['usage']);
     final lat = ev['latency_ms'] is num ? (ev['latency_ms'] as num).toInt() : null;
     v.onFinalMessage(text, media);
-    _endTurn(chatId, usage: usage, latencyMs: lat);
+    _endTurn(chatId,
+        usage: usage,
+        latencyMs: lat,
+        media: media,
+        turnId: ev['turn_id'] as String?);
   }
 
   void _handleFileEdit(Map<String, dynamic> ev, String? chatId) {
@@ -358,11 +505,17 @@ class NanobotSocket {
         order: order++,
       ));
     }
-    if (steps.isNotEmpty) v.onActivity(steps);
+    if (steps.isNotEmpty) {
+      onTurnActivity?.call(chatId ?? '');
+      v.onActivity(steps);
+    }
   }
 
   void _endTurn(String? chatId,
-      {required Map<String, num>? usage, required int? latencyMs}) {
+      {required Map<String, num>? usage,
+      required int? latencyMs,
+      List<String> media = const [],
+      String? turnId}) {
     if (chatId == null) return;
     if (!_activeTurns.remove(chatId)) {
       // Terminal event for a turn we did not think was active. Two cases:
@@ -373,11 +526,13 @@ class NanobotSocket {
       // it exactly once — otherwise the green indicator rolls forever.
       if (_finalizedTurns.contains(chatId)) return;
       _finalizedTurns.add(chatId);
-      _view(chatId)?.onTurnEnd(TurnSummary(usage: usage, latencyMs: latencyMs));
+      _view(chatId)?.onTurnEnd(
+          TurnSummary(usage: usage, latencyMs: latencyMs, media: media, turnId: turnId));
       return;
     }
     _finalizedTurns.add(chatId);
-    _view(chatId)?.onTurnEnd(TurnSummary(usage: usage, latencyMs: latencyMs));
+    _view(chatId)?.onTurnEnd(
+        TurnSummary(usage: usage, latencyMs: latencyMs, media: media, turnId: turnId));
   }
 
   ChatView? _view(String? chatId) => chatId == null ? null : _views[chatId];
@@ -395,8 +550,9 @@ class NanobotSocket {
   // ---- outbound ----------------------------------------------------------
 
   /// Provision a fresh persistent chat (server `new_chat`) and resolve with
-  /// its chat_id.
-  Future<String> newChat({Duration timeout = const Duration(seconds: 10)}) async {
+  /// its chat_id. Connects first when needed so a cold start can one-shot.
+  Future<String> newChat({Duration timeout = const Duration(seconds: 15)}) async {
+    if (!isConnected) await connect();
     final completer = Completer<String>();
     _pendingNewChat['__any__'] = completer;
     _send({'type': 'new_chat'});
@@ -409,10 +565,14 @@ class NanobotSocket {
     return completer.future.whenComplete(timer.cancel);
   }
 
-  /// Subscribe to an existing chat. Safe to call repeatedly.
+  /// Subscribe to an existing chat. Safe to call repeatedly; re-sends the
+  /// frame when the server has not acked it yet (idempotent server-side).
   Future<String> attach(String chatId,
-      {Duration timeout = const Duration(seconds: 10)}) async {
+      {Duration timeout = const Duration(seconds: 15)}) async {
+    if (!isConnected) await connect();
     if (_attachedChats.contains(chatId)) return chatId;
+    final existing = _pendingNewChat[chatId];
+    if (existing != null) return existing.future;
     final completer = Completer<String>();
     _pendingNewChat[chatId] = completer;
     _send({'type': 'attach', 'chat_id': chatId});
@@ -434,11 +594,29 @@ class NanobotSocket {
 
   void unlisten(String chatId) => _views.remove(chatId);
 
+  /// Forget all client-side state for a chat that was deleted server-side, so
+  /// a later re-attach cannot resurrect a stale busy indicator.
+  void dropChat(String chatId) {
+    _views.remove(chatId);
+    _attachedChats.remove(chatId);
+    _activeTurns.remove(chatId);
+    _finalizedTurns.remove(chatId);
+    _pendingNewChat.remove(chatId);
+  }
+
+  /// Mark a turn as started for [chatId] before the server confirms it, so a
+  /// terminal event that arrives first is still attributed correctly.
+  void markUserTurn(String chatId) {
+    _activeTurns.add(chatId);
+    _finalizedTurns.remove(chatId);
+  }
+
   /// Start a turn: register the active flag, then send the message frame.
   void sendMessage(
     String chatId,
     String content, {
     List<Map<String, dynamic>>? media,
+    String? turnId,
   }) {
     _activeTurns.add(chatId);
     _finalizedTurns.remove(chatId);
@@ -447,12 +625,24 @@ class NanobotSocket {
       'chat_id': chatId,
       'content': content,
       if (media != null && media.isNotEmpty) 'media': media,
+      if (turnId != null) 'turn_id': turnId,
       'webui': true,
     });
   }
 
   /// Cancel the running task on [chatId] (server-side /stop semantics).
-  void stopTask(String chatId) => sendMessage(chatId, '/stop');
+  void stopTask(String chatId) {
+    // Clear the local busy flag only after the server acknowledges; the UI
+    // keeps a bounded grace timer for the pathological case where the
+    // gateway never answers.
+    _send({
+      'type': 'message',
+      'chat_id': chatId,
+      'content': '/stop',
+      'webui': true,
+      'turn_id': 'stop-${DateTime.now().microsecondsSinceEpoch}',
+    });
+  }
 
   /// Whether a turn for [chatId] was active and finalized since [listen].
   bool sawTurnEnd(String chatId) => _finalizedTurns.contains(chatId);
@@ -461,11 +651,16 @@ class NanobotSocket {
     _closedByUser = true;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
+    _stopHeartbeat();
     _sub?.cancel();
-    _channel?.sink.close(ws_status.normalClosure);
+    _sub = null;
+    try {
+      _channel?.sink.close(ws_status.normalClosure);
+    } catch (_) {}
     _channel = null;
     _views.clear();
     _attachedChats.clear();
     _activeTurns.clear();
+    _outbox.clear();
   }
 }

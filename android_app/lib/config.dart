@@ -11,7 +11,7 @@ class PowerXConfig {
   /// Settings > About row is the install-time proof of which build is running.
   static const String appName = 'CDNAI';
   static const String tagline = 'Your AI Work Partner';
-  static const String appVersion = '1.1.3+5';
+  static const String appVersion = '1.2.0+7';
 
   /// Normalized base without trailing slash.
   static String get origin {
