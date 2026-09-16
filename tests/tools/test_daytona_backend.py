@@ -546,6 +546,149 @@ async def test_fetch_url_respects_configured_hosts(calls: Any) -> None:  # noqa:
 
 
 # --------------------------------------------------------------------------- #
+# Host-side relay: the fix for Tier 1/2 organizations where the sandbox cannot #
+# dial arbitrary hosts and no sandbox-level allow list can change that.        #
+# --------------------------------------------------------------------------- #
+
+
+def test_relay_enabled_by_default_and_policy_follows_fetch_hosts() -> None:
+    """An unrestricted sandbox still benefits: the relay mirrors fetch_allow_hosts."""
+    backend = DaytonaExecutionBackend(
+        _config(fetch_allow_hosts="example.com,*.example.org"), sandbox_name="px-r1"
+    )
+    assert backend.relay_enabled is True
+    assert backend.relay_policy.host_allowed("example.com") is True
+    assert backend.relay_policy.host_allowed("sub.example.org") is True
+    assert backend.relay_policy.host_allowed("evil.com") is False
+
+
+def test_relay_policy_isolated_from_fetch_hosts_when_overridden() -> None:
+    backend = DaytonaExecutionBackend(
+        _config(fetch_allow_hosts="only.example.com", relay_allow_hosts="relay.example.net"),
+        sandbox_name="px-r2",
+    )
+    assert backend.relay_policy.host_allowed("relay.example.net") is True
+    assert backend.relay_policy.host_allowed("only.example.com") is False
+
+
+def test_relay_defaults_are_https_only_and_ssrf_safe() -> None:
+    backend = DaytonaExecutionBackend(_config(), sandbox_name="px-r3")
+    assert backend.relay_policy.allow_http is False
+    assert backend.relay_policy.allow_private is False
+
+
+def test_relay_status_reports_diagnostics() -> None:
+    backend = DaytonaExecutionBackend(_config(), sandbox_name="px-r4")
+    status = backend.relay_status()
+    assert status["relay_enabled"] is True
+    assert status["relay_allow_http"] is False
+    assert status["network_override_restricted"] is False
+    assert status["relay_max_bytes"] == 268_435_456
+
+
+async def test_fetch_url_uses_host_relay(calls: Any, monkeypatch: Any) -> None:  # noqa: ANN401
+    """The relay fetches on the host and writes bytes in, with no sandbox curl."""
+    captured: dict[str, Any] = {}
+
+    async def fake_relay(backend: Any, url: str, dest_path: str, *, timeout: int, policy: Any) -> Any:
+        from nanobot.agent.tools.daytona_relay import RelayResult
+
+        captured["url"] = url
+        captured["dest"] = dest_path
+        captured["policy_allows"] = policy.host_allowed("example.com")
+        result = RelayResult(
+            url=url, final_url=url, status=200, content_type="text/plain", data=b"relayed-bytes"
+        )
+        await backend.write_bytes(dest_path, result.data)
+        return dest_path, result
+
+    monkeypatch.setattr(daytona_backend, "relay_fetch_into_backend", fake_relay)
+    backend = DaytonaExecutionBackend(
+        _config(fetch_allow_hosts="example.com"), sandbox_name="px-relay"
+    )
+    relayed: list[tuple[str, bytes]] = []
+
+    async def fake_write_bytes(path: str, data: bytes) -> None:
+        relayed.append((path, data))
+
+    monkeypatch.setattr(backend, "write_bytes", fake_write_bytes)
+    written = await backend.fetch_url("https://example.com/file.bin", "downloads/file.bin")
+    assert written == "/home/daytona/downloads/file.bin"
+    assert captured["url"] == "https://example.com/file.bin"
+    assert captured["policy_allows"] is True
+    assert relayed == [("/home/daytona/downloads/file.bin", b"relayed-bytes")]
+    # No sandbox exec happened: the host did the network I/O.
+    assert not [c for c in calls if "process/execute" in c[1]]
+
+
+async def test_fetch_url_falls_back_to_sandbox_curl_when_relay_declines(
+    calls: Any, monkeypatch: Any  # noqa: ANN401
+) -> None:
+    """A relay transport failure must not break allowlisted direct downloads."""
+    from nanobot.agent.tools.daytona_relay import RelayError
+
+    async def failing_relay(*_args: Any, **_kwargs: Any) -> Any:
+        raise RelayError("relay transport error reaching https://example.com: ClientError")
+
+    def handler(method: str, url: str, kwargs: dict[str, Any]) -> _Response:
+        if method == "GET" and "/sandbox/" in url:
+            return _Response(status=200, payload={"id": "sbx-fb", "state": "started", "toolboxProxyUrl": "https://tb.example"})
+        if method == "POST" and url.endswith("/process/execute"):
+            return _Response(status=200, payload={"exitCode": 0, "result": "1024"})
+        return _Response(status=404, payload={"error": "not found"})
+
+    monkeypatch.setattr(daytona_backend, "relay_fetch_into_backend", failing_relay)
+    calls.install(handler)
+    backend = DaytonaExecutionBackend(
+        _config(fetch_allow_hosts="example.com"), sandbox_name="px-fallback"
+    )
+    assert await backend.fetch_url("https://example.com/f.bin", "f.bin") == "/home/daytona/f.bin"
+    # The curl path ran because the relay failed but the host is allowlisted.
+    assert [c for c in calls if "process/execute" in c[1]]
+
+
+async def test_fetch_url_rejects_disallowed_host_without_relaying(
+    calls: Any, monkeypatch: Any  # noqa: ANN401
+) -> None:
+    """A host outside the allow list is refused outright, relay or not."""
+    from nanobot.agent.tools.daytona_relay import RelayError
+
+    async def failing_relay(*_args: Any, **_kwargs: Any) -> Any:
+        raise RelayError("URL host 'evil.test' is not in the allowed fetch hosts list.")
+
+    monkeypatch.setattr(daytona_backend, "relay_fetch_into_backend", failing_relay)
+    backend = DaytonaExecutionBackend(
+        _config(fetch_allow_hosts="example.com"), sandbox_name="px-reject"
+    )
+    with pytest.raises(ValueError, match="not in the allowed fetch hosts"):
+        await backend.fetch_url("https://evil.test/payload", "payload.bin")
+
+
+async def test_fetch_url_skips_relay_when_disabled(calls: Any, monkeypatch: Any) -> None:  # noqa: ANN401
+    """relay_enabled=False restores the original direct-from-sandbox behaviour."""
+    called = {"relay": False}
+
+    async def unexpected_relay(*_args: Any, **_kwargs: Any) -> Any:
+        called["relay"] = True
+        raise AssertionError("relay must not run when disabled")
+
+    def handler(method: str, url: str, kwargs: dict[str, Any]) -> _Response:
+        if method == "GET" and "/sandbox/" in url:
+            return _Response(status=200, payload={"id": "sbx-off", "state": "started", "toolboxProxyUrl": "https://tb.example"})
+        if method == "POST" and url.endswith("/process/execute"):
+            return _Response(status=200, payload={"exitCode": 0, "result": "5"})
+        return _Response(status=404, payload={"error": "not found"})
+
+    monkeypatch.setattr(daytona_backend, "relay_fetch_into_backend", unexpected_relay)
+    calls.install(handler)
+    backend = DaytonaExecutionBackend(
+        _config(fetch_allow_hosts="example.com", relay_enabled=False), sandbox_name="px-off"
+    )
+    await backend.fetch_url("https://example.com/f.bin", "f.bin")
+    assert called["relay"] is False
+
+
+# --------------------------------------------------------------------------- #
 # Daytona workspace persistence ("perfect sandbox" parity with Upstash)      #
 # --------------------------------------------------------------------------- #
 

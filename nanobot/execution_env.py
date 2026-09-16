@@ -137,6 +137,34 @@ def apply_render_execution_env(config: Any) -> Any:
         }:
             daytona.network_allow_list = network_list
         _fill(daytona, "fetch_allow_hosts", _env("NANOBOT_DAYTONA_FETCH_ALLOW_HOSTS"))
+        _fill(daytona, "relay_allow_hosts", _env("NANOBOT_DAYTONA_RELAY_ALLOW_HOSTS"))
+        relay_enabled = _env("NANOBOT_DAYTONA_RELAY_ENABLED")
+        if relay_enabled is not None and str(relay_enabled).strip().lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            daytona.relay_enabled = False
+        relay_allow_http = _env("NANOBOT_DAYTONA_RELAY_ALLOW_HTTP")
+        if relay_allow_http is not None and str(relay_allow_http).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            daytona.relay_allow_http = True
+        relay_allow_private = _env("NANOBOT_DAYTONA_RELAY_ALLOW_PRIVATE_HOSTS")
+        if relay_allow_private is not None and str(relay_allow_private).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            daytona.relay_allow_private_hosts = True
+        relay_max_bytes = _positive_int(_env("NANOBOT_DAYTONA_RELAY_MAX_BYTES"), maximum=2_147_483_648)
+        if relay_max_bytes is not None and relay_max_bytes >= 1_048_576:
+            daytona.relay_max_bytes = relay_max_bytes
         ttl_minutes = _positive_int(_env("NANOBOT_DAYTONA_TTL_MINUTES"), maximum=43_200)
         if ttl_minutes is not None and ttl_minutes >= 5 and int(getattr(daytona, "ttl_minutes", 60) or 60) == 60:
             daytona.ttl_minutes = ttl_minutes

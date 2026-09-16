@@ -40,6 +40,14 @@ from urllib.parse import quote, urlparse, urlsplit
 import aiohttp
 from loguru import logger
 
+from nanobot.agent.tools.daytona_relay import (
+    RelayError,
+    RelayPolicy,
+    RelayResult,
+    build_policy,
+    relay_fetch_into_backend,
+)
+
 _MAX_COMMAND_CHARS = 12_000
 _MAX_CONTENT_CHARS = 120_000
 _MAX_RESULT_CHARS = 16_000
@@ -295,6 +303,10 @@ def validate_daytona_fetch_allow_hosts(raw: str) -> str:
 
 _NETWORK_POLICY_KEYS = frozenset({"domainAllowList", "networkAllowList", "networkBlockAll"})
 
+# Relay defaults: the curated fetch allow list doubles as the relay allow list so
+# `action=fetch_url` behaves the same whether or not the sandbox can dial out.
+DEFAULT_RELAY_ALLOW_HOSTS: tuple[str, ...] = DEFAULT_FETCH_ALLOW_HOSTS
+
 
 def daytona_sandbox_name(session_key: str) -> str:
     """Deterministic, valid sandbox name for a session so sandboxes survive restarts."""
@@ -353,6 +365,22 @@ class DaytonaExecutionBackend:
             {h.strip() for h in self.fetch_allow_hosts.split(",") if h.strip()}
             if self.fetch_allow_hosts
             else set(DEFAULT_FETCH_ALLOW_HOSTS)
+        )
+        # Host-side relay. A Tier 1/Tier 2 Daytona organization blocks arbitrary
+        # egress no matter what allow list PowerX sends, so destinations outside
+        # the essential-services set can never be dialled from inside the
+        # sandbox. Instead the PowerX host (unrestricted egress) performs the
+        # fetch and injects the bytes over the toolbox files API. Set
+        # relay_enabled=False to force the old direct-from-sandbox behaviour.
+        self.relay_enabled = bool(getattr(config, "relay_enabled", True))
+        self.relay_allow_http = bool(getattr(config, "relay_allow_http", False))
+        self.relay_allow_private_hosts = bool(getattr(config, "relay_allow_private_hosts", False))
+        relay_hosts = str(getattr(config, "relay_allow_hosts", "") or "").strip()
+        self.relay_policy: RelayPolicy = build_policy(
+            relay_hosts if relay_hosts else sorted(self._fetch_hosts),
+            allow_http=self.relay_allow_http,
+            max_bytes=int(getattr(config, "relay_max_bytes", 0) or 0) or 268_435_456,
+            allow_private=self.relay_allow_private_hosts,
         )
         self.ttl_minutes = max(5, min(int(getattr(config, "ttl_minutes", 60) or 60), 43_200))
         self.auto_stop_minutes = max(0, min(int(getattr(config, "auto_stop_minutes", 0) or 0), 10_080))
@@ -844,15 +872,56 @@ class DaytonaExecutionBackend:
         )
 
     async def fetch_url(self, url: str, dest_path: str, *, timeout: int = 150) -> str:
+        """Fetch *url* into the sandbox workspace.
+
+        Order of operations:
+
+        1. **Host relay** (default). PowerX fetches the URL on the host — which
+           has unrestricted egress — and writes the bytes into the sandbox. This
+           is the only path that reaches arbitrary hosts on a network-restricted
+           (Tier 1/Tier 2) Daytona organization, where the sandbox firewall
+           permits essential services only.
+        2. **Direct sandbox curl** (fallback). Used when the relay is disabled or
+           declined the URL, preserving the previous behaviour for unrestricted
+           organizations and for straightforward registry/mirror downloads.
+        """
         parsed = urlparse(url)
         host = (parsed.netloc or "").lower()
         allowed = parsed.scheme in ("https", "http") and self._is_host_allowed(host)
+        dest = _safe_path(dest_path, self.workspace)
+
+        relay_error: str = ""
+        if self.relay_enabled:
+            try:
+                written, result = await relay_fetch_into_backend(
+                    self,
+                    url,
+                    dest,
+                    timeout=timeout,
+                    policy=self.relay_policy,
+                )
+                note = " (truncated at the relay size cap)" if result.truncated else ""
+                logger.info(
+                    "relayed {} -> {} ({} bytes{})",
+                    url,
+                    written,
+                    result.size,
+                    note,
+                )
+                return written
+            except RelayError as exc:
+                relay_error = str(exc)
+                # A policy refusal is authoritative: fall through to the sandbox
+                # curl only when the host allow list would have permitted it.
+                if not allowed:
+                    raise ValueError(relay_error) from None
+                logger.warning("host relay declined {} ({}); trying sandbox curl", url, relay_error)
+
         if not allowed:
             raise ValueError(
                 f"URL host {host!r} is not in the allowed fetch hosts list. "
                 "Add it to the Daytona fetch_allow_hosts setting or set NANOBOT_DAYTONA_FETCH_ALLOW_HOSTS."
             )
-        dest = _safe_path(dest_path, self.workspace)
         command = (
             f"mkdir -p {shlex.quote(posixpath.dirname(dest))} && "
             f"curl -fsSL --max-time {int(timeout)} -o {shlex.quote(dest)} {shlex.quote(url)} && "
@@ -862,6 +931,38 @@ class DaytonaExecutionBackend:
         if "[exit_code=" in out and "exit_code=0" not in out:
             raise DaytonaError(f"remote fetch failed: {out[:300]}")
         return dest
+
+    # ------------------------------------------------------------------ relay
+
+    @property
+    def relay_spool_dir(self) -> str:
+        """Sandbox-side directory the relay bridge watches for requests."""
+        return f"{self.workspace}/.px-relay"
+
+    def relay_status(self) -> dict[str, Any]:
+        """Diagnostics for the relay, surfaced through reset/health checks."""
+        return {
+            "relay_enabled": self.relay_enabled,
+            "relay_allow_hosts": sorted(self.relay_policy.allow_hosts)[:20],
+            "relay_allow_http": self.relay_policy.allow_http,
+            "relay_max_bytes": self.relay_policy.max_bytes,
+            "network_override_restricted": daytona_network_override_restricted(),
+            "outbound_proxy_configured": bool(self.outbound_proxy_url),
+        }
+
+    async def run_with_relay(self, command: str, *, timeout: int = 120) -> str:
+        """Run a command directly.
+
+        Commands that dial arbitrary hosts (``curl``/``wget`` to a
+        non-essential host, ``git clone`` from an arbitrary origin) still cannot
+        egress from a Tier 1/Tier 2 sandbox, because the organization firewall
+        rejects every sandbox-level allow list. Use :meth:`fetch_url` for those
+        downloads: the PowerX host performs the fetch and injects the bytes, so
+        the sandbox never needs to dial out. This method therefore just runs the
+        command, and exists so callers have a single documented entry point.
+        """
+        _ = self.relay_spool_dir
+        return await self.run(command, timeout=timeout)
 
     async def download(self, remote_path: str, local_path: Any) -> Any:
         """Download a sandbox file to a local path."""

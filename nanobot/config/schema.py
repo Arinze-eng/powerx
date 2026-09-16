@@ -442,6 +442,24 @@ class DaytonaExecutionConfig(Base):
     # Format: http://host:port or http://user:pass@host:port.
     outbound_proxy_url: str = Field(default="", repr=False)
     fetch_allow_hosts: str = ""
+    # Host-side fetch relay. On a Tier 1/Tier 2 organization EVERY sandbox-level
+    # egress override is rejected, so an allow list cannot widen access and even
+    # `outboundProxyUrl` does not lift the restriction (measured: setting it
+    # leaves non-essential hosts blocked and can break allowlisted ones too).
+    # The remaining option is to invert the request: the PowerX host, which has
+    # unrestricted egress, performs the fetch and pushes the bytes into the
+    # sandbox over the toolbox files API. This is on by default because without
+    # it `action=fetch_url` silently fails for every non-essential host.
+    relay_enabled: bool = True
+    # Allow list enforced by the host relay. Empty means "reuse fetch_allow_hosts".
+    # The host has unrestricted egress, so this list is the real enforcement point.
+    relay_allow_hosts: str = ""
+    # The relay defaults to HTTPS-only; opt in to plain HTTP for legacy mirrors.
+    relay_allow_http: bool = False
+    # Escape hatch for operators relaying to private origins (e.g. an internal
+    # artifact mirror). Leaves the relay open to SSRF, so it is off by default.
+    relay_allow_private_hosts: bool = False
+    relay_max_bytes: int = Field(default=268_435_456, ge=1_048_576, le=2_147_483_648)
     ttl_minutes: int = Field(default=60, ge=5, le=43_200)
     auto_stop_minutes: int = Field(default=0, ge=0, le=10_080)
     # "Perfect sandbox" persistence: keep workspace files across finished tasks

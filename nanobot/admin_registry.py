@@ -368,6 +368,15 @@ def _execution_settings() -> dict[str, Any]:
                 "domain_allow_list": str(getattr(daytona, "domain_allow_list", "") or ""),
                 "network_allow_list": str(getattr(daytona, "network_allow_list", "") or ""),
                 "fetch_allow_hosts": str(getattr(daytona, "fetch_allow_hosts", "") or ""),
+                "relay_enabled": bool(getattr(daytona, "relay_enabled", True)),
+                "relay_allow_hosts": str(getattr(daytona, "relay_allow_hosts", "") or ""),
+                "relay_allow_http": bool(getattr(daytona, "relay_allow_http", False)),
+                "relay_allow_private_hosts": bool(
+                    getattr(daytona, "relay_allow_private_hosts", False)
+                ),
+                "relay_max_bytes": int(
+                    getattr(daytona, "relay_max_bytes", 268_435_456) or 268_435_456
+                ),
                 "ttl_minutes": int(getattr(daytona, "ttl_minutes", 60) or 60),
                 "auto_stop_minutes": int(getattr(daytona, "auto_stop_minutes", 0) or 0),
                 "apiKeyConfigured": bool(str(getattr(daytona, "api_key", "") or "").strip()),
@@ -550,6 +559,21 @@ def _save_execution_settings(
             raw_proxy = _text(payload, "daytonaOutboundProxyUrl", maximum=512)
             if raw_proxy:
                 daytona.outbound_proxy_url = validate_daytona_outbound_proxy_url(raw_proxy)
+            raw_relay_hosts = _text(payload, "daytonaRelayAllowHosts", maximum=2048)
+            if raw_relay_hosts:
+                daytona.relay_allow_hosts = validate_daytona_fetch_allow_hosts(raw_relay_hosts)
+            raw_relay_enabled = payload.get("daytonaRelayEnabled")
+            if isinstance(raw_relay_enabled, bool):
+                daytona.relay_enabled = raw_relay_enabled
+            raw_relay_http = payload.get("daytonaRelayAllowHttp")
+            if isinstance(raw_relay_http, bool):
+                daytona.relay_allow_http = raw_relay_http
+            raw_relay_private = payload.get("daytonaRelayAllowPrivateHosts")
+            if isinstance(raw_relay_private, bool):
+                daytona.relay_allow_private_hosts = raw_relay_private
+            raw_relay_max = payload.get("daytonaRelayMaxBytes")
+            if isinstance(raw_relay_max, (int, float)) and 1_048_576 <= int(raw_relay_max) <= 2_147_483_648:
+                daytona.relay_max_bytes = int(raw_relay_max)
         # Runloop Devbox settings (key is only replaced when a new value is sent).
         runloop = getattr(config.execution, "runloop", None)
         if runloop is not None:
