@@ -9,6 +9,7 @@ import '../services/chat_cache.dart';
 import '../services/device_id.dart';
 import '../services/gateway_api.dart';
 import '../services/nanobot_socket.dart';
+import '../services/pending_sends.dart';
 import '../services/supabase_auth.dart';
 
 enum AppStatus { loading, unauthenticated, authenticating, authenticated, error }
@@ -42,10 +43,16 @@ class AppState extends ChangeNotifier {
   static const _kName = 'name';
   static const _kLastChat = 'last_chat_id';
   static const _kSessionCache = 'sessions_cache';
+  static const _kOpenChat = 'open_chat_v1';
 
   /// Local transcript persistence so a chat renders instantly and survives a
   /// backgrounded turn that the gateway does not replay over the socket.
   final ChatCache chatCache = ChatCache();
+
+  /// Durable queue of user messages that have not been confirmed by the
+  /// gateway yet, so a task survives the app being killed mid-send.
+  final PendingSendQueue pendingSends =
+      PendingSendQueue(SecureKeyValueStore());
 
   AppStatus status = AppStatus.loading;
   String? errorMessage;
@@ -122,6 +129,10 @@ class AppState extends ChangeNotifier {
         notifyListeners();
         unawaited(loadSessions());
         unawaited(refreshCredits());
+        // Cold start after an app kill: reconnect and re-subscribe the chat
+        // that was open so an in-flight task keeps streaming (steps + answer)
+        // instead of the user finding a frozen transcript.
+        unawaited(resumeOpenChat());
       } catch (_) {
         try {
           await _refreshSupabase();
@@ -130,6 +141,7 @@ class AppState extends ChangeNotifier {
           notifyListeners();
           unawaited(loadSessions());
           unawaited(refreshCredits());
+          unawaited(resumeOpenChat());
         } catch (e) {
           _resetIdentity(wipeStorage: false);
           await _clearSession();
@@ -240,6 +252,8 @@ class AppState extends ChangeNotifier {
     _resetIdentity(wipeStorage: false);
     await _clearSession();
     await chatCache.clearAll();
+    await pendingSends.clear();
+    await _storage.delete(key: _kOpenChat);
     status = AppStatus.unauthenticated;
     notifyListeners();
   }
@@ -269,6 +283,8 @@ class AppState extends ChangeNotifier {
       unawaited(_storage.delete(key: _kName));
       unawaited(_storage.delete(key: _kLastChat));
       unawaited(_storage.delete(key: _kSessionCache));
+      unawaited(_storage.delete(key: _kOpenChat));
+      unawaited(pendingSends.clear());
       unawaited(chatCache.clearAll());
     }
   }
@@ -624,6 +640,10 @@ class AppState extends ChangeNotifier {
       if (_wsToken == null) throw Exception('No gateway token available');
       return WsToken(_wsToken!, _wsPath ?? '/', supabaseToken: accessToken);
     });
+    // Durable send queue: a task typed before the app was killed is re-sent
+    // when the connection returns, and a task that reached the server keeps
+    // running while the screen is closed.
+    sock.pendingSends = pendingSends;
     sock.onConnectionChanged = (connected) {
       socketConnected = connected;
       if (connected) {
@@ -647,6 +667,59 @@ class AppState extends ChangeNotifier {
       }
     }
     return sock;
+  }
+
+  /// Remember which chat the user has open so a task that is still running
+  /// when the app is killed resumes streaming on the next launch.
+  void rememberOpenChat(String chatId, {String? sessionKey}) {
+    _socket?.setOpenChat(chatId, sessionKey: sessionKey);
+    rememberChat(chatId);
+    unawaited(_storage.write(
+      key: _kOpenChat,
+      value: jsonEncode({
+        'chat_id': chatId,
+        if (sessionKey != null) 'session_key': sessionKey,
+      }),
+    ));
+  }
+
+  /// The chat that was open when the app last stopped.
+  Future<OpenChat?> _restoreOpenChat() async {
+    try {
+      final raw = await _storage.read(key: _kOpenChat);
+      if (raw == null || raw.isEmpty) return null;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      final chatId = decoded['chat_id'];
+      if (chatId is! String || chatId.isEmpty) return null;
+      final sessionKey = decoded['session_key'];
+      return OpenChat(
+        chatId: chatId,
+        sessionKey: sessionKey is String && sessionKey.isNotEmpty
+            ? sessionKey
+            : null,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Reconnect and re-subscribe the chat that was open, then flush any task
+  /// that never reached the gateway. Idempotent; safe to call on every resume.
+  ///
+  /// This is what makes "give a task, close the app, come back" show the task
+  /// still progressing — with its steps and its answer — instead of a frozen
+  /// transcript.
+  Future<void> resumeOpenChat() async {
+    if (status != AppStatus.authenticated) return;
+    final sock = await ensureSocket();
+    final saved = await _restoreOpenChat();
+    final target = saved?.chatId ?? sock.lastActedChatId ?? lastChatId;
+    if (target == null) return;
+    sock.setOpenChat(target, sessionKey: saved?.sessionKey);
+    await sock.restore(chatId: target);
+    socketConnected = sock.isConnected;
+    notifyListeners();
   }
 
   void _fail(String msg) {

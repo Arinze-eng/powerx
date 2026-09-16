@@ -9,6 +9,7 @@ import 'package:web_socket_channel/status.dart' as ws_status;
 import '../config.dart';
 import '../models.dart';
 import 'gateway_api.dart';
+import 'pending_sends.dart';
 
 /// Live view callbacks for one chat's turn, mirroring the WebUI's
 /// useNanobotStream semantics. All callbacks run on the UI isolate; the
@@ -70,6 +71,46 @@ class _MutationReply {
     this.status,
     this.message,
   });
+}
+
+/// Persistent per-chat window that forwards live events to whichever
+/// [ChatView] is currently registered for the chat.
+///
+/// Why the indirection exists: the socket installs ONE long-lived relay per
+/// chat, so inbound events are never dropped while a screen re-registers its
+/// listener. Previously `unlisten` removed the view outright, and every frame
+/// that arrived in the gap (a reopen / re-attach) was silently discarded —
+/// which is what made a running task's steps and stream vanish after closing
+/// and reopening the app.
+class _ChatViewProxy {
+  ChatView? target;
+
+  /// The stable [ChatView] handed to the socket. It reads [target] at call
+  /// time, so replacing the listener never changes this object's identity and
+  /// no event is lost during the swap.
+  ChatView? _relay;
+
+  ChatView get relay => _relay ??= ChatView(
+        onDelta: (chunk) => target?.onDelta(chunk),
+        onActivity: (steps) => target?.onActivity(steps),
+        onReasoningDelta: (chunk) => target?.onReasoningDelta(chunk),
+        onReasoningEnd: () => target?.onReasoningEnd(),
+        onStreamEnd: (finalText) => target?.onStreamEnd(finalText),
+        onTurnEnd: (summary) => target?.onTurnEnd(summary),
+        onError: (detail) => target?.onError(detail),
+        onUserMessage: (text, turnId) => target?.onUserMessage(text, turnId),
+        onFinalMessage: (text, media) => target?.onFinalMessage(text, media),
+        onUsage: (usage) => target?.onUsage(usage),
+      );
+}
+
+/// A durable chat: the chat the user has open, restored after a cold start so
+/// a task started before the app was killed keeps streaming into a live view
+/// instead of being silently abandoned.
+class OpenChat {
+  const OpenChat({required this.chatId, required this.sessionKey});
+  final String chatId;
+  final String? sessionKey;
 }
 
 /// Token pair used to (re)establish a connection. [ws] is the gateway WS
@@ -153,8 +194,9 @@ class NanobotSocket {
   final List<String> _outbox = [];
   static const int _maxOutbox = 40;
 
-  /// Views (live UI listeners) per attached chat.
-  final Map<String, ChatView> _views = {};
+  /// Views (live UI listeners) per attached chat, behind a persistent window
+  /// so events survive a screen re-registering its listener.
+  final Map<String, _ChatViewProxy> _views = {};
   /// Chats the UI wants subscribed. Persists across reconnects so a
   /// backgrounded turn resumes streaming into the same view.
   final Set<String> _wantedChats = {};
@@ -175,6 +217,9 @@ class NanobotSocket {
   /// already finished here is ignored instead of re-opening the live results
   /// bubble (a finished task "firing" its results again).
   final Map<String, String> _completedTurnIds = {};
+  /// Server turn id owning each chat's current run, learned from the frames
+  /// that carry one (goal_status running, message, turn_end).
+  final Map<String, String> _currentTurnIds = {};
   final Map<String, Completer<String>> _pendingNewChat = {};
   final Random _rng = Random();
 
@@ -191,6 +236,23 @@ class NanobotSocket {
   /// Server-reported error with no attached view (connection-level).
   void Function(String? chatId, String detail)? onErrorEvent;
 
+  /// Persisted user messages awaiting gateway confirmation. Set by the app
+  /// layer (after sign-in) so a task survives an app process kill. Null keeps
+  /// the previous in-memory-only behaviour, which tests rely on.
+  PendingSendQueue? pendingSends;
+
+  /// The chat the user currently has open, in memory so [restore] can re-open
+  /// it without touching storage on the hot path.
+  OpenChat? _openChat;
+
+  /// Frames accepted by the UI but not yet confirmed written to the socket.
+  final List<PendingSend> _pendingSends = [];
+  bool _pendingLoaded = false;
+  Timer? _pendingFlushTimer;
+  /// Which chat the user is looking at, so a replayed in-flight turn is routed
+  /// to the right transcript after a cold start.
+  String? _lastActedChatId;
+
   NanobotSocket({required this.tokenProvider, String? wsBase})
       : wsBase = wsBase ?? PowerXConfig.wsOrigin;
 
@@ -198,6 +260,9 @@ class NanobotSocket {
 
   /// Whether a turn is currently believed to be running for [chatId].
   bool isTurnActive(String chatId) => _activeTurns.contains(chatId);
+
+  /// The server turn id currently believed to own [chatId]'s run, if known.
+  String? activeTurnId(String chatId) => _currentTurnIds[chatId];
 
   /// Timestamp of the last frame received from the server (any kind).
   DateTime get lastInboundAt => _lastInboundAt;
@@ -241,6 +306,10 @@ class NanobotSocket {
       );
       _startHeartbeat();
       await _flushOutbox();
+      // Replay any task the user issued before the app was killed. This runs
+      // before onConnectionChanged so the resend is on the wire ahead of the
+      // UI's own attach/reconcile work.
+      await _flushPendingSends();
       onConnectionChanged?.call(true);
     } catch (e) {
       _connecting = false;
@@ -285,6 +354,9 @@ class NanobotSocket {
           _attachedChats.remove(cid);
           _send({'type': 'attach', 'chat_id': cid});
         }
+        // A task typed while offline / before a process kill must still go
+        // out now that we are back.
+        await _flushPendingSends();
       } catch (_) {
         _scheduleReconnect();
       }
@@ -391,6 +463,166 @@ class NanobotSocket {
     }
   }
 
+  // ---- durable pending sends --------------------------------------------
+
+  /// Load the persisted unconfirmed sends (once per process) and resend them.
+  Future<void> _ensurePendingLoaded() async {
+    final queue = pendingSends;
+    if (queue == null || _pendingLoaded) return;
+    _pendingLoaded = true;
+    try {
+      final loaded = await queue.load();
+      if (loaded.isEmpty) return;
+      _pendingSends
+        ..clear()
+        ..addAll(loaded);
+      for (final s in _pendingSends) {
+        _activeTurns.add(s.chatId);
+      }
+      await queue.save(_pendingSends);
+    } catch (_) {
+      // Storage unavailable: fall back to in-memory only.
+    }
+  }
+
+  /// Re-send every frame the gateway has not confirmed, keeping the rest.
+  ///
+  /// A frame is dropped from the queue only once the socket has actually
+  /// accepted it, so a crash mid-send cannot lose the user's task.
+  Future<void> _flushPendingSends() async {
+    await _ensurePendingLoaded();
+    if (_pendingSends.isEmpty) return;
+    final remaining = <PendingSend>[];
+    for (final s in _pendingSends) {
+      var written = false;
+      try {
+        _channel?.sink.add(jsonEncode(s.toWireFrame()));
+        written = _channel != null;
+      } catch (_) {
+        written = false;
+      }
+      if (written) {
+        _activeTurns.add(s.chatId);
+      } else {
+        remaining.add(s);
+      }
+    }
+    _pendingSends
+      ..clear()
+      ..addAll(remaining);
+    await _persistPending();
+    if (remaining.isEmpty) {
+      // Everything is on the wire: let the UI reconcile against the server.
+      onSessionsChanged?.call();
+    }
+  }
+
+  Future<void> _persistPending() async {
+    final queue = pendingSends;
+    if (queue == null) return;
+    try {
+      await queue.save(_pendingSends);
+    } catch (_) {}
+  }
+
+  /// Record an outbound user message durably BEFORE it reaches the socket.
+  ///
+  /// Returns immediately; persistence is fire-and-forget so typing never
+  /// blocks on disk.
+  void _trackPendingSend(
+    String chatId,
+    String content, {
+    List<Map<String, dynamic>>? media,
+    String? turnId,
+  }) {
+    if (pendingSends == null) return;
+    final send = PendingSend(
+      id: 'ps-${DateTime.now().microsecondsSinceEpoch}',
+      chatId: chatId,
+      content: content,
+      media: media,
+      turnId: turnId,
+      createdAtMs: DateTime.now().millisecondsSinceEpoch,
+    );
+    _pendingSends.add(send);
+    if (_pendingSends.length > PendingSendQueue.maxEntries) {
+      _pendingSends.removeAt(0);
+    }
+    unawaited(_persistPending());
+    // A send that never reaches the wire is retried without waiting for a
+    // network change (covers "socket claimed open but is half dead").
+    _pendingFlushTimer?.cancel();
+    _pendingFlushTimer = Timer(const Duration(seconds: 4), () {
+      if (!_closedByUser && _pendingSends.isNotEmpty) {
+        unawaited(_flushPendingSends());
+      }
+    });
+  }
+
+  /// Drop a pending send once the server owns the turn. Anything else we may
+  /// still be holding for that chat is superseded too — the gateway only runs
+  /// one turn per chat.
+  void _confirmPendingSend(String chatId, String? turnId) {
+    if (_pendingSends.isEmpty) return;
+    var changed = false;
+    for (var i = _pendingSends.length - 1; i >= 0; i--) {
+      final s = _pendingSends[i];
+      if (s.chatId != chatId) continue;
+      if (turnId != null && s.turnId != null && s.turnId != turnId) continue;
+      _pendingSends.removeAt(i);
+      changed = true;
+    }
+    if (changed) unawaited(_persistPending());
+  }
+
+  /// Whether a task for [chatId] is still waiting to reach the gateway.
+  bool hasPendingSend(String chatId) =>
+      _pendingSends.any((s) => s.chatId == chatId);
+
+  // ---- open chat / cold-start recovery -----------------------------------
+
+  /// Remember which chat the user has open and make sure a background turn on
+  /// it keeps streaming into a live view.
+  void setOpenChat(String chatId, {String? sessionKey}) {
+    _openChat = OpenChat(chatId: chatId, sessionKey: sessionKey);
+    _lastActedChatId = chatId;
+    _wantedChats.add(chatId);
+  }
+
+  OpenChat? get openChat => _openChat;
+
+  /// The chat with the most recent gateway turn activity in this process.
+  ///
+  /// Used as a fallback when the app has to re-open a chat after a restart and
+  /// no explicit open-chat marker survived — a task that was streaming is a
+  /// better recovery target than an empty new conversation.
+  String? get lastActedChatId => _lastActedChatId;
+
+  /// Re-open a chat before/without the UI, and re-subscribe, so an in-flight
+  /// task resumes streaming (steps + answer) instead of the user finding a
+  /// frozen transcript.
+  ///
+  /// Attaches are normally driven by the UI; this only sends one when the chat
+  /// is not already confirmed subscribed, so it cannot double-subscribe.
+  Future<String?> restore({String? chatId}) async {
+    final target = chatId ?? _openChat?.chatId ?? _lastActedChatId;
+    if (target == null) return null;
+    await _ensurePendingLoaded();
+    if (!isConnected) {
+      try {
+        await connect();
+      } catch (_) {
+        return target;
+      }
+    }
+    if (!_attachedChats.contains(target)) {
+      _wantedChats.add(target);
+      _send({'type': 'attach', 'chat_id': target});
+    }
+    await _flushPendingSends();
+    return target;
+  }
+
   // ---- inbound events ----------------------------------------------------
 
   void _onData(dynamic raw) {
@@ -425,6 +657,12 @@ class NanobotSocket {
         break;
       case 'delta':
         onTurnActivity?.call(chatId ?? '');
+        if (chatId != null) {
+          _lastActedChatId = chatId;
+          // Streaming began: the gateway is definitely running this turn, so
+          // any copy we still hold is stale.
+          _confirmPendingSend(chatId, null);
+        }
         _view(chatId)?.onDelta((ev['text'] ?? '') as String);
         break;
       case 'reasoning_delta':
@@ -446,6 +684,13 @@ class NanobotSocket {
         // run state (never echo the text back as a second user bubble).
         if (chatId != null) {
           _activeTurns.add(chatId);
+          _lastActedChatId = chatId;
+          final acceptedTurnId = ev['turn_id'] as String?;
+          if (acceptedTurnId != null && acceptedTurnId.isNotEmpty) {
+            _currentTurnIds[chatId] = acceptedTurnId;
+          }
+          // The server owns this turn now — stop re-sending it.
+          _confirmPendingSend(chatId, acceptedTurnId);
           onTurnActivity?.call(chatId);
         }
         break;
@@ -466,6 +711,7 @@ class NanobotSocket {
       case 'goal_status':
         final status = ev['status'] as String?;
         if (chatId != null && status != null) {
+          _lastActedChatId = chatId;
           if (status == 'running') {
             final replayTurnId = ev['turn_id'] as String?;
             if (replayTurnId != null &&
@@ -475,9 +721,14 @@ class NanobotSocket {
               // reopening a finished task cannot re-fire its results.
               break;
             }
+            if (replayTurnId != null && replayTurnId.isNotEmpty) {
+              _currentTurnIds[chatId] = replayTurnId;
+            }
             // A turn started server-side (ours or a backgrounded one):
             // mark active so the eventual turn_end/idle closes it exactly once.
             _activeTurns.add(chatId);
+            // The gateway is executing this chat's turn — stop re-sending.
+            _confirmPendingSend(chatId, null);
           }
           onGoalStatus?.call(chatId, status);
           if (status == 'idle') {
@@ -491,6 +742,9 @@ class NanobotSocket {
         onSessionsChanged?.call();
         break;
       case 'user_message':
+        if (chatId != null) _lastActedChatId = chatId;
+        // The proxy keeps the window alive even if the screen is between
+        // listeners, so this projection is never lost mid-reopen.
         final v = _view(chatId);
         if (v != null) {
           final text = (ev['text'] ?? '') as String;
@@ -629,6 +883,7 @@ class NanobotSocket {
     if (turnId != null && turnId.isNotEmpty) {
       _completedTurnIds[chatId] = turnId;
     }
+    _currentTurnIds.remove(chatId);
     if (!_activeTurns.remove(chatId)) {
       // Terminal event for a turn we did not think was active. Two cases:
       // (a) duplicate/late terminal event — already finalized, ignore;
@@ -647,7 +902,8 @@ class NanobotSocket {
         TurnSummary(usage: usage, latencyMs: latencyMs, media: media, turnId: turnId));
   }
 
-  ChatView? _view(String? chatId) => chatId == null ? null : _views[chatId];
+  ChatView? _view(String? chatId) =>
+      chatId == null ? null : _views[chatId]?.target;
 
   static Map<String, num>? _numMap(dynamic v) {
     if (v is! Map) return null;
@@ -701,13 +957,26 @@ class NanobotSocket {
   }
 
   /// Register the live UI listener for [chatId]. The previous listener (if
-  /// any) is replaced.
+  /// any) is replaced inside the chat's persistent window.
+  ///
+  /// The window itself is never torn down here, so inbound frames keep being
+  /// routed to the chat (not dropped) during the moment a screen is between
+  /// listeners — the reopen / re-attach gap where a running task's steps and
+  /// stream used to disappear.
   void listen(String chatId, ChatView view) {
-    _views[chatId] = view;
+    final proxy = _views.putIfAbsent(chatId, _ChatViewProxy.new);
+    proxy.target = view;
     _finalizedTurns.remove(chatId);
   }
 
-  void unlisten(String chatId) => _views.remove(chatId);
+  /// Detach the UI listener but KEEP the chat's window so events for a
+  /// backgrounded turn are still processed and the next screen that opens this
+  /// chat resumes mid-stream.
+  void unlisten(String chatId) {
+    final proxy = _views[chatId];
+    if (proxy == null) return;
+    proxy.target = null;
+  }
 
   /// Forget all client-side state for a chat that was deleted server-side, so
   /// a later re-attach cannot resurrect a stale busy indicator.
@@ -718,7 +987,13 @@ class NanobotSocket {
     _activeTurns.remove(chatId);
     _finalizedTurns.remove(chatId);
     _completedTurnIds.remove(chatId);
+    _currentTurnIds.remove(chatId);
     _pendingNewChat.remove(chatId);
+    if (_openChat?.chatId == chatId) _openChat = null;
+    final hadPending =
+        _pendingSends.any((s) => s.chatId == chatId);
+    _pendingSends.removeWhere((s) => s.chatId == chatId);
+    if (hadPending) unawaited(_persistPending());
   }
 
   /// Mark a turn as started for [chatId] before the server confirms it, so a
@@ -737,6 +1012,13 @@ class NanobotSocket {
   }) {
     _activeTurns.add(chatId);
     _finalizedTurns.remove(chatId);
+    _lastActedChatId = chatId;
+    _wantedChats.add(chatId);
+    // Persist BEFORE the frame reaches the socket. If the app is killed (or
+    // the socket is already half dead) the task is re-sent on the next
+    // connect instead of vanishing, and it is cleared the moment the gateway
+    // answers `message_accepted` or starts streaming.
+    _trackPendingSend(chatId, content, media: media, turnId: turnId);
     _send({
       'type': 'message',
       'chat_id': chatId,
@@ -752,6 +1034,7 @@ class NanobotSocket {
     // Clear the local busy flag only after the server acknowledges; the UI
     // keeps a bounded grace timer for the pathological case where the
     // gateway never answers.
+    _confirmPendingSend(chatId, null);
     _send({
       'type': 'message',
       'chat_id': chatId,
@@ -850,6 +1133,8 @@ class NanobotSocket {
     _closedByUser = true;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
+    _pendingFlushTimer?.cancel();
+    _pendingFlushTimer = null;
     _stopHeartbeat();
     _sub?.cancel();
     _sub = null;

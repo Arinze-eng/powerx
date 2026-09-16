@@ -112,7 +112,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final chatId = _chatId;
     if (chatId == null) return;
     try {
-      final sock = await context.read<AppState>().ensureSocket();
+      final state = context.read<AppState>();
+      final sock = await state.ensureSocket();
       _socket = sock;
       _wireSocket(sock);
       // Rebuild the connection when it is stale, then re-subscribe.
@@ -120,6 +121,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       await sock.attach(chatId);
       if (mounted) setState(() => _connected = sock.isConnected);
       _registerView();
+      // A task that started before backgrounding is still ours: make sure the
+      // socket is watching this chat even if the screen never re-registered.
+      sock.setOpenChat(chatId, sessionKey: widget.session?.key);
     } catch (_) {
       if (mounted) setState(() => _connected = false);
     }
@@ -165,6 +169,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       final session = widget.session!;
       _chatId = session.chatId;
       state.rememberChat(session.chatId);
+      // Mark this chat as the one that is open, so a task still running when
+      // the app is killed resumes streaming on the next launch.
+      state.rememberOpenChat(session.chatId, sessionKey: session.key);
       // Render the local copy FIRST so the screen never flashes empty and
       // prior answers are visible instantly, then reconcile in background.
       final cached = await state.chatCache.load(session.chatId);
@@ -195,6 +202,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         final id = await sock.newChat();
         _chatId = id;
         state.rememberChat(id);
+        state.rememberOpenChat(id);
         _registerView();
         setState(() => _connected = true);
       } catch (e) {
@@ -225,7 +233,51 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     });
     _scheduleCacheWrite();
     if (history.activeTurnId != null) {
+      // The turn is genuinely running server-side. Re-arm the live bubble and
+      // make sure it is subscribed, so steps and stream keep arriving rather
+      // than the transcript sitting frozen mid-task.
+      _resumeLiveTurn(history.activeTurnId!);
       _startResyncWatch();
+    }
+  }
+
+  /// Re-open the live bubble for a turn that is running server-side, adopting
+  /// the server's turn id so the persisted copy and the streamed copy are
+  /// recognised as the same turn (and never both rendered).
+  ///
+  /// Also guarantees the socket is subscribed to this chat: a resume must not
+  /// depend on the UI having got as far as `_registerView`.
+  void _resumeLiveTurn(String serverTurnId) {
+    final chatId = _chatId;
+    final existing = _liveTurn;
+    if (existing != null) {
+      if ((existing.turnId ?? '').isEmpty) existing.turnId = serverTurnId;
+    } else {
+      // Reuse the trailing assistant bubble when it is the paused/streamed
+      // turn rather than the server's persisted copy of it.
+      ChatMessage? target;
+      final last = _messages.isNotEmpty ? _messages.last : null;
+      if (last != null &&
+          last.role == Role.assistant &&
+          ((last.turnId ?? '').isEmpty || last.turnId == serverTurnId)) {
+        target = last;
+      }
+      if (target == null) {
+        target = ChatMessage(
+          id: 'live-${DateTime.now().microsecondsSinceEpoch}',
+          role: Role.assistant,
+          streaming: true,
+          turnId: serverTurnId,
+        );
+        _messages.add(target);
+      }
+      target.streaming = true;
+      target.turnId = serverTurnId;
+      _liveTurn = target;
+    }
+    if (chatId != null && _socket != null) {
+      _registerView();
+      unawaited(_socket!.attach(chatId));
     }
   }
 
@@ -235,7 +287,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _touchActivity();
       final running = status == 'running';
       setState(() => _remoteRunning = running);
-      if (running) _ensureLiveTurn(); // replayed running turn → open bubble
+      // A replayed running turn (background task, reconnect, cold start) must
+      // re-open the live bubble AND keep the subscription armed, otherwise the
+      // steps and stream never arrive.
+      if (running) _resumeLiveTurn(_socket?.activeTurnId(chatId) ?? '');
       _updateWakelock();
     };
     sock.onConnectionChanged = (connected) {
@@ -327,9 +382,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       onActivity: (steps) {
         _touchActivity();
         final t = _ensureLiveTurn();
-        for (final s in steps) {
-          _upsertStep(t, s);
-        }
+        _upsertSteps(t, steps);
         _scheduleFlush();
         _scrollToBottom();
       },
@@ -349,11 +402,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           _messages.add(turn);
         }
         final t = turn;
-        if (text.trim().isNotEmpty && text.length >= t.text.length) {
-          t.segments
-            ..clear()
-            ..add(text);
-        }
+        // The server's final text is authoritative — adopt it whenever it is
+        // non-empty. The old `text.length >= t.text.length` guard silently
+        // threw away a correct-but-shorter answer, which is exactly how
+        // results stopped appearing.
+        t.absorbFinalText(text);
         if (media.isNotEmpty) {
           t.media = [...t.media, ...media.where((m) => !t.media.contains(m))];
         }
@@ -365,31 +418,52 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         // no live bubble exists (e.g. the turn ran while the screen was
         // closed). Skipping this is what let the green indicator keep
         // rolling after the task already completed.
+        final terminalTurnId = summary.turnId;
+        if (terminalTurnId != null && terminalTurnId.isNotEmpty) {
+          // Stamp the canonical identity on the user row and the live bubble,
+          // so the persisted transcript dedupes against server history on the
+          // next open instead of appending the answer again.
+          for (var i = _messages.length - 1; i >= 0; i--) {
+            final m = _messages[i];
+            if (m.role != Role.user) continue;
+            if ((m.turnId ?? '').isEmpty) m.turnId = terminalTurnId;
+            break;
+          }
+        }
         final t = _liveTurn;
         if (t != null) {
           t.streaming = false;
           t.reasoningStreaming = false;
           t.dropEmptyTrailingSegment();
-          // Adopt the server's canonical turn id: the persisted transcript
-          // carries it, so deduping the cached copy against server history on
-          // the next open actually matches instead of appending the answer
-          // again.
           if ((t.turnId ?? '').isEmpty &&
-              summary.turnId != null &&
-              summary.turnId!.isNotEmpty) {
-            t.turnId = summary.turnId;
+              terminalTurnId != null &&
+              terminalTurnId.isNotEmpty) {
+            t.turnId = terminalTurnId;
           }
           t.usage = summary.usage ?? t.usage;
           t.latencyMs = summary.latencyMs ?? t.latencyMs;
           if (summary.media.isNotEmpty) {
             t.media = {...t.media, ...summary.media}.toList();
           }
+          // The turn is finished: every step that never reported an end is
+          // settled, so no row is left spinning forever.
           for (final s in t.activity) {
             if (!s.isDone) s.status = 'done';
           }
           _liveTurn = null;
+        } else {
+          // No live bubble (the turn ran while the screen was closed): settle
+          // any trailing assistant row so its timeline stops animating.
+          final last = _messages.isNotEmpty ? _messages.last : null;
+          if (last != null && last.role == Role.assistant) {
+            last.streaming = false;
+            for (final s in last.activity) {
+              if (!s.isDone) s.status = 'done';
+            }
+          }
         }
         _cancelStopFallback();
+        _stopResyncWatch();
         if (mounted) {
           setState(() {
             _sending = false;
@@ -400,7 +474,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           _updateWakelock();
           _flashCompleted();
           _scrollToBottom();
-          _scheduleCacheWrite();
+          _scheduleCacheWrite(immediate: true);
         }
       },
       onError: (detail) {
@@ -426,13 +500,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       onUserMessage: (text, turnId) {
         // Projected user echo / replay after reconnect — dedupe by turnId
         // when known, else by identical user text in this view.
-        final dup = _messages.any(
+        //
+        // A replayed echo may arrive while an optimistic bubble for the same
+        // text is still the LAST user row (cold start, or a resend after the
+        // app was killed). Matching the trailing row as well means the user
+        // never sees their own message twice.
+        final trimmed = text.trim();
+        var dup = _messages.any(
           (m) =>
               m.role == Role.user &&
               ((turnId != null && m.turnId == turnId) ||
                   (turnId == null && m.text == text)),
         );
-        if (!dup && text.trim().isNotEmpty) {
+        if (!dup && trimmed.isNotEmpty) {
+          // Adopt the server turn id onto a matching local row instead of
+          // adding a second bubble.
+          for (var i = _messages.length - 1; i >= 0; i--) {
+            final m = _messages[i];
+            if (m.role != Role.user) continue;
+            if (m.text.trim() != trimmed) break;
+            if (turnId != null && (m.turnId ?? '').isEmpty) m.turnId = turnId;
+            dup = true;
+            break;
+          }
+        }
+        if (!dup && trimmed.isNotEmpty) {
           setState(
             () => _messages.add(
               ChatMessage(
@@ -444,6 +536,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ),
           );
           _scrollToBottom();
+        }
+        if (turnId != null && turnId.isNotEmpty) {
+          final live = _liveTurn;
+          if (live != null && (live.turnId ?? '').isEmpty) live.turnId = turnId;
         }
       },
       onUsage: (usage) {
@@ -460,13 +556,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _socket!.listen(chatId, _view!);
   }
 
-  void _upsertStep(ChatMessage msg, ActivityStep incoming) {
-    final idx = msg.activity.indexWhere((s) => s.id == incoming.id);
-    if (idx >= 0) {
-      msg.activity[idx].status = incoming.status;
-    } else {
-      msg.activity.add(incoming);
-    }
+  /// Merge one live activity batch into the turn's timeline.
+  ///
+  /// Matching by `id` alone was the duplication bug: the live socket sends the
+  /// real tool `call_id`, the persisted transcript replays a generated
+  /// `trace-N` id and the on-disk cache carries whatever was live when it was
+  /// written. The same tool call therefore arrived three times under three ids
+  /// and rendered as three rows. [mergeActivitySteps] matches on tool identity
+  /// plus argument summary, so a replay folds into the row already on screen.
+  void _upsertSteps(ChatMessage msg, List<ActivityStep> incoming) {
+    if (incoming.isEmpty) return;
+    final merged = mergeActivitySteps(msg.activity, incoming);
+    msg.activity
+      ..clear()
+      ..addAll(merged);
   }
 
   /// Keep the newest content in view while a turn streams.
@@ -560,9 +663,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   /// Write the transcript to disk (debounced) so reopening the app always
   /// shows what was produced, even for a turn that never completed in-view.
-  void _scheduleCacheWrite() {
+  ///
+  /// [immediate] bypasses the debounce — used at turn end so a completed
+  /// result is durable before the process can be killed.
+  void _scheduleCacheWrite({bool immediate = false}) {
     final chatId = _chatId;
     if (chatId == null) return;
+    if (immediate) {
+      _cacheTimer?.cancel();
+      _cacheTimer = null;
+      final state = context.read<AppState>();
+      unawaited(state.cacheThread(chatId, List<ChatMessage>.from(_messages)));
+      return;
+    }
     _cacheTimer ??= Timer(const Duration(milliseconds: 700), () {
       _cacheTimer = null;
       final state = context.read<AppState>();
@@ -833,8 +946,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _stopWatchTimer?.cancel();
     _completedFadeTimer?.cancel();
     _cacheTimer?.cancel();
-    // Persist the final transcript before leaving so reopening the chat shows
-    // the completed answer immediately.
+    // Detach the UI listener and persist the transcript, which keeps the
+    // result visible on reopen. The chat's socket WINDOW is deliberately kept
+    // alive: leaving this screen must not unsubscribe it, otherwise a turn
+    // that is still running stops streaming and its steps/answer are lost.
     final chatId = _chatId;
     if (chatId != null) {
       unawaited(
@@ -844,7 +959,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ),
       );
     }
-    WakelockPlus.disable();
+    // Keep the screen awake if a turn is still running for this chat — the
+    // socket keeps streaming into it even though the UI is gone.
+    if (!_busy) WakelockPlus.disable();
     WidgetsBinding.instance.removeObserver(this);
     if (chatId != null) _socket?.unlisten(chatId);
     _input.dispose();
@@ -1213,6 +1330,12 @@ class _Bubble extends StatelessWidget {
 }
 
 /// Ordered list of tool/activity steps for a turn, live-updated.
+///
+/// The step list is *ordered by the merge*, so it is stable across replays: a
+/// replayed copy of an existing step updates that row in place instead of
+/// appending a second one. This is what stopped the duplicated
+/// `write_file · power_bank_guide.tex` / `edit · …` / `novita_sandbox · …`
+/// blocks in the screenshot.
 class _ActivityPanel extends StatelessWidget {
   const _ActivityPanel({required this.steps, required this.turnStreaming});
   final List<ActivityStep> steps;

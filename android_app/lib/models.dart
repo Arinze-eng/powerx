@@ -5,12 +5,20 @@ import 'dart:convert';
 
 enum Role { user, assistant }
 
+/// Collapse whitespace so two renderings of the same answer compare equal.
+///
+/// Lives here (not in the cache layer) because both the cache merge and the
+/// transcript dedupe logic need it, and the cache layer already depends on
+/// these models — putting it there would create an import cycle.
+String normalizeAssistantText(String text) =>
+    text.trim().replaceAll(RegExp(r'\s+'), ' ');
+
 /// A single in-progress "step" the agent emits while working on a turn —
 /// mirrors the WebUI's activity timeline (tool hints + tool_events).
 class ActivityStep {
-  final String id;
-  final String name; // tool name or hint text
-  final String detail; // short argument summary
+  String id;
+  String name; // tool name or hint text
+  String detail; // short argument summary
   /// start | running | done | error
   String status;
   final DateTime startedAt;
@@ -117,6 +125,123 @@ class ActivityStep {
     }
     return 'generic';
   }
+
+  /// Stable identity of *what this step did*, independent of where it came
+  /// from.
+  ///
+  /// This is the fix for the duplicated activity list. Three sources describe
+  /// the same tool call with three different `id`s:
+  ///   * live socket `tool_events[]`  → the real tool `call_id`
+  ///   * persisted transcript replay  → a generated `trace-3` style id
+  ///   * the on-disk chat cache       → whatever id was live when it was saved
+  /// Matching on `id` alone therefore rendered every step two or three times.
+  /// Tool name + argument summary is the only identity shared by all three.
+  String get toolKey {
+    final n = name.trim().toLowerCase();
+    var d = detail.trim();
+    if (d.endsWith('…')) d = d.substring(0, d.length - 1).trim();
+    return '$n\u0000$d';
+  }
+
+  /// Prefix used for activity ids synthesised by the persisted-transcript
+  /// replay. Kept in one place because [ActivityStep.hasStableId] relies on
+  /// recognising it — a mismatch between this prefix and the check is exactly
+  /// what let the same tool row render twice.
+  static const String traceIdPrefix = 'trace-';
+
+  /// Whether [id] is a real gateway tool `call_id` rather than an id
+  /// synthesised by a replay / hint / file-edit fallback path.
+  bool get hasStableId {
+    if (id.isEmpty) return false;
+    return !id.startsWith(traceIdPrefix) &&
+        !id.startsWith('t-') &&
+        !id.startsWith('h-') &&
+        !id.startsWith('fe-');
+  }
+
+  /// Whether [other] describes the same underlying tool call as this step.
+  ///
+  /// Matching order:
+  ///  1. equal ids always match;
+  ///  2. two *different* real `call_id`s are two different calls — a retried
+  ///     command genuinely ran twice and must stay two rows;
+  ///  3. otherwise (at least one side is a synthetic replay id) match on tool
+  ///     identity plus argument summary.
+  bool matchesIdentity(ActivityStep other) {
+    if (id.isNotEmpty && other.id.isNotEmpty) {
+      if (id == other.id) return true;
+      if (hasStableId && other.hasStableId) return false;
+    }
+    if (toolKey == other.toolKey) return true;
+    // The persisted transcript stores a truncated argument summary, so a
+    // replayed row can carry a prefix of the live detail. Treat that as the
+    // same call rather than adding a second row.
+    final n = name.trim().toLowerCase();
+    if (n != other.name.trim().toLowerCase()) return false;
+    final a = detail.trim();
+    final b = other.detail.trim();
+    if (a.isEmpty || b.isEmpty) return false;
+    final shorter = a.length <= b.length ? a : b;
+    final longer = a.length <= b.length ? b : a;
+    if (shorter.length < 8) return false;
+    final stem = shorter.endsWith('…')
+        ? shorter.substring(0, shorter.length - 1)
+        : shorter;
+    return stem.length >= 8 && longer.startsWith(stem);
+  }
+
+  static int _statusRank(String s) =>
+      s == 'error' ? 3 : (s == 'done' ? 2 : 1);
+
+  /// Fold a second observation of this same step into the row already on
+  /// screen: the most advanced status wins (a late `running` replay must never
+  /// reopen a finished row) and missing text is filled in, never overwritten.
+  void mergeLive(ActivityStep other) {
+    if (_statusRank(other.status) > _statusRank(status)) {
+      status = other.status;
+    }
+    if (name.trim().isEmpty) name = other.name;
+    if (detail.trim().isEmpty) detail = other.detail;
+    // Adopt a real tool call id over a synthetic one so subsequent live frames
+    // for this call merge by id as well.
+    if (!hasStableId && other.hasStableId) {
+      id = other.id;
+    }
+  }
+}
+
+/// Merge [incoming] activity steps into [existing] without ever producing a
+/// duplicate row, and without dropping genuine repeats.
+///
+/// Existing rows keep their position (the timeline must not reshuffle while a
+/// turn streams); a replayed copy of a row merges into the row it matches. The
+/// `claimed` set means two *identical* commands that really did run twice stay
+/// two rows — each incoming copy consumes a distinct existing row.
+List<ActivityStep> mergeActivitySteps(
+  List<ActivityStep> existing,
+  List<ActivityStep> incoming,
+) {
+  if (incoming.isEmpty) return existing;
+  final result = List<ActivityStep>.from(existing);
+  final claimed = <int>{};
+  for (final step in incoming) {
+    var match = -1;
+    for (var i = 0; i < result.length; i++) {
+      if (claimed.contains(i)) continue;
+      if (result[i].matchesIdentity(step)) {
+        match = i;
+        break;
+      }
+    }
+    if (match >= 0) {
+      claimed.add(match);
+      result[match].mergeLive(step);
+    } else {
+      claimed.add(result.length);
+      result.add(step);
+    }
+  }
+  return result;
 }
 
 /// An outbound attachment selected by the user before sending. Images are
@@ -233,12 +358,18 @@ class ChatMessage {
 
   /// Finalize the live segment with authoritative stream text (if given) and
   /// start a fresh segment for any following stream.
+  ///
+  /// An empty/null [finalText] leaves the streamed text untouched — the
+  /// gateway sometimes closes a stream with no buffered text, and clobbering
+  /// the segment with `''` erased the answer on screen.
   void endSegment([String? finalText]) {
     if (segments.isEmpty) {
-      if (finalText != null && finalText.isNotEmpty) segments.add(finalText);
+      if (finalText != null && finalText.trim().isNotEmpty) {
+        segments.add(finalText);
+      }
       return;
     }
-    if (finalText != null) {
+    if (finalText != null && finalText.trim().isNotEmpty) {
       // stream_end carries the complete buffered text for the stream.
       segments[segments.length - 1] = finalText;
     }
@@ -255,6 +386,73 @@ class ChatMessage {
       text.trim().isEmpty &&
       reasoning.trim().isEmpty &&
       activity.isEmpty;
+
+  /// Whether this bubble already renders the *same answer text* as [other].
+  ///
+  /// Used to recognise a server replay / cache copy of a bubble we are already
+  /// showing, so reopening a finished task never appends its results twice.
+  bool rendersSameAnswer(ChatMessage other) {
+    final a = normalizeAssistantText(text);
+    final b = normalizeAssistantText(other.text);
+    return a.isNotEmpty && a == b;
+  }
+
+  /// Adopt the server's canonical answer text for the stream that just closed.
+  ///
+  /// The previous guard (`text.length >= t.text.length`) silently DROPPED a
+  /// correct-but-shorter final text — that is why results stopped appearing
+  /// after the last fix. `stream_end`/final-message text is authoritative by
+  /// protocol, so it is taken whenever it is non-empty.
+  void absorbFinalText(String? authoritative) {
+    if (authoritative == null || authoritative.trim().isEmpty) return;
+    if (segments.isEmpty) {
+      segments.add(authoritative);
+      return;
+    }
+    segments[segments.length - 1] = authoritative;
+  }
+
+  /// Fold a second copy of this same turn (a server replay or a cache copy)
+  /// into this bubble without duplicating any visible content.
+  ///
+  /// Rules, in order of authority:
+  ///   * answer text  — the server's wins when both are present;
+  ///   * reasoning    — kept, concatenated only when genuinely different;
+  ///   * activity     — merged through [mergeActivitySteps] (never duplicated);
+  ///   * media/usage/latency/turnId — union, server value wins.
+  void mergeFrom(ChatMessage other) {
+    final mine = text.trim();
+    final theirs = other.text.trim();
+    if (mine.isEmpty && theirs.isNotEmpty) {
+      segments
+        ..clear()
+        ..addAll(other.segments.where((s) => s.trim().isNotEmpty));
+    }
+    final myReasoning = reasoning.trim();
+    final theirReasoning = other.reasoning.trim();
+    if (myReasoning.isEmpty && theirReasoning.isNotEmpty) {
+      reasoning = other.reasoning;
+    } else if (theirReasoning.isNotEmpty &&
+        normalizeAssistantText(other.reasoning) !=
+            normalizeAssistantText(reasoning) &&
+        !normalizeAssistantText(reasoning).contains(
+            normalizeAssistantText(other.reasoning))) {
+      reasoning = '$reasoning\n\n${other.reasoning}';
+    }
+    final merged = mergeActivitySteps(activity, other.activity);
+    activity
+      ..clear()
+      ..addAll(merged);
+    for (final m in other.media) {
+      if (!media.contains(m)) media.add(m);
+    }
+    if (other.usage != null) usage = {...?usage, ...other.usage!};
+    latencyMs ??= other.latencyMs;
+    if ((turnId ?? '').isEmpty && (other.turnId ?? '').isNotEmpty) {
+      turnId = other.turnId;
+    }
+    if (other.hasError) hasError = true;
+  }
 
   /// Attachments that can be rendered inline (http(s) urls only).
   List<String> get viewableMedia =>
@@ -478,8 +676,9 @@ class ThreadHistory {
         }
         if (lines.isNotEmpty) {
           for (final line in lines) {
-            t.activity.add(ActivityStep.fromTraceLine(
-                line.trim(), id: 't-$stepOrder', order: stepOrder++));
+            t.activity.add(ActivityStep.fromTraceLine(line.trim(),
+                id: '${ActivityStep.traceIdPrefix}$stepOrder',
+                order: stepOrder++));
           }
         } else if (!added && kind == 'progress' && content.trim().isEmpty) {
           // empty progress breadcrumb — skip silently

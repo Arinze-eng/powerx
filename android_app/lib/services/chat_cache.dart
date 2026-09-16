@@ -237,21 +237,24 @@ class ChatCache {
 
 /// Merge authoritative server history with the local cache.
 ///
-/// Rules:
-///  * Server messages win whenever they carry the same turn identity.
-///  * If the server has an assistant bubble for a cached turn but its text is
-///    empty (the turn was still streaming when the transcript was written),
-///    the cached text/reasoning/activity is folded in so the answer is never
-///    lost.
-///  * Cached messages the server does not know about are appended, which
-///    covers a turn that completed while the app was closed and whose
-///    transcript write lagged behind the local copy.
-///  * User echoes are de-duplicated by text, and assistant answers are
-///    de-duplicated by their normalised text: an answer the server already
-///    holds is never appended a second time. Without that, a finished task's
-///    results were re-added to the transcript on every reopen (the "results
-///    keep firing" bug) because the live bubble carries no server turn id
-///    until the turn ends.
+/// The goal is one and only one visible copy of every message and every
+/// activity step, no matter how many times the app is closed and reopened
+/// mid-task.
+///
+/// Rules, applied in order:
+///  1. Same turn identity → the server row is authoritative and the cached
+///     copy is *folded into it* (never appended beside it).
+///  2. No usable turn id, but the server already holds an identical answer →
+///     the same fold happens, matched by normalised text. This is the case
+///     that produced the duplicate chat: the live bubble only learns its turn
+///     id on `turn_end`, so an app killed mid-turn carried no id and was
+///     appended as a second answer.
+///  3. The trailing assistant bubble of an interrupted turn (empty turn id) is
+///     folded into the server's trailing turn, so a partial answer that the
+///     cache captured cannot appear twice.
+///  4. Anything else unknown to the server is kept only when it carries real
+///     content — streamed text, reasoning, activity or media — so a task's
+///     results are never silently dropped.
 List<ChatMessage> mergeThreadHistory({
   required List<ChatMessage> server,
   required List<ChatMessage> cached,
@@ -268,14 +271,32 @@ List<ChatMessage> mergeThreadHistory({
   final serverAssistantTexts = <String>{};
   for (final m in merged) {
     if (m.role != Role.assistant) continue;
-    if ((m.turnId ?? '').isNotEmpty) {
-      serverAssistantByTurn[m.turnId!] = m;
+    final tid = m.turnId ?? '';
+    if (tid.isNotEmpty && !serverAssistantByTurn.containsKey(tid)) {
+      serverAssistantByTurn[tid] = m;
     }
-    final t = m.text.trim();
-    if (t.isNotEmpty) serverAssistantTexts.add(normalizeAssistantText(t));
+    final t = normalizeAssistantText(m.text);
+    if (t.isNotEmpty) serverAssistantTexts.add(t);
   }
 
-  for (final c in cached) {
+  /// Last assistant bubble in the merged (server) transcript, if it is the
+  /// tail — the only bubble an interrupted turn can legitimately extend.
+  ChatMessage? trailingServerAssistant() {
+    if (merged.isEmpty) return null;
+    final last = merged.last;
+    return last.role == Role.assistant ? last : null;
+  }
+
+  var lastCachedAssistantIndex = -1;
+  for (var i = cached.length - 1; i >= 0; i--) {
+    if (cached[i].role == Role.assistant) {
+      lastCachedAssistantIndex = i;
+      break;
+    }
+  }
+
+  for (var i = 0; i < cached.length; i++) {
+    final c = cached[i];
     if (c.role == Role.user) {
       final t = c.text.trim();
       if (t.isEmpty || serverUserTexts.contains(t)) continue;
@@ -283,39 +304,54 @@ List<ChatMessage> mergeThreadHistory({
       serverUserTexts.add(t);
       continue;
     }
+
     final turnId = c.turnId ?? '';
-    final existing = turnId.isEmpty ? null : serverAssistantByTurn[turnId];
-    if (existing != null) {
-      // Fill gaps only — never overwrite authoritative server text.
-      if (existing.text.trim().isEmpty && c.text.trim().isNotEmpty) {
-        existing.segments
-          ..clear()
-          ..addAll(c.segments.where((s) => s.trim().isNotEmpty));
-      }
-      if (existing.reasoning.trim().isEmpty && c.reasoning.trim().isNotEmpty) {
-        existing.reasoning = c.reasoning;
-      }
-      if (existing.activity.isEmpty && c.activity.isNotEmpty) {
-        existing.activity.addAll(c.activity);
-      }
-      for (final u in c.media) {
-        if (!existing.media.contains(u)) existing.media.add(u);
-      }
+
+    // 1) Known turn: fold into the authoritative server bubble for that turn.
+    final byTurn = turnId.isEmpty ? null : serverAssistantByTurn[turnId];
+    if (byTurn != null) {
+      byTurn.mergeFrom(c);
       continue;
     }
-    // Unknown to the server: only keep it when it actually carries content
-    // the server does not already have. Text-level dedupe also protects
-    // answers cached before (or without) a turn id.
-    if (c.text.trim().isEmpty && c.reasoning.trim().isEmpty) continue;
-    if (c.text.trim().isNotEmpty &&
-        serverAssistantTexts.contains(normalizeAssistantText(c.text.trim()))) {
+
+    final cachedText = normalizeAssistantText(c.text);
+
+    // 2) The server already holds this exact answer — fold, never append.
+    if (cachedText.isNotEmpty && serverAssistantTexts.contains(cachedText)) {
+      ChatMessage? twin;
+      for (final m in merged) {
+        if (m.role == Role.assistant &&
+            normalizeAssistantText(m.text) == cachedText) {
+          twin = m;
+          break;
+        }
+      }
+      if (twin != null) {
+        twin.mergeFrom(c);
+        continue;
+      }
+    }
+
+    // 3) The tail bubble of a turn that never reported its completion: fold it
+    //    into the server's trailing turn, which is where that work landed.
+    if (i == lastCachedAssistantIndex && turnId.isEmpty) {
+      final tail = trailingServerAssistant();
+      if (tail != null) {
+        tail.mergeFrom(c);
+        continue;
+      }
+    }
+
+    // 4) Genuinely unknown to the server: keep it when it has content.
+    if (c.text.trim().isEmpty &&
+        c.reasoning.trim().isEmpty &&
+        c.activity.isEmpty &&
+        c.media.isEmpty) {
       continue;
     }
     merged.add(c);
+    if (cachedText.isNotEmpty) serverAssistantTexts.add(cachedText);
+    if (turnId.isNotEmpty) serverAssistantByTurn[turnId] = c;
   }
   return merged;
 }
-
-/// Collapse whitespace so two renderings of the same answer compare equal.
-String normalizeAssistantText(String text) =>
-    text.trim().replaceAll(RegExp(r'\s+'), ' ');
