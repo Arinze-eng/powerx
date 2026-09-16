@@ -1413,14 +1413,14 @@ export default function App() {
       );
     }
     // Default for all other unauthenticated routes: the landing page.
-    // The payment page URL is surfaced so the pricing cards can start a real
-    // purchase when the deployment exposes one.
+    // NOTE: the checkout URL is intentionally NOT passed here. Purchasing is
+    // only reachable once the visitor is signed in (see PricingSection), so the
+    // public surface never exposes a payment link.
     return (
       <LandingPage
         onSignIn={() => navigate("#/login")}
         onSignUp={() => navigate("#/signup")}
         onPrivacy={() => navigate("#/privacy")}
-        purchaseUrl={state.paymentUrl || undefined}
       />
     );
   }

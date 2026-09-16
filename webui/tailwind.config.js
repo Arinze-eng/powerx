@@ -46,6 +46,24 @@ export default {
           "Consolas",
           "monospace",
         ],
+        /**
+         * Editorial serif used for the public-facing display type (hero
+         * headline and wordmark). A pure system stack keeps the marketing
+         * surface dependency-free — no webfont request, no layout shift — while
+         * still giving the page the refined, not-quite-sans voice the brand
+         * relies on.
+         */
+        serif: [
+          '"Iowan Old Style"',
+          '"Palatino Linotype"',
+          "Palatino",
+          '"Book Antiqua"',
+          "Georgia",
+          "Cambria",
+          '"Times New Roman"',
+          "Times",
+          "serif",
+        ],
       },
       borderRadius: {
         lg: "var(--radius)",
@@ -115,10 +133,15 @@ export default {
           from: { height: "var(--radix-accordion-content-height)" },
           to: { height: "0" },
         },
+        "manus-rise": {
+          from: { opacity: "0", transform: "translateY(8px)" },
+          to: { opacity: "1", transform: "translateY(0)" },
+        },
       },
       animation: {
         "accordion-down": "accordion-down 0.2s ease-out",
         "accordion-up": "accordion-up 0.2s ease-out",
+        "manus-rise": "manus-rise 0.4s cubic-bezier(0.16, 1, 0.3, 1) both",
       },
     },
   },

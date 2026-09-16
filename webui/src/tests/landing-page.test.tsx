@@ -3,7 +3,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { LandingPage } from "@/components/LandingPage";
 import { CREDIT_PACKS, formatCredits, formatUsd } from "@/lib/plans";
-import { APP_SUMMARY, FEATURES, STEPS, SUGGESTED_TASKS } from "@/lib/marketing";
+import {
+  APP_SUMMARY,
+  FEATURES,
+  QUICK_ACTIONS,
+  SUGGESTED_TASKS,
+  STEPS,
+} from "@/lib/marketing";
 
 /** Renders the landing page with spy callbacks. */
 function renderLanding(props: Partial<Parameters<typeof LandingPage>[0]> = {}) {
@@ -68,6 +74,38 @@ describe("LandingPage structure", () => {
     for (const s of SUGGESTED_TASKS) {
       expect(screen.getByText(s.title), s.title).toBeTruthy();
     }
+  });
+
+  it("renders the Manus-style quick-action chips", () => {
+    renderLanding();
+    for (const a of QUICK_ACTIONS) {
+      expect(screen.getByText(a.label), a.label).toBeTruthy();
+    }
+  });
+
+  it("fills the composer from a quick-action chip instead of sending it", () => {
+    const { onSignUp } = renderLanding();
+    const first = QUICK_ACTIONS[0];
+    fireEvent.click(screen.getByText(first.label));
+    const composer = screen.getByLabelText(
+      "Describe what you want CDNAI to work on",
+    ) as HTMLTextAreaElement;
+    expect(composer.value).toBe(first.prompt);
+    // Filling is not submitting — the visitor can still edit the prompt.
+    expect(onSignUp).not.toHaveBeenCalled();
+  });
+
+  it("uses the monochrome surface rather than gradient accents", () => {
+    // Regression guard for the "blue shiny" marketing treatment: the public
+    // surface is intentionally monochrome, so any reintroduced purple/cyan
+    // gradient should fail here rather than silently ship.
+    const { container } = render(
+      <LandingPage onSignIn={vi.fn()} onSignUp={vi.fn()} onPrivacy={vi.fn()} />,
+    );
+    const html = container.innerHTML;
+    expect(html).not.toContain("7C5CFF");
+    expect(html).not.toContain("22D3EE");
+    expect(html).not.toMatch(/gradient-to-/);
   });
 
   it("does not mention institution-specific content", () => {
@@ -167,8 +205,8 @@ describe("LandingPage pricing", () => {
     expect(screen.getByText("Best value")).toBeTruthy();
   });
 
-  it("routes to sign-in when there is no purchase url", () => {
-    const { onSignIn } = renderLanding({ purchaseUrl: undefined });
+  it("routes to sign-in for every pack purchase", () => {
+    const { onSignIn } = renderLanding();
     const popular = CREDIT_PACKS.find((p) => p.featured)!;
     fireEvent.click(screen.getByText(`Get ${popular.name}`));
     expect(onSignIn).toHaveBeenCalledTimes(1);
@@ -178,25 +216,25 @@ describe("LandingPage pricing", () => {
     );
   });
 
-  it("opens the payment page when one is configured", () => {
+  it("never opens a payment page for an anonymous visitor", () => {
+    // PAYWALL REGRESSION GUARD. The pack CTAs used to call window.open() with
+    // the checkout URL straight from the public landing page, sending signed-out
+    // visitors to the payment provider without an account — so the payment could
+    // never be claimed by a user. Every CTA must now start the auth flow.
     const open = vi.spyOn(window, "open").mockReturnValue(null);
-    renderLanding({ purchaseUrl: "https://flutterwave.com/pay/cdnai" });
-    const popular = CREDIT_PACKS.find((p) => p.featured)!;
-    fireEvent.click(screen.getByText(`Buy ${popular.name}`));
-    expect(open).toHaveBeenCalledWith(
-      "https://flutterwave.com/pay/cdnai",
-      "_blank",
-      "noopener,noreferrer",
-    );
+    const { onSignIn, onSignUp } = renderLanding();
+    for (const pack of CREDIT_PACKS) {
+      fireEvent.click(screen.getByText(`Get ${pack.name}`));
+    }
+    expect(open).not.toHaveBeenCalled();
+    expect(onSignIn).toHaveBeenCalledTimes(CREDIT_PACKS.length);
+    expect(onSignUp).not.toHaveBeenCalled();
   });
 
-  it("labels purchase buttons by mode so the CTA is never misleading", () => {
-    const { unmount } = render(
-      <LandingPage onSignIn={vi.fn()} onSignUp={vi.fn()} onPrivacy={vi.fn()} />,
-    );
-    // Without a payment URL every pack CTA is a "Get" (auth-gated) button.
-    // Match the exact pack-CTA labels so the nav's "Get started" and the
-    // "Buy once — no subscription" copy line are not counted.
+  it("labels every pack CTA as an auth-gated action", () => {
+    renderLanding();
+    // The public surface never renders a raw "Buy" that implies an immediate
+    // payment, and it holds no checkout URL to leak.
     const packCtas = () =>
       screen
         .getAllByRole("button")
@@ -204,16 +242,5 @@ describe("LandingPage pricing", () => {
         .filter((t) => CREDIT_PACKS.some((p) => t === `Get ${p.name}` || t === `Buy ${p.name}`));
     expect(packCtas().filter((t) => t.startsWith("Buy "))).toHaveLength(0);
     expect(packCtas().filter((t) => t.startsWith("Get "))).toHaveLength(CREDIT_PACKS.length);
-    unmount();
-
-    render(
-      <LandingPage
-        onSignIn={vi.fn()}
-        onSignUp={vi.fn()}
-        onPrivacy={vi.fn()}
-        purchaseUrl="https://flutterwave.com/pay/cdnai"
-      />,
-    );
-    expect(packCtas().filter((t) => t.startsWith("Buy "))).toHaveLength(CREDIT_PACKS.length);
   });
 });

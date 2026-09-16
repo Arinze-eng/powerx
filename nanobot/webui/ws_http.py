@@ -194,6 +194,10 @@ _WEBUI_MUTATION_PATHS = {
     "settings.mcp.oauth_start": "/api/settings/mcp-oauth/start",
     "settings.mcp.oauth_complete": "/api/settings/mcp-oauth/complete",
     "settings.mcp.oauth_cancel": "/api/settings/mcp-oauth/cancel",
+    # Authenticated checkout: mints a unique single-use payment link for the
+    # signed-in user. Exposed over the WebUI mutation channel so the client
+    # never needs a raw payment URL — the gateway returns one tied to the buyer.
+    "payment.pay_link": "/api/webui/pay-link",
     "admin.provider.models": "/api/admin/provider-models",
     "admin.provider.test": "/api/admin/provider-test",
     "admin.provider.save": "/api/admin/provider-settings/save",

@@ -883,6 +883,33 @@ export async function fetchSidebarState(
   );
 }
 
+/** Result of minting a checkout link for the signed-in user. */
+export interface PaymentLinkResult {
+  ok: boolean;
+  /** Provider-hosted checkout URL. Only present when `ok` is true. */
+  link?: string;
+  /** Unique single-use transaction reference for this payment. */
+  txRef?: string;
+  package?: { name: string; slug: string; credits: number; amount_usd: number };
+  error?: string;
+}
+
+/**
+ * Mint a unique, single-use checkout link for one credit pack.
+ *
+ * This runs over the authenticated WebUI socket, so the gateway can tie the
+ * payment to the signed-in user and mint a fresh transaction reference per
+ * attempt. It is the only purchase entry point in the app: the public landing
+ * page has no checkout URL at all, which is what keeps the paywall closed to
+ * signed-out visitors.
+ */
+export async function createPaymentLink(
+  transport: WebUIMutationTransport,
+  slug: string,
+): Promise<PaymentLinkResult> {
+  return mutation<PaymentLinkResult>(transport, "payment.pay_link", { slug });
+}
+
 export async function updateSidebarState(
   transport: WebUIMutationTransport,
   state: SidebarStatePayload,

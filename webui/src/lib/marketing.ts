@@ -161,6 +161,37 @@ export const SUGGESTED_TASKS: { icon: IconName; title: string; prompt: string }[
   },
 ];
 
+/**
+ * Quick-action chips shown on the first row under the composer.
+ *
+ * These are the highest-frequency starting points, kept deliberately short so
+ * they read as a single scannable row. Tapping one fills the composer (rather
+ * than sending immediately) so the visitor can adjust the prompt first — the
+ * same behaviour as the reference design.
+ */
+export const QUICK_ACTIONS: { icon: IconName; label: string; prompt: string }[] = [
+  {
+    icon: "file-text",
+    label: "Create slides",
+    prompt: "Create a slide deck about the state of renewable energy in West Africa. Use clear headings, one idea per slide, and finish with a summary.",
+  },
+  {
+    icon: "code",
+    label: "Build website",
+    prompt: "Build a responsive landing page for a small coffee roastery, with a hero, product list and a contact section.",
+  },
+  {
+    icon: "image",
+    label: "Design",
+    prompt: "Design a clean, modern logo concept for a fintech product and describe the reasoning behind the shapes and colours.",
+  },
+  {
+    icon: "workflow",
+    label: "Create games",
+    prompt: "Create a small browser game with a playable loop, score tracking and a game-over state. Output a single HTML file.",
+  },
+];
+
 /** Alt text / captions keyed by icon so decorative art stays described. */
 export const APP_SUMMARY =
   "CDNAI is an autonomous AI agent. Give it a goal in plain language and it plans the work, uses the right tools, and delivers a finished result.";

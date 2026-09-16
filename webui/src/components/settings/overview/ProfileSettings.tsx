@@ -17,6 +17,8 @@ import {
 } from "@/components/settings/shared/SettingsControls";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { createPaymentLink } from "@/lib/api";
+import { useClient } from "@/providers/ClientProvider";
 import { useSupabaseUser } from "@/lib/supabase-user-context";
 import { verifyPayment } from "@/lib/supabase-auth";
 import { cn } from "@/lib/utils";
@@ -25,11 +27,19 @@ import { cn } from "@/lib/utils";
  * Profile & Billing section shown only for Supabase-gated WebUI sessions.
  *
  * Displays the signed-in user's credit balance and the fixed credit packages,
- * with a link to the Flutterwave payment page and a form to verify a completed
- * payment (mirrors the Telegram bot's /buy + /verify-payment flow).
+ * with a form to verify a completed payment (mirrors the Telegram bot's
+ * /buy + /verify-payment flow).
+ *
+ * PURCHASE: "Buy credits" mints a fresh, single-use checkout link over the
+ * authenticated socket rather than linking a shared static payment page. The
+ * static page reuses one transaction reference for every payer, which makes the
+ * second payer's credits fail to claim; a minted link is unique per attempt and
+ * is bound to this signed-in account. The static URL is kept only as a fallback
+ * for deployments where link minting is unavailable.
  */
 export function ProfileSettings() {
   const user = useSupabaseUser();
+  const { client } = useClient();
   const { t } = useTranslation();
   const tx = (key: string, fallback: string) => t(key, { defaultValue: fallback });
 
@@ -37,6 +47,8 @@ export function ProfileSettings() {
   const [txRef, setTxRef] = useState("");
   const [transactionId, setTransactionId] = useState("");
   const [verifying, setVerifying] = useState(false);
+  const [buyingSlug, setBuyingSlug] = useState<string | null>(null);
+  const [buyError, setBuyError] = useState<string | null>(null);
   const [result, setResult] = useState<
     | { ok: true; credits: number; pkg?: string }
     | { ok: false; error: string }
@@ -76,6 +88,35 @@ export function ProfileSettings() {
       cancelled = true;
     };
   }, [user.supabaseUrl, user.anonKey, user.email]);
+
+  /**
+   * Start a purchase for one pack.
+   *
+   * Mints a unique single-use checkout link bound to the signed-in account and
+   * opens it. Falls back to the deployment's static payment page only when link
+   * minting is unavailable, so a purchase is never blocked by provider downtime.
+   */
+  const handleBuy = async (slug: string) => {
+    if (buyingSlug) return;
+    setBuyError(null);
+    setBuyingSlug(slug);
+    try {
+      const res = await createPaymentLink(client, slug);
+      if (res.ok && res.link) {
+        window.open(res.link, "_blank", "noopener,noreferrer");
+        return;
+      }
+      setBuyError(res.error ?? tx("settings.profile.buyFailed", "Could not start the payment."));
+    } catch (e) {
+      setBuyError(
+        e instanceof Error && e.message
+          ? e.message
+          : tx("settings.profile.buyFailed", "Could not start the payment."),
+      );
+    } finally {
+      setBuyingSlug(null);
+    }
+  };
 
   const handleVerify = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -212,26 +253,47 @@ export function ProfileSettings() {
                       {pkg.credits.toLocaleString()} credits
                     </span>
                     <span className="font-semibold text-foreground">${pkg.amount_usd.toFixed(2)}</span>
+                    <Button
+                      type="button"
+                      disabled={buyingSlug !== null}
+                      onClick={() => void handleBuy(pkg.slug)}
+                      className="h-8 shrink-0 rounded-full px-3 text-[12.5px] font-semibold"
+                    >
+                      {buyingSlug === pkg.slug ? (
+                        <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" aria-hidden />
+                      ) : (
+                        <CreditCard className="mr-1 h-3.5 w-3.5" aria-hidden />
+                      )}
+                      {tx("settings.profile.buy", "Buy")}
+                    </Button>
                   </div>
                 ))}
               </div>
             </SettingsRow>
 
-            {paymentUrl ? (
+            {buyError ? (
               <SettingsRow
-                title={tx("settings.profile.payNow", "Pay now")}
-                description={tx("settings.profile.payNowHint", "Open the payment page to purchase credits.")}
+                title={tx("settings.profile.buyFailedTitle", "Payment could not start")}
+                description={tx(
+                  "settings.profile.buyFailedHint",
+                  "You can still pay on the payment page and verify the reference below.",
+                )}
               >
-                <a
-                  href={paymentUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex h-8 min-w-[9rem] items-center justify-center gap-1.5 rounded-full bg-foreground px-3.5 text-[13px] font-semibold text-background transition-opacity hover:opacity-90"
-                >
-                  <CreditCard className="h-3.5 w-3.5" aria-hidden />
-                  {tx("settings.profile.buy", "Buy credits")}
-                  <ExternalLink className="h-3 w-3" aria-hidden />
-                </a>
+                <span role="alert" className="flex flex-col items-end gap-1.5 text-right">
+                  <span className="max-w-[22rem] text-[12.5px] text-destructive">{buyError}</span>
+                  {paymentUrl ? (
+                    <a
+                      href={paymentUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex h-8 items-center justify-center gap-1.5 rounded-full bg-foreground px-3.5 text-[13px] font-semibold text-background transition-opacity hover:opacity-90"
+                    >
+                      <CreditCard className="h-3.5 w-3.5" aria-hidden />
+                      {tx("settings.profile.payNow", "Open payment page")}
+                      <ExternalLink className="h-3 w-3" aria-hidden />
+                    </a>
+                  ) : null}
+                </span>
               </SettingsRow>
             ) : null}
           </SettingsGroup>

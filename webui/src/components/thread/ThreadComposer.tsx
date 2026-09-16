@@ -2253,7 +2253,7 @@ export function ThreadComposer({
           sessionDragPreview && "ring-1 ring-primary/25",
           isDragging && "ring-2 ring-primary/40 motion-reduce:ring-0 motion-reduce:border-primary",
           goalState?.active &&
-            "goal-shell-glow ring-1 ring-sky-400/35 motion-reduce:ring-sky-400/25 dark:ring-sky-400/45",
+            "goal-shell-glow ring-1 ring-foreground/20 motion-reduce:ring-foreground/15 dark:ring-foreground/25",
         )}
       >
         {queuedPrompts.length > 0 ? (
