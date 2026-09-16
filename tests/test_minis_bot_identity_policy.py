@@ -15,9 +15,43 @@ def test_identity_templates_name_minis_bot() -> None:
     soul = (REPO_ROOT / "nanobot/templates/SOUL.md").read_text(encoding="utf-8")
     subagent = (REPO_ROOT / "nanobot/templates/agent/subagent_system.md").read_text(encoding="utf-8")
 
-    assert "You are Minis Bot" in identity
-    assert "I am Minis Bot" in soul
-    assert "subagent of Minis Bot" in subagent
+    assert "You are CDNAI" in identity
+    assert "I am CDNAI" in soul
+    assert "subagent of CDNAI" in subagent
+
+
+def test_no_template_brands_the_agent_as_minis_bot() -> None:
+    """Regression guard: the old 'Minis Bot' name must not reappear as branding.
+
+    The only acceptable mentions are the explicit "never call yourself Minis Bot"
+    guards and the historical test-module name.
+    """
+    templates = list((REPO_ROOT / "nanobot/templates").rglob("*.md"))
+    templates.append(REPO_ROOT / "nanobot/skills/safety-ethics/SKILL.md")
+
+    for path in templates:
+        text = path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if "Minis Bot" not in line and "Minis bot" not in line:
+                continue
+            lowered = line.lower()
+            allowed = "never call yourself" in lowered or "never minis bot" in lowered
+            assert allowed, f"unexpected 'Minis Bot' branding in {path}: {line.strip()}"
+
+
+def test_identity_declares_hard_cap_on_user_identity() -> None:
+    """The user-identity refusal is a hard cap, not a soft preference."""
+    identity = (REPO_ROOT / "nanobot/templates/agent/identity.md").read_text(encoding="utf-8")
+    skill = (REPO_ROOT / "nanobot/skills/safety-ethics/SKILL.md").read_text(encoding="utf-8")
+
+    # Telling the user to introduce themselves is mandated in both places.
+    assert "introduce themselves" in identity
+    assert "introduce themselves" in skill
+    # The cap explicitly survives an administrator claim.
+    assert "does not lift" in identity
+    assert "does not lift" in skill
+    # And the agent must never leak a stored person's details.
+    assert "NEVER reveal" in identity
 
 
 def test_safety_ethics_is_always_loaded() -> None:
@@ -75,7 +109,7 @@ def test_admin_context_is_included_in_current_prompt_but_not_as_a_skill() -> Non
     )
 
     assert blocks[0].source == "telegram_verified_admin"
-    assert "Minis Bot" in prompt
+    assert "CDNAI" in prompt
     assert "safety-ethics" in prompt
-    assert "verified Minis Bot administrator" in str(current["content"])
+    assert "verified CDNAI administrator" in str(current["content"])
     assert current["_meta"]["runtime_context"]["sources"] == ["telegram_verified_admin"]

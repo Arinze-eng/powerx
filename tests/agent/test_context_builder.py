@@ -326,7 +326,7 @@ class TestBuildSystemPrompt:
         result = ContextBuilder(agent_home)._get_identity(workspace=project)
 
         assert str(project.resolve()) not in result
-        assert f"Minis Bot's agent workspace is at: {agent_home.resolve()}" in result
+        assert f"CDNAI's agent workspace is at: {agent_home.resolve()}" in result
         assert f"{agent_home.resolve()}/SOUL.md" in result
         assert f"{project.resolve()}/SOUL.md" not in result
 

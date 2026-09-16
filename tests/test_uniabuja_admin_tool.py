@@ -25,7 +25,7 @@ def _ctx(*, verified: bool = True, channel: str = "telegram") -> RequestContext:
                 source="telegram_verified_admin",
                 content=wrap_runtime_context_lines(
                     [
-                        "The current Telegram sender is the verified Minis Bot administrator.",
+                        "The current Telegram sender is the verified CDNAI administrator.",
                         "Verified administrator account: allisonarinze@gmail.com",
                     ]
                 ),

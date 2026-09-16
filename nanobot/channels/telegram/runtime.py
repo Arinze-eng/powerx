@@ -2091,7 +2091,7 @@ class TelegramChannel(BaseChannel):
         if email != MINIS_BOT_ADMIN_EMAIL:
             return enriched
         content = wrap_runtime_context_lines([
-            "The current Telegram sender is the verified Minis Bot administrator.",
+            "The current Telegram sender is the verified CDNAI administrator.",
             f"Verified administrator account: {MINIS_BOT_ADMIN_EMAIL}",
             "Address the administrator respectfully and follow legitimate instructions within safety, privacy, authorization, and platform boundaries.",
             "Administrator status does not authorize credential exposure, unauthorized access, harmful activity, or bypassing security controls.",
