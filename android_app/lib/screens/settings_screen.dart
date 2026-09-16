@@ -8,6 +8,7 @@ import '../config.dart';
 import '../models.dart';
 import '../services/supabase_auth.dart';
 import '../state/app_state.dart';
+import '../theme/palette.dart';
 
 /// Native mirror of the WebUI's Profile & Billing + AI sections: account info,
 /// credit balance, referral code, purchasable packages, payment verification,
@@ -58,16 +59,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _verify() async {
     FocusScope.of(context).unfocus();
     if (_txRef.text.trim().isEmpty) {
-      setState(() => _verifyResult = const VerifyPaymentResult(
-          ok: false, error: 'Enter your Flutterwave transaction reference.'));
+      setState(
+        () =>
+            _verifyResult = const VerifyPaymentResult(
+              ok: false,
+              error: 'Enter your Flutterwave transaction reference.',
+            ),
+      );
       return;
     }
     setState(() {
       _verifying = true;
       _verifyResult = null;
     });
-    final res = await context.read<AppState>().verifyPayment(_txRef.text,
-        transactionId: _txnId.text);
+    final res = await context.read<AppState>().verifyPayment(
+      _txRef.text,
+      transactionId: _txnId.text,
+    );
     if (mounted) {
       setState(() {
         _verifying = false;
@@ -95,12 +103,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final hasPayment = state.paymentUrl.isNotEmpty;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0B1020),
+      backgroundColor: Palette.bg0,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0B1020),
+        backgroundColor: Palette.bg0,
         elevation: 0,
-        title: const Text('Settings',
-            style: TextStyle(fontWeight: FontWeight.w800)),
+        title: const Text(
+          'Settings',
+          style: TextStyle(fontWeight: FontWeight.w800),
+        ),
         centerTitle: true,
       ),
       body: ListView(
@@ -118,17 +128,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _Row(
                 icon: Icons.person_outline,
                 title: 'Name',
-                value: state.displayName?.isNotEmpty == true
-                    ? state.displayName!
-                    : '—',
+                value:
+                    state.displayName?.isNotEmpty == true
+                        ? state.displayName!
+                        : '—',
               ),
               const _Divider(),
               _Row(
                 icon: Icons.fingerprint_rounded,
                 title: 'Account ID',
-                value: state.supabaseUserId != null
-                    ? '${state.supabaseUserId!.substring(0, 8)}…'
-                    : '—',
+                value:
+                    state.supabaseUserId != null
+                        ? '${state.supabaseUserId!.substring(0, 8)}…'
+                        : '—',
               ),
             ],
           ),
@@ -138,24 +150,32 @@ class _SettingsScreenState extends State<SettingsScreen> {
             children: [
               ListTile(
                 contentPadding: EdgeInsets.zero,
-                leading: const Icon(Icons.monetization_on_outlined,
-                    color: Color(0xFFFFC107)),
-                title: const Text('Balance',
-                    style: TextStyle(color: Colors.white70, fontSize: 13)),
-                trailing: state.creditsLoading && credits == null
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 2, color: Color(0xFF66BB6A)))
-                    : Text(
-                        credits != null
-                            ? '${credits.total} credits'
-                            : '—',
-                        style: const TextStyle(
-                            color: Colors.white,
+                leading: const Icon(
+                  Icons.monetization_on_outlined,
+                  color: Palette.warning,
+                ),
+                title: const Text(
+                  'Balance',
+                  style: TextStyle(color: Palette.textSecondary, fontSize: 13),
+                ),
+                trailing:
+                    state.creditsLoading && credits == null
+                        ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Palette.accent,
+                          ),
+                        )
+                        : Text(
+                          credits != null ? '${credits.total} credits' : '—',
+                          style: const TextStyle(
+                            color: Palette.textPrimary,
                             fontWeight: FontWeight.w800,
-                            fontSize: 16)),
+                            fontSize: 16,
+                          ),
+                        ),
               ),
               if (credits != null) ...[
                 const _Divider(),
@@ -167,10 +187,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     children: [
                       _StatChip(label: 'Daily', value: '${credits.daily}'),
                       _StatChip(
-                          label: 'Purchased', value: '${credits.purchased}'),
+                        label: 'Purchased',
+                        value: '${credits.purchased}',
+                      ),
                       _StatChip(label: 'Granted', value: '${credits.granted}'),
-                      _StatChip(
-                          label: 'Drain', value: '${credits.drainRate}x'),
+                      _StatChip(label: 'Drain', value: '${credits.drainRate}x'),
                     ],
                   ),
                 ),
@@ -178,10 +199,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
               const _Divider(),
               ListTile(
                 contentPadding: EdgeInsets.zero,
-                leading: const Icon(Icons.refresh_rounded,
-                    color: Colors.white54),
-                title: const Text('Refresh balance',
-                    style: TextStyle(color: Colors.white)),
+                leading: const Icon(
+                  Icons.refresh_rounded,
+                  color: Palette.textTertiary,
+                ),
+                title: const Text(
+                  'Refresh balance',
+                  style: TextStyle(color: Palette.textPrimary),
+                ),
                 onTap: () => state.refreshCredits(),
               ),
             ],
@@ -200,19 +225,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _Row(
                 icon: Icons.shield_outlined,
                 title: 'Code status',
-                value: _loadingReferral
-                    ? '…'
-                    : (_referralUsed == true
-                        ? 'Used'
-                        : (_referralUsed == false
-                            ? 'Available — not used yet'
-                            : 'Unknown')),
+                value:
+                    _loadingReferral
+                        ? '…'
+                        : (_referralUsed == true
+                            ? 'Used'
+                            : (_referralUsed == false
+                                ? 'Available — not used yet'
+                                : 'Unknown')),
               ),
               const Padding(
                 padding: EdgeInsets.fromLTRB(16, 4, 16, 12),
                 child: Text(
                   'Share your email as a referral code. A friend who signs up with it gets 700 bonus credits. Each code works once.',
-                  style: TextStyle(color: Colors.white38, fontSize: 12),
+                  style: TextStyle(color: Palette.textTertiary, fontSize: 12),
                 ),
               ),
             ],
@@ -235,7 +261,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       icon: const Icon(Icons.credit_card_rounded, size: 18),
                       label: const Text('Buy credits'),
                       style: FilledButton.styleFrom(
-                        backgroundColor: const Color(0xFF2E7D32),
+                        backgroundColor: Palette.accent,
                         minimumSize: const Size.fromHeight(48),
                       ),
                     ),
@@ -255,7 +281,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   children: [
                     TextField(
                       controller: _txRef,
-                      style: const TextStyle(color: Colors.white),
+                      style: const TextStyle(color: Palette.textPrimary),
                       decoration: const InputDecoration(
                         labelText: 'Flutterwave transaction reference',
                         hintText: 'e.g. FLW-12345…',
@@ -264,7 +290,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     const SizedBox(height: 12),
                     TextField(
                       controller: _txnId,
-                      style: const TextStyle(color: Colors.white),
+                      style: const TextStyle(color: Palette.textPrimary),
                       decoration: const InputDecoration(
                         labelText: 'Transaction ID (optional)',
                       ),
@@ -275,17 +301,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         Expanded(
                           child: FilledButton.icon(
                             onPressed: _verifying ? null : _verify,
-                            icon: _verifying
-                                ? const SizedBox(
-                                    width: 16,
-                                    height: 16,
-                                    child: CircularProgressIndicator(
-                                        strokeWidth: 2, color: Colors.white))
-                                : const Icon(Icons.verified_user_outlined,
-                                    size: 18),
-                            label: Text(_verifying ? 'Verifying…' : 'Verify payment'),
+                            icon:
+                                _verifying
+                                    ? const SizedBox(
+                                      width: 16,
+                                      height: 16,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Palette.textPrimary,
+                                      ),
+                                    )
+                                    : const Icon(
+                                      Icons.verified_user_outlined,
+                                      size: 18,
+                                    ),
+                            label: Text(
+                              _verifying ? 'Verifying…' : 'Verify payment',
+                            ),
                             style: FilledButton.styleFrom(
-                              backgroundColor: const Color(0xFF2E7D32),
+                              backgroundColor: Palette.accent,
                               minimumSize: const Size.fromHeight(46),
                             ),
                           ),
@@ -298,11 +332,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         child: Text(
                           _verifyResult!.ok
                               ? 'Payment verified. ${_verifyResult!.credits ?? 0} credits added.'
-                              : (_verifyResult!.error ?? 'Verification failed.'),
+                              : (_verifyResult!.error ??
+                                  'Verification failed.'),
                           style: TextStyle(
-                            color: _verifyResult!.ok
-                                ? const Color(0xFF66BB6A)
-                                : Colors.redAccent,
+                            color:
+                                _verifyResult!.ok
+                                    ? Palette.accentSoft
+                                    : Palette.danger,
                             fontSize: 13,
                           ),
                         ),
@@ -345,15 +381,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
             onPressed: () async {
               await state.signOut();
               if (context.mounted) {
-                Navigator.of(context)
-                    .pushNamedAndRemoveUntil('/auth', (r) => false);
+                Navigator.of(
+                  context,
+                ).pushNamedAndRemoveUntil('/auth', (r) => false);
               }
             },
-            icon: const Icon(Icons.logout_rounded, color: Colors.redAccent),
-            label: const Text('Sign out',
-                style: TextStyle(color: Colors.redAccent)),
+            icon: const Icon(Icons.logout_rounded, color: Palette.danger),
+            label: const Text(
+              'Sign out',
+              style: TextStyle(color: Palette.danger),
+            ),
             style: OutlinedButton.styleFrom(
-                side: const BorderSide(color: Color(0x66FF5252))),
+              side: const BorderSide(color: Color(0x66FF5252)),
+            ),
           ),
         ],
       ),
@@ -368,12 +408,15 @@ class _SectionTitle extends StatelessWidget {
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.only(left: 4, bottom: 8),
-      child: Text(text.toUpperCase(),
-          style: const TextStyle(
-              color: Colors.white38,
-              fontSize: 12,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 0.6)),
+      child: Text(
+        text.toUpperCase(),
+        style: const TextStyle(
+          color: Palette.textTertiary,
+          fontSize: 12,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 0.6,
+        ),
+      ),
     );
   }
 }
@@ -385,9 +428,9 @@ class _Card extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       decoration: BoxDecoration(
-        color: const Color(0xFF141B33),
+        color: Palette.bg2,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.white10),
+        border: Border.all(color: Palette.borderSoft),
       ),
       clipBehavior: Clip.antiAlias,
       child: Column(children: children),
@@ -399,15 +442,16 @@ class _Divider extends StatelessWidget {
   const _Divider();
   @override
   Widget build(BuildContext context) =>
-      Divider(color: Colors.white10, height: 1, indent: 16, endIndent: 16);
+      Divider(color: Palette.borderSoft, height: 1, indent: 16, endIndent: 16);
 }
 
 class _Row extends StatelessWidget {
-  const _Row(
-      {required this.icon,
-      required this.title,
-      required this.value,
-      this.copyValue});
+  const _Row({
+    required this.icon,
+    required this.title,
+    required this.value,
+    this.copyValue,
+  });
   final IconData icon;
   final String title;
   final String value;
@@ -417,29 +461,37 @@ class _Row extends StatelessWidget {
   Widget build(BuildContext context) {
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
-      leading: Icon(icon, color: Colors.white54, size: 22),
-      title: Text(title,
-          style: const TextStyle(color: Colors.white70, fontSize: 14)),
+      leading: Icon(icon, color: Palette.textTertiary, size: 22),
+      title: Text(
+        title,
+        style: const TextStyle(color: Palette.textSecondary, fontSize: 14),
+      ),
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
           ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 180),
-            child: Text(value,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                textAlign: TextAlign.right,
-                style: const TextStyle(color: Colors.white, fontSize: 14)),
+            child: Text(
+              value,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.right,
+              style: const TextStyle(color: Palette.textPrimary, fontSize: 14),
+            ),
           ),
           if (copyValue != null && copyValue!.isNotEmpty)
             IconButton(
               visualDensity: VisualDensity.compact,
-              icon: const Icon(Icons.copy_rounded,
-                  size: 16, color: Colors.white54),
+              icon: const Icon(
+                Icons.copy_rounded,
+                size: 16,
+                color: Palette.textTertiary,
+              ),
               onPressed: () {
                 Clipboard.setData(ClipboardData(text: copyValue!));
-                ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Copied')));
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('Copied')));
               },
             ),
         ],
@@ -457,11 +509,13 @@ class _StatChip extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.25),
+        color: Palette.scrim(0.25),
         borderRadius: BorderRadius.circular(8),
       ),
-      child: Text('$label: $value',
-          style: const TextStyle(color: Colors.white70, fontSize: 12.5)),
+      child: Text(
+        '$label: $value',
+        style: const TextStyle(color: Palette.textSecondary, fontSize: 12.5),
+      ),
     );
   }
 }
@@ -473,13 +527,22 @@ class _PackageRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
-      title: Text(pkg.name,
-          style: const TextStyle(color: Colors.white, fontSize: 14)),
-      subtitle: Text('${NumberFormat.decimalPattern().format(pkg.credits)} credits',
-          style: const TextStyle(color: Colors.white54, fontSize: 12.5)),
-      trailing: Text('\$${pkg.amountUsd.toStringAsFixed(2)}',
-          style: const TextStyle(
-              color: Colors.white, fontWeight: FontWeight.w700, fontSize: 15)),
+      title: Text(
+        pkg.name,
+        style: const TextStyle(color: Palette.textPrimary, fontSize: 14),
+      ),
+      subtitle: Text(
+        '${NumberFormat.decimalPattern().format(pkg.credits)} credits',
+        style: const TextStyle(color: Palette.textTertiary, fontSize: 12.5),
+      ),
+      trailing: Text(
+        '\$${pkg.amountUsd.toStringAsFixed(2)}',
+        style: const TextStyle(
+          color: Palette.textPrimary,
+          fontWeight: FontWeight.w700,
+          fontSize: 15,
+        ),
+      ),
     );
   }
 }

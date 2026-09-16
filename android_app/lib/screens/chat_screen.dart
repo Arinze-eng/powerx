@@ -13,16 +13,22 @@ import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
-import '../config.dart';
 import '../models.dart';
 import '../services/chat_cache.dart';
 import '../services/gateway_api.dart';
 import '../services/nanobot_socket.dart';
 import '../state/app_state.dart';
+import '../theme/app_theme.dart';
+import '../theme/palette.dart';
+import '../widgets/brand.dart';
 
 class ChatScreen extends StatefulWidget {
-  const ChatScreen({super.key, this.session});
+  const ChatScreen({super.key, this.session, this.initialPrompt});
   final SessionSummary? session;
+
+  /// Optional text seeded into the composer (used by the landing screen's
+  /// starter cards so a suggestion opens a ready-to-send draft).
+  final String? initialPrompt;
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -79,6 +85,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // Seed a starter suggestion so the user can review before sending.
+    final seed = widget.initialPrompt;
+    if (seed != null && seed.trim().isNotEmpty) {
+      _input.text = seed.trim();
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) => _boot());
   }
 
@@ -267,9 +278,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final existing = _liveTurn;
     if (existing != null) return existing;
     final msg = ChatMessage(
-        id: 'live-${DateTime.now().microsecondsSinceEpoch}',
-        role: Role.assistant,
-        streaming: true);
+      id: 'live-${DateTime.now().microsecondsSinceEpoch}',
+      role: Role.assistant,
+      streaming: true,
+    );
     setState(() {
       _messages.add(msg);
       _liveTurn = msg;
@@ -330,9 +342,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         if (turn == null) {
           if (text.trim().isEmpty && media.isEmpty) return;
           turn = ChatMessage(
-              id: 'm-${DateTime.now().microsecondsSinceEpoch}',
-              role: Role.assistant,
-              streaming: false);
+            id: 'm-${DateTime.now().microsecondsSinceEpoch}',
+            role: Role.assistant,
+            streaming: false,
+          );
           _messages.add(turn);
         }
         final t = turn;
@@ -342,10 +355,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ..add(text);
         }
         if (media.isNotEmpty) {
-          t.media = [
-            ...t.media,
-            ...media.where((m) => !t.media.contains(m)),
-          ];
+          t.media = [...t.media, ...media.where((m) => !t.media.contains(m))];
         }
         if (mounted) setState(() {});
       },
@@ -407,16 +417,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       onUserMessage: (text, turnId) {
         // Projected user echo / replay after reconnect — dedupe by turnId
         // when known, else by identical user text in this view.
-        final dup = _messages.any((m) =>
-            m.role == Role.user &&
-            ((turnId != null && m.turnId == turnId) ||
-                (turnId == null && m.text == text)));
+        final dup = _messages.any(
+          (m) =>
+              m.role == Role.user &&
+              ((turnId != null && m.turnId == turnId) ||
+                  (turnId == null && m.text == text)),
+        );
         if (!dup && text.trim().isNotEmpty) {
-          setState(() => _messages.add(ChatMessage(
-              id: 'u-echo-${DateTime.now().microsecondsSinceEpoch}',
-              role: Role.user,
-              text: text,
-              turnId: turnId)));
+          setState(
+            () => _messages.add(
+              ChatMessage(
+                id: 'u-echo-${DateTime.now().microsecondsSinceEpoch}',
+                role: Role.user,
+                text: text,
+                turnId: turnId,
+              ),
+            ),
+          );
           _scrollToBottom();
         }
       },
@@ -519,8 +536,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       final offline = sock == null || !sock.isConnected;
       // No inbound frame for a while although the socket claims to be up:
       // verify the turn is genuinely still running instead of assuming.
-      final stale = DateTime.now().difference(_lastEventAt) >
-          const Duration(seconds: 90);
+      final stale =
+          DateTime.now().difference(_lastEventAt) > const Duration(seconds: 90);
       if (offline || stale) {
         await _resync();
       }
@@ -661,14 +678,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final wireMedia = readyMedia.map((a) => a.toWireMedia()).toList();
 
     setState(() {
-      _messages.add(ChatMessage(
+      _messages.add(
+        ChatMessage(
           id: 'u-${DateTime.now().microsecondsSinceEpoch}',
           role: Role.user,
           text: text,
-          media: readyMedia
-              .map((a) => a.url ?? (a.localPath ?? ''))
-              .where((s) => s.isNotEmpty)
-              .toList()));
+          media:
+              readyMedia
+                  .map((a) => a.url ?? (a.localPath ?? ''))
+                  .where((s) => s.isNotEmpty)
+                  .toList(),
+        ),
+      );
       _pending.clear();
       _sending = true;
       _stopping = false;
@@ -696,8 +717,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     // Mark the turn before the frame hits the wire so an early terminal event
     // is still attributed to this turn.
     _socket!.markUserTurn(_chatId!);
-    _socket!.sendMessage(_chatId!, text,
-        media: wireMedia.isEmpty ? null : wireMedia);
+    _socket!.sendMessage(
+      _chatId!,
+      text,
+      media: wireMedia.isEmpty ? null : wireMedia,
+    );
   }
 
   /// Cancel the running task (server `/stop` slash command).
@@ -750,8 +774,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return;
     }
     try {
-      final payload = await state.api.fetchFilePreview(state.apiToken!, key,
-          path: path, supabaseToken: state.accessToken);
+      final payload = await state.api.fetchFilePreview(
+        state.apiToken!,
+        key,
+        path: path,
+        supabaseToken: state.accessToken,
+      );
       final content = payload['content'];
       if (content is! String || content.isEmpty) {
         throw StateError('file is empty or not text-previewable');
@@ -759,7 +787,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       final name = path.split('/').last;
       final dir = await getTemporaryDirectory();
       final file = File(
-          '${dir.path}/${DateTime.now().millisecondsSinceEpoch}-$name');
+        '${dir.path}/${DateTime.now().millisecondsSinceEpoch}-$name',
+      );
       await file.writeAsString(content, flush: true);
       final result = await OpenFilex.open(file.path);
       if (result.type != ResultType.done) {
@@ -767,8 +796,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
     } on ApiException catch (e) {
       if (e.status == 415) {
-        _toast('"${path.split('/').last}" is binary — ask the agent to send it '
-            'as an attachment to download it.');
+        _toast(
+          '"${path.split('/').last}" is binary — ask the agent to send it '
+          'as an attachment to download it.',
+        );
       } else if (e.status == 404) {
         _toast('File not found in this workspace: $path');
       } else if (e.status == 403) {
@@ -797,9 +828,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     // the completed answer immediately.
     final chatId = _chatId;
     if (chatId != null) {
-      unawaited(context
-          .read<AppState>()
-          .cacheThread(chatId, List<ChatMessage>.from(_messages)));
+      unawaited(
+        context.read<AppState>().cacheThread(
+          chatId,
+          List<ChatMessage>.from(_messages),
+        ),
+      );
     }
     WakelockPlus.disable();
     WidgetsBinding.instance.removeObserver(this);
@@ -811,22 +845,28 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    final userInitial = state.greetingName;
+
     return Scaffold(
-      backgroundColor: const Color(0xFF0B1020),
+      backgroundColor: Palette.bg0,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0B1020),
+        backgroundColor: Palette.bg1,
         elevation: 0,
+        // A compact, ChatGPT-style bar: brand mark on the left of the title,
+        // fixed-size status slot on the right so nothing shifts while a turn
+        // streams.
         title: Stack(
           alignment: Alignment.center,
           children: [
-            const Text(PowerXConfig.appName, style: TextStyle(fontWeight: FontWeight.w800)),
-            // Fixed-size status slot: occupies the same space whether it is
-            // showing the working spinner, the settled done check, or nothing,
-            // so the title never shifts and the pill never bounces.
+            const BrandWordmark(fontSize: 15),
             Positioned(
               right: 0,
               child: _StatusPill(
-                  busy: _busy, stopping: _stopping, completed: _justCompleted),
+                busy: _busy,
+                stopping: _stopping,
+                completed: _justCompleted,
+              ),
             ),
           ],
         ),
@@ -834,15 +874,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         actions: [
           if (!_connected)
             const Padding(
-              padding: EdgeInsets.only(right: 4),
+              padding: EdgeInsets.only(right: 2),
               child: Tooltip(
                 message: 'Reconnecting…',
-                child: Icon(Icons.cloud_off_rounded,
-                    size: 18, color: Colors.orangeAccent),
+                child: Icon(
+                  Icons.cloud_off_rounded,
+                  size: 18,
+                  color: Palette.warning,
+                ),
               ),
             ),
           IconButton(
-            icon: const Icon(Icons.settings_outlined),
+            icon: const Icon(Icons.settings_outlined, size: 21),
             tooltip: 'Settings',
             onPressed: () => Navigator.of(context).pushNamed('/settings'),
           ),
@@ -853,33 +896,47 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           if (!_connected)
             Container(
               width: double.infinity,
-              color: const Color(0xFF3E2723),
+              color: Palette.bg3,
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
               child: const Row(
                 children: [
-                  Icon(Icons.cloud_off_rounded,
-                      size: 15, color: Colors.orangeAccent),
+                  Icon(
+                    Icons.cloud_off_rounded,
+                    size: 15,
+                    color: Palette.warning,
+                  ),
                   SizedBox(width: 8),
                   Expanded(
                     child: Text(
                       'Reconnecting… your task keeps running on the server.',
-                      style: TextStyle(fontSize: 12, color: Colors.orangeAccent),
+                      style: TextStyle(fontSize: 12, color: Palette.warning),
                     ),
                   ),
                 ],
               ),
             ),
           Expanded(
-            child: _loadingHistory
-                ? const Center(child: CircularProgressIndicator())
-                : ListView.builder(
-                    controller: _scroll,
-                    padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-                    itemCount: _messages.length,
-                    itemBuilder: (_, i) => _Bubble(
-                        message: _messages[i],
-                        onOpenArtifact: (p) => _openArtifact(p)),
-                  ),
+            child:
+                _loadingHistory
+                    ? const Center(
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.4,
+                        color: Palette.accent,
+                      ),
+                    )
+                    : _messages.isEmpty
+                    ? _EmptyChat(greetingName: state.greetingName)
+                    : ListView.builder(
+                      controller: _scroll,
+                      padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
+                      itemCount: _messages.length,
+                      itemBuilder:
+                          (_, i) => _Bubble(
+                            message: _messages[i],
+                            userInitial: userInitial,
+                            onOpenArtifact: (p) => _openArtifact(p),
+                          ),
+                    ),
           ),
           _Composer(
             controller: _input,
@@ -897,147 +954,236 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 }
 
+/// Shown on a brand-new, still-empty conversation: a quiet prompt that tells
+/// the user the agent is ready without shouting.
+class _EmptyChat extends StatelessWidget {
+  const _EmptyChat({required this.greetingName});
+  final String greetingName;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const BrandMark(size: 66),
+            const SizedBox(height: 20),
+            Text(
+              'Hi $greetingName',
+              style: const TextStyle(
+                fontSize: 21,
+                fontWeight: FontWeight.w800,
+                color: Palette.textPrimary,
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Ask a question, attach a file, or describe a task.\n'
+              'I can research, write, analyse data and build things.',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Palette.textTertiary,
+                fontSize: 13.5,
+                height: 1.5,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _Bubble extends StatelessWidget {
-  const _Bubble({required this.message, this.onOpenArtifact});
+  const _Bubble({
+    required this.message,
+    this.onOpenArtifact,
+    this.userInitial = '',
+  });
   final ChatMessage message;
   final void Function(String path)? onOpenArtifact;
+  final String userInitial;
 
   @override
   Widget build(BuildContext context) {
     final isUser = message.role == Role.user;
+    final maxWidth = MediaQuery.of(context).size.width * 0.86;
+
     final bubble = Container(
-      margin: const EdgeInsets.symmetric(vertical: 6),
-      constraints:
-          BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.90),
+      constraints: BoxConstraints(maxWidth: maxWidth),
       decoration: BoxDecoration(
-        color: isUser ? const Color(0xFF2E7D32) : const Color(0xFF1A2138),
+        // The user surface is the warm brown gradient (the "brown chat
+        // section"); the assistant reads as a flat card so answers stay the
+        // visual focus.
+        color: isUser ? null : Palette.bg2,
+        gradient: isUser ? Palette.userBubbleGradient : null,
         borderRadius: BorderRadius.only(
           topLeft: const Radius.circular(18),
           topRight: const Radius.circular(18),
-          bottomLeft: Radius.circular(isUser ? 18 : 6),
-          bottomRight: Radius.circular(isUser ? 6 : 18),
+          bottomLeft: Radius.circular(isUser ? 18 : 5),
+          bottomRight: Radius.circular(isUser ? 5 : 18),
         ),
+        border: isUser ? null : Border.all(color: Palette.borderSoft),
       ),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
       child: _content(context, isUser),
     );
-    return Align(
-      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      // Long-press copies the message text — handy for short answers and
-      // error reports on a phone.
-      child: GestureDetector(
-        onLongPress: message.text.trim().isEmpty
-            ? null
-            : () {
-                Clipboard.setData(ClipboardData(text: message.text));
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                    content: Text('Copied to clipboard'),
-                    duration: Duration(seconds: 1)));
-              },
-        child: bubble,
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisAlignment:
+            isUser ? MainAxisAlignment.end : MainAxisAlignment.start,
+        children: [
+          if (!isUser) ...[
+            const Padding(
+              padding: EdgeInsets.only(top: 2),
+              child: ChatAvatar(isAssistant: true, size: 28),
+            ),
+            const SizedBox(width: 9),
+          ],
+          Flexible(
+            child: Align(
+              alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+              // Long-press copies the message text — handy for short answers
+              // and error reports on a phone.
+              child: GestureDetector(
+                onLongPress:
+                    message.text.trim().isEmpty
+                        ? null
+                        : () {
+                          Clipboard.setData(ClipboardData(text: message.text));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text('Copied to clipboard'),
+                              duration: Duration(seconds: 1),
+                            ),
+                          );
+                        },
+                child: bubble,
+              ),
+            ),
+          ),
+          if (isUser) ...[
+            const SizedBox(width: 9),
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: ChatAvatar(
+                isAssistant: false,
+                initial: userInitial,
+                size: 28,
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }
 
   Widget _content(BuildContext context, bool isUser) {
     return isUser
-            ? Column(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (message.text.isNotEmpty)
-                    SelectableText(message.text,
-                        style: const TextStyle(
-                            color: Colors.white, fontSize: 15)),
-                  if (message.media.isNotEmpty)
-                    Padding(
-                      padding: EdgeInsets.only(
-                          top: message.text.isNotEmpty ? 8 : 0),
-                      child: Wrap(
-                        spacing: 6,
-                        runSpacing: 6,
-                        alignment: WrapAlignment.end,
-                        children: [
-                          for (final m in message.media)
-                            _AttachmentChip(
-                                label: _basename(m), url: m),
-                        ],
-                      ),
-                    ),
-                ],
-              )
-            : Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (message.activity.isNotEmpty)
-                    _ActivityPanel(
-                        steps: message.activity, turnStreaming: message.streaming),
-                  if (message.artifactPaths.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 8),
-                      child: _FileChips(
-                          paths: message.artifactPaths,
-                          onOpen: onOpenArtifact),
-                    ),
-                  if (message.reasoning.trim().isNotEmpty)
-                    _ThinkingPanel(
-                        reasoning: message.reasoning,
-                        streaming: message.reasoningStreaming),
-                  for (var i = 0; i < message.segments.length; i++)
-                    Padding(
-                      padding: EdgeInsets.only(
-                          top: i == 0 ? 0 : 8),
-                      child: MarkdownBody(
-                        data: message.segments[i],
-                        selectable: true,
-                        styleSheet:
-                            MarkdownStyleSheet.fromTheme(Theme.of(context))
-                                .copyWith(
-                          p: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 15,
-                              height: 1.35),
-                          codeblockDecoration: BoxDecoration(
-                              color: Colors.black.withValues(alpha: 0.35),
-                              borderRadius: BorderRadius.circular(8)),
-                        ),
-                      ),
-                    ),
-                  if (message.streaming &&
-                      message.isEmpty &&
-                      message.activity.isEmpty)
-                    const Padding(
-                      padding: EdgeInsets.only(top: 2),
-                      child: _TypingDots(compact: true),
-                    ),
-                  if (message.viewableMedia.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 8),
-                      child: Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          for (final u in message.viewableMedia)
-                            _MediaLink(url: u),
-                        ],
-                      ),
-                    ),
-                  if (!message.streaming && message.hasError)
-                    const Padding(
-                      padding: EdgeInsets.only(top: 6),
-                      child: Icon(Icons.error_outline,
-                          size: 16, color: Colors.redAccent),
-                    ),
-                  if (!message.streaming && _footer(message) != null)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 6),
-                      child: Text(_footer(message)!,
-                          style: const TextStyle(
-                              color: Colors.white30, fontSize: 11)),
-                    ),
-                ],
-              );
+        ? Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (message.text.isNotEmpty)
+              SelectableText(
+                message.text,
+                style: const TextStyle(
+                  color: Palette.userText,
+                  fontSize: 15,
+                  height: 1.4,
+                ),
+              ),
+            if (message.media.isNotEmpty)
+              Padding(
+                padding: EdgeInsets.only(top: message.text.isNotEmpty ? 8 : 0),
+                child: Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  alignment: WrapAlignment.end,
+                  children: [
+                    for (final m in message.media)
+                      _AttachmentChip(label: _basename(m), url: m),
+                  ],
+                ),
+              ),
+          ],
+        )
+        : Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (message.activity.isNotEmpty)
+              _ActivityPanel(
+                steps: message.activity,
+                turnStreaming: message.streaming,
+              ),
+            if (message.artifactPaths.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: _FileChips(
+                  paths: message.artifactPaths,
+                  onOpen: onOpenArtifact,
+                ),
+              ),
+            if (message.reasoning.trim().isNotEmpty)
+              _ThinkingPanel(
+                reasoning: message.reasoning,
+                streaming: message.reasoningStreaming,
+              ),
+            for (var i = 0; i < message.segments.length; i++)
+              Padding(
+                padding: EdgeInsets.only(top: i == 0 ? 0 : 8),
+                child: MarkdownBody(
+                  data: message.segments[i],
+                  selectable: true,
+                  styleSheet: AppTheme.markdown(context),
+                ),
+              ),
+            if (message.streaming &&
+                message.isEmpty &&
+                message.activity.isEmpty)
+              const Padding(
+                padding: EdgeInsets.only(top: 2),
+                child: _TypingDots(compact: true),
+              ),
+            if (message.viewableMedia.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final u in message.viewableMedia) _MediaLink(url: u),
+                  ],
+                ),
+              ),
+            if (!message.streaming && message.hasError)
+              const Padding(
+                padding: EdgeInsets.only(top: 6),
+                child: Icon(
+                  Icons.error_outline,
+                  size: 16,
+                  color: Palette.danger,
+                ),
+              ),
+            if (!message.streaming && _footer(message) != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  _footer(message)!,
+                  style: const TextStyle(
+                    color: Palette.textTertiary,
+                    fontSize: 11,
+                  ),
+                ),
+              ),
+          ],
+        );
   }
 
   static String? _footer(ChatMessage m) {
@@ -1081,11 +1227,12 @@ class _ActivityPanel extends StatelessWidget {
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      s.detail.isNotEmpty
-                          ? '${s.name} · ${s.detail}'
-                          : s.name,
+                      s.detail.isNotEmpty ? '${s.name} · ${s.detail}' : s.name,
                       style: TextStyle(
-                        color: s.isDone ? Colors.white54 : Colors.white70,
+                        color:
+                            s.isDone
+                                ? Palette.textTertiary
+                                : Palette.textSecondary,
                         fontSize: 12.5,
                         decoration: TextDecoration.none,
                       ),
@@ -1112,15 +1259,20 @@ class _StepStatus extends StatelessWidget {
           width: 12,
           height: 12,
           child: CircularProgressIndicator(
-              strokeWidth: 1.6, color: Color(0xFF66BB6A)),
+            strokeWidth: 1.6,
+            color: Palette.accent,
+          ),
         ),
       );
     }
     if (status == 'error') {
-      return const Icon(Icons.error_outline, size: 14, color: Colors.redAccent);
+      return const Icon(Icons.error_outline, size: 14, color: Palette.danger);
     }
-    return const Icon(Icons.check_circle_outline,
-        size: 14, color: Color(0xFF4CAF50));
+    return const Icon(
+      Icons.check_circle_outline,
+      size: 14,
+      color: Palette.success,
+    );
   }
 }
 
@@ -1153,8 +1305,9 @@ class _ThinkingPanelState extends State<_ThinkingPanel> {
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.22),
+        color: Palette.scrim(0.28),
         borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Palette.borderSoft),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1170,22 +1323,26 @@ class _ThinkingPanelState extends State<_ThinkingPanel> {
                         ? Icons.expand_more_rounded
                         : Icons.chevron_right_rounded,
                     size: 18,
-                    color: Colors.white54,
+                    color: Palette.textTertiary,
                   ),
                   const SizedBox(width: 4),
                   Text(
                     widget.streaming ? 'Thinking…' : 'Thought',
                     style: TextStyle(
-                      color: widget.streaming
-                          ? const Color(0xFF9CCC65)
-                          : Colors.white54,
+                      color:
+                          widget.streaming
+                              ? Palette.accentSoft
+                              : Palette.textTertiary,
                       fontSize: 12.5,
                       fontWeight: FontWeight.w600,
                     ),
                   ),
                   const Spacer(),
-                  const Icon(Icons.psychology_alt_outlined,
-                      size: 14, color: Colors.white24),
+                  const Icon(
+                    Icons.psychology_alt_outlined,
+                    size: 14,
+                    color: Palette.textTertiary,
+                  ),
                 ],
               ),
             ),
@@ -1198,7 +1355,10 @@ class _ThinkingPanelState extends State<_ThinkingPanel> {
                     ? '${widget.reasoning.substring(0, 4000)}…'
                     : widget.reasoning,
                 style: const TextStyle(
-                    color: Colors.white38, fontSize: 12, height: 1.35),
+                  color: Palette.textTertiary,
+                  fontSize: 12,
+                  height: 1.4,
+                ),
               ),
             ),
         ],
@@ -1216,11 +1376,13 @@ class _AttachmentChip extends StatelessWidget {
     final isHttp = url.startsWith('http');
     return InkWell(
       onTap: isHttp ? () => _launch(url) : null,
+      borderRadius: BorderRadius.circular(8),
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.2),
+          color: Palette.scrim(0.25),
           borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Palette.borderSoft),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
@@ -1229,10 +1391,12 @@ class _AttachmentChip extends StatelessWidget {
             const SizedBox(width: 6),
             ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 160),
-              child: Text(label,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(color: Colors.white70, fontSize: 12)),
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Colors.white70, fontSize: 12),
+              ),
             ),
           ],
         ),
@@ -1254,15 +1418,23 @@ class _MediaLink extends StatelessWidget {
           onTap: () => _launch(url),
           child: Image.network(
             url,
-            errorBuilder: (_, __, ___) =>
-                _AttachmentChip(label: _basename(url), url: url),
-            loadingBuilder: (_, child, prog) => prog == null
-                ? child
-                : const SizedBox(
-                    width: 120,
-                    height: 120,
-                    child:
-                        Center(child: CircularProgressIndicator(strokeWidth: 2))),
+            errorBuilder:
+                (_, __, ___) =>
+                    _AttachmentChip(label: _basename(url), url: url),
+            loadingBuilder:
+                (_, child, prog) =>
+                    prog == null
+                        ? child
+                        : const SizedBox(
+                          width: 120,
+                          height: 120,
+                          child: Center(
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Palette.accent,
+                            ),
+                          ),
+                        ),
             fit: BoxFit.cover,
             width: 220,
             height: 160,
@@ -1311,8 +1483,9 @@ class _TypingDots extends StatefulWidget {
 class _TypingDotsState extends State<_TypingDots>
     with SingleTickerProviderStateMixin {
   late final AnimationController _c = AnimationController(
-      vsync: this, duration: const Duration(milliseconds: 900))
-    ..repeat();
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  )..repeat();
   @override
   void dispose() {
     _c.dispose();
@@ -1333,7 +1506,7 @@ class _TypingDotsState extends State<_TypingDots>
               height: widget.compact ? 6 : 8,
               margin: const EdgeInsets.symmetric(horizontal: 2),
               decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: 0.3 + 0.5 * v),
+                color: Palette.accentSoft.withValues(alpha: 0.3 + 0.6 * v),
                 shape: BoxShape.circle,
               ),
             );
@@ -1369,17 +1542,17 @@ class _Composer extends StatelessWidget {
     return SafeArea(
       top: false,
       child: Container(
-        padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
         decoration: const BoxDecoration(
-          color: Color(0xFF0B1020),
-          border: Border(top: BorderSide(color: Colors.white10)),
+          color: Palette.bg0,
+          border: Border(top: BorderSide(color: Palette.borderSoft)),
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             if (pending.isNotEmpty)
               Padding(
-                padding: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.only(bottom: 10),
                 child: SizedBox(
                   height: 64,
                   child: ListView(
@@ -1389,68 +1562,103 @@ class _Composer extends StatelessWidget {
                         Padding(
                           padding: const EdgeInsets.only(right: 8),
                           child: _PendingTile(
-                              attachment: a, onRemove: () => onRemove(a)),
+                            attachment: a,
+                            onRemove: () => onRemove(a),
+                          ),
                         ),
                     ],
                   ),
                 ),
               ),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                IconButton(
-                  onPressed: onPick,
-                  icon: const Icon(Icons.attach_file_rounded,
-                      color: Colors.white54),
-                  tooltip: 'Attach files',
-                ),
-                Expanded(
-                  child: TextField(
-                    controller: controller,
-                    minLines: 1,
-                    maxLines: 5,
-                    textInputAction: TextInputAction.newline,
-                    style: const TextStyle(color: Colors.white, fontSize: 15),
-                    decoration: InputDecoration(
-                      hintText: busy
-                          ? (stopping ? 'Stopping task…' : 'CDNAI is working…')
-                          : 'Message CDNAI…',
-                      hintStyle: const TextStyle(color: Colors.white38),
-                      filled: true,
-                      fillColor: const Color(0xFF1A2138),
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 16, vertical: 12),
-                      border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(22),
-                          borderSide: BorderSide.none),
+            // One elevated pill holds attach + input + send, the way a modern
+            // chat app does — fewer floating controls, clearer target.
+            Container(
+              decoration: BoxDecoration(
+                color: Palette.bg3,
+                borderRadius: BorderRadius.circular(26),
+                border: Border.all(color: Palette.border),
+              ),
+              padding: const EdgeInsets.fromLTRB(4, 4, 6, 4),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  IconButton(
+                    onPressed: onPick,
+                    icon: const Icon(
+                      Icons.add_rounded,
+                      color: Palette.textSecondary,
+                      size: 22,
+                    ),
+                    tooltip: 'Attach files',
+                  ),
+                  Expanded(
+                    child: TextField(
+                      controller: controller,
+                      minLines: 1,
+                      maxLines: 5,
+                      textInputAction: TextInputAction.newline,
+                      style: const TextStyle(
+                        color: Palette.textPrimary,
+                        fontSize: 15,
+                      ),
+                      decoration: InputDecoration(
+                        hintText:
+                            busy
+                                ? (stopping
+                                    ? 'Stopping task…'
+                                    : 'CDNAI is working…')
+                                : 'Message CDNAI…',
+                        hintStyle: const TextStyle(
+                          color: Palette.textTertiary,
+                          fontSize: 15,
+                        ),
+                        filled: false,
+                        isDense: true,
+                        contentPadding: const EdgeInsets.symmetric(
+                          vertical: 12,
+                        ),
+                        border: InputBorder.none,
+                        enabledBorder: InputBorder.none,
+                        focusedBorder: InputBorder.none,
+                      ),
                     ),
                   ),
-                ),
-                const SizedBox(width: 8),
-                // Send arrow when idle; red stop square while the agent works.
-                Material(
-                  color: busy ? Colors.red.shade700 : const Color(0xFF2E7D32),
-                  shape: const CircleBorder(),
-                  child: InkWell(
-                    customBorder: const CircleBorder(),
-                    onTap: busy ? (stopping ? null : onStop) : onSend,
-                    child: Padding(
-                      padding: const EdgeInsets.all(12),
-                      child: busy
-                          ? (stopping
-                              ? const SizedBox(
-                                  width: 18,
-                                  height: 18,
-                                  child: CircularProgressIndicator(
-                                      strokeWidth: 2, color: Colors.white))
-                              : const Icon(Icons.stop_rounded,
-                                  color: Colors.white, size: 22))
-                          : const Icon(Icons.arrow_upward_rounded,
-                              color: Colors.white, size: 22),
+                  const SizedBox(width: 6),
+                  // Send arrow when idle; stop square while the agent works.
+                  Material(
+                    color: busy ? Palette.danger : Palette.accent,
+                    shape: const CircleBorder(),
+                    child: InkWell(
+                      customBorder: const CircleBorder(),
+                      onTap: busy ? (stopping ? null : onStop) : onSend,
+                      child: Padding(
+                        padding: const EdgeInsets.all(11),
+                        child:
+                            busy
+                                ? (stopping
+                                    ? const SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Color(0xFF241407),
+                                      ),
+                                    )
+                                    : const Icon(
+                                      Icons.stop_rounded,
+                                      color: Color(0xFF241407),
+                                      size: 22,
+                                    ))
+                                : const Icon(
+                                  Icons.arrow_upward_rounded,
+                                  color: Color(0xFF241407),
+                                  size: 22,
+                                ),
+                      ),
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ],
         ),
@@ -1474,47 +1682,54 @@ class _PendingTile extends StatelessWidget {
           width: 64,
           height: 64,
           decoration: BoxDecoration(
-            color: const Color(0xFF1A2138),
+            color: Palette.bg3,
             borderRadius: BorderRadius.circular(10),
             border: Border.all(
-                color: attachment.isError ? Colors.redAccent : Colors.white12),
+              color: attachment.isError ? Palette.danger : Palette.border,
+            ),
           ),
           clipBehavior: Clip.antiAlias,
-          child: isImage
-              ? Image.file(File(attachment.localPath!), fit: BoxFit.cover)
-              : Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        attachment.kind == 'video'
-                            ? Icons.movie_outlined
-                            : Icons.insert_drive_file_outlined,
-                        size: 22,
-                        color: Colors.white54,
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        _shortName(attachment.name),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                            color: Colors.white54, fontSize: 9),
-                      ),
-                    ],
+          child:
+              isImage
+                  ? Image.file(File(attachment.localPath!), fit: BoxFit.cover)
+                  : Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          attachment.kind == 'video'
+                              ? Icons.movie_outlined
+                              : Icons.insert_drive_file_outlined,
+                          size: 22,
+                          color: Palette.textTertiary,
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          _shortName(attachment.name),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Palette.textTertiary,
+                            fontSize: 9,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
         ),
         if (attachment.status == 'uploading')
           Positioned.fill(
             child: ColoredBox(
-              color: Colors.black45,
+              color: Palette.scrim(0.5),
               child: const Center(
                 child: SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(
-                        strokeWidth: 2, color: Colors.white)),
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Palette.accent,
+                  ),
+                ),
               ),
             ),
           ),
@@ -1522,11 +1737,15 @@ class _PendingTile extends StatelessWidget {
           Positioned.fill(
             child: Tooltip(
               message: attachment.errorText ?? 'Upload failed',
-              child: const ColoredBox(
-                color: Colors.black54,
-                child: Center(
-                    child: Icon(Icons.error_outline,
-                        color: Colors.redAccent, size: 22)),
+              child: ColoredBox(
+                color: Palette.scrim(0.55),
+                child: const Center(
+                  child: Icon(
+                    Icons.error_outline,
+                    color: Palette.danger,
+                    size: 22,
+                  ),
+                ),
               ),
             ),
           ),
@@ -1537,7 +1756,9 @@ class _PendingTile extends StatelessWidget {
             onTap: onRemove,
             child: Container(
               decoration: const BoxDecoration(
-                  color: Color(0xFF2E7D32), shape: BoxShape.circle),
+                color: Palette.accentDeep,
+                shape: BoxShape.circle,
+              ),
               padding: const EdgeInsets.all(2),
               child: const Icon(Icons.close, size: 12, color: Colors.white),
             ),
@@ -1574,16 +1795,19 @@ class _StatusPill extends StatelessWidget {
     if (busy) {
       content = _pill(
         const SizedBox(
-            width: 10,
-            height: 10,
-            child: CircularProgressIndicator(
-                strokeWidth: 1.6, color: Color(0xFF66BB6A))),
+          width: 10,
+          height: 10,
+          child: CircularProgressIndicator(
+            strokeWidth: 1.6,
+            color: Palette.accent,
+          ),
+        ),
         stopping ? 'stopping…' : 'working…',
       );
     } else if (completed) {
       // Static, non-animating confirmation that the task completed.
       content = _pill(
-        const Icon(Icons.check_circle, size: 13, color: Color(0xFF66BB6A)),
+        const Icon(Icons.check_circle, size: 13, color: Palette.success),
         'done',
       );
     }
@@ -1602,15 +1826,21 @@ class _StatusPill extends StatelessWidget {
       key: ValueKey(label),
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
-        color: const Color(0xFF1A2138),
+        color: Palette.bg3,
         borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Palette.borderSoft),
       ),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
-        leading,
-        const SizedBox(width: 6),
-        Text(label,
-            style: const TextStyle(fontSize: 11, color: Colors.white70)),
-      ]),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          leading,
+          const SizedBox(width: 6),
+          Text(
+            label,
+            style: const TextStyle(fontSize: 11, color: Palette.textSecondary),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1636,22 +1866,32 @@ class _FileChips extends StatelessWidget {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
               decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha: 0.35),
+                color: Palette.scrim(0.35),
                 borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.white12),
+                border: Border.all(color: Palette.border),
               ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Icon(Icons.insert_drive_file_outlined,
-                      size: 14, color: Color(0xFF66BB6A)),
+                  const Icon(
+                    Icons.insert_drive_file_outlined,
+                    size: 14,
+                    color: Palette.accentSoft,
+                  ),
                   const SizedBox(width: 5),
-                  Text(_fileBaseName(p),
-                      style:
-                          const TextStyle(color: Colors.white, fontSize: 12)),
+                  Text(
+                    _fileBaseName(p),
+                    style: const TextStyle(
+                      color: Palette.textPrimary,
+                      fontSize: 12,
+                    ),
+                  ),
                   const SizedBox(width: 4),
-                  const Icon(Icons.download_rounded,
-                      size: 14, color: Colors.white54),
+                  const Icon(
+                    Icons.download_rounded,
+                    size: 14,
+                    color: Palette.textTertiary,
+                  ),
                 ],
               ),
             ),
