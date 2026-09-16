@@ -451,6 +451,33 @@ class DaytonaExecutionConfig(Base):
     persist_workspace: bool = True
 
 
+class RunloopExecutionConfig(Base):
+    """Administrator-configured Runloop Devbox target for sandbox-backed execution."""
+
+    api_key: str = Field(default="", repr=False)
+    api_url: str = "https://api.runloop.ai"
+    # A devbox is built from exactly one base disk: an operator snapshot (exact
+    # baselined state) or a named blueprint (a reusable template image). When
+    # both are blank Runloop's default devbox image is used, which ships Python,
+    # Node, git, apt and open network egress.
+    snapshot_id: str = ""
+    blueprint: str = ""
+    # ``resource_size_request`` in Runloop's launch parameters.
+    resource_size: Literal[
+        "X_SMALL", "SMALL", "MEDIUM", "LARGE", "X_LARGE", "XX_LARGE"
+    ] = "SMALL"
+    architecture: Literal["", "x86_64", "arm64"] = ""
+    # Runloop auto-shuts a devbox down once this deadline passes, so a user
+    # sandbox cannot linger past its task.
+    keep_alive_seconds: int = Field(default=3600, ge=60, le=604_800)
+    fetch_allow_hosts: str = ""
+    # "Perfect sandbox" persistence: keep the devbox (and every file written or
+    # read in it) alive across finished tasks and agent restarts. A suspended
+    # devbox keeps its disk, so a fresh operation resumes it rather than
+    # starting from an empty workspace.
+    persist_workspace: bool = True
+
+
 class NovitaTemplateConfig(Base):
     """Per-deployment Novita sandbox sizing (CPU/RAM).
 
@@ -467,7 +494,7 @@ class NovitaTemplateConfig(Base):
 class ExecutionBackendConfig(Base):
     """Select the remote execution provider used by sandbox-compatible tasks."""
 
-    backend: Literal["novita", "vps", "upstash", "daytona"] = "novita"
+    backend: Literal["novita", "vps", "upstash", "daytona", "runloop"] = "novita"
     # Who picked ``backend``. This is recorded instead of inferred from which
     # credentials happen to sit on disk, so an administrator's explicit choice
     # can never be silently reverted by a durable deployment environment value.
@@ -478,6 +505,7 @@ class ExecutionBackendConfig(Base):
     vps: VPSExecutionConfig = Field(default_factory=VPSExecutionConfig)
     upstash: UpstashExecutionConfig = Field(default_factory=UpstashExecutionConfig)
     daytona: DaytonaExecutionConfig = Field(default_factory=DaytonaExecutionConfig)
+    runloop: RunloopExecutionConfig = Field(default_factory=RunloopExecutionConfig)
     novita_template: NovitaTemplateConfig = Field(default_factory=NovitaTemplateConfig)
 
 

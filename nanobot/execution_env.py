@@ -53,12 +53,14 @@ def apply_render_execution_env(config: Any) -> Any:
         return config
     upstash = getattr(execution, "upstash", None)
     daytona = getattr(execution, "daytona", None)
+    runloop = getattr(execution, "runloop", None)
     # Credential-only overlay: env never changes which backend is selected.
     if (_env("NANOBOT_EXECUTION_BACKEND") or "").lower() not in {
         "novita",
         "vps",
         "upstash",
         "daytona",
+        "runloop",
     }:
         return config
 
@@ -139,4 +141,22 @@ def apply_render_execution_env(config: Any) -> Any:
         if ttl_minutes is not None and ttl_minutes >= 5 and int(getattr(daytona, "ttl_minutes", 60) or 60) == 60:
             daytona.ttl_minutes = ttl_minutes
         _fill(daytona, "outbound_proxy_url", _env("NANOBOT_DAYTONA_OUTBOUND_PROXY_URL"))
+    # Runloop overlay (used when the deployment selects the Runloop backend).
+    # Same credential-only, fill-blanks rule as VPS, Upstash, and Daytona: an
+    # admin-saved key/endpoint wins, env restores what is missing.
+    if runloop is not None:
+        _fill(runloop, "api_key", _env("NANOBOT_RUNLOOP_API_KEY") or _env("RUNLOOP_API_KEY"))
+        _fill(runloop, "api_url", _env("NANOBOT_RUNLOOP_API_URL"))
+        _fill(runloop, "snapshot_id", _env("NANOBOT_RUNLOOP_SNAPSHOT_ID"))
+        _fill(runloop, "blueprint", _env("NANOBOT_RUNLOOP_BLUEPRINT"))
+        resource_size = _env("NANOBOT_RUNLOOP_RESOURCE_SIZE")
+        if resource_size and str(getattr(runloop, "resource_size", "") or "").strip() in {"", "SMALL"}:
+            runloop.resource_size = resource_size.upper()
+        architecture = _env("NANOBOT_RUNLOOP_ARCHITECTURE")
+        if architecture and not str(getattr(runloop, "architecture", "") or "").strip():
+            runloop.architecture = architecture.lower()
+        keep_alive = _positive_int(_env("NANOBOT_RUNLOOP_KEEP_ALIVE"), maximum=604_800)
+        if keep_alive is not None and keep_alive >= 60 and int(getattr(runloop, "keep_alive_seconds", 3600) or 3600) == 3600:
+            runloop.keep_alive_seconds = keep_alive
+        _fill(runloop, "fetch_allow_hosts", _env("NANOBOT_RUNLOOP_FETCH_ALLOW_HOSTS"))
     return config

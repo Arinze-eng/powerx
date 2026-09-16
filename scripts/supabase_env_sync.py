@@ -87,6 +87,15 @@ RUNTIME_KEYS: tuple[str, ...] = (
     "NANOBOT_DAYTONA_DOMAIN_ALLOW_LIST",
     "NANOBOT_DAYTONA_NETWORK_ALLOW_LIST",
     "NANOBOT_DAYTONA_TTL_MINUTES",
+    # Runloop Devbox backend (execution provider chosen in admin settings)
+    "NANOBOT_RUNLOOP_API_KEY",
+    "NANOBOT_RUNLOOP_API_URL",
+    "NANOBOT_RUNLOOP_SNAPSHOT_ID",
+    "NANOBOT_RUNLOOP_BLUEPRINT",
+    "NANOBOT_RUNLOOP_RESOURCE_SIZE",
+    "NANOBOT_RUNLOOP_ARCHITECTURE",
+    "NANOBOT_RUNLOOP_KEEP_ALIVE",
+    "NANOBOT_RUNLOOP_FETCH_ALLOW_HOSTS",
 )
 
 # Storage prefix for runtime config keys. Using a prefix avoids clashing with

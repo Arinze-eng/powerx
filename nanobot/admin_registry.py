@@ -349,6 +349,7 @@ def _execution_settings() -> dict[str, Any]:
         vps = execution.vps
         upstash = getattr(execution, "upstash", None)
         daytona = getattr(execution, "daytona", None)
+        runloop = getattr(execution, "runloop", None)
         novita_template = getattr(execution, "novita_template", None)
         return {
             "backend": execution.backend,
@@ -378,6 +379,17 @@ def _execution_settings() -> dict[str, Any]:
             "novitaTemplate": {
                 "cpu_count": int(getattr(novita_template, "cpu_count", 2) or 2),
                 "memory_mb": int(getattr(novita_template, "memory_mb", 4096) or 4096),
+            },
+            "runloop": {
+                "api_url": str(getattr(runloop, "api_url", "") or ""),
+                "snapshot_id": str(getattr(runloop, "snapshot_id", "") or ""),
+                "blueprint": str(getattr(runloop, "blueprint", "") or ""),
+                "resource_size": str(getattr(runloop, "resource_size", "") or "SMALL"),
+                "architecture": str(getattr(runloop, "architecture", "") or ""),
+                "keep_alive_seconds": int(getattr(runloop, "keep_alive_seconds", 3600) or 3600),
+                "fetch_allow_hosts": str(getattr(runloop, "fetch_allow_hosts", "") or ""),
+                "apiKeyConfigured": bool(str(getattr(runloop, "api_key", "") or "").strip()),
+                "persistWorkspace": bool(getattr(runloop, "persist_workspace", True)),
             },
             "vps": {
                 "host": vps.host,
@@ -415,8 +427,8 @@ def _save_execution_settings(
 ) -> Response:
     try:
         backend_name = _text(payload, "backend", maximum=20).lower() or "novita"
-        if backend_name not in {"novita", "vps", "upstash", "daytona"}:
-            raise ValueError("execution backend must be novita, vps, upstash, or daytona")
+        if backend_name not in {"novita", "vps", "upstash", "daytona", "runloop"}:
+            raise ValueError("execution backend must be novita, vps, upstash, daytona, or runloop")
         config_path = _config_path()
         config = apply_render_execution_env(load_config(config_path))
         vps = config.execution.vps
@@ -538,6 +550,49 @@ def _save_execution_settings(
             raw_proxy = _text(payload, "daytonaOutboundProxyUrl", maximum=512)
             if raw_proxy:
                 daytona.outbound_proxy_url = validate_daytona_outbound_proxy_url(raw_proxy)
+        # Runloop Devbox settings (key is only replaced when a new value is sent).
+        runloop = getattr(config.execution, "runloop", None)
+        if runloop is not None:
+            from nanobot.agent.tools.runloop_backend import (
+                validate_runloop_api_key,
+                validate_runloop_api_url,
+                validate_runloop_architecture,
+                validate_runloop_blueprint,
+                validate_runloop_fetch_allow_hosts,
+                validate_runloop_keep_alive_seconds,
+                validate_runloop_resource_size,
+                validate_runloop_snapshot_id,
+            )
+
+            raw_key = _text(payload, "runloopApiKey", maximum=256)
+            if raw_key:
+                runloop.api_key = validate_runloop_api_key(raw_key)
+            raw_api_url = _text(payload, "runloopApiUrl", maximum=253)
+            if raw_api_url:
+                runloop.api_url = validate_runloop_api_url(raw_api_url)
+            raw_snapshot = _text(payload, "runloopSnapshotId", maximum=200)
+            if raw_snapshot:
+                runloop.snapshot_id = validate_runloop_snapshot_id(raw_snapshot)
+            raw_blueprint = _text(payload, "runloopBlueprint", maximum=200)
+            if raw_blueprint:
+                runloop.blueprint = validate_runloop_blueprint(raw_blueprint)
+            raw_size = _text(payload, "runloopResourceSize", maximum=20)
+            if raw_size:
+                runloop.resource_size = validate_runloop_resource_size(raw_size)
+            raw_arch = _text(payload, "runloopArchitecture", maximum=10)
+            if raw_arch:
+                runloop.architecture = validate_runloop_architecture(raw_arch)
+            raw_keep_alive = payload.get("runloopKeepAliveSeconds")
+            if isinstance(raw_keep_alive, (int, float)):
+                runloop.keep_alive_seconds = validate_runloop_keep_alive_seconds(
+                    int(raw_keep_alive)
+                )
+            raw_fetch_hosts = _text(payload, "runloopFetchAllowHosts", maximum=2048)
+            if raw_fetch_hosts:
+                runloop.fetch_allow_hosts = validate_runloop_fetch_allow_hosts(raw_fetch_hosts)
+            raw_persist = payload.get("runloopPersistWorkspace")
+            if isinstance(raw_persist, bool):
+                runloop.persist_workspace = raw_persist
         # Novita sandbox sizing (CPU/RAM for auto-built templates).
         novita_template = getattr(config.execution, "novita_template", None)
         if novita_template is not None:
@@ -583,8 +638,8 @@ def _run_vps_test(config: Any) -> dict[str, Any]:
 
 def _execution_test_config(payload: dict[str, Any], config: Any) -> tuple[str, Any]:
     backend_name = _text(payload, "backend", maximum=20).lower() or config.execution.backend
-    if backend_name not in {"novita", "vps", "upstash", "daytona"}:
-        raise ValueError("execution backend must be novita, vps, upstash, or daytona")
+    if backend_name not in {"novita", "vps", "upstash", "daytona", "runloop"}:
+        raise ValueError("execution backend must be novita, vps, upstash, daytona, or runloop")
     vps = config.execution.vps.model_copy(deep=True)
     host = _text(payload, "host", maximum=253) or vps.host
     username = _text(payload, "username", maximum=64) or vps.username
@@ -668,6 +723,22 @@ def _test_execution_response(payload: dict[str, Any] | None = None) -> Response:
                 DaytonaExecutionBackend(daytona, sandbox_name="powerx-connection-test").test_connection()
             )
             return http_json_response({"ok": bool(tested.get("ok")), "backend": "daytona", **tested})
+        if backend_name == "runloop":
+            from nanobot.agent.tools.runloop_backend import RunloopExecutionBackend
+
+            runloop = config.execution.runloop.model_copy(deep=True)
+            raw_key = _text(payload or {}, "runloopApiKey", maximum=256)
+            if raw_key:
+                runloop.api_key = raw_key
+            raw_api_url = _text(payload or {}, "runloopApiUrl", maximum=253)
+            if raw_api_url:
+                runloop.api_url = raw_api_url
+            if not str(runloop.api_key or "").strip():
+                return http_error(400, "Runloop API key is required to test the Runloop backend")
+            tested = asyncio.run(
+                RunloopExecutionBackend(runloop, devbox_name="powerx-connection-test").test_connection()
+            )
+            return http_json_response({"ok": bool(tested.get("ok")), "backend": "runloop", **tested})
         if backend_name != "vps":
             return http_json_response({"ok": True, "backend": "novita", "message": "Novita Sandbox is selected."})
         tested = _run_vps_test(vps)
@@ -686,7 +757,7 @@ def _dbq_admin_section() -> str:
 
 
 def _execution_admin_section() -> str:
-    return """<section><h2>Execution backend</h2><p class='hint'>Only administrators can change where sandbox-compatible tasks and Telegram image OCR run. Novita remains the default. Secrets are never returned after saving; leave a secret blank to keep it.</p><label>Backend<select id='executionBackend'><option value='novita'>Novita Sandbox</option><option value='vps'>Linux VPS over SSH</option><option value='upstash'>Upstash Box</option><option value='daytona'>Daytona Sandbox</option></select></label><label>Upstash API key<input id='upstashApiKey' type='password' placeholder='box_... (leave blank to keep saved key)' autocomplete='off'></label><span id='upstashKeyState' class='hint'></span><label>Upstash base URL<input id='upstashBaseUrl' placeholder='https://us-east-1.box.upstash.com'></label><label>Upstash runtime<select id='upstashRuntime'><option value='python'>python</option><option value='node'>node</option><option value='golang'>golang</option><option value='ruby'>ruby</option><option value='rust'>rust</option></select></label><label>Upstash size<select id='upstashSize'><option value='small'>small (2 vCPU / 4 GB)</option><option value='medium'>medium (4 vCPU / 8 GB)</option><option value='large'>large (8 vCPU / 16 GB)</option></select></label><label>Upstash auto-kill TTL seconds<input id='upstashTtl' type='number' min='60' max='86400' placeholder='3600'></label><label>Daytona API key<input id='daytonaApiKey' type='password' placeholder='dtn_... (leave blank to keep saved key)' autocomplete='off'></label><span id='daytonaKeyState' class='hint'></span><label>Daytona API URL<input id='daytonaApiUrl' placeholder='https://app.daytona.io/api'></label><label>Daytona snapshot<input id='daytonaSnapshot' placeholder='daytona-small'></label><label>Daytona domain allow list<input id='daytonaDomainAllowList' placeholder='*.pypi.org,files.pythonhosted.org,deb.debian.org,example.com (blank = broad IPv4 allow)'></label><label>Daytona network allow list (CIDRs)<input id='daytonaNetworkAllowList' placeholder='0.0.0.0/0'></label><label>Daytona sandbox TTL minutes<input id='daytonaTtl' type='number' min='5' max='43200' placeholder='60'></label><label>Daytona auto-stop minutes<input id='daytonaAutoStop' type='number' min='0' max='10080' placeholder='0 = disabled'></label><label>Novita CPU cores<input id='novitaCpu' type='number' min='1' max='8' placeholder='2'></label><label>Novita memory MB<input id='novitaMemory' type='number' min='512' max='65536' placeholder='4096'></label><p class='hint'>Novita RAM/CPU: sandboxes are spawned from a template built with these values (built automatically once per size). Save to apply.</p><label>VPS host<input id='vpsHost' placeholder='vps.example.com or IP address'></label><label>VPS port<input id='vpsPort' type='number' min='1' max='65535' placeholder='22'></label><label>VPS username<input id='vpsUser' placeholder='ubuntu'></label><label>VPS workspace<input id='vpsWorkspace' placeholder='/workspace'></label><label>VPS password<input id='vpsPassword' type='password' placeholder='leave blank to keep saved' autocomplete='new-password'></label><label>VPS private key<textarea id='vpsPrivateKey' rows='4' placeholder='paste a multiline OpenSSH or PEM private key (leave blank to keep saved)'></textarea></label><label>Host key fingerprint<input id='vpsFingerprint' placeholder='SHA256:...'></label><div class='row'><button id='saveExecution' class='btn primary'>Save</button><button id='testExecution' class='btn'>Test connection</button></div><p id='executionStatus' class='hint'></p><script>(()=>{const $=id=>document.getElementById(id);const status=(t,ok=true)=>{const el=$('executionStatus');el.textContent=t;el.style.color=ok?'#16a34a':'#dc2626';};let saved=null;const load=async()=>{const r=await fetch('/api/admin/execution-settings',{cache:'no-store'});if(!r.ok)throw new Error('Execution settings request failed: '+r.status);saved=await r.json();$('executionBackend').value=saved.backend||'novita';if(saved.vps){$('vpsHost').value=saved.vps.host||'';$('vpsPort').value=saved.vps.port||22;$('vpsUser').value=saved.vps.username||'';$('vpsWorkspace').value=saved.vps.workspace_dir||'';$('vpsFingerprint').value=saved.vps.host_key_fingerprint||'';status(`Saved. Active backend: ${saved.backend}`);}const u=saved.upstash||{};$('upstashBaseUrl').value=u.base_url||'';$('upstashRuntime').value=u.runtime||'python';$('upstashSize').value=u.size||'small';$('upstashTtl').value=u.ttl_s||3600;$('upstashKeyState').textContent=u.apiKeyConfigured?'A Upstash API key is saved.':'No Upstash API key saved yet.';const d=saved.daytona||{};$('daytonaApiUrl').value=d.api_url||'';$('daytonaSnapshot').value=d.snapshot||'daytona-small';$('daytonaDomainAllowList').value=d.domain_allow_list||'';$('daytonaNetworkAllowList').value=d.network_allow_list||'0.0.0.0/0';$('daytonaTtl').value=d.ttl_minutes||60;$('daytonaKeyState').textContent=d.apiKeyConfigured?'A Daytona API key is saved.':'No Daytona API key saved yet.';const nt=saved.novitaTemplate||{};$('novitaCpu').value=nt.cpu_count||2;$('novitaMemory').value=nt.memory_mb||4096;};const fields=()=>({backend:$('executionBackend').value,host:$('vpsHost').value.trim(),port:Number($('vpsPort').value||22),username:$('vpsUser').value.trim(),workspaceDir:$('vpsWorkspace').value.trim(),hostKeyFingerprint:$('vpsFingerprint').value.trim(),password:$('vpsPassword').value,privateKey:$('vpsPrivateKey').value,upstashApiKey:$('upstashApiKey').value.trim(),upstashBaseUrl:$('upstashBaseUrl').value.trim(),upstashRuntime:$('upstashRuntime').value,upstashSize:$('upstashSize').value,upstashTtlSeconds:Number($('upstashTtl').value||3600),daytonaApiKey:$('daytonaApiKey').value.trim(),daytonaApiUrl:$('daytonaApiUrl').value.trim(),daytonaSnapshot:$('daytonaSnapshot').value.trim(),daytonaDomainAllowList:$('daytonaDomainAllowList').value.trim(),daytonaNetworkAllowList:$('daytonaNetworkAllowList').value.trim(),daytonaTtlMinutes:Number($('daytonaTtl').value||60),daytonaAutoStopMinutes:Number($('daytonaAutoStop').value||0),novitaCpuCount:Number($('novitaCpu').value||2),novitaMemoryMb:Number($('novitaMemory').value||4096)});$('saveExecution').onclick=async()=>{status('Saving...');try{const v=await window.nanobotAdminRequest('admin.execution.save',fields());saved=v;$('executionBackend').value=v.backend;status(`Saved. Active backend: ${v.backend}`);$('upstashKeyState').textContent=v.upstash&&v.upstash.apiKeyConfigured?'A Upstash API key is saved.':'No Upstash API key saved yet.';if(v.daytona){$('daytonaKeyState').textContent=v.daytona.apiKeyConfigured?'A Daytona API key is saved.':'No Daytona API key saved yet.';}$('vpsPassword').value='';$('vpsPrivateKey').value='';$('upstashApiKey').value='';$('daytonaApiKey').value='';}catch(e){status(e.message,false);}};$('testExecution').onclick=async()=>{const backend=$('executionBackend').value;status(backend==='daytona'?'Testing Daytona connection (creates a test sandbox)...':backend==='upstash'?'Testing Upstash Box connection (creates a test box)...':backend==='vps'?'Testing SSH connection...':'Checking backend...');try{const v=await window.nanobotAdminRequest('admin.execution.test',fields());if(v.backend==='daytona'){status(`Connection passed. Sandbox: ${v.sandbox_id||''}; platform: ${v.platform||''}`);}else if(v.backend==='upstash'){status(`Connection passed. Box: ${v.box_id||''}; platform: ${v.platform||''}`);}else{status(`Connection passed. Platform: ${v.platform||'Novita selected'}; fingerprint: ${v.host_key_fingerprint||'not applicable'}`);}}catch(e){status(e.message,false);}};const __execReady=()=>{setTimeout(()=>{if(typeof window.nanobotAdminRequest==='function'){load().catch(e=>status(e.message,false));}else{__execReady();}},250);};__execReady();})();</script>"""
+    return """<section><h2>Execution backend</h2><p class='hint'>Only administrators can change where sandbox-compatible tasks and Telegram image OCR run. Novita remains the default. Secrets are never returned after saving; leave a secret blank to keep it.</p><label>Backend<select id='executionBackend'><option value='novita'>Novita Sandbox</option><option value='vps'>Linux VPS over SSH</option><option value='upstash'>Upstash Box</option><option value='daytona'>Daytona Sandbox</option><option value='runloop'>Runloop Devbox</option></select></label><label>Upstash API key<input id='upstashApiKey' type='password' placeholder='box_... (leave blank to keep saved key)' autocomplete='off'></label><span id='upstashKeyState' class='hint'></span><label>Upstash base URL<input id='upstashBaseUrl' placeholder='https://us-east-1.box.upstash.com'></label><label>Upstash runtime<select id='upstashRuntime'><option value='python'>python</option><option value='node'>node</option><option value='golang'>golang</option><option value='ruby'>ruby</option><option value='rust'>rust</option></select></label><label>Upstash size<select id='upstashSize'><option value='small'>small (2 vCPU / 4 GB)</option><option value='medium'>medium (4 vCPU / 8 GB)</option><option value='large'>large (8 vCPU / 16 GB)</option></select></label><label>Upstash auto-kill TTL seconds<input id='upstashTtl' type='number' min='60' max='86400' placeholder='3600'></label><label>Daytona API key<input id='daytonaApiKey' type='password' placeholder='dtn_... (leave blank to keep saved key)' autocomplete='off'></label><span id='daytonaKeyState' class='hint'></span><label>Daytona API URL<input id='daytonaApiUrl' placeholder='https://app.daytona.io/api'></label><label>Daytona snapshot<input id='daytonaSnapshot' placeholder='daytona-small'></label><label>Daytona domain allow list<input id='daytonaDomainAllowList' placeholder='*.pypi.org,files.pythonhosted.org,deb.debian.org,example.com (blank = broad IPv4 allow)'></label><label>Daytona network allow list (CIDRs)<input id='daytonaNetworkAllowList' placeholder='0.0.0.0/0'></label><label>Daytona sandbox TTL minutes<input id='daytonaTtl' type='number' min='5' max='43200' placeholder='60'></label><label>Daytona auto-stop minutes<input id='daytonaAutoStop' type='number' min='0' max='10080' placeholder='0 = disabled'></label><label>Runloop API key<input id='runloopApiKey' type='password' placeholder='ak_... (leave blank to keep saved key)' autocomplete='off'></label><span id='runloopKeyState' class='hint'></span><label>Runloop API URL<input id='runloopApiUrl' placeholder='https://api.runloop.ai'></label><label>Runloop snapshot ID<input id='runloopSnapshotId' placeholder='snap_... (optional; exact baselined disk)'></label><label>Runloop blueprint<input id='runloopBlueprint' placeholder='owner/blueprint-name (optional; used when no snapshot)'></label><label>Runloop resource size<select id='runloopResourceSize'><option value='X_SMALL'>X_SMALL</option><option value='SMALL'>SMALL</option><option value='MEDIUM'>MEDIUM</option><option value='LARGE'>LARGE</option><option value='X_LARGE'>X_LARGE</option><option value='XX_LARGE'>XX_LARGE</option></select></label><label>Runloop architecture<select id='runloopArchitecture'><option value=''>default</option><option value='x86_64'>x86_64</option><option value='arm64'>arm64</option></select></label><label>Runloop keep-alive seconds<input id='runloopKeepAlive' type='number' min='60' max='604800' placeholder='3600'></label><p class='hint'>Runloop auto-shuts a Devbox down once the keep-alive deadline passes, so a user sandbox cannot linger past its task.</p><label>Novita CPU cores<input id='novitaCpu' type='number' min='1' max='8' placeholder='2'></label><label>Novita memory MB<input id='novitaMemory' type='number' min='512' max='65536' placeholder='4096'></label><p class='hint'>Novita RAM/CPU: sandboxes are spawned from a template built with these values (built automatically once per size). Save to apply.</p><label>VPS host<input id='vpsHost' placeholder='vps.example.com or IP address'></label><label>VPS port<input id='vpsPort' type='number' min='1' max='65535' placeholder='22'></label><label>VPS username<input id='vpsUser' placeholder='ubuntu'></label><label>VPS workspace<input id='vpsWorkspace' placeholder='/workspace'></label><label>VPS password<input id='vpsPassword' type='password' placeholder='leave blank to keep saved' autocomplete='new-password'></label><label>VPS private key<textarea id='vpsPrivateKey' rows='4' placeholder='paste a multiline OpenSSH or PEM private key (leave blank to keep saved)'></textarea></label><label>Host key fingerprint<input id='vpsFingerprint' placeholder='SHA256:...'></label><div class='row'><button id='saveExecution' class='btn primary'>Save</button><button id='testExecution' class='btn'>Test connection</button></div><p id='executionStatus' class='hint'></p><script>(()=>{const $=id=>document.getElementById(id);const status=(t,ok=true)=>{const el=$('executionStatus');el.textContent=t;el.style.color=ok?'#16a34a':'#dc2626';};let saved=null;const load=async()=>{const r=await fetch('/api/admin/execution-settings',{cache:'no-store'});if(!r.ok)throw new Error('Execution settings request failed: '+r.status);saved=await r.json();$('executionBackend').value=saved.backend||'novita';if(saved.vps){$('vpsHost').value=saved.vps.host||'';$('vpsPort').value=saved.vps.port||22;$('vpsUser').value=saved.vps.username||'';$('vpsWorkspace').value=saved.vps.workspace_dir||'';$('vpsFingerprint').value=saved.vps.host_key_fingerprint||'';status(`Saved. Active backend: ${saved.backend}`);}const u=saved.upstash||{};$('upstashBaseUrl').value=u.base_url||'';$('upstashRuntime').value=u.runtime||'python';$('upstashSize').value=u.size||'small';$('upstashTtl').value=u.ttl_s||3600;$('upstashKeyState').textContent=u.apiKeyConfigured?'A Upstash API key is saved.':'No Upstash API key saved yet.';const d=saved.daytona||{};$('daytonaApiUrl').value=d.api_url||'';$('daytonaSnapshot').value=d.snapshot||'daytona-small';$('daytonaDomainAllowList').value=d.domain_allow_list||'';$('daytonaNetworkAllowList').value=d.network_allow_list||'0.0.0.0/0';$('daytonaTtl').value=d.ttl_minutes||60;$('daytonaKeyState').textContent=d.apiKeyConfigured?'A Daytona API key is saved.':'No Daytona API key saved yet.';const rl=saved.runloop||{};$('runloopApiUrl').value=rl.api_url||'';$('runloopSnapshotId').value=rl.snapshot_id||'';$('runloopBlueprint').value=rl.blueprint||'';$('runloopResourceSize').value=rl.resource_size||'SMALL';$('runloopArchitecture').value=rl.architecture||'';$('runloopKeepAlive').value=rl.keep_alive_seconds||3600;$('runloopKeyState').textContent=rl.apiKeyConfigured?'A Runloop API key is saved.':'No Runloop API key saved yet.';const nt=saved.novitaTemplate||{};$('novitaCpu').value=nt.cpu_count||2;$('novitaMemory').value=nt.memory_mb||4096;};const fields=()=>({backend:$('executionBackend').value,host:$('vpsHost').value.trim(),port:Number($('vpsPort').value||22),username:$('vpsUser').value.trim(),workspaceDir:$('vpsWorkspace').value.trim(),hostKeyFingerprint:$('vpsFingerprint').value.trim(),password:$('vpsPassword').value,privateKey:$('vpsPrivateKey').value,upstashApiKey:$('upstashApiKey').value.trim(),upstashBaseUrl:$('upstashBaseUrl').value.trim(),upstashRuntime:$('upstashRuntime').value,upstashSize:$('upstashSize').value,upstashTtlSeconds:Number($('upstashTtl').value||3600),daytonaApiKey:$('daytonaApiKey').value.trim(),daytonaApiUrl:$('daytonaApiUrl').value.trim(),daytonaSnapshot:$('daytonaSnapshot').value.trim(),daytonaDomainAllowList:$('daytonaDomainAllowList').value.trim(),daytonaNetworkAllowList:$('daytonaNetworkAllowList').value.trim(),daytonaTtlMinutes:Number($('daytonaTtl').value||60),daytonaAutoStopMinutes:Number($('daytonaAutoStop').value||0),runloopApiKey:$('runloopApiKey').value.trim(),runloopApiUrl:$('runloopApiUrl').value.trim(),runloopSnapshotId:$('runloopSnapshotId').value.trim(),runloopBlueprint:$('runloopBlueprint').value.trim(),runloopResourceSize:$('runloopResourceSize').value,runloopArchitecture:$('runloopArchitecture').value,runloopKeepAliveSeconds:Number($('runloopKeepAlive').value||3600),novitaCpuCount:Number($('novitaCpu').value||2),novitaMemoryMb:Number($('novitaMemory').value||4096)});$('saveExecution').onclick=async()=>{status('Saving...');try{const v=await window.nanobotAdminRequest('admin.execution.save',fields());saved=v;$('executionBackend').value=v.backend;status(`Saved. Active backend: ${v.backend}`);$('upstashKeyState').textContent=v.upstash&&v.upstash.apiKeyConfigured?'A Upstash API key is saved.':'No Upstash API key saved yet.';if(v.daytona){$('daytonaKeyState').textContent=v.daytona.apiKeyConfigured?'A Daytona API key is saved.':'No Daytona API key saved yet.';}if(v.runloop){$('runloopKeyState').textContent=v.runloop.apiKeyConfigured?'A Runloop API key is saved.':'No Runloop API key saved yet.';}$('vpsPassword').value='';$('vpsPrivateKey').value='';$('upstashApiKey').value='';$('daytonaApiKey').value='';$('runloopApiKey').value='';}catch(e){status(e.message,false);}};$('testExecution').onclick=async()=>{const backend=$('executionBackend').value;status(backend==='daytona'?'Testing Daytona connection (creates a test sandbox)...':backend==='upstash'?'Testing Upstash Box connection (creates a test box)...':backend==='runloop'?'Testing Runloop connection (creates a test devbox)...':backend==='vps'?'Testing SSH connection...':'Checking backend...');try{const v=await window.nanobotAdminRequest('admin.execution.test',fields());if(v.backend==='daytona'){status(`Connection passed. Sandbox: ${v.sandbox_id||''}; platform: ${v.platform||''}`);}else if(v.backend==='upstash'){status(`Connection passed. Box: ${v.box_id||''}; platform: ${v.platform||''}`);}else if(v.backend==='runloop'){status(`Connection passed. Devbox: ${v.devbox_id||''}; platform: ${v.platform||''}`);}else{status(`Connection passed. Platform: ${v.platform||'Novita selected'}; fingerprint: ${v.host_key_fingerprint||'not applicable'}`);}}catch(e){status(e.message,false);}};const __execReady=()=>{setTimeout(()=>{if(typeof window.nanobotAdminRequest==='function'){load().catch(e=>status(e.message,false));}else{__execReady();}},250);};__execReady();})();</script>"""
 
 
 def _admin_page(rows: list[dict[str, Any]]) -> str:
