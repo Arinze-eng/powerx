@@ -2,6 +2,11 @@
     <!-- CDNAI Android client needs network access to reach the hosted gateway. -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <!-- Voice notes: capture the mic so speech can be transcribed into the
+         composer. Without this the record plugin throws at runtime and the
+         mic button silently did nothing. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
 
     <application
         android:label="CDNAI"

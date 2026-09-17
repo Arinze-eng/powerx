@@ -148,6 +148,31 @@ const Set<String> kSocketControlEvents = {
   'heartbeat',
 };
 
+/// Error details the gateway emits for chat-scoped, RECOVERABLE problems.
+///
+/// These arrive while the turn is still legitimately running, so treating them
+/// as terminal cleared the busy state mid-task — the "task gets cut off on a
+/// long run" symptom, where the work continued server-side but the UI stopped
+/// streaming and only recovered when the user asked again.
+///
+/// Matched by exact detail (or prefix where the gateway appends context) so a
+/// genuine fatal error still ends the turn.
+const kRecoverableTurnErrors = <String>{
+  'attachment_rejected',
+  'message_rejected',
+  'invalid temperature chat_id',
+  'invalid temporary chat_id',
+  'message_deduplicated',
+  'queued',
+};
+
+bool isRecoverableTurnError(String detail) {
+  if (detail.isEmpty) return false;
+  if (kRecoverableTurnErrors.contains(detail)) return true;
+  // Queued/deduped notices carry the turn id as a suffix.
+  return detail.startsWith('queued') || detail.startsWith('duplicate');
+}
+
 /// True when [raw] is a protocol/control frame rather than a transcript event.
 bool isProtocolFrame(String raw) {
   try {
@@ -775,8 +800,32 @@ class NanobotSocket {
       case 'webui_response':
         _handleWebuiResponse(ev);
         break;
+      case 'transcription_result':
+        _handleTranscriptionResult(ev);
+        break;
+      case 'transcription_error':
+        _handleTranscriptionError(ev);
+        break;
       case 'error':
         final detail = (ev['detail'] ?? 'error') as String;
+        // Not every error frame ends the turn. The gateway emits `error` for
+        // recoverable, chat-scoped problems too — a rejected attachment, a
+        // deduped/queued message, an invalid temporary id — and those arrive
+        // WHILE the turn keeps running. The previous build treated any error
+        // as terminal on both sides:
+        //   * onErrorError cleared `_remoteRunning`;
+        //   * the socket dropped the chat from `_activeTurns`.
+        // The visible result was exactly the reported symptom: a long task got
+        // "cut off" in the UI mid-run, stopped streaming, and only reappeared
+        // when the user asked again. Recoverable details are now surfaced as a
+        // breadcrumb on the live turn without touching run state.
+        if (isRecoverableTurnError(detail)) {
+          // Keep the run alive: these are chat-scoped, recoverable problems
+          // that arrive while the turn continues. Treat it as activity so the
+          // liveness clock is touched, and surface nothing destructive.
+          onTurnActivity?.call(chatId ?? '');
+          break;
+        }
         final v = _view(chatId);
         if (v != null) {
           v.onError(detail);
@@ -1058,6 +1107,95 @@ class NanobotSocket {
 
   /// Whether a turn for [chatId] was active and finalized since [listen].
   bool sawTurnEnd(String chatId) => _finalizedTurns.contains(chatId);
+
+  // ---- Voice notes (audio -> text) ---------------------------------------
+
+  final Map<String, Completer<String>> _transcriptions = {};
+  int _transcriptionSeq = 0;
+
+  /// Transcribe one recorded audio clip and return the text.
+  ///
+  /// The gateway owns the speech-to-text provider, so the APK never needs an
+  /// on-device model or an API key. The clip is sent as a base64 data URL
+  /// (the exact contract `webui_transcription_event` expects) and the reply
+  /// arrives as `transcription_result` / `transcription_error`, correlated by
+  /// `request_id`.
+  ///
+  /// Throws [StateError] with a user-readable message on failure so the
+  /// composer can surface it instead of silently dropping the recording.
+  Future<String> transcribeAudio({
+    required String dataUrl,
+    required int durationMs,
+    Duration timeout = const Duration(seconds: 90),
+  }) async {
+    if (!isConnected) await connect();
+    final requestId =
+        'apk-tr-${DateTime.now().microsecondsSinceEpoch}-${_transcriptionSeq++}';
+    final completer = Completer<String>();
+    _transcriptions[requestId] = completer;
+    _send({
+      'type': 'transcribe_audio',
+      if (_openChat != null) 'chat_id': _openChat!.chatId,
+      'request_id': requestId,
+      'data_url': dataUrl,
+      'duration_ms': durationMs,
+    });
+    final timer = Timer(timeout, () {
+      final c = _transcriptions.remove(requestId);
+      if (c != null && !c.isCompleted) {
+        c.completeError(
+          StateError('Transcription timed out. Try a shorter voice note.'),
+        );
+      }
+    });
+    try {
+      return await completer.future;
+    } finally {
+      timer.cancel();
+      _transcriptions.remove(requestId);
+    }
+  }
+
+  void _handleTranscriptionResult(Map<String, dynamic> ev) {
+    final requestId = ev['request_id'];
+    if (requestId is! String) return;
+    final completer = _transcriptions.remove(requestId);
+    if (completer == null || completer.isCompleted) return;
+    final text = ev['text'];
+    completer.complete(text is String ? text : '');
+  }
+
+  void _handleTranscriptionError(Map<String, dynamic> ev) {
+    final requestId = ev['request_id'];
+    if (requestId is! String) return;
+    final completer = _transcriptions.remove(requestId);
+    if (completer == null || completer.isCompleted) return;
+    // The gateway sends a short machine reason ("mime", "duration", "size").
+    final detail = ev['detail'];
+    completer.completeError(
+      StateError(_transcriptionMessage(detail is String ? detail : 'failed')),
+    );
+  }
+
+  /// Map the gateway's short transcription reasons to something a user can act
+  /// on. Falling back to the raw code keeps an unknown reason visible rather
+  /// than swallowing it.
+  static String _transcriptionMessage(String detail) {
+    switch (detail) {
+      case 'mime':
+        return 'That audio format is not supported.';
+      case 'duration':
+        return 'That voice note is too long. Keep it under a couple of minutes.';
+      case 'size':
+        return 'That voice note is too large to upload.';
+      case 'not_configured':
+        return 'Speech-to-text is not enabled on the server yet.';
+      case 'empty':
+        return 'No speech detected — try again closer to the mic.';
+      default:
+        return 'Could not transcribe that voice note ($detail).';
+    }
+  }
 
   // ---- WebSocket mutations ----------------------------------------------
   //

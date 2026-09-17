@@ -2,7 +2,7 @@ name: powerx_android
 description: "PowerX — native Android client for your self-hosted PowerX AI agent."
 publish_to: 'none'
 
-version: 1.4.0+10
+version: 1.5.0+11
 
 environment:
   sdk: ^3.7.2
@@ -35,6 +35,10 @@ dependencies:
   crypto: ^3.0.3
   # Keep the screen on while a long task streams (up to ~1h turns).
   wakelock_plus: ^1.2.8
+  # Voice notes: capture audio natively, then hand the bytes to the gateway's
+  # transcription endpoint so speech becomes text in the composer.
+  record: ^5.1.2
+  permission_handler: ^11.3.1
 
 dev_dependencies:
   flutter_test:

@@ -9,7 +9,9 @@ import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:mime/mime.dart' as mime_lib;
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
+import 'package:record/record.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
@@ -74,6 +76,161 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   /// the composer. The server is authoritative, but a dead socket must not
   /// lock the user out forever.
   static const Duration _stopGrace = Duration(seconds: 20);
+
+  // ---- Voice notes -------------------------------------------------------
+
+  /// Records to a temporary m4a file, then hands the bytes to the gateway for
+  /// transcription. The transcript is appended to the composer so the user can
+  /// review (and edit) it before sending, which is what "the voice note should
+  /// become text in the typing section" asks for.
+  late final AudioRecorder _recorder = AudioRecorder();
+  bool _recording = false;
+  bool _transcribing = false;
+  DateTime? _recordStartedAt;
+  Timer? _recordTick;
+  int _recordSeconds = 0;
+
+  bool get _voiceBusy => _recording || _transcribing;
+
+  /// Start or stop a voice note. While recording, the composer shows a live
+  /// level/timer strip; on stop the clip is transcribed into the text field.
+  Future<void> _toggleVoiceNote() async {
+    if (_transcribing) return;
+    if (_recording) {
+      await _finishVoiceNote();
+    } else {
+      await _startVoiceNote();
+    }
+  }
+
+  Future<void> _startVoiceNote() async {
+    if (_voiceBusy) return;
+    // The mic permission is granted at runtime (declared in the manifest).
+    // Without this the record plugin throws and the button looks dead.
+    try {
+      final status = await Permission.microphone.request();
+      if (!status.isGranted) {
+        _toast('Microphone permission is needed for voice notes.');
+        return;
+      }
+    } catch (_) {
+      // Permission handler is unavailable on some builds; fall through and let
+      // the recorder surface a real error if it truly cannot capture.
+    }
+    try {
+      if (await _recorder.hasPermission() == false) {
+        _toast('Microphone permission is needed for voice notes.');
+        return;
+      }
+      final dir = await getTemporaryDirectory();
+      final path =
+          '${dir.path}/voice-${DateTime.now().microsecondsSinceEpoch}.m4a';
+      await _recorder.start(
+        const RecordConfig(
+          // m4a/AAC is in the gateway's allowed audio MIME list and is
+          // universally supported by Android encoders.
+          encoder: AudioEncoder.aacLc,
+          bitRate: 64000,
+          sampleRate: 16000,
+          numChannels: 1,
+        ),
+        path: path,
+      );
+      _recordStartedAt = DateTime.now();
+      _recordSeconds = 0;
+      _recordTick?.cancel();
+      _recordTick = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (!mounted) return;
+        setState(() => _recordSeconds++);
+      });
+      if (mounted) {
+        setState(() => _recording = true);
+      }
+    } catch (e) {
+      if (mounted) setState(() => _recording = false);
+      _toast('Could not start recording: $e');
+    }
+  }
+
+  Future<void> _finishVoiceNote() async {
+    if (!_recording) return;
+    _recordTick?.cancel();
+    _recordTick = null;
+    final started = _recordStartedAt;
+    final elapsedMs = started == null
+        ? 0
+        : DateTime.now().difference(started).inMilliseconds;
+    String? path;
+    try {
+      path = await _recorder.stop();
+    } catch (e) {
+      if (mounted) setState(() => _recording = false);
+      _toast('Could not finish recording: $e');
+      return;
+    }
+    if (mounted) setState(() => _recording = false);
+
+    // A tap-and-release accident produces a clip with no usable audio; the
+    // gateway would reject it as "empty". Guard locally for a clear message.
+    if (path == null || elapsedMs < 700) {
+      if (path != null) unawaited(_deleteQuietly(path));
+      _toast('That was too short — hold the mic and speak.');
+      return;
+    }
+
+    if (mounted) setState(() => _transcribing = true);
+    try {
+      final file = File(path);
+      final bytes = await file.readAsBytes();
+      if (bytes.lengthInBytes > 24 * 1024 * 1024) {
+        _toast('That voice note is too large to upload.');
+        return;
+      }
+      final dataUrl = 'data:audio/m4a;base64,${base64Encode(bytes)}';
+      // Resolve the socket BEFORE the await gap so no BuildContext is used
+      // after an async suspension.
+      var sock = _socket;
+      if (sock == null) {
+        if (!mounted) return;
+        final state = context.read<AppState>();
+        sock = await state.ensureSocket();
+        _socket = sock;
+      }
+      final text = await sock.transcribeAudio(
+        dataUrl: dataUrl,
+        durationMs: elapsedMs,
+      );
+      if (!mounted) return;
+      final trimmed = text.trim();
+      if (trimmed.isEmpty) {
+        _toast('No speech detected — try again closer to the mic.');
+        return;
+      }
+      // Append into the composer so the user can review before sending.
+      final existing = _input.text.trimRight();
+      _input.text = existing.isEmpty ? trimmed : '$existing $trimmed';
+      _input.selection = TextSelection.fromPosition(
+        TextPosition(offset: _input.text.length),
+      );
+    } catch (e) {
+      final msg = e is StateError ? e.message : '$e';
+      _toast(msg);
+    } finally {
+      if (mounted) setState(() => _transcribing = false);
+      unawaited(_deleteQuietly(path));
+    }
+  }
+
+  /// Remove a temporary clip without ever surfacing a filesystem error.
+  static Future<void> _deleteQuietly(String? path) async {
+    if (path == null) return;
+    try {
+      final f = File(path);
+      if (await f.exists()) await f.delete();
+    } catch (_) {
+      // A leftover temp file is harmless; the OS clears the cache dir.
+    }
+  }
 
   /// Minimum gap between scroll-to-bottom animations while streaming. Starting
   /// a new 180 ms animation on every delta (many per second) is what made the
@@ -1087,6 +1244,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _resyncTimer?.cancel();
     _settleWatch?.cancel();
     _stopWatchTimer?.cancel();
+    _recordTick?.cancel();
+    // Never leave the mic open: a recorder outliving the screen keeps the
+    // Android mic indicator on and blocks other apps.
+    if (_recording) {
+      unawaited(_recorder.stop().then(_deleteQuietly).catchError((_) => ''));
+    }
+    unawaited(_recorder.dispose());
     _completedFadeTimer?.cancel();
     _cacheTimer?.cancel();
     // Detach the UI listener and persist the transcript, which keeps the
@@ -1245,6 +1409,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             onRemove: (a) => setState(() => _pending.remove(a)),
             onSend: _send,
             onStop: _stop,
+            onVoice: _toggleVoiceNote,
+            recording: _recording,
+            transcribing: _transcribing,
+            recordSeconds: _recordSeconds,
           ),
         ],
       ),
@@ -1832,6 +2000,10 @@ class _Composer extends StatefulWidget {
     required this.onRemove,
     required this.onSend,
     required this.onStop,
+    required this.onVoice,
+    required this.recording,
+    required this.transcribing,
+    required this.recordSeconds,
   });
   final TextEditingController controller;
   final bool busy;
@@ -1841,6 +2013,16 @@ class _Composer extends StatefulWidget {
   final void Function(PendingAttachment) onRemove;
   final VoidCallback onSend;
   final VoidCallback onStop;
+
+  /// Start/stop a voice note. The screen owns recording so the mic state
+  /// survives this widget rebuilding on every streamed delta.
+  final VoidCallback onVoice;
+
+  /// Live voice-note state, rendered as a strip above the input while the
+  /// user is talking and while the clip is being transcribed.
+  final bool recording;
+  final bool transcribing;
+  final int recordSeconds;
 
   @override
   State<_Composer> createState() => _ComposerState();
@@ -1885,6 +2067,68 @@ class _ComposerState extends State<_Composer> {
                 ),
               ),
             // Quick-action tray, mirroring the reference app's "+" menu.
+            // Live voice-note strip: shows while the user is talking and while
+            // the clip is being turned into text, so the mic never looks stuck.
+            if (widget.recording || widget.transcribing)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 11,
+                  ),
+                  decoration: BoxDecoration(
+                    color: widget.recording
+                        ? Palette.danger.withValues(alpha: 0.12)
+                        : Palette.bg2,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color: widget.recording
+                          ? Palette.danger.withValues(alpha: 0.45)
+                          : Palette.borderSoft,
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      if (widget.recording)
+                        const _PulsingDot()
+                      else
+                        const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Palette.accent,
+                          ),
+                        ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          widget.recording
+                              ? 'Listening… tap to stop'
+                              : 'Transcribing voice note…',
+                          style: const TextStyle(
+                            fontSize: 13,
+                            color: Palette.textPrimary,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      if (widget.recording)
+                        Text(
+                          '${(widget.recordSeconds ~/ 60).toString().padLeft(2, '0')}:'
+                          '${(widget.recordSeconds % 60).toString().padLeft(2, '0')}',
+                          style: const TextStyle(
+                            fontSize: 13,
+                            color: Palette.danger,
+                            fontWeight: FontWeight.w700,
+                            fontFeatures: [FontFeature.tabularFigures()],
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
             AnimatedSize(
               duration: const Duration(milliseconds: 160),
               curve: Curves.easeOut,
@@ -1914,17 +2158,10 @@ class _ComposerState extends State<_Composer> {
                             const SizedBox(width: 8),
                             _ToolChip(
                               icon: Icons.keyboard_voice_outlined,
-                              label: 'Voice',
+                              label: 'Voice note',
                               onTap: () {
                                 setState(() => _toolsOpen = false);
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(
-                                    content: Text(
-                                      'Voice input follows your keyboard’s mic.',
-                                    ),
-                                    duration: Duration(seconds: 2),
-                                  ),
-                                );
+                                widget.onVoice();
                               },
                             ),
                           ],
@@ -1986,6 +2223,24 @@ class _ComposerState extends State<_Composer> {
                     ),
                   ),
                   const SizedBox(width: 6),
+                  // Mic sits next to send so a voice note is always one tap
+                  // away, and turns into a stop control while recording.
+                  if (!widget.transcribing)
+                    IconButton(
+                      onPressed: widget.onVoice,
+                      icon: Icon(
+                        widget.recording
+                            ? Icons.stop_circle_rounded
+                            : Icons.mic_none_rounded,
+                        color: widget.recording
+                            ? Palette.danger
+                            : Palette.textSecondary,
+                        size: 22,
+                      ),
+                      tooltip: widget.recording
+                          ? 'Stop and transcribe'
+                          : 'Record a voice note',
+                    ),
                   // Send arrow when idle; stop square while the agent works.
                   Material(
                     color: widget.busy ? Palette.danger : Palette.accent,
@@ -2026,6 +2281,42 @@ class _ComposerState extends State<_Composer> {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A small breathing red dot used on the recording strip.
+class _PulsingDot extends StatefulWidget {
+  const _PulsingDot();
+  @override
+  State<_PulsingDot> createState() => _PulsingDotState();
+}
+
+class _PulsingDotState extends State<_PulsingDot>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 800),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: Tween(begin: 0.35, end: 1.0).animate(_c),
+      child: Container(
+        width: 12,
+        height: 12,
+        decoration: const BoxDecoration(
+          color: Palette.danger,
+          shape: BoxShape.circle,
         ),
       ),
     );

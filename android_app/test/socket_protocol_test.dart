@@ -622,4 +622,50 @@ void main() {
     expect(gw.inbound.any((f) => f['type'] == 'ping'), isFalse);
     expect(gw.inbound.every((f) => f['type'] != 'ping'), isTrue);
   });
+
+  test('a recoverable error frame does not end a running turn', () async {
+    // Regression: every `error` frame was treated as terminal, so a
+    // chat-scoped, recoverable error arriving mid-run cleared the busy state
+    // and the long task looked "cut off" in the UI while it kept running
+    // server-side. Only genuine fatal errors may end a turn.
+    expect(isRecoverableTurnError('attachment_rejected'), isTrue);
+    expect(isRecoverableTurnError('message_rejected'), isTrue);
+    expect(isRecoverableTurnError('invalid temporary chat_id'), isTrue);
+    expect(isRecoverableTurnError('queued-turn-123'), isTrue);
+    expect(isRecoverableTurnError(''), isFalse);
+    expect(isRecoverableTurnError('access_denied'), isFalse);
+    expect(isRecoverableTurnError('unknown type: \'foo\''), isFalse);
+  });
+
+  test('voice note transcription correlates result and error frames', () async {
+    await sock.connect();
+    final chatId = await sock.newChat();
+    sock.listen(chatId, Recorder().view());
+
+    // Drive a transcription request through the gateway stub.
+    final pending = sock.transcribeAudio(dataUrl: 'data:audio/m4a;base64,AAAA', durationMs: 1200);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    final sent = gw.inbound.lastWhere((f) => f['type'] == 'transcribe_audio');
+    expect(sent['data_url'], 'data:audio/m4a;base64,AAAA');
+    expect(sent['duration_ms'], 1200);
+    expect(sent['request_id'], isA<String>());
+
+    gw.send({
+      'event': 'transcription_result',
+      'request_id': sent['request_id'],
+      'text': 'hello world',
+    });
+    expect(await pending, 'hello world');
+
+    // An error frame completes with a user-readable message.
+    final failing = sock.transcribeAudio(dataUrl: 'data:audio/m4a;base64,AAAA', durationMs: 1200);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    final sent2 = gw.inbound.lastWhere((f) => f['type'] == 'transcribe_audio');
+    gw.send({
+      'event': 'transcription_error',
+      'request_id': sent2['request_id'],
+      'detail': 'duration',
+    });
+    await expectLater(failing, throwsA(isA<StateError>()));
+  });
 }
