@@ -25,8 +25,15 @@ android {
 
     defaultConfig {
         applicationId = "com.powerx.powerx_android"
-        // flutter_inappwebview requires API 21+.
-        minSdk = 21
+        // API 23 (Marshmallow) is the floor imposed by the voice-note stack:
+        // record_android declares minSdk 23 in its manifest, and the Android
+        // manifest merger hard-fails when the app floor is lower
+        // ("uses-sdk:minSdkVersion 21 cannot be smaller than version 23
+        // declared in library [:record_android]"). 23 is also the API level
+        // that introduced the runtime-permission model the mic prompt relies
+        // on, so this raises the floor rather than forcing the library in with
+        // tools:overrideLibrary (which would only defer the crash to runtime).
+        minSdk = 23
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
