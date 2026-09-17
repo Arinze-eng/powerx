@@ -226,3 +226,126 @@ async def test_stage_from_sandbox_uses_dedicated_temp_dir(
     result.cleanup()
     # The user's directory survives staging cleanup.
     assert (workspace / "user-file.txt").read_text() == "keep me"
+
+
+# ---- persistent-disk protection ------------------------------------------
+
+
+def test_default_staging_root_is_not_on_the_persistent_disk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression guard: staging previously wrote archives to the 6 GB volume.
+
+    Staged archives are throwaway bytes that can reach the size cap, so they must
+    never live on the durable disk that serves customers.
+    """
+    persistent = tmp_path / "persistent"
+    persistent.mkdir()
+    _patch_persistent_dir(monkeypatch, persistent)
+    monkeypatch.delenv("POWERX_STAGING_DIR", raising=False)
+
+    root = workspace_bridge._default_staging_root()
+    assert persistent not in root.parents
+    assert root != persistent
+    assert workspace_bridge._assert_ephemeral(root) is True
+
+
+def _patch_persistent_dir(monkeypatch: pytest.MonkeyPatch, persistent: Path) -> None:
+    """Patch the persistent-dir lookup where ``_assert_ephemeral`` imports it.
+
+    ``_assert_ephemeral`` does a local import from ``nanobot.config.paths``, so
+    patching the name on ``workspace_bridge`` would silently do nothing.
+    """
+    from nanobot.config import paths as paths_module
+
+    monkeypatch.setattr(paths_module, "get_persistent_data_dir", lambda *a, **k: persistent)
+
+
+def test_assert_ephemeral_rejects_persistent_disk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    persistent = tmp_path / "persistent"
+    (persistent / "powerx").mkdir(parents=True)
+    _patch_persistent_dir(monkeypatch, persistent)
+
+    assert workspace_bridge._assert_ephemeral(persistent) is False
+    assert workspace_bridge._assert_ephemeral(persistent / "powerx" / "staging") is False
+
+
+def test_assert_ephemeral_accepts_temp_space(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    persistent = tmp_path / "persistent"
+    persistent.mkdir()
+    _patch_persistent_dir(monkeypatch, persistent)
+    assert workspace_bridge._assert_ephemeral(tmp_path / "tmp") is True
+
+
+@pytest.mark.asyncio
+async def test_failed_staging_leaves_no_archive_behind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed transfer must not accumulate archives on the temp volume."""
+    staging_root = tmp_path / "staging"
+
+    async def _fake_backend() -> tuple[str, object | None]:
+        return "novita", None
+
+    async def _fake_stage(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(workspace_bridge, "_selected_backend", _fake_backend)
+    monkeypatch.setattr(workspace_bridge, "_stage_novita_native", _fake_stage)
+
+    result = await workspace_bridge.stage_from_sandbox(None, staging_root=staging_root)
+    assert result is None
+    # The scratch dir created for the attempt was removed.
+    assert list(staging_root.glob("powerx-stage-*")) == []
+
+
+@pytest.mark.asyncio
+async def test_raising_staging_leaves_no_archive_behind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    staging_root = tmp_path / "staging"
+
+    async def _fake_backend() -> tuple[str, object | None]:
+        return "novita", None
+
+    async def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("sandbox went away")
+
+    monkeypatch.setattr(workspace_bridge, "_selected_backend", _fake_backend)
+    monkeypatch.setattr(workspace_bridge, "_stage_novita_native", _boom)
+
+    assert await workspace_bridge.stage_from_sandbox(None, staging_root=staging_root) is None
+    assert list(staging_root.glob("powerx-stage-*")) == []
+
+
+@pytest.mark.asyncio
+async def test_staging_onto_persistent_disk_is_redirected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Even an explicit request to stage on the persistent disk is redirected."""
+    persistent = tmp_path / "persistent"
+    persistent.mkdir()
+    _patch_persistent_dir(monkeypatch, persistent)
+    monkeypatch.setattr(workspace_bridge.tempfile, "gettempdir", lambda: str(tmp_path / "ephemeral"))
+
+    async def _fake_backend() -> tuple[str, object | None]:
+        return "novita", None
+
+    async def _fake_stage(source_dir: object, staging: Path, *_args: object, **_kwargs: object) -> Path:
+        project = staging / "project"
+        project.mkdir(parents=True)
+        return project
+
+    monkeypatch.setattr(workspace_bridge, "_selected_backend", _fake_backend)
+    monkeypatch.setattr(workspace_bridge, "_stage_novita_native", _fake_stage)
+
+    result = await workspace_bridge.stage_from_sandbox("app", staging_root=persistent)
+    assert result is not None
+    # Nothing was written under the persistent volume.
+    assert not any(persistent.rglob("*.tar.gz"))
+    assert not any(persistent.rglob("powerx-stage-*"))
+    result.cleanup()

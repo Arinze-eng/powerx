@@ -40,9 +40,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import os
 import posixpath
 import re
 import shlex
+import shutil
 import tarfile
 import tempfile
 from dataclasses import dataclass
@@ -95,8 +97,6 @@ class StagedProject:
     cleanup_root: Path
 
     def cleanup(self) -> None:
-        import shutil
-
         shutil.rmtree(self.cleanup_root, ignore_errors=True)
 
 
@@ -259,6 +259,14 @@ async def stage_from_sandbox(
     """
     backend_name, backend_config = await _selected_backend()
     parent = staging_root or _default_staging_root()
+    if not _assert_ephemeral(parent):
+        # Never stage onto the durable volume: these archives are throwaway bytes.
+        logger.warning(
+            "workspace_bridge: staging path {} is on the persistent disk; "
+            "using ephemeral temp instead",
+            parent,
+        )
+        parent = Path(tempfile.gettempdir()) / "powerx-staging"
     try:
         parent.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -275,22 +283,58 @@ async def stage_from_sandbox(
             project = await _stage_remote_backend(
                 backend_name, backend_config, source_dir, staging, local_archive, excludes, max_bytes
             )
-        if project is None:
-            return None
-        return StagedProject(path=project, cleanup_root=staging)
     except Exception as exc:  # noqa: BLE001 - staging is best-effort
         logger.warning("workspace_bridge: staging from {} failed: {}", backend_name, exc)
+        shutil.rmtree(staging, ignore_errors=True)
         return None
+
+    if project is None:
+        # Nothing usable was produced: remove the scratch dir so a failed transfer
+        # does not leave an archive behind. Repeated failures would otherwise
+        # accumulate on the temp volume until it filled.
+        shutil.rmtree(staging, ignore_errors=True)
+        return None
+
+    return StagedProject(path=project, cleanup_root=staging)
 
 
 def _default_staging_root() -> Path:
-    """Return a writable scratch root outside any user project directory."""
+    """Return an **ephemeral** scratch root for staged source archives.
+
+    Deliberately NOT on the persistent disk. Staging is transient by definition —
+    the archive is downloaded, extracted, consumed, and deleted — so putting it on
+    the durable volume would spend customer capacity (a project archive can reach
+    the size cap) on bytes that are worthless seconds later. The persistent volume
+    is reserved for small text facts.
+
+    Honours ``POWERX_STAGING_DIR`` for operators who want to pin it, then uses the
+    system temp dir, which is container-local scratch space. ``_assert_ephemeral``
+    verifies the choice rather than trusting it.
+    """
+    override = (os.environ.get("POWERX_STAGING_DIR") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path(tempfile.gettempdir()) / "powerx-staging"
+
+
+def _assert_ephemeral(root: Path) -> bool:
+    """Return ``False`` when ``root`` would consume the persistent volume.
+
+    A silent regression here would spend customer disk on throwaway archives, so
+    this is checked explicitly instead of assumed. Never raises: staging is best
+    effort and the caller falls back to the system temp dir.
+    """
     try:
         from nanobot.config.paths import get_persistent_data_dir
 
-        return Path(get_persistent_data_dir("staging"))
-    except Exception:  # noqa: BLE001 - fall back to the OS temp dir
-        return Path(tempfile.gettempdir()) / "powerx-staging"
+        persistent = get_persistent_data_dir().resolve()
+    except Exception:  # noqa: BLE001 - cannot resolve, so cannot judge
+        return True
+    try:
+        candidate = root.resolve()
+    except OSError:
+        return True
+    return not (candidate == persistent or persistent in candidate.parents)
 
 
 async def _stage_remote_backend(
