@@ -293,6 +293,32 @@ def _decode_api_key(raw_key: str) -> str | None:
     return key
 
 
+def _session_row_has_visible_activity(row: dict[str, Any]) -> bool:
+    """Return whether a session row has user-visible activity.
+
+    [FIX 2026-09-17] A `new_chat` request (and the per-connection default chat)
+    persists a durable session record purely to store workspace scope + owner so
+    they survive a reconnect. That record exists before any message is sent, so
+    the sidebar rendered it as an empty "New topic" entry placed above the real
+    conversation — looking like a duplicate of it. Such placeholder rows must
+    stay hidden until the chat is actually used.
+
+    A row is considered used once it has a preview (first user/assistant text),
+    an explicit title, or a currently running turn (so a chat that is mid-run
+    with only a hidden/reasoning frame still shows up).
+    """
+    preview = row.get("preview")
+    if isinstance(preview, str) and preview.strip():
+        return True
+    title = row.get("title")
+    if isinstance(title, str) and title.strip():
+        return True
+    run_started_at = row.get("run_started_at")
+    if isinstance(run_started_at, int | float) and not isinstance(run_started_at, bool):
+        return True
+    return False
+
+
 def _mutation_payload(request: WsRequest) -> dict[str, Any] | None:
     payload = getattr(request, _WEBUI_MUTATION_PAYLOAD_ATTR, None)
     if not isinstance(payload, dict):
@@ -992,6 +1018,16 @@ class GatewayHTTPHandler:
             started_at = websocket_turn_wall_started_at(chat_id)
             if started_at is not None:
                 row["run_started_at"] = started_at
+            # [FIX 2026-09-17] Hide never-used placeholder sessions.
+            # `new_chat` (and the per-connection default chat) persist a durable
+            # session record for the fresh chat id so workspace scope and owner
+            # survive a reconnect. Those records have no messages yet, so the
+            # sidebar rendered them as an empty "New topic" row *above* the real
+            # conversation — appearing as a duplicate of it. Only expose a row
+            # once the chat has real user-visible activity (a preview, a title,
+            # or an in-flight run).
+            if not _session_row_has_visible_activity(row):
+                continue
             if default_scope is None:
                 default_scope = self.workspaces.default_scope()
             scope_present, raw_scope = indexed_workspace_scope(s)

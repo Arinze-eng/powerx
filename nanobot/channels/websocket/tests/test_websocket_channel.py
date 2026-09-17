@@ -5024,6 +5024,62 @@ def test_sessions_list_includes_active_run_started_at(monkeypatch) -> None:
     ]
 
 
+def test_sessions_list_hides_never_used_new_chat_placeholders(monkeypatch) -> None:
+    """[FIX 2026-09-17] Empty `new_chat` placeholders must not reach the sidebar.
+
+    Clicking "New topic" (and opening a WebSocket) persists a durable session
+    record for the fresh chat id before any message exists. The sidebar rendered
+    each of those as an empty "New topic" row above the real conversation, which
+    read as a duplicate. Placeholder rows must be filtered out of the list API
+    while the real (used) chat is preserved.
+    """
+    from websockets.datastructures import Headers
+    from websockets.http11 import Request
+
+    from nanobot.webui import ws_http as ws_http_module
+
+    sessions = [
+        {
+            "key": "websocket:chat-real",
+            "created_at": "2026-05-19T10:00:00Z",
+            "updated_at": "2026-05-19T10:01:00Z",
+            "title": "",
+            "preview": "real first question",
+        },
+        {
+            # Default chat provisioned on connect: no messages yet.
+            "key": "websocket:chat-placeholder-a",
+            "created_at": "2026-05-19T10:02:00Z",
+            "updated_at": "2026-05-19T10:03:00Z",
+            "title": "",
+            "preview": "",
+        },
+        {
+            # A "New topic" click that was never used.
+            "key": "websocket:chat-placeholder-b",
+            "created_at": "2026-05-19T10:04:00Z",
+            "updated_at": "2026-05-19T10:05:00Z",
+            "title": "",
+            "preview": "",
+        },
+    ]
+    monkeypatch.setattr(ws_http_module, "list_webui_sessions", lambda _session_manager: sessions)
+    monkeypatch.setattr(
+        ws_http_module,
+        "SessionHandleResolver",
+        lambda _session_manager: MagicMock(list_all_by_key=lambda: {}),
+    )
+    channel = _ch(MagicMock(), port=29961)
+    channel.session_manager = MagicMock()
+
+    req = Request("/api/sessions", Headers([("Authorization", "Bearer tok")]))
+    resp = asyncio.run(channel.gateway.http._handle_sessions_list(req))
+
+    assert resp.status_code == 200
+    body = json.loads(resp.body.decode())
+    assert [row["key"] for row in body["sessions"]] == ["websocket:chat-real"]
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
