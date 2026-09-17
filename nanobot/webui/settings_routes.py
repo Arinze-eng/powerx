@@ -26,6 +26,7 @@ from nanobot.webui.cli_apps_api import cli_apps_action, cli_apps_payload
 from nanobot.webui.http_utils import http_response as _http_response
 from nanobot.webui.http_utils import is_local_browser_request as _is_local_browser_request
 from nanobot.webui.mcp_oauth_api import McpOAuthManager
+from nanobot.youtube.oauth import get_youtube_oauth_manager
 from nanobot.webui.mcp_presets_api import (
     ensure_mcp_oauth_server,
     mcp_presets_settings_action,
@@ -179,6 +180,8 @@ _SETTINGS_MUTATION_PATHS = frozenset({
     "/api/settings/mcp-oauth/start",
     "/api/settings/mcp-oauth/complete",
     "/api/settings/mcp-oauth/cancel",
+    "/api/settings/youtube/start",
+    "/api/settings/youtube/disconnect",
     *_MCP_PRESET_ACTIONS_BY_PATH,
 })
 
@@ -229,6 +232,7 @@ class WebUISettingsRouter:
         mcp_runtime_status: Callable[[], Mapping[str, str]] | None = None,
         mcp_reload: Callable[[], Awaitable[dict[str, Any]]] | None = None,
         mcp_oauth_redirect_uri: Callable[[WsRequest], str] | None = None,
+        youtube_user_id: Callable[[WsRequest], str] | None = None,
     ) -> None:
         self.settings = settings
         self.bus = bus
@@ -244,6 +248,7 @@ class WebUISettingsRouter:
         self._mcp_runtime_status = mcp_runtime_status
         self._mcp_reload = mcp_reload
         self._mcp_oauth_redirect_uri = mcp_oauth_redirect_uri
+        self._youtube_user_id = youtube_user_id
         self._mcp_oauth = McpOAuthManager()
         self._restart_sections: set[str] = set()
         self._models = model_domain.ModelSettingsHandler(settings, logger)
@@ -278,6 +283,12 @@ class WebUISettingsRouter:
             return self._handle_mcp_oauth_complete(request)
         if path == "/api/settings/mcp-oauth/cancel":
             return await self._handle_mcp_oauth_cancel(request)
+        if path == "/api/settings/youtube/start":
+            return await self._handle_youtube_start(request)
+        if path == "/api/settings/youtube/status":
+            return await self._handle_youtube_status(request)
+        if path == "/api/settings/youtube/disconnect":
+            return await self._handle_youtube_disconnect(request)
 
         route = self._route(path)
         if route is None:
@@ -726,6 +737,61 @@ class WebUISettingsRouter:
             ok=True,
             message=f"Authorization received for {name}. Return to nanobot to finish connecting.",
         )
+
+    # -- YouTube connector --------------------------------------------------
+
+    def _youtube_user(self, request: WsRequest) -> str:
+        if self._youtube_user_id is None:
+            return ""
+        try:
+            return (self._youtube_user_id(request) or "").strip()
+        except Exception:
+            return ""
+
+    async def _handle_youtube_start(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        user_id = self._youtube_user(request)
+        if not user_id:
+            return self._error_response(401, "Sign in to connect YouTube")
+        try:
+            payload = get_youtube_oauth_manager().start(user_id)
+        except Exception as exc:
+            return self._youtube_error_response(exc, action="start")
+        return self._json_response(payload)
+
+    async def _handle_youtube_status(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        user_id = self._youtube_user(request)
+        try:
+            payload = await get_youtube_oauth_manager().status(user_id)
+        except Exception as exc:
+            return self._youtube_error_response(exc, action="status")
+        return self._json_response(payload)
+
+    async def _handle_youtube_disconnect(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        user_id = self._youtube_user(request)
+        if not user_id:
+            return self._error_response(401, "Sign in to disconnect YouTube")
+        try:
+            payload = await get_youtube_oauth_manager().disconnect(user_id)
+        except Exception as exc:
+            return self._youtube_error_response(exc, action="disconnect")
+        return self._json_response(payload)
+
+    def _youtube_error_response(self, exc: Exception, *, action: str) -> Response:
+        raw_status = getattr(exc, "status", 500)
+        status = raw_status if isinstance(raw_status, int) and 400 <= raw_status <= 599 else 500
+        if status >= 500:
+            self.logger.exception("YouTube '{}' failed", action)
+            message = f"YouTube {action} failed"
+        else:
+            raw_message = getattr(exc, "message", None)
+            message = raw_message if isinstance(raw_message, str) else "YouTube request failed"
+        return self._error_response(status, message)
 
     def _mcp_oauth_error_response(self, exc: Exception, *, action: str) -> Response:
         raw_status = getattr(exc, "status", 500)

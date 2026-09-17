@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import binascii
+import html
 import json
 import mimetypes
 import os
@@ -470,6 +471,7 @@ class GatewayHTTPHandler:
             mcp_runtime_status=mcp_runtime_status,
             mcp_reload=mcp_reload,
             mcp_oauth_redirect_uri=self._mcp_oauth_redirect_uri,
+            youtube_user_id=self._supabase_user_id_for_request,
         )
 
     def workspace_controls_available(self, connection: Any) -> bool:
@@ -746,6 +748,14 @@ class GatewayHTTPHandler:
         if got.startswith("/api/") or got.startswith("/v1/"):
             return _http_error(404, "API route not found")
 
+        # YouTube OAuth callback: Google redirects to the app root with
+        # ?code=...&state=.... Only intercept requests whose state matches a
+        # pending flow, so ordinary SPA serving at "/" is untouched.
+        if got == "/":
+            youtube_response = await self._maybe_complete_youtube_callback(request)
+            if youtube_response is not None:
+                return youtube_response
+
         # Static SPA serving
         if self.static_dist_path is not None:
             response = self._serve_static(
@@ -985,6 +995,79 @@ class GatewayHTTPHandler:
         public_ws_url = urlsplit(self._bootstrap_ws_url(request))
         scheme = "https" if public_ws_url.scheme == "wss" else "http"
         return urlunsplit((scheme, public_ws_url.netloc, MCP_OAUTH_CALLBACK_PATH, "", ""))
+
+    async def _maybe_complete_youtube_callback(self, request: WsRequest) -> Response | None:
+        """Complete a YouTube OAuth callback that lands on the app root.
+
+        Google's only registered redirect URI is the bare origin, so the
+        callback arrives as ``/?code=...&state=...``. We complete it ONLY when
+        the ``state`` matches a pending flow (and only the code/error is
+        present); every other request to "/" falls through to SPA serving.
+        """
+        query = _parse_query(request.path)
+        state = (_query_first(query, "state") or "").strip()
+        if not state:
+            return None
+        code = _query_first(query, "code")
+        error = _query_first(query, "error")
+        if not code and not error:
+            return None
+
+        from nanobot.youtube.oauth import YouTubeOAuthError, get_youtube_oauth_manager
+
+        manager = get_youtube_oauth_manager()
+        if not manager.has_pending_state(state):
+            return None
+        try:
+            await manager.submit_callback(state=state, code=code, error=error)
+        except YouTubeOAuthError as exc:
+            return self._youtube_callback_page(ok=False, message=exc.message, status=exc.status)
+        except Exception:
+            self._log.exception("YouTube OAuth callback failed")
+            return self._youtube_callback_page(
+                ok=False,
+                message="Could not complete YouTube authorization. Try again.",
+                status=500,
+            )
+        return self._youtube_callback_page(
+            ok=True,
+            message="YouTube connected. Returning you to Settings...",
+        )
+
+    @staticmethod
+    def _youtube_callback_page(*, ok: bool, message: str, status: int = 200) -> Response:
+        title = "YouTube connected" if ok else "YouTube connection failed"
+        safe_title = html.escape(title)
+        safe_message = html.escape(message)
+        target = "/?youtube=connected" if ok else "/?youtube=error"
+        delay = 400 if ok else 1500
+        script = (
+            f"<script>setTimeout(() => window.location.replace('{target}'), {delay})</script>"
+        )
+        body = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{safe_title}</title><style>"
+            "body{font:16px system-ui;margin:0;min-height:100vh;display:grid;place-items:center;"
+            "background:#f7f7f6;color:#171717}.card{max-width:34rem;margin:2rem;padding:2rem;"
+            "border:1px solid #ddd;border-radius:16px;background:white}h1{font-size:1.35rem}"
+            "p{line-height:1.55;color:#555}</style></head><body><main class='card'>"
+            f"<h1>{safe_title}</h1><p>{safe_message}</p></main>{script}</body></html>"
+        ).encode("utf-8")
+        return _http_response(
+            body,
+            status=status,
+            content_type="text/html; charset=utf-8",
+            extra_headers=[
+                ("Cache-Control", "no-store"),
+                ("Referrer-Policy", "no-referrer"),
+                (
+                    "Content-Security-Policy",
+                    "default-src 'none'; base-uri 'none'; form-action 'none'; "
+                    "frame-ancestors 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+                ),
+            ],
+        )
 
     # -- Session routes -----------------------------------------------------
 
