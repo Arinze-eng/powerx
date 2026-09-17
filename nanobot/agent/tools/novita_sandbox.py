@@ -65,6 +65,45 @@ _RUNLOOP_KEEP_ALIVE_BUDGET = 60
 _RUNLOOP_RELEASE_RESET_BUDGET = 90
 _WORKSPACE = "/workspace"
 _OCR_DIR = f"{_WORKSPACE}/.nanobot"
+#: GitHub credentials are materialised inside the sandbox as a sourced env file
+#: (see _write_sandbox_credentials). Keeping them in a file rather than inline on
+#: the command line means the token never lands in tool-call logs or output.
+_GIT_CREDS_PATH = f"{_OCR_DIR}/github-env.sh"
+_GIT_CREDS_SOURCE = f'. {shlex.quote(_GIT_CREDS_PATH)} 2>/dev/null || true; '
+
+#: Env vars that may hold a GitHub token, in precedence order. GITHUB_BUILD_TOKEN
+#: is the operator-provisioned build account the build_artifact tool uses;
+#: GITHUB_TOKEN / GH_TOKEN are the conventional names the `gh` CLI and `git`
+#: credential helpers read.
+_GITHUB_TOKEN_ENVS = ("GITHUB_BUILD_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
+
+
+def _github_credentials() -> dict[str, str]:
+    """Collect GitHub credentials available to the runtime.
+
+    Returns an empty dict when no token is configured, in which case sandbox
+    commands run unauthenticated exactly as before.
+    """
+    token = ""
+    for name in _GITHUB_TOKEN_ENVS:
+        candidate = os.environ.get(name, "").strip()
+        if candidate:
+            token = candidate
+            break
+    if not token:
+        return {}
+    creds = {"GITHUB_TOKEN": token, "GH_TOKEN": token}
+    owner = os.environ.get("GITHUB_BUILD_OWNER", "").strip()
+    if owner:
+        creds["GITHUB_BUILD_OWNER"] = owner
+    return creds
+
+
+def _git_identity() -> tuple[str, str]:
+    """Resolve the commit identity used inside the sandbox."""
+    owner = os.environ.get("GITHUB_BUILD_OWNER", "").strip() or "nanobot"
+    email = os.environ.get("GIT_COMMIT_EMAIL", "").strip() or f"{owner}@users.noreply.github.com"
+    return owner, email
 
 #: Automatic Novita sandbox sizing when the admin configured none. The stock
 #: "base" image ships ~486 MB which OOM-kills builds/OCR, so we default every
@@ -1529,6 +1568,63 @@ class NovitaSandboxTool(Tool):
         # letting the caller fail later with a confusing cwd error.
         raise last_error if last_error is not None else RuntimeError("workspace prepare failed")
 
+    def _prepare_sandbox(self, sandbox: Any) -> None:
+        """Ensure the workspace exists AND GitHub credentials are materialised.
+
+        Sandbox commands run in an isolated container that does NOT inherit the
+        backend's environment, so ``git``/``gh``/``curl`` had no credentials even
+        though GITHUB_BUILD_TOKEN is set on the host. That made every
+        repo-create/clone/push attempt inside the sandbox fail with an
+        authentication error while the host-side build_artifact tool worked fine.
+
+        Must run on every path that hands a sandbox back (create AND reconnect),
+        because a resumed box can have lost the workspace and the env file.
+        """
+        self._ensure_workspace(sandbox)
+        self._write_sandbox_credentials(sandbox)
+
+    def _write_sandbox_credentials(self, sandbox: Any) -> None:
+        """Write GitHub credentials into the sandbox as a sourced env file.
+
+        Deliberately NOT injected inline on the command line: commands are
+        logged, so a literal ``GITHUB_TOKEN=ghp_...`` prefix would leak the
+        token into tool-call logs and transcript history. A 0600 file sourced by
+        each command keeps the secret out of logs while still making it
+        available to git/gh/curl.
+        """
+        creds = _github_credentials()
+        if not creds:
+            # No token configured: leave the box unauthenticated (previous
+            # behaviour) rather than writing an empty file that looks like
+            # working auth.
+            return
+        owner, email = _git_identity()
+        lines = ["# Managed by nanobot - do not edit.", "#!/bin/sh"]
+        for name, value in creds.items():
+            lines.append(f"export {name}={shlex.quote(value)}")
+        # Neutralise any pre-existing credential helper (e.g. a stale gh login)
+        # and instead store the token for github.com so git push/pull works
+        # non-interactively. `|| true` keeps this a no-op when git is absent.
+        lines.append(
+            "git config --global credential.helper "
+            "'!f() { echo username=x-access-token; echo password=$GITHUB_TOKEN; }; f' "
+            "2>/dev/null || true"
+        )
+        lines.append(f"git config --global user.name {shlex.quote(owner)} 2>/dev/null || true")
+        lines.append(f"git config --global user.email {shlex.quote(email)} 2>/dev/null || true")
+        script = "\n".join(lines) + "\n"
+        try:
+            sandbox.files.write(_GIT_CREDS_PATH, script)
+            # 0600: only the sandbox user may read the token.
+            sandbox.commands.run(
+                f"chmod 600 {shlex.quote(_GIT_CREDS_PATH)}",
+                cwd="/",
+                timeout=30,
+                request_timeout=60,
+            )
+        except Exception as exc:  # noqa: BLE001 - credentials are best-effort
+            logger.warning("could not seed GitHub credentials into sandbox: {}", exc)
+
     def _get_or_create(self, key: str) -> Any:
         client = self._client()
         # Resolve the target template up front so we can tell whether an existing
@@ -1575,7 +1671,7 @@ class NovitaSandboxTool(Tool):
         if sandbox is not None:
             try:
                 if _matches_sizing(_STORE.template_for(key)) and _try_resume(sandbox):
-                    self._ensure_workspace(sandbox)
+                    self._prepare_sandbox(sandbox)
                     return sandbox
             except Exception:
                 pass
@@ -1587,7 +1683,7 @@ class NovitaSandboxTool(Tool):
                 sandbox = client.sandbox.connect(sandbox_id)
                 if _matches_sizing(_STORE.template_for(key)) and _try_resume(sandbox):
                     _STORE.set(key, sandbox, template=sandbox_template)
-                    self._ensure_workspace(sandbox)
+                    self._prepare_sandbox(sandbox)
                     return sandbox
                 # Connected but undersized/unknown template: don't reuse it.
                 _STORE.remove(key)
@@ -1601,7 +1697,7 @@ class NovitaSandboxTool(Tool):
             lifecycle={"on_timeout": "pause", "auto_resume": True},
         )
         try:
-            self._ensure_workspace(sandbox)
+            self._prepare_sandbox(sandbox)
         except Exception:
             # A freshly created box we cannot prepare is unusable; kill it so a
             # broken sandbox is not left running (and billing) on Novita.
@@ -2543,7 +2639,10 @@ class NovitaSandboxTool(Tool):
                     timeout = max(1, min(int(kwargs.get("timeout") or 120), _MAX_TIMEOUT))
                     result = await asyncio.to_thread(
                         sandbox.commands.run,
-                        command,
+                        # Source the credential file so git/gh/curl authenticate
+                        # inside the sandbox. Failure is tolerated (`|| true`), so
+                        # boxes without a configured token behave as before.
+                        _GIT_CREDS_SOURCE + command,
                         cwd=_WORKSPACE,
                         timeout=timeout,
                         request_timeout=timeout + 30,
