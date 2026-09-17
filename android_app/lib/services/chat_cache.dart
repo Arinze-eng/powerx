@@ -355,3 +355,60 @@ List<ChatMessage> mergeThreadHistory({
   }
   return merged;
 }
+
+/// Re-link [live] — the bubble currently receiving streamed deltas — back into
+/// a freshly merged transcript, and return the list the UI should render.
+///
+/// Why this is needed: [mergeThreadHistory] builds its result from SERVER-owned
+/// [ChatMessage] instances, so the object the UI holds as its live streaming
+/// target is not necessarily among them any more. The screen replaces its
+/// message list with the merged result on every resync (turn start, every
+/// reconnect, and every 15 s while a long turn runs), which orphaned that
+/// bubble: inbound `delta` frames kept appending to an object that was no
+/// longer rendered. The visible symptom was a long task appearing to be "cut
+/// off" — the transcript froze mid-answer while the busy indicator kept
+/// spinning and the answer only landed once a terminal frame arrived.
+///
+/// The streamed bubble is the row of record while a turn runs, so it is kept
+/// and the server snapshot is folded INTO it (via [ChatMessage.mergeFrom],
+/// which only fills gaps and therefore never clobbers streamed text).
+///
+/// Returns the merged list; the live bubble is placed at the end when the
+/// server has not persisted its row yet, so it stays the visual tail.
+List<ChatMessage> relinkLiveTurn({
+  required List<ChatMessage> merged,
+  required ChatMessage? live,
+  String? activeTurnId,
+}) {
+  if (live == null) return merged;
+
+  final liveTurnId = (live.turnId ?? '').trim();
+  final tid =
+      liveTurnId.isNotEmpty ? liveTurnId : (activeTurnId ?? '').trim();
+
+  // Drop any copy of this bubble already in the merged list, otherwise folding
+  // it back in could leave two rows for one turn.
+  merged.remove(live);
+
+  var targetIndex = -1;
+  if (tid.isNotEmpty) {
+    for (var i = 0; i < merged.length; i++) {
+      final m = merged[i];
+      if (m.role == Role.assistant && (m.turnId ?? '').trim() == tid) {
+        targetIndex = i;
+        break;
+      }
+    }
+  }
+
+  if (targetIndex < 0) {
+    // The server holds no persisted row for this turn yet — normal while it is
+    // mid-stream. The streamed bubble IS that row.
+    merged.add(live);
+    return merged;
+  }
+
+  live.mergeFrom(merged[targetIndex]);
+  merged[targetIndex] = live;
+  return merged;
+}

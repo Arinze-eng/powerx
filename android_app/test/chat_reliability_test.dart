@@ -202,4 +202,85 @@ void main() {
       expect(DeleteSessionResult.fromJson(parsed).blockedByAutomations, isTrue);
     });
   });
+
+  group('live turn re-link across a history resync', () {
+    // The streamed bubble receives deltas through a Dart object reference. A
+    // resync swaps `_messages` for a list built from SERVER-owned instances,
+    // which used to orphan that reference: deltas kept appending to an object
+    // the list no longer rendered, so a long task visibly "cut off" mid-answer
+    // while the busy pill kept spinning.
+
+    test('keeps the streamed bubble rendered when the server has no row yet',
+        () {
+      final live = ChatMessage(id: 'live-1', role: Role.assistant)
+        ..turnId = 't1'
+        ..streaming = true
+        ..appendDelta('partial answer');
+
+      final merged = mergeThreadHistory(
+        server: [ChatMessage(id: 'u1', role: Role.user, text: 'do the thing')],
+        cached: const [],
+      );
+
+      relinkLiveTurn(merged: merged, live: live, activeTurnId: 't1');
+
+      // The exact same object is still the row that gets rendered, so further
+      // deltas remain visible.
+      expect(merged.contains(live), isTrue);
+      expect(identical(merged.last, live), isTrue);
+
+      live.appendDelta(' more');
+      expect(merged.last.text, 'partial answer more');
+    });
+
+    test('folds the server snapshot into the live bubble, streamed text wins',
+        () {
+      final live = ChatMessage(id: 'live-1', role: Role.assistant)
+        ..turnId = 't1'
+        ..streaming = true
+        ..appendDelta('streamed partial');
+      final serverRow = ChatMessage(
+        id: 'srv-1',
+        role: Role.assistant,
+        text: 'streamed partial',
+        turnId: 't1',
+      )..media = ['https://cdn/x.png'];
+
+      final merged = [serverRow];
+      relinkLiveTurn(merged: merged, live: live, activeTurnId: 't1');
+
+      // One row for the turn, and it is the live bubble (now carrying the
+      // server's media) rather than a duplicate.
+      expect(merged.where((m) => m.role == Role.assistant).length, 1);
+      expect(identical(merged.single, live), isTrue);
+      expect(merged.single.text, 'streamed partial');
+      expect(merged.single.media, contains('https://cdn/x.png'));
+    });
+
+    test('adopts the active turn id when the bubble has none yet', () {
+      final live = ChatMessage(id: 'live-1', role: Role.assistant)
+        ..streaming = true
+        ..appendDelta('streaming');
+      final serverRow = ChatMessage(
+        id: 'srv-1',
+        role: Role.assistant,
+        text: 'streaming',
+        turnId: 't9',
+      );
+
+      final merged = [serverRow];
+      relinkLiveTurn(merged: merged, live: live, activeTurnId: 't9');
+
+      expect(merged.length, 1);
+      expect(identical(merged.single, live), isTrue);
+      expect(merged.single.turnId, 't9');
+    });
+
+    test('is a no-op when there is no live turn', () {
+      final server = ChatMessage(id: 's1', role: Role.assistant, text: 'done');
+      final merged = [server];
+      relinkLiveTurn(merged: merged, live: null, activeTurnId: 't1');
+      expect(merged, [server]);
+    });
+  });
 }

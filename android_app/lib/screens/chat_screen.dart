@@ -424,6 +424,25 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       server: history.messages,
       cached: List<ChatMessage>.from(_messages),
     );
+
+    // Re-link the live streaming bubble before the list is swapped.
+    //
+    // `merged` is built from SERVER-owned ChatMessage instances, so the object
+    // `_liveTurn` points at — the one every inbound `delta` appends to — is not
+    // guaranteed to be in it. Without this, deltas render into a DETACHED
+    // object and the transcript freezes mid-task with the busy pill still
+    // spinning, which is the "long takes still get cut off" symptom. It fired
+    // on every resync (turn start, every reconnect, every 15 s during a long
+    // turn), so it — not the error frames the previous fix addressed — was what
+    // killed the stream. See [relinkLiveTurn].
+    final live = _liveTurn;
+    relinkLiveTurn(
+      merged: merged,
+      live: live,
+      activeTurnId: history.activeTurnId,
+    );
+    if (live != null) _liveTurn = live;
+
     setState(() {
       _messages
         ..clear()
@@ -578,6 +597,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           t.endSegment(finalText);
           t.dropEmptyTrailingSegment();
         }
+        _flushNow();
         if (mounted) setState(() {});
         _scrollToBottom();
       },
@@ -612,6 +632,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         if (media.isNotEmpty) {
           t.media = [...t.media, ...media.where((m) => !t.media.contains(m))];
         }
+        _flushNow();
         if (mounted) setState(() {});
       },
       onTurnEnd: (summary) {
@@ -833,14 +854,37 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  /// Coalesces high-frequency streaming deltas into UI rebuilds (~12/s max)
-  /// so the markdown bubble re-renders smoothly instead of on every chunk.
+  /// Coalesces high-frequency streaming deltas into UI rebuilds.
+  ///
+  /// One frame (16 ms) — the same cadence the web client uses via
+  /// `requestAnimationFrame` — so text paints as it arrives. The previous
+  /// 80 ms timer was 5x slower than the reference client and stacked on top of
+  /// the socket/network hop, which is what read as "streaming is slow, it
+  /// delays". Coalescing still happens (deltas are batched per frame rather
+  /// than per chunk), so this does not regress the smooth-render work.
+  static const Duration _streamFlushInterval = Duration(milliseconds: 16);
+
   void _scheduleFlush() {
-    _flushTimer ??= Timer(const Duration(milliseconds: 80), () {
+    _flushTimer ??= Timer(_streamFlushInterval, () {
       _flushTimer = null;
       if (mounted) setState(() {});
+      // Persisting on every frame would thrash the disk while streaming; the
+      // transcript is cached on its own longer debounce instead.
       _scheduleCacheWrite();
     });
+  }
+
+  /// Flush any pending stream paint immediately.
+  ///
+  /// Terminal events (turn end, stream end, final message) must not wait out
+  /// the frame timer, otherwise the finished answer visibly lags behind the
+  /// server by up to one flush interval.
+  void _flushNow() {
+    if (_flushTimer == null) return;
+    _flushTimer!.cancel();
+    _flushTimer = null;
+    if (mounted) setState(() {});
+    _scheduleCacheWrite();
   }
 
   // ---- Turn liveness, resync & local persistence -------------------------
