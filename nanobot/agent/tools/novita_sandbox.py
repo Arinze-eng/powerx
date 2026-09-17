@@ -1479,15 +1479,41 @@ class NovitaSandboxTool(Tool):
         does, as a side effect of ``mkdir -p /workspace/.nanobot`` — which is why
         this presented as an intermittent failure).
 
+        [FIX 2026-09-17] Custom sized templates run as the unprivileged ``user``
+        (uid 1000) rather than ``root``. ``/`` is owned by root with ``0755``,
+        so a plain ``mkdir -p /workspace`` fails outright::
+
+            mkdir: cannot create directory '/workspace': Permission denied
+
+        The stock ``base`` image happens to run as root, which is why this only
+        surfaced once the 2 GB/4 GB sized templates were built. Escalate through
+        passwordless ``sudo -n`` (the user is in the sudo group) to create the
+        directory AND hand it to the invoking user, otherwise later writes —
+        uploads, downloads, OCR — still fail on a root-owned workspace.
+
         This is idempotent and must run on *every* path that hands a sandbox
         back, not just fresh creation: a box resumed from ``pause`` or
         reconnected by id can also be missing the directory.
         """
+        quoted = shlex.quote(_WORKSPACE)
+        # 1) plain mkdir covers root-style images; 2) sudo -n covers uid-1000
+        # images; 3) chown flips a root-owned workspace to the invoking user so
+        # subsequent unprivileged writes succeed. `||` keeps it a single
+        # idempotent command, and `sudo -n` fails fast instead of hanging on a
+        # password prompt when passwordless sudo is unavailable.
+        prep_cmd = (
+            f"mkdir -p {quoted} 2>/dev/null"
+            f" || sudo -n mkdir -p {quoted}"
+            f" || exit 1; "
+            f"if [ ! -w {quoted} ]; then sudo -n chown -R \"$(id -u):$(id -g)\" {quoted}; fi; "
+            f"chmod u+rwx {quoted} 2>/dev/null; "
+            f"[ -d {quoted} ] && [ -w {quoted} ]"
+        )
         last_error: Exception | None = None
         for attempt in range(6):
             try:
                 sandbox.commands.run(
-                    f"mkdir -p {shlex.quote(_WORKSPACE)}",
+                    prep_cmd,
                     cwd="/",
                     timeout=30,
                     request_timeout=60,
