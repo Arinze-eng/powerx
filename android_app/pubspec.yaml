@@ -37,8 +37,16 @@ dependencies:
   wakelock_plus: ^1.2.8
   # Voice notes: capture audio natively, then hand the bytes to the gateway's
   # transcription endpoint so speech becomes text in the composer.
-  record: ^5.1.2
+  record: ^6.1.2
   permission_handler: ^11.3.1
+
+dependency_overrides:
+  # record's transitive Linux federated plugin must match the resolved
+  # record_platform_interface major/minor. Without this override pub resolves
+  # record_linux 0.7.2, which does not implement `startStream` and has a stale
+  # `hasPermission` signature, so the Dart kernel snapshot fails to compile even
+  # for Android builds (the host tool compiles every reachable plugin source).
+  record_linux: ^1.3.1
 
 dev_dependencies:
   flutter_test:

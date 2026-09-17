@@ -8,7 +8,11 @@ plugins {
 android {
     namespace = "com.powerx.powerx_android"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+    // Pinned to the highest NDK required by the resolved plugin set
+    // (device_info_plus, file_picker, record_android, ...). NDK releases are
+    // backward compatible, so a single version satisfies every plugin and
+    // silences the "plugin(s) depend on a different Android NDK" warning.
+    ndkVersion = "27.0.12077973"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
