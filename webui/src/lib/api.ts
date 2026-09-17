@@ -779,6 +779,53 @@ export async function cancelMcpOAuth(
   );
 }
 
+export interface YouTubeConnectorStatus {
+  connected: boolean;
+  configured?: boolean;
+  channel_id?: string | null;
+  channel_title?: string | null;
+  scope?: string;
+}
+
+export interface YouTubeConnectPayload {
+  authorization_url: string;
+  flow_state: string;
+  expires_in: number;
+}
+
+export async function fetchYouTubeStatus(
+  token: string,
+  base: string = "",
+): Promise<YouTubeConnectorStatus> {
+  return request<YouTubeConnectorStatus>(
+    `${base}/api/settings/youtube/status`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
+}
+
+export async function startYouTubeConnect(
+  transport: WebUIMutationTransport,
+): Promise<YouTubeConnectPayload> {
+  return mutation<YouTubeConnectPayload>(
+    transport,
+    "settings.youtube.connect",
+    {},
+    30_000,
+  );
+}
+
+export async function disconnectYouTube(
+  transport: WebUIMutationTransport,
+): Promise<YouTubeConnectorStatus> {
+  return mutation<YouTubeConnectorStatus>(
+    transport,
+    "settings.youtube.disconnect",
+    {},
+  );
+}
+
 export async function fetchProviderModels(
   token: string,
   provider: string,

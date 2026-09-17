@@ -38,6 +38,7 @@ import {
   McpManagementDialog,
   type McpManagementTab,
 } from "@/components/settings/system/McpManagementDialog";
+import { YouTubeConnectorCard } from "@/components/settings/system/YouTubeConnectorCard";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -288,6 +289,8 @@ export function AppsCatalogSettings({
           isRestarting={isRestarting}
         />
       ) : null}
+
+      <YouTubeConnectorCard />
 
       <section className="rounded-panel bg-settings-surface px-3 py-3 sm:px-4">
         <div className="flex items-center justify-between border-b border-border/45 pb-3">
