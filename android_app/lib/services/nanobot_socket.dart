@@ -627,6 +627,18 @@ class NanobotSocket {
 
   void _onData(dynamic raw) {
     _lastInboundAt = DateTime.now();
+    // A malformed or unexpected frame must never propagate: an exception
+    // raised inside the stream listener tears down the socket (and, before
+    // the global crash fence, the whole Android process). Catch everything,
+    // keep the connection, and let the next frame do the work.
+    try {
+      _handleFrame(raw);
+    } catch (_) {
+      // Ignore the bad frame; the socket stays usable.
+    }
+  }
+
+  void _handleFrame(dynamic raw) {
     late final Map<String, dynamic> ev;
     try {
       ev = jsonDecode(raw as String) as Map<String, dynamic>;

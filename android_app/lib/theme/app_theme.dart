@@ -15,17 +15,17 @@ class AppTheme {
     const scheme = ColorScheme(
       brightness: Brightness.dark,
       primary: Palette.accent,
-      onPrimary: Color(0xFF241407),
+      onPrimary: Colors.white,
       primaryContainer: Palette.accentDeep,
       onPrimaryContainer: Palette.textPrimary,
       secondary: Palette.accentSoft,
-      onSecondary: Color(0xFF241407),
+      onSecondary: Colors.white,
       secondaryContainer: Palette.bg3,
       onSecondaryContainer: Palette.textPrimary,
       tertiary: Palette.warning,
-      onTertiary: Color(0xFF241407),
+      onTertiary: Colors.white,
       error: Palette.danger,
-      onError: Color(0xFF2A0D08),
+      onError: Colors.white,
       surface: Palette.bg0,
       onSurface: Palette.textPrimary,
       surfaceContainerLowest: Palette.bg0,
@@ -51,10 +51,20 @@ class AppTheme {
       canvasColor: Palette.bg1,
       dividerColor: Palette.borderSoft,
       fontFamily: 'Roboto',
-      splashFactory: InkSparkle.splashFactory,
+      // InkRipple instead of InkSparkle: the sparkle shader is noticeably
+      // expensive on low-end Android GPUs and re-rasterises on every tap.
+      splashFactory: InkRipple.splashFactory,
     );
 
     return base.copyWith(
+      // A shared, GPU-cheap route transition keeps navigation feeling
+      // continuous instead of dropping frames on the default platform one.
+      pageTransitionsTheme: const PageTransitionsTheme(
+        builders: {
+          TargetPlatform.android: FadeForwardsPageTransitionsBuilder(),
+          TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
+        },
+      ),
       appBarTheme: const AppBarTheme(
         backgroundColor: Palette.bg1,
         surfaceTintColor: Colors.transparent,
@@ -145,7 +155,7 @@ class AppTheme {
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
           backgroundColor: Palette.accent,
-          foregroundColor: const Color(0xFF241407),
+          foregroundColor: Colors.white,
           disabledBackgroundColor: Palette.bg3,
           disabledForegroundColor: Palette.textTertiary,
           textStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
@@ -173,8 +183,10 @@ class AppTheme {
         ),
       ),
       floatingActionButtonTheme: const FloatingActionButtonThemeData(
-        backgroundColor: Palette.accent,
-        foregroundColor: Color(0xFF241407),
+        backgroundColor: Color(0xFFF2F2F4),
+        foregroundColor: Color(0xFF101012),
+        elevation: 2,
+        highlightElevation: 3,
       ),
       chipTheme: ChipThemeData(
         backgroundColor: Palette.bg3,

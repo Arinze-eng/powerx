@@ -1,57 +1,58 @@
 import 'package:flutter/material.dart';
 
-/// Central design tokens for the CDNAI (PowerX) native client.
+/// Central design tokens for the PowerX native client.
 ///
-/// The palette is a warm "coffee" brown system: deep espresso backgrounds,
-/// caramel accents and cream typography. Every screen pulls its colours from
-/// here, so the app reads as one product instead of a set of screens. Keeping
-/// the values in a single place also means a future re-skin is a one-file
-/// change rather than a hunt through literal hex codes.
+/// The palette follows the modern "agent workspace" language: a near-black
+/// neutral canvas, softly-lifted charcoal surfaces, hairline borders and a
+/// single restrained blue accent. Colour is used for meaning only (running,
+/// done, error) so long transcripts stay calm to read.
+///
+/// Everything pulls from here, so a re-skin remains a one-file change.
 class Palette {
   const Palette._();
 
   // ---- Backgrounds (deep -> light) -------------------------------------
-  /// App canvas / scaffold.
-  static const bg0 = Color(0xFF0E0A08);
+  /// App canvas / scaffold. Near-black, slightly cool neutral.
+  static const bg0 = Color(0xFF0A0A0B);
 
-  /// Drawer, app bar — one step above the canvas.
-  static const bg1 = Color(0xFF171110);
+  /// App bar, drawer — one step above the canvas.
+  static const bg1 = Color(0xFF101012);
 
   /// Cards and assistant bubbles.
-  static const bg2 = Color(0xFF211816);
+  static const bg2 = Color(0xFF17171A);
 
   /// Composer, inputs, elevated chips.
-  static const bg3 = Color(0xFF2C211D);
+  static const bg3 = Color(0xFF1F1F23);
 
   /// Pressed / hover surface.
-  static const bg4 = Color(0xFF3A2B24);
+  static const bg4 = Color(0xFF2A2A30);
 
   // ---- Hairlines --------------------------------------------------------
-  static const border = Color(0xFF3B2C26);
-  static const borderSoft = Color(0xFF2A1F1A);
+  static const border = Color(0xFF2E2E34);
+  static const borderSoft = Color(0xFF212126);
 
-  // ---- Brand accent (caramel) ------------------------------------------
-  static const accent = Color(0xFFC98A5B);
-  static const accentSoft = Color(0xFFE3B489);
-  static const accentDeep = Color(0xFF8A5A34);
+  // ---- Brand accent (the single blue) ----------------------------------
+  static const accent = Color(0xFF4C8DFF);
+  static const accentSoft = Color(0xFF8FB6FF);
+  static const accentDeep = Color(0xFF2F6BE0);
 
   /// Very low-opacity accent used for selected rows and tinted panels.
-  static const accentWash = Color(0x1FC98A5B);
+  static const accentWash = Color(0x1F4C8DFF);
 
-  // ---- User bubble (the brown chat surface) ----------------------------
-  static const userBubbleTop = Color(0xFF8A5A34);
-  static const userBubbleBottom = Color(0xFF68412A);
-  static const userText = Color(0xFFFFF5EA);
+  // ---- User bubble (a light neutral slab, like the reference) ----------
+  static const userBubbleTop = Color(0xFF2A2A30);
+  static const userBubbleBottom = Color(0xFF232328);
+  static const userText = Color(0xFFF5F5F7);
 
   // ---- Typography -------------------------------------------------------
-  static const textPrimary = Color(0xFFF4EAE2);
-  static const textSecondary = Color(0xFFC3B0A2);
-  static const textTertiary = Color(0xFF8E7C6E);
+  static const textPrimary = Color(0xFFF2F2F4);
+  static const textSecondary = Color(0xFFA9A9B2);
+  static const textTertiary = Color(0xFF70707A);
 
   // ---- Semantic ---------------------------------------------------------
-  static const success = Color(0xFF8FBF7F);
-  static const warning = Color(0xFFE0A458);
-  static const danger = Color(0xFFE5735F);
+  static const success = Color(0xFF4ADE80);
+  static const warning = Color(0xFFF5B54A);
+  static const danger = Color(0xFFF0616D);
 
   // ---- Gradients --------------------------------------------------------
   /// Brand mark / primary button.
@@ -68,11 +69,11 @@ class Palette {
     colors: [userBubbleTop, userBubbleBottom],
   );
 
-  /// Soft warm glow used behind hero surfaces on the landing screen.
+  /// Soft cool glow used behind hero surfaces on the landing screen.
   static const heroGlow = RadialGradient(
     center: Alignment.topCenter,
-    radius: 1.1,
-    colors: [Color(0x33C98A5B), Color(0x000E0A08)],
+    radius: 1.15,
+    colors: [Color(0x1F4C8DFF), Color(0x000A0A0B)],
   );
 
   // ---- Helpers ----------------------------------------------------------

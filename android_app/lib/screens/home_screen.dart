@@ -17,7 +17,10 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final GlobalKey<ScaffoldState> _scaffold = GlobalKey<ScaffoldState>();
-  final int _page = 0;
+  final ScrollController _recentScroll = ScrollController();
+
+  /// 0 = Tasks (recent work), 1 = Agent (start something new).
+  int _tab = 0;
 
   @override
   void initState() {
@@ -27,6 +30,12 @@ class _HomeScreenState extends State<HomeScreen> {
       state.loadSessions();
       state.refreshCredits();
     });
+  }
+
+  @override
+  void dispose() {
+    _recentScroll.dispose();
+    super.dispose();
   }
 
   Future<void> _newChat({String? prompt}) async {
@@ -52,125 +61,40 @@ class _HomeScreenState extends State<HomeScreen> {
     final state = context.watch<AppState>();
     return Scaffold(
       key: _scaffold,
+      backgroundColor: Palette.bg0,
       drawer: _SessionsDrawer(
         state: state,
         onNew: () => _newChat(),
         onOpen: _openSession,
       ),
-      body: IndexedStack(
-        index: _page,
-        children: [
-          _ChatLanding(
-            onMenu: () => _scaffold.currentState?.openDrawer(),
-            onNew: () => _newChat(),
-            onStarter: (p) => _newChat(prompt: p),
-            onOpen: _openSession,
-          ),
-        ],
+      floatingActionButton: FloatingActionButton(
+        onPressed: () => _newChat(),
+        tooltip: 'New task',
+        child: const Icon(Icons.add_comment_rounded, size: 23),
       ),
-    );
-  }
-}
-
-/// Landing view shown when no conversation is open: a warm greeting, a few
-/// starting points (Manus-style) and a compact list of recent threads.
-class _ChatLanding extends StatelessWidget {
-  const _ChatLanding({
-    required this.onMenu,
-    required this.onNew,
-    required this.onStarter,
-    required this.onOpen,
-  });
-  final VoidCallback onMenu;
-  final VoidCallback onNew;
-  final void Function(String prompt) onStarter;
-  final void Function(SessionSummary) onOpen;
-
-  @override
-  Widget build(BuildContext context) {
-    final state = context.watch<AppState>();
-    final recent = state.sessions.take(4).toList();
-    return Container(
-      decoration: const BoxDecoration(gradient: Palette.heroGlow),
-      child: SafeArea(
+      body: SafeArea(
         child: Column(
           children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(6, 6, 6, 2),
-              child: Row(
-                children: [
-                  IconButton(
-                    onPressed: onMenu,
-                    icon: const Icon(Icons.menu_rounded),
-                    tooltip: 'Conversations',
-                  ),
-                  const Spacer(),
-                  const BrandWordmark(fontSize: 15),
-                  const Spacer(),
-                  IconButton(
-                    onPressed:
-                        () => Navigator.of(context).pushNamed('/settings'),
-                    icon: const Icon(Icons.settings_outlined),
-                    tooltip: 'Settings',
-                  ),
-                ],
-              ),
+            _WorkspaceBar(
+              tab: _tab,
+              onTab: (t) => setState(() => _tab = t),
+              onMenu: () => _scaffold.currentState?.openDrawer(),
+              onSearch: () => _scaffold.currentState?.openDrawer(),
             ),
             Expanded(
-              child: ListView(
-                padding: const EdgeInsets.fromLTRB(20, 6, 20, 28),
+              child: IndexedStack(
+                index: _tab,
                 children: [
-                  const SizedBox(height: 14),
-                  const Center(child: BrandMark(size: 84)),
-                  const SizedBox(height: 26),
-                  Center(
-                    child: Text(
-                      'Hi ${state.greetingName}',
-                      style: const TextStyle(
-                        fontSize: 25,
-                        fontWeight: FontWeight.w800,
-                        color: Palette.textPrimary,
-                      ),
-                    ),
+                  _TasksView(
+                    state: state,
+                    controller: _recentScroll,
+                    onOpen: _openSession,
+                    onNew: () => _newChat(),
                   ),
-                  const SizedBox(height: 8),
-                  const Center(
-                    child: Text(
-                      'What would you like me to work on?',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        color: Palette.textTertiary,
-                        fontSize: 14.5,
-                      ),
-                    ),
+                  _AgentView(
+                    state: state,
+                    onStarter: (p) => _newChat(prompt: p),
                   ),
-                  const SizedBox(height: 26),
-                  FilledButton.icon(
-                    onPressed: onNew,
-                    icon: const Icon(Icons.add_comment_outlined, size: 19),
-                    label: const Text('Start a new chat'),
-                    style: FilledButton.styleFrom(
-                      minimumSize: const Size.fromHeight(50),
-                    ),
-                  ),
-                  const SizedBox(height: 28),
-                  const _SectionLabel('Try asking for'),
-                  const SizedBox(height: 10),
-                  for (final p in starterPrompts)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 9),
-                      child: _StarterCard(
-                        prompt: p,
-                        onTap: () => onStarter(p.prompt),
-                      ),
-                    ),
-                  if (recent.isNotEmpty) ...[
-                    const SizedBox(height: 24),
-                    const _SectionLabel('Recent'),
-                    const SizedBox(height: 8),
-                    for (final s in recent)
-                      _RecentRow(session: s, onTap: onOpen),
-                  ],
                 ],
               ),
             ),
@@ -181,19 +105,436 @@ class _ChatLanding extends StatelessWidget {
   }
 }
 
-class _SectionLabel extends StatelessWidget {
-  const _SectionLabel(this.text);
-  final String text;
+/// Top bar: account avatar, segmented Tasks/Agent switch, search.
+class _WorkspaceBar extends StatelessWidget {
+  const _WorkspaceBar({
+    required this.tab,
+    required this.onTab,
+    required this.onMenu,
+    required this.onSearch,
+  });
+  final int tab;
+  final ValueChanged<int> onTab;
+  final VoidCallback onMenu;
+  final VoidCallback onSearch;
 
   @override
   Widget build(BuildContext context) {
-    return Text(
-      text.toUpperCase(),
-      style: const TextStyle(
-        color: Palette.textTertiary,
-        fontSize: 11.5,
-        fontWeight: FontWeight.w700,
-        letterSpacing: 1.0,
+    final state = context.watch<AppState>();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+      child: Row(
+        children: [
+          // Account avatar doubles as the history drawer handle.
+          InkWell(
+            onTap: onMenu,
+            borderRadius: BorderRadius.circular(20),
+            child: Padding(
+              padding: const EdgeInsets.all(4),
+              child: ChatAvatar(
+                isAssistant: false,
+                initial: state.greetingName,
+                size: 30,
+              ),
+            ),
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Center(
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Palette.bg2,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Palette.borderSoft),
+                ),
+                padding: const EdgeInsets.all(3),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _SegTab(
+                      label: 'Tasks',
+                      selected: tab == 0,
+                      onTap: () => onTab(0),
+                    ),
+                    _SegTab(
+                      label: 'Agent',
+                      selected: tab == 1,
+                      onTap: () => onTab(1),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 6),
+          IconButton(
+            onPressed: onSearch,
+            icon: const Icon(Icons.search_rounded, size: 21),
+            tooltip: 'Search conversations',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SegTab extends StatelessWidget {
+  const _SegTab({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      behavior: HitTestBehavior.opaque,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        curve: Curves.easeOut,
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 7),
+        decoration: BoxDecoration(
+          color: selected ? Palette.bg4 : Colors.transparent,
+          borderRadius: BorderRadius.circular(9),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 13.5,
+            fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+            color: selected ? Palette.textPrimary : Palette.textTertiary,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Tasks tab: quick-action tiles plus the recent-work feed.
+class _TasksView extends StatelessWidget {
+  const _TasksView({
+    required this.state,
+    required this.controller,
+    required this.onOpen,
+    required this.onNew,
+  });
+  final AppState state;
+  final ScrollController controller;
+  final void Function(SessionSummary) onOpen;
+  final VoidCallback onNew;
+
+  @override
+  Widget build(BuildContext context) {
+    final sessions = state.sessions;
+    return RefreshIndicator(
+      onRefresh: () => state.loadSessions(),
+      color: Palette.accent,
+      backgroundColor: Palette.bg2,
+      child: CustomScrollView(
+        controller: controller,
+        slivers: [
+          SliverPadding(
+            padding: const EdgeInsets.fromLTRB(12, 2, 12, 4),
+            sliver: SliverToBoxAdapter(
+              child: Row(
+                children: [
+                  Expanded(
+                    child: _QuickTile(
+                      icon: Icons.workspace_premium_outlined,
+                      label: 'Upgrade',
+                      onTap: () => Navigator.of(context).pushNamed('/settings'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _QuickTile(
+                      icon: Icons.view_kanban_outlined,
+                      label: 'Projects',
+                      onTap: onNew,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _QuickTile(
+                      icon: Icons.menu_book_outlined,
+                      label: 'Library',
+                      onTap: () => Navigator.of(context).pushNamed('/settings'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          SliverPadding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
+            sliver: SliverToBoxAdapter(
+              child: Row(
+                children: [
+                  const Text(
+                    'RECENT',
+                    style: TextStyle(
+                      color: Palette.textTertiary,
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 1.0,
+                    ),
+                  ),
+                  const Spacer(),
+                  if (state.sessionsLoading)
+                    const SizedBox(
+                      width: 13,
+                      height: 13,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 1.8,
+                        color: Palette.textTertiary,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          if (sessions.isEmpty)
+            SliverFillRemaining(
+              hasScrollBody: false,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 34),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const BrandMark(size: 62),
+                    const SizedBox(height: 18),
+                    Text(
+                      'Hi ${state.greetingName}',
+                      style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.w800,
+                        color: Palette.textPrimary,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'No tasks yet. Start one and it keeps running\n'
+                      'in the cloud even if you close the app.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: Palette.textTertiary,
+                        fontSize: 13.5,
+                        height: 1.5,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            )
+          else
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(10, 0, 10, 96),
+              sliver: SliverList.builder(
+                itemCount: sessions.length,
+                itemBuilder:
+                    (_, i) => _TaskRow(
+                      key: ValueKey(sessions[i].key),
+                      session: sessions[i],
+                      onTap: () => onOpen(sessions[i]),
+                    ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Agent tab: the entry point for a fresh task, with starter prompts.
+class _AgentView extends StatelessWidget {
+  const _AgentView({required this.state, required this.onStarter});
+  final AppState state;
+  final void Function(String prompt) onStarter;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(18, 6, 18, 96),
+      children: [
+        const SizedBox(height: 8),
+        const Center(child: BrandMark(size: 76)),
+        const SizedBox(height: 22),
+        Center(
+          child: Text(
+            'Hi ${state.greetingName}',
+            style: const TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.w800,
+              color: Palette.textPrimary,
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        const Center(
+          child: Text(
+            'Assign a task. It runs in the cloud and keeps going\n'
+            'even when this app is closed.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Palette.textTertiary,
+              fontSize: 14,
+              height: 1.5,
+            ),
+          ),
+        ),
+        const SizedBox(height: 24),
+        FilledButton.icon(
+          onPressed: () => onStarter(''),
+          icon: const Icon(Icons.bolt_rounded, size: 19),
+          label: const Text('Start a new task'),
+          style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(50)),
+        ),
+        const SizedBox(height: 26),
+        const Text(
+          'TRY ASKING FOR',
+          style: TextStyle(
+            color: Palette.textTertiary,
+            fontSize: 11.5,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 1.0,
+          ),
+        ),
+        const SizedBox(height: 10),
+        for (final p in starterPrompts)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 9),
+            child: _StarterCard(
+              prompt: p,
+              onTap: () => onStarter(p.prompt),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _QuickTile extends StatelessWidget {
+  const _QuickTile({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Palette.bg2,
+      borderRadius: BorderRadius.circular(14),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 14),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: Palette.borderSoft),
+          ),
+          child: Column(
+            children: [
+              Icon(icon, size: 20, color: Palette.accentSoft),
+              const SizedBox(height: 7),
+              Text(
+                label,
+                style: const TextStyle(
+                  color: Palette.textSecondary,
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// One row in the recent-work feed. Rows are two-line (title + preview) and
+/// show relative recency, the way the reference workspace does.
+class _TaskRow extends StatelessWidget {
+  const _TaskRow({super.key, required this.session, required this.onTap});
+  final SessionSummary session;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 2),
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(12),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 11, 12, 11),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Padding(
+                  padding: EdgeInsets.only(top: 2),
+                  child: Icon(
+                    Icons.chat_bubble_outline_rounded,
+                    size: 16,
+                    color: Palette.textTertiary,
+                  ),
+                ),
+                const SizedBox(width: 11),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        session.displayTitle,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 14.5,
+                          height: 1.3,
+                          color: Palette.textPrimary,
+                        ),
+                      ),
+                      if (session.preview.isNotEmpty) ...[
+                        const SizedBox(height: 3),
+                        Text(
+                          session.preview,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Palette.textTertiary,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                if (session.updatedAt != null) ...[
+                  const SizedBox(width: 8),
+                  Text(
+                    relativeDayLabel(session.updatedAt!),
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: Palette.textTertiary,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -267,76 +608,6 @@ class _StarterCard extends StatelessWidget {
                 color: Palette.textTertiary,
               ),
             ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _RecentRow extends StatelessWidget {
-  const _RecentRow({required this.session, required this.onTap});
-  final SessionSummary session;
-  final void Function(SessionSummary) onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: Material(
-        color: Palette.bg2,
-        borderRadius: BorderRadius.circular(12),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(12),
-          onTap: () => onTap(session),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            child: Row(
-              children: [
-                const Icon(
-                  Icons.chat_bubble_outline_rounded,
-                  size: 17,
-                  color: Palette.textTertiary,
-                ),
-                const SizedBox(width: 11),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        session.displayTitle,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 14,
-                          color: Palette.textPrimary,
-                        ),
-                      ),
-                      if (session.preview.isNotEmpty) ...[
-                        const SizedBox(height: 2),
-                        Text(
-                          session.preview,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            fontSize: 12,
-                            color: Palette.textTertiary,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-                if (session.updatedAt != null)
-                  Text(
-                    relativeDayLabel(session.updatedAt!),
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: Palette.textTertiary,
-                    ),
-                  ),
-              ],
-            ),
           ),
         ),
       ),
@@ -501,7 +772,7 @@ class _SessionsDrawerState extends State<_SessionsDrawer> {
                 child: FilledButton.icon(
                   onPressed: widget.onNew,
                   icon: const Icon(Icons.add_rounded, size: 19),
-                  label: const Text('New chat'),
+                  label: const Text('New task'),
                   style: FilledButton.styleFrom(
                     minimumSize: const Size.fromHeight(46),
                   ),
@@ -580,6 +851,7 @@ class _SessionsDrawerState extends State<_SessionsDrawer> {
                               ),
                               for (final s in g.rows)
                                 _SessionTile(
+                                  key: ValueKey(s.key),
                                   session: s,
                                   onTap: () => widget.onOpen(s),
                                   onDelete: () => _delete(s),
@@ -625,6 +897,7 @@ class _SessionsDrawerState extends State<_SessionsDrawer> {
 /// One conversation row: title, preview, recency and a delete action.
 class _SessionTile extends StatelessWidget {
   const _SessionTile({
+    super.key,
     required this.session,
     required this.onTap,
     required this.onDelete,

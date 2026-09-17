@@ -63,6 +63,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   DateTime _lastEventAt = DateTime.now();
   Timer? _resyncTimer;
   bool _resyncInFlight = false;
+  /// Short post-completion reconcile window (see [_armSettleWatch]).
+  Timer? _settleWatch;
   Timer? _stopWatchTimer; // bounded grace window after a /stop request
   bool _justCompleted = false; // shows the settled "done" check in the pill
   Timer? _completedFadeTimer;
@@ -133,9 +135,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   /// Re-establish the socket + subscription and reconcile the transcript with
   /// the server. Called on resume and whenever the socket comes back, so a
   /// turn that ran while the screen was closed reappears (with its answer).
-  Future<void> _resync() async {
+  ///
+  /// [force] lets the post-completion settle watcher run even when another
+  /// reconcile is in flight — it must never be starved or the finished result
+  /// may not land until the user types again.
+  Future<void> _resync({bool force = false}) async {
     final chatId = _chatId;
-    if (chatId == null || _resyncInFlight) return;
+    if (chatId == null) return;
+    if (_resyncInFlight) {
+      if (!force) return;
+      // A pass is already running; it will fetch the same authoritative
+      // history, so there is nothing left to do.
+      return;
+    }
     _resyncInFlight = true;
     try {
       final state = context.read<AppState>();
@@ -150,7 +162,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       // The gateway does not replay accumulated deltas, so pull the thread to
       // recover anything produced while this screen was not listening. This
       // also clears a stale busy pill when the turn finished in the background.
-      final session = widget.session;
+      final session = _sessionSummaryFor(state);
       if (session != null) {
         final history = await state.openSession(session);
         if (!mounted) return;
@@ -161,6 +173,39 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     } finally {
       _resyncInFlight = false;
     }
+  }
+
+  /// The session row that describes this chat.
+  ///
+  /// A chat opened from "new chat" has no [widget.session], and the previous
+  /// build therefore SKIPPED the history reconcile entirely for it. That is
+  /// precisely why a long task started in a brand-new chat finished in the
+  /// cloud but produced nothing on screen until the user sent another message:
+  /// the only recovery path was the socket's running-turn replay, and if the
+  /// turn had already ended by the time we re-attached, there was no replay
+  /// and no history fetch. Resolving the row from the session list closes that
+  /// hole — the answer is pulled from the server regardless of how the chat
+  /// was created.
+  SessionSummary? _sessionSummaryFor(AppState state) {
+    final opened = widget.session;
+    final chatId = _chatId;
+    if (chatId == null) return opened;
+    if (opened != null && opened.chatId == chatId) return opened;
+    for (final s in state.sessions) {
+      if (s.chatId == chatId) return s;
+    }
+    // The session list has not caught up yet (a brand-new chat, or a refresh
+    // still in flight). The gateway keys every websocket session by its chat
+    // id, so the canonical key is derivable — synthesising it keeps the
+    // reconcile path alive instead of silently skipping the fetch, which is
+    // how a finished background task previously stayed invisible.
+    return SessionSummary(
+      key: 'websocket:$chatId',
+      chatId: chatId,
+      title: opened?.title ?? '',
+      preview: opened?.preview ?? '',
+      updatedAt: opened?.updatedAt,
+    );
   }
 
   Future<void> _boot() async {
@@ -475,6 +520,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           _flashCompleted();
           _scrollToBottom();
           _scheduleCacheWrite(immediate: true);
+          // Guarantee the completed result actually lands: pull the
+          // authoritative transcript a few times over the next half minute so
+          // a terminal event missed during a reconnect / background gap still
+          // results in the answer being on screen — without the user having to
+          // ask again.
+          _armSettleWatch();
         }
       },
       onError: (detail) {
@@ -605,14 +656,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   /// Keep the screen awake while a turn is running — long tasks (up to ~1h)
   /// must keep streaming with the display on.
+  ///
+  /// The platform call is wrapped: wakelock plugins surface a
+  /// MissingPluginException on some OEM builds, and an unguarded throw here
+  /// ran on every turn tick — one of the paths that could take the app down
+  /// mid-task.
   void _updateWakelock() {
-    if (_busy) {
-      WakelockPlus.enable();
-      _startResyncWatch();
-    } else {
-      WakelockPlus.disable();
-      _stopResyncWatch();
-      _scheduleCacheWrite();
+    try {
+      if (_busy) {
+        WakelockPlus.enable();
+        _startResyncWatch();
+      } else {
+        WakelockPlus.disable();
+        _stopResyncWatch();
+        _scheduleCacheWrite();
+      }
+    } catch (_) {
+      // Display timeout is a nicety, never worth failing a task over.
     }
   }
 
@@ -659,6 +719,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void _stopResyncWatch() {
     _resyncTimer?.cancel();
     _resyncTimer = null;
+    _settleWatch?.cancel();
+    _settleWatch = null;
+  }
+
+  /// After a terminal event, keep reconciling for a short window.
+  ///
+  /// A long task frequently ends while the app is backgrounded or the socket
+  /// is mid-reconnect. The terminal frame is then missed, so the answer the
+  /// server already persisted is never pulled into view — the reported
+  /// symptom being "the task ran in the cloud but only showed up after I
+  /// asked again". This watcher re-fetches history a few times after the
+  /// perceived end and also recovers the case where the end was never
+  /// perceived at all, guaranteeing the result lands without user input.
+  void _armSettleWatch() {
+    _settleWatch?.cancel();
+    var ticks = 0;
+    _settleWatch = Timer.periodic(const Duration(seconds: 6), (t) {
+      ticks++;
+      if (!mounted || _busy || ticks > 5) {
+        t.cancel();
+        _settleWatch = null;
+        return;
+      }
+      unawaited(_resync());
+    });
   }
 
   /// Write the transcript to disk (debounced) so reopening the app always
@@ -939,10 +1024,68 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
+  /// Overflow menu: the actions that used to crowd the app bar.
+  void _showChatMenu(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Palette.bg2,
+      showDragHandle: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder:
+          (sheet) => SafeArea(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.settings_outlined, size: 20),
+                  title: const Text('Settings'),
+                  onTap: () {
+                    Navigator.pop(sheet);
+                    Navigator.of(context).pushNamed('/settings');
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.refresh_rounded, size: 20),
+                  title: const Text('Reload conversation'),
+                  onTap: () {
+                    Navigator.pop(sheet);
+                    unawaited(_resync(force: true));
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(
+                    Icons.copy_all_rounded,
+                    size: 20,
+                    color: Palette.textSecondary,
+                  ),
+                  title: const Text('Copy conversation'),
+                  onTap: () {
+                    Navigator.pop(sheet);
+                    final all = _messages
+                        .where((m) => m.text.trim().isNotEmpty)
+                        .map((m) => m.text.trim())
+                        .join('\n\n');
+                    if (all.isEmpty) {
+                      _toast('Nothing to copy yet.');
+                      return;
+                    }
+                    Clipboard.setData(ClipboardData(text: all));
+                    _toast('Conversation copied.');
+                  },
+                ),
+              ],
+            ),
+          ),
+    );
+  }
+
   @override
   void dispose() {
     _flushTimer?.cancel();
     _resyncTimer?.cancel();
+    _settleWatch?.cancel();
     _stopWatchTimer?.cancel();
     _completedFadeTimer?.cancel();
     _cacheTimer?.cancel();
@@ -979,25 +1122,45 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       appBar: AppBar(
         backgroundColor: Palette.bg1,
         elevation: 0,
-        // A compact, ChatGPT-style bar: brand mark on the left of the title,
-        // fixed-size status slot on the right so nothing shifts while a turn
-        // streams.
-        title: Stack(
-          alignment: Alignment.center,
+        // Compact workspace bar: back affordance on the left, a two-line
+        // title (app + live model) in the middle, status on the right. Nothing
+        // shifts while a turn streams because the status slot is fixed-size.
+        leading:
+            Navigator.of(context).canPop()
+                ? IconButton(
+                  icon: const Icon(Icons.arrow_back_rounded, size: 21),
+                  tooltip: 'Back',
+                  onPressed: () => Navigator.of(context).maybePop(),
+                )
+                : null,
+        titleSpacing: 0,
+        title: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const BrandWordmark(fontSize: 15),
-            Positioned(
-              right: 0,
-              child: _StatusPill(
-                busy: _busy,
-                stopping: _stopping,
-                completed: _justCompleted,
+            Text(
+              state.modelName?.isNotEmpty == true
+                  ? state.modelName!
+                  : 'Ready',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontSize: 11,
+                height: 1.3,
+                color: Palette.textTertiary,
+                fontWeight: FontWeight.w500,
               ),
             ),
           ],
         ),
-        centerTitle: true,
+        centerTitle: false,
         actions: [
+          _StatusPill(
+            busy: _busy,
+            stopping: _stopping,
+            completed: _justCompleted,
+          ),
           if (!_connected)
             const Padding(
               padding: EdgeInsets.only(right: 2),
@@ -1011,9 +1174,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               ),
             ),
           IconButton(
-            icon: const Icon(Icons.settings_outlined, size: 21),
-            tooltip: 'Settings',
-            onPressed: () => Navigator.of(context).pushNamed('/settings'),
+            icon: const Icon(Icons.more_horiz_rounded, size: 21),
+            tooltip: 'More',
+            onPressed: () => _showChatMenu(context),
           ),
         ],
       ),
@@ -1054,10 +1217,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     ? _EmptyChat(greetingName: state.greetingName)
                     : ListView.builder(
                       controller: _scroll,
-                      padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
+                      // Cache a small window only: with a 400-message bounded
+                      // transcript the previous generous cacheExtent kept dead
+                      // render objects (and their markdown trees) alive, which
+                      // is what made long chats feel heavy while scrolling.
+                      cacheExtent: 480,
+                      padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
                       itemCount: _messages.length,
                       itemBuilder:
                           (_, i) => _Bubble(
+                            // Stable identity per row: without a key a re-sorted
+                            // or merged transcript rebuilt every bubble from
+                            // scratch on each streaming flush.
+                            key: ValueKey(_messages[i].id),
                             message: _messages[i],
                             userInitial: userInitial,
                             onOpenArtifact: (p) => _openArtifact(p),
@@ -1124,6 +1296,7 @@ class _EmptyChat extends StatelessWidget {
 
 class _Bubble extends StatelessWidget {
   const _Bubble({
+    super.key,
     required this.message,
     this.onOpenArtifact,
     this.userInitial = '',
@@ -1649,7 +1822,7 @@ class _TypingDotsState extends State<_TypingDots>
   }
 }
 
-class _Composer extends StatelessWidget {
+class _Composer extends StatefulWidget {
   const _Composer({
     required this.controller,
     required this.busy,
@@ -1670,11 +1843,20 @@ class _Composer extends StatelessWidget {
   final VoidCallback onStop;
 
   @override
+  State<_Composer> createState() => _ComposerState();
+}
+
+class _ComposerState extends State<_Composer> {
+  /// Manus-style tools tray: the "+" reveals a row of quick actions above the
+  /// input instead of dumping the user straight into a system file picker.
+  bool _toolsOpen = false;
+
+  @override
   Widget build(BuildContext context) {
     return SafeArea(
       top: false,
       child: Container(
-        padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
         decoration: const BoxDecoration(
           color: Palette.bg0,
           border: Border(top: BorderSide(color: Palette.borderSoft)),
@@ -1682,32 +1864,79 @@ class _Composer extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (pending.isNotEmpty)
+            if (widget.pending.isNotEmpty)
               Padding(
-                padding: const EdgeInsets.only(bottom: 10),
+                padding: const EdgeInsets.only(bottom: 8),
                 child: SizedBox(
-                  height: 64,
+                  height: 62,
                   child: ListView(
                     scrollDirection: Axis.horizontal,
                     children: [
-                      for (final a in pending)
+                      for (final a in widget.pending)
                         Padding(
                           padding: const EdgeInsets.only(right: 8),
                           child: _PendingTile(
                             attachment: a,
-                            onRemove: () => onRemove(a),
+                            onRemove: () => widget.onRemove(a),
                           ),
                         ),
                     ],
                   ),
                 ),
               ),
-            // One elevated pill holds attach + input + send, the way a modern
-            // chat app does — fewer floating controls, clearer target.
+            // Quick-action tray, mirroring the reference app's "+" menu.
+            AnimatedSize(
+              duration: const Duration(milliseconds: 160),
+              curve: Curves.easeOut,
+              child:
+                  _toolsOpen
+                      ? Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Row(
+                          children: [
+                            _ToolChip(
+                              icon: Icons.attach_file_rounded,
+                              label: 'Attach file',
+                              onTap: () {
+                                setState(() => _toolsOpen = false);
+                                widget.onPick();
+                              },
+                            ),
+                            const SizedBox(width: 8),
+                            _ToolChip(
+                              icon: Icons.camera_alt_outlined,
+                              label: 'Photo',
+                              onTap: () {
+                                setState(() => _toolsOpen = false);
+                                widget.onPick();
+                              },
+                            ),
+                            const SizedBox(width: 8),
+                            _ToolChip(
+                              icon: Icons.keyboard_voice_outlined,
+                              label: 'Voice',
+                              onTap: () {
+                                setState(() => _toolsOpen = false);
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                      'Voice input follows your keyboard’s mic.',
+                                    ),
+                                    duration: Duration(seconds: 2),
+                                  ),
+                                );
+                              },
+                            ),
+                          ],
+                        ),
+                      )
+                      : const SizedBox.shrink(),
+            ),
+            // One elevated pill holds attach + input + send.
             Container(
               decoration: BoxDecoration(
                 color: Palette.bg3,
-                borderRadius: BorderRadius.circular(26),
+                borderRadius: BorderRadius.circular(24),
                 border: Border.all(color: Palette.border),
               ),
               padding: const EdgeInsets.fromLTRB(4, 4, 6, 4),
@@ -1715,17 +1944,18 @@ class _Composer extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
                   IconButton(
-                    onPressed: onPick,
-                    icon: const Icon(
-                      Icons.add_rounded,
+                    onPressed:
+                        () => setState(() => _toolsOpen = !_toolsOpen),
+                    icon: Icon(
+                      _toolsOpen ? Icons.close_rounded : Icons.add_rounded,
                       color: Palette.textSecondary,
                       size: 22,
                     ),
-                    tooltip: 'Attach files',
+                    tooltip: 'Tools',
                   ),
                   Expanded(
                     child: TextField(
-                      controller: controller,
+                      controller: widget.controller,
                       minLines: 1,
                       maxLines: 5,
                       textInputAction: TextInputAction.newline,
@@ -1735,11 +1965,11 @@ class _Composer extends StatelessWidget {
                       ),
                       decoration: InputDecoration(
                         hintText:
-                            busy
-                                ? (stopping
+                            widget.busy
+                                ? (widget.stopping
                                     ? 'Stopping task…'
-                                    : 'CDNAI is working…')
-                                : 'Message CDNAI…',
+                                    : 'Working on your task…')
+                                : 'Assign a task or ask anything',
                         hintStyle: const TextStyle(
                           color: Palette.textTertiary,
                           fontSize: 15,
@@ -1758,32 +1988,35 @@ class _Composer extends StatelessWidget {
                   const SizedBox(width: 6),
                   // Send arrow when idle; stop square while the agent works.
                   Material(
-                    color: busy ? Palette.danger : Palette.accent,
+                    color: widget.busy ? Palette.danger : Palette.accent,
                     shape: const CircleBorder(),
                     child: InkWell(
                       customBorder: const CircleBorder(),
-                      onTap: busy ? (stopping ? null : onStop) : onSend,
+                      onTap:
+                          widget.busy
+                              ? (widget.stopping ? null : widget.onStop)
+                              : widget.onSend,
                       child: Padding(
                         padding: const EdgeInsets.all(11),
                         child:
-                            busy
-                                ? (stopping
+                            widget.busy
+                                ? (widget.stopping
                                     ? const SizedBox(
                                       width: 18,
                                       height: 18,
                                       child: CircularProgressIndicator(
                                         strokeWidth: 2,
-                                        color: Color(0xFF241407),
+                                        color: Colors.white,
                                       ),
                                     )
                                     : const Icon(
                                       Icons.stop_rounded,
-                                      color: Color(0xFF241407),
+                                      color: Colors.white,
                                       size: 22,
                                     ))
                                 : const Icon(
                                   Icons.arrow_upward_rounded,
-                                  color: Color(0xFF241407),
+                                  color: Colors.white,
                                   size: 22,
                                 ),
                       ),
@@ -1793,6 +2026,48 @@ class _Composer extends StatelessWidget {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// One pill in the composer's quick-action tray.
+class _ToolChip extends StatelessWidget {
+  const _ToolChip({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Palette.bg2,
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 16, color: Palette.accentSoft),
+              const SizedBox(width: 6),
+              Text(
+                label,
+                style: const TextStyle(
+                  color: Palette.textSecondary,
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

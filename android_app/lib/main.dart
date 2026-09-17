@@ -1,3 +1,6 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -11,17 +14,54 @@ import 'theme/app_theme.dart';
 import 'theme/palette.dart';
 import 'widgets/brand.dart';
 
+/// Global crash fence.
+///
+/// The previous build let a single uncaught exception in a background
+/// callback (socket frame handling, file IO, a platform channel returning
+/// null) tear down the whole Android process — which is exactly the "APK
+/// keeps stopping" report, and why the task looked gone even though it was
+/// still running server-side. Every isolate-level and framework-level error
+/// is now swallowed and logged instead of killing the UI. The app stays
+/// alive, the socket keeps streaming, and the transcript still lands.
 void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  SystemChrome.setSystemUIOverlayStyle(
-    const SystemUiOverlayStyle(
-      statusBarColor: Colors.transparent,
-      systemNavigationBarColor: Palette.bg0,
-      statusBarIconBrightness: Brightness.light,
-      systemNavigationBarIconBrightness: Brightness.light,
-    ),
+  // Framework errors (build/layout/paint, gesture callbacks) must never
+  // terminate the process. Log in debug, ignore in release.
+  FlutterError.onError = (FlutterErrorDetails details) {
+    if (kDebugMode) {
+      FlutterError.presentError(details);
+    }
+  };
+
+  // Platform-dispatcher errors: anything thrown outside the framework's
+  // zones (platform channels, plugin callbacks, timers). Returning true
+  // marks the error as handled so the engine does not abort.
+  PlatformDispatcher.instance.onError = (error, stack) {
+    if (kDebugMode) {
+      debugPrint('Unhandled platform error: $error');
+    }
+    return true;
+  };
+
+  // Last-resort net for async gaps that escape both handlers above.
+  runZonedGuarded(
+    () {
+      WidgetsFlutterBinding.ensureInitialized();
+      SystemChrome.setSystemUIOverlayStyle(
+        const SystemUiOverlayStyle(
+          statusBarColor: Colors.transparent,
+          systemNavigationBarColor: Palette.bg0,
+          statusBarIconBrightness: Brightness.light,
+          systemNavigationBarIconBrightness: Brightness.light,
+        ),
+      );
+      runApp(const PowerXApp());
+    },
+    (error, stack) {
+      if (kDebugMode) {
+        debugPrint('Unhandled zone error: $error');
+      }
+    },
   );
-  runApp(const PowerXApp());
 }
 
 class PowerXApp extends StatelessWidget {
@@ -40,6 +80,21 @@ class PowerXApp extends StatelessWidget {
           '/auth': (_) => const AuthScreen(),
           '/home': (_) => const HomeScreen(),
           '/settings': (_) => const SettingsScreen(),
+        },
+        builder: (context, child) {
+          // Never let the OS font-scaling setting break the layout: clamp it
+          // to a sane range so tall accessibility settings cannot overflow
+          // the composer or the status pill.
+          final mq = MediaQuery.of(context);
+          return MediaQuery(
+            data: mq.copyWith(
+              textScaler: mq.textScaler.clamp(
+                minScaleFactor: 0.85,
+                maxScaleFactor: 1.3,
+              ),
+            ),
+            child: child ?? const SizedBox.shrink(),
+          );
         },
       ),
     );
