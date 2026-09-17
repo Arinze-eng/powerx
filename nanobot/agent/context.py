@@ -84,6 +84,9 @@ class ContextBuilder:
     _SKIPPABLE_DEFAULTS = {"AGENTS.md", "USER.md"}
     _RUNTIME_CONTEXT_TAG = RUNTIME_CONTEXT_TAG
     _MAX_RECENT_HISTORY = 50
+    #: How many remembered artifact links to surface in the system prompt. Kept
+    #: small deliberately: the goal is durable recall, not a link dump.
+    _DURABLE_ARTIFACT_LIMIT = 12
     _MAX_HISTORY_TOKENS = 8_000  # hard cap on recent history section size (tokens)
     _RUNTIME_CONTEXT_END = RUNTIME_CONTEXT_END
 
@@ -144,6 +147,14 @@ class ContextBuilder:
             memory = self.memory.read_memory()
             if memory and not self._is_template_content(memory, "memory/MEMORY.md"):
                 parts.append(f"# Memory\n\n## Long-term Memory\n{memory}")
+
+        # Durable artifact links: sandboxes are recycled and older context is
+        # dropped, but a delivered artifact's link is a tiny permanent fact. This
+        # band lets the agent answer "where is that APK?" instead of redoing the
+        # build because it lost the file.
+        durable_artifacts = self._build_durable_artifacts_section()
+        if durable_artifacts:
+            parts.append(durable_artifacts)
 
         active_skills = self.skills.get_always_skills()
         if active_skills:
@@ -225,6 +236,43 @@ class ContextBuilder:
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
         )
+
+    def _build_durable_artifacts_section(self) -> str:
+        """Render the persisted artifact-link index for the system prompt.
+
+        Only recent links are shown, and only text metadata is ever stored, so the
+        prompt stays small and the persistent disk does not fill up. Failure is
+        silent: this is a convenience band, never a hard dependency.
+        """
+        try:
+            from nanobot.utils.onlyfiles import artifact_memory
+
+            records = artifact_memory().search(limit=self._DURABLE_ARTIFACT_LIMIT)
+        except Exception:  # noqa: BLE001 - never break prompt building
+            return ""
+        if not records:
+            return ""
+
+        lines = [
+            "# Durable Artifact Links",
+            "",
+            "Links to artifacts delivered earlier. They are permanent and live on the "
+            "persistent disk, so when the user asks for a file again — even after the "
+            "sandbox was recycled or the file was lost — hand back the link below "
+            "instead of rebuilding it from scratch.",
+            "",
+        ]
+        for record in records:
+            name = str(record.get("name") or "artifact")
+            url = str(record.get("url") or "")
+            if not url:
+                continue
+            detail = str(record.get("description") or "").strip()
+            kind = str(record.get("kind") or "").strip()
+            meta = ", ".join(b for b in (kind, detail) if b)
+            suffix = f" — {meta}" if meta else ""
+            lines.append(f"- **{name}**: {url}{suffix}")
+        return "\n".join(lines) if len(lines) > 4 else ""
 
     @staticmethod
     def _build_sandbox_workspace_section(agent_workspace_path: str = "") -> str:

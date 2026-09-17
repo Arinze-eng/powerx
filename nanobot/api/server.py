@@ -11,11 +11,13 @@ import contextlib
 import hmac
 import json as _json
 import os
+import re
 import time
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 
+import aiohttp
 from aiohttp import web
 from loguru import logger
 
@@ -25,6 +27,7 @@ from nanobot.api.miniapp import register_miniapp_routes
 from nanobot.api.telegram_auth import miniapp_tokens
 from nanobot.config.paths import get_media_dir
 from nanobot.utils.helpers import safe_filename
+from nanobot.utils.onlyfiles import ONLYFILES_HOST, resolve_raw_url
 from nanobot.utils.media_decode import (
     MAX_FILE_SIZE,
 )
@@ -485,6 +488,59 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
+async def handle_permanent_download(request: web.Request) -> web.Response:
+    """GET /f/{file_id} — permanent link that downloads instead of viewing.
+
+    The onlyfiles *page* URL is permanent but serves an HTML viewer, while the
+    raw ``/dl/`` URL downloads but its token expires in ~2h. Storing either one
+    is therefore broken: pasting a stored link opens a web page instead of
+    downloading. This route is stable forever and resolves a fresh raw token at
+    request time, so a pasted link always downloads the bytes.
+
+    Unauthenticated by design (it is handed to end users) and restricted to
+    onlyfiles slug ids so it cannot be used as an open proxy.
+    """
+    file_id = (request.match_info.get("file_id") or "").strip().strip("/")
+    if not file_id or not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", file_id):
+        raise web.HTTPNotFound(text="unknown file")
+
+    page_url = f"https://{ONLYFILES_HOST}/{file_id}"
+    try:
+        raw_url = await resolve_raw_url(page_url)
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=60)
+        ) as session:
+            async with session.get(raw_url, headers={"User-Agent": "Mozilla/5.0"}) as upstream:
+                if upstream.status != 200:
+                    raise web.HTTPNotFound(text="file is no longer available")
+                body = await upstream.read()
+                filename = _gateway_filename(upstream, file_id)
+                return web.Response(
+                    body=body,
+                    content_type=upstream.headers.get("Content-Type", "application/octet-stream"),
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{filename}"',
+                        "Cache-Control": "private, max-age=300",
+                    },
+                )
+    except web.HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - never surface internals to end users
+        logger.warning("download gateway failed for {}: {}", file_id, exc)
+        raise web.HTTPBadGateway(text="could not fetch file") from None
+
+
+def _gateway_filename(upstream: Any, file_id: str) -> str:
+    """Pick a safe attachment filename from the upstream response."""
+    disposition = upstream.headers.get("Content-Disposition", "")
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^\";]+)"?', disposition)
+    if match:
+        candidate = Path(match.group(1).strip()).name
+        if candidate:
+            return candidate
+    return f"{file_id}.bin"
+
+
 async def handle_version(request: web.Request) -> web.Response:
     """GET /version — deployment identity + which zero-call cost layers are live.
 
@@ -572,7 +628,7 @@ def create_app(
         # browser's gofile.io result. Both only hand off an in-memory record.
         # /app serves the chat page; /app/token mints a short-lived bearer from
         # validated initData — neither carries the api_key itself.
-        if request.path in ("/health", "/version", "/upload", "/upload/complete", "/app", "/app/token", "/v1/api-docs"):
+        if request.path in ("/health", "/version", "/upload", "/upload/complete", "/app", "/app/token", "/v1/api-docs") or request.path.startswith("/f/"):
             return await handler(request)
         auth = request.headers.get("Authorization", "")
         supplied = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
@@ -607,6 +663,9 @@ def create_app(
     app.router.add_get("/v1/api-docs", handle_api_docs)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/version", handle_version)
+    # Permanent, unauthenticated artifact download link. Handed to end users, so
+    # it must work without an API key; the handler only proxies onlyfiles slugs.
+    app.router.add_get("/f/{file_id}", handle_permanent_download)
 
     # Telegram Mini App routes (large file upload via gofile.io).
     register_miniapp_routes(app)

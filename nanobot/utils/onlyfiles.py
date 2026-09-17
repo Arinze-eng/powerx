@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -64,6 +65,78 @@ _ONLYFILES_EXPIRY = 0
 
 class OnlyFilesError(RuntimeError):
     """Raised when onlyfiles.com cannot accept or describe a transfer."""
+
+
+#: onlyfiles rejects uploads whose filename stem is shorter than this with
+#: HTTP 422 ``ERROR_FILE_INVALID`` ("Invalid file name."). Verified live: a
+#: 1-char stem (``a.txt``, ``t.txt``) is rejected, a 2-char stem is accepted.
+_MIN_FILENAME_STEM = 2
+
+
+def safe_upload_filename(filename: str) -> str:
+    """Return a filename onlyfiles will accept.
+
+    The service rejects short stems with HTTP 422 (verified live: ``t.txt`` and
+    ``x.bin`` fail, ``ab.txt`` succeeds) and requires an extension. Artifacts
+    produced by the agent are frequently named by a one-letter variable, so
+    without this the upload fails and the user never receives a link. Never
+    raises; always returns a usable name.
+    """
+    raw = Path(str(filename or "")).name.strip().replace("\x00", "")
+    if not raw:
+        return "powerx-file.bin"
+    stem, dot, suffix = raw.rpartition(".")
+    if not dot:
+        # No extension at all: onlyfiles rejects it, so add a neutral one.
+        stem, suffix = raw, "bin"
+    if not suffix:
+        suffix = "bin"
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-.")
+    if len(cleaned) < _MIN_FILENAME_STEM:
+        cleaned = f"file-{cleaned}" if cleaned else "powerx-file"
+    return f"{cleaned}.{suffix}"
+
+
+def onlyfiles_file_id(url: str) -> str:
+    """Return the slug id for a page or ``/dl/`` onlyfiles URL (``''`` if none)."""
+    parsed = urlparse(str(url or "").strip())
+    if parsed.netloc != ONLYFILES_HOST:
+        return ""
+    parts = [p for p in parsed.path.split("/") if p]
+    if not parts:
+        return ""
+    # /dl/<ts.nonce>/<id>/<file> -> the id is the third segment.
+    if parts[0] == "dl":
+        return parts[2] if len(parts) >= 3 else ""
+    return parts[0]
+
+
+def gateway_base_url() -> str:
+    """Public base URL of this gateway, used to build permanent links."""
+    for var in ("POWERX_PUBLIC_URL", "NANOBOT_API_PUBLIC_URL", "API_SERVER_URL"):
+        value = (os.environ.get(var) or "").strip().rstrip("/")
+        if value:
+            return value
+    return ""
+
+
+def permanent_download_url(page_url: str) -> str:
+    """Return a stable link that downloads the bytes instead of opening a page.
+
+    The policy is configured at the gateway (`/f/<id>` redirects to a
+    freshly-minted raw ``/dl/`` token), so this link never expires. When no
+    gateway is configured the page URL is returned, since it is still the
+    permanent, shareable form.
+
+    This is the fix for "pasting the link opens an HTML viewer": the page URL is
+    permanent but serves a viewer, and the raw ``/dl/`` URL downloads but expires
+    in ~2h, so neither can be stored. The gateway is both.
+    """
+    base = gateway_base_url()
+    file_id = onlyfiles_file_id(page_url)
+    if base and file_id:
+        return f"{base}/f/{file_id}"
+    return page_url
 
 
 def _public_url(value: Any) -> str:
@@ -151,7 +224,7 @@ async def upload_bytes(
         raise OnlyFilesError("cannot upload an empty file")
     if len(data) > _MAX_UPLOAD_BYTES:
         raise OnlyFilesError("file exceeds the onlyfiles transfer limit")
-    safe_filename = Path(filename).name or "upload.bin"
+    safe_filename = safe_upload_filename(filename)
     timeout = aiohttp.ClientTimeout(total=max(10, min(int(timeout_seconds), 180)))
     form = aiohttp.FormData()
     form.add_field(
@@ -183,8 +256,13 @@ async def upload_bytes(
     page_url = _extract_page_url(payload)
     # Mint a raw /dl/ link now so an immediate hand-off downloads on tap. The
     # token expires, so a link delivered later must be re-resolved with
-    # ``resolve_raw_url`` rather than persisting this raw form.
-    return {"url": page_url, "download_url": await resolve_raw_url(page_url)}
+    # ``resolve_raw_url``. ``url`` is the permanent link; when a gateway is
+    # configured it is the always-downloads form rather than the HTML viewer.
+    return {
+        "url": permanent_download_url(page_url),
+        "page_url": page_url,
+        "download_url": await resolve_raw_url(page_url),
+    }
 
 
 async def file_info(file_id: str, *, timeout_seconds: int = 20) -> dict[str, Any] | None:
@@ -254,7 +332,8 @@ class UploadedUrlMemory:
     """
 
     def __init__(self, root: Path | None = None) -> None:
-        self._path = (root or get_persistent_data_dir("onlyfiles")) / "uploads.json"
+        base = Path(root) if root is not None else get_persistent_data_dir("onlyfiles")
+        self._path = base / "uploads.json"
         self._data: dict[str, dict[str, Any]] = {}
         self._loaded = False
 
@@ -333,9 +412,10 @@ async def upload_and_remember(
         logger.info("onlyfiles: reusing stored URL for {}", source.name)
         # The page URL is permanent but its raw /dl/ token expires, so mint a
         # fresh download link rather than handing back a stale one.
-        stored_page = remembered.get("url") or ""
+        stored_page = remembered.get("page_url") or remembered.get("url") or ""
         return {
-            "url": stored_page,
+            "url": permanent_download_url(stored_page) or stored_page,
+            "page_url": stored_page,
             "download_url": await resolve_raw_url(stored_page),
         }
     result = await upload_path(
@@ -345,3 +425,105 @@ async def upload_and_remember(
     )
     memory.remember(data, source.name, result)
     return result
+
+
+class ArtifactLinkMemory:
+    """Persistent, named index of delivered artifact links.
+
+    This is the durable "where did that file go?" memory. Sandboxes are torn
+    down and the agent's context is small, but the *link* to an artifact is a
+    tiny, permanent fact — uploads use ``expire=0`` and the gateway link stays
+    valid, so it can be recalled forever.
+
+    Only a short record per artifact is stored (name, description, URLs, size,
+    timestamp) — never file bytes — so the persistent disk does not fill up.
+    """
+
+    #: Records kept before the oldest are pruned; each record is ~300 bytes, so
+    #: this caps the store at roughly 1.5 MB.
+    MAX_RECORDS = 5000
+
+    def __init__(self, root: Path | None = None) -> None:
+        base = Path(root) if root is not None else get_persistent_data_dir("artifacts")
+        self._path = base / "links.json"
+        self._loaded = False
+        self._records: list[dict[str, Any]] = []
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            if self._path.is_file():
+                payload = json.loads(self._path.read_text(encoding="utf-8"))
+                if isinstance(payload, list):
+                    self._records = [r for r in payload if isinstance(r, dict)]
+                elif isinstance(payload, dict) and isinstance(payload.get("records"), list):
+                    self._records = [r for r in payload["records"] if isinstance(r, dict)]
+        except (OSError, ValueError, TypeError):
+            self._records = []
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            if len(self._records) > self.MAX_RECORDS:
+                self._records = self._records[-self.MAX_RECORDS :]
+            self._path.write_text(json.dumps(self._records), encoding="utf-8")
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning("artifact link memory save failed: {}", exc)
+
+    def remember(
+        self,
+        *,
+        name: str,
+        url: str,
+        description: str = "",
+        page_url: str = "",
+        size: int | None = None,
+        kind: str = "",
+    ) -> dict[str, Any]:
+        """Record (or refresh) a delivered artifact link. Never raises."""
+        self._load()
+        entry: dict[str, Any] = {
+            "name": str(name or "").strip(),
+            "description": str(description or "").strip()[:280],
+            "url": str(url or "").strip(),
+            "page_url": str(page_url or "").strip(),
+            "kind": str(kind or "").strip(),
+            "ts": time.time(),
+        }
+        if size is not None:
+            entry["size"] = int(size)
+        # Same name + same link replaces the previous record rather than
+        # appending a duplicate every time the artifact is re-delivered.
+        for index, existing in enumerate(self._records):
+            if existing.get("name") == entry["name"] and existing.get("url") == entry["url"]:
+                self._records[index] = entry
+                self._save()
+                return entry
+        self._records.append(entry)
+        self._save()
+        return entry
+
+    def search(self, query: str = "", *, limit: int = 10) -> list[dict[str, Any]]:
+        """Return records matching ``query`` (name/description), newest first."""
+        self._load()
+        needle = str(query or "").strip().lower()
+        records = list(reversed(self._records))
+        if not needle:
+            return records[:limit]
+        terms = [t for t in re.split(r"\s+", needle) if t]
+        hits = [
+            r
+            for r in records
+            if all(
+                term in f"{r.get('name','')} {r.get('description','')} {r.get('kind','')}".lower()
+                for term in terms
+            )
+        ]
+        return hits[:limit]
+
+
+def artifact_memory() -> ArtifactLinkMemory:
+    """Return the shared artifact-link memory (persistent disk backed)."""
+    return ArtifactLinkMemory()

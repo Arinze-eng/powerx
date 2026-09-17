@@ -22,11 +22,6 @@ from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from loguru import logger
-from nanobot.utils.onlyfiles import resolve_raw_url
-from nanobot.webui.media_api import (
-    b64url_decode,
-    verify_onlyfiles_resolver_sig,
-)
 from websockets.datastructures import Headers
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
@@ -41,6 +36,7 @@ from nanobot.session.session_handles import (
     SessionHandleResolver,
 )
 from nanobot.triggers.local_types import LocalTrigger
+from nanobot.utils.onlyfiles import resolve_raw_url
 from nanobot.webui.file_preview import (
     WebUIFilePreviewError,
     file_preview_availability_payload,
@@ -97,6 +93,10 @@ from nanobot.webui.http_utils import (
     safe_host_header as _safe_host_header,
 )
 from nanobot.webui.ingress_policy import WebUIIngressPolicy
+from nanobot.webui.media_api import (
+    b64url_decode,
+    verify_onlyfiles_resolver_sig,
+)
 from nanobot.webui.media_gateway import WebUIMediaGateway
 from nanobot.webui.native_folder_picker import (
     NativeFolderPickerError,
@@ -143,6 +143,20 @@ _WEBUI_MUTATION_PAYLOAD_ATTR = "_nanobot_webui_mutation_payload"
 _WEBUI_MUTATION_REQUEST_ATTR = "_nanobot_webui_mutation_request"
 _WEBUI_MUTATION_SUPABASE_USER_ATTR = "_nanobot_webui_mutation_supabase_user"
 _NO_STORE_HEADERS = [("Cache-Control", "no-store")]
+
+#: Valid onlyfiles slug shape for the permanent-download route. Restricting the
+#: accepted ids keeps ``/f/`` from becoming an open proxy.
+_PERMANENT_DOWNLOAD_ID_RE = re.compile(r"[A-Za-z0-9_-]{4,64}")
+
+
+def _attachment_filename(disposition: str, file_id: str) -> str:
+    """Pick a safe ``Content-Disposition`` filename from the upstream headers."""
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', disposition or "")
+    if match:
+        candidate = Path(unquote(match.group(1).strip())).name
+        if candidate:
+            return candidate.replace('"', "")
+    return f"{file_id}.bin"
 
 _WEBUI_MUTATION_PATHS = {
     "automation.enable": "/api/webui/automations/enable",
@@ -503,6 +517,55 @@ class GatewayHTTPHandler:
         finally:
             self._log_slow_http(got, response, started)
 
+    async def _handle_permanent_download(self, got: str) -> Any:
+        """Serve ``/f/{file_id}`` by streaming freshly-resolved file bytes.
+
+        A paste-and-download link has to satisfy three things: be permanent, work
+        without auth, and actually download rather than render a viewer. The
+        onlyfiles page URL fails the third and the raw ``/dl/`` URL fails the
+        first, so this endpoint proxies the bytes and sets
+        ``Content-Disposition: attachment``.
+
+        The slug is validated against the onlyfiles id shape so this cannot be
+        used as an open proxy.
+        """
+        import aiohttp
+
+        from nanobot.utils.onlyfiles import ONLYFILES_HOST
+
+        file_id = got[len("/f/") :].strip().strip("/")
+        if not file_id or not _PERMANENT_DOWNLOAD_ID_RE.fullmatch(file_id):
+            return _http_error(404, "unknown file")
+
+        page_url = f"https://{ONLYFILES_HOST}/{file_id}"
+        try:
+            raw_url = await resolve_raw_url(page_url)
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    raw_url, headers={"User-Agent": "Mozilla/5.0"}
+                ) as upstream:
+                    if upstream.status != 200:
+                        return _http_error(404, "file is no longer available")
+                    body = await upstream.read()
+                    content_type = upstream.headers.get(
+                        "Content-Type", "application/octet-stream"
+                    )
+                    disposition = upstream.headers.get("Content-Disposition", "")
+        except Exception as exc:  # noqa: BLE001 - never surface internals to a user
+            logger.warning("permanent download failed for {}: {}", file_id, exc)
+            return _http_error(502, "could not fetch file")
+
+        filename = _attachment_filename(disposition, file_id)
+        return _http_response(
+            body,
+            content_type=content_type,
+            extra_headers=[
+                ("Content-Disposition", f'attachment; filename="{filename}"'),
+                ("Cache-Control", "private, max-age=300"),
+            ],
+        )
+
     async def dispatch_webui_mutation(
         self,
         connection: Any,
@@ -604,6 +667,13 @@ class GatewayHTTPHandler:
         # server but reachable through the webui front door (/api/version).
         if got == "/api/version":
             return _http_json_response(_deployment_identity())
+
+        # Permanent artifact download link (no auth). The onlyfiles page URL is
+        # permanent but serves an HTML viewer, and the raw /dl/ token expires in
+        # ~2h, so neither can be handed to a user. This stable link mints a fresh
+        # token per request, so a copied link always downloads the bytes.
+        if got.startswith("/f/"):
+            return await self._handle_permanent_download(got)
 
         # Public announcement banner (no auth): the newest active admin
         # announcement, shown as a dialog on the landing page / AI section.

@@ -17,13 +17,13 @@ transparently fall back to catbox if onlyfiles rejects them.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 
-from nanobot.utils.onlyfiles import OnlyFilesError, upload_bytes as _onlyfiles_upload_bytes
+from nanobot.utils.onlyfiles import OnlyFilesError
+from nanobot.utils.onlyfiles import upload_bytes as _onlyfiles_upload_bytes
 
 # Routing thresholds (bytes).
 _ONLYFILES_MAX_BYTES = 100 * 1024 * 1024        # onlyfiles hard limit (~100 MiB)
@@ -39,15 +39,49 @@ class FileShareError(RuntimeError):
 
 
 def _normalize_onlyfiles(result: dict[str, str]) -> dict[str, Any]:
+    """Map the onlyfiles result onto the uniform share contract.
+
+    ``url`` must be the link a user can **paste and download**, so it prefers the
+    permanent gateway form. The raw ``/dl/`` token expires in ~2h, so it is
+    exposed separately as ``download_url`` for immediate one-off use only. Before
+    this, ``url`` was the expiring raw token and ``page_url`` the HTML viewer —
+    which is why a copied link either opened a web page or stopped working.
+    """
+    permanent = result.get("url") or ""
     return {
-        "url": result.get("download_url") or result.get("url"),
-        "page_url": result.get("url"),
+        "url": permanent or result.get("download_url") or "",
+        "page_url": result.get("page_url") or permanent,
+        "download_url": result.get("download_url", ""),
         "host": "onlyfiles",
     }
 
 
 def _normalize_catbox(url: str) -> dict[str, Any]:
-    return {"url": url, "page_url": url, "host": "catbox"}
+    return {"url": url, "page_url": url, "download_url": url, "host": "catbox"}
+
+
+def remember_artifact(result: dict[str, Any], *, filename: str, description: str = "") -> None:
+    """Persist a delivered artifact link so it can be recalled after sandbox loss.
+
+    Only the short metadata record is written (never the bytes), so this survives
+    sandbox restarts and context loss without filling the persistent disk.
+    Never raises — memory is best-effort and must not break a delivery.
+    """
+    url = str(result.get("url") or "").strip()
+    if not url:
+        return
+    try:
+        from nanobot.utils.onlyfiles import artifact_memory
+
+        artifact_memory().remember(
+            name=str(filename or "artifact"),
+            url=url,
+            page_url=str(result.get("page_url") or ""),
+            description=description,
+            kind=Path(str(filename or "")).suffix.lstrip(".").lower(),
+        )
+    except Exception:  # noqa: BLE001 - memory failure must never break delivery
+        pass
 
 
 async def _upload_onlyfiles(
@@ -115,23 +149,29 @@ async def upload_artifact_bytes(
     name = Path(filename).name or "upload.bin"
 
     if size > _CATBOX_THRESHOLD_BYTES:
-        return await _upload_catbox(
+        result = await _upload_catbox(
             data, filename=name, content_type=content_type, timeout_seconds=timeout_seconds
         )
+        remember_artifact(result, filename=name)
+        return result
 
     if size <= _ONLYFILES_MAX_BYTES:
         try:
-            return await _upload_onlyfiles(
+            result = await _upload_onlyfiles(
                 data, filename=name, content_type=content_type, timeout_seconds=timeout_seconds
             )
+            remember_artifact(result, filename=name)
+            return result
         except OnlyFilesError:
             # Fall through to catbox for any onlyfiles rejection.
             pass
 
     # Mid-size (>100 MiB or onlyfiles rejected): use catbox.
-    return await _upload_catbox(
+    result = await _upload_catbox(
         data, filename=name, content_type=content_type, timeout_seconds=timeout_seconds
     )
+    remember_artifact(result, filename=name)
+    return result
 
 
 async def upload_artifact_path(
