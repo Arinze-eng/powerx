@@ -71,6 +71,17 @@ _OCR_DIR = f"{_WORKSPACE}/.nanobot"
 _GIT_CREDS_PATH = f"{_OCR_DIR}/github-env.sh"
 _GIT_CREDS_SOURCE = f'. {shlex.quote(_GIT_CREDS_PATH)} 2>/dev/null || true; '
 
+
+def _git_creds_source_for(root: str) -> str:
+    """Source-prefix for a credential file under an arbitrary workspace root.
+
+    Each backend has its own workspace root (novita /workspace, upstash
+    /workspace/home, vps configurable), so the source line must be built from
+    the root actually in use rather than a single hard-coded path.
+    """
+    path = f"{root.rstrip('/')}/.nanobot/github-env.sh"
+    return f'. {shlex.quote(path)} 2>/dev/null || true; '
+
 #: Env vars that may hold a GitHub token, in precedence order. GITHUB_BUILD_TOKEN
 #: is the operator-provisioned build account the build_artifact tool uses;
 #: GITHUB_TOKEN / GH_TOKEN are the conventional names the `gh` CLI and `git`
@@ -104,6 +115,30 @@ def _git_identity() -> tuple[str, str]:
     owner = os.environ.get("GITHUB_BUILD_OWNER", "").strip() or "nanobot"
     email = os.environ.get("GIT_COMMIT_EMAIL", "").strip() or f"{owner}@users.noreply.github.com"
     return owner, email
+
+def _git_creds_script() -> str:
+    """Shell script body exporting GitHub credentials inside a sandbox/box.
+
+    Shared by every execution backend (novita / upstash / vps / daytona /
+    runloop). The token is written to a file rather than passed inline on the
+    command line because commands are logged - an inline token would leak into
+    tool-call logs and transcript history.
+    """
+    creds = _github_credentials()
+    if not creds:
+        return ""
+    owner, email = _git_identity()
+    lines = ["# Managed by nanobot - do not edit.", "#!/bin/sh"]
+    for name, value in creds.items():
+        lines.append(f"export {name}={shlex.quote(value)}")
+    lines.append(
+        "git config --global credential.helper "
+        "'!f() { echo username=x-access-token; echo password=$GITHUB_TOKEN; }; f' "
+        "2>/dev/null || true"
+    )
+    lines.append(f"git config --global user.name {shlex.quote(owner)} 2>/dev/null || true")
+    lines.append(f"git config --global user.email {shlex.quote(email)} 2>/dev/null || true")
+    return "\n".join(lines) + "\n"
 
 #: Automatic Novita sandbox sizing when the admin configured none. The stock
 #: "base" image ships ~486 MB which OOM-kills builds/OCR, so we default every
@@ -1780,7 +1815,13 @@ class NovitaSandboxTool(Tool):
             if action == "run":
                 command = str(kwargs.get("command") or "").strip()
                 timeout = max(1, min(int(kwargs.get("timeout") or 120), _MAX_TIMEOUT))
-                return await backend.run(command, timeout=timeout, cwd=root)
+                # Seed once per session, then source the credential file so git,
+                # gh and curl authenticate inside the VPS (it does not inherit
+                # the backend environment).
+                if not getattr(backend, "_nb_creds_seeded", False):
+                    await self._seed_git_credentials(backend, root)
+                    backend._nb_creds_seeded = True
+                return await backend.run(_git_creds_source_for(root) + command, timeout=timeout, cwd=root)
             if action == "install":
                 raw_packages = str(kwargs.get("packages") or "").strip()
                 packages = [part for part in re.split(r"[\s,]+", raw_packages) if part]
@@ -1869,6 +1910,28 @@ class NovitaSandboxTool(Tool):
         if stored_id:
             backend.last_sandbox_id = stored_id
         return backend
+
+
+    async def _seed_git_credentials(self, backend: Any, root: str) -> None:
+        """Write GitHub credentials into a remote backend's workspace.
+
+        Every execution backend is an isolated container that does NOT inherit
+        the backend process environment, so git/gh/curl ran unauthenticated even
+        though GITHUB_BUILD_TOKEN is configured on the host. This seeds the same
+        credential file the Novita path uses, for backends whose run() cannot
+        prefix a source line. Best-effort: a failure must not break the action.
+        """
+        script = _git_creds_script()
+        if not script:
+            return
+        path = f"{root.rstrip('/')}/.nanobot/github-env.sh"
+        try:
+            parent = path.rsplit("/", 1)[0]
+            await backend.run(f"mkdir -p {shlex.quote(parent)}", timeout=60)
+            await backend.write(path, script)
+            await backend.run(f"chmod 600 {shlex.quote(path)}", timeout=60)
+        except Exception as exc:  # noqa: BLE001 - credentials are best-effort
+            logger.warning("could not seed git credentials into backend: {}", exc)
 
     def _runloop_backend(self, config: Any, key: str) -> RunloopExecutionBackend:
         backend = RunloopExecutionBackend(config, devbox_name=runloop_devbox_name(key))
@@ -2020,7 +2083,13 @@ class NovitaSandboxTool(Tool):
                     if not command:
                         return ToolResult.error("command is required")
                     timeout = max(1, min(int(kwargs.get("timeout") or 120), _MAX_TIMEOUT))
-                    output = await backend.run(command, timeout=timeout)
+                    # First command of the session seeds the credential file so
+                    # git/gh/curl authenticate (the box does not inherit the
+                    # backend env). Then source it for every command.
+                    if not getattr(backend, "_nb_creds_seeded", False):
+                        await self._seed_git_credentials(backend, backend.workspace)
+                        backend._nb_creds_seeded = True
+                    output = await backend.run(_git_creds_source_for(backend.workspace) + command, timeout=timeout)
                     if getattr(backend, "last_sandbox_id", ""):
                         _DAYTONA_STORE.set_id(key, backend.last_sandbox_id)
                     return output
