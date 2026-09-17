@@ -2266,7 +2266,13 @@ class NovitaSandboxTool(Tool):
                     if not command:
                         return ToolResult.error("command is required")
                     timeout = max(1, min(int(kwargs.get("timeout") or 120), _MAX_TIMEOUT))
-                    output = await backend.run(command, timeout=timeout)
+                    # Seed once per session, then source the credential file so
+                    # git/gh/curl authenticate (the Devbox does not inherit the
+                    # backend environment).
+                    if not getattr(backend, "_nb_creds_seeded", False):
+                        await self._seed_git_credentials(backend, backend.workspace)
+                        backend._nb_creds_seeded = True
+                    output = await backend.run(_git_creds_source_for(backend.workspace) + command, timeout=timeout)
                     if getattr(backend, "last_devbox_id", ""):
                         _RUNLOOP_STORE.set_id(key, backend.last_devbox_id)
                     return output
@@ -2564,7 +2570,13 @@ class NovitaSandboxTool(Tool):
                     if not command:
                         return ToolResult.error("command is required")
                     timeout = max(1, min(int(kwargs.get("timeout") or 120), _MAX_TIMEOUT))
-                    output = await backend.run(command, timeout=timeout)
+                    # Seed once per session, then source the credential file so
+                    # git/gh/curl authenticate (the Box does not inherit the
+                    # backend environment).
+                    if not getattr(backend, "_nb_creds_seeded", False):
+                        await self._seed_git_credentials(backend, backend.workspace)
+                        backend._nb_creds_seeded = True
+                    output = await backend.run(_git_creds_source_for(backend.workspace) + command, timeout=timeout)
                     if getattr(backend, "last_box_id", ""):
                         _UPSTASH_STORE.set_id(key, backend.last_box_id)
                     return output
