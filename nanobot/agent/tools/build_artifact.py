@@ -52,6 +52,7 @@ from nanobot.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
+from nanobot.agent.tools.workspace_bridge import StagedProject, stage_from_sandbox
 from nanobot.config.paths import get_workspace_path
 from nanobot.security.workspace_access import current_tool_workspace
 
@@ -356,7 +357,9 @@ class BuildArtifactTool(Tool):
     # ---- workspace resolution --------------------------------------------
     def _resolve_dir(self, sub: str | None) -> Path:
         base = self._workspace
-        p = Path(sub).expanduser() if sub else base
+        if not sub:
+            return base
+        p = Path(sub).expanduser()
         if not p.is_absolute():
             p = base / sub
         resolved = p.resolve()
@@ -368,6 +371,49 @@ class BuildArtifactTool(Tool):
             except ValueError:
                 raise ValueError(f"path {resolved} is outside the configured workspace") from None
         return resolved
+
+    def _resolve_source(
+        self, requested: str | None, host_dir: Path
+    ) -> tuple[Path | None, StagedProject | None]:
+        """Locate the project to push, bridging out of the execution sandbox if needed.
+
+        The agent creates files with the sandbox/exec tools inside the *remote*
+        execution backend, while this tool runs on the host. Those filesystems
+        are isolated, so a host-only lookup finds nothing. When the host
+        directory is missing or empty, stage it from the active sandbox backend.
+
+        Returns ``(project_dir, staged)`` where ``staged`` is non-None only when
+        the returned directory came from the sandbox and must be cleaned up by
+        the caller.
+        """
+        if host_dir.is_dir() and any(host_dir.iterdir()):
+            return host_dir, None
+
+        staged = self._stage_from_sandbox(requested)
+        if staged is not None:
+            return staged.path, staged
+        # Nothing in the sandbox either: fall back to the host path so the
+        # caller can report one consistent, actionable error.
+        return (host_dir if host_dir.is_dir() else None), None
+
+    def _stage_from_sandbox(self, requested: str | None) -> StagedProject | None:
+        """Run the async sandbox staging bridge from this sync code path."""
+        coro = stage_from_sandbox(requested)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            # _push/_build run inside asyncio.to_thread, so a loop here means an
+            # unexpected calling context; skipping beats deadlocking on it.
+            logger.warning("build_artifact: cannot stage from sandbox inside a running loop")
+            coro.close()
+            return None
+        try:
+            return asyncio.run(coro)
+        except Exception as exc:  # noqa: BLE001 - staging is best-effort
+            logger.warning("build_artifact: sandbox staging failed: {}", exc)
+            return None
 
     # ---- public entry ----------------------------------------------------
     async def execute(self, **kwargs: Any) -> ToolResult | str:
@@ -432,11 +478,20 @@ class BuildArtifactTool(Tool):
 
     def _push(self, kwargs: dict) -> str:
         repo = self._require_repo(kwargs)
-        src = self._resolve_dir(str(kwargs.get("source_dir") or "").strip() or None)
-        if not src.is_dir():
-            raise ValueError(f"source_dir '{src}' is not a directory")
+        requested = str(kwargs.get("source_dir") or "").strip() or None
+        host_dir = self._resolve_dir(requested)
+        src, staged = self._resolve_source(requested, host_dir)
+        if src is None or not src.is_dir():
+            raise ValueError(
+                "no project sources found to push. "
+                f"Requested source_dir={requested or '(default workspace)'!r} resolved to "
+                f"{host_dir} on the host, and the execution sandbox could not be staged out "
+                "of it either. Create the project with the sandbox/exec tool and retry, or "
+                "pass a source_dir that exists in the sandbox workspace."
+            )
         tok = _token() or ""
         clone = Path(tempfile.mkdtemp(prefix="nfbuild_"))
+        note = f" [staged from execution sandbox: {requested or src.name}]" if staged else ""
         try:
             auth_url = f"https://x-access-token:{tok}@github.com/{repo}.git"
             r = subprocess.run(["git", "clone", auth_url, str(clone)], capture_output=True, text=True, timeout=180)
@@ -460,9 +515,11 @@ class BuildArtifactTool(Tool):
                                capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
                 raise RuntimeError(f"push failed: {(r.stderr or r.stdout)[:300]}")
-            return f"[ok] pushed {src} -> {repo} (branch main)"
+            return f"[ok] pushed {src} -> {repo} (branch main){note}"
         finally:
             shutil.rmtree(clone, ignore_errors=True)
+            if staged is not None:
+                staged.cleanup()
 
     def _add_workflow(self, kwargs: dict) -> str:
         repo = self._require_repo(kwargs)
