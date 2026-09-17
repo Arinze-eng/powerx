@@ -19,10 +19,24 @@ RUN npm install -g vercel && rm -rf /root/.npm
 
 WORKDIR /app
 
+# Create the non-root runtime user up front and build the virtualenv AS that
+# user. A recursive `chown -R` over the finished venv (120+ packages, tens of
+# thousands of files already committed in lower layers) forces overlayfs to copy
+# up every file; it took 15+ minutes per cold build and could stall indefinitely,
+# making deploys look hung. Owning the venv from creation removes that step.
+RUN useradd -m -u 1000 -s /bin/bash nanobot && \
+    mkdir -p /home/nanobot/.nanobot /app/.venv && \
+    chown nanobot:nanobot /home/nanobot /app /app/.venv
+
 # Keep the runtime environment writable by the non-root nanobot user. Enabled
 # channels may install their manifest-declared dependencies at startup.
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
+# Give the non-root build steps a writable HOME and uv cache so `uv` never
+# tries to write to /root/.cache while running as nanobot.
+ENV HOME=/home/nanobot \
+    UV_CACHE_DIR=/home/nanobot/.cache/uv
+USER nanobot
 RUN uv venv --seed "$VIRTUAL_ENV"
 RUN uv pip install --python "$VIRTUAL_ENV/bin/python" --no-cache "aiohttp>=3.9.0,<4.0.0"
 
@@ -68,10 +82,8 @@ RUN for channel in $(printf '%s' "$NANOBOT_CHANNELS" | tr ',' ' '); do \
 # won't shadow it. Only used when RENDER=true; ignored by local runs.
 COPY render-config.json ./
 
-# Create the non-root user and hand ownership of the writable virtualenv to it.
-RUN useradd -m -u 1000 -s /bin/bash nanobot && \
-    mkdir -p /home/nanobot/.nanobot && \
-    chown -R nanobot:nanobot /home/nanobot /app/.venv
+# Back to root for the remaining system-level install steps.
+USER root
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh && \
@@ -83,7 +95,6 @@ RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/ent
 # and fails closed if it cannot, so the agent never runs as root (see
 # entrypoint.sh).
 USER root
-ENV HOME=/home/nanobot
 # Ensure crash output reaches Render logs (app output is otherwise swallowed on
 # non-graceful exit).
 ENV PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1
