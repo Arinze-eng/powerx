@@ -23,7 +23,14 @@ from loguru import logger
 from nanobot.utils.helpers import sanitize_surrogates_deep
 
 STREAM_IDLE_TIMEOUT_ENV = "NANOBOT_STREAM_IDLE_TIMEOUT_S"
-DEFAULT_STREAM_IDLE_TIMEOUT_S = 90.0
+# [FIX 2026-09-17] Raised 90s -> 300s. The idle timeout guards against a truly
+# dead stream, but 90s was short enough to kill *legitimate* long thinking /
+# long tool runs: the model can be silent for minutes while a coding turn
+# reasons or a slow tool executes. When the stream was cut, the streamed
+# reasoning silently stopped mid-turn ("the thinking stops showing") and the
+# task appeared to abort on its own. 300s still catches a genuinely stalled
+# socket while not truncating real work; operators can tune via the env var.
+DEFAULT_STREAM_IDLE_TIMEOUT_S = 300.0
 MAX_STREAM_IDLE_TIMEOUT_S = 3600.0
 RETRY_AFTER_BUFFER = 1
 

@@ -1284,11 +1284,19 @@ class AgentRunner:
             # Default to a finite timeout to avoid per-session lock starvation when an LLM
             # request hangs indefinitely (e.g. gateway/network stall).
             # Set NANOBOT_LLM_TIMEOUT_S=0 to disable.
-            raw = os.environ.get("NANOBOT_LLM_TIMEOUT_S", "300").strip()
+            #
+            # [FIX 2026-09-17] Raised 300s -> 1800s. Long coding/deploy turns
+            # routinely need more than 5 minutes of *model* wall-clock time, and
+            # the 300s ceiling was killing them mid-run: the turn died with
+            # "Error calling LLM: timed out after 300s", the streamed reasoning
+            # stopped, and the user had to re-ask before the (already produced)
+            # result surfaced. 30 min keeps the anti-starvation guarantee that
+            # motivated the finite default while not truncating real work.
+            raw = os.environ.get("NANOBOT_LLM_TIMEOUT_S", "1800").strip()
             try:
                 timeout_s = float(raw)
             except (TypeError, ValueError):
-                timeout_s = 300.0
+                timeout_s = 1800.0
         if timeout_s <= 0:
             timeout_s = None
 
