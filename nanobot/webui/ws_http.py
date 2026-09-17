@@ -209,6 +209,14 @@ _WEBUI_MUTATION_PATHS = {
     "settings.mcp.oauth_start": "/api/settings/mcp-oauth/start",
     "settings.mcp.oauth_complete": "/api/settings/mcp-oauth/complete",
     "settings.mcp.oauth_cancel": "/api/settings/mcp-oauth/cancel",
+    # YouTube connector. The card posts these two actions, and the settings
+    # router already serves the paths below, but neither action was present in
+    # this allowlist. ``_webui_mutation_path`` therefore fell through to its
+    # final ``return _http_error(404, "unknown WebUI mutation action")`` and the
+    # Connect button could never reach the handler - the connector looked
+    # implemented but was unreachable over the mutation channel.
+    "settings.youtube.connect": "/api/settings/youtube/start",
+    "settings.youtube.disconnect": "/api/settings/youtube/disconnect",
     # Authenticated checkout: mints a unique single-use payment link for the
     # signed-in user. Exposed over the WebUI mutation channel so the client
     # never needs a raw payment URL — the gateway returns one tied to the buyer.

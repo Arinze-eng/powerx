@@ -36,3 +36,33 @@ def test_mcp_oauth_callback_uses_safe_forwarded_request_origin() -> None:
     )
 
     assert redirect_uri == "https://nanobot.example:9443/auth/mcp/callback"
+
+
+# ---------------------------------------------------------------------------
+# YouTube connector mutation allowlist
+# ---------------------------------------------------------------------------
+
+# The Settings card posts exactly these actions. They were missing from the
+# allowlist while the settings router already served the target paths, so
+# ``_webui_mutation_path`` fell through to 404 "unknown WebUI mutation action"
+# and the Connect button could never reach the handler.
+def test_youtube_connector_actions_resolve_to_settings_paths() -> None:
+    assert (
+        GatewayHTTPHandler._webui_mutation_path("settings.youtube.connect", {})
+        == "/api/settings/youtube/start"
+    )
+    assert (
+        GatewayHTTPHandler._webui_mutation_path("settings.youtube.disconnect", {})
+        == "/api/settings/youtube/disconnect"
+    )
+
+
+def test_youtube_connector_paths_are_recognised_as_mutations() -> None:
+    handler = object.__new__(GatewayHTTPHandler)
+    from nanobot.webui.settings_routes import WebUISettingsRouter
+
+    handler.settings_routes = WebUISettingsRouter.__new__(WebUISettingsRouter)
+    for path in ("/api/settings/youtube/start", "/api/settings/youtube/disconnect"):
+        # Both must be treated as mutations so the plain-HTTP path is rejected
+        # with 405 instead of silently 404-ing.
+        assert WebUISettingsRouter.is_mutation_path(path) is True
