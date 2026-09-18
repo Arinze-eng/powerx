@@ -229,6 +229,7 @@ _WEBUI_MUTATION_PATHS = {
     "admin.provider.pool.delete": "/api/admin/provider-pool/delete",
     "admin.provider.pool.update": "/api/admin/provider-pool/update",
     "admin.provider.pool.test": "/api/admin/provider-pool/test",
+    "admin.provider.pool.models": "/api/admin/provider-pool/models",
     "admin.execution.save": "/api/admin/execution-settings",
     "admin.execution.test": "/api/admin/execution-test",
     "admin.dbq.execute": "/api/admin/dbq/action",
@@ -707,8 +708,13 @@ class GatewayHTTPHandler:
                 payload = {"announcement": None}
             return _http_json_response(payload)
 
-        # Admin dashboard and user registry
-        admin_response = admin_route(
+        # Admin dashboard and user registry. Every admin route performs blocking
+        # network I/O (provider tests, DBQ gateway, Supabase reads), so run it in
+        # a worker thread: on the event loop a slow provider test stalls the whole
+        # socket and the admin UI sits on "Testing..." because the reply is never
+        # delivered.
+        admin_response = await asyncio.to_thread(
+            admin_route,
             request,
             got,
             issue_admin_token=lambda: self.tokens.issue_token(

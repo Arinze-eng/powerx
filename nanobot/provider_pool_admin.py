@@ -13,14 +13,16 @@ PROVIDER_POOL_SECTION = """\
 across the enabled lanes and automatically fails over to the next lane when one returns a rate-limit,
 overload, server or connection error &mdash; so a single key can never rate-limit the whole app.
 Keys stay on the server and are only ever shown masked. Saving stores the pool in the Northflank service
-environment &mdash; nothing is written to the database, so no Supabase egress is used.</p>
+environment &mdash; nothing is written to the database, so no Supabase egress is used.
+Enter a base URL and key, click <strong>Load models</strong> to pick from the lane's own model list, then Add entry.</p>
 <div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.5rem'>
 <label>Base URL<input id='poolBaseUrl' type='url' placeholder='https://example.com/v1'></label>
 <label>API key<input id='poolApiKey' type='password' placeholder='sk-...' autocomplete='off'></label>
-<label>Model<input id='poolModel' placeholder='gpt-4o-mini'></label>
+<label>Model<input id='poolModel' list='poolModelList' placeholder='gpt-4o-mini'><datalist id='poolModelList'></datalist></label>
 <label>Label (optional)<input id='poolLabel' placeholder='kyma-1'></label>
 </div>
 <button id='poolAdd'>Add entry</button>
+<button id='poolLoadModels' class='secondary'>Load models</button>
 <button id='poolReload' class='secondary'>Reload</button>
 <button id='poolTestAll' class='secondary'>Test all enabled</button>
 <p class='hint'>Pool: <strong id='poolCount'>0 / 40</strong></p>
@@ -91,11 +93,33 @@ environment &mdash; nothing is written to the database, so no Supabase egress is
     }).catch(function(e){ setStatus(e.message, false); });
   };
   $('poolReload').onclick = load;
+  var summarise = function(results){
+    var rows = results || [];
+    if(!rows.length){ return 'No enabled lanes to test.'; }
+    var passed = rows.filter(function(r){ return r.ok; }).length;
+    return 'Tested ' + rows.length + ' lane(s): ' + passed + ' passed, ' + (rows.length - passed) + ' failed.';
+  };
+  $('poolLoadModels').onclick = function(){
+    var payload = {baseUrl: $('poolBaseUrl').value, apiKey: $('poolApiKey').value};
+    if(!payload.baseUrl){ setStatus('Enter the base URL first.', false); return; }
+    setStatus('Loading models...');
+    req('admin.provider.pool.models', payload).then(function(v){
+      var models = v.models || [];
+      var list = $('poolModelList');
+      list.replaceChildren.apply(list, models.map(function(id){
+        var option = document.createElement('option');
+        option.value = id;
+        return option;
+      }));
+      if(models.length && !$('poolModel').value){ $('poolModel').value = models[0]; }
+      setStatus('Loaded ' + (v.count || 0) + ' model(s). Pick one in the Model field.');
+    }).catch(function(e){ setStatus(e.message, false); });
+  };
   $('poolTestAll').onclick = function(){
     setStatus('Testing enabled lanes...');
     req('admin.provider.pool.test', {all:true}).then(function(v){
       showResults(v.results);
-      setStatus('Test complete.');
+      setStatus(summarise(v.results));
     }).catch(function(e){ setStatus(e.message, false); });
   };
   $('poolRows').addEventListener('click', function(ev){
@@ -112,7 +136,7 @@ environment &mdash; nothing is written to the database, so no Supabase egress is
       setStatus('Testing lane...');
       req('admin.provider.pool.test', {id:id}).then(function(v){
         showResults(v.results);
-        setStatus('Test complete.');
+        setStatus(summarise(v.results));
       }).catch(function(e){ setStatus(e.message, false); });
     }
   });
