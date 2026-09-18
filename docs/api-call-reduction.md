@@ -164,4 +164,12 @@ work.
 ## Rollback
 
 `POWERX_SHAPE_ROUTER=0` disables the steering layer entirely and restores the
-previous behaviour, no redeploy required.
+previous behaviour. The flag is read live on every call rather than cached at
+import, so no **code change or rebuild** is needed.
+
+Being precise about what that does and does not mean: on Northflank, changing an
+environment variable restarts the service anyway. The benefit is that the
+rollback is a config flip on a known-safe variable — not a `git revert` plus a
+Docker rebuild. It also does not disable `run_plan` / `python_code` (those stay
+registered and reachable; the model simply stops being nudged toward them), and
+it does not touch ReAct.
