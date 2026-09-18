@@ -39,6 +39,7 @@ def test_pool_routes_require_auth(monkeypatch) -> None:
         "/api/admin/provider-pool/delete",
         "/api/admin/provider-pool/update",
         "/api/admin/provider-pool/test",
+        "/api/admin/provider-pool/models",
     ):
         response = admin_registry.admin_route(SimpleNamespace(path=path, headers={}), path)
         assert response is not None
@@ -197,3 +198,173 @@ def test_pool_save_reports_when_northflank_unconfigured(monkeypatch, tmp_path) -
         "/api/admin/provider-pool/add",
     )
     assert _json(response)["northflank"] == {"configured": False, "synced": False}
+
+
+def test_pool_models_route_lists_lane_models(monkeypatch) -> None:
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    captured: dict = {}
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"data": [{"id": "gemini-3.1-flash-lite"}, {"id": "gpt-4o-mini"}, {"nope": 1}]}
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> bool:
+            return False
+
+        def get(self, url, headers=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            return _Response()
+
+    monkeypatch.setattr(admin_registry.httpx, "Client", _Client)
+
+    response = admin_registry.admin_route(
+        _request(
+            "/api/admin/provider-pool/models",
+            payload={"baseUrl": "https://api.example.com/v1", "apiKey": "sk-abcdefghijklmnop"},
+        ),
+        "/api/admin/provider-pool/models",
+    )
+    body = _json(response)
+    assert body["models"] == ["gemini-3.1-flash-lite", "gpt-4o-mini"]
+    assert body["count"] == 2
+    assert captured["url"] == "https://api.example.com/v1/models"
+    assert captured["headers"]["Authorization"] == "Bearer sk-abcdefghijklmnop"
+
+
+def test_pool_models_route_rejects_missing_base_url(monkeypatch) -> None:
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    response = admin_registry.admin_route(
+        _request("/api/admin/provider-pool/models", payload={}),
+        "/api/admin/provider-pool/models",
+    )
+    assert response is not None
+    assert response.status_code == 400
+
+
+def test_pool_models_route_can_use_a_saved_entry(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setenv("PROVIDER_POOL_PATH", str(tmp_path / "pool.json"))
+    entry = provider_pool.add_entry(
+        {"baseUrl": "https://api.example.com/v1", "apiKey": "sk-abcdefghijklmnop", "model": "gpt-4o-mini"}
+    )
+    captured: dict = {}
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"data": [{"id": "gpt-4o-mini"}]}
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> bool:
+            return False
+
+        def get(self, url, headers=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            return _Response()
+
+    monkeypatch.setattr(admin_registry.httpx, "Client", _Client)
+
+    response = admin_registry.admin_route(
+        _request("/api/admin/provider-pool/models", payload={"id": entry["id"]}),
+        "/api/admin/provider-pool/models",
+    )
+    assert _json(response)["models"] == ["gpt-4o-mini"]
+    assert captured["headers"]["Authorization"] == "Bearer sk-abcdefghijklmnop"
+
+
+def test_pool_test_all_reports_every_enabled_lane(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setenv("PROVIDER_POOL_PATH", str(tmp_path / "pool.json"))
+    provider_pool.add_entry({"baseUrl": "https://a.example.com/v1", "apiKey": "sk-aaaaaaaaaaaa", "model": "m1"})
+    provider_pool.add_entry({"baseUrl": "https://b.example.com/v1", "apiKey": "sk-bbbbbbbbbbbb", "model": "m2"})
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": "OK"}}]}
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> bool:
+            return False
+
+        def post(self, url, headers=None, json=None):
+            return _Response()
+
+    monkeypatch.setattr(admin_registry.httpx, "Client", _Client)
+
+    response = admin_registry.admin_route(
+        _request("/api/admin/provider-pool/test", payload={"all": True}),
+        "/api/admin/provider-pool/test",
+    )
+    results = _json(response)["results"]
+    assert len(results) == 2
+    assert all(result["ok"] is True for result in results)
+
+
+def test_pool_test_surfaces_a_lane_failure(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setenv("PROVIDER_POOL_PATH", str(tmp_path / "pool.json"))
+    entry = provider_pool.add_entry(
+        {"baseUrl": "https://api.example.com/v1", "apiKey": "sk-abcdefghijklmnop", "model": "gpt-4o-mini"}
+    )
+
+    class _Response:
+        status_code = 429
+
+        def json(self) -> dict:
+            return {}
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> bool:
+            return False
+
+        def post(self, url, headers=None, json=None):
+            return _Response()
+
+    monkeypatch.setattr(admin_registry.httpx, "Client", _Client)
+
+    response = admin_registry.admin_route(
+        _request("/api/admin/provider-pool/test", payload={"id": entry["id"]}),
+        "/api/admin/provider-pool/test",
+    )
+    result = _json(response)["results"][0]
+    assert result["ok"] is False
+    assert result["status"] == 429
+    assert result["error"] == "HTTP 429"
