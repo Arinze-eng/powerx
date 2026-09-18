@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
@@ -281,6 +282,46 @@ def _resolve_fallback_presets(config: Config, primary: ModelPresetConfig) -> lis
     return presets
 
 
+def _pool_disabled() -> bool:
+    """Whether the admin provider pool must be ignored.
+
+    The pool is opt-in: it only takes effect once the admin has saved at least
+    one entry. Set POWERX_PROVIDER_POOL to a falsey value to force the single
+    configured provider even with entries present.
+    """
+    raw = os.environ.get("POWERX_PROVIDER_POOL")
+    if raw is None or not raw.strip():
+        return False
+    return raw.strip().lower() in {"0", "false", "no", "off"}
+
+
+def make_pool_provider(config: Config, *, preset: ModelPresetConfig) -> LLMProvider | None:
+    """Build a rotating provider over the admin pool, or None when unused."""
+    if _pool_disabled():
+        return None
+    from nanobot.provider_pool import enabled_entries
+
+    entries = enabled_entries()
+    if not entries:
+        return None
+    from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+    from nanobot.providers.pool_provider import PoolProvider
+
+    generation = preset.to_generation_settings()
+    lanes: list[tuple[dict[str, Any], LLMProvider]] = []
+    for entry in entries:
+        lane = OpenAICompatProvider(
+            api_key=str(entry.get("apiKey") or ""),
+            api_base=str(entry.get("baseUrl") or ""),
+            default_model=str(entry.get("model") or preset.model),
+        )
+        lane.generation = generation
+        lanes.append((entry, lane))
+    if not lanes:
+        return None
+    return PoolProvider(lanes, generation=generation)
+
+
 def make_provider(
     config: Config,
     *,
@@ -294,6 +335,9 @@ def make_provider(
     the failover path to create providers for fallback models.
     """
     resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
+    pool_provider = make_pool_provider(config, preset=resolved)
+    if pool_provider is not None:
+        return pool_provider
     provider = _make_provider_core(config, preset=resolved, model=model)
     fallback_presets = _resolve_fallback_presets(config, resolved)
 
