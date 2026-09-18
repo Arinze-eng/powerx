@@ -35,6 +35,15 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 
+try:  # renderer is optional so the tool still loads if it is missing
+    from nanobot.agent.tools.arduino_diagram import (
+        diagram_summary,
+        render_svg,
+    )
+except Exception:  # pragma: no cover - defensive
+    diagram_summary = None  # type: ignore[assignment]
+    render_svg = None  # type: ignore[assignment]
+
 # --------------------------------------------------------------------------- #
 # Paths / constants
 # --------------------------------------------------------------------------- #
@@ -141,7 +150,144 @@ KADUNA_PRICES: dict[str, tuple[int, str]] = {
     "battery": (2000, "Power source"),
 }
 
+#: Board keys that ship a hardware UART we must not steal for IO.
 _SAFETY_PINS_RESERVED = {0, 1}  # UART RX/TX on AVR boards
+
+#: What each board can realistically do on its own. Used to refuse impossible
+#: instructions *before* wiring money is spent, instead of shipping a build that
+#: can never work.
+BOARD_CAPABILITIES: dict[str, dict[str, Any]] = {
+    "uno": {
+        "ram_kb": 2,
+        "has_wifi": False,
+        "has_mic": False,
+        "has_dac": False,
+        "can_do_voice_recognition": False,
+        "can_do_ml": False,
+        "note": "ATmega328P: 2 KB RAM, no network, no audio input.",
+    },
+    "nano": {
+        "ram_kb": 2,
+        "has_wifi": False,
+        "has_mic": False,
+        "has_dac": False,
+        "can_do_voice_recognition": False,
+        "can_do_ml": False,
+        "note": "ATmega328P: 2 KB RAM, no network, no audio input.",
+    },
+    "mega": {
+        "ram_kb": 8,
+        "has_wifi": False,
+        "has_mic": False,
+        "has_dac": False,
+        "can_do_voice_recognition": False,
+        "can_do_ml": False,
+        "note": "ATmega2560: 8 KB RAM, plenty of IO, still no audio front-end.",
+    },
+    "leonardo": {
+        "ram_kb": 2.5,
+        "has_wifi": False,
+        "has_mic": False,
+        "has_dac": False,
+        "can_do_voice_recognition": False,
+        "can_do_ml": False,
+        "note": "ATmega32u4: native USB, 2.5 KB RAM.",
+    },
+    "esp32": {
+        "ram_kb": 520,
+        "has_wifi": True,
+        "has_mic": False,  # needs an external I2S mic
+        "has_dac": True,
+        "can_do_voice_recognition": True,  # with an I2S mic + off-chip or cloud ASR
+        "can_do_ml": True,
+        "note": "520 KB RAM, Wi-Fi/BLE, I2S. Needs an external I2S microphone for audio.",
+    },
+    "esp8266": {
+        "ram_kb": 80,
+        "has_wifi": True,
+        "has_mic": False,
+        "has_dac": False,
+        "can_do_voice_recognition": False,
+        "can_do_ml": False,
+        "note": "80 KB RAM, Wi-Fi. Audio is not practical; use an ESP32 instead.",
+    },
+}
+
+#: Requirement keyword groups, the capability they need, how to satisfy them with
+#: an add-on, and the remedy when neither the board nor an add-on covers it.
+_CAPABILITY_REQUIREMENTS: list[tuple[tuple[str, ...], str, tuple[str, ...], str]] = [
+    (
+        ("voice recognition", "speech recognition", "voice control", "voice command",
+         "say \"", "wake word", "keyword spotting", "speech to text", "voice activated"),
+        "can_do_voice_recognition",
+        ("elechouse", "dfrobot", "voice recognition v3", "voice module", "speech module",
+         "microphone", "i2s", "max9814", "softwareserial", "inmp441", "ics43434",
+         "voice shield", "easyvr"),
+        "Add an offline voice module (Elechouse VR3 / DFRobot Voice Recognition V3) on "
+        "Serial, or move to an ESP32 with an I2S microphone. An Uno has no microphone "
+        "input and only 2 KB of RAM, so recognition must happen off-chip.",
+    ),
+    (
+        ("wifi", "wi-fi", "internet", "cloud", "mqtt", "http request", "telegram", "blynk"),
+        "has_wifi",
+        ("esp-01", "esp01", "esp8266", "esp32", "ethernet", "w5500", "enc28j60",
+         "sim800", "sim7600", "gsm", "nrf24", "wifi module", "wifi shield"),
+        "Add an ESP32/ESP8266 (or an ESP-01 / W5500 shield) for connectivity; the Uno "
+        "has no network interface.",
+    ),
+    (
+        ("machine learning", "tensorflow", "neural network", "image recognition",
+         "face recognition", "camera"),
+        "can_do_ml",
+        ("esp32-s3", "esp32-cam", "esp32cam", "raspberry", "jetson", "openmv", "pixy", "k210"),
+        "Use an ESP32-S3/CAM or a Raspberry Pi. AVR boards cannot run ML models.",
+    ),
+    (
+        ("play music", "audio playback", "mp3", "wav", "speaker output", "sound output"),
+        "has_dac",
+        ("dfplayer", "mp3 module", "sd card", "vs1053", "pam8403", "max98357", "i2s dac"),
+        "Add a DFPlayer Mini + SD card for audio playback; the Uno has no DAC or audio "
+        "output of its own.",
+    ),
+]
+
+
+def capability_check(code: str, board: str, diagram: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    """Refuse requirements the chosen board physically cannot satisfy.
+
+    An add-on module in the diagram or sketch *does* satisfy the requirement
+    (an Uno plus a voice module can absolutely turn pages), so those are treated
+    as satisfied rather than impossible. Only when neither the on-board
+    capability nor a co-processor is present is the build flagged IMPOSSIBLE.
+    """
+    info = BOARD_CAPABILITIES.get(board)
+    if info is None:
+        return []
+
+    code_text = code.lower()
+    diagram_text = json.dumps(diagram).lower() if diagram else ""
+    haystack = code_text + " " + diagram_text
+    label = BOARDS.get(board, {}).get("label", board)
+
+    findings: list[dict[str, str]] = []
+    for keywords, capability, satisfiers, remedy in _CAPABILITY_REQUIREMENTS:
+        if not any(kw in haystack for kw in keywords):
+            continue
+        if info.get(capability):
+            continue
+        if any(tok in haystack for tok in satisfiers):
+            continue  # covered by an add-on module
+        findings.append(
+            {
+                "level": "IMPOSSIBLE",
+                "issue": (
+                    f"'{keywords[0]}' was requested, but {label} cannot do it and no "
+                    f"supporting module is present. {info['note']}"
+                ),
+                "fix": remedy,
+            }
+        )
+    return findings
 
 
 class ArduinoVerificationError(RuntimeError):
@@ -679,8 +825,19 @@ def compile_sketch(code: str, board: str = "uno", workdir: str | None = None) ->
     }
 
 
-def simulate(hex_path: str, ms: int = _DEFAULT_MS, expect: str | None = None) -> dict[str, Any]:
-    """Run firmware on the headless AVR emulator and capture serial + pin activity."""
+def simulate(
+    hex_path: str,
+    ms: int = _DEFAULT_MS,
+    expect: str | None = None,
+    scenario: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run firmware on the headless AVR emulator and capture serial + pin activity.
+
+    ``scenario`` drives inputs during the run (button presses, serial commands)
+    so behaviour is *exercised* rather than assumed:
+    ``{"inputs": [{"pin": 4, "at_ms": 1000, "state": "low", "hold_ms": 200}],
+       "serial_in": [{"at_ms": 500, "bytes": [1]}]}``
+    """
     node = _node_bin()
     if not node:
         return {"ok": False, "log": "node is not installed; cannot run the AVR simulator."}
@@ -693,6 +850,13 @@ def simulate(hex_path: str, ms: int = _DEFAULT_MS, expect: str | None = None) ->
     cmd = [node, str(script), hex_path, "--ms", str(max(100, min(ms, _MAX_MS)))]
     if expect:
         cmd += ["--expect", expect]
+
+    scenario_path: Path | None = None
+    if scenario:
+        scenario_path = Path(hex_path).parent / "scenario.json"
+        scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        cmd += ["--scenario", str(scenario_path)]
+
     rc, out = _run(cmd, timeout=180)
     if rc != 0:
         return {"ok": False, "log": _tail(out, 3000)}
@@ -710,6 +874,8 @@ def simulate(hex_path: str, ms: int = _DEFAULT_MS, expect: str | None = None) ->
     data["active_pins"] = active
     data["serial"] = data.get("serial", "")
     data["ok"] = bool(data.get("serial", "").strip()) or bool(active)
+    if expect is not None:
+        data["ok"] = bool(data["ok"]) and bool(data.get("expect_found"))
     return data
 
 
@@ -720,6 +886,7 @@ def verify(
     expect: str | None = None,
     ms: int = _DEFAULT_MS,
     max_tries: int = _MAX_TRIES,
+    scenario: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Full pipeline: compile -> simulate -> safety -> BOM -> verdict."""
     board = board.lower() if board else "uno"
@@ -731,17 +898,19 @@ def verify(
     attempts = 1
 
     while compile_result["ok"] and attempts <= max(1, max_tries):
-        sim_result = simulate(compile_result["hex"], ms=ms, expect=expect)
+        sim_result = simulate(compile_result["hex"], ms=ms, expect=expect, scenario=scenario)
         if sim_result.get("ok"):
             break
         # Nothing to auto-fix here (wiring/expectation issue) — report honestly.
         break
 
     findings = safety_check(code, board, diagram)
+    findings = capability_check(code, board, diagram) + findings
     bom = build_bom(diagram, board)
     total = sum(item["qty"] * item["unit_price"] for item in bom)
 
     critical = [f for f in findings if f["level"] == "CRITICAL"]
+    impossible = [f for f in findings if f["level"] == "IMPOSSIBLE"]
     compiled = bool(compile_result["ok"])
     simulated = bool(sim_result and sim_result.get("ok"))
     confidence = 0
@@ -753,6 +922,9 @@ def verify(
         confidence += 13
     if expect and sim_result and sim_result.get("expect_found"):
         confidence = min(99, confidence + 2)
+    if impossible:
+        # A board that cannot meet the requirement can never be "safe to buy".
+        confidence = min(confidence, 35)
 
     return {
         "compiled": compiled,
@@ -760,10 +932,13 @@ def verify(
         "compile": compile_result,
         "simulation": sim_result,
         "safety": findings,
+        "impossible": impossible,
         "bom": bom,
         "bom_total_naira": total,
         "confidence_pct": confidence,
         "expect": expect,
+        "scenario": scenario,
+        "diagram_summary": diagram_summary(diagram) if diagram_summary else None,
     }
 
 
@@ -880,7 +1055,7 @@ console.log(JSON.stringify(run(hexPath, ms, expect), null, 2));
         required=["action"],
         action=StringSchema(
             "Arduino verification operation",
-            enum=["build", "compile", "simulate", "safety", "bom", "setup"],
+            enum=["build", "compile", "simulate", "safety", "bom", "diagram", "setup"],
         ),
         code=StringSchema("Full Arduino sketch (.ino) source, including every #include"),
         board=StringSchema(
@@ -891,6 +1066,14 @@ console.log(JSON.stringify(run(hexPath, ms, expect), null, 2));
         expect=StringSchema("Serial text that must appear for the simulation to pass, e.g. 'Servo moving'"),
         ms=IntegerSchema(description="Milliseconds of firmware execution to simulate", minimum=100, maximum=_MAX_MS),
         hex=StringSchema("Firmware .hex path for the simulate action"),
+        scenario=ObjectSchema(
+            description=(
+                "Optional stimulus to DRIVE inputs during simulation instead of "
+                "assuming them: {inputs: [{pin, at_ms, state:'low', hold_ms}], "
+                "serial_in: [{at_ms, bytes:[..]}]}"
+            )
+        ),
+        title=StringSchema("Title shown on a rendered diagram (action=diagram)"),
         install_esp32=BooleanSchema(description="Set true during setup to also install the ESP32 core"),
     )
 )
@@ -946,6 +1129,14 @@ class ArduinoVerifyTool(Tool):
         ms = int(kwargs.get("ms") or _DEFAULT_MS)
         hex_path = str(kwargs.get("hex") or "")
         diagram = kwargs.get("diagram")
+        scenario = kwargs.get("scenario")
+        if isinstance(scenario, str):
+            try:
+                scenario = json.loads(scenario)
+            except ValueError:
+                return ToolResult.error("scenario must be valid JSON.")
+        if not isinstance(scenario, dict):
+            scenario = None
         if isinstance(diagram, str):
             try:
                 diagram = json.loads(diagram)
@@ -982,6 +1173,25 @@ class ArduinoVerifyTool(Tool):
                 total = sum(i["qty"] * i["unit_price"] for i in bom)
                 return json.dumps({"bom": bom, "total_naira": total}, indent=2)
 
+            if action == "diagram":
+                if render_svg is None:
+                    return ToolResult.error("the diagram renderer is not available in this install.")
+                if not diagram:
+                    return ToolResult.error("diagram (parts + connections) is required for action=diagram.")
+                svg = render_svg(
+                    diagram,
+                    title=str(kwargs.get("title") or "Circuit Diagram"),
+                    board=BOARDS.get(board, BOARDS["uno"])["label"],
+                )
+                return json.dumps(
+                    {
+                        "format": "svg",
+                        "svg": svg,
+                        "summary": diagram_summary(diagram) if diagram_summary else None,
+                    },
+                    indent=2,
+                )
+
             # default: full build
             if not code.strip():
                 return ToolResult.error("code is required for the build pipeline.")
@@ -1014,7 +1224,7 @@ class ArduinoVerifyTool(Tool):
                     )
                     return json.dumps(remote, indent=2)
 
-            result = await asyncio.to_thread(verify, code, board, diagram, expect, ms)
+            result = await asyncio.to_thread(verify, code, board, diagram, expect, ms, _MAX_TRIES, scenario)
             result["where"] = "local"
             return json.dumps(result, indent=2)
         except ArduinoVerificationError as exc:
