@@ -12,7 +12,8 @@ PROVIDER_POOL_SECTION = """\
 <p class='hint'>Add up to 40 OpenAI-compatible lanes (base URL + API key + model). The agent rotates
 across the enabled lanes and automatically fails over to the next lane when one returns a rate-limit,
 overload, server or connection error &mdash; so a single key can never rate-limit the whole app.
-Keys stay on the server and are only ever shown masked.</p>
+Keys stay on the server and are only ever shown masked. Saving stores the pool in the Northflank service
+environment &mdash; nothing is written to the database, so no Supabase egress is used.</p>
 <div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.5rem'>
 <label>Base URL<input id='poolBaseUrl' type='url' placeholder='https://example.com/v1'></label>
 <label>API key<input id='poolApiKey' type='password' placeholder='sk-...' autocomplete='off'></label>
@@ -34,6 +35,13 @@ Keys stay on the server and are only ever shown masked.</p>
     var el = $('poolStatus');
     el.textContent = text;
     el.style.color = (ok === false) ? '#fca5a5' : '#a7f3d0';
+  };
+  var sync = function(v){
+    var nf = v && v.northflank;
+    if(!nf){ return; }
+    if(nf.synced){ setStatus('Saved and stored in the Northflank environment.'); }
+    else if(nf.configured){ setStatus('Saved here, but the Northflank sync failed: ' + (nf.error || 'unknown error'), false); }
+    else { setStatus('Saved. Add a Northflank API token to persist it across restarts.'); }
   };
   var esc = function(value){
     return String(value == null ? '' : value).replace(/[&<>"']/g, function(c){
@@ -79,7 +87,7 @@ Keys stay on the server and are only ever shown masked.</p>
       render(v);
       $('poolApiKey').value = '';
       $('poolModel').value = '';
-      setStatus('Entry added.');
+      sync(v);
     }).catch(function(e){ setStatus(e.message, false); });
   };
   $('poolReload').onclick = load;
@@ -98,7 +106,7 @@ Keys stay on the server and are only ever shown masked.</p>
     if(role === 'delete'){
       if(!confirm('Remove this pool entry?')){ return; }
       setStatus('Removing...');
-      req('admin.provider.pool.delete', {id:id}).then(render).then(function(){ setStatus('Entry removed.'); })
+      req('admin.provider.pool.delete', {id:id}).then(function(v){ render(v); sync(v); })
         .catch(function(e){ setStatus(e.message, false); });
     } else if(role === 'test'){
       setStatus('Testing lane...');
@@ -113,7 +121,7 @@ Keys stay on the server and are only ever shown masked.</p>
     if(box.getAttribute('data-role') !== 'enabled'){ return; }
     var id = box.getAttribute('data-id');
     setStatus('Saving...');
-    req('admin.provider.pool.update', {id:id, enabled: box.checked}).then(render).then(function(){ setStatus('Saved.'); })
+    req('admin.provider.pool.update', {id:id, enabled: box.checked}).then(function(v){ render(v); sync(v); })
       .catch(function(e){ setStatus(e.message, false); });
   });
   var init = function(){ load(); };

@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import nanobot.provider_pool as provider_pool
+
+
+@pytest.fixture(autouse=True)
+def _clear_pool_env(monkeypatch):
+    monkeypatch.delenv(provider_pool.POOL_ENV_VAR, raising=False)
 
 
 @pytest.fixture()
@@ -83,3 +90,28 @@ def test_save_is_atomic_no_temp_left(pool_file) -> None:
     assert pool_file.exists()
     leftovers = [p.name for p in pool_file.parent.iterdir() if p.name.endswith(".tmp")]
     assert leftovers == []
+
+
+def test_env_var_is_a_durable_fallback(pool_file, monkeypatch) -> None:
+    monkeypatch.setenv(provider_pool.POOL_ENV_VAR, json.dumps({"entries": [_entry(7)]}))
+    entries = provider_pool.load_pool()
+    assert len(entries) == 1
+    assert entries[0]["label"] == "lane-7"
+
+
+def test_file_cache_wins_over_env(pool_file, monkeypatch) -> None:
+    provider_pool.add_entry(_entry(1))  # writes the on-disk cache
+    monkeypatch.setenv(provider_pool.POOL_ENV_VAR, json.dumps({"entries": [_entry(7)]}))
+    assert provider_pool.load_pool()[0]["label"] == "lane-1"
+
+
+def test_malformed_env_falls_back_to_file(pool_file, monkeypatch) -> None:
+    provider_pool.add_entry(_entry(1))
+    monkeypatch.setenv(provider_pool.POOL_ENV_VAR, "{not json")
+    assert provider_pool.load_pool()[0]["label"] == "lane-1"
+
+
+def test_pool_env_json_round_trips(pool_file) -> None:
+    provider_pool.add_entry(_entry(1))
+    payload = json.loads(provider_pool.pool_env_json())
+    assert payload["entries"][0]["label"] == "lane-1"

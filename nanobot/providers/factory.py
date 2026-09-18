@@ -286,13 +286,13 @@ def _pool_disabled() -> bool:
     """Whether the admin provider pool must be ignored.
 
     The pool is opt-in: it only takes effect once the admin has saved at least
-    one entry. Set POWERX_PROVIDER_POOL to a falsey value to force the single
+    one entry. Set PROVIDER-POOL-DISABLED to a truthy value to force the single
     configured provider even with entries present.
     """
-    raw = os.environ.get("POWERX_PROVIDER_POOL")
+    raw = os.environ.get("PROVIDER-POOL-DISABLED")
     if raw is None or not raw.strip():
         return False
-    return raw.strip().lower() in {"0", "false", "no", "off"}
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def make_pool_provider(config: Config, *, preset: ModelPresetConfig) -> LLMProvider | None:

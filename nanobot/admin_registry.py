@@ -791,18 +791,43 @@ def _provider_pool_section() -> str:
     return provider_pool_section()
 
 
-def _pool_list_response() -> Response:
+def _pool_list_payload() -> dict[str, Any]:
     from nanobot import provider_pool
 
     entries = provider_pool.public_entries()
-    return http_json_response(
-        {
-            "ok": True,
-            "entries": entries,
-            "count": len(entries),
-            "max": provider_pool.MAX_POOL_ENTRIES,
-        }
-    )
+    return {
+        "ok": True,
+        "entries": entries,
+        "count": len(entries),
+        "max": provider_pool.MAX_POOL_ENTRIES,
+    }
+
+
+def _pool_list_response() -> Response:
+    return http_json_response(_pool_list_payload())
+
+
+def _pool_sync_northflank() -> dict[str, Any]:
+    """Persist the current pool into the Northflank service environment.
+
+    No database is involved, so nothing is billed as Supabase egress.
+    """
+    from nanobot import northflank_env, provider_pool
+
+    if not northflank_env.configured():
+        return {"configured": False, "synced": False}
+    try:
+        northflank_env.set_env_var(provider_pool.POOL_ENV_VAR, provider_pool.pool_env_json())
+    except northflank_env.NorthflankError as exc:
+        logger.warning("Provider pool did not reach the Northflank environment: {}", exc)
+        return {"configured": True, "synced": False, "error": str(exc)}
+    return {"configured": True, "synced": True}
+
+
+def _pool_mutation_response() -> Response:
+    payload = _pool_list_payload()
+    payload["northflank"] = _pool_sync_northflank()
+    return http_json_response(payload)
 
 
 def _pool_add_response(payload: dict[str, Any]) -> Response:
@@ -819,7 +844,7 @@ def _pool_add_response(payload: dict[str, Any]) -> Response:
         )
     except ValueError as exc:
         return http_error(400, str(exc))
-    return _pool_list_response()
+    return _pool_mutation_response()
 
 
 def _pool_delete_response(payload: dict[str, Any]) -> Response:
@@ -830,7 +855,7 @@ def _pool_delete_response(payload: dict[str, Any]) -> Response:
         return http_error(400, "id is required")
     if not provider_pool.remove_entry(entry_id):
         return http_error(404, "Pool entry not found")
-    return _pool_list_response()
+    return _pool_mutation_response()
 
 
 def _pool_update_response(payload: dict[str, Any]) -> Response:
@@ -852,7 +877,7 @@ def _pool_update_response(payload: dict[str, Any]) -> Response:
         provider_pool.update_entry(entry_id, changes)
     except ValueError as exc:
         return http_error(400, str(exc))
-    return _pool_list_response()
+    return _pool_mutation_response()
 
 
 def _pool_test_one(entry: dict[str, Any]) -> dict[str, Any]:

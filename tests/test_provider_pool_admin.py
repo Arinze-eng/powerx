@@ -6,8 +6,17 @@ import base64
 import json
 from types import SimpleNamespace
 
+import pytest
+
 import nanobot.admin_registry as admin_registry
+import nanobot.northflank_env as northflank_env
 import nanobot.provider_pool as provider_pool
+
+
+@pytest.fixture(autouse=True)
+def _isolate_env(monkeypatch):
+    monkeypatch.delenv(provider_pool.POOL_ENV_VAR, raising=False)
+    monkeypatch.delenv(northflank_env.TOKEN_VAR, raising=False)
 
 
 def _request(path: str, *, payload: dict | None = None, password: str = "nethunter") -> SimpleNamespace:
@@ -140,3 +149,51 @@ def test_pool_test_route_builds_request(monkeypatch, tmp_path) -> None:
     assert result["response"] == "OK"
     assert captured["url"] == "https://api.example.com/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer sk-abcdefghijklmnop"
+
+
+def test_pool_save_syncs_to_northflank(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setenv("PROVIDER_POOL_PATH", str(tmp_path / "pool.json"))
+    monkeypatch.setenv(northflank_env.TOKEN_VAR, "nf-test-token")
+
+    synced: dict = {}
+
+    def _fake_set(name, value):
+        synced["name"] = name
+        synced["value"] = value
+        return {name: value}
+
+    monkeypatch.setattr(northflank_env, "set_env_var", _fake_set)
+
+    response = admin_registry.admin_route(
+        _request(
+            "/api/admin/provider-pool/add",
+            payload={
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-abcdefghijklmnop",
+                "model": "gpt-4o-mini",
+            },
+        ),
+        "/api/admin/provider-pool/add",
+    )
+    body = _json(response)
+    assert body["northflank"] == {"configured": True, "synced": True}
+    assert synced["name"] == provider_pool.POOL_ENV_VAR
+    assert "sk-abcdefghijklmnop" in synced["value"]
+
+
+def test_pool_save_reports_when_northflank_unconfigured(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setenv("PROVIDER_POOL_PATH", str(tmp_path / "pool.json"))
+    response = admin_registry.admin_route(
+        _request(
+            "/api/admin/provider-pool/add",
+            payload={
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-abcdefghijklmnop",
+                "model": "gpt-4o-mini",
+            },
+        ),
+        "/api/admin/provider-pool/add",
+    )
+    assert _json(response)["northflank"] == {"configured": False, "synced": False}

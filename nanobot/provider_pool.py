@@ -24,6 +24,13 @@ from urllib.parse import urlsplit
 
 MAX_POOL_ENTRIES = 40
 
+#: Environment variable carrying the whole pool as JSON. The admin panel writes
+#: it onto the Northflank service, so the pool survives restarts and redeploys
+#: without any database round-trip (no Supabase egress). Northflank only allows
+#: letters, numbers, hyphens, dots and slashes in a variable name, hence the
+#: hyphens rather than underscores.
+POOL_ENV_VAR = "PROVIDER-POOL-JSON"
+
 _MAX_API_BASE = 2048
 _MAX_API_KEY = 4096
 _MAX_MODEL_ID = 512
@@ -33,10 +40,11 @@ _LOCK = threading.RLock()
 
 
 def data_dir() -> Path:
-    """Directory the runtime config lives in (also holds the pool file)."""
-    configured = os.getenv("NANOBOT_DATA_DIR", "").strip()
-    if configured:
-        return Path(configured).expanduser()
+    """Directory holding the pool file (``POWERX_DATA_DIR`` on Northflank)."""
+    for name in ("POWERX_DATA_DIR", "NANOBOT_DATA_DIR"):
+        configured = os.getenv(name, "").strip()
+        if configured:
+            return Path(configured).expanduser()
     return Path(os.getenv("HOME", ".")) / ".nanobot"
 
 
@@ -96,19 +104,12 @@ def _clean(raw: dict[str, Any], *, entry_id: str | None = None) -> dict[str, Any
     }
 
 
-def load_pool() -> list[dict[str, Any]]:
-    """Return the stored entries (empty list when absent or unreadable)."""
-    path = pool_path()
-    with _LOCK:
-        if not path.exists():
-            return []
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
+def _rows(payload: Any) -> list[Any] | None:
     rows = payload.get("entries") if isinstance(payload, dict) else payload
-    if not isinstance(rows, list):
-        return []
+    return rows if isinstance(rows, list) else None
+
+
+def _normalise(rows: list[Any]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -118,6 +119,50 @@ def load_pool() -> list[dict[str, Any]]:
         except ValueError:
             continue
     return entries[:MAX_POOL_ENTRIES]
+
+
+def env_entries() -> list[dict[str, Any]] | None:
+    """Entries from :data:`POOL_ENV_VAR`, or None when unset or malformed."""
+    raw = os.getenv(POOL_ENV_VAR, "").strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return None
+    rows = _rows(payload)
+    if rows is None:
+        return None
+    return _normalise(rows)
+
+
+def load_pool() -> list[dict[str, Any]]:
+    """Return the stored entries.
+
+    The on-disk cache (the live copy the admin panel rewrites) wins, and the
+    Northflank-injected environment variable is the durable fallback that
+    survives restarts and redeploys.
+    """
+    path = pool_path()
+    payload: Any = None
+    with _LOCK:
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                payload = None
+    if payload is not None:
+        rows = _rows(payload)
+        if rows is not None:
+            return _normalise(rows)
+    from_env = env_entries()
+    return from_env if from_env is not None else []
+
+
+def pool_env_json(entries: list[dict[str, Any]] | None = None) -> str:
+    """Serialise the pool for the environment variable."""
+    rows = load_pool() if entries is None else _normalise(entries)
+    return json.dumps({"entries": rows}, separators=(",", ":"))
 
 
 def save_pool(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -132,6 +177,9 @@ def save_pool(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         with suppress(OSError):
             os.chmod(temp, 0o600)
         os.replace(temp, path)
+    # Mirror into the process environment so this instance reads the new pool
+    # immediately; the durable copy lives on the Northflank service.
+    os.environ[POOL_ENV_VAR] = json.dumps({"entries": cleaned}, separators=(",", ":"))
     return cleaned
 
 
