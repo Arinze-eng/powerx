@@ -12,6 +12,8 @@ rate-limiting the whole agent.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import threading
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -81,6 +83,36 @@ _FAILOVER_TOKENS = (
     "billing",
 )
 
+# Hard ceiling on how long a single lane may hold the whole request.
+#
+# This is the fix for "the backup lane is never used, it just hangs". A lane
+# whose host does not resolve, black-holes the connection, or accepts the socket
+# and then never replies produced NO error at all, so `_should_failover` had
+# nothing to act on: the pool awaited that first lane forever and never reached
+# the backup. The per-provider timeout cannot cover this, because the stream
+# idle timeout is 1800s by default, the request timeout is 120s, and the layer
+# above retries the *same* lane several times before giving up.
+#
+# Raising this guards the "everything is genuinely slow" case; the default is
+# deliberately well inside a user's patience so a dead primary fails over fast.
+DEFAULT_LANE_TIMEOUT_S = 45.0
+LANE_TIMEOUT_ENV = "PROVIDER_POOL_LANE_TIMEOUT_S"
+
+
+def _lane_timeout_s() -> float | None:
+    """Per-lane wall-clock budget, or None to disable the guard entirely."""
+    raw = os.environ.get(LANE_TIMEOUT_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_LANE_TIMEOUT_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_LANE_TIMEOUT_S
+    if value <= 0:
+        # Explicit opt-out for anyone who wants the old unbounded behaviour.
+        return None
+    return value
+
 
 class PoolProvider(LLMProvider):
     """Rotate chat requests across pool lanes, failing over on transient errors."""
@@ -128,6 +160,34 @@ class PoolProvider(LLMProvider):
                 return True
         return False
 
+    async def _call_lane(
+        self,
+        call: Callable[[], Awaitable[LLMResponse]],
+        entry: dict[str, Any],
+    ) -> LLMResponse:
+        """Await one lane's call under a wall-clock budget.
+
+        A lane that never answers is treated as a lane failure so the loop can
+        move on to the next one. Without this the pool awaited a black-holed
+        endpoint indefinitely and the caller saw no response at all rather than
+        a failover.
+        """
+        timeout = _lane_timeout_s()
+        if timeout is None:
+            return await call()
+        try:
+            return await asyncio.wait_for(call(), timeout=timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            label = entry.get("label") or entry.get("id") or entry.get("baseUrl") or "lane"
+            return LLMResponse(
+                content=None,
+                finish_reason="error",
+                error_kind="timeout",
+                error_type="lane_timeout",
+                error_code=f"lane_timeout:{label}:{timeout:g}s",
+                error_should_retry=True,
+            )
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -140,14 +200,17 @@ class PoolProvider(LLMProvider):
     ) -> LLMResponse:
         last: LLMResponse | None = None
         for entry, provider in self._order():
-            response = await provider.chat(
-                messages=messages,
-                tools=tools,
-                model=entry.get("model") or model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                reasoning_effort=reasoning_effort,
-                tool_choice=tool_choice,
+            response = await self._call_lane(
+                lambda p=provider, e=entry: p.chat(
+                    messages=messages,
+                    tools=tools,
+                    model=e.get("model") or model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                    tool_choice=tool_choice,
+                ),
+                entry,
             )
             if not self._should_failover(response):
                 return response
@@ -177,17 +240,20 @@ class PoolProvider(LLMProvider):
                 await on_content_delta(delta)
 
         for entry, provider in self._order():
-            response = await provider.chat_stream(
-                messages=messages,
-                tools=tools,
-                model=entry.get("model") or model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                reasoning_effort=reasoning_effort,
-                tool_choice=tool_choice,
-                on_content_delta=_track,
-                on_thinking_delta=on_thinking_delta,
-                on_tool_call_delta=on_tool_call_delta,
+            response = await self._call_lane(
+                lambda p=provider, e=entry: p.chat_stream(
+                    messages=messages,
+                    tools=tools,
+                    model=e.get("model") or model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                    tool_choice=tool_choice,
+                    on_content_delta=_track,
+                    on_thinking_delta=on_thinking_delta,
+                    on_tool_call_delta=on_tool_call_delta,
+                ),
+                entry,
             )
             # Never rotate after output has reached the user: a retry would duplicate it.
             if streamed or not self._should_failover(response):

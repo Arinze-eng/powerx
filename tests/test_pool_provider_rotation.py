@@ -226,6 +226,96 @@ def test_stream_fails_over_on_auth_error_before_output() -> None:
     assert second[1].calls == 1
 
 
+def test_dead_lane_fails_over_instead_of_hanging() -> None:
+    """The core bug: a lane that never answers must not block the backup.
+
+    A host that does not resolve, or that accepts the socket and never replies,
+    produces no error at all. Before the per-lane timeout the pool awaited that
+    lane forever, so the user saw "no response" and the backup key was never
+    tried.
+    """
+    import asyncio as _asyncio
+    import os
+
+    os.environ["PROVIDER_POOL_LANE_TIMEOUT_S"] = "0.2"
+
+    class _NeverAnswers(_FakeProvider):
+        async def chat(self, messages, **kwargs):  # type: ignore[override]
+            self.calls += 1
+            await _asyncio.sleep(30)
+            return LLMResponse(content="too late")
+
+    first = ({"id": "a", "model": "m-a"}, _NeverAnswers("a"))
+    second = _lane("b", [LLMResponse(content="b-answer")])
+    pool = _provider(first, second)
+    try:
+        response = _asyncio.run(pool.chat(_MESSAGES))
+        assert response.content == "b-answer"
+        assert first[1].calls == 1, "the dead lane should have been tried once"
+        assert second[1].calls == 1, "the backup lane must be reached"
+    finally:
+        os.environ.pop("PROVIDER_POOL_LANE_TIMEOUT_S", None)
+
+
+def test_lane_timeout_is_reported_as_a_failover_error() -> None:
+    import asyncio as _asyncio
+    import os
+
+    os.environ["PROVIDER_POOL_LANE_TIMEOUT_S"] = "0.2"
+
+    class _NeverAnswers(_FakeProvider):
+        async def chat(self, messages, **kwargs):  # type: ignore[override]
+            self.calls += 1
+            await _asyncio.sleep(30)
+            return LLMResponse(content="too late")
+
+    only = ({"id": "a", "label": "Key one", "model": "m-a"}, _NeverAnswers("a"))
+    pool = PoolProvider([only])
+    try:
+        response = _asyncio.run(pool.chat(_MESSAGES))
+        assert response.content is None
+        assert response.error_kind == "timeout"
+        assert response.error_type == "lane_timeout"
+    finally:
+        os.environ.pop("PROVIDER_POOL_LANE_TIMEOUT_S", None)
+
+
+def test_lane_timeout_can_be_disabled() -> None:
+    # A non-positive value restores the old unbounded behaviour on purpose.
+    import os
+
+    os.environ["PROVIDER_POOL_LANE_TIMEOUT_S"] = "0"
+    try:
+        from nanobot.providers.pool_provider import _lane_timeout_s
+
+        assert _lane_timeout_s() is None
+    finally:
+        os.environ.pop("PROVIDER_POOL_LANE_TIMEOUT_S", None)
+
+
+def test_stream_dead_lane_fails_over_before_output() -> None:
+    import asyncio as _asyncio
+    import os
+
+    os.environ["PROVIDER_POOL_LANE_TIMEOUT_S"] = "0.2"
+
+    class _NeverAnswers(_FakeProvider):
+        async def chat_stream(self, messages, **kwargs):  # type: ignore[override]
+            self.calls += 1
+            await _asyncio.sleep(30)
+            return LLMResponse(content="too late")
+
+    first = ({"id": "a", "model": "m-a"}, _NeverAnswers("a"))
+    second = _lane("b", [LLMResponse(content="b-answer")])
+    pool = _provider(first, second)
+    try:
+        response = _asyncio.run(pool.chat_stream(_MESSAGES))
+        assert response.content == "b-answer"
+        assert second[1].calls == 1
+    finally:
+        os.environ.pop("PROVIDER_POOL_LANE_TIMEOUT_S", None)
+
+
 def test_empty_pool_reports_a_connection_error() -> None:
     pool = PoolProvider([])
     response = asyncio.run(pool.chat(_MESSAGES))
