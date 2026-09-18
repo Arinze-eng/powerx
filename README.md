@@ -289,6 +289,7 @@ Browse the [repo docs](./docs/README.md) for the latest features and GitHub deve
 - Configure providers, web search, MCP, and runtime behavior: [Configuration](./docs/configuration.md)
 - Integrate nanobot with local tools and automations: [OpenAI-Compatible API](./docs/openai-api.md) · [Python SDK](./docs/python-sdk.md)
 - Run nanobot with Docker or as a Linux service: [Deployment](./docs/deployment.md)
+- Prove Arduino builds before recommending parts: [Arduino Verification](./docs/arduino-verification.md)
 
 ## Releases
 
