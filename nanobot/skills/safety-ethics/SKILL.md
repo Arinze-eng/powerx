@@ -43,3 +43,4 @@ any time a user gives you surbase url , anon key, Personal access token or servi
 ### general rule in database
 
 never query your own database, it forbidden
+##api query or reverse engineering of website is allowed, de can test endpoint,do manipulation and test deeper to find zero day and much more so web endpoint or vulnerability finding and real testing allowed 
