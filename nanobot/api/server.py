@@ -553,6 +553,7 @@ async def handle_version(request: web.Request) -> web.Response:
     from nanobot.agent import tool_middleware as _tm
     from nanobot.agent import task_cache as _rc
     from nanobot.agent.deterministic_router import router_enabled as _router_enabled
+    from nanobot.agent.shape_router import shape_router_enabled as _shape_enabled
 
     git_sha = os.environ.get("GIT_SHA") or os.environ.get("COMMIT_SHA") or ""
     if not git_sha:
@@ -575,6 +576,9 @@ async def handle_version(request: web.Request) -> web.Response:
                 "tool_middleware": _tm.middleware_enabled(),
                 "replay_cache": _rc.replay_cache_enabled(),
                 "deterministic_router": bool(_router_enabled()),
+                # Lever-A steering layer. Its presence here is itself the
+                # build-identity signal: an older image cannot report this key.
+                "shape_router": bool(_shape_enabled()),
             },
         }
     )

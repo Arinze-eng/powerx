@@ -293,10 +293,15 @@ def _deployment_identity() -> dict[str, Any]:
         from nanobot.agent import tool_middleware as _tm
         from nanobot.agent.deterministic_router import router_enabled as _router_enabled
 
+        from nanobot.agent.shape_router import shape_router_enabled as _shape_enabled
+
         cost_layers = {
             "plan_cache": bool(_pc.plan_cache_enabled()),
             "tool_middleware": bool(_tm.middleware_enabled()),
             "deterministic_router": bool(_router_enabled()),
+            # Lever-A steering layer. Its presence here is itself the build-identity
+            # signal: an older image cannot report this key at all.
+            "shape_router": bool(_shape_enabled()),
         }
     except Exception:  # pragma: no cover - identity must never 500
         pass
