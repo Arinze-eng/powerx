@@ -807,30 +807,67 @@ def _pool_list_response() -> Response:
     return http_json_response(_pool_list_payload())
 
 
+_POOL_SYNC_LOCK = threading.Lock()
+_POOL_SYNC_LAST: dict[str, str] = {"value": ""}
+
+
 def _pool_sync_northflank() -> dict[str, Any]:
     """Persist the current pool into the Northflank service environment.
 
     No database is involved, so nothing is billed as Supabase egress.
+
+    Patching ``runtimeEnvironment`` makes Northflank roll the service, which
+    wipes the gateway's in-memory token store. Doing that on every mutation —
+    including no-op ones such as re-saving an unchanged lane, or the admin
+    clicking around while testing — is what produced the intermittent
+    "Admin session expired" errors and the 503s while the container was being
+    replaced. So the patch is skipped entirely when the serialised pool has not
+    actually changed since the last successful sync.
     """
     from nanobot import northflank_env, provider_pool
 
     if not northflank_env.configured():
         return {"configured": False, "synced": False}
+
+    serialised = provider_pool.pool_env_json()
+    with _POOL_SYNC_LOCK:
+        if serialised == _POOL_SYNC_LAST["value"]:
+            # Identical value: patching would restart the service for nothing.
+            return {"configured": True, "synced": True, "skipped": "unchanged"}
+
     try:
-        northflank_env.set_env_var(provider_pool.POOL_ENV_VAR, provider_pool.pool_env_json())
+        northflank_env.set_env_var(provider_pool.POOL_ENV_VAR, serialised)
     except northflank_env.NorthflankError as exc:
         logger.warning("Provider pool did not reach the Northflank environment: {}", exc)
         return {"configured": True, "synced": False, "error": str(exc)}
+    with _POOL_SYNC_LOCK:
+        _POOL_SYNC_LAST["value"] = serialised
     return {"configured": True, "synced": True}
 
 
-def _pool_mutation_response() -> Response:
+def _pool_mutation_response(refresh_runtime_config: Callable[[], Any] | None = None) -> Response:
     payload = _pool_list_payload()
     payload["northflank"] = _pool_sync_northflank()
+    # Adding/updating/deleting a lane must take effect in the running gateway.
+    # Without this the pool was persisted (and pushed to the Northflank env)
+    # but the in-process provider resolution kept serving the old single
+    # provider until the next restart, so a freshly added backup lane looked
+    # like it "did nothing".
+    if refresh_runtime_config is not None:
+        try:
+            refresh_runtime_config()
+        except Exception as exc:  # noqa: BLE001 - a refresh failure must not lose the save
+            logger.warning("Provider pool saved but runtime refresh failed: {}", type(exc).__name__)
+            payload["runtimeRefreshed"] = False
+        else:
+            payload["runtimeRefreshed"] = True
     return http_json_response(payload)
 
 
-def _pool_add_response(payload: dict[str, Any]) -> Response:
+def _pool_add_response(
+    payload: dict[str, Any],
+    refresh_runtime_config: Callable[[], Any] | None = None,
+) -> Response:
     from nanobot import provider_pool
 
     try:
@@ -844,10 +881,13 @@ def _pool_add_response(payload: dict[str, Any]) -> Response:
         )
     except ValueError as exc:
         return http_error(400, str(exc))
-    return _pool_mutation_response()
+    return _pool_mutation_response(refresh_runtime_config)
 
 
-def _pool_delete_response(payload: dict[str, Any]) -> Response:
+def _pool_delete_response(
+    payload: dict[str, Any],
+    refresh_runtime_config: Callable[[], Any] | None = None,
+) -> Response:
     from nanobot import provider_pool
 
     entry_id = _text(payload, "id", maximum=64)
@@ -855,10 +895,13 @@ def _pool_delete_response(payload: dict[str, Any]) -> Response:
         return http_error(400, "id is required")
     if not provider_pool.remove_entry(entry_id):
         return http_error(404, "Pool entry not found")
-    return _pool_mutation_response()
+    return _pool_mutation_response(refresh_runtime_config)
 
 
-def _pool_update_response(payload: dict[str, Any]) -> Response:
+def _pool_update_response(
+    payload: dict[str, Any],
+    refresh_runtime_config: Callable[[], Any] | None = None,
+) -> Response:
     from nanobot import provider_pool
 
     entry_id = _text(payload, "id", maximum=64)
@@ -877,16 +920,55 @@ def _pool_update_response(payload: dict[str, Any]) -> Response:
         provider_pool.update_entry(entry_id, changes)
     except ValueError as exc:
         return http_error(400, str(exc))
-    return _pool_mutation_response()
+    return _pool_mutation_response(refresh_runtime_config)
+
+
+def _pool_test_error_detail(response: "httpx.Response") -> str:
+    """Extract a human-usable reason from a failed probe.
+
+    Providers report the useful part in the JSON body (``error.message``) or in
+    the raw text. Returning only ``HTTP 401`` hid *why* a lane failed, so admins
+    could not tell a bad key from an out-of-credit account from a wrong model id.
+    """
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 - non-JSON error pages are common
+        body = None
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            for key in ("message", "code", "type"):
+                value = error.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()[:200]
+        if isinstance(error, str) and error.strip():
+            return error.strip()[:200]
+        for key in ("message", "detail", "error_description"):
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:200]
+    try:
+        text = (response.text or "").strip()
+    except Exception:  # noqa: BLE001 - response stubs may not expose text
+        text = ""
+    return text[:200] if text else f"HTTP {response.status_code}"
 
 
 def _pool_test_one(entry: dict[str, Any]) -> dict[str, Any]:
-    api_base = str(entry.get("baseUrl") or "")
+    api_base = str(entry.get("baseUrl") or "").rstrip("/")
     model = str(entry.get("model") or "")
     api_key = str(entry.get("apiKey") or "")
+    entry_id = entry.get("id")
     started = time.monotonic()
+
+    if not api_base:
+        return {"id": entry_id, "ok": False, "status": None, "latencyMs": 0, "error": "base URL is empty"}
+
     try:
-        with httpx.Client(timeout=20.0, follow_redirects=False) as client:
+        # Bounded timeout on purpose: an unreachable or black-holing lane must
+        # fail its own probe, not stall the whole "Test all" request until the
+        # socket times out and the admin sees a 503.
+        with httpx.Client(timeout=httpx.Timeout(12.0, connect=6.0), follow_redirects=False) as client:
             response = _request_with_auth_fallback(
                 lambda headers: client.post(
                     f"{api_base}/chat/completions",
@@ -903,20 +985,33 @@ def _pool_test_one(entry: dict[str, Any]) -> dict[str, Any]:
         latency_ms = int((time.monotonic() - started) * 1000)
         if response.status_code >= 400:
             return {
-                "id": entry.get("id"),
+                "id": entry_id,
                 "ok": False,
                 "status": response.status_code,
                 "latencyMs": latency_ms,
-                "error": f"HTTP {response.status_code}",
+                "error": _pool_test_error_detail(response),
             }
-        body = response.json()
+        try:
+            body = response.json()
+        except Exception:  # noqa: BLE001 - some gateways reply 200 with junk
+            return {
+                "id": entry_id,
+                "ok": False,
+                "status": response.status_code,
+                "latencyMs": latency_ms,
+                "error": "Endpoint replied 200 but the body was not JSON",
+            }
         choice = body.get("choices", [{}])[0] if isinstance(body, dict) else {}
         message = choice.get("message", {}) if isinstance(choice, dict) else {}
         content = str(message.get("content") or "").strip()[:200] if isinstance(message, dict) else ""
-        return {"id": entry.get("id"), "ok": True, "status": response.status_code, "latencyMs": latency_ms, "response": content}
-    except (httpx.HTTPError, ValueError) as exc:
+        return {"id": entry_id, "ok": True, "status": response.status_code, "latencyMs": latency_ms, "response": content}
+    except Exception as exc:  # noqa: BLE001
+        # Deliberately broad. This runs inside a ThreadPoolExecutor whose
+        # results feed the HTTP response, so any escaping exception aborts the
+        # whole request and the admin sees "503" instead of one failed lane.
         latency_ms = int((time.monotonic() - started) * 1000)
-        return {"id": entry.get("id"), "ok": False, "status": None, "latencyMs": latency_ms, "error": type(exc).__name__}
+        detail = str(exc).strip()[:200] or type(exc).__name__
+        return {"id": entry_id, "ok": False, "status": None, "latencyMs": latency_ms, "error": detail}
 
 
 def _pool_test_response(payload: dict[str, Any]) -> Response:
@@ -935,8 +1030,12 @@ def _pool_test_response(payload: dict[str, Any]) -> Response:
     from concurrent.futures import ThreadPoolExecutor
 
     workers = max(1, min(8, len(targets)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(_pool_test_one, targets))
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(_pool_test_one, targets))
+    except Exception as exc:  # noqa: BLE001 - never let the pool turn into a 503
+        logger.warning("Provider pool test failed: {}", type(exc).__name__)
+        return http_error(502, f"Provider test failed: {type(exc).__name__}")
     return http_json_response({"ok": True, "results": results})
 
 
@@ -961,7 +1060,7 @@ def _pool_models_response(payload: dict[str, Any]) -> Response:
     if not base_url:
         return http_error(400, "Enter the base URL to load its models")
     try:
-        with httpx.Client(timeout=20.0, follow_redirects=False) as client:
+        with httpx.Client(timeout=httpx.Timeout(12.0, connect=6.0), follow_redirects=False) as client:
             response = _request_with_auth_fallback(
                 lambda headers: client.get(f"{base_url}/models", headers=headers),
                 api_key,
@@ -995,7 +1094,7 @@ def _admin_page(rows: list[dict[str, Any]]) -> str:
         for row in rows
     )
     return f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Nanobot Admin</title><style>body{{font-family:system-ui,sans-serif;background:#0b1020;color:#eef2ff;margin:2rem;max-width:1100px}}section{{background:#121a31;border:1px solid #2a3557;border-radius:12px;padding:1.2rem;margin:1rem 0}}table{{border-collapse:collapse;width:100%;background:#121a31}}th,td{{padding:.7rem;border:1px solid #2a3557;text-align:left}}th{{color:#93c5fd}}input,select,textarea{{box-sizing:border-box;width:100%;padding:.65rem;border-radius:7px;border:1px solid #46557e;background:#0b1020;color:#eef2ff;margin:.25rem 0 .7rem}}button{{padding:.65rem .9rem;border:0;border-radius:7px;background:#2563eb;color:white;cursor:pointer;margin:.25rem .4rem .25rem 0}}button.secondary{{background:#334155}}#status{{min-height:1.4rem;color:#a7f3d0;white-space:pre-wrap}}.hint{{color:#aab6d3;font-size:.9rem}}code{{color:#a7f3d0}}@media (max-width:680px){{body{{margin:.5rem;max-width:none}}section{{padding:.75rem;border-radius:8px}}button{{width:100%;margin:.25rem 0}}label{{display:block}}table{{font-size:.78rem;min-width:680px}}#dbqRowsView,#dbqSchemaView{{-webkit-overflow-scrolling:touch}}pre{{font-size:.78rem;max-height:20rem;overflow:auto;white-space:pre-wrap;word-break:break-word}}}}</style></head><body><h1>Nanobot Admin</h1><section><h2>Provider settings</h2><p class='hint'>Update the OpenAI-compatible API base URL, API key, and model ID. The API key is never displayed after saving.</p><label>API base URL<input id='apiBase' type='url' placeholder='https://example.com/v1'></label><label>API key<input id='apiKey' type='password' placeholder='Leave blank to keep the current key'></label><label>Model ID<input id='model' list='modelList' placeholder='gemini-3.1-flash-lite'><datalist id='modelList'></datalist></label><button id='loadModels' class='secondary'>Load models</button><button id='testProvider'>Test connection</button><button id='saveProvider'>Save settings</button><p id='status'></p></section>{_provider_pool_section()}{_execution_admin_section()}{_dbq_admin_section()}<section><h2>Supabase users, credits and payments</h2><p class='hint'>This view reads the existing Supabase <code>profiles</code>, <code>telegram_accounts</code>, and <code>payment_claims</code> tables. Credit changes use the database-backed ledger path.</p><button id='refreshSupabase' class='secondary'>Load database users</button><div style='overflow:auto;margin-top:1rem'><table><thead><tr><th>User ID</th><th>Name / email</th><th>Role</th><th>Status</th><th>Credits</th><th>Last seen</th><th>Questions</th><th>Telegram</th></tr></thead><tbody id='supabaseRows'><tr><td colspan='8'>Click Load database users.</td></tr></tbody></table></div><label>Selected user ID<input id='supabaseUserId' placeholder='UUID from the table'></label><label>Grant credits<input id='grantAmount' type='number' min='1' max='1000000' value='1000'></label><label><input id='blockState' type='checkbox'> Block selected user</label><button id='grantCredits'>Grant credits</button><button id='blockUser' class='secondary'>Block / unblock selected user</button><button id='deleteUser' class='secondary'>Delete selected user</button><h3>Announcement</h3><label>Title<input id='announcementTitle' value='Nanobot announcement'></label><label>Message<textarea id='announcementMessage' rows='3' placeholder='Message shown to users'></textarea></label><button id='sendAnnouncement'>Publish announcement</button><h3>Payment claims</h3><button id='loadPayments' class='secondary'>Load payment claims</button><pre id='paymentRows' class='hint'>No payment claims loaded.</pre></section><section><h2>Telegram user questions</h2><p class='hint'>Recent task instructions captured from Telegram. Credentials and token-like values are redacted before storage.</p><button id='loadQuestions' class='secondary'>Load question history</button><pre id='questionRows' class='hint'>No question history loaded.</pre></section><section><h2>WebUI user questions</h2><p class='hint'>Questions asked by users on the WebUI website, with their name/email and the type/category of each question.</p><button id='loadWebuiQuestions' class='secondary'>Load WebUI question history</button><pre id='webuiQuestionRows' class='hint'>No WebUI question history loaded.</pre></section><section><h2>APK users &mdash; last seen &amp; questions</h2><p class='hint'>Mobile (APK) users connect through the same gateway as the WebUI, so their presence lands in the same tables. Last seen is rendered in West Africa Time (WAT, UTC+1). Each question shows its source channel (apk / webui); APK clients tag themselves automatically.</p><button id='loadApkUsers' class='secondary'>Load APK users</button><div style='overflow:auto;margin-top:1rem'><table><thead><tr><th>User</th><th>Last seen (WAT)</th><th>Questions</th><th>Recent questions</th></tr></thead><tbody id='apkRows'><tr><td colspan='4'>Click Load APK users.</td></tr></tbody></table></div></section><section><h2>Telegram users</h2><p>Telegram users recorded: <strong>{len(rows)}</strong></p><table><thead><tr><th>Username</th><th>Name</th><th>Telegram ID</th><th>Last seen</th><th>Messages</th></tr></thead><tbody>{body_rows or '<tr><td colspan="5">No users recorded yet.</td></tr>'}</tbody></table><p class='hint'><code>GET /api/admin/users</code> is available with the same Basic Auth credentials.</p></section><script>(()=>{{const $=id=>document.getElementById(id);const status=(text,ok=true)=>{{$('status').textContent=text;$('status').style.color=ok?'#a7f3d0':'#fca5a5';}};const fmtWAT=(v)=>{{if(!v)return '—';const d=new Date(v);if(isNaN(d.getTime()))return String(v);const w=new Date(d.getTime()+60*60*1000);const p=n=>String(n).padStart(2,'0');return `${{w.getUTCFullYear()}}-${{p(w.getUTCMonth()+1)}}-${{p(w.getUTCDate())}} ${{p(w.getUTCHours())}}:${{p(w.getUTCMinutes())}} WAT`;}};
-let socket=null;const pending=new Map();const request=(action,payload={{}})=>new Promise(async(resolve,reject)=>{{try{{if(!socket||socket.readyState!==1){{const boot=await fetch('/api/admin/ws-bootstrap',{{cache:'no-store'}}).then(r=>r.ok?r.json():Promise.reject(new Error('Admin session expired')));const scheme=location.protocol==='https:'?'wss':'ws';socket=new WebSocket(`${{scheme}}://${{location.host}}${{boot.ws_path}}?token=${{encodeURIComponent(boot.token)}}&client_id=admin`);socket.onmessage=e=>{{const msg=JSON.parse(e.data);if(msg.event==='webui_response'&&pending.has(msg.request_id)){{const p=pending.get(msg.request_id);pending.delete(msg.request_id);msg.ok?p.resolve(msg.result):p.reject(new Error(msg.error?.message||'Admin request failed'));}}}};socket.onclose=()=>{{for(const p of pending.values())p.reject(new Error('The admin socket closed before a reply arrived.'));pending.clear();}};socket.onerror=()=>{{for(const p of pending.values())p.reject(new Error('Admin socket failed'));pending.clear();}};await new Promise((res,rej)=>{{socket.addEventListener('open',res,{{once:true}});socket.addEventListener('error',()=>rej(new Error('Admin socket failed')),{{once:true}});}});}}const requestId=`admin-${{Date.now()}}-${{Math.random().toString(36).slice(2)}}`;const timer=setTimeout(()=>{{const p=pending.get(requestId);if(p){{pending.delete(requestId);p.reject(new Error('No reply from the admin server after 150s. Check the lane and try again.'));}}}},150000);const guard=fn=>value=>{{clearTimeout(timer);fn(value);}};pending.set(requestId,{{resolve:guard(resolve),reject:guard(reject)}});socket.send(JSON.stringify({{type:'webui_request',request_id:requestId,action,payload}}));}}catch(e){{reject(e);}}}});window.nanobotAdminRequest=request;const fields=()=>({{apiBase:$('apiBase').value,apiKey:$('apiKey').value,model:$('model').value}});fetch('/api/admin/provider-settings',{{cache:'no-store'}}).then(r=>r.json()).then(v=>{{$('apiBase').value=v.apiBase||'';$('model').value=v.model||'';}}).catch(e=>status(e.message,false));$('loadModels').onclick=async()=>{{status('Loading models...');try{{const v=await request('admin.provider.models',fields());const list=$('modelList');list.replaceChildren(...(v.models||[]).map(id=>{{const o=document.createElement('option');o.value=id;return o}}));status(`Loaded ${{v.count||0}} model(s). Choose one and save.`);}}catch(e){{status(e.message,false);}}}};$('testProvider').onclick=async()=>{{status('Testing provider...');try{{const v=await request('admin.provider.test',fields());status(`Provider test passed. Response: ${{v.response||'(empty)'}}`);}}catch(e){{status(e.message,false);}}}};$('saveProvider').onclick=async()=>{{status('Saving settings...');try{{const v=await request('admin.provider.save',fields());$('apiKey').value='';status(`Saved. Active model: ${{v.model||$('model').value}}`);}}catch(e){{status(e.message,false);}}}};const adminAction=async(kind,extra={{}})=>{{const userId=$('supabaseUserId').value.trim();if(kind!=='announcement'&&!userId){{status('Select or enter a user ID first.',false);return;}}status('Working...');try{{const v=await request('admin.supabase.action',{{kind,userId,...extra}});if(kind==='announcement'){{status(`Announcement delivered to ${{v.sent||0}}/${{v.total||0}} Telegram chat(s); failed: ${{v.failed||0}}.`);}}else{{status(`Completed: ${{v.action||kind}}`);}}$('refreshSupabase').click();}}catch(e){{status(e.message,false);}}}};$('refreshSupabase').onclick=async()=>{{status('Loading Supabase users...');try{{const r=await fetch('/api/admin/supabase/users',{{cache:'no-store'}});if(!r.ok)throw new Error(`Database users request failed: ${{r.status}}`);const v=await r.json();const rows=v.users||[];$('supabaseRows').replaceChildren(...rows.map(u=>{{const tr=document.createElement('tr');tr.dataset.id=String(u.id||'');const tg=(u.telegram_accounts||[]).map(a=>`@${{a.username||''}} (${{a.telegram_user_id||''}})`).join(', ');tr.innerHTML=`<td>${{String(u.id||'')}}</td><td>${{String(u.name||'')}}<br><span class='hint'>${{String(u.email||'')}}</span></td><td>${{String(u.role||'')}}</td><td>${{String(u.status||'')}}</td><td>${{String(u.total_credits||0)}}</td><td>${{fmtWAT(u.last_seen_at)}}</td><td>${{String(u.questions_count??0)}}</td><td>${{tg||'—'}}</td>`;tr.onclick=()=>{{$('supabaseUserId').value=String(u.id||'');document.querySelectorAll('#supabaseRows tr').forEach(x=>x.style.outline='');tr.style.outline='2px solid #60a5fa';}};return tr}}));status(`Loaded ${{rows.length}} Supabase user(s). Click a row to select it.`);}}catch(e){{status(e.message,false);}}}};$('grantCredits').onclick=()=>adminAction('grant',{{amount:Number($('grantAmount').value||0)}});$('blockUser').onclick=()=>adminAction('block',{{blocked:$('blockState').checked}});$('deleteUser').onclick=()=>{{if(confirm('Delete the selected Supabase user and their Auth account? This cannot be undone.'))void adminAction('delete')}};$('sendAnnouncement').onclick=()=>adminAction('announcement',{{title:$('announcementTitle').value,message:$('announcementMessage').value}});$('loadPayments').onclick=async()=>{{status('Loading payment claims...');try{{const r=await fetch('/api/admin/supabase/payments',{{cache:'no-store'}});if(!r.ok)throw new Error(`Payment claims request failed: ${{r.status}}`);const v=await r.json();$('paymentRows').textContent=JSON.stringify(v.payments||[],null,2);status(`Loaded ${{(v.payments||[]).length}} payment claim(s).`);}}catch(e){{status(e.message,false);}}}};$('loadQuestions').onclick=async()=>{{status('Loading Telegram question history...');try{{const r=await fetch('/api/admin/supabase/questions',{{cache:'no-store'}});if(!r.ok)throw new Error(`Question history request failed: ${{r.status}}`);const v=await r.json();$('questionRows').textContent=JSON.stringify(v.questions||[],null,2);status(`Loaded ${{(v.questions||[]).length}} Telegram question(s).`);}}catch(e){{status(e.message,false);}}}};$('loadWebuiQuestions').onclick=async()=>{{status('Loading WebUI question history...');try{{const r=await fetch('/api/admin/supabase/webui-questions',{{cache:'no-store'}});if(!r.ok)throw new Error(`WebUI question history request failed: ${{r.status}}`);const v=await r.json();$('webuiQuestionRows').textContent=JSON.stringify((v.questions||[]).map(q=>({{user:q.user_name||q.user_id||'?',email:q.user_email||'',type:q.category||'',question:(q.message||'').slice(0,300),at:q.created_at}})),null,2);status(`Loaded ${{(v.questions||[]).length}} WebUI question(s).`);}}catch(e){{status(e.message,false);}}}};$('loadApkUsers').onclick=async()=>{{status('Loading APK users...');try{{const r=await fetch('/api/admin/supabase/apk-users',{{cache:'no-store'}});if(!r.ok)throw new Error(`APK users request failed: ${{r.status}}`);const v=await r.json();const rows=v.users||[];const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));$('apkRows').replaceChildren(...rows.map(u=>{{const tr=document.createElement('tr');const td=html=>{{const c=document.createElement('td');c.innerHTML=html;return c}};const qs=(u.questions||[]).slice(0,5).map(q=>`<div class='hint'>${{fmtWAT(q.created_at)}} &mdash; [${{esc(q.category||'webui')}}] ${{esc(String(q.message||'').slice(0,220))}}</div>`).join('')||'&mdash;';tr.appendChild(td(`${{esc(u.name||'')}}<br><span class='hint'>${{esc(u.email||'')}}</span>`));tr.appendChild(td(fmtWAT(u.last_seen_at)||'&mdash;'));tr.appendChild(td(String(u.questions_count??0)));tr.appendChild(td(qs));return tr}}));status(`Loaded ${{rows.length}} user(s). Last seen shown in WAT.`);}}catch(e){{status(e.message,false);}}}};void $('refreshSupabase').click();void $('loadQuestions').click();}})();</script></body></html>"""
+let socket=null;const pending=new Map();const request=(action,payload={{}})=>new Promise(async(resolve,reject)=>{{try{{if(!socket||socket.readyState!==1){{const boot=await fetch('/api/admin/ws-bootstrap',{{cache:'no-store'}}).then(r=>r.ok?r.json():Promise.reject(Object.assign(new Error(r.status===401?'Admin session expired':'Admin service unavailable (HTTP '+r.status+'). Retrying...'),{{status:r.status}})));const scheme=location.protocol==='https:'?'wss':'ws';socket=new WebSocket(`${{scheme}}://${{location.host}}${{boot.ws_path}}?token=${{encodeURIComponent(boot.token)}}&client_id=admin`);socket.onmessage=e=>{{const msg=JSON.parse(e.data);if(msg.event==='webui_response'&&pending.has(msg.request_id)){{const p=pending.get(msg.request_id);pending.delete(msg.request_id);msg.ok?p.resolve(msg.result):p.reject(new Error(msg.error?.message||'Admin request failed'));}}}};socket.onclose=()=>{{for(const p of pending.values())p.reject(new Error('The admin socket closed before a reply arrived.'));pending.clear();}};socket.onerror=()=>{{for(const p of pending.values())p.reject(new Error('Admin socket failed'));pending.clear();}};await new Promise((res,rej)=>{{socket.addEventListener('open',res,{{once:true}});socket.addEventListener('error',()=>rej(new Error('Admin socket failed')),{{once:true}});}});}}const requestId=`admin-${{Date.now()}}-${{Math.random().toString(36).slice(2)}}`;const timer=setTimeout(()=>{{const p=pending.get(requestId);if(p){{pending.delete(requestId);p.reject(new Error('No reply from the admin server after 150s. Check the lane and try again.'));}}}},150000);const guard=fn=>value=>{{clearTimeout(timer);fn(value);}};pending.set(requestId,{{resolve:guard(resolve),reject:guard(reject)}});socket.send(JSON.stringify({{type:'webui_request',request_id:requestId,action,payload}}));}}catch(e){{reject(e);}}}});window.nanobotAdminRequest=request;const fields=()=>({{apiBase:$('apiBase').value,apiKey:$('apiKey').value,model:$('model').value}});fetch('/api/admin/provider-settings',{{cache:'no-store'}}).then(r=>r.json()).then(v=>{{$('apiBase').value=v.apiBase||'';$('model').value=v.model||'';}}).catch(e=>status(e.message,false));$('loadModels').onclick=async()=>{{status('Loading models...');try{{const v=await request('admin.provider.models',fields());const list=$('modelList');list.replaceChildren(...(v.models||[]).map(id=>{{const o=document.createElement('option');o.value=id;return o}}));status(`Loaded ${{v.count||0}} model(s). Choose one and save.`);}}catch(e){{status(e.message,false);}}}};$('testProvider').onclick=async()=>{{status('Testing provider...');try{{const v=await request('admin.provider.test',fields());status(`Provider test passed. Response: ${{v.response||'(empty)'}}`);}}catch(e){{status(e.message,false);}}}};$('saveProvider').onclick=async()=>{{status('Saving settings...');try{{const v=await request('admin.provider.save',fields());$('apiKey').value='';status(`Saved. Active model: ${{v.model||$('model').value}}`);}}catch(e){{status(e.message,false);}}}};const adminAction=async(kind,extra={{}})=>{{const userId=$('supabaseUserId').value.trim();if(kind!=='announcement'&&!userId){{status('Select or enter a user ID first.',false);return;}}status('Working...');try{{const v=await request('admin.supabase.action',{{kind,userId,...extra}});if(kind==='announcement'){{status(`Announcement delivered to ${{v.sent||0}}/${{v.total||0}} Telegram chat(s); failed: ${{v.failed||0}}.`);}}else{{status(`Completed: ${{v.action||kind}}`);}}$('refreshSupabase').click();}}catch(e){{status(e.message,false);}}}};$('refreshSupabase').onclick=async()=>{{status('Loading Supabase users...');try{{const r=await fetch('/api/admin/supabase/users',{{cache:'no-store'}});if(!r.ok)throw new Error(`Database users request failed: ${{r.status}}`);const v=await r.json();const rows=v.users||[];$('supabaseRows').replaceChildren(...rows.map(u=>{{const tr=document.createElement('tr');tr.dataset.id=String(u.id||'');const tg=(u.telegram_accounts||[]).map(a=>`@${{a.username||''}} (${{a.telegram_user_id||''}})`).join(', ');tr.innerHTML=`<td>${{String(u.id||'')}}</td><td>${{String(u.name||'')}}<br><span class='hint'>${{String(u.email||'')}}</span></td><td>${{String(u.role||'')}}</td><td>${{String(u.status||'')}}</td><td>${{String(u.total_credits||0)}}</td><td>${{fmtWAT(u.last_seen_at)}}</td><td>${{String(u.questions_count??0)}}</td><td>${{tg||'—'}}</td>`;tr.onclick=()=>{{$('supabaseUserId').value=String(u.id||'');document.querySelectorAll('#supabaseRows tr').forEach(x=>x.style.outline='');tr.style.outline='2px solid #60a5fa';}};return tr}}));status(`Loaded ${{rows.length}} Supabase user(s). Click a row to select it.`);}}catch(e){{status(e.message,false);}}}};$('grantCredits').onclick=()=>adminAction('grant',{{amount:Number($('grantAmount').value||0)}});$('blockUser').onclick=()=>adminAction('block',{{blocked:$('blockState').checked}});$('deleteUser').onclick=()=>{{if(confirm('Delete the selected Supabase user and their Auth account? This cannot be undone.'))void adminAction('delete')}};$('sendAnnouncement').onclick=()=>adminAction('announcement',{{title:$('announcementTitle').value,message:$('announcementMessage').value}});$('loadPayments').onclick=async()=>{{status('Loading payment claims...');try{{const r=await fetch('/api/admin/supabase/payments',{{cache:'no-store'}});if(!r.ok)throw new Error(`Payment claims request failed: ${{r.status}}`);const v=await r.json();$('paymentRows').textContent=JSON.stringify(v.payments||[],null,2);status(`Loaded ${{(v.payments||[]).length}} payment claim(s).`);}}catch(e){{status(e.message,false);}}}};$('loadQuestions').onclick=async()=>{{status('Loading Telegram question history...');try{{const r=await fetch('/api/admin/supabase/questions',{{cache:'no-store'}});if(!r.ok)throw new Error(`Question history request failed: ${{r.status}}`);const v=await r.json();$('questionRows').textContent=JSON.stringify(v.questions||[],null,2);status(`Loaded ${{(v.questions||[]).length}} Telegram question(s).`);}}catch(e){{status(e.message,false);}}}};$('loadWebuiQuestions').onclick=async()=>{{status('Loading WebUI question history...');try{{const r=await fetch('/api/admin/supabase/webui-questions',{{cache:'no-store'}});if(!r.ok)throw new Error(`WebUI question history request failed: ${{r.status}}`);const v=await r.json();$('webuiQuestionRows').textContent=JSON.stringify((v.questions||[]).map(q=>({{user:q.user_name||q.user_id||'?',email:q.user_email||'',type:q.category||'',question:(q.message||'').slice(0,300),at:q.created_at}})),null,2);status(`Loaded ${{(v.questions||[]).length}} WebUI question(s).`);}}catch(e){{status(e.message,false);}}}};$('loadApkUsers').onclick=async()=>{{status('Loading APK users...');try{{const r=await fetch('/api/admin/supabase/apk-users',{{cache:'no-store'}});if(!r.ok)throw new Error(`APK users request failed: ${{r.status}}`);const v=await r.json();const rows=v.users||[];const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));$('apkRows').replaceChildren(...rows.map(u=>{{const tr=document.createElement('tr');const td=html=>{{const c=document.createElement('td');c.innerHTML=html;return c}};const qs=(u.questions||[]).slice(0,5).map(q=>`<div class='hint'>${{fmtWAT(q.created_at)}} &mdash; [${{esc(q.category||'webui')}}] ${{esc(String(q.message||'').slice(0,220))}}</div>`).join('')||'&mdash;';tr.appendChild(td(`${{esc(u.name||'')}}<br><span class='hint'>${{esc(u.email||'')}}</span>`));tr.appendChild(td(fmtWAT(u.last_seen_at)||'&mdash;'));tr.appendChild(td(String(u.questions_count??0)));tr.appendChild(td(qs));return tr}}));status(`Loaded ${{rows.length}} user(s). Last seen shown in WAT.`);}}catch(e){{status(e.message,false);}}}};void $('refreshSupabase').click();void $('loadQuestions').click();}})();</script></body></html>"""
 
 
 def admin_route(
@@ -1239,11 +1338,11 @@ def admin_route(
     if path == "/api/admin/provider-pool":
         return _pool_list_response()
     if path == "/api/admin/provider-pool/add":
-        return _pool_add_response(payload)
+        return _pool_add_response(payload, refresh_runtime_config)
     if path == "/api/admin/provider-pool/delete":
-        return _pool_delete_response(payload)
+        return _pool_delete_response(payload, refresh_runtime_config)
     if path == "/api/admin/provider-pool/update":
-        return _pool_update_response(payload)
+        return _pool_update_response(payload, refresh_runtime_config)
     if path == "/api/admin/provider-pool/test":
         return _pool_test_response(payload)
     if path == "/api/admin/provider-pool/models":

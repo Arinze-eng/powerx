@@ -162,6 +162,70 @@ def test_stream_does_not_rotate_after_output_started() -> None:
     assert response.content == "partial"
 
 
+def test_chat_fails_over_when_primary_key_is_rejected() -> None:
+    # A revoked/expired key on the primary lane must not strand the request:
+    # the backup lane is the entire reason the pool exists.
+    first = _lane("a", [LLMResponse(content=None, error_status_code=401)])
+    second = _lane("b", [LLMResponse(content="b-answer")])
+    pool = _provider(first, second)
+    response = asyncio.run(pool.chat(_MESSAGES))
+    assert response.content == "b-answer"
+    assert first[1].calls == 1
+    assert second[1].calls == 1
+
+
+def test_chat_fails_over_on_forbidden_key() -> None:
+    first = _lane("a", [LLMResponse(content=None, error_status_code=403)])
+    second = _lane("b", [LLMResponse(content="b-answer")])
+    pool = _provider(first, second)
+    assert asyncio.run(pool.chat(_MESSAGES)).content == "b-answer"
+
+
+def test_chat_fails_over_when_primary_is_out_of_credit() -> None:
+    # 402 = balance exhausted. The backup lane should still serve the request.
+    first = _lane("a", [LLMResponse(content=None, error_status_code=402)])
+    second = _lane("b", [LLMResponse(content="b-answer")])
+    pool = _provider(first, second)
+    assert asyncio.run(pool.chat(_MESSAGES)).content == "b-answer"
+
+
+def test_chat_fails_over_on_auth_error_kind() -> None:
+    first = _lane("a", [LLMResponse(content=None, error_kind="auth")])
+    second = _lane("b", [LLMResponse(content="b-answer")])
+    pool = _provider(first, second)
+    assert asyncio.run(pool.chat(_MESSAGES)).content == "b-answer"
+
+
+def test_chat_fails_over_on_invalid_api_key_error_code() -> None:
+    first = _lane("a", [LLMResponse(content=None, error_code="invalid_api_key")])
+    second = _lane("b", [LLMResponse(content="b-answer")])
+    pool = _provider(first, second)
+    assert asyncio.run(pool.chat(_MESSAGES)).content == "b-answer"
+
+
+def test_chat_fails_over_when_model_is_missing_on_the_lane() -> None:
+    # 404 usually means the model id is not served by that lane, which is a
+    # lane-specific problem rather than a bad request.
+    first = _lane("a", [LLMResponse(content=None, error_status_code=404)])
+    second = _lane("b", [LLMResponse(content="b-answer")])
+    pool = _provider(first, second)
+    assert asyncio.run(pool.chat(_MESSAGES)).content == "b-answer"
+
+
+def test_stream_fails_over_on_auth_error_before_output() -> None:
+    class _AuthFailing(_FakeProvider):
+        async def chat_stream(self, messages, **kwargs):  # type: ignore[override]
+            self.calls += 1
+            return LLMResponse(content=None, error_status_code=401)
+
+    first = ({"id": "a", "model": "m-a"}, _AuthFailing("a"))
+    second = _lane("b", [LLMResponse(content="b-answer")])
+    pool = _provider(first, second)
+    response = asyncio.run(pool.chat_stream(_MESSAGES))
+    assert response.content == "b-answer"
+    assert second[1].calls == 1
+
+
 def test_empty_pool_reports_a_connection_error() -> None:
     pool = PoolProvider([])
     response = asyncio.run(pool.chat(_MESSAGES))

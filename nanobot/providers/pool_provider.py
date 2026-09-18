@@ -19,9 +19,34 @@ from typing import Any
 from nanobot.providers.base import GenerationSettings, LLMProvider, LLMResponse
 
 # Error kinds that mean "try another lane" rather than "fail the request".
-_FAILOVER_KINDS = frozenset({"rate_limit", "overloaded", "timeout", "connection", "server_error"})
+#
+# `auth`/`permission`/`billing` belong here just as much as the transient
+# network kinds do: a lane whose key expired, was revoked, or whose account ran
+# out of credit is permanently unusable for this request, and the whole point of
+# the pool is that the backup lane still answers. Without these the wrapper
+# returned the primary lane's 401/402 immediately and rotation never happened.
+_FAILOVER_KINDS = frozenset(
+    {
+        "rate_limit",
+        "overloaded",
+        "timeout",
+        "connection",
+        "server_error",
+        "auth",
+        "authentication",
+        "permission",
+        "unauthorized",
+        "forbidden",
+        "billing",
+        "quota",
+    }
+)
 # HTTP statuses worth rotating away from.
-_FAILOVER_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 522, 524})
+# 401/403 = bad or revoked key; 402 = out of credit; 404 = model decommissioned
+# on this lane. All are lane-specific, so the next lane is worth trying.
+_FAILOVER_STATUS = frozenset(
+    {401, 402, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 522, 524}
+)
 # Tokens matched against provider error type/code (never against model output).
 _FAILOVER_TOKENS = (
     "rate_limit",
@@ -42,6 +67,18 @@ _FAILOVER_TOKENS = (
     "insufficient_balance",
     "balance",
     "out of credits",
+    # Auth/permission failures that are lane-specific. Matched against the
+    # provider's error type/code only, never against model output.
+    "invalid_api_key",
+    "invalid api key",
+    "unauthorized",
+    "authentication",
+    "authenticationerror",
+    "forbidden",
+    "permission",
+    "no auth credentials",
+    "credit_balance",
+    "billing",
 )
 
 
