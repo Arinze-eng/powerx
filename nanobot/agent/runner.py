@@ -21,6 +21,11 @@ from nanobot.agent.context_governance import (
     ContextGovernor,
 )
 from nanobot.agent.deterministic_router import deterministic_plan, router_enabled
+from nanobot.agent.shape_router import (
+    plan_preference_message,
+    shape_router_enabled,
+    should_steer_to_plan,
+)
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
 from nanobot.agent.plan_cache import (
@@ -92,6 +97,12 @@ _ARREARAGE_ERROR_MESSAGE = (
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
+#: A ``finish_reason="length"`` response is only worth continuing when it made
+#: real textual progress. A blank segment, or one byte-identical to the segment
+#: we just appended, means the model is re-emitting the same truncated prefix:
+#: continuing would pay another provider call for zero new work, forever. This
+#: is the burn-loop (documented in tools/run_plan.py) and it is refused here.
+_LENGTH_SEGMENT_PROGRESS_CHARS = 16
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 
@@ -703,6 +714,42 @@ class AgentRunner:
             inflight_start_index=len(spec.initial_messages),
         )
 
+        # --- Deterministic SHAPE routing (Lever A: fewer DECISIONS) -----------
+        # The Re-Act loop bills one provider call per decision. Batch-shaped and
+        # clearly-chained asks ("for each of these 40 files, ...") do not need a
+        # decision per item: the whole job is expressible as ONE `run_plan` (or
+        # `python_code`) call. This classifies the task SHAPE with regexes --
+        # never with an extra model call, which would defeat the purpose -- and
+        # emits one short steering message for the model on that turn only.
+        #
+        # Deliberately narrow: anything exploratory, adaptive, conversational or
+        # single-action classifies as not-multi_step and the turn runs EXACTLY as
+        # it does today. The plan path commits the whole graph before any
+        # observation, so force-steering exploratory work would trade graceful
+        # partial progress for total failure. Re-Act stays the fallback.
+        #
+        # Scope guards mirror the deterministic router: image turns and turns
+        # with an active sustained goal keep the full model path.
+        steer_message: dict[str, Any] | None = None
+        if (
+            shape_router_enabled()
+            and spec.deterministic_router_text is not None
+            and not spec.strip_image_content_before_provider
+            and should_steer_to_plan(
+                spec.deterministic_router_text,
+                plan_tool_available=spec.tools.get("run_plan") is not None,
+                code_tool_available=spec.tools.get("python_code") is not None,
+            )
+        ):
+            steer_message = plan_preference_message()
+            logger.info(
+                "shape router steering {} to the one-call plan path "
+                "(multi-step ask, plan_tool={}, code_tool={})",
+                spec.session_key or "default",
+                spec.tools.get("run_plan") is not None,
+                spec.tools.get("python_code") is not None,
+            )
+
         for iteration in range(spec.max_iterations):
             if spec.strip_image_content_before_provider:
                 # Injections and recovery/finalization messages are appended
@@ -719,6 +766,15 @@ class AgentRunner:
                 messages,
                 compacted_tool_call_ids,
             )
+            # The steering hint rides on the REQUEST VIEW ONLY, appended last so
+            # it never invalidates the cached static prefix. `messages` (the
+            # transcript the caller persists) is never touched, so history,
+            # replays, and every later turn are unaware it ever existed.
+            request_messages = (
+                [*messages_for_model, steer_message]
+                if steer_message is not None
+                else messages_for_model
+            )
             context = AgentHookContext(
                 iteration=iteration,
                 messages=messages,
@@ -729,10 +785,13 @@ class AgentRunner:
                 messages,
                 context_window_tokens=spec.runtime.context_window_tokens,
                 model_messages=messages_for_model,
+                supplemental_messages=(
+                    [steer_message] if steer_message is not None else None
+                ),
             )
             response = await self._request_model(
                 spec,
-                messages_for_model,
+                request_messages,
                 hook,
                 context,
                 conversation_state=conversation_state,
@@ -1013,10 +1072,24 @@ class AgentRunner:
                 clean = hook.finalize_content(context, response.content)
 
             if response.finish_reason == "length":
-                if len(length_recovery_parts) < _MAX_LENGTH_RECOVERIES:
-                    length_recovery_parts.append(
-                        _restore_outer_whitespace(clean or "", original_content)
-                    )
+                segment = _restore_outer_whitespace(clean or "", original_content)
+                # --- burn-loop guard (see _LENGTH_SEGMENT_PROGRESS_CHARS) ------
+                # Continuing a truncated response is only worthwhile if the
+                # segment actually advanced the answer. When the model re-emits
+                # a blank or byte-identical truncated prefix, every further
+                # replay is a paid provider call that produces no new work --
+                # the exact failure documented in tools/run_plan.py. Refuse to
+                # replay and finish with whatever we already have instead.
+                prior = "".join(length_recovery_parts)
+                stalled = (
+                    len(segment.strip()) < _LENGTH_SEGMENT_PROGRESS_CHARS
+                    or (bool(prior) and segment.strip() == prior.strip())
+                )
+                if (
+                    not stalled
+                    and len(length_recovery_parts) < _MAX_LENGTH_RECOVERIES
+                ):
+                    length_recovery_parts.append(segment)
                     logger.info(
                         "Output truncated on turn {} for {} ({}/{}); continuing",
                         iteration,
@@ -1038,6 +1111,24 @@ class AgentRunner:
                     messages.append(build_length_recovery_message(clean or ""))
                     await hook.after_iteration(context)
                     continue
+                if stalled:
+                    logger.warning(
+                        "Refusing truncated-replay burn loop on turn {} for {} "
+                        "({}-char segment, no new content); finishing with the {} "
+                        "char(s) already produced",
+                        iteration,
+                        spec.session_key or "default",
+                        len(segment.strip()),
+                        len(prior),
+                    )
+                else:
+                    logger.info(
+                        "Length recovery exhausted on turn {} for {} after {} "
+                        "segment(s); finishing",
+                        iteration,
+                        spec.session_key or "default",
+                        len(length_recovery_parts),
+                    )
 
             # Some streaming providers recover with a complete response but no
             # content deltas. When an earlier length segment is already visible,
