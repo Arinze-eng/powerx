@@ -98,6 +98,44 @@ _ACTION_GLUE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Deliverable / library work. A task that must *produce a file* using a
+# third-party library (a deck, a PDF, an image batch, a spreadsheet) is multi-
+# step in practice even when the user names no loop: the unavoidable shape is
+# `probe the sandbox -> provision the missing tools -> generate the artefact`.
+# Walking that one-at-a-time is exactly the "pandoc not installed" spiral seen
+# in production: each probe costs a provider call, each failed install costs
+# another, and the artefact still is not written.
+#
+# Per repo policy this routes to the SANDBOX via the `exec` bridge. It must NOT
+# be pushed into the interpreter: `python_code` is a restricted AST interpreter
+# with no `exec()` and a deliberately narrow import allowlist, and widening that
+# allowlist is explicitly out of bounds.
+_LIBRARY_TASK_RE = re.compile(
+    r"\b(?:"
+    r"pptx?|powerpoint|power\s*point|slide\s*deck|slide|deck|"
+    r"pdf|pdflatex|latex|texlive|pandoc|"
+    r"docx?|word\s+document|"
+    r"xlsx?|spreadsheet|excel|"
+    r"pypdf|reportlab|pillow|numpy|pandas|matplotlib|openpyxl|python-docx|weasyprint|"
+    r"charts?|plots?|graphs?|diagrams?|images?|thumbnails?|logos?|posters?|"
+    r"banners?|presentations?|reports?|whitepapers?|ebooks?|invoices?|"
+    r"newsletters?|decks?|slides?"
+    r")\b",
+    re.IGNORECASE,
+)
+# A concrete artefact count: "16 slides", "20 pages", "12 charts".
+_ARTEFACT_COUNT_RE = re.compile(
+    r"\b\d{1,3}\s*(?:slides?|pages?|charts?|plots?|sheets?|rows?|images?|"
+    r"figures?|sections?|paragraphs?)\b",
+    re.IGNORECASE,
+)
+# Conversion / generation verbs that imply tooling rather than a single read.
+_TOOLING_VERB_RE = re.compile(
+    r"\b(?:create|make|build|generate|produce|export|convert|render|compile|"
+    r"assemble|draft|compose|design|format)\b",
+    re.IGNORECASE,
+)
+
 # Exploratory / adaptive / conversational asks. These are Re-Act's home turf:
 # the next step genuinely depends on what the previous step returned, so the
 # whole-graph plan path would be a downgrade. Any hit here wins outright, before
@@ -129,6 +167,28 @@ _SINGLE_ACTION_RE = re.compile(
     r"run|execute|write|create|delete|remove|rename|move|copy|"
     r"install|upload|download|check)\b",
     re.IGNORECASE,
+)
+
+_LIBRARY_STEER_MESSAGE = (
+    "[Routing hint — task shape: library/deliverable]\n"
+    "This task must PRODUCE a file using third-party tooling (deck, PDF, image, "
+    "sheet). The expensive part is not the content — it is provisioning, which "
+    "must NOT be walked one probe per model call.\n"
+    "- FIRST call: one `exec` that probes everything at once, e.g. "
+    "`python -c \"import importlib.util as u; print({m: bool(u.find_spec(m)) "
+    "for m in ['pptx','docx','openpyxl','PIL','reportlab']})\"` plus "
+    "`command -v pandoc; which pdflatex`.\n"
+    "- SECOND call: ONE install command installing every missing piece "
+    "together (e.g. a single `pip install` for the python libs, or ONE "
+    "`apt-get install -y --no-install-recommends` for the CLI tools). Do not "
+    "install them one at a time.\n"
+    "- Prefer a pure-Python library over a system tool: `python-pptx` writes a "
+    ".pptx with no pandoc and no LaTeX, so it cannot fail on a missing binary.\n"
+    "- THEN generate the whole artefact in a single `exec` (write every slide / "
+    "page / sheet in one script). Do not emit one call per slide.\n"
+    "- If a tool is genuinely unavailable after the combined install, state "
+    "that plainly and deliver the best artefact you can. Never spend more than "
+    "2 calls on provisioning."
 )
 
 #: The steering message. Short on purpose: it is injected on every multi-step
@@ -189,6 +249,12 @@ def classify_task_shape(text: str | None) -> str:
         # "read the file, then tell me what it says" would be misrouted.
         if len(_ACTION_VERB_RE.findall(normalized)) >= 2:
             return "multi_step"
+    # Library / deliverable work: probe, provision, then generate. The
+    # provisioning step is usually a MISS on the first attempt, which is why
+    # this shape burns calls so badly when walked one step at a time.
+    if _LIBRARY_TASK_RE.search(normalized):
+        if _TOOLING_VERB_RE.search(normalized) or _ARTEFACT_COUNT_RE.search(normalized):
+            return "multi_step"
     # Three-plus glued actions is a program regardless of the words used.
     if _ACTION_GLUE_RE.search(normalized):
         if len(_ACTION_VERB_RE.findall(normalized)) >= 3:
@@ -225,3 +291,45 @@ def plan_preference_message() -> dict[str, str]:
     per-request model view only -- never to the persisted transcript.
     """
     return {"role": "user", "content": _STEER_MESSAGE}
+
+
+def prefer_library_workflow(text: str | None) -> bool:
+    """True when the task needs third-party tooling to produce an artefact.
+
+    Such a task should be steered toward a batched *provisioning* workflow
+    rather than the generic plan hint: the failure mode is a probe/install
+    spiral, not an un-batched loop.
+    """
+    raw = re.sub(r"\s+", " ", text or "").strip()
+    if not (_MIN_TEXT_CHARS <= len(raw) <= _MAX_TEXT_CHARS):
+        return False
+    if _EXPLORATORY_RE.search(raw):
+        return False
+    if not _LIBRARY_TASK_RE.search(raw):
+        return False
+    if _ARTEFACT_COUNT_RE.search(raw):
+        return True
+    if _TOOLING_VERB_RE.search(raw):
+        # A bare noun ("the pdf format") is not a request to build anything;
+        # require the tooling verb only when the ask is not a read.
+        return not _looks_like_read_request(raw)
+    return False
+
+
+def _looks_like_read_request(text: str) -> bool:
+    """Local guard so a question *about* a format is not steered as a build."""
+    return bool(
+        re.match(
+            r"^\s*(?:what|why|how|when|where|which|who|is|are|does|do|can|"
+            r"explain|describe|tell\s+me|show\s+me|read|list|find)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def steer_message_for(text: str | None) -> dict[str, str]:
+    """Pick the right steering hint for this task's shape."""
+    if prefer_library_workflow(text):
+        return {"role": "user", "content": _LIBRARY_STEER_MESSAGE}
+    return plan_preference_message()

@@ -25,6 +25,7 @@ from nanobot.agent.shape_router import (
     plan_preference_message,
     shape_router_enabled,
     should_steer_to_plan,
+    steer_message_for,
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
@@ -741,7 +742,7 @@ class AgentRunner:
                 code_tool_available=spec.tools.get("python_code") is not None,
             )
         ):
-            steer_message = plan_preference_message()
+            steer_message = steer_message_for(spec.deterministic_router_text)
             logger.info(
                 "shape router steering {} to the one-call plan path "
                 "(multi-step ask, plan_tool={}, code_tool={})",

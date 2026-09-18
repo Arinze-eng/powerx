@@ -26,6 +26,8 @@ import pytest
 from agent.runner_helpers import make_run_spec
 from nanobot.agent.runner import AgentRunner
 from nanobot.agent.shape_router import (
+    prefer_library_workflow,
+    steer_message_for,
     classify_task_shape,
     plan_preference_message,
     shape_router_enabled,
@@ -59,6 +61,71 @@ class TestClassifyMultiStep:
     )
     def test_multi_step_shapes(self, text: str) -> None:
         assert classify_task_shape(text) == "multi_step", text
+
+
+class TestClassifyLibraryWork:
+    """Deliverable/library work is multi-step even with no explicit loop.
+
+    This is the production case: "create a powerpoint, 16 slides, green" walked
+    the probe/install spiral one provider call at a time (pandoc missing ->
+    install attempt -> pdflatex missing -> install attempt -> ...) and still had
+    not written the artefact. The shape is really
+    probe -> provision -> generate, so it must be steered as multi-step.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # The exact production prompt from the screenshot.
+            "Create a power point presentation on how to create a ai agent "
+            "16slides ,green color",
+            "create a 16 slide pptx about AI agents in green",
+            "build a 20 page pdf report with charts",
+            "generate an excel spreadsheet with 100 rows",
+            "make a slide deck about our roadmap",
+            "generate 10 images of cats",
+            "convert this folder of markdown into a pdf",
+        ],
+    )
+    def test_library_shapes_are_multi_step(self, text: str) -> None:
+        assert classify_task_shape(text) == "multi_step", text
+
+    def test_library_tasks_get_the_provisioning_hint(self) -> None:
+        """A deliverable ask must get the provisioning hint, not the generic
+        plan hint — the failure mode is a probe/install spiral."""
+        message = steer_message_for(
+            "Create a power point presentation on how to create a ai agent "
+            "16slides ,green color"
+        )
+        content = message["content"]
+        assert "library/deliverable" in content
+        # Must forbid one-probe-per-call and one-install-per-call.
+        assert "FIRST call" in content
+        assert "ONE install" in content
+        # Must point at a library that needs no system binary at all.
+        assert "python-pptx" in content
+        # Must bound the waste explicitly.
+        assert "2 calls on provisioning" in content
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "read the pdf config",
+            "show me the report",
+            "explain what pptx is",
+            "what does pandoc do?",
+            "list the spreadsheets in the workspace",
+        ],
+    )
+    def test_reads_and_questions_about_formats_are_not_steered(
+        self, text: str
+    ) -> None:
+        """Asking *about* a format is not a request to build one."""
+        assert not prefer_library_workflow(text), text
+
+    def test_images_batch_gets_library_hint(self) -> None:
+        message = steer_message_for("generate 10 images of cats")
+        assert "library/deliverable" in message["content"]
 
 
 class TestClassifyExploratory:
