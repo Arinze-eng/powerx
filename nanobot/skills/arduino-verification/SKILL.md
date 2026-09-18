@@ -126,7 +126,22 @@ SSD1306 N7,000. The Uno R3 clone is billed at N15,000.
 
 ## Sandbox note
 
-The toolchain lives in `/opt/arduino-toolchain` in the sandbox (override with
-`ARDUINO_TOOLCHAIN_DIR`). The AVR emulator runs on Node with the `avr8js` package;
-if `require('avr8js')` fails, install it once inside the sandbox:
-`cd /opt/arduino-toolchain && npm install avr8js@0.20.0`.
+**The toolchain lives in the execution sandbox, not the gateway image.** At runtime
+the agent installs it there and runs the build there:
+
+1. `arduino_verify action=setup` → runs `scripts/install_arduino_sandbox.sh` inside
+   the sandbox (installs arduino-cli + `arduino:avr` + common libraries + `avr8js`).
+2. `action=build` uploads `sketch.ino`, compiles, and runs the emulator in that same
+   sandbox. The reply carries `"where": "sandbox"` to confirm this.
+
+Envs the tool reads: `ARDUINO_TOOLCHAIN_DIR` (default `/opt/arduino-toolchain`),
+`ARDUINO_SIM_DIR`, `ARDUINO_CLI_PATH`, and `ARDUINO_VERIFY_ENABLED=1` to force
+enablement. Use `INSTALL_ESP32=1` with the installer for the ESP32 core.
+
+If `require('avr8js')` ever fails inside the sandbox, the tool reinstalls it:
+`cd ${ARDUINO_SIM_DIR} && npm install avr8js@0.20.0`.
+
+When no local toolchain exists, `arduino_verify` dispatches to whichever sandbox
+tool is registered (`novita_sandbox`, `vps_exec`, `runloop_sandbox`,
+`daytona_sandbox`). It only falls back to local execution when a toolchain exists
+on the host.

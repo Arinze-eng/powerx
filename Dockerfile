@@ -17,32 +17,12 @@ RUN apt-get update && \
 # Vercel non-interactively (auth is provided at runtime via VERCEL_TOKEN).
 RUN npm install -g vercel && rm -rf /root/.npm
 
-# ---------------------------------------------------------------------------
-# Arduino verification toolchain (arduino_verify tool)
-#   arduino-cli + the arduino:avr core + the AVR emulator runtime land in
-#   /opt/arduino-toolchain so the agent can COMPILE and SIMULATE a sketch
-#   inside the sandbox before recommending hardware to a user. The ESP32 core
-#   is installed lazily by `arduino_verify action=setup install_esp32=true`
-#   because it is large and rarely needed.
-# ---------------------------------------------------------------------------
-ARG ARDUINO_CLI_VERSION=1.5.1
-RUN mkdir -p /opt/arduino-toolchain/{data,dl,sim} && \
-    curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_${ARDUINO_CLI_VERSION}_Linux_64bit.tar.gz" \
-      | tar -xz -C /opt/arduino-toolchain && \
-    curl -fsSL -o /opt/arduino-toolchain/dl/package_index.tar.bz2 https://downloads.arduino.cc/packages/package_index.tar.bz2 || true
-ENV ARDUINO_DIRECTORIES_DATA=/opt/arduino-toolchain/data \
-    ARDUINO_DIRECTORIES_DOWNLOADS=/opt/arduino-toolchain/dl \
-    ARDUINO_TOOLCHAIN_DIR=/opt/arduino-toolchain \
-    ARDUINO_SIM_DIR=/opt/arduino-toolchain/sim
-RUN /opt/arduino-toolchain/arduino-cli core update-index && \
-    /opt/arduino-toolchain/arduino-cli core install arduino:avr && \
-    for lib in Servo "DHT sensor library" RTClib LiquidCrystal LiquidCrystal_I2C; do \
-      /opt/arduino-toolchain/arduino-cli lib install "$lib"; \
-    done && \
-    cd /opt/arduino-toolchain/sim && \
-    printf '{"name":"arduino-sim","private":true}' > package.json && \
-    npm install --no-audit --no-fund avr8js@0.20.0 && rm -rf /root/.npm
-RUN chmod -R a+rX /opt/arduino-toolchain
+# NOTE: the Arduino verification toolchain (arduino-cli + AVR core + the avr8js
+# emulator) is deliberately NOT baked into this image. It is installed at
+# runtime inside the execution sandbox (Novita / VPS / Runloop) by the
+# `arduino_verify` tool's `setup` action, which runs
+# scripts/install_arduino_sandbox.sh. This keeps the gateway image small and
+# lets hardware builds run where they belong — the sandbox that owns the work.
 
 WORKDIR /app
 

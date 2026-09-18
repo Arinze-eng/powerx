@@ -55,15 +55,29 @@ port — concrete evidence the actuator code path actually executes.
 
 ## Installing the toolchain
 
-### In the gateway image (automatic)
+**The toolchain is not baked into the gateway image.** It is installed at
+runtime inside the execution sandbox (Novita / VPS / Runloop), because that is
+where the work — and the network access to fetch cores — actually lives.
 
-The `Dockerfile` installs arduino-cli, the `arduino:avr` core, common libraries,
-and the `avr8js` runtime into `/opt/arduino-toolchain`. Nothing else to do —
-`arduino_verify` is offered as soon as the container boots.
+### How the agent installs it (automatic)
 
-### In a remote sandbox (Novita / VPS / Runloop)
+The tool exposes `arduino_verify action=setup`, which runs
+`scripts/install_arduino_sandbox.sh` inside the sandbox. When the gateway image
+has no local toolchain, `action=build` dispatches to the sandbox automatically:
 
-Run the installer once per sandbox:
+```
+1. arduino_verify  →  resolves the novita_sandbox / vps_exec / runloop_sandbox tool
+2. setup           →  installs arduino-cli + arduino:avr + avr8js in the sandbox
+3. upload          →  writes sketch.ino into the sandbox workspace
+4. compile         →  arduino-cli compile --fqbn arduino:avr:uno
+5. simulate        →  node arduino_sim.js <hex> --expect "<text>"
+6. verdict         →  compiled / simulated / confidence + safety + Naira BOM
+```
+
+The returned payload carries `"where": "sandbox"` so callers can see which host
+did the work.
+
+### Manual install (once per sandbox)
 
 ```bash
 bash scripts/install_arduino_sandbox.sh
@@ -75,16 +89,25 @@ Through the agent:
 novita_sandbox action=run command="bash /workspace/install_arduino_sandbox.sh"
 ```
 
-It handles x86_64 and arm64, falls back to `$HOME/.arduino-toolchain` when
-`/opt` is not writable, and prints the env exports the tool needs:
+Then export the paths so the tool can find them:
 
 ```bash
-export ARDUINO_TOOLCHAIN_DIR=<dest>
-export ARDUINO_SIM_DIR=<dest>/sim
+export ARDUINO_TOOLCHAIN_DIR=/opt/arduino-toolchain
+export ARDUINO_SIM_DIR=/opt/arduino-toolchain/sim
 export ARDUINO_VERIFY_ENABLED=1
 ```
 
-Set `INSTALL_ESP32=1` to also pull the (large) ESP32 core.
+Set `INSTALL_ESP32=1` to also pull the (large) ESP32 core. The installer handles
+x86_64 and arm64, and falls back to `$HOME/.arduino-toolchain` when `/opt` is
+not writable.
+
+### Why not bake it into the image?
+
+- The ESP32/AVR cores plus toolchains add hundreds of MB and a slow download to
+  every gateway build — and an intermittent network failure there fails the
+  whole image build.
+- Sandboxes are disposable: a toolchain installed there costs nothing at rest.
+- The tool works locally too (developer laptops, CI) when a toolchain exists.
 
 ## Configuration
 

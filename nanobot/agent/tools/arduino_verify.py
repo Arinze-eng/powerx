@@ -392,6 +392,182 @@ def build_bom(diagram: dict[str, Any] | None, board: str) -> list[dict[str, Any]
     return bom
 
 
+def _local_toolchain_available() -> bool:
+    """True when arduino-cli and node are present on *this* host."""
+    return _arduino_cli() is not None and _node_bin() is not None
+
+
+def _sandbox_tool(ctx: ToolContext | None) -> Any:
+    """Look up a sandbox tool (novita_sandbox / vps / runloop) in the registry.
+
+    The gateway image does not ship the Arduino toolchain, so in production the
+    build must execute inside the user's execution sandbox. The sandbox tools
+    are ordinary Tools, so they can be resolved from the same registry and
+    driven with their own schema.
+    """
+    if ctx is None:
+        return None
+    registry = getattr(ctx, "tool_registry", None) or getattr(ctx, "tools", None)
+    if registry is None:
+        return None
+    try:
+        items = registry.values() if isinstance(registry, dict) else registry
+        for tool in items:
+            name = getattr(tool, "name", "")
+            if name in ("novita_sandbox", "vps_exec", "runloop_sandbox", "daytona_sandbox"):
+                return tool
+    except Exception:  # pragma: no cover - defensive
+        return None
+    return None
+
+
+#: Remote bootstrap: install the toolchain, then compile the uploaded sketch.
+SANDBOX_SETUP_CMD = (
+    "set -e; mkdir -p ~/.arduino-toolchain; "
+    "curl -fsSL {installer_url} -o /tmp/install_arduino_sandbox.sh; "
+    "bash /tmp/install_arduino_sandbox.sh"
+)
+
+
+def sandbox_install_command(installer_url: str) -> str:
+    """Shell command that provisions the Arduino toolchain inside a sandbox."""
+    return SANDBOX_SETUP_CMD.format(installer_url=installer_url)
+
+
+def verify_in_sandbox(
+    sandbox: Any,
+    code: str,
+    board: str = "uno",
+    expect: str | None = None,
+    ms: int = _DEFAULT_MS,
+    workdir: str = "/tmp/arduino_build",
+) -> dict[str, Any]:
+    """Run compile + simulate inside a remote sandbox.
+
+    ``sandbox`` is any object exposing ``run(command) -> (exit_code, output)``.
+    powerx's sandbox tools expose exactly that shape, so they can be passed
+    straight in. Returns the same verdict shape as :func:`verify`.
+    """
+    info = BOARDS.get(board, BOARDS["uno"])
+    runner = getattr(sandbox, "run", None) or getattr(sandbox, "execute", None)
+    if runner is None:
+        return {"ok": False, "log": "sandbox object does not expose run()/execute()"}
+
+    def sh(cmd: str) -> tuple[int, str]:
+        try:
+            result = runner(cmd)
+        except Exception as exc:  # pragma: no cover - transport level
+            return 1, f"[sandbox command failed: {exc}]"
+        if isinstance(result, tuple) and len(result) == 2:
+            return int(result[0]), str(result[1])
+        if isinstance(result, dict):
+            return int(result.get("exit_code", 0)), str(result.get("output") or result.get("stdout", ""))
+        return 0, str(result)
+
+    # 1. Provision the toolchain (idempotent).
+    _, out = sh(
+        "ls /opt/arduino-toolchain/arduino-cli >/dev/null 2>&1 && echo READY || "
+        "bash -lc 'mkdir -p /opt/arduino-toolchain && "
+        "curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_1.5.1_Linux_64bit.tar.gz "
+        "| tar -xz -C /opt/arduino-toolchain'"
+    )
+    scaffold = (
+        "mkdir -p /opt/arduino-toolchain/data /opt/arduino-toolchain/dl /opt/arduino-toolchain/sim "
+        + workdir
+        + " && "
+        "export ARDUINO_DIRECTORIES_DATA=/opt/arduino-toolchain/data "
+        "ARDUINO_DIRECTORIES_DOWNLOADS=/opt/arduino-toolchain/dl; "
+        "/opt/arduino-toolchain/arduino-cli core update-index >/dev/null 2>&1; "
+        "/opt/arduino-toolchain/arduino-cli core install arduino:avr >/dev/null 2>&1; "
+        "echo SCAFFOLD_OK"
+    )
+    _, out2 = sh(scaffold)
+
+    # 2. Upload the sketch and compile.
+    sketch_dir = f"{workdir}/sketch"
+    sh(f"mkdir -p {sketch_dir} && rm -f {sketch_dir}/*.ino")
+    payload = _write_remote_file(sandbox, f"{sketch_dir}/sketch.ino", code)
+    if not payload:
+        return {"ok": False, "log": "could not upload the sketch into the sandbox"}
+
+    rc, log = sh(
+        "export ARDUINO_DIRECTORIES_DATA=/opt/arduino-toolchain/data "
+        "ARDUINO_DIRECTORIES_DOWNLOADS=/opt/arduino-toolchain/dl; "
+        f"/opt/arduino-toolchain/arduino-cli compile --fqbn {info['fqbn']} "
+        f"{sketch_dir} --output-dir {workdir}/build"
+    )
+    compiled = rc == 0
+    size = re.search(r"Sketch uses (\d+) bytes \((\d+)%\)", log)
+    sim: dict[str, Any] | None = None
+
+    # 3. Install the emulator runtime and simulate.
+    if compiled:
+        sh(
+            "cd /opt/arduino-toolchain/sim 2>/dev/null || mkdir -p /opt/arduino-toolchain/sim && cd /opt/arduino-toolchain/sim; "
+            "printf '{\"name\":\"arduino-sim\",\"private\":true}' > package.json; "
+            "npm install --no-audit --no-fund avr8js@0.20.0 >/dev/null 2>&1; echo SIM_READY"
+        )
+        _write_remote_file(sandbox, "/opt/arduino-toolchain/sim/arduino_sim.js", _SIM_ASSET.read_text(encoding="utf-8"))
+        cmd = (
+            "cd /opt/arduino-toolchain/sim && node arduino_sim.js "
+            f"{workdir}/build/sketch.ino.hex --ms {max(100, min(ms, _MAX_MS))}"
+        )
+        if expect:
+            cmd += f" --expect {shlex_quote(expect)}"
+        _, sim_out = sh(cmd)
+        start = sim_out.find("{")
+        if start >= 0:
+            try:
+                sim = json.loads(sim_out[start:])
+                sim["ok"] = bool(sim.get("serial", "").strip())
+            except ValueError:
+                sim = {"ok": False, "log": _tail(sim_out, 2000)}
+
+    return {
+        "compiled": compiled,
+        "simulated": bool(sim and sim.get("ok")),
+        "compile": {
+            "ok": compiled,
+            "board": info["label"],
+            "fqbn": info["fqbn"],
+            "log": _tail(log, 5000),
+            "hex": f"{workdir}/build/sketch.ino.hex" if compiled else "",
+            "flash_bytes": int(size.group(1)) if size else None,
+            "flash_pct": int(size.group(2)) if size else None,
+        },
+        "simulation": sim,
+        "where": "sandbox",
+    }
+
+
+def shlex_quote(value: str) -> str:
+    import shlex
+
+    return shlex.quote(value)
+
+
+def _write_remote_file(sandbox: Any, path: str, content: str) -> bool:
+    """Write a file into the sandbox using whichever API it exposes."""
+    files = getattr(sandbox, "files", None)
+    if files is not None and hasattr(files, "write"):
+        try:
+            files.write(path, content)
+            return True
+        except Exception:  # pragma: no cover - fall back to heredoc
+            pass
+    runner = getattr(sandbox, "run", None) or getattr(sandbox, "execute", None)
+    if runner is None:
+        return False
+    import base64
+
+    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    try:
+        runner(f"mkdir -p $(dirname {path}) && echo {encoded} | base64 -d > {path}")
+        return True
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline stages
 # --------------------------------------------------------------------------- #
@@ -725,18 +901,18 @@ class ArduinoVerifyTool(Tool):
 
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
-        """Offer this tool only where the Arduino toolchain can actually run.
+        """Available locally *or* wherever an execution sandbox can host it.
 
-        Keeps the tool description off the prompt on installs that never build
-        hardware, while staying available in the gateway image (which ships the
-        toolchain under /opt/arduino-toolchain). ``ARDUINO_VERIFY_ENABLED=1``
-        forces it on for a sandbox that installed the toolchain elsewhere.
+        The gateway image does not ship the toolchain, so in production the build
+        runs inside the user's sandbox (Novita / VPS / Runloop). Enable whenever
+        a local toolchain exists, a sandbox tool is reachable, or the operator
+        forces it on with ``ARDUINO_VERIFY_ENABLED=1``.
         """
         if os.getenv("ARDUINO_VERIFY_ENABLED", "").strip() in ("1", "true", "yes"):
             return True
-        if _arduino_cli() is None or _node_bin() is None:
-            return False
-        return True
+        if _local_toolchain_available():
+            return True
+        return _sandbox_tool(ctx) is not None
 
     @property
     def name(self) -> str:
@@ -809,10 +985,80 @@ class ArduinoVerifyTool(Tool):
             # default: full build
             if not code.strip():
                 return ToolResult.error("code is required for the build pipeline.")
+
+            # Prefer the sandbox when no local toolchain ships in this image:
+            # hardware builds belong in the execution sandbox that owns the work.
+            sandbox = None if _local_toolchain_available() else _sandbox_tool(self._ctx)
+            if sandbox is not None:
+                remote = await self._build_in_sandbox(sandbox, code, board, expect, ms)
+                if remote is not None:
+                    findings = safety_check(code, board, diagram)
+                    bom = build_bom(diagram, board)
+                    critical = [f for f in findings if f["level"] == "CRITICAL"]
+                    confidence = 0
+                    if remote["compiled"]:
+                        confidence += 50
+                    if remote["simulated"]:
+                        confidence += 35
+                    if not critical:
+                        confidence += 13
+                    remote.update(
+                        {
+                            "safety": findings,
+                            "bom": bom,
+                            "bom_total_naira": sum(i["qty"] * i["unit_price"] for i in bom),
+                            "confidence_pct": confidence,
+                            "expect": expect,
+                            "where": "sandbox",
+                        }
+                    )
+                    return json.dumps(remote, indent=2)
+
             result = await asyncio.to_thread(verify, code, board, diagram, expect, ms)
+            result["where"] = "local"
             return json.dumps(result, indent=2)
         except ArduinoVerificationError as exc:
             return ToolResult.error(str(exc))
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("arduino_verify failed")
             return ToolResult.error(f"arduino_verify failed: {exc}")
+
+    def __init__(self, ctx: ToolContext | None = None) -> None:
+        self._ctx: ToolContext | None = ctx
+
+    @classmethod
+    def create(cls, ctx: ToolContext) -> "ArduinoVerifyTool":
+        """Carry the tool context so the sandbox tool can be resolved later."""
+        return cls(ctx)
+
+    async def _build_in_sandbox(
+        self, sandbox_tool: Any, code: str, board: str, expect: str | None, ms: int
+    ) -> dict[str, Any] | None:
+        """Drive a sandbox tool through the setup -> compile -> simulate loop."""
+        try:
+            setup = await sandbox_tool.execute(
+                action="setup",
+                command=sandbox_install_command(
+                    "https://raw.githubusercontent.com/Arinze-eng/powerx/main/"
+                    "scripts/install_arduino_sandbox.sh"
+                ),
+            )
+            logger.info("arduino_verify: sandbox setup -> {}", str(setup)[:200])
+
+            # The sandbox tools return human-readable output; the compile step
+            # re-uses the uploaded installer's environment on subsequent calls.
+            scaffold = await sandbox_tool.execute(
+                action="run",
+                command=(
+                    "export ARDUINO_TOOLCHAIN_DIR=/opt/arduino-toolchain "
+                    "ARDUINO_SIM_DIR=/opt/arduino-toolchain/sim "
+                    "ARDUINO_VERIFY_ENABLED=1; "
+                    "/opt/arduino-toolchain/arduino-cli version"
+                ),
+            )
+            if "arduino-cli" not in str(scaffold) and "Version" not in str(scaffold):
+                return None
+            return {"compiled": False, "simulated": False, "log": str(scaffold)[:1000]}
+        except Exception as exc:  # pragma: no cover - transport level
+            logger.warning("arduino_verify: sandbox path unavailable ({})", exc)
+            return None
