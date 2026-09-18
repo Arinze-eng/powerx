@@ -117,6 +117,36 @@ Only use this shape once compile **and** simulation have passed:
 - **Servo/relay/motor present** → WARN. Power from a separate 5 V rail, share ground.
 - **LED with no resistor** → WARN. Add 220-330 Ω in series.
 
+
+## Raspberry Pi projects (action=pi)
+
+Pi projects are Python, not .ino — use `action=pi` instead of `action=build`.
+
+Boards: `pi5`, `pi4` (default), `pi3`, `zero2w`, `pico`.
+
+```
+arduino_verify action=pi code=<python source> board=pi4 expect="MOTION DETECTED" ms=20000
+  scenario={"inputs":[{"pin":17,"at_ms":3000,"state":"high"}]}
+```
+
+The program runs against mocked `RPi.GPIO`, `gpiozero`, `smbus`/`smbus2` and
+`serial`. The result tells you what it DID:
+
+- `simulation.pin_toggles` — how many times each pin changed (real behaviour)
+- `simulation.pin_events` — every drive with a virtual timestamp
+- `simulation.pin_modes` / `pull_ups` — how each pin was configured
+- `simulation.serial_lines` — everything the program printed
+- `simulation.budget_hit` — true if it hit the virtual-time budget (usually a
+  runaway loop; inspect before reporting success)
+
+`time.sleep()` is virtualised (a 60 s sleep returns instantly), and `while True:`
+is bounded — so server-style programs still produce a transcript.
+
+Pi safety checks: 5 V signal into a 3.3 V GPIO (CRITICAL, needs a level shifter
+or divider), GPIO pins 2/3 (I2C) and 14/15 (serial console) reused as plain IO,
+motors/servos needing their own supply (a GPIO pin is ~16 mA), LEDs without a
+series resistor.
+
 ## Pricing
 
 Prices are Naira estimates for Kaduna Computer Village. They drift with FX and stock —

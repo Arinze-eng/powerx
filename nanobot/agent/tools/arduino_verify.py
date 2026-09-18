@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -714,6 +715,330 @@ def _write_remote_file(sandbox: Any, path: str, content: str) -> bool:
         return False
 
 
+def _pi_python() -> str | None:
+    """Locate a Python interpreter capable of running the Pi simulator."""
+    return sys.executable or shutil.which("python3")
+
+
+# --------------------------------------------------------------------------- #
+# Raspberry Pi support
+# --------------------------------------------------------------------------- #
+
+#: Raspberry Pi board variants and their Naira estimates (Kaduna).
+PI_BOARDS: dict[str, dict[str, Any]] = {
+    "pi5": {"label": "Raspberry Pi 5 (4GB)", "logic_v": 3.3, "price": 135000, "note": "Latest, fastest"},
+    "pi4": {"label": "Raspberry Pi 4 Model B (4GB)", "logic_v": 3.3, "price": 95000, "note": "Best value for most projects"},
+    "pi3": {"label": "Raspberry Pi 3 Model B+", "logic_v": 3.3, "price": 65000, "note": "Older but capable"},
+    "zero2w": {"label": "Raspberry Pi Zero 2 W", "logic_v": 3.3, "price": 35000, "note": "Tiny, Wi-Fi, low power"},
+    "pico": {"label": "Raspberry Pi Pico (RP2040)", "logic_v": 3.3, "price": 9000, "note": "Microcontroller, not a Linux Pi"},
+}
+
+#: BCM pin safety facts for the 40-pin header.
+PI_RESERVED_PINS = {
+    0: "ID_SD (HAT EEPROM) — avoid",
+    1: "ID_SC (HAT EEPROM) — avoid",
+    2: "SDA1 (I2C) — shared bus",
+    3: "SCL1 (I2C) — shared bus",
+    14: "TXD (serial console) — used by default",
+    15: "RXD (serial console) — used by default",
+}
+PI_MAX_SAFE_CURRENT_MA = 16  # per GPIO pin, realistically
+PI_3V3_RAIL_MA = 300
+PI_5V_RAIL_MA = 1000
+
+_PI_SENSITIVE_PINS = (2, 3, 14, 15)
+
+#: Libraries the Pi simulator mocks. Anything else is a real dependency.
+PI_MOCKED_LIBS = ("RPi.GPIO", "gpiozero", "smbus", "smbus2", "serial", "time")
+
+
+def pi_sim_script() -> Path | None:
+    """Materialise the Raspberry Pi simulator, or None if the asset is missing."""
+    asset = Path(__file__).parent / "arduino_assets" / "pi_sim.py"
+    if not asset.exists():
+        return None
+    _SIM_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _SIM_DIR / "pi_sim.py"
+    source = asset.read_text(encoding="utf-8")
+    if not dest.exists() or dest.read_text(encoding="utf-8") != source:
+        dest.write_text(source, encoding="utf-8")
+    return dest
+
+
+def _strip_python_comments(code: str) -> str:
+    """Remove comments and string literals so only executable code is scanned.
+
+    Wiring is usually documented in comments ("PIR VCC -> 5V"), and scanning
+    those as if they were code produces false hazards — a module *powered* from
+    5 V is perfectly fine; only a 5 V *signal* into a GPIO is dangerous.
+    """
+    code = re.sub(r'"""(?:.|\n)*?"""', " ", code)
+    code = re.sub(r"'''(?:.|\n)*?'''", " ", code)
+    out_lines = []
+    for line in code.splitlines():
+        in_str: str | None = None
+        kept = []
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if in_str:
+                if ch == "\\":
+                    i += 2
+                    continue
+                if ch == in_str:
+                    in_str = None
+                i += 1
+                continue
+            if ch in "\"'":
+                in_str = ch
+                i += 1
+                continue
+            if ch == "#":
+                break
+            kept.append(ch)
+            i += 1
+        out_lines.append("".join(kept))
+    return "\n".join(out_lines)
+
+
+def pi_safety_check(code: str, board: str = "pi4") -> list[dict[str, str]]:
+    """Static audit of a Raspberry Pi program for common hardware hazards."""
+    findings: list[dict[str, str]] = []
+    info = PI_BOARDS.get(board, PI_BOARDS["pi4"])
+    executable = _strip_python_comments(code)
+    lowered = executable.lower()
+
+    used_pins: set[int] = set()
+    for match in re.finditer(r"GPIO\.setup\(\s*(\d+)", executable):
+        used_pins.add(int(match.group(1)))
+    for match in re.finditer(r"GPIO\.(?:output|input)\(\s*(\d+)", executable):
+        used_pins.add(int(match.group(1)))
+    for match in re.finditer(r"(?:LED|Button|Buzzer|MotionSensor|Servo|Motor|PWMLED)\(\s*(\d+)", executable):
+        used_pins.add(int(match.group(1)))
+
+    clashes = sorted(p for p in used_pins if p in _PI_SENSITIVE_PINS)
+    if clashes:
+        findings.append(
+            {
+                "level": "WARN",
+                "issue": f"GPIO pins {clashes} are used for application IO.",
+                "fix": (
+                    "Pins 2/3 are the I2C bus and 14/15 the serial console. Sharing them "
+                    "with a sensor usually breaks one or the other — move to spare GPIO."
+                ),
+            }
+        )
+
+    # Peripherals whose *signal* line is 5 V and must not feed a 3.3 V GPIO.
+    # Hardware facts live in comments too ("HC-SR04 echo -> GPIO17"), so the full
+    # source is scanned here — but a line that only describes the power rail
+    # ("VCC -> 5V") is not a signal hazard.
+    five_volt_signal = (
+        "hc-sr04", "hc_sr04", "hc sr04", "ultrasonic", "l298", "l293", "level shifter",
+    )
+    signal_words = ("echo", "trig", "signal", "out", "data", "sensor", "gpio", "pin")
+    power_only = re.compile(r"vcc|vin|\b5v\b|power|supply|rail", re.IGNORECASE)
+
+    signal_hazard = False
+    for line in code.splitlines():
+        low = line.lower()
+        if not any(tok in low for tok in five_volt_signal):
+            continue
+        stripped = line.strip().lstrip("#").strip()
+        mentions_signal = any(w in low for w in signal_words)
+        mentions_power_only = bool(power_only.search(stripped)) and not mentions_signal
+        if mentions_power_only:
+            continue
+        signal_hazard = True
+        break
+
+    # A bare peripheral name in code (no wiring comment) is still a signal risk.
+    if not signal_hazard and any(tok in lowered for tok in five_volt_signal):
+        signal_hazard = True
+
+    if signal_hazard:
+        findings.append(
+            {
+                "level": "CRITICAL",
+                "issue": (
+                    f"{info['label']} GPIO is 3.3 V only, but a peripheral with a 5 V signal "
+                    "line is present."
+                ),
+                "fix": (
+                    "Divide the 5 V signal down (1k/2k) or fit a bidirectional level shifter "
+                    "before it reaches a GPIO pin. A 5 V signal will damage the SoC."
+                ),
+            }
+        )
+    else:
+        findings.append(
+            {
+                "level": "OK",
+                "issue": "No 5 V signal lines detected — all peripherals appear 3.3 V safe.",
+                "fix": "Modules may still be *powered* from the 5 V rail; only signals matter.",
+            }
+        )
+
+    # Current budget.
+    if re.search(r"Motor|Servo|relay|solenoid", executable):
+        findings.append(
+            {
+                "level": "WARN",
+                "issue": "Motors, servos and relays draw far more current than a GPIO pin can source.",
+                "fix": (
+                    f"A GPIO pin is safe for roughly {PI_MAX_SAFE_CURRENT_MA} mA. Power loads from a "
+                    "separate 5 V supply (>=2 A) and share only the ground."
+                ),
+            }
+        )
+    if re.search(r"LED|Buzzer", executable) and not re.search(
+        r"220|330|470|resistor|1k", code, re.IGNORECASE
+    ):
+        findings.append(
+            {
+                "level": "WARN",
+                "issue": "An LED/buzzer is driven without an obvious series resistor.",
+                "fix": "Fit 220-330 ohm in series with each LED; a bare LED can damage the pin.",
+            }
+        )
+
+    # Bus contention.
+    if re.search(r"GPIO\.setup\(\s*(?:2|3)\b", executable) or re.search(
+        r"(?:LED|Button)\(\s*(?:2|3)\b", executable
+    ):
+        findings.append(
+            {
+                "level": "WARN",
+                "issue": "An I2C pin (2/3) is claimed as plain GPIO.",
+                "fix": "If you use any I2C device (LCD, RTC, IMU), those pins must stay on the bus.",
+            }
+        )
+
+    if re.search(r"time\.sleep\(\s*(?:[1-9]\d*|[1-9]\d*\.\d+)\s*\)", executable):
+        findings.append(
+            {
+                "level": "INFO",
+                "issue": "Long time.sleep() calls detected.",
+                "fix": "Fine for simple builds; for multitasking use gpiozero callbacks or asyncio.",
+            }
+        )
+
+    return findings
+
+
+def build_pi_bom(diagram: dict[str, Any] | None, board: str = "pi4") -> list[dict[str, Any]]:
+    """Naira BOM for a Raspberry Pi build, always including the board + SD card."""
+    info = PI_BOARDS.get(board, PI_BOARDS["pi4"])
+    bom: list[dict[str, Any]] = [
+        {"item": info["label"], "qty": 1, "unit_price": info["price"], "note": info["note"]},
+        {"item": "microSD card 32GB (Class 10)", "qty": 1, "unit_price": 6500, "note": "OS + storage"},
+        {"item": "5V 3A USB-C power supply", "qty": 1, "unit_price": 5500, "note": "Undervoltage causes weird bugs"},
+    ]
+    parts, _ = parse_diagram(diagram)
+    for part in parts:
+        pid = str(part.get("type") or part.get("id") or "")
+        if "raspberry" in pid.lower() or "rpi" in pid.lower():
+            continue
+        name = str(part.get("name") or pid)
+        price, note = _price_for(pid, name)
+        bom.append({"item": name, "qty": 1, "unit_price": price, "note": note})
+    for extra in ("jumper wire", "breadboard"):
+        price, note = KADUNA_PRICES[extra]
+        bom.append({"item": extra.title(), "qty": 1, "unit_price": price, "note": note})
+    return bom
+
+
+def verify_pi(
+    code: str,
+    board: str = "pi4",
+    diagram: dict[str, Any] | None = None,
+    expect: str | None = None,
+    ms: int = 5000,
+    scenario: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Full Raspberry Pi pipeline: syntax -> simulate -> safety -> BOM -> verdict."""
+    board = board.lower() if board else "pi4"
+    if board not in PI_BOARDS:
+        board = "pi4"
+
+    python = _pi_python()
+    result: dict[str, Any] = {
+        "platform": "raspberry-pi",
+        "board": PI_BOARDS[board]["label"],
+        "compiled": False,
+        "simulated": False,
+        "simulation": None,
+        "safety": [],
+    }
+    if not python:
+        result["error"] = "no python interpreter available to run the Pi simulator"
+        return result
+
+    script = pi_sim_script()
+    if script is None:
+        result["error"] = "the Raspberry Pi simulator asset (pi_sim.py) is missing"
+        return result
+    workdir = Path(tempfile.mkdtemp(prefix="pi_"))
+    program = workdir / "program.py"
+    program.write_text(code, encoding="utf-8")
+
+    cmd = [python, str(script), str(program), "--ms", str(max(100, min(ms, _MAX_MS)))]
+    if expect:
+        cmd += ["--expect", expect]
+    if scenario:
+        scen_path = workdir / "scenario.json"
+        scen_path.write_text(json.dumps(scenario), encoding="utf-8")
+        cmd += ["--scenario", str(scen_path)]
+
+    rc, out = _run(cmd, timeout=180)
+    payload = out.strip()
+    start = payload.find("{")
+    sim: dict[str, Any] | None = None
+    if start >= 0:
+        try:
+            sim = json.loads(payload[start:])
+        except ValueError:
+            sim = None
+
+    if sim is None:
+        result["compile"] = {"ok": False, "log": _tail(out, 3000)}
+        result["safety"] = pi_safety_check(code, board)
+        result["bom"] = build_pi_bom(diagram, board)
+        result["bom_total_naira"] = sum(i["qty"] * i["unit_price"] for i in result["bom"])
+        result["confidence_pct"] = 0
+        return result
+
+    syntax_ok = sim.get("syntax_error") is None
+    ran = sim.get("ok", False)
+    result["compiled"] = syntax_ok
+    result["simulated"] = bool(ran)
+    result["compile"] = {
+        "ok": syntax_ok,
+        "log": sim.get("syntax_error") or "syntax OK",
+        "runtime_error": sim.get("runtime_error"),
+    }
+    result["simulation"] = sim
+    result["safety"] = pi_safety_check(code, board)
+    result["bom"] = build_pi_bom(diagram, board)
+    result["bom_total_naira"] = sum(i["qty"] * i["unit_price"] for i in result["bom"])
+    result["expect"] = expect
+
+    critical = [f for f in result["safety"] if f["level"] == "CRITICAL"]
+    confidence = 0
+    if syntax_ok:
+        confidence += 50
+    if ran:
+        confidence += 35
+    if not critical:
+        confidence += 13
+    if expect and sim.get("expect_found"):
+        confidence = min(99, confidence + 2)
+    if not syntax_ok:
+        confidence = 0
+    result["confidence_pct"] = confidence
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline stages
 # --------------------------------------------------------------------------- #
@@ -1055,12 +1380,12 @@ console.log(JSON.stringify(run(hexPath, ms, expect), null, 2));
         required=["action"],
         action=StringSchema(
             "Arduino verification operation",
-            enum=["build", "compile", "simulate", "safety", "bom", "diagram", "setup"],
+            enum=["build", "compile", "simulate", "safety", "bom", "diagram", "setup", "pi"],
         ),
         code=StringSchema("Full Arduino sketch (.ino) source, including every #include"),
         board=StringSchema(
-            "Target board key",
-            enum=sorted(BOARDS.keys()),
+            "Target board key. Arduino: uno (default), nano, mega, leonardo, esp32, esp8266. "
+            "Raspberry Pi (action=pi): pi5, pi4 (default), pi3, zero2w, pico.",
         ),
         diagram=ObjectSchema(description="Wokwi/Velxio diagram.json content (parts + connections)"),
         expect=StringSchema("Serial text that must appear for the simulation to pass, e.g. 'Servo moving'"),
@@ -1109,6 +1434,11 @@ class ArduinoVerifyTool(Tool):
             "firmware is executed on a headless AVR emulator that captures USART serial "
             "output and per-pin GPIO activity. Also performs a static wiring/ISR safety "
             "audit and produces a Naira (Kaduna Computer Village) bill of materials. "
+            "SUPPORTS RASPBERRY PI TOO: action='pi' runs a Python program against mocked "
+            "RPi.GPIO / gpiozero / smbus / serial, so you can observe which pins it drives "
+            "and in what order, with a virtual clock so sleeps and infinite loops still "
+            "yield a transcript. Use action='pi' for any Raspberry Pi (Python) project and "
+            "action='build' for Arduino (.ino) projects. "
             "Actions: 'setup' installs arduino-cli + AVR core + common libraries; "
             "'compile' compiles sketch code and returns the build log and hex path; "
             "'simulate' executes a hex and returns the serial transcript; "
@@ -1195,6 +1525,14 @@ class ArduinoVerifyTool(Tool):
             # default: full build
             if not code.strip():
                 return ToolResult.error("code is required for the build pipeline.")
+
+            # Raspberry Pi programs are Python: route to the Pi simulator.
+            if action == "pi":
+                result = await asyncio.to_thread(
+                    verify_pi, code, kwargs.get("board") or "pi4", diagram, expect, ms, scenario
+                )
+                result["where"] = "local"
+                return json.dumps(result, indent=2)
 
             # Prefer the sandbox when no local toolchain ships in this image:
             # hardware builds belong in the execution sandbox that owns the work.

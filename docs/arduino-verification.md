@@ -123,8 +123,35 @@ node is present, so installs that never touch hardware pay no prompt cost.
 
 ## Supported boards
 
-`uno` (default), `nano`, `mega`, `leonardo` — 5 V AVR.
-`esp32`, `esp8266` — 3.3 V (compile only; the AVR emulator covers the Uno).
+### Arduino (.ino) — `action=build`
+`uno` (default), `nano`, `mega`, `leonardo` — 5 V AVR, full compile + simulate.
+`esp32`, `esp8266` — 3.3 V, **compile only** (the AVR emulator covers the Uno).
+
+### Raspberry Pi (Python) — `action=pi`
+`pi5`, `pi4` (default), `pi3`, `zero2w`, `pico`.
+
+Pi programs are executed against mocked `RPi.GPIO`, `gpiozero`, `smbus`/`smbus2`
+and `serial`, with a **virtual clock**:
+
+- `time.sleep()` is virtualised, so a program sleeping 60 s still finishes
+  instantly while timestamps stay faithful.
+- Runaway `while True:` loops are bounded by virtual time *and* an instruction
+  budget, so a server-style program yields a transcript instead of hanging.
+- Inputs are **driven** from a scenario (`{"inputs": [{"pin": 17, "at_ms": 3000,
+  "state": "high"}]}`), so `GPIO.input()` returns what a real sensor would.
+
+The result reports `pin_events` (every drive with a timestamp), `pin_toggles`,
+`pin_modes`, and `pull_ups` — real behavioural evidence, e.g. a PIR alarm
+toggling the buzzer 12 times and the status LED 3 times.
+
+### What is *not* verified
+
+- **ESP32 behaviour.** It compiles, but there is no ESP32 emulator. You get a
+  build proof, not a behavioural proof.
+- **Analog reality.** If correctness depends on a sensor's actual reading
+  (temperature, distance), the emulator only proves your code path.
+- **Network / cloud / Wi-Fi** cannot be exercised on either platform.
+- **Mechanical fit** (does the servo arm reach the page?) is unknowable here.
 
 ## Safety checks
 
