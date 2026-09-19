@@ -224,6 +224,10 @@ class SubagentManager:
                 restrict_to_workspace=cfg.restrict_to_workspace,
                 workspace=root,
             ),
+            # Subagents run tools from their own registry; expose it so
+            # peer-resolving tools (mt5_sandbox, arduino_verify) can find the
+            # execution sandbox instead of reporting "no sandbox configured".
+            tool_registry=registry,
         )
         ToolLoader().load(ctx, registry, scope="subagent")
         return registry

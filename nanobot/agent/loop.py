@@ -712,6 +712,10 @@ class AgentLoop:
             timezone=self.context.timezone or "UTC",
             workspace_sandbox=self.workspace_scopes.sandbox_status,
             runtime_events=self.runtime_events,
+            # Let peer-resolving tools (mt5_sandbox, arduino_verify) find the
+            # configured execution sandbox at execute() time. self.tools is the
+            # same registry the loader is about to populate.
+            tool_registry=self.tools,
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)

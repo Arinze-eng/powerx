@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Iterator, cast
 
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import ContextAware, current_request_context
@@ -209,6 +209,36 @@ class ToolRegistry:
     def tool_names(self) -> list[str]:
         """Get list of registered tool names."""
         return list(self._tools.keys())
+
+    def values(self) -> list[Tool]:
+        """Return the registered tools (dict-compatible read access).
+
+        Several tools resolve a *peer* tool out of this registry at runtime
+        (``mt5_sandbox`` and ``arduino_verify`` both look for the configured
+        execution sandbox). They historically did::
+
+            items = registry.values() if isinstance(registry, dict) else registry
+            for tool in items: ...
+
+        The registry is not a dict and had no ``values()``/``__iter__``, so that
+        raised ``TypeError: 'ToolRegistry' object is not iterable``. The callers
+        swallow exceptions and return ``None``, which surfaced to the model as
+        "No execution sandbox is configured" even on a fully wired deployment.
+        Offering the mapping-style read API makes those lookups work.
+        """
+        return list(self._tools.values())
+
+    def items(self) -> list[tuple[str, Tool]]:
+        """Return ``(name, tool)`` pairs, mirroring ``dict.items()``."""
+        return list(self._tools.items())
+
+    def keys(self) -> list[str]:
+        """Return registered tool names, mirroring ``dict.keys()``."""
+        return list(self._tools.keys())
+
+    def __iter__(self) -> Iterator[Tool]:
+        """Iterate registered tools so ``for tool in registry`` works."""
+        return iter(self._tools.values())
 
     def __len__(self) -> int:
         return len(self._tools)

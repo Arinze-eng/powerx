@@ -114,8 +114,30 @@ def _sandbox_tool(ctx: ToolContext | None) -> Any:
     registry = getattr(ctx, "tool_registry", None) or getattr(ctx, "tools", None)
     if registry is None:
         return None
+
+    # The registry is a ToolRegistry, not a dict. Resolve by name first — that is
+    # the only guaranteed API — then fall back to iterating tools defensively.
+    # Relying on iteration alone used to raise TypeError (the registry had no
+    # __iter__/values), and because this function swallows exceptions it returned
+    # None, which reached the model as "No execution sandbox is configured" even
+    # when the sandbox was fully configured.
+    for name in ("novita_sandbox", "vps_exec", "runloop_sandbox", "daytona_sandbox"):
+        getter = getattr(registry, "get", None)
+        if callable(getter):
+            try:
+                tool = getter(name)
+            except Exception:  # pragma: no cover - defensive
+                tool = None
+            if tool is not None:
+                return tool
+
     try:
-        items = registry.values() if isinstance(registry, dict) else registry
+        if isinstance(registry, dict):
+            items: Any = registry.values()
+        elif callable(getattr(registry, "values", None)):
+            items = registry.values()
+        else:
+            items = registry
         for tool in items:
             name = getattr(tool, "name", "")
             if name in ("novita_sandbox", "vps_exec", "runloop_sandbox", "daytona_sandbox"):

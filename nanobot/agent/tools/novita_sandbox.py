@@ -1493,7 +1493,12 @@ class NovitaSandboxTool(Tool):
 
         sizing = self._template_sizing()
         if sizing is None:  # defensive: _template_sizing no longer returns None
-            return _first_existing(["powerx-base-2g-c2", "powerx-base-4g", "base"]) or "base"
+            return (
+                _first_existing(
+                    ["powerx-base-4g-c2", "powerx-base-2g-c2", "powerx-base-4g", "base"]
+                )
+                or "base"
+            )
 
         alias = self._desired_alias(sizing)
         cached = _TEMPLATE_CACHE.get(alias)
@@ -1526,7 +1531,12 @@ class NovitaSandboxTool(Tool):
             except Exception as exc:
                 # Building failed. Prefer an already-published sized template over
                 # the tiny stock base image; only use "base" as a last resort.
-                fallback = _first_existing([alias, "powerx-base-2g-c2", "powerx-base-4g"]) or "base"
+                fallback = (
+                    _first_existing(
+                        [alias, "powerx-base-4g-c2", "powerx-base-2g-c2", "powerx-base-4g"]
+                    )
+                    or "base"
+                )
                 logger.warning(
                     "Could not build Novita template '{}' ({}); falling back to '{}'. "
                     "If this is 'base', sandboxes run at ~486 MB — publish a 2 GB "

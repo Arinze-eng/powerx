@@ -91,3 +91,9 @@ class ToolContext:
     timezone: str = "UTC"
     workspace_sandbox: WorkspaceSandboxStatus | None = None
     runtime_events: RuntimeEventBus | None = None
+    #: The live registry of tools being built/run. Carried so a tool can resolve a
+    #: *peer* tool at execute() time — `mt5_sandbox` and `arduino_verify` both need
+    #: the configured execution sandbox tool (novita/vps/runloop/daytona) to
+    #: forward work into. Without it the peer lookup always returned None and the
+    #: model was told "No execution sandbox is configured" on wired deployments.
+    tool_registry: Any | None = None

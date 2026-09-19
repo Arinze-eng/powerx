@@ -33,6 +33,7 @@ from nanobot.agent.tools.mt5_sandbox import (
     build_cli_command,
 )
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.config.schema import ToolsConfig
 
 
 class _FakeSandbox:
@@ -443,6 +444,73 @@ def test_sandbox_scripts_exist_in_the_repo():
     repo_root = Path(__file__).resolve().parents[2]
     assert (repo_root / "scripts" / "mt5_cli.py").is_file()
     assert (repo_root / "scripts" / "install_mt5_sandbox.sh").is_file()
+
+
+def test_registry_iteration_api_is_available():
+    """The registry must expose mapping-style reads and be iterable.
+
+    ``mt5_sandbox``/``arduino_verify`` resolve a PEER tool out of this registry at
+    runtime. They previously did ``registry.values() if isinstance(registry, dict)
+    else registry`` and iterated the result. ``ToolRegistry`` is not a dict and
+    shipped no ``values()``/``__iter__``, so the lookup raised
+    ``TypeError: 'ToolRegistry' object is not iterable``. The surrounding
+    ``except Exception`` returned None, which reached the model as
+    "No execution sandbox is configured" on a fully wired deployment.
+    """
+    registry = ToolRegistry()
+    registry.register(
+        MT5SandboxTool.create(ToolContext(config=ToolsConfig(), workspace="/tmp"))
+    )
+
+    # Must not raise, and must yield the registered tool.
+    assert [t.name for t in registry] == ["mt5_sandbox"]
+    assert [t.name for t in registry.values()] == ["mt5_sandbox"]
+    assert registry.keys() == ["mt5_sandbox"]
+    assert [name for name, _ in registry.items()] == ["mt5_sandbox"]
+    assert registry.get("mt5_sandbox") is not None
+
+
+def test_sandbox_lookup_resolves_a_peer_tool_by_name():
+    """A configured sandbox must be found — not reported as 'no sandbox configured'.
+
+    This is the regression that made the agent tell users it had no execution
+    sandbox: the peer lookup silently returned None because the registry could not
+    be iterated.
+    """
+    from nanobot.agent.tools.mt5_sandbox import _sandbox_tool
+
+    class _Peer:
+        name = "novita_sandbox"
+
+    registry = ToolRegistry()
+    registry.register(_Peer())
+
+    ctx = ToolContext(config=ToolsConfig(), workspace="/tmp", tool_registry=registry)
+    assert _sandbox_tool(ctx) is registry.get("novita_sandbox")
+
+
+def test_sandbox_lookup_returns_none_when_absent():
+    """With no sandbox registered the tool must still report None (honest error)."""
+    from nanobot.agent.tools.mt5_sandbox import _sandbox_tool
+
+    ctx = ToolContext(config=ToolsConfig(), workspace="/tmp", tool_registry=ToolRegistry())
+    assert _sandbox_tool(ctx) is None
+    assert _sandbox_tool(None) is None
+
+
+def test_sandbox_lookup_survives_an_uniterable_registry():
+    """A registry exposing only ``get`` must not raise inside the lookup."""
+    from nanobot.agent.tools.mt5_sandbox import _sandbox_tool
+
+    class _GetOnly:
+        def __init__(self):
+            self.tool = type("T", (), {"name": "novita_sandbox"})()
+
+        def get(self, name):
+            return self.tool if name == "novita_sandbox" else None
+
+    ctx = ToolContext(config=ToolsConfig(), workspace="/tmp", tool_registry=_GetOnly())
+    assert _sandbox_tool(ctx) is not None
 
 
 def test_registry_can_resolve_the_tool(tmp_path):
