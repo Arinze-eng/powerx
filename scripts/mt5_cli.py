@@ -143,6 +143,41 @@ def find_terminal() -> Path | None:
     return None
 
 
+def _find_exe(directory: Path, name: str) -> Path | None:
+    """Find a Windows .exe case-insensitively inside a Wine drive_c.
+
+    Linux paths are case-sensitive and MT5 ships ``MetaEditor64.exe`` /
+    ``Terminal64.exe`` with capital letters, while everything in this file was
+    written in lowercase. Matching literally therefore never found MetaEditor on a
+    perfectly good install, so the chain check reported ``metaeditor64.exe``
+    missing and ``compile`` refused forever. Always compare case-folded.
+    """
+    wanted = name.lower()
+    if not directory.exists():
+        return None
+    try:
+        for candidate in directory.rglob("*"):
+            if candidate.is_file() and candidate.name.lower() == wanted:
+                return candidate
+    except OSError:  # pragma: no cover - defensive
+        return None
+    return None
+
+
+def find_metaeditor(terminal: Path | None = None) -> Path | None:
+    """Locate MetaEditor64.exe (the ONLY MQL5 compiler) case-insensitively."""
+    if terminal is None:
+        terminal = find_terminal()
+    if terminal is None:
+        return None
+    # Sits next to terminal64.exe in the MetaTrader 5 Program Files directory.
+    found = _find_exe(terminal.parent, "metaeditor64.exe")
+    if found is not None:
+        return found
+    drive_c = WINE_PREFIX / "drive_c"
+    return _find_exe(drive_c, "metaeditor64.exe") if drive_c.exists() else None
+
+
 def terminal_running() -> bool:
     result = subprocess.run(
         ["pgrep", "-f", "terminal64.exe"], capture_output=True, text=True
@@ -807,15 +842,9 @@ def installed_chain() -> dict[str, Any]:
     terminal = find_terminal()
     winpy = win_python()
 
-    metaeditor: Path | None = None
-    if terminal is not None:
-        candidate = terminal.parent / "metaeditor64.exe"
-        if candidate.exists():
-            metaeditor = candidate
-        else:
-            for cand in terminal.parent.rglob("metaeditor64.exe"):
-                metaeditor = cand
-                break
+    # MetaEditor is the actual compiler and is named ``MetaEditor64.exe`` on
+    # disk; resolve it case-insensitively so a good install is not reported broken.
+    metaeditor = find_metaeditor(terminal)
 
     try:
         wine_present = (
@@ -895,18 +924,20 @@ def cmd_compile(args: argparse.Namespace) -> int:
         return gate
 
     terminal = find_terminal()
-    metaeditor = terminal.parent / "metaeditor64.exe"
-    if not metaeditor.exists():
-        for cand in (terminal.parent).rglob("metaeditor64.exe"):
-            metaeditor = cand
-            break
-    if not metaeditor.exists():
-        return fail("metaeditor64.exe not found next to the terminal", code=2)
+    # Case-insensitive: MT5 installs ``MetaEditor64.exe``, not ``metaeditor64.exe``,
+    # and Linux would never match the lowercase spelling on a good install.
+    metaeditor = find_metaeditor(terminal)
+    if metaeditor is None:
+        return fail("MetaEditor64.exe not found next to the terminal", code=2)
+
+    # MetaEditor only emits a .ex5 when it can find MQL5/Include (Trade.mqh and
+    # friends live there); default it so a plain `#include <Trade/Trade.mqh>`
+    # compiles without the caller having to know the layout.
+    include = f"/include:{args.include}" if args.include else ""
 
     log_path = src.with_suffix(".log")
     if log_path.exists():
         log_path.unlink()
-    include = f"/include:{args.include}" if args.include else ""
     cmd = [wine_bin(), str(metaeditor), f"/compile:{src}", "/log", include]
     cmd = [c for c in cmd if c]
     proc = subprocess.run(cmd, env=wine_env(), capture_output=True, text=True,
