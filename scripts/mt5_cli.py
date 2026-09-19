@@ -794,6 +794,88 @@ def cmd_close_all(args: argparse.Namespace) -> int:
                 text=f"closed {len(results)} position(s)", code=0 if ok else 3)
 
 
+def installed_chain() -> dict[str, Any]:
+    """Report whether the FULL Wine + MT5 chain is installed.
+
+    An ``.mq5`` cannot be compiled by anything except MetaEditor running inside
+    the installed Wine prefix, so every chain-dependent action must prove the
+    chain exists before it does any work. A partial prefix (missing MetaEditor,
+    missing Windows python, or a bridge that will not import) is NOT usable: the
+    old code only checked ``terminal64.exe`` and then let a compile attempt fail
+    in a way that looked like a code error.
+    """
+    terminal = find_terminal()
+    winpy = win_python()
+
+    metaeditor: Path | None = None
+    if terminal is not None:
+        candidate = terminal.parent / "metaeditor64.exe"
+        if candidate.exists():
+            metaeditor = candidate
+        else:
+            for cand in terminal.parent.rglob("metaeditor64.exe"):
+                metaeditor = cand
+                break
+
+    try:
+        wine_present = (
+            subprocess.run(["which", wine_bin()], capture_output=True).returncode == 0
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        wine_present = False
+
+    missing: list[str] = []
+    if not wine_present:
+        missing.append("wine")
+    if not (WINE_PREFIX / "drive_c").exists():
+        missing.append("wine_prefix")
+    if terminal is None:
+        missing.append("terminal64.exe")
+    if metaeditor is None:
+        missing.append("metaeditor64.exe")
+    if winpy is None:
+        missing.append("windows_python")
+
+    return {
+        "installed": not missing,
+        "missing": missing,
+        "wine": wine_present,
+        "wine_prefix": str(WINE_PREFIX),
+        "terminal_path": str(terminal) if terminal else None,
+        "metaeditor_path": str(metaeditor) if metaeditor else None,
+        "windows_python": str(winpy) if winpy else None,
+    }
+
+
+def require_installed_chain(action: str) -> int | None:
+    """Hard gate: refuse a chain-dependent action unless the chain is installed.
+
+    THIS IS THE INSTALLATION RULE. Handing the agent an ``.mq5`` must never lead
+    to a casual "compile" that skips provisioning: the only supported path is
+    ``install`` (detached) -> poll ``status`` until ``stage="done"`` -> then
+    ``compile``. Without this gate the tool cheerfully attempted a compile against
+    a missing/partial prefix and then looked like an ordinary compile failure, so
+    the agent treated MQL5 like any other source file instead of provisioning the
+    Wine + MT5 chain first.
+    """
+    info = installed_chain()
+    if info["installed"]:
+        return None
+    return fail(
+        f"action='{action}' requires the installed MT5 chain (Wine + MetaTrader 5 "
+        "+ MetaEditor + Windows python bridge), but it is missing: "
+        f"{', '.join(info['missing']) or 'unknown'}. Do NOT try to compile or fix "
+        "the MQL5 source some other way — follow the installation rules: run "
+        "action='install' (it returns immediately and installs detached), then poll "
+        "action='status' until stage='done', then retry.",
+        code=5,
+        stage="not_installed",
+        missing=info["missing"],
+        next="mt5_sandbox(action='install') then poll action='status' until stage='done'",
+        chain=info,
+    )
+
+
 def cmd_compile(args: argparse.Namespace) -> int:
     """Compile an MQL5 source file via MetaEditor's command-line interface.
 
@@ -804,9 +886,15 @@ def cmd_compile(args: argparse.Namespace) -> int:
     src = Path(args.file)
     if not src.exists():
         return fail(f"source file not found: {src}")
+
+    # Installation rule: the chain must exist BEFORE a compile is attempted. A
+    # .mq5 has no other compiler, so this is not a nicety — skipping it produces a
+    # misleading "compile failed" that the agent then tries to fix in the source.
+    gate = require_installed_chain("compile")
+    if gate is not None:
+        return gate
+
     terminal = find_terminal()
-    if terminal is None:
-        return fail("terminal not installed; cannot locate MetaEditor", code=2)
     metaeditor = terminal.parent / "metaeditor64.exe"
     if not metaeditor.exists():
         for cand in (terminal.parent).rglob("metaeditor64.exe"):

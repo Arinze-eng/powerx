@@ -20,6 +20,31 @@ installer is launched *detached* and you poll `status` until it finishes.
 Do **not** retry `install` in a loop, and do not assume a `status` call that
 still says `in_progress` has failed. Poll patiently.
 
+## The installation rule (this is what you were getting wrong)
+
+Being handed an `.mq5` is **not** permission to compile it casually. An `.mq5`
+has exactly one compiler — MetaEditor, inside the Wine + MT5 chain — so **every**
+MQL5 run begins with `install`, then `status` until `stage="done"`, and only
+then `compile`. Skipping that is the bug this playbook exists to prevent.
+
+`compile` enforces the rule itself: with no (or a partial) chain it refuses with
+
+```json
+{"ok": false, "stage": "not_installed", "missing": ["wine", "metaeditor64.exe"],
+ "next": "mt5_sandbox(action='install') then poll action='status' until stage='done'"}
+```
+
+Read that literally. It means **provisioning is missing**, so:
+
+* **Never** treat it as a code error — do not edit the source to "make it compile".
+* **Never** conclude MQL5 cannot be compiled in the sandbox.
+* **Never** hand the uncompiled `.mq5` back to the user asking them to compile it.
+* Run `install`, poll `status` to `stage="done"`, then retry `compile`.
+
+A `not_installed` refusal is the *only* result that requires zero edits. Every
+other `ok: false` (real `errors[...]` from MetaEditor) is a genuine source error —
+fix that, and compile again.
+
 ## Canonical workflow
 
 ```

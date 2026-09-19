@@ -78,13 +78,22 @@ not this. Wine 10 is pinned automatically because Wine 11 trips MetaTrader's
 anti-debug check.
 
 ```
-1. mt5_sandbox(action="install")     # detached; returns immediately
+1. mt5_sandbox(action="install")     # MANDATORY FIRST — detached; returns immediately
 2. mt5_sandbox(action="status")      # poll until stage="done" (~2 min). Do NOT re-run install.
 3. mt5_sandbox(action="compile", file="<abs path to .mq5>", include="<MQL5/Include>")
      -> {"ok": true, "ex5": ".../MyEA.ex5", "errors": [...]}
      -> {"ok": false, "errors": ["MyEA.mq5(42,7) : error 256: ..."]}   # fix and re-compile
 4. mt5_sandbox(action="start", login=..., password=..., server=...)   # then quote/order
 ```
+
+**THE INSTALLATION RULE — no exceptions.** When the user hands you an `.mq5`
+script, that is NOT a cue to compile it casually. An `.mq5` can only be built by
+MetaEditor inside the installed Wine + MT5 chain, so the run **always** starts at
+step 1 (`install`) and proceeds in order. `compile` enforces this: if the chain
+is missing it refuses with `stage="not_installed"` and lists what is absent.
+**That refusal is a provisioning problem, NOT a source-code problem** — never
+"fix" the `.mq5`, never hand it back, never claim MQL5 cannot be compiled. Just
+install, poll `status` to `stage="done"`, and retry the compile.
 
 `doctor` reports readiness. Read `error`/`log` from the returned JSON — MetaEditor
 writes its log as UTF-16 and the CLI already decodes it, so do not read the raw

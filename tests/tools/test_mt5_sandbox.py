@@ -1,6 +1,6 @@
 """Tests for the MT5 sandbox tool (compile / log / trade via the sandbox).
 
-These tests pin the two properties that matter most:
+These tests pin the properties that matter most:
 
 1. **The host is never touched.** Every action must be forwarded to an execution
    sandbox; with no sandbox configured the tool must refuse rather than run
@@ -8,6 +8,10 @@ These tests pin the two properties that matter most:
 2. **Live trading is opt-in.** ``order`` / ``close`` / ``close_all`` are blocked
    unless ``MT5_ALLOW_TRADING`` is enabled, while ``dry_run`` still previews the
    exact command.
+3. **The installation rule is enforced.** Compiling an ``.mq5`` must require the
+   full Wine + MT5 chain. Given a script with no chain installed, the tool must
+   refuse and tell the model to ``install`` first — never let it look like an
+   ordinary compilation error that the agent "fixes" in the source.
 
 The sandbox is faked, so the tests are fast and need no network or Wine.
 """
@@ -451,3 +455,151 @@ def test_registry_can_resolve_the_tool(tmp_path):
     )
     registry.register(tool)
     assert registry.has("mt5_sandbox")
+
+
+# --------------------------------------------------------------------------- #
+# installation rule (the regression: compile was attempted with no chain)
+# --------------------------------------------------------------------------- #
+def _isolate_prefix(monkeypatch, tmp_path):
+    """Point the CLI at an empty HOME so no real Wine/MT5 chain is detected."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MT5_ROOT", str(tmp_path / ".mt5"))
+    monkeypatch.setenv("WINE_PREFIX", str(tmp_path / ".wine-mt5"))
+    monkeypatch.delenv("MT5_WIN_PYTHON", raising=False)
+
+
+def test_installed_chain_reports_everything_missing_on_a_bare_box(monkeypatch, tmp_path):
+    """A fresh sandbox must be reported as not installed, listing the gaps.
+
+    ``installed_chain`` is what the gate reads. It checks the WHOLE chain, not
+    just terminal64.exe: MetaEditor actually compiles, and the Windows python
+    bridge is what makes the terminal usable, so a partial prefix must not pass.
+    """
+    _isolate_prefix(monkeypatch, tmp_path)
+    info = _load_cli_module().installed_chain()
+
+    assert info["installed"] is False
+    assert "wine" in info["missing"]
+    assert "wine_prefix" in info["missing"]
+    assert "terminal64.exe" in info["missing"]
+    assert "metaeditor64.exe" in info["missing"]
+    assert "windows_python" in info["missing"]
+
+
+def test_compile_refuses_when_the_chain_is_missing(monkeypatch, tmp_path):
+    """THE REGRESSION TEST.
+
+    Handed an .mq5 with no chain installed, ``compile`` must refuse with
+    ``stage="not_installed"`` and a machine-readable ``next`` step. Previously it
+    probed only for the terminal and produced a bare failure, which the model read
+    as "compile this script" — fixing MQL5 casually instead of installing
+    Wine + MT5 first.
+    """
+    _isolate_prefix(monkeypatch, tmp_path)
+    src = tmp_path / "MyEA.mq5"
+    src.write_text("//+------------------------------------------------------------------+\n")
+
+    module = _load_cli_module()
+    args = module.build_parser().parse_args(["compile", "--file", str(src)])
+    rc = module.cmd_compile(args)
+
+    assert rc != 0, "a missing chain must not be reported as success"
+
+
+def test_require_installed_chain_emits_the_install_directive(monkeypatch, tmp_path, capsys):
+    """The gate must name the missing pieces AND the action to take."""
+    import json
+
+    _isolate_prefix(monkeypatch, tmp_path)
+    module = _load_cli_module()
+
+    rc = module.require_installed_chain("compile")
+    assert rc is not None and rc != 0
+
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["ok"] is False
+    assert payload["stage"] == "not_installed"
+    assert payload["missing"]
+    assert "install" in payload["next"]
+    # The message must steer to install, not to editing the source.
+    assert "installation rules" in payload["error"]
+    assert "install" in payload["error"]
+
+
+def test_require_installed_chain_passes_when_the_chain_exists(monkeypatch, tmp_path):
+    """With the chain present the gate must stay silent (return None)."""
+    _isolate_prefix(monkeypatch, tmp_path)
+
+    # Fabricate a complete-looking chain.
+    terminal_dir = tmp_path / ".wine-mt5" / "drive_c" / "Program Files" / "MetaTrader 5"
+    terminal_dir.mkdir(parents=True)
+    (terminal_dir / "terminal64.exe").write_bytes(b"stub")
+    (terminal_dir / "metaeditor64.exe").write_bytes(b"stub")
+    winpy = tmp_path / ".wine-mt5" / "drive_c" / "Python311"
+    winpy.mkdir(parents=True)
+    (winpy / "python.exe").write_bytes(b"stub")
+
+    module = _load_cli_module()
+    monkeypatch.setattr(module, "wine_bin", lambda: "python3")
+
+    info = module.installed_chain()
+    assert info["installed"] is True, info["missing"]
+    assert module.require_installed_chain("compile") is None
+
+
+@pytest.mark.asyncio
+async def test_not_installed_refusal_surfaces_as_actionable_guidance():
+    """The tool must translate stage=not_installed into an unmistakable directive.
+
+    This is the model-facing half of the fix: the error has to say "install first,
+    do not edit the .mq5", otherwise the agent defaults to treating it as a code
+    problem and tries to fix the script casually.
+    """
+    payload = (
+        '{"ok": false, "stage": "not_installed", "missing": ["wine", "metaeditor64.exe"],'
+        ' "error": "chain missing"}\n[exit_code=5]'
+    )
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox(payload)}))
+
+    result = await tool.execute(action="compile", file="/home/user/MyEA.mq5")
+
+    text = str(result)
+    assert result.is_error
+    assert "NOT INSTALLED" in text
+    assert "not a code error" in text
+    assert "action='install'" in text
+    assert "status" in text
+
+
+def test_tool_description_mandates_install_before_compile():
+    """The schema text is the agent's primary instruction — it must say install first."""
+    desc = MT5SandboxTool().description
+    assert "install" in desc
+    assert "MANDATORY" in desc.upper()
+    assert "not_installed" in desc
+
+
+def test_prompt_template_states_the_installation_rule():
+    """sandbox_workspace.md drives behaviour before any skill is loaded."""
+    template = (
+        Path(__file__).resolve().parents[2]
+        / "nanobot" / "templates" / "agent" / "sandbox_workspace.md"
+    ).read_text()
+
+    assert "INSTALLATION RULE" in template
+    assert "MANDATORY FIRST" in template
+    # It must explicitly forbid the wrong behaviour.
+    assert "not_installed" in template
+    assert "NOT a source-code problem" in template
+
+
+def test_skill_documents_the_installation_rule():
+    """The mt5-trading playbook must carry the same rule."""
+    skill = (
+        Path(__file__).resolve().parents[2]
+        / "nanobot" / "skills" / "mt5-trading" / "SKILL.md"
+    ).read_text()
+
+    assert "installation rule" in skill.lower()
+    assert "not_installed" in skill
+    assert "Never" in skill

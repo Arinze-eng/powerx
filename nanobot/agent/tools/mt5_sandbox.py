@@ -302,12 +302,15 @@ class MT5SandboxTool(Tool):
         return (
             "MetaTrader 5 in the user's execution sandbox. NEVER runs Wine or the MT5 "
             "terminal on the application host. "
-            "Workflow: action='install' (starts a DETACHED Wine + Xvfb + MT5 + python "
-            "bridge install inside the sandbox) -> poll action='status' until "
-            "stage='done' (a full install takes ~10-25 min; sandbox commands are "
-            "timeout-capped so the install is never run inline) -> action='start' "
-            "(pass login/password/server so the terminal connects) -> then "
-            "quotes/candles/orders. "
+            "MANDATORY FIRST STEP: any MT5/MQL5 work — including compiling an .mq5 the "
+            "user just gave you — MUST begin with action='install' (starts a DETACHED "
+            "Wine + Xvfb + MT5 + python bridge install inside the sandbox), then poll "
+            "action='status' until stage='done' (a full install takes ~2-25 min; "
+            "sandbox commands are timeout-capped so the install is never run inline). "
+            "Only then call action='start' (pass login/password/server so the terminal "
+            "connects) or action='compile'. 'compile' REFUSES with stage='not_installed' "
+            "until the chain exists — that refusal is NOT a source-code error: never try "
+            "to fix or compile the .mq5 by any other means, just install first. "
             "Read/fix loop: use 'compile' to build an .mq5 with MetaEditor (returns the "
             "compiler errors), and 'logs'/'experts' to tail the terminal and Experts "
             "journal. "
@@ -437,6 +440,21 @@ class MT5SandboxTool(Tool):
             payload["password"] = "***"
 
         if payload.get("ok") is False:
+            # The chain-not-installed case is the one that used to be silently
+            # swallowed: the model saw a bare compile failure and started "fixing"
+            # the MQL5 source instead of provisioning Wine + MT5. Make the required
+            # next action impossible to miss so the installation rules are followed.
+            if payload.get("stage") == "not_installed":
+                missing = ", ".join(payload.get("missing") or []) or "unknown"
+                return ToolResult.error(
+                    "MT5 CHAIN NOT INSTALLED — this is not a code error, do NOT edit "
+                    f"or 'fix' the .mq5. Missing: {missing}. An .mq5 can only be built "
+                    "by MetaEditor inside the installed Wine + MT5 chain, so follow the "
+                    "installation rules first:\n"
+                    "  1. mt5_sandbox(action='install')   # starts the detached install\n"
+                    "  2. mt5_sandbox(action='status')    # poll until stage='done' (~2-25 min)\n"
+                    f"  3. mt5_sandbox(action='{action}', ...)  # retry only after done"
+                )
             return ToolResult.error(json.dumps(payload))
 
         return json.dumps(payload)
