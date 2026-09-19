@@ -561,6 +561,33 @@ else
   log "WARN: Windows Python was not installed; the MT5 bridge is unavailable"
 fi
 
+# ---------------------------------------------------------------------------
+# Materialise the MQL5 folder.
+#
+# MT5 ships the standard library (<Trade/Trade.mqh>, <MovingAverages.mqh>, ...)
+# *inside* terminal64.exe and only unpacks it into <install>/MQL5 on the first
+# terminal launch. A silent install never launches the terminal, so the tree is
+# absent and every compile of a realistic EA dies with
+#   "cannot open source file, Include\Trade\Trade.mqh  not found"
+# which reads exactly like a bug in the user's .mq5. Launch the terminal once,
+# let it build the tree, then stop it. Best-effort: a failure here must not
+# mark the whole install failed, since the chain is otherwise usable.
+# ---------------------------------------------------------------------------
+MT5_DIR="${WINE_PREFIX}/drive_c/Program Files/MetaTrader 5"
+if [ -d "${MT5_DIR}" ] && [ ! -d "${MT5_DIR}/MQL5/Include" ]; then
+  log "materialising MQL5 standard library (first terminal launch)"
+  set +e
+  timeout 180 wine "${MT5_DIR}/terminal64.exe" >/dev/null 2>&1
+  sleep 10
+  pkill -f terminal64 >/dev/null 2>&1
+  set -e
+  if [ -d "${MT5_DIR}/MQL5/Include" ]; then
+    log "MQL5 standard library ready ($(find "${MT5_DIR}/MQL5/Include" -name '*.mqh' | wc -l) headers)"
+  else
+    log "WARN: MQL5/Include still missing; compiles using <Trade/...> will need #include paths supplied"
+  fi
+fi
+
 status done "install complete: prefix=${WINE_PREFIX} win_python=${WIN_PY}"
 printf '{"ok": true, "stage": "done", "wine_prefix": "%s", "mt5_root": "%s", "windows_python": "%s"}\n' \
   "${WINE_PREFIX}" "${MT5_ROOT}" "${WIN_PY}"

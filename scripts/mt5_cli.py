@@ -982,6 +982,12 @@ def cmd_compile(args: argparse.Namespace) -> int:
     # friends live there); default it so a plain `#include <Trade/Trade.mqh>`
     # compiles without the caller having to know the layout.
     include = f"/include:{args.include}" if args.include else ""
+    if not include:
+        stdlib = metaeditor.parent / "MQL5"
+        if not stdlib.is_dir():
+            stdlib = metaeditor.parent / "MQL5" / "Include"
+        if stdlib.is_dir():
+            include = f"/include:{stdlib}"
 
     log_path = src.with_suffix(".log")
     if log_path.exists():
