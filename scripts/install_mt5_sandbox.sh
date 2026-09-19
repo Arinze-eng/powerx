@@ -122,18 +122,25 @@ if command -v wine >/dev/null 2>&1; then
   WINE_MAJOR=$(wine --version 2>/dev/null | sed 's/[^0-9]*\([0-9]*\).*/\1/' || echo 0)
 fi
 
+# Supporting tools are installed FIRST and independently of wine. They must not
+# be gated on "wine is missing": WineHQ provides wine itself, so installing it
+# first used to skip xvfb/winbind entirely (and MT5 then had no display).
+apt_install xvfb winbind cabextract p7zip-full ca-certificates curl wget unzip \
+            python3-pip fonts-wine || true
+
 # Reinstall via WineHQ when missing or too old for the bridge (< 9).
 if [ "${WINE_MAJOR:-0}" -lt 9 ]; then
-  log "wine ${WINE_MAJOR} is too old for the MetaTrader5 bridge; installing WineHQ stable ..."
-  install_winehq || log "WARN: WineHQ install failed; continuing with the distro wine"
+  if [ "${WINE_MAJOR:-0}" -eq 0 ]; then
+    log "wine not present; installing WineHQ stable (>= 9 required by the bridge) ..."
+  else
+    log "wine ${WINE_MAJOR} is unusable for the MetaTrader5 bridge; installing WineHQ stable ..."
+  fi
+  install_winehq || log "WARN: WineHQ install failed"
 fi
 
 if ! command -v wine >/dev/null 2>&1 && ! command -v wine64 >/dev/null 2>&1; then
-  log "installing wine / xvfb / winbind ..."
-  apt_install wine64 wine32 wine xvfb winbind cabextract p7zip-full \
-              fonts-wine ca-certificates curl wget unzip python3-pip \
-    || apt_install wine xvfb winbind cabextract curl wget unzip python3-pip \
-    || true
+  log "installing distro wine ..."
+  apt_install wine64 wine32 wine || apt_install wine || true
 fi
 
 if command -v wine >/dev/null 2>&1; then
