@@ -41,7 +41,6 @@ MT5_WINPY_VERSION="${MT5_WINPY_VERSION:-3.11.9}"
 MT5_GECKO_VERSION="${MT5_GECKO_VERSION:-2.47.4 2.47.3}"
 # The Wine series MT5 requires. Wine 11 trips MetaTrader's anti-debug check.
 MT5_WINE_SERIES="${MT5_WINE_SERIES:-10}"
-MT5_WINE_VERSION="${MT5_WINE_VERSION:-10.0.0.0~bookworm-1}"
 
 log() { printf '[mt5-install] %s\n' "$*" >&2; }
 
@@ -150,9 +149,8 @@ apt_install() {
 # bridge at all: the first broker call aborts with
 #   "Call from ... to unimplemented function ucrtbase.dll.crealf"
 # Wine 9+ implements crealf (and the other C99 complex-math ucrtbase entry
-# points the bridge uses), so we install WineHQ's stable build. Without this the
-# terminal installs fine and then *every* IPC call dies, which is a confusing
-# failure to debug later.
+# points the bridge uses), so we install WineHQ's Wine 10 build. The upper bound
+# matters just as much as the lower one — see the Wine 11 note below.
 install_winehq() {
   # Only meaningful on Debian/Ubuntu with passwordless sudo; otherwise fall back
   # to the distro Wine, which is enough for the terminal but not the bridge.
@@ -188,10 +186,13 @@ install_winehq() {
   # Wine 10.0 is not affected. Measured in the sandbox: with Wine 11 the install
   # never produced a terminal; with Wine 10.0 pinned, terminal64.exe and
   # MetaEditor64.exe appeared in ~30 seconds.
-  #
-  # Also note Wine 11 flags are already too old to satisfy the bridge's Wine 9+
-  # requirement, so a range is used rather than "any version".
-  local pin="${MT5_WINE_VERSION:-10.0.0.0~bookworm-1}"
+  local pin
+  pin="$(resolve_wine10_version)"
+  if [ -z "${pin}" ]; then
+    log "WARN: no Wine 10 build found in the repo; MT5 may refuse to install"
+    return 1
+  fi
+  log "pinning Wine ${pin}"
   # ALL FOUR packages must be pinned together. Pinning only the winehq-stable
   # metapackage leaves wine-stable/amd64/i386 at 11.0, so `wine --version` still
   # reports 11.0 and MT5's anti-debug check still fires. Verified in the sandbox:
@@ -201,12 +202,46 @@ install_winehq() {
       "wine-stable-amd64=${pin}" "wine-stable-i386=${pin}" >/dev/null 2>&1; then
     return 0
   fi
-  # Fall back to the metapackage alone, then to whatever is newest.
+  # Fall back to the metapackage alone (some distros do not ship the split
+  # packages), then give up rather than silently installing Wine 11 — which
+  # would reintroduce exactly the anti-debug failure this function prevents.
   $SUDO apt-get install -y -qq --allow-downgrades --install-recommends \
       "winehq-stable=${pin}" >/dev/null 2>&1 && return 0
-  $SUDO apt-get install -y -qq --install-recommends winehq-stable >/dev/null 2>&1 \
-    || return 1
-  return 0
+  return 1
+}
+
+# Discover the Wine 10 apt version for THIS distro.
+#
+# The version string embeds the distro codename (Debian: "10.0.0.0~bookworm-1",
+# Ubuntu: "10.0.0.0~jammy-1"), so a hardcoded pin silently fails to match on any
+# other distro — and because it then falls back to the default candidate the box
+# would quietly end up on Wine 11, reintroducing MT5's anti-debug abort. Ask apt
+# for the actual 10.x candidate instead, and only fall back to a computed guess.
+resolve_wine10_version() {
+  # Explicit override wins (lets an operator pin a different build).
+  if [ -n "${MT5_WINE_VERSION:-}" ]; then
+    printf '%s' "${MT5_WINE_VERSION}"
+    return 0
+  fi
+
+  local found
+  found="$(apt-cache madison winehq-stable 2>/dev/null \
+    | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' \
+    | grep -E '^10\.' | head -1)"
+  if [ -n "${found}" ]; then
+    printf '%s' "${found}"
+    return 0
+  fi
+
+  # apt has no candidate (repo not reachable / already removed): compute the
+  # conventional Debian-style version from this distro's own codename.
+  local codename="bookworm"
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    codename="${VERSION_CODENAME:-bookworm}"
+  fi
+  printf '10.0.0.0~%s-1' "${codename}"
 }
 
 WINE_MAJOR=0

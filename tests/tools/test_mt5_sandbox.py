@@ -180,6 +180,25 @@ def test_installer_pins_wine_10_and_strips_winedebug():
     assert "env -u WINEDEBUG" in script
 
 
+def test_wine_pin_is_discovered_rather_than_hardcoded():
+    """The Wine pin must not hardcode one distro's codename.
+
+    The apt version embeds the codename ("10.0.0.0~bookworm-1" on Debian,
+    "~jammy-1" on Ubuntu). A hardcoded pin would fail to match on Ubuntu and the
+    installer would quietly fall back to Wine 11 — silently reintroducing the
+    anti-debug abort. So the version is resolved at runtime.
+    """
+    script = (Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh").read_text()
+
+    assert "resolve_wine10_version" in script
+    # Query apt for the real 10.x candidate...
+    assert "apt-cache madison winehq-stable" in script
+    # ...rather than defaulting to a fixed codename-suffixed string.
+    assert 'MT5_WINE_VERSION:-10.0.0.0~bookworm-1' not in script
+    # An unreachable repo must not silently install Wine 11.
+    assert "would reintroduce exactly the anti-debug failure" in script
+
+
 def test_wine_version_comparison_triggers_reinstall_outside_the_10_series():
     """A Wine too old OR too new must trigger the pinned reinstall.
 
