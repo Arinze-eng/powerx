@@ -20,6 +20,13 @@ through :func:`nanobot.security.network.resolve_url_target`, which rejects
 loopback, private, link-local and cloud-metadata targets, and an optional
 ``allowed_domains`` list narrows it further.
 
+Navigation and clicks also clear a Cloudflare Turnstile challenge when one is
+presented: the widget lives in nested shadow roots, so it is reached by
+traversal (shadow root -> challenge iframe -> body -> inner shadow root) and
+its checkbox is clicked with the same humanized mouse movement used elsewhere.
+``solve_cloudflare`` exposes that as an explicit action, and ``navigate`` /
+``click`` run it automatically.
+
 The tool is disabled until an operator enables it; see
 :class:`HumanBrowserToolConfig`.
 """
@@ -34,7 +41,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 from pydantic import Field
@@ -76,6 +83,10 @@ class HumanBrowserToolConfig(Base):
     session_idle_seconds: int = Field(default=900, ge=60, le=7_200)
     max_page_text_chars: int = Field(default=12_000, ge=1_000, le=50_000)
     humanize: bool = True
+    #: Click through a Cloudflare Turnstile challenge after navigate/click.
+    solve_cloudflare: bool = True
+    #: How long to keep polling for the Turnstile widget before giving up.
+    cloudflare_timeout_seconds: float = Field(default=15.0, ge=1.0, le=120.0)
     allowed_domains: list[str] = Field(default_factory=list)
 
 
@@ -91,6 +102,16 @@ class _HumanBrowserSession:
 
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
+
+# Cloudflare Turnstile renders inside nested shadow roots, so the widget is
+# reached by traversal rather than a single CSS selector. These mirror the
+# constants pydoll uses internally; they are duplicated here because we drive
+# the traversal ourselves to keep the click humanized.
+_CLOUDFLARE_CHALLENGE_DOMAIN = "challenges.cloudflare.com"
+_CLOUDFLARE_IFRAME_SELECTOR = f'iframe[src*="{_CLOUDFLARE_CHALLENGE_DOMAIN}"]'
+_CLOUDFLARE_CHECKBOX_SELECTOR = 'input[type="checkbox"]'
+#: How often the shadow DOM is re-scanned while waiting for the widget.
+_CLOUDFLARE_POLL_SECONDS = 0.5
 
 
 def _strip_html(html: str) -> str:
@@ -119,7 +140,17 @@ class HumanBrowserTool(Tool):
     _MAX_URL = 2_000
     _MAX_SCROLL = 5_000
     _ACTIONS = frozenset(
-        {"navigate", "read_page", "click", "type", "scroll", "wait_for", "screenshot", "close"}
+        {
+            "navigate",
+            "read_page",
+            "click",
+            "type",
+            "scroll",
+            "wait_for",
+            "screenshot",
+            "solve_cloudflare",
+            "close",
+        }
     )
 
     def __init__(
@@ -137,6 +168,8 @@ class HumanBrowserTool(Tool):
         session_idle_seconds: int = 900,
         max_page_text_chars: int = 12_000,
         humanize: bool = True,
+        solve_cloudflare: bool = True,
+        cloudflare_timeout_seconds: float = 15.0,
         allowed_domains: list[str] | None = None,
     ) -> None:
         self.workspace = workspace
@@ -151,6 +184,8 @@ class HumanBrowserTool(Tool):
         self.session_idle_seconds = session_idle_seconds
         self.max_page_text_chars = max_page_text_chars
         self.humanize = bool(humanize)
+        self.solve_cloudflare = bool(solve_cloudflare)
+        self.cloudflare_timeout_seconds = float(cloudflare_timeout_seconds)
         self.allowed_domains = [
             domain.strip().lower()
             for domain in (allowed_domains or [])
@@ -194,6 +229,8 @@ class HumanBrowserTool(Tool):
             session_idle_seconds=cfg.session_idle_seconds,
             max_page_text_chars=cfg.max_page_text_chars,
             humanize=cfg.humanize,
+            solve_cloudflare=cfg.solve_cloudflare,
+            cloudflare_timeout_seconds=cfg.cloudflare_timeout_seconds,
             allowed_domains=cfg.allowed_domains,
         )
 
@@ -206,10 +243,13 @@ class HumanBrowserTool(Tool):
         return (
             "Browse a public website with human-like mouse, typing and scrolling, attaching to an "
             "existing Chrome over the DevTools Protocol. Actions: navigate, read_page, click, type, "
-            "scroll, wait_for, screenshot and close. Prefer this over the plain browser tool when a "
-            "site is sensitive to obviously automated input. Private/internal URLs are blocked. "
-            "Never submit purchases, publish content, send messages, or enter credentials unless the "
-            "user explicitly authorized that exact action in the conversation."
+            "scroll, wait_for, screenshot, solve_cloudflare and close. Prefer this over the plain "
+            "browser tool when a site is sensitive to obviously automated input. navigate and click "
+            "automatically click through a Cloudflare Turnstile challenge when the page presents "
+            "one; use solve_cloudflare to retry that explicitly and wait for it to clear. "
+            "Private/internal URLs are blocked. Never submit purchases, publish content, send "
+            "messages, or enter credentials unless the user explicitly authorized that exact action "
+            "in the conversation."
         )
 
     @property
@@ -250,12 +290,22 @@ class HumanBrowserTool(Tool):
         return context.session_key or f"{context.channel}:{context.chat_id}"
 
     async def _discover_ws_address(self, endpoint: str) -> str:
-        """Ask a DevTools debug endpoint for its browser WebSocket URL."""
+        """Ask a DevTools debug endpoint for its browser WebSocket URL.
+
+        A Novita sandbox serves the debug endpoint over **https** and answers
+        with a WebSocket URL pointing at its own internal host, which is not
+        reachable from here. The scheme and host are therefore rewritten onto
+        the public sandbox host that was just reached, and ``wss`` is used to
+        match the https endpoint. Passing a ``ws://``/``wss://`` address
+        directly is left untouched, since the caller supplied the full target.
+        """
         base = endpoint.strip().rstrip("/")
         if base.startswith(("ws://", "wss://")):
             return base
         if not base.startswith(("http://", "https://")):
-            base = f"http://{base}"
+            # Bare host:port from a sandbox. The sandbox ingress is https-only,
+            # so http would simply time out.
+            base = f"https://{base}"
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.get(f"{base}/json/version")
         if not response.is_success:
@@ -269,7 +319,24 @@ class HumanBrowserTool(Tool):
         address = str((payload or {}).get("webSocketDebuggerUrl") or "").strip()
         if not address:
             raise RuntimeError("the browser debug endpoint exposed no WebSocket address")
-        return address
+        return self._rewrite_ws_host(address, base)
+
+    @staticmethod
+    def _rewrite_ws_host(address: str, base: str) -> str:
+        """Point the browser WebSocket at the host we actually reached.
+
+        ``/json/version`` reports the address the browser sees internally
+        (e.g. ``ws://localhost:9222/devtools/browser/<id>``), which is not
+        routable from the agent. Only the path is meaningful to us.
+        """
+        reported = urlparse(address)
+        if not reported.path:
+            return address
+        endpoint = urlparse(base)
+        scheme = "wss" if endpoint.scheme == "https" else "ws"
+        return urlunparse(
+            (scheme, endpoint.netloc, reported.path, reported.params, reported.query, "")
+        )
 
     async def _new_session(self, key: str) -> _HumanBrowserSession:
         if Chrome is None:
@@ -294,7 +361,7 @@ class HumanBrowserTool(Tool):
                     allow_internet_access=True,
                 )
                 host = await asyncio.to_thread(sandbox.get_host, self.novita_browser_port)
-                address = await self._discover_ws_address(f"http://{host}")
+                address = await self._discover_ws_address(f"https://{host}")
             elif self.provider == "cdp":
                 if not self.cdp_url:
                     raise RuntimeError("provider 'cdp' requires cdp_url in the tool configuration")
@@ -449,6 +516,119 @@ class HumanBrowserTool(Tool):
             raise ValueError(f"no element matched {wanted!r}")
         return element
 
+    # --- Cloudflare Turnstile ---------------------------------------------
+
+    async def _find_cloudflare_shadow_root(self, tab: Any) -> Any:
+        """Return the Turnstile shadow root if the widget is currently mounted.
+
+        Cloudflare injects the widget asynchronously and re-renders its iframe
+        during the proof-of-work, so callers re-scan rather than caching a node.
+        """
+        finder = getattr(tab, "find_shadow_roots", None)
+        if finder is None:
+            return None
+        try:
+            roots = await finder(deep=False)
+        except Exception:  # noqa: BLE001 - a transient DOM read is not fatal here
+            return None
+        for shadow_root in roots or []:
+            try:
+                inner = await shadow_root.inner_html
+            except Exception:  # noqa: BLE001 - stale node; try the next one
+                continue
+            if _CLOUDFLARE_CHALLENGE_DOMAIN in str(inner or ""):
+                return shadow_root
+        return None
+
+    async def _click_cloudflare_checkbox(self, shadow_root: Any) -> None:
+        """Traverse the Turnstile widget and click its verification checkbox.
+
+        Every lookup fails fast (``timeout=0``). Any node captured here can go
+        stale while Cloudflare re-renders the challenge iframe; failing fast
+        lets the caller restart the traversal instead of blocking on a dead
+        node for the whole timeout budget.
+        """
+        iframe = await shadow_root.query(_CLOUDFLARE_IFRAME_SELECTOR, timeout=0)
+        if iframe is None:
+            raise ValueError("the Turnstile challenge iframe was not present")
+        body = await iframe.find(tag_name="body", timeout=0)
+        if body is None:
+            raise ValueError("the Turnstile challenge iframe had no body")
+        inner_shadow = await body.get_shadow_root(timeout=0)
+        checkbox = await inner_shadow.query(_CLOUDFLARE_CHECKBOX_SELECTOR, timeout=0)
+        if checkbox is None:
+            raise ValueError("the Turnstile checkbox was not present")
+        # Click with the same humanized pointer movement used for ordinary
+        # clicks, so the interaction is not a bare synthetic dispatch.
+        await asyncio.wait_for(
+            checkbox.click(humanize=self.humanize),
+            timeout=self.action_timeout_ms / 1000,
+        )
+
+    async def _solve_cloudflare(self, tab: Any) -> dict[str, Any]:
+        """Poll for a Turnstile widget and click through it.
+
+        Returns a small report rather than raising: a page with no challenge is
+        a normal outcome, not an error. ``solved`` is True only once a checkbox
+        click actually landed.
+        """
+        if getattr(tab, "find_shadow_roots", None) is None:
+            # Nothing to poll: this pydoll build cannot inspect shadow roots, so
+            # waiting the full timeout would only stall the caller.
+            return {
+                "challenge_present": False,
+                "solved": False,
+                "attempts": 0,
+                "reason": "this pydoll build exposes no shadow root inspection",
+            }
+        deadline = time.monotonic() + self.cloudflare_timeout_seconds
+        attempts = 0
+        last_error = ""
+        while True:
+            attempts += 1
+            try:
+                shadow_root = await self._find_cloudflare_shadow_root(tab)
+                if shadow_root is not None:
+                    await self._click_cloudflare_checkbox(shadow_root)
+                    # Give the widget a beat to settle before verification
+                    # reads the page; Cloudflare swaps in a success frame.
+                    await asyncio.sleep(_CLOUDFLARE_POLL_SECONDS)
+                    return {
+                        "challenge_present": True,
+                        "solved": True,
+                        "attempts": attempts,
+                    }
+            except Exception as exc:  # noqa: BLE001 - retry the whole traversal
+                last_error = f"{type(exc).__name__}: {exc}"
+            if time.monotonic() >= deadline:
+                return {
+                    "challenge_present": False,
+                    "solved": False,
+                    "attempts": attempts,
+                    "reason": (
+                        f"no Cloudflare Turnstile challenge was found within "
+                        f"{self.cloudflare_timeout_seconds:g}s"
+                        if not last_error
+                        else f"the Turnstile challenge was not cleared: {last_error}"
+                    ),
+                }
+            await asyncio.sleep(_CLOUDFLARE_POLL_SECONDS)
+
+    async def _summary_with_cloudflare(self, tab: Any) -> str:
+        """Page summary plus a Turnstile report, when solving is enabled.
+
+        The report is merged into the summary JSON so a caller can tell that a
+        challenge was present and whether the click landed, rather than having
+        to infer it from the page text alone.
+        """
+        report = None
+        if self.solve_cloudflare:
+            report = await self._solve_cloudflare(tab)
+        payload = json.loads(await self._summary(tab))
+        if report is not None:
+            payload["cloudflare"] = report
+        return json.dumps(payload)
+
     async def execute(
         self,
         action: str,
@@ -481,7 +661,7 @@ class HumanBrowserTool(Tool):
                         tab.go_to(requested),
                         timeout=self.navigation_timeout_ms / 1000,
                     )
-                    return await self._summary(tab)
+                    return await self._summary_with_cloudflare(tab)
 
                 if action == "read_page":
                     return await self._summary(tab)
@@ -492,7 +672,12 @@ class HumanBrowserTool(Tool):
                         element.click(humanize=self.humanize),
                         timeout=self.action_timeout_ms / 1000,
                     )
-                    return await self._summary(tab)
+                    return await self._summary_with_cloudflare(tab)
+
+                if action == "solve_cloudflare":
+                    return json.dumps(
+                        {"cloudflare": await self._solve_cloudflare(tab)}
+                    )
 
                 if action == "type":
                     if text is None:

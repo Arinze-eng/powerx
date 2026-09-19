@@ -154,6 +154,43 @@ def _ensure_browser_defaults(data: dict[str, Any]) -> bool:
     return changed
 
 
+def _ensure_human_browser_defaults(data: dict[str, Any]) -> bool:
+    """Backfill the human_browser tool config, including Turnstile solving.
+
+    A deployed instance keeps ``~/.nanobot/config.json`` on a persistent disk,
+    so a config template added in a later release never reaches it. Without this
+    migration the pydoll tool would stay disabled and the new Cloudflare
+    Turnstile solving keys would be missing from an existing install.
+    """
+    tools = data.setdefault("tools", {})
+    if not isinstance(tools, dict):
+        return False
+    human = tools.setdefault("human_browser", {})
+    if not isinstance(human, dict):
+        return False
+    defaults = {
+        "enable": True,
+        "provider": "novita",
+        "novitaApiKeyEnv": "NOVITA_API_KEY",
+        "novitaTemplate": "browser-chromium",
+        "novitaTimeoutSeconds": 600,
+        "novitaBrowserPort": 9223,
+        "navigationTimeoutMs": 30_000,
+        "actionTimeoutMs": 15_000,
+        "sessionIdleSeconds": 900,
+        "maxPageTextChars": 12_000,
+        "humanize": True,
+        "solveCloudflare": True,
+        "cloudflareTimeoutSeconds": 15,
+    }
+    changed = False
+    for key, value in defaults.items():
+        if key not in human:
+            human[key] = value
+            changed = True
+    return changed
+
+
 def _ensure_provider_defaults(data: dict[str, Any]) -> bool:
     """Make the environment-configured provider win over any stale on-disk model.
 
@@ -401,6 +438,7 @@ def ensure_render_defaults(config_path: Path) -> bool:
         return False
     changed = _ensure_tools_file(data) or False
     changed = _ensure_browser_defaults(data) or changed
+    changed = _ensure_human_browser_defaults(data) or changed
     changed = _ensure_provider_defaults(data) or changed
     changed = _ensure_telegram_polling_defaults(data) or changed
     changed = _ensure_deliberate_defaults(data) or changed

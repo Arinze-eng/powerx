@@ -147,6 +147,10 @@ a file with `novita_sandbox(action="write", ...)`, then run it, then read result
 - **Timeouts:** increase default timeout, switch `wait_until` to `domcontentloaded`.
 - **Cloudflare/bot walls:** set a realistic UA + viewport, `page.wait_for_load_state`, retry
   once; if still blocked, tell the user the site blocks automation rather than looping.
+  When you are already using the `human_browser` tool, its `navigate` and `click` actions
+  click through a Cloudflare Turnstile challenge automatically and report the outcome under
+  a `cloudflare` key (`challenge_present`, `solved`). If a challenge reappears, call
+  `human_browser(action="solve_cloudflare")` to retry it and wait.
 - **Empty screenshots:** ensure `wait_for_load_state("networkidle")` or a selector wait first.
 - **Headless detection:** some sites block headless; try `chromium.launch(channel="chrome")`
   or `headless=False` with `xvfb-run` if a virtual display is available.

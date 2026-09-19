@@ -206,7 +206,86 @@ def test_http_debug_endpoint_is_resolved_via_json_version(
     address = asyncio.run(tool._discover_ws_address("http://host:9222"))
 
     assert seen == ["http://host:9222/json/version"]
-    assert address == "ws://host/devtools/browser/abc"
+    # The reported host is the browser's own view and is not routable from the
+    # agent, so the endpoint we actually reached wins and the path is kept.
+    assert address == "ws://host:9222/devtools/browser/abc"
+
+
+def test_novita_sandbox_uses_https_and_rewrites_the_reported_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real Novita sandbox is https-only and reports an internal ws host.
+
+    Regression: the tool used to dial ``http://<host>``, which times out
+    against the sandbox ingress, and returned the internal address verbatim.
+    """
+    seen: list[str] = []
+
+    class _Response:
+        is_success = True
+
+        def json(self) -> dict[str, str]:
+            # What a Novita sandbox actually reports: its own local view.
+            return {
+                "webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/internal-id"
+            }
+
+    class _Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Client":
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> bool:
+            return False
+
+        async def get(self, url: str) -> _Response:
+            seen.append(url)
+            return _Response()
+
+    monkeypatch.setattr(hb.httpx, "AsyncClient", _Client)
+    host = "9223-abc123.us-phx-1.sandbox.novita.ai"
+    tool = HumanBrowserTool(provider="novita")
+
+    address = asyncio.run(tool._discover_ws_address(f"https://{host}"))
+
+    assert seen == [f"https://{host}/json/version"]
+    assert address == f"wss://{host}/devtools/browser/internal-id"
+
+
+def test_bare_sandbox_host_defaults_to_https(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+
+    class _Response:
+        is_success = True
+
+        def json(self) -> dict[str, str]:
+            return {"webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/x"}
+
+    class _Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Client":
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> bool:
+            return False
+
+        async def get(self, url: str) -> _Response:
+            seen.append(url)
+            return _Response()
+
+    monkeypatch.setattr(hb.httpx, "AsyncClient", _Client)
+    tool = HumanBrowserTool(provider="novita")
+
+    address = asyncio.run(tool._discover_ws_address("sandbox.example:9223"))
+
+    assert seen == ["https://sandbox.example:9223/json/version"]
+    assert address == "wss://sandbox.example:9223/devtools/browser/x"
 
 
 # --- URL safety -------------------------------------------------------------
@@ -419,3 +498,189 @@ def test_read_page_returns_visible_text_not_markup() -> None:
     payload = json.loads(out)
     assert payload["text"] == "Readable page body"
     assert "<html" not in payload["text"]
+
+
+# --------------------------------------------------------------------------
+# Cloudflare Turnstile solving
+#
+# The widget lives in nested shadow roots (shadow host -> challenge iframe ->
+# body -> inner shadow root -> checkbox), so the solver is exercised against a
+# fake shadow DOM that mirrors that shape.
+# --------------------------------------------------------------------------
+
+
+class _FakeShadowRoot:
+    """Stand-in for a pydoll ShadowRoot with a stubbed inner_html."""
+
+    def __init__(self, html: str, iframe: Any = None) -> None:
+        self._html = html
+        self._iframe = iframe
+        self.queries: list[str] = []
+
+    @property
+    async def inner_html(self) -> str:
+        return self._html
+
+    async def query(self, expression: str, **kwargs: Any) -> Any:
+        self.queries.append(expression)
+        return self._iframe
+
+
+class _FakeBody:
+    """The challenge iframe's body, which hosts the inner shadow root."""
+
+    def __init__(self, inner_shadow: Any) -> None:
+        self._inner_shadow = inner_shadow
+        self.shadow_root_requests: list[dict[str, Any]] = []
+
+    async def get_shadow_root(self, **kwargs: Any) -> Any:
+        self.shadow_root_requests.append(kwargs)
+        return self._inner_shadow
+
+
+class _FakeWidget:
+    """The inner shadow root holding the Turnstile checkbox."""
+
+    def __init__(self, checkbox: Any) -> None:
+        self._checkbox = checkbox
+
+    async def query(self, expression: str, **kwargs: Any) -> Any:
+        return self._checkbox
+
+
+class _FakeIframe:
+    def __init__(self, body: Any) -> None:
+        self._body = body
+
+    async def find(self, **kwargs: Any) -> Any:
+        self._body_find_kwargs = kwargs
+        return self._body
+
+
+class _CloudflareTab(_FakeTab):
+    """A tab that exposes a Cloudflare Turnstile shadow DOM.
+
+    ``roots`` is a list of per-scan snapshots: each call to
+    ``find_shadow_roots`` pops the next one, which is how the async injection
+    and the re-render of the challenge are modelled.
+    """
+
+    def __init__(self, roots: list[Any], clicks: list[bool] | None = None) -> None:
+        super().__init__()
+        self._roots = list(roots)
+        self.scans = 0
+        if clicks is not None:
+            self.element.clicks = clicks
+
+    async def find_shadow_roots(self, deep: bool = False) -> list[Any]:
+        self.scans += 1
+        if not self._roots:
+            return []
+        if len(self._roots) == 1:
+            return self._roots
+        return [self._roots.pop(0)]
+
+
+def _cloudflare_widget(checkbox: Any) -> _FakeShadowRoot:
+    """Build the full Turnstile traversal: iframe -> body -> shadow -> checkbox."""
+    body = _FakeBody(_FakeWidget(checkbox))
+    iframe = _FakeIframe(body)
+    return _FakeShadowRoot(
+        f'<iframe src="https://{hb._CLOUDFLARE_CHALLENGE_DOMAIN}/turnstile/v0/api.js"></iframe>',
+        iframe=iframe,
+    )
+
+
+def test_solve_cloudflare_clicks_the_checkbox_humanized() -> None:
+    checkbox = _FakeElement()
+    root = _cloudflare_widget(checkbox)
+    tab = _CloudflareTab([root])
+    tool = _tool_with_session(tab, humanize=True, cloudflare_timeout_seconds=1.0)
+
+    out = asyncio.run(tool.execute("solve_cloudflare"))
+
+    report = json.loads(out)["cloudflare"]
+    assert report["challenge_present"] is True
+    assert report["solved"] is True
+    assert checkbox.clicks == [True], "the checkbox click must be humanized"
+
+
+def test_solve_cloudflare_respects_humanize_off() -> None:
+    checkbox = _FakeElement()
+    tab = _CloudflareTab([_cloudflare_widget(checkbox)])
+    tool = _tool_with_session(tab, humanize=False, cloudflare_timeout_seconds=1.0)
+
+    asyncio.run(tool.execute("solve_cloudflare"))
+
+    assert checkbox.clicks == [False]
+
+
+def test_solve_cloudflare_retries_until_the_widget_is_injected() -> None:
+    checkbox = _FakeElement()
+    # First scan: widget not yet injected. Second scan: it is. This is the
+    # async-injection case Cloudflare actually produces.
+    tab = _CloudflareTab([_FakeShadowRoot("<div>not cloudflare</div>"), _cloudflare_widget(checkbox)])
+    tool = _tool_with_session(tab, cloudflare_timeout_seconds=5.0)
+
+    out = asyncio.run(tool.execute("solve_cloudflare"))
+
+    report = json.loads(out)["cloudflare"]
+    assert report["solved"] is True
+    assert report["attempts"] >= 2
+    assert checkbox.clicks == [True]
+
+
+def test_solve_cloudflare_reports_absence_without_raising() -> None:
+    tab = _CloudflareTab([_FakeShadowRoot("<div>plain page</div>")])
+    tool = _tool_with_session(tab, cloudflare_timeout_seconds=1.0)
+
+    out = asyncio.run(tool.execute("solve_cloudflare"))
+
+    report = json.loads(out)["cloudflare"]
+    assert report["challenge_present"] is False
+    assert report["solved"] is False
+    assert "no Cloudflare Turnstile challenge" in report["reason"]
+
+
+def test_solve_cloudflare_degrades_when_shadow_roots_are_unsupported() -> None:
+    tab = _FakeTab()  # no find_shadow_roots
+    tool = _tool_with_session(tab, cloudflare_timeout_seconds=120.0)
+
+    out = asyncio.run(tool.execute("solve_cloudflare"))
+
+    report = json.loads(out)["cloudflare"]
+    assert report["solved"] is False
+    assert "no shadow root inspection" in report["reason"]
+
+
+def test_navigate_solves_cloudflare_and_reports_it() -> None:
+    checkbox = _FakeElement()
+    tab = _CloudflareTab([_cloudflare_widget(checkbox)])
+    tool = _tool_with_session(tab, cloudflare_timeout_seconds=1.0)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(hb, "resolve_url_target", lambda url, **_kw: (True, "", ()))
+        out = asyncio.run(tool.execute("navigate", url="https://example.com"))
+
+    payload = json.loads(out)
+    assert payload["cloudflare"]["solved"] is True
+    assert checkbox.clicks == [True]
+
+
+def test_cloudflare_solving_can_be_disabled() -> None:
+    checkbox = _FakeElement()
+    tab = _CloudflareTab([_cloudflare_widget(checkbox)])
+    tool = _tool_with_session(tab, solve_cloudflare=False)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(hb, "resolve_url_target", lambda url, **_kw: (True, "", ()))
+        out = asyncio.run(tool.execute("navigate", url="https://example.com"))
+
+    assert "cloudflare" not in json.loads(out)
+    assert checkbox.clicks == []
+
+
+def test_config_defaults_enable_turnstile_solving() -> None:
+    cfg = Config().tools.human_browser
+    assert cfg.solve_cloudflare is True
+    assert cfg.cloudflare_timeout_seconds == 15.0

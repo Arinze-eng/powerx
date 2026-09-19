@@ -80,7 +80,9 @@
       "actionTimeoutMs": 15000,
       "sessionIdleSeconds": 900,
       "maxPageTextChars": 12000,
-      "humanize": true
+      "humanize": true,
+      "solveCloudflare": true,
+      "cloudflareTimeoutSeconds": 15
     }
   }
 }
