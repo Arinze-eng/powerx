@@ -351,3 +351,71 @@ def test_close_kills_a_sandbox_we_provisioned() -> None:
     asyncio.run(tool.execute("close"))
 
     assert sandbox.killed is True
+
+
+# --------------------------------------------------------------------------
+# read_page text extraction
+#
+# Regression: pydoll's execute_script returns the raw CDP envelope, not the
+# script value. Treating the envelope as a string made _page_text fall through
+# to page_source, so read_page returned raw HTML to the model.
+# --------------------------------------------------------------------------
+
+
+class _ScriptTab(_FakeTab):
+    """A tab whose execute_script behaves like real pydoll (CDP envelope)."""
+
+    def __init__(self, envelope: Any) -> None:
+        super().__init__()
+        self._envelope = envelope
+
+    @property
+    def execute_script(self):  # type: ignore[override]
+        async def _script(_expression: str) -> Any:
+            return self._envelope
+
+        return _script
+
+
+def test_page_text_unwraps_cdp_envelope() -> None:
+    envelope = {
+        "id": 4,
+        "result": {"result": {"type": "string", "value": "Example Domain\n\nLearn more"}},
+    }
+    tool = _tool_with_session(_ScriptTab(envelope))
+    text = asyncio.run(tool._page_text(tool._sessions["default"].tab))
+    assert text == "Example Domain\n\nLearn more"
+
+
+def test_page_text_accepts_plain_string() -> None:
+    tool = _tool_with_session(_ScriptTab("just text"))
+    text = asyncio.run(tool._page_text(tool._sessions["default"].tab))
+    assert text == "just text"
+
+
+def test_page_text_strips_html_when_script_is_unavailable() -> None:
+    class _NoScriptTab(_FakeTab):
+        def __init__(self) -> None:
+            super().__init__()
+            self.page_source = (
+                "<html><head><style>body{color:red}</style>"
+                "<script>var x=1;</script></head>"
+                "<body><h1>Hello</h1><p>World</p></body></html>"
+            )
+
+    tool = _tool_with_session(_NoScriptTab())
+    text = asyncio.run(tool._page_text(tool._sessions["default"].tab))
+    assert "Hello" in text and "World" in text
+    assert "<h1>" not in text and "var x=1" not in text and "color:red" not in text
+
+
+def test_read_page_returns_visible_text_not_markup() -> None:
+    envelope = {
+        "id": 1,
+        "result": {"result": {"type": "string", "value": "Readable page body"}},
+    }
+    tool = _tool_with_session(_ScriptTab(envelope))
+    out = asyncio.run(tool.execute("read_page"))
+    payload = json.loads(out)
+    assert payload["text"] == "Readable page body"
+    assert "<html" not in payload["text"]

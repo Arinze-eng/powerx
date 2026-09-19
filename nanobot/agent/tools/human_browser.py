@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,6 +87,25 @@ class _HumanBrowserSession:
     tab: Any
     sandbox: Any
     last_used: float
+
+
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(html: str) -> str:
+    """Reduce markup to readable text (last-resort fallback for page text)."""
+    text = _SCRIPT_STYLE_RE.sub(" ", html)
+    text = _TAG_RE.sub(" ", text)
+    text = (
+        text.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+    )
+    return re.sub(r"[ \t\r\f\v]+", " ", text)
 
 
 class HumanBrowserTool(Tool):
@@ -339,27 +359,61 @@ class HumanBrowserTool(Tool):
     # --- actions ----------------------------------------------------------
 
     async def _page_text(self, tab: Any) -> str:
-        """Best-effort visible text for the current page."""
-        for attribute in ("execute_script",):
-            script = getattr(tab, attribute, None)
-            if script is None:
-                continue
+        """Best-effort *visible* text for the current page.
+
+        pydoll's ``execute_script`` returns the raw CDP envelope, i.e.
+        ``{"id": n, "result": {"result": {"type": "string", "value": ...}}}``,
+        not the script value. Unwrapping it is what makes ``read_page`` return
+        readable text instead of falling through to the raw HTML source.
+        """
+        script = getattr(tab, "execute_script", None)
+        if script is not None:
             try:
-                text = await script(
+                raw = await script(
                     "return document.body ? document.body.innerText : '';"
                 )
             except Exception:  # noqa: BLE001 - fall back to the raw source
-                continue
-            if isinstance(text, str) and text.strip():
+                raw = None
+            text = self._unwrap_script_value(raw)
+            if text and text.strip():
                 return text.strip()[: self.max_page_text_chars]
+
         source = getattr(tab, "page_source", None)
         if source is not None:
             try:
                 html = await source if asyncio.iscoroutine(source) else source
             except Exception:  # noqa: BLE001
                 html = None
-            if isinstance(html, str):
-                return html.strip()[: self.max_page_text_chars]
+            if isinstance(html, str) and html.strip():
+                # Never hand raw markup to the model: strip it if the browser
+                # could not give us innerText.
+                return _strip_html(html).strip()[: self.max_page_text_chars]
+        return ""
+
+    @staticmethod
+    def _unwrap_script_value(raw: Any) -> str:
+        """Extract the string value from a CDP ``execute_script`` response."""
+        if isinstance(raw, str):
+            return raw
+        if not isinstance(raw, dict):
+            return ""
+        # Walk the standard CDP nesting defensively; different pydoll builds
+        # have returned both the full envelope and the inner result object.
+        node: Any = raw
+        for _ in range(4):
+            if not isinstance(node, dict):
+                break
+            if isinstance(node.get("value"), str):
+                return str(node["value"])
+            nxt = None
+            for key in ("result", "resultValue", "value"):
+                candidate = node.get(key)
+                if isinstance(candidate, (dict, str)):
+                    nxt = candidate
+                    break
+            if nxt is None:
+                break
+            node = nxt
         return ""
 
     async def _summary(self, tab: Any) -> str:
