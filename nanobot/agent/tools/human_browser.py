@@ -598,6 +598,17 @@ class HumanBrowserTool(Tool):
                         "solved": True,
                         "attempts": attempts,
                     }
+                if attempts == 1 and not await self._page_hints_cloudflare(tab):
+                    # Most pages have no challenge at all. Waiting the full
+                    # timeout on every navigate would tax every ordinary browse,
+                    # so bail out as soon as the first scan comes up empty and
+                    # nothing on the page points at Cloudflare.
+                    return {
+                        "challenge_present": False,
+                        "solved": False,
+                        "attempts": attempts,
+                        "reason": "no Cloudflare Turnstile challenge was found",
+                    }
             except Exception as exc:  # noqa: BLE001 - retry the whole traversal
                 last_error = f"{type(exc).__name__}: {exc}"
             if time.monotonic() >= deadline:
@@ -613,6 +624,37 @@ class HumanBrowserTool(Tool):
                     ),
                 }
             await asyncio.sleep(_CLOUDFLARE_POLL_SECONDS)
+
+    async def _page_hints_cloudflare(self, tab: Any) -> bool:
+        """Whether anything on the page suggests a Cloudflare challenge.
+
+        The Turnstile widget is injected after the load event, so an empty
+        first scan is not conclusive on a challenge page. This cheap check
+        distinguishes "nothing here" from "not here *yet*".
+        """
+        source = getattr(tab, "page_source", None)
+        if source is not None:
+            try:
+                html = await source if asyncio.iscoroutine(source) else source
+            except Exception:  # noqa: BLE001
+                html = None
+            if isinstance(html, str):
+                lowered = html.lower()
+                if any(
+                    marker in lowered
+                    for marker in (
+                        _CLOUDFLARE_CHALLENGE_DOMAIN,
+                        "cf-turnstile",
+                        "challenges.cloudflare.com",
+                        "__cf_chl",
+                    )
+                ):
+                    return True
+        try:
+            title = str(await tab.title or "").lower()
+        except Exception:  # noqa: BLE001
+            title = ""
+        return "just a moment" in title or "attention required" in title
 
     async def _summary_with_cloudflare(self, tab: Any) -> str:
         """Page summary plus a Turnstile report, when solving is enabled.

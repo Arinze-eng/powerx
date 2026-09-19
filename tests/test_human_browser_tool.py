@@ -618,8 +618,10 @@ def test_solve_cloudflare_respects_humanize_off() -> None:
 def test_solve_cloudflare_retries_until_the_widget_is_injected() -> None:
     checkbox = _FakeElement()
     # First scan: widget not yet injected. Second scan: it is. This is the
-    # async-injection case Cloudflare actually produces.
+    # async-injection case Cloudflare actually produces, and the page already
+    # references Cloudflare (which is what tells us to keep polling).
     tab = _CloudflareTab([_FakeShadowRoot("<div>not cloudflare</div>"), _cloudflare_widget(checkbox)])
+    tab.page_source = '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>'
     tool = _tool_with_session(tab, cloudflare_timeout_seconds=5.0)
 
     out = asyncio.run(tool.execute("solve_cloudflare"))
@@ -639,7 +641,57 @@ def test_solve_cloudflare_reports_absence_without_raising() -> None:
     report = json.loads(out)["cloudflare"]
     assert report["challenge_present"] is False
     assert report["solved"] is False
-    assert "no Cloudflare Turnstile challenge" in report["reason"]
+    assert "no Cloudflare Turnstile challenge was found" in report["reason"]
+
+
+def test_plain_page_bails_out_fast_instead_of_waiting_the_full_timeout() -> None:
+    """A page with no Cloudflare markers must not tax every navigate.
+
+    Regression guard: an unconditional poll loop would add the whole
+    cloudflare_timeout_seconds to every ordinary page load.
+    """
+    tab = _CloudflareTab([_FakeShadowRoot("<div>nothing to see</div>")])
+    tab.page_source = "<html><body><h1>Plain page</h1></body></html>"
+    tool = _tool_with_session(tab, cloudflare_timeout_seconds=30.0)
+
+    started = time.monotonic()
+    out = asyncio.run(tool.execute("solve_cloudflare"))
+    elapsed = time.monotonic() - started
+
+    report = json.loads(out)["cloudflare"]
+    assert report["solved"] is False
+    assert report["attempts"] == 1
+    assert elapsed < 5.0, f"should bail out fast, took {elapsed:.1f}s"
+    assert tab.scans == 1
+
+
+def test_page_with_cloudflare_markers_keeps_polling() -> None:
+    """An empty first scan is not conclusive on a challenge page."""
+    checkbox = _FakeElement()
+    bare = _FakeShadowRoot("<div>loading</div>")
+    tab = _CloudflareTab([bare, _cloudflare_widget(checkbox)])
+    tab.page_source = '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>'
+    tool = _tool_with_session(tab, cloudflare_timeout_seconds=5.0)
+
+    out = asyncio.run(tool.execute("solve_cloudflare"))
+
+    report = json.loads(out)["cloudflare"]
+    assert report["solved"] is True
+    assert report["attempts"] >= 2, "must keep polling when Cloudflare is indicated"
+    assert checkbox.clicks == [True]
+
+
+def test_just_a_moment_title_keeps_polling() -> None:
+    checkbox = _FakeElement()
+    tab = _CloudflareTab([_FakeShadowRoot("<div>loading</div>"), _cloudflare_widget(checkbox)])
+    tab.page_source = "<html><body>wait</body></html>"
+    tab.title = _Awaitable("Just a moment...")
+    tool = _tool_with_session(tab, cloudflare_timeout_seconds=5.0)
+
+    out = asyncio.run(tool.execute("solve_cloudflare"))
+
+    assert json.loads(out)["cloudflare"]["solved"] is True
+    assert checkbox.clicks == [True]
 
 
 def test_solve_cloudflare_degrades_when_shadow_roots_are_unsupported() -> None:
