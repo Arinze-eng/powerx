@@ -35,8 +35,24 @@ MT5_INSTALLER_URL="${MT5_INSTALLER_URL:-https://download.mql5.com/cdn/web/metaqu
 # MetaTrader5's PyPI wheels are Windows-only, so the bridge needs a Windows
 # python inside the Wine prefix (see section 5 below).
 MT5_WINPY_VERSION="${MT5_WINPY_VERSION:-3.11.9}"
+# Wine-Gecko release used by the MT5 web installer. Space-separated fallbacks are
+# attempted in order; the default matches WineHQ stable's own pairing closely
+# enough that the embedded browser works.
+MT5_GECKO_VERSION="${MT5_GECKO_VERSION:-2.47.4 2.47.3}"
 
 log() { printf '[mt5-install] %s\n' "$*" >&2; }
+
+# Publish a machine-readable progress marker so the caller can follow a LONG
+# install without holding a single (timeout-capped) sandbox command open. The
+# Novita tool clamps every command to 900 s while a full Wine+MT5 install can
+# take longer, so the install is started detached and polled through this file.
+# Format: ``<stage>|<human message>`` — deliberately one line, last write wins.
+status() {
+  local stage="$1"; shift
+  mkdir -p "$MT5_ROOT" 2>/dev/null || true
+  printf '%s|%s\n' "$stage" "$*" >"${MT5_ROOT}/install.status" 2>/dev/null || true
+  log "$*"
+}
 
 is_root() { [ "$(id -u)" -eq 0 ]; }
 
@@ -48,6 +64,18 @@ is_root() { [ "$(id -u)" -eq 0 ]; }
 # (see nanobot/agent/tools/novita_sandbox.py::_template_sizing), so in a normal
 # deployment this check passes; it exists to make a mis-sized sandbox obvious.
 MIN_MEMORY_MB="${MT5_MIN_MEMORY_MB:-1800}"
+
+# Any uncaught error is recorded as a terminal stage so a poller sees a definite
+# failure instead of waiting forever on a stale "in progress" marker.
+_on_error() {
+  local rc=$?
+  printf 'failed|installer exited with code %s\n' "$rc" >"${MT5_ROOT}/install.status" 2>/dev/null || true
+  exit "$rc"
+}
+trap _on_error ERR
+
+status bootstrap "installer started"
+
 if [ -r /proc/meminfo ]; then
   AVAILABLE_MB=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo)
   if [ "${AVAILABLE_MB:-0}" -lt "${MIN_MEMORY_MB}" ]; then
@@ -55,11 +83,12 @@ if [ -r /proc/meminfo ]; then
     log "The installer and terminal are OOM-killed on the stock ~486 MB template."
     log "Fix: run this in a sized sandbox (NOVITA_SANDBOX_MEMORY_MB=4096, or an"
     log "existing powerx-base-2g-c2 / powerx-base-4g template), then retry."
+    status failed "insufficient memory: ${AVAILABLE_MB} MB available, >= ${MIN_MEMORY_MB} MB required"
     printf '{"ok": false, "error": "insufficient memory: %s MB available, %s MB required", "fix": "use a sandbox with >= %s MB (NOVITA_SANDBOX_MEMORY_MB=4096)"}\n' \
       "${AVAILABLE_MB}" "${MIN_MEMORY_MB}" "${MIN_MEMORY_MB}"
     exit 6
   fi
-  log "sandbox memory: ${AVAILABLE_MB} MB (>= ${MIN_MEMORY_MB} MB required)"
+  status bootstrap "sandbox memory: ${AVAILABLE_MB} MB (>= ${MIN_MEMORY_MB} MB required)"
 fi
 
 # Passwordless sudo keeps the script working on the sized Novita templates,
@@ -128,18 +157,24 @@ fi
 apt_install xvfb winbind cabextract p7zip-full ca-certificates curl wget unzip \
             python3-pip fonts-wine || true
 
+# MT5's terminal is a GUI app: without a GL/Vulkan loader it aborts before it can
+# even open a window (``err:vulkan:vulkan_init_once Failed to load libvulkan.so.1``
+# followed by a hard error). These are cheap and make the terminal startable.
+apt_install libgl1 libglu1-mesa libvulkan1 mesa-vulkan-drivers \
+            libgnutls30 libasound2 || true
+
 # Reinstall via WineHQ when missing or too old for the bridge (< 9).
 if [ "${WINE_MAJOR:-0}" -lt 9 ]; then
   if [ "${WINE_MAJOR:-0}" -eq 0 ]; then
-    log "wine not present; installing WineHQ stable (>= 9 required by the bridge) ..."
+    status wine "installing WineHQ stable (>= 9 required by the MetaTrader5 bridge) ..."
   else
-    log "wine ${WINE_MAJOR} is unusable for the MetaTrader5 bridge; installing WineHQ stable ..."
+    status wine "wine ${WINE_MAJOR} is too old for the bridge; installing WineHQ stable ..."
   fi
   install_winehq || log "WARN: WineHQ install failed"
 fi
 
 if ! command -v wine >/dev/null 2>&1 && ! command -v wine64 >/dev/null 2>&1; then
-  log "installing distro wine ..."
+  status wine "installing distro wine ..."
   apt_install wine64 wine32 wine || apt_install wine || true
 fi
 
@@ -157,7 +192,7 @@ fi
 # --------------------------------------------------------------------------- #
 if command -v Xvfb >/dev/null 2>&1; then
   if ! pgrep -f "Xvfb :${DISPLAY_NUM}" >/dev/null 2>&1; then
-    log "starting Xvfb on :${DISPLAY_NUM}"
+    status display "starting Xvfb on :${DISPLAY_NUM}"
     nohup Xvfb ":${DISPLAY_NUM}" -screen 0 1280x1024x24 >/dev/null 2>&1 &
     sleep 2
   fi
@@ -172,9 +207,22 @@ fi
 export WINEPREFIX="${WINE_PREFIX}"
 export WINEDEBUG="${WINEDEBUG:--all}"
 export WINEARCH=win64
+# THE MOST IMPORTANT LINE IN THIS FILE.
+#
+# On a headless first boot, Wine tries to offer its Mono (.NET) and Gecko (HTML)
+# add-ons through a GUI prompt. Nothing can answer that prompt in a container, so
+# ``wineboot`` blocks inside setupapi's ``InstallHinfSection`` and never returns —
+# measured at 10+ minutes with no terminal64.exe produced, which looks exactly
+# like "the install silently failed". Disabling both DLLs makes wineboot finish
+# its one-time prefix work in seconds (~6 s measured on Debian 12 / WineHQ
+# stable). This is also why Wine never needed a real display here.
+#
+# Set unconditionally (not ``:=``): a partially-answered prefix is what breaks
+# the install, so honouring a stale caller value would reintroduce the hang.
+export WINEDLLOVERRIDES="mscoree,mshtml="
 
 if [ ! -d "${WINE_PREFIX}/drive_c" ]; then
-  log "initialising wine prefix at ${WINE_PREFIX} (wine 9+ builds ~800 MB, this takes minutes)"
+  status wineprefix "initialising wine prefix at ${WINE_PREFIX} (this takes minutes)"
   mkdir -p "${WINE_PREFIX}"
   # wineboot can return non-zero on first run in headless containers and its
   # setupapi phase is slow and occasionally wedges, so it is bounded. A partial
@@ -192,7 +240,7 @@ fi
 # the wineserver to go idle, which on a fresh prefix can take a long time, so it
 # is bounded by ``timeout``. A prefix that is still busy is harmless — the MT5
 # installer just queues behind it.
-log "settling wine prefix (best effort) ..."
+status wineprefix "settling wine prefix (best effort) ..."
 if command -v wineserver >/dev/null 2>&1; then
   timeout 180 wineserver -w >/dev/null 2>&1 || true
 fi
@@ -206,16 +254,49 @@ DONE_MARKER="${MT5_ROOT}/.installed"
 
 if [ ! -f "${DONE_MARKER}" ]; then
   if [ ! -s "${INSTALLER}" ]; then
-    log "downloading MT5 installer ..."
+    status download "downloading the MT5 installer ..."
     curl -fsSL --retry 3 --max-time 600 -o "${INSTALLER}" "${MT5_INSTALLER_URL}" \
       || wget -q -O "${INSTALLER}" "${MT5_INSTALLER_URL}" \
-      || { log "FATAL: could not download MT5 installer"; exit 4; }
+      || { status failed "could not download the MT5 installer"; exit 4; }
   fi
 
-  log "running silent MT5 install (this can take several minutes) ..."
-  # /auto performs an unattended install into the current prefix. MT5 returns
+  # ------------------------------------------------------------------ #
+  # 4a. Wine-Gecko — REQUIRED by mt5setup.exe
+  # ------------------------------------------------------------------ #
+  # mt5setup.exe is a *web* installer with an embedded browser. Without
+  # mshtml/Gecko it aborts with ``fixme:ntdll:NtRaiseHardError`` and produces no
+  # terminal64.exe at all — the exact symptom of a "silent" install failure.
+  #
+  # The catch: wineboot must NOT install Mono/Gecko itself or it wedges in
+  # setupapi on a headless box (see section 3). So the DLLs are disabled for the
+  # prefix boot, and real Gecko is installed here from the official MSI.
+  MSHTML_DLL="${WINE_PREFIX}/drive_c/windows/system32/mshtml.dll"
+  if [ ! -s "${MSHTML_DLL}" ]; then
+    GECKO_MSI="${MT5_ROOT}/wine-gecko-x86_64.msi"
+    if [ ! -s "${GECKO_MSI}" ]; then
+      status gecko "downloading Wine-Gecko (needed by the MT5 web installer) ..."
+      # Try a small list of versions so one 404 does not fail the whole install.
+      for ver in ${MT5_GECKO_VERSION}; do
+        curl -fsSL --retry 2 --max-time 600 -o "${GECKO_MSI}" \
+          "https://dl.winehq.org/wine/wine-gecko/${ver}/wine-gecko-${ver}-x86_64.msi" \
+          && break || rm -f "${GECKO_MSI}"
+      done
+    fi
+    if [ -s "${GECKO_MSI}" ]; then
+      status gecko "installing Wine-Gecko into the prefix ..."
+      # msiexec runs with mshtml enabled so the MSI's own registration succeeds.
+      WINEDLLOVERRIDES="mscoree=" timeout 600 "$WINE_BIN" msiexec /i "${GECKO_MSI}" /qn \
+        >/dev/null 2>&1 || log "WARN: Wine-Gecko msiexec returned non-zero"
+    else
+      log "WARN: could not download Wine-Gecko; the MT5 web installer may abort"
+    fi
+  fi
+
+  status mt5 "running the silent MT5 install (several minutes) ..."
+  # /auto performs an unattended install into the current prefix. mshtml must be
+  # ENABLED here (it is disabled only for the prefix boot), and MT5 returns
   # before its files finish landing, so the wait below matters.
-  "$WINE_BIN" "${INSTALLER}" /auto >/dev/null 2>&1 || true
+  WINEDLLOVERRIDES="mscoree=" "$WINE_BIN" "${INSTALLER}" /auto >/dev/null 2>&1 || true
 
   # Wine 9+ unpacks the terminal noticeably slower than Wine 8 did, so allow a
   # generous window (10 minutes) before declaring the install failed.
@@ -228,9 +309,9 @@ if [ ! -f "${DONE_MARKER}" ]; then
 
   if find "${WINE_PREFIX}/drive_c" -iname 'terminal64.exe' 2>/dev/null | grep -q .; then
     touch "${DONE_MARKER}"
-    log "MT5 terminal installed"
+    status mt5 "MT5 terminal installed"
   else
-    log "WARN: terminal64.exe not found yet; leaving marker absent for a retry"
+    status failed "terminal64.exe was not produced; rerun install"
     exit 5
   fi
 fi
@@ -256,7 +337,7 @@ WIN_PY="${WIN_PY_DIR}/python.exe"
 # installer, so it works reliably in Wine. It ships a ``python3XX._pth`` that
 # disables site-packages by default, so we re-enable it before running get-pip.
 if [ ! -f "${WIN_PY}" ]; then
-  log "installing embeddable Windows Python ${MT5_WINPY_VERSION} into the Wine prefix ..."
+  status winpython "installing embeddable Windows Python ${MT5_WINPY_VERSION} ..."
   WINPY_ZIP="${MT5_ROOT}/python-embed.zip"
   if [ ! -s "${WINPY_ZIP}" ]; then
     curl -fsSL --retry 3 --max-time 900 -o "${WINPY_ZIP}" \
@@ -281,7 +362,7 @@ if [ ! -f "${WIN_PY}" ]; then
 fi
 
 if [ -f "${WIN_PY}" ]; then
-  log "Windows Python present; installing pip + the MetaTrader5 bridge inside Wine ..."
+  status bridge "installing pip + the MetaTrader5 bridge inside Wine ..."
   # Bootstrap pip (the embeddable zip has none) then install the bridge.
   if ! "$WINE_BIN" "${WIN_PY}" -m pip --version >/dev/null 2>&1; then
     GETPIP="${MT5_ROOT}/get-pip.py"
@@ -296,4 +377,6 @@ else
   log "WARN: Windows Python was not installed; the MT5 bridge is unavailable"
 fi
 
-log "done. prefix=${WINE_PREFIX} root=${MT5_ROOT} win_python=${WIN_PY}"
+status done "install complete: prefix=${WINE_PREFIX} win_python=${WIN_PY}"
+printf '{"ok": true, "stage": "done", "wine_prefix": "%s", "mt5_root": "%s", "windows_python": "%s"}\n' \
+  "${WINE_PREFIX}" "${MT5_ROOT}" "${WIN_PY}"

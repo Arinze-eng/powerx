@@ -87,6 +87,11 @@ def wine_env() -> dict[str, str]:
     env.setdefault("WINEPREFIX", str(WINE_PREFIX))
     env.setdefault("WINEDEBUG", "-all")
     env.setdefault("DISPLAY", f":{DISPLAY_NUM}")
+    # Wine's Mono/.NET and Gecko/HTML add-on prompts cannot be answered in a
+    # headless container, and ``wineboot`` then wedges in setupapi for 10+ minutes.
+    # Disabling both is what keeps prefix creation fast and non-interactive, so
+    # every Wine call — not just the installer — must carry these overrides.
+    env.setdefault("WINEDLLOVERRIDES", "mscoree,mshtml=")
     return env
 
 
@@ -260,6 +265,48 @@ def cmd_install(args: argparse.Namespace) -> int:
     script = Path(args.script).expanduser()
     if not script.exists():
         return fail(f"installer script not found: {script}")
+    if not os.access(script, os.O_RDONLY):
+        return fail(f"installer script is not readable: {script}")
+
+    log_path = MT5_ROOT / "install.log"
+    status_path = MT5_ROOT / "install.status"
+    MT5_ROOT.mkdir(parents=True, exist_ok=True)
+    # A stale success/failure marker from a previous attempt must not be
+    # mistaken for this run's outcome.
+    for stale in (status_path, log_path):
+        if stale.exists():
+            stale.unlink()
+
+    if args.detach:
+        # WHY DETACHED: the execution sandbox clamps every single command to a
+        # fixed ceiling (900 s on Novita) while a full Wine + MT5 + bridge
+        # install legitimately runs longer. Holding one command open would be
+        # killed mid-install and leave a half-built prefix. So the installer is
+        # launched with nohup/setsid and the caller polls ``status`` instead.
+        inner = f"bash {shlex.quote(str(script))} > {shlex.quote(str(log_path))} 2>&1"
+        quoted = shlex.quote(inner)
+        proc = subprocess.run(
+            ["sh", "-c", f"nohup setsid sh -c {quoted} >/dev/null 2>&1 & echo $!"],
+            env=wine_env(),
+            capture_output=True,
+            text=True,
+        )
+        pid = (proc.stdout or "").strip()
+        return emit(
+            {
+                "ok": True,
+                "detached": True,
+                "pid": pid,
+                "status_file": str(status_path),
+                "log_file": str(log_path),
+                "hint": "Poll action='status' (or mt5_cli.py status) until stage is "
+                "'done' or 'failed'. A full install takes ~10-25 minutes.",
+            },
+            text=f"install started detached (pid {pid}); poll status until done",
+        )
+
+    # Foreground mode: only usable when the caller's command ceiling exceeds the
+    # install duration (e.g. a local run or a self-hosted box).
     env = wine_env()
     proc = subprocess.run(
         ["bash", str(script)],
@@ -274,6 +321,80 @@ def cmd_install(args: argparse.Namespace) -> int:
         text=tail,
         code=0 if proc.returncode == 0 else 2,
     )
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Report install progress and overall stack readiness (pollable)."""
+    status_path = MT5_ROOT / "install.status"
+    log_path = MT5_ROOT / "install.log"
+    stage, message = "unknown", ""
+    if status_path.exists():
+        raw = status_path.read_text(encoding="utf-8", errors="replace").strip()
+        stage, _, message = raw.partition("|")
+
+    terminal = find_terminal()
+    winpy = win_python()
+    running = terminal_running()
+    installed = bool(terminal and winpy is not None)
+    failed = stage == "failed"
+    done = installed or stage == "done"
+
+    if status_path.exists():
+        # An install log that is still growing means the detached installer is
+        # alive; that is the only reliable "in progress" signal.
+        pass
+    in_progress = (not done) and (not failed) and _installer_alive()
+
+    if not status_path.exists() and not done:
+        stage, message = "not_started", "no install has been run in this sandbox"
+
+    payload = {
+        "ok": not failed,
+        "stage": "done" if done else stage,
+        "message": message,
+        "in_progress": in_progress,
+        "installed": installed,
+        "terminal_path": str(terminal) if terminal else None,
+        "terminal_running": running,
+        "windows_python": str(winpy) if winpy else None,
+        "windows_python_bytes": _wine_python_bytes(),
+        "log_tail": _tail(log_path, int(args.lines)),
+        "next": (
+            "Stack installed — run action='start' with login/password/server."
+            if done
+            else "Keep polling action='status' until stage='done'."
+            if in_progress
+            else "Run action='install'."
+        ),
+    }
+    return emit(payload, text=f"stage={payload['stage']}: {message}"[:2000],
+                code=0 if not failed else 6)
+
+
+def _installer_alive() -> bool:
+    """True while a detached ``install_mt5_sandbox.sh`` is still running."""
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-f", "install_mt5_sandbox.sh"], capture_output=True, timeout=15
+        )
+        return proc.returncode == 0
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return False
+
+
+def _wine_python_bytes() -> int:
+    """Total size of the Windows python tree (0 when it does not exist yet)."""
+    winpy = win_python()
+    if winpy is None:
+        return 0
+    total = 0
+    for path in winpy.parent.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
 def _bridge_probe() -> dict[str, Any] | None:
@@ -790,7 +911,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("install", help="install Wine + MT5 + python bridge")
     p.add_argument("--script", default=str(Path(__file__).with_name("install_mt5_sandbox.sh")))
     p.add_argument("--timeout", type=int, default=1800)
+    # Detached is the default because sandbox commands are timeout-capped; the
+    # caller polls ``status`` instead of holding one long command open.
+    p.add_argument("--detach", dest="detach", action="store_true", default=True)
+    p.add_argument("--foreground", dest="detach", action="store_false")
     p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("status", help="install progress / stack readiness (pollable)")
+    p.add_argument("--lines", type=int, default=25)
+    p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("start", help="launch the terminal headless")
     p.add_argument("--wait", type=int, default=180)

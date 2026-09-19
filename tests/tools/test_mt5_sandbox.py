@@ -86,6 +86,40 @@ def test_install_command_points_at_the_sandbox_installer():
     assert "--script" in cmd and "install_mt5_sandbox.sh" in cmd
 
 
+def test_install_is_detached_by_default():
+    """A full install outlives the sandbox command ceiling.
+
+    The Novita tool caps every command at 900 s while Wine + MT5 + the bridge
+    takes longer, so ``install`` must hand off to a detached process instead of
+    holding one command open (which would be killed mid-prefix-build).
+    """
+    cmd = build_cli_command("install", {})
+    assert "--foreground" not in cmd
+
+
+def test_install_can_be_forced_to_the_foreground():
+    cmd = build_cli_command("install", {"foreground": True})
+    assert "--foreground" in cmd
+
+
+def test_install_action_timeout_stays_under_the_sandbox_ceiling():
+    """The install kick-off is a short call; only the detached work is long."""
+    from nanobot.agent.tools.mt5_sandbox import _MAX_SANDBOX_COMMAND_TIMEOUT, _TIMEOUTS
+
+    assert _TIMEOUTS["install"] <= _MAX_SANDBOX_COMMAND_TIMEOUT
+    for action, value in _TIMEOUTS.items():
+        assert value <= _MAX_SANDBOX_COMMAND_TIMEOUT, f"{action} exceeds the ceiling"
+
+
+def test_status_is_a_pollable_read_only_action():
+    from nanobot.agent.tools.mt5_sandbox import _READ_ONLY_ACTIONS
+
+    assert "status" in _READ_ONLY_ACTIONS
+    assert "status" in MT5SandboxTool().parameters["properties"]["action"]["enum"]
+    assert "--lines 25" in build_cli_command("status", {})
+    assert "--lines 5" in build_cli_command("status", {"lines": 5})
+
+
 def test_start_command_seeds_login_and_portable_mode():
     cmd = build_cli_command(
         "start", {"login": 1111291280, "password": "pw", "server": "Forex Hedged USD"}

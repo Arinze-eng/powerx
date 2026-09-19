@@ -60,26 +60,38 @@ _MT5_HOME = "$HOME/.mt5"
 _CLI_PATH = f"{_MT5_HOME}/bin/mt5_cli.py"
 _INSTALLER_PATH = f"{_MT5_HOME}/bin/install_mt5_sandbox.sh"
 
+#: The execution sandbox caps every command at 900 s, but a full Wine + MT5 +
+#: bridge install genuinely takes longer. ``install`` therefore starts the
+#: installer *detached* and returns immediately; progress is polled through
+#: ``status``. Keeping this in sync with the sandbox ceiling matters: if the
+#: install were run inline it would be killed mid-prefix-build.
+_MAX_SANDBOX_COMMAND_TIMEOUT = 900
+_INSTALL_COMMAND_TIMEOUT = 240
+
 #: Actions that move money. Blocked unless explicitly enabled.
 _TRADING_ACTIONS = frozenset({"order", "close", "close_all"})
 
 #: Actions that only read state. These never require the trading opt-in.
 _READ_ONLY_ACTIONS = frozenset(
     {
-        "doctor", "account", "quote", "candles", "positions", "orders",
+        "status", "doctor", "account", "quote", "candles", "positions", "orders",
         "history", "symbol", "logs", "experts", "run",
     }
 )
 
 _ALL_ACTIONS = sorted(
-    _READ_ONLY_ACTIONS | _TRADING_ACTIONS | {"install", "start", "stop", "login", "compile"}
+    _READ_ONLY_ACTIONS
+    | _TRADING_ACTIONS
+    | {"install", "start", "stop", "login", "compile"}
 )
 
-#: Generous per-action timeouts. Installing Wine + MT5 genuinely takes minutes;
-#: everything else should be quick once the terminal is warm.
+#: Generous per-action timeouts. Installing Wine + MT5 genuinely takes minutes,
+#: so ``install`` only ever kick-starts a detached process (see above) and
+#: readiness is reported by ``status``.
 _TIMEOUTS: dict[str, int] = {
-    "install": 2400,
-    "start": 300,
+    "install": _INSTALL_COMMAND_TIMEOUT,
+    "status": 90,
+    "start": 900,
     "stop": 60,
     "doctor": 120,
     "compile": 360,
@@ -136,6 +148,12 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
         parts += ["--script", _INSTALLER_PATH]
         if kwargs.get("timeout"):
             parts += ["--timeout", str(int(kwargs["timeout"]))]
+        if kwargs.get("foreground"):
+            # Only for callers whose own command ceiling exceeds the install
+            # duration; the sandbox default must stay detached.
+            parts += ["--foreground"]
+    elif action == "status":
+        parts += ["--lines", str(int(kwargs.get("lines") or 25))]
     elif action == "start":
         parts += ["--wait", str(int(kwargs.get("wait") or 180))]
         # Credentials can be supplied here so the terminal auto-connects on boot,
@@ -276,8 +294,11 @@ class MT5SandboxTool(Tool):
         return (
             "MetaTrader 5 in the user's execution sandbox. NEVER runs Wine or the MT5 "
             "terminal on the application host. "
-            "Workflow: action='install' (Wine + Xvfb + MT5 + python bridge inside the "
-            "sandbox, takes a few minutes) -> action='start' -> action='login' -> then "
+            "Workflow: action='install' (starts a DETACHED Wine + Xvfb + MT5 + python "
+            "bridge install inside the sandbox) -> poll action='status' until "
+            "stage='done' (a full install takes ~10-25 min; sandbox commands are "
+            "timeout-capped so the install is never run inline) -> action='start' "
+            "(pass login/password/server so the terminal connects) -> then "
             "quotes/candles/orders. "
             "Read/fix loop: use 'compile' to build an .mq5 with MetaEditor (returns the "
             "compiler errors), and 'logs'/'experts' to tail the terminal and Experts "
@@ -313,10 +334,11 @@ class MT5SandboxTool(Tool):
                 "comment": {"type": "string", "description": "Order comment."},
                 "file": {"type": "string", "description": "Absolute .mq5/.mqh path inside the sandbox (action=compile)."},
                 "include": {"type": "string", "description": "MetaEditor include dir (action=compile)."},
-                "lines": {"type": "integer", "description": "Log lines to tail (action=logs/experts)."},
+                "lines": {"type": "integer", "description": "Log lines to tail (action=logs/experts/status)."},
                 "code": {"type": "string", "description": "Raw python using the MetaTrader5 module (action=run)."},
                 "wait": {"type": "integer", "description": "Seconds to wait for terminal IPC (action=start)."},
                 "timeout": {"type": "integer", "description": "Command timeout override in seconds."},
+                "foreground": {"type": "boolean", "description": "action=install: run inline instead of detached. Only safe when no command-timeout ceiling applies."},
                 "portable": {"type": "boolean", "description": "action=start: launch the terminal in portable mode so a seeded config/login is used."},
                 "dry_run": {"type": "boolean", "description": "For order/close: validate inputs and report the planned request without sending."},
             },
