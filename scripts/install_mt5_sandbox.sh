@@ -174,11 +174,12 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 export WINEARCH=win64
 
 if [ ! -d "${WINE_PREFIX}/drive_c" ]; then
-  log "initialising wine prefix at ${WINE_PREFIX}"
+  log "initialising wine prefix at ${WINE_PREFIX} (wine 9+ builds ~800 MB, this takes minutes)"
   mkdir -p "${WINE_PREFIX}"
-  # wineboot can return non-zero on first run in headless containers; the
-  # prefix is still usable, so the exit status is intentionally ignored.
-  "$WINE_BIN" wineboot --init >/dev/null 2>&1 || true
+  # wineboot can return non-zero on first run in headless containers and its
+  # setupapi phase is slow and occasionally wedges, so it is bounded. A partial
+  # prefix is still usable — wineboot finishes the remaining work lazily.
+  timeout 900 "$WINE_BIN" wineboot --init >/dev/null 2>&1 || true
   sleep 5
 fi
 
