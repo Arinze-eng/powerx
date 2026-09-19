@@ -47,9 +47,39 @@ mt5_sandbox(action="compile", file="/home/user/.mt5/MQL5/Experts/MyEA.mq5")
 ```
 
 Read `errors`, edit the source, compile again. `ex5` is non-null only on
-success. Put sources under the terminal data dir so MetaEditor resolves
-`#include <Trade/Trade.mqh>` from the standard library; pass `include=` if your
-headers live elsewhere.
+success.
+
+### Where sources must live
+
+MetaEditor resolves `#include <Trade/Trade.mqh>` relative to the terminal it is
+invoked from. Two consequences, both verified:
+
+* Put sources under the terminal's **MQL5 data tree** (below), and
+* If you compile a file from anywhere else, pass `include=` pointing at the
+  MQL5 `Include` directory (`--include` on the CLI). Without it you get
+  `error 106: file 'Include\Trade\Trade.mqh' not found`, which is a *path*
+  problem, not a code problem.
+
+```text
+# terminal data dir (where Experts/ and Include/ belong)
+~/.wine-mt5/drive_c/users/user/AppData/Roaming/MetaQuotes/Terminal/Common/MQL5/
+
+# install dir (holds the binaries + a stub MQL5/Experts)
+~/.wine-mt5/drive_c/Program Files/MetaTrader 5/
+```
+
+The installer ships only a stub `MQL5/Experts` — MetaQuotes pushes the full
+standard library on first broker sync. A self-contained EA compiles with no
+setup; anything using `<Trade/…>`, `<Arrays/…>` etc. needs either that sync or
+an `include=` path to a library you provide.
+
+Verified end to end in a sandbox: a self-contained `Plain.mq5` compiled to a
+6186-byte `Plain.ex5` with `Result: 0 errors, 0 warnings, 335 ms elapsed,
+cpu='X64 Regular'`.
+
+The `.log` MetaEditor writes next to the source is UTF-16LE with a BOM; the CLI
+auto-detects UTF-16/UTF-8/Latin-1, so read `errors`/`log` from the JSON rather
+than fetching the file yourself.
 
 After compiling an EA, `action="experts"` tails the Experts journal and
 `action="logs"` tails the terminal log — together they are the full read/fix
