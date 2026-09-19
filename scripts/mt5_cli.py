@@ -85,12 +85,18 @@ def fail(message: str, *, code: int = 1, **extra: Any) -> int:
 def wine_env() -> dict[str, str]:
     env = dict(os.environ)
     env.setdefault("WINEPREFIX", str(WINE_PREFIX))
-    env.setdefault("WINEDEBUG", "-all")
     env.setdefault("DISPLAY", f":{DISPLAY_NUM}")
+    # WINEDEBUG is deliberately NOT set here.
+    #
+    # Wine raises PEB heap-debug flags for any process while WINEDEBUG is present
+    # in the environment — *including* WINEDEBUG=-all. MetaTrader treats those
+    # flags as "a debugger is attached" and aborts with
+    #   "A debugger has been found running in your system."
+    # Any leftover value is therefore stripped, and one must never be added.
+    env.pop("WINEDEBUG", None)
     # Wine's Mono/.NET and Gecko/HTML add-on prompts cannot be answered in a
     # headless container, and ``wineboot`` then wedges in setupapi for 10+ minutes.
-    # Disabling both is what keeps prefix creation fast and non-interactive, so
-    # every Wine call — not just the installer — must carry these overrides.
+    # Disabling both is what keeps prefix creation fast and non-interactive.
     env.setdefault("WINEDLLOVERRIDES", "mscoree,mshtml=")
     return env
 

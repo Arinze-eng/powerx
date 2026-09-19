@@ -82,9 +82,20 @@ with `NOVITA_SANDBOX_MEMORY_MB=4096`) and the installer refuses to start below
 
 | Symptom | Cause / fix |
 |---|---|
+| **`A debugger has been found running in your system`** | MetaTrader's anti-debug check. Two causes, both handled automatically: **Wine 11 is unusable** (Wine 10 installs in ~30 s), and **any `WINEDEBUG` value** — even `-all` — makes Wine set PEB heap-debug flags MT5 detects. The installer pins Wine 10 across all four wine packages and strips `WINEDEBUG`. Never pass `WINEDEBUG` to an MT5 binary. |
 | `status` stuck on `wineprefix` | Wine's first boot does one-time registry work; it is slow but bounded. Keep polling. |
 | `stage="failed"`, `insufficient memory` | Sandbox too small. Raise `NOVITA_SANDBOX_MEMORY_MB` and recreate. |
 | `start` returns `ipc_ready=false` | No broker login. Pass `login`/`password`/`server` to `start`. |
-| `unimplemented function ucrtbase.dll.crealf` | Wine < 9. The installer pins WineHQ stable; re-run `install`. |
+| `unimplemented function ucrtbase.dll.crealf` | Wine < 9. The installer pins Wine 10; re-run `install`. |
 | `bridge_imports_in_wine=false` in `doctor` | Windows python or the `MetaTrader5` wheel failed to install; check `log_tail`. |
 | `mt5_cli.py must run inside Wine` | Do not invoke the CLI's bridge actions directly on Linux python — always go through `mt5_sandbox`. |
+
+## Verified facts (measured in a Novita sandbox)
+
+- Wine **10.0** is required. Wine 11.0 fails MetaTrader's anti-debug check.
+- `WINEDEBUG` must be **absent** from the environment of every MT5 process.
+- `WINEDLLOVERRIDES=mscoree,mshtml=` makes `wineboot` finish in **~6 s** instead
+  of wedging for 10+ minutes in setupapi.
+- Total install time with the stack above: **~2 minutes** (terminal + MetaEditor
+  + Windows Python bridge), producing
+  `Program Files/MetaTrader 5/terminal64.exe` and `MetaEditor64.exe`.

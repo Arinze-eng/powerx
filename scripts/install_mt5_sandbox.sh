@@ -39,8 +39,37 @@ MT5_WINPY_VERSION="${MT5_WINPY_VERSION:-3.11.9}"
 # attempted in order; the default matches WineHQ stable's own pairing closely
 # enough that the embedded browser works.
 MT5_GECKO_VERSION="${MT5_GECKO_VERSION:-2.47.4 2.47.3}"
+# The Wine series MT5 requires. Wine 11 trips MetaTrader's anti-debug check.
+MT5_WINE_SERIES="${MT5_WINE_SERIES:-10}"
+MT5_WINE_VERSION="${MT5_WINE_VERSION:-10.0.0.0~bookworm-1}"
 
 log() { printf '[mt5-install] %s\n' "$*" >&2; }
+
+# Bump the prefix if it was built by a Wine that MT5 refuses (>= 11).
+# MetaTrader's anti-debug check fires on Wine 11's prefix, and Wine 10 cannot
+# read an 11-built prefix, so the only reliable path is a rebuild.
+maybe_reset_prefix_for_wine10() {
+  local ver_file="${WINE_PREFIX}/.wine-version-built"
+  if [ -d "${WINE_PREFIX}/drive_c" ]; then
+    local built=""
+    [ -r "${ver_file}" ] && built="$(cat "${ver_file}" 2>/dev/null || true)"
+    if [ "${built}" != "" ] && [ "${built}" != "${MT5_WINE_SERIES}" ]; then
+      status wine "rebuilding the prefix (built with wine ${built}, MT5 needs ${MT5_WINE_SERIES})"
+      rm -rf "${WINE_PREFIX}"
+    fi
+  fi
+}
+
+# Run a MT5 binary.
+#
+# WHY WINEDEBUG IS STRIPPED HERE: Wine sets PEB heap-debug flags whenever
+# WINEDEBUG is present in the environment — even WINEDEBUG=-all. MetaTrader reads
+# those flags as "a debugger is attached" and refuses to start with
+# "A debugger has been found running in your system." Winning combination,
+# verified in the sandbox: Wine 10 + WINEDEBUG unset.
+run_mt5() {
+  env -u WINEDEBUG -u WINEINVALIDATECACHE "$WINE_BIN" "$@"
+}
 
 # Publish a machine-readable progress marker so the caller can follow a LONG
 # install without holding a single (timeout-capped) sandbox command open. The
@@ -64,6 +93,10 @@ is_root() { [ "$(id -u)" -eq 0 ]; }
 # (see nanobot/agent/tools/novita_sandbox.py::_template_sizing), so in a normal
 # deployment this check passes; it exists to make a mis-sized sandbox obvious.
 MIN_MEMORY_MB="${MT5_MIN_MEMORY_MB:-1800}"
+# MT5's installer and terminal refuse to run correctly under Wine's default
+# "Windows 7" reporting — MetaQuotes has required Windows 10 for years. This is
+# set in the registry below, before any MT5 binary is executed.
+MT5_WINVER="${MT5_WINVER:-win10}"
 
 # Any uncaught error is recorded as a terminal stage so a poller sees a definite
 # failure instead of waiting forever on a stale "in progress" marker.
@@ -142,7 +175,37 @@ install_winehq() {
 
   export DEBIAN_FRONTEND=noninteractive
   $SUDO apt-get update -qq >/dev/null 2>&1 || return 1
-  $SUDO apt-get install -y -qq --install-recommends winehq-stable >/dev/null 2>&1 || return 1
+
+  # WHY WINE 10 AND NOT THE LATEST:
+  #
+  # Wine 11 sets PEB heap-debug flags that MetaTrader reads as "a debugger is
+  # attached". mt5setup.exe then refuses to run at all and pops a modal dialog
+  # reading "A debugger has been found running in your system. Please, unload it
+  # from memory and restart your program." — captured from a screenshot inside
+  # the sandbox. The install stops before making a single network request, so it
+  # looks like a silent hang (0% CPU, no terminal64.exe) rather than an error.
+  #
+  # Wine 10.0 is not affected. Measured in the sandbox: with Wine 11 the install
+  # never produced a terminal; with Wine 10.0 pinned, terminal64.exe and
+  # MetaEditor64.exe appeared in ~30 seconds.
+  #
+  # Also note Wine 11 flags are already too old to satisfy the bridge's Wine 9+
+  # requirement, so a range is used rather than "any version".
+  local pin="${MT5_WINE_VERSION:-10.0.0.0~bookworm-1}"
+  # ALL FOUR packages must be pinned together. Pinning only the winehq-stable
+  # metapackage leaves wine-stable/amd64/i386 at 11.0, so `wine --version` still
+  # reports 11.0 and MT5's anti-debug check still fires. Verified in the sandbox:
+  # the 4-package form downgrades cleanly and reports wine-10.0.
+  if $SUDO apt-get install -y -qq --allow-downgrades --install-recommends \
+      "winehq-stable=${pin}" "wine-stable=${pin}" \
+      "wine-stable-amd64=${pin}" "wine-stable-i386=${pin}" >/dev/null 2>&1; then
+    return 0
+  fi
+  # Fall back to the metapackage alone, then to whatever is newest.
+  $SUDO apt-get install -y -qq --allow-downgrades --install-recommends \
+      "winehq-stable=${pin}" >/dev/null 2>&1 && return 0
+  $SUDO apt-get install -y -qq --install-recommends winehq-stable >/dev/null 2>&1 \
+    || return 1
   return 0
 }
 
@@ -163,15 +226,28 @@ apt_install xvfb winbind cabextract p7zip-full ca-certificates curl wget unzip \
 apt_install libgl1 libglu1-mesa libvulkan1 mesa-vulkan-drivers \
             libgnutls30 libasound2 || true
 
-# Reinstall via WineHQ when missing or too old for the bridge (< 9).
-if [ "${WINE_MAJOR:-0}" -lt 9 ]; then
+# Wine 10 specifically is required — see install_winehq() above. Wine 11 trips
+# MetaTrader's anti-debug check and nothing installs. A Wine 11 prefix is also not
+# readable by Wine 10, so an existing too-new prefix is rebuilt below.
+if [ "${WINE_MAJOR:-0}" -lt 9 ] || [ "${WINE_MAJOR:-0}" -ge 11 ]; then
   if [ "${WINE_MAJOR:-0}" -eq 0 ]; then
-    status wine "installing WineHQ stable (>= 9 required by the MetaTrader5 bridge) ..."
+    status wine "installing WineHQ stable 10 (required by the MT5 installer) ..."
   else
-    status wine "wine ${WINE_MAJOR} is too old for the bridge; installing WineHQ stable ..."
+    status wine "wine ${WINE_MAJOR} is unusable for MT5; installing WineHQ 10 ..."
   fi
   install_winehq || log "WARN: WineHQ install failed"
+  # apt may have swapped the binaries; re-read the version so the prefix rebuild
+  # below (and the doctor report) sees the version actually in place.
+  WINE_MAJOR=$(wine --version 2>/dev/null | sed 's/[^0-9]*\([0-9]*\).*/\1/' || echo 0)
+  if [ "${WINE_MAJOR:-0}" -ge 11 ]; then
+    log "WARN: wine is still ${WINE_MAJOR} after the WineHQ install; MT5 may refuse to run"
+  fi
 fi
+
+# A prefix built by a different Wine series is not reliably readable. Discard a
+# Wine-11 prefix so Wine 10 builds a clean one (this is what makes terminal64.exe
+# appear — a stale 11-built prefix keeps tripping the anti-debug check).
+maybe_reset_prefix_for_wine10
 
 if ! command -v wine >/dev/null 2>&1 && ! command -v wine64 >/dev/null 2>&1; then
   status wine "installing distro wine ..."
@@ -205,8 +281,14 @@ fi
 # 3. Wine prefix
 # --------------------------------------------------------------------------- #
 export WINEPREFIX="${WINE_PREFIX}"
-export WINEDEBUG="${WINEDEBUG:--all}"
 export WINEARCH=win64
+# NOTE: WINEDEBUG is intentionally NOT set anywhere in this script.
+#
+# Wine raises PEB heap-debug flags for a process whenever WINEDEBUG exists in its
+# environment — even the seemingly harmless WINEDEBUG=-all. MetaTrader inspects
+# those flags and, finding them, refuses to run: "A debugger has been found
+# running in your system." Setting WINEDEBUG to anything therefore breaks the
+# install. MT5 binaries are launched through run_mt5(), which strips it.
 # THE MOST IMPORTANT LINE IN THIS FILE.
 #
 # On a headless first boot, Wine tries to offer its Mono (.NET) and Gecko (HTML)
@@ -221,6 +303,24 @@ export WINEARCH=win64
 # the install, so honouring a stale caller value would reintroduce the hang.
 export WINEDLLOVERRIDES="mscoree,mshtml="
 
+# --------------------------------------------------------------------------- #
+# 3a. A window manager for the virtual display
+# --------------------------------------------------------------------------- #
+# Xvfb alone provides no window manager. Without one, Wine's dialogs are not
+# properly mapped/adopted by the X server, and MT5's installer windows can hang
+# unmapped. A tiny WM makes the display behave like a real desktop.
+if ! pgrep -x matchbox-window-manager >/dev/null 2>&1; then
+  apt_install matchbox-window-manager >/dev/null 2>&1 || true
+  if command -v matchbox-window-manager >/dev/null 2>&1; then
+    status display "starting a window manager on :${DISPLAY_NUM}"
+    nohup matchbox-window-manager -use_titlebar no >/dev/null 2>&1 &
+    sleep 2
+  fi
+fi
+
+# --------------------------------------------------------------------------- #
+# 3b. Report Windows 10
+# --------------------------------------------------------------------------- #
 if [ ! -d "${WINE_PREFIX}/drive_c" ]; then
   status wineprefix "initialising wine prefix at ${WINE_PREFIX} (this takes minutes)"
   mkdir -p "${WINE_PREFIX}"
@@ -229,6 +329,38 @@ if [ ! -d "${WINE_PREFIX}/drive_c" ]; then
   # prefix is still usable — wineboot finishes the remaining work lazily.
   timeout 900 "$WINE_BIN" wineboot --init >/dev/null 2>&1 || true
   sleep 5
+  # Stamp the series that built this prefix so a later version change (e.g. an
+  # image upgrade to Wine 11) triggers an automatic rebuild instead of a
+  # mysterious anti-debug failure.
+  printf '%s' "${MT5_WINE_SERIES}" >"${WINE_PREFIX}/.wine-version-built" 2>/dev/null || true
+fi
+
+# Wine defaults to reporting itself as Windows 7. MetaQuotes has required
+# Windows 10 for years and mt5setup.exe refuses to proceed under the older
+# version string — it raises a hard error and shows a modal dialog that nothing
+# can dismiss, which is exactly the "0% CPU, nothing produced" hang. This must
+# be corrected before ANY MT5 binary runs, i.e. only after the prefix exists.
+winver_current=$(timeout 60 "$WINE_BIN" reg query \
+  'HKLM\Software\Microsoft\Windows NT\CurrentVersion' /v CurrentVersion 2>/dev/null \
+  | tr -d '\r' | awk '/CurrentVersion/{print $3}')
+if [ "${winver_current}" != "10.0" ]; then
+  status winecfg "configuring the prefix to report Windows 10"
+  timeout 120 "$WINE_BIN" reg add \
+    'HKLM\Software\Microsoft\Windows NT\CurrentVersion' /v CurrentVersion /t REG_SZ \
+    /d 10.0 /f >/dev/null 2>&1 || true
+  timeout 120 "$WINE_BIN" reg add \
+    'HKLM\Software\Microsoft\Windows NT\CurrentVersion' /v CurrentBuildNumber /t REG_SZ \
+    /d 19045 /f >/dev/null 2>&1 || true
+fi
+
+# MT5 links against the MSVC runtime; without it the installer aborts.
+if ! ls "${WINE_PREFIX}/drive_c/windows/system32/msvcp140.dll" >/dev/null 2>&1; then
+  status vcrun "installing the MSVC runtime (vcrun2022) ..."
+  apt_install winetricks >/dev/null 2>&1 || true
+  if command -v winetricks >/dev/null 2>&1; then
+    timeout 600 winetricks -q --force vcrun2022 >/dev/null 2>&1 || \
+      log "WARN: vcrun2022 install failed; continuing"
+  fi
 fi
 
 # Let the prefix finish initialising before installing anything. Wine 9+ does a
@@ -294,13 +426,22 @@ if [ ! -f "${DONE_MARKER}" ]; then
 
   status mt5 "running the silent MT5 install (several minutes) ..."
   # /auto performs an unattended install into the current prefix. mshtml must be
-  # ENABLED here (it is disabled only for the prefix boot), and MT5 returns
-  # before its files finish landing, so the wait below matters.
-  WINEDLLOVERRIDES="mscoree=" "$WINE_BIN" "${INSTALLER}" /auto >/dev/null 2>&1 || true
+  # ENABLED here (it is disabled only for the prefix boot).
+  #
+  # The installer is BOUNDED on purpose. mt5setup.exe is a web installer: when it
+  # cannot reach its download backend it opens a small dialog and simply sits
+  # there — measured at 0% CPU for 20+ minutes with no terminal64.exe. Without a
+  # timeout the whole install would hang forever and the poller would never see a
+  # terminal state. Bounding it converts "hangs indefinitely" into a fast,
+  # diagnosable failure with the installer's own output attached.
+  MT5_SETUP_TIMEOUT="${MT5_SETUP_TIMEOUT:-900}"
+  MT5_SETUP_LOG="${MT5_ROOT}/mt5setup.log"
+  WINEDLLOVERRIDES="mscoree=" timeout "${MT5_SETUP_TIMEOUT}" \
+    env -u WINEDEBUG "$WINE_BIN" "${INSTALLER}" /auto >"${MT5_SETUP_LOG}" 2>&1 || true
 
   # Wine 9+ unpacks the terminal noticeably slower than Wine 8 did, so allow a
-  # generous window (10 minutes) before declaring the install failed.
-  for _ in $(seq 1 120); do
+  # generous window (5 minutes) after the installer returns.
+  for _ in $(seq 1 60); do
     if find "${WINE_PREFIX}/drive_c" -iname 'terminal64.exe' 2>/dev/null | grep -q .; then
       break
     fi
@@ -311,7 +452,15 @@ if [ ! -f "${DONE_MARKER}" ]; then
     touch "${DONE_MARKER}"
     status mt5 "MT5 terminal installed"
   else
-    status failed "terminal64.exe was not produced; rerun install"
+    # Surface the installer's own output so the failure is actionable instead of
+    # looking like a silent no-op.
+    {
+      printf '{"ok": false, "stage": "failed", "error": "terminal64.exe was not produced",\n'
+      printf ' "installer_log": "'
+      tr -d '\000' <"${MT5_SETUP_LOG}" 2>/dev/null | tail -c 900 | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '
+      printf '"}\n'
+    } >&2
+    status failed "terminal64.exe was not produced (installer log: ${MT5_SETUP_LOG})"
     exit 5
   fi
 fi

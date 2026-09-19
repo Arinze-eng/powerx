@@ -13,6 +13,8 @@ The sandbox is faked, so the tests are fast and need no network or Wine.
 """
 from __future__ import annotations
 
+import importlib.util
+import os
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -118,6 +120,74 @@ def test_status_is_a_pollable_read_only_action():
     assert "status" in MT5SandboxTool().parameters["properties"]["action"]["enum"]
     assert "--lines 25" in build_cli_command("status", {})
     assert "--lines 5" in build_cli_command("status", {"lines": 5})
+
+
+def _load_cli_module():
+    """Import scripts/mt5_cli.py, which is not an importable package.
+
+    The CLI lives outside the package tree (it is deployed into the sandbox as a
+    standalone script), so it has to be loaded by path.
+    """
+    path = Path(__file__).resolve().parents[2] / "scripts" / "mt5_cli.py"
+    spec = importlib.util.spec_from_file_location("mt5_cli_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_wine_env_never_sets_winedebug():
+    """WINEDEBUG presence makes MetaTrader think a debugger is attached.
+
+    Wine sets PEB heap-debug flags for any process while WINEDEBUG exists in the
+    environment — even ``WINEDEBUG=-all``. mt5setup.exe then aborts with
+    "A debugger has been found running in your system." and the install silently
+    stalls at 0% CPU. The env builder must therefore strip it, never add it.
+    """
+    env = _load_cli_module().wine_env()
+    assert "WINEDEBUG" not in env
+
+    # ...and it must actively remove an inherited value too.
+    os.environ["WINEDEBUG"] = "-all"
+    try:
+        assert "WINEDEBUG" not in _load_cli_module().wine_env()
+    finally:
+        del os.environ["WINEDEBUG"]
+
+
+def test_installer_pins_wine_10_and_strips_winedebug():
+    """The installer must pin Wine 10 and never pass WINEDEBUG to MT5.
+
+    Wine 11 trips MetaTrader's anti-debug check; Wine 10 installs in ~30 s. Both
+    facts were measured in a real sandbox, so they are pinned here to stop a
+    regression that is very hard to diagnose from the outside (the failure looks
+    like a silent hang rather than an error).
+    """
+    script = (Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh").read_text()
+
+    # Wine 10 is pinned for all four packages; pinning only the metapackage
+    # leaves wine-stable/amd64/i386 on 11.0 and MT5 still refuses to run.
+    assert "winehq-stable=${pin}" in script
+    assert "wine-stable=${pin}" in script
+    assert "wine-stable-amd64=${pin}" in script
+    assert "wine-stable-i386=${pin}" in script
+    assert "--allow-downgrades" in script
+    assert "MT5_WINE_SERIES" in script
+
+    # WINEDEBUG must never be exported/set for the whole script...
+    assert 'export WINEDEBUG=' not in script
+    # ...and MT5 binaries are launched through the stripping helper.
+    assert "env -u WINEDEBUG" in script
+
+
+def test_wine_version_comparison_triggers_reinstall_outside_the_10_series():
+    """A Wine too old OR too new must trigger the pinned reinstall.
+
+    The guard is a range (not just "< 9"), because Wine 11 is *newer* than the
+    required 10 yet still unusable for MT5.
+    """
+    script = (Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh").read_text()
+    assert 'if [ "${WINE_MAJOR:-0}" -lt 9 ] || [ "${WINE_MAJOR:-0}" -ge 11 ]' in script
 
 
 def test_start_command_seeds_login_and_portable_mode():
