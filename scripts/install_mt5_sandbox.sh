@@ -175,6 +175,17 @@ if [ ! -d "${WINE_PREFIX}/drive_c" ]; then
   sleep 5
 fi
 
+# Fully settle the prefix before installing anything. Wine 9+ rebuilds the whole
+# prefix on first boot (the update takes minutes and is CPU-bound); starting the
+# MT5 installer concurrently makes both slower and can push the install past its
+# deadline. This second wineboot blocks until that work is done.
+log "settling wine prefix ..."
+if command -v wineserver >/dev/null 2>&1; then
+  "$WINE_BIN" wineboot --update >/dev/null 2>&1 || true
+  # -w waits for the wineserver to finish, i.e. for the prefix to be quiet.
+  wineserver -w >/dev/null 2>&1 || true
+fi
+
 # --------------------------------------------------------------------------- #
 # 4. MT5 terminal
 # --------------------------------------------------------------------------- #
@@ -195,8 +206,9 @@ if [ ! -f "${DONE_MARKER}" ]; then
   # before its files finish landing, so the wait below matters.
   "$WINE_BIN" "${INSTALLER}" /auto >/dev/null 2>&1 || true
 
-  # Wait for terminal64.exe to appear anywhere under the prefix.
-  for _ in $(seq 1 60); do
+  # Wine 9+ unpacks the terminal noticeably slower than Wine 8 did, so allow a
+  # generous window (10 minutes) before declaring the install failed.
+  for _ in $(seq 1 120); do
     if find "${WINE_PREFIX}/drive_c" -iname 'terminal64.exe' 2>/dev/null | grep -q .; then
       break
     fi
