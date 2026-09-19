@@ -154,6 +154,22 @@ def _sandbox_tool(ctx: ToolContext | None) -> Any:
     return None
 
 
+def _missing_from_text(text: str) -> list[str]:
+    """Recover the missing-chain list from a text-only refusal.
+
+    When the sandbox drops stdout we still get the human-readable error line, which
+    enumerates what is absent. Parsing it back keeps the auto-provision report
+    informative instead of blank.
+    """
+    marker = "is missing:"
+    idx = text.find(marker)
+    if idx == -1:
+        return []
+    tail = text[idx + len(marker):].strip().rstrip(".")
+    head = tail.split(" Do NOT ")[0]
+    return [piece.strip() for piece in head.split(",") if piece.strip()]
+
+
 def bootstrap_command() -> str:
     """Idempotently fetch the CLI + installer into the sandbox."""
     return (
@@ -448,20 +464,54 @@ class MT5SandboxTool(Tool):
                 timeout=timeout,
             )
         except Exception as exc:  # noqa: BLE001 - transport-level failure
+            # Novita raises for any non-zero exit status and drops stdout. The CLI
+            # now always exits 0, but an older cached CLI (or a hard transport
+            # failure) can still land here. If the exception text carries our
+            # refusal, honour it and auto-provision rather than surfacing a
+            # traceback the model can only guess at.
+            detail = f"{type(exc).__name__}: {exc}"
+            if "not_installed" in detail or "requires the installed MT5 chain" in detail:
+                return await self._auto_provision(
+                    sandbox,
+                    action,
+                    {"missing": [], "error": detail},
+                )
             logger.warning("mt5_sandbox: sandbox call failed ({})", exc)
-            return ToolResult.error(f"MT5 sandbox call failed: {type(exc).__name__}: {exc}")
+            return ToolResult.error(
+                f"MT5 sandbox call failed: {detail}. This is a transport error, not a "
+                "problem with the MQL5 source: do NOT ask the user to compile the .mq5 "
+                "locally. Retry, or call action='status' to see provisioning state."
+            )
 
         rendered_text = str(rendered)
         payload = _parse_payload(rendered_text)
 
         if payload is None:
+            # novita_sandbox converts a non-zero exit into a plain text error and
+            # DROPS stdout, so the CLI's JSON can be missing even though the run
+            # produced one. If that text is our chain refusal, treat it as the
+            # structured result it was and provision — otherwise the model receives
+            # "produced no JSON result" and concludes the compiler is broken.
+            lowered = rendered_text.lower()
+            if (
+                "requires the installed mt5 chain" in lowered
+                or "not_installed" in lowered
+                or "is missing: wine" in lowered
+            ):
+                return await self._auto_provision(
+                    sandbox,
+                    action,
+                    {"missing": _missing_from_text(rendered_text), "error": rendered_text[-400:]},
+                )
             # The CLI prints JSON last; if nothing parsed, the command itself blew
             # up (no sandbox python, curl failure, ...). Hand the raw tail back
             # with the bootstrap hint so the model can self-correct.
             tail = rendered_text[-2000:]
             return ToolResult.error(
                 "MT5 command produced no JSON result. Raw output tail:\n"
-                f"{tail}\n\nHint: run action='install' first, then action='start'."
+                f"{tail}\n\nHint: run action='install' first, then action='start'. "
+                "This is a transport problem, not an MQL5 source error — do NOT tell "
+                "the user to compile the .mq5 locally."
             )
 
         # Never echo a password back, even if a broker/library logged it.

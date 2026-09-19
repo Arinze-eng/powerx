@@ -1275,14 +1275,28 @@ def main(argv: list[str] | None = None) -> int:
         # (doctor/install/start/stop/compile/logs) runs natively on Linux.
         reexec_code = _reexec_under_wine(args_list)
         if reexec_code is not None:
-            return int(reexec_code)
+            # Same rule: the payload is in the JSON, never in the exit code.
+            return 0
 
         args = build_parser().parse_args(args_list)
-        return int(args.func(args))
+        # ALWAYS exit 0. Novita's command runner raises an exception for any
+        # non-zero exit status ("Command exited with status 5") and discards the
+        # stdout we carefully wrote, so a structured result — a refused compile,
+        # a genuine MetaEditor compilation error, a not-installed directive — never
+        # reached the model. It only saw a raw traceback with no JSON, which is
+        # precisely why it concluded "the mt5_sandbox tool was not responding
+        # because the MT5/Wine container was not initialized" and handed the .mq5
+        # back for a local compile. Outcome is carried in the JSON (`ok`, `stage`,
+        # `errors`), never in the process exit code.
+        args.func(args)
+        return 0
     except KeyboardInterrupt:
-        return fail("interrupted", code=1)
+        fail("interrupted", code=1)
+        return 0
     except Exception as exc:  # noqa: BLE001
-        return fail(f"{type(exc).__name__}: {exc}", code=1)
+        # Even an unexpected crash must arrive as parseable JSON.
+        fail(f"{type(exc).__name__}: {exc}", code=1)
+        return 0
 
 
 if __name__ == "__main__":

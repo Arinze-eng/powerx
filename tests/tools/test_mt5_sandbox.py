@@ -18,6 +18,8 @@ The sandbox is faked, so the tests are fast and need no network or Wine.
 from __future__ import annotations
 
 import importlib.util
+import inspect
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -511,6 +513,122 @@ def test_sandbox_lookup_survives_an_uniterable_registry():
 
     ctx = ToolContext(config=ToolsConfig(), workspace="/tmp", tool_registry=_GetOnly())
     assert _sandbox_tool(ctx) is not None
+
+
+def test_cli_always_exits_zero_so_novita_keeps_the_stdout():
+    """REGRESSION: a non-zero exit code deletes the payload before the model sees it.
+
+    Novita's command runner raises ``Command exited with status N`` for any
+    non-zero exit and discards stdout. The CLI used to signal a refused compile
+    with exit 5 and a real compilation error with exit 4, so BOTH arrived as a
+    bare traceback with no JSON. A model handed an opaque transport failure
+    invents an explanation — "the mt5_sandbox tool was not responding because the
+    execution environment's MT5/Wine container was not initialized" — and tells
+    the user to compile the .mq5 locally. Outcome must travel in the JSON only.
+    """
+    import subprocess
+    import sys as _sys
+    import tempfile
+
+    cli = Path(__file__).resolve().parents[2] / "scripts" / "mt5_cli.py"
+    with tempfile.TemporaryDirectory() as td:
+        env = {
+            **os.environ,
+            "HOME": td,
+            "MT5_ROOT": str(Path(td) / ".mt5"),
+            "WINE_PREFIX": str(Path(td) / ".wine-mt5"),
+        }
+        src = Path(td) / "EA.mq5"
+        src.write_text("//+---+\n//| test\n//+---+\n")
+        proc = subprocess.run(
+            [_sys.executable, str(cli), "compile", "--file", str(src)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+
+    # The whole point: the exit code must not betray the payload.
+    assert proc.returncode == 0, (
+        f"non-zero exit {proc.returncode} makes Novita drop stdout; "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert payload["ok"] is False
+    assert payload["stage"] == "not_installed"
+    assert payload["missing"]
+
+
+def test_cli_reports_real_compile_failure_as_json_not_exit_code():
+    """A genuine MetaEditor error must also arrive as JSON with exit code 0."""
+    import subprocess
+    import sys as _sys
+    import tempfile
+
+    cli = Path(__file__).resolve().parents[2] / "scripts" / "mt5_cli.py"
+    with tempfile.TemporaryDirectory() as td:
+        # Fabricate an installed chain, then let the compile fail for real.
+        root = Path(td) / ".wine-mt5" / "drive_c" / "Program Files" / "MetaTrader 5"
+        root.mkdir(parents=True)
+        (root / "terminal64.exe").write_bytes(b"stub")
+        (root / "MetaEditor64.exe").write_bytes(b"stub")  # capitalised, as MT5 ships
+        winpy = Path(td) / ".wine-mt5" / "drive_c" / "Python311"
+        winpy.mkdir(parents=True)
+        (winpy / "python.exe").write_bytes(b"stub")
+        src = Path(td) / "EA.mq5"
+        src.write_text("this is not valid mql5;\n")
+        env = {
+            **os.environ,
+            "HOME": td,
+            "MT5_ROOT": str(Path(td) / ".mt5"),
+            "WINE_PREFIX": str(Path(td) / ".wine-mt5"),
+        }
+        proc = subprocess.run(
+            [_sys.executable, str(cli), "compile", "--file", str(src)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=240,
+        )
+
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    # Whatever the compile did, the model must get structured JSON to reason about.
+    assert "ok" in payload
+
+
+def test_metaeditor_resolves_despite_mixed_case(monkeypatch, tmp_path):
+    """MT5 installs ``MetaEditor64.exe`` — the gate must find it, not call it missing."""
+    _isolate_prefix(monkeypatch, tmp_path)
+    root = tmp_path / ".wine-mt5" / "drive_c" / "Program Files" / "MetaTrader 5"
+    root.mkdir(parents=True)
+    (root / "terminal64.exe").write_bytes(b"stub")
+    (root / "MetaEditor64.exe").write_bytes(b"stub")  # capitalised, exactly as shipped
+    winpy = tmp_path / ".wine-mt5" / "drive_c" / "Python311"
+    winpy.mkdir(parents=True)
+    (winpy / "python.exe").write_bytes(b"stub")
+
+    module = _load_cli_module()
+    monkeypatch.setattr(module, "wine_bin", lambda: "python3")
+
+    found = module.find_metaeditor()
+    assert found is not None, "mixed-case MetaEditor64.exe must resolve"
+    assert found.name == "MetaEditor64.exe"
+    assert module.installed_chain()["installed"] is True
+
+
+def test_find_exe_is_shallow_not_a_full_prefix_walk():
+    """_find_exe must not recursively walk drive_c (that blew the compile timeout)."""
+    module = _load_cli_module()
+    # Check executable statements only — the docstring legitimately *describes*
+    # the old rglob behaviour it replaced.
+    src = inspect.getsource(module._find_exe)
+    code = "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+    body = code.split('"""')[-1]  # strip the docstring
+    assert "iterdir" in body, "shallow scan expected"
+    assert "rglob" not in body, "recursive walk in the hot path is the timeout bug"
 
 
 def test_registry_can_resolve_the_tool(tmp_path):
