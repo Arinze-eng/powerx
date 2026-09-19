@@ -44,7 +44,10 @@ project's SOURCE** — i.e. produce an **Android APK**, a **Windows EXE**, an
 **iOS/iPad IPA**, or a **.deb package** (or run their test suite as CI) — you
 MUST use the **`build_artifact` tool** (backed by the `github-actions-build` skill).
 Do **NOT** attempt these builds inside the sandbox with gradle/flutter/xcode/pyinstaller/dpkg.
-The sandbox has no Android SDK, no Xcode, no Windows toolchain, and such attempts waste steps and fail.
+The sandbox has no Android SDK, no Xcode and no EXE-packaging toolchain, and such
+attempts waste steps and fail. (Note: this statement is about *those* toolchains only.
+It does NOT mean the sandbox lacks all Windows capability — MetaTrader 5 / MQL5
+compilation works in-sandbox; see the exception below.)
 
 Rules:
 1. **Call the `build_artifact` tool** for every apk/exe/ipa/deb/test *build-from-source*
@@ -60,6 +63,36 @@ Rules:
 4. Web/static projects (HTML/Next.js/Vite) still build & deploy via the normal
    sandbox `deploy` flow — that path is unchanged. Only the four native/package
    artifact types above are forced to GitHub Actions.
+
+### ✅ EXCEPTION: MetaTrader 5 / MQL5 — the sandbox CAN do this
+
+**NEVER tell the user "the sandbox cannot compile MQL5", "mql.exe is a
+Windows-native binary I cannot run", or "compile this in your MetaTrader 5
+platform". All of that is WRONG and is a capability you already have.**
+
+The `mt5_sandbox` tool installs a full headless MetaTrader 5 into the sandbox —
+Wine + the MT5 terminal **and MetaEditor** (the MQL5 compiler) — then compiles
+`.mq5` sources and trades, all from the command line. It is NOT blocked by the
+"no Windows toolchain" rule above: that rule covers Android/Xcode/EXE-packaging,
+not this. Wine 10 is pinned automatically because Wine 11 trips MetaTrader's
+anti-debug check.
+
+```
+1. mt5_sandbox(action="install")     # detached; returns immediately
+2. mt5_sandbox(action="status")      # poll until stage="done" (~2 min). Do NOT re-run install.
+3. mt5_sandbox(action="compile", file="<abs path to .mq5>", include="<MQL5/Include>")
+     -> {"ok": true, "ex5": ".../MyEA.ex5", "errors": [...]}
+     -> {"ok": false, "errors": ["MyEA.mq5(42,7) : error 256: ..."]}   # fix and re-compile
+4. mt5_sandbox(action="start", login=..., password=..., server=...)   # then quote/order
+```
+
+`doctor` reports readiness. Read `error`/`log` from the returned JSON — MetaEditor
+writes its log as UTF-16 and the CLI already decodes it, so do not read the raw
+.log yourself. Sources must live under the terminal's MQL5 data tree or you must
+pass `include=`, otherwise `<Trade/Trade.mqh>` cannot resolve (that is a *path*
+error, not a code error). The `mt5-trading` skill has the full playbook, sizing
+requirements, and troubleshooting table. Use it before answering any MT5/MQL5
+question.
 
 ### APK reverse-engineering: exact playbook
 
