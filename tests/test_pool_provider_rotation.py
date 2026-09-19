@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from nanobot.providers.base import LLMResponse
 from nanobot.providers.pool_provider import PoolProvider
 
@@ -326,3 +328,52 @@ def test_empty_pool_reports_a_connection_error() -> None:
 def test_default_model_comes_from_the_first_lane() -> None:
     pool = _provider(({"id": "a", "model": "model-a"}, _FakeProvider("a")), ({"id": "b", "model": "model-b"}, _FakeProvider("b")))
     assert pool.get_default_model() == "model-a"
+
+
+def test_failed_lane_stops_taking_the_first_attempt() -> None:
+    """An exhausted lane must not keep being the first try of every request.
+
+    This is the reported symptom: the pool handed the next request to the same
+    unusable lane first, so what the user saw was that lane's error rather than
+    an answer from a healthy one.
+    """
+    dead = _lane("dead", [LLMResponse(content=None, error_status_code=402)])
+    live = _lane("live", [LLMResponse(content="live-answer")])
+    pool = _provider(dead, live)
+
+    assert asyncio.run(pool.chat(_MESSAGES)).content == "live-answer"
+    assert asyncio.run(pool.chat(_MESSAGES)).content == "live-answer"
+
+    assert dead[1].calls == 1, "the exhausted lane must not get the next first attempt"
+    assert live[1].calls == 2
+
+
+def test_parking_never_starves_the_pool() -> None:
+    """With every lane parked the pool still tries them rather than giving up."""
+    first = _lane("a", [LLMResponse(content=None, error_kind="rate_limit")])
+    second = _lane("b", [LLMResponse(content=None, error_kind="rate_limit")])
+    pool = _provider(first, second)
+
+    assert asyncio.run(pool.chat(_MESSAGES)).error_kind == "rate_limit"
+    assert asyncio.run(pool.chat(_MESSAGES)).error_kind == "rate_limit"
+
+    assert first[1].calls == 2
+    assert second[1].calls == 2
+
+
+def test_terminal_lane_failure_parks_longer_than_a_transient_one() -> None:
+    """An out-of-credit or revoked key is parked for longer than a 429."""
+    pool = _provider(_lane("a"), _lane("b"))
+    terminal = pool._park_window_s(LLMResponse(content=None, error_status_code=402))
+    transient = pool._park_window_s(LLMResponse(content=None, error_kind="rate_limit"))
+    assert terminal > transient > 0
+
+
+def test_parking_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PROVIDER_POOL_LANE_PARK_S", "0")
+    monkeypatch.setenv("PROVIDER_POOL_LANE_COOLDOWN_S", "0")
+    dead = _lane("dead", [LLMResponse(content=None, error_status_code=402)])
+    live = _lane("live", [LLMResponse(content="live-answer")])
+    pool = _provider(dead, live)
+    assert asyncio.run(pool.chat(_MESSAGES)).content == "live-answer"
+    assert pool._is_parked(dead[0]) is False, "parking disabled keeps the lane in rotation"

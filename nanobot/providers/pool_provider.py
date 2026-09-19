@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -99,6 +100,41 @@ DEFAULT_LANE_TIMEOUT_S = 45.0
 LANE_TIMEOUT_ENV = "PROVIDER_POOL_LANE_TIMEOUT_S"
 
 
+# How long a lane is skipped after it answers with a lane-specific failure.
+#
+# Without this the rotating cursor kept handing the very next request to the
+# same unhealthy lane first: a single call to a lane that is out of credit, has
+# a revoked key, or accepts the socket and never replies repeated that failure
+# forever, and when it was the pool's only usable lane the user saw its error
+# directly instead of a rotating answer.
+#
+# A transient failure (rate limit, timeout, 5xx) usually clears in seconds, so
+# it gets the short window; a terminal one (invalid key, out of credit) will not
+# clear on its own, so it gets the long window.
+DEFAULT_LANE_COOLDOWN_S = 60.0
+DEFAULT_LANE_PARK_S = 900.0
+LANE_COOLDOWN_ENV = "PROVIDER_POOL_LANE_COOLDOWN_S"
+LANE_PARK_ENV = "PROVIDER_POOL_LANE_PARK_S"
+
+# Error kinds/statuses that mean "this lane is unusable", not "this request is".
+_TERMINAL_LANE_KINDS = frozenset(
+    {"auth", "authentication", "permission", "unauthorized", "forbidden", "billing", "quota"}
+)
+_TERMINAL_LANE_STATUS = frozenset({401, 402, 403})
+
+
+def _cooldown_seconds(env_name: str, default: float) -> float:
+    """Parking window in seconds; 0 disables parking for that class."""
+    raw = os.environ.get(env_name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else 0.0
+
+
 def _lane_timeout_s() -> float | None:
     """Per-lane wall-clock budget, or None to disable the guard entirely."""
     raw = os.environ.get(LANE_TIMEOUT_ENV)
@@ -129,20 +165,71 @@ class PoolProvider(LLMProvider):
         self._lanes: list[tuple[dict[str, Any], LLMProvider]] = list(lanes)
         self._lock = threading.Lock()
         self._cursor = 0
+        # lane id -> monotonic time it becomes eligible again.
+        self._parked_until: dict[str, float] = {}
+        self._cooldown_s = _cooldown_seconds(LANE_COOLDOWN_ENV, DEFAULT_LANE_COOLDOWN_S)
+        self._park_s = _cooldown_seconds(LANE_PARK_ENV, DEFAULT_LANE_PARK_S)
         self.generation = generation or GenerationSettings()
 
     @property
     def lanes(self) -> list[tuple[dict[str, Any], LLMProvider]]:
         return self._lanes
 
+    @staticmethod
+    def _lane_id(entry: dict[str, Any]) -> str:
+        return str(
+            entry.get("id")
+            or entry.get("label")
+            or entry.get("baseUrl")
+            or entry.get("base_url")
+            or ""
+        )
+
+    def _is_parked(self, entry: dict[str, Any]) -> bool:
+        """Whether *entry* failed recently enough to be worth skipping."""
+        until = self._parked_until.get(self._lane_id(entry))
+        return until is not None and time.monotonic() < until
+
+    @staticmethod
+    def _is_terminal_failure(response: LLMResponse | None) -> bool:
+        """Whether the failure says the lane itself is unusable."""
+        kind = str(getattr(response, "error_kind", "") or "").lower()
+        status = getattr(response, "error_status_code", None)
+        return kind in _TERMINAL_LANE_KINDS or (
+            isinstance(status, int) and status in _TERMINAL_LANE_STATUS
+        )
+
+    def _park_window_s(self, response: LLMResponse | None) -> float:
+        """Parking window for a failure: long for a terminal, short otherwise."""
+        return self._park_s if self._is_terminal_failure(response) else self._cooldown_s
+
+    def _park(self, entry: dict[str, Any], response: LLMResponse | None) -> None:
+        """Stop offering *entry* first for a while after it failed on us."""
+        lane_id = self._lane_id(entry)
+        if not lane_id:
+            return
+        window = self._park_window_s(response)
+        if window <= 0:
+            return
+        with self._lock:
+            self._parked_until[lane_id] = time.monotonic() + window
+
     def _order(self) -> list[tuple[dict[str, Any], LLMProvider]]:
-        """Return the lanes starting at the rotating cursor (round-robin)."""
+        """Return the lanes starting at the rotating cursor (round-robin).
+
+        Lanes parked by a recent failure are moved to the back of the rotation
+        so a dead lane cannot keep taking the first attempt of every request.
+        When every lane is parked the full order is returned anyway: a stale
+        cooldown must never turn into "no lane was tried at all".
+        """
         if not self._lanes:
             return []
         with self._lock:
             start = self._cursor % len(self._lanes)
             self._cursor = (self._cursor + 1) % len(self._lanes)
-        return self._lanes[start:] + self._lanes[:start]
+            ordered = self._lanes[start:] + self._lanes[:start]
+            healthy = [lane for lane in ordered if not self._is_parked(lane[0])]
+        return healthy + [lane for lane in ordered if lane not in healthy]
 
     @staticmethod
     def _should_failover(response: LLMResponse | None) -> bool:
@@ -214,6 +301,7 @@ class PoolProvider(LLMProvider):
             )
             if not self._should_failover(response):
                 return response
+            self._park(entry, response)
             last = response
         return last if last is not None else LLMResponse(content=None, error_kind="connection")
 
@@ -258,6 +346,7 @@ class PoolProvider(LLMProvider):
             # Never rotate after output has reached the user: a retry would duplicate it.
             if streamed or not self._should_failover(response):
                 return response
+            self._park(entry, response)
             last = response
         return last if last is not None else LLMResponse(content=None, error_kind="connection")
 

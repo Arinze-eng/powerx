@@ -295,6 +295,72 @@ def _pool_disabled() -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+#: Lane id/label for the configured main provider when it joins the pool.
+ADMIN_LANE_ID = "admin-main"
+ADMIN_LANE_LABEL = "Admin (main provider)"
+
+#: The persisted config prefixes a custom provider's model id with this (see
+#: ``scripts/ensure_render_config.py``). It is stripped before comparing models,
+#: so one lane is not added twice under two spellings of the same model.
+_CUSTOM_MODEL_PREFIX = "custom/"
+
+
+def _base_model(model: str) -> str:
+    """Model id with the config's ``custom/`` provider prefix removed."""
+    value = str(model or "").strip()
+    if value.startswith(_CUSTOM_MODEL_PREFIX):
+        return value[len(_CUSTOM_MODEL_PREFIX) :]
+    return value
+
+
+def _admin_pool_lane(
+    config: Config,
+    *,
+    preset: ModelPresetConfig,
+    entries: list[dict[str, Any]],
+) -> tuple[dict[str, Any], LLMProvider] | None:
+    """The configured main provider, as the pool's last-resort lane.
+
+    The pool used to *replace* the configured provider outright, so the key set
+    up in provider settings could never serve a request once a pool existed:
+    with the pool's lanes exhausted the caller got a lane's error and nothing
+    else was tried. Appending the main provider as a final lane keeps that key
+    inside the rotation, so an exhausted pool lane falls through to it instead
+    of surfacing the lane's failure to the user. Returns ``None`` when the main
+    provider cannot be built or is already one of the pool's own lanes.
+    """
+    try:
+        provider = _make_provider_core(config, preset=preset)
+    except Exception as exc:  # noqa: BLE001 - a bad main provider must not break the pool
+        logger.warning("Main provider unusable as a pool lane: {}", type(exc).__name__)
+        return None
+
+    base = str(getattr(provider, "api_base", "") or "").rstrip("/")
+    api_key = str(getattr(provider, "api_key", "") or "")
+    try:
+        model = str(provider.get_default_model() or preset.model)
+    except Exception:  # noqa: BLE001 - fall back to the preset's model
+        model = preset.model
+
+    if base and any(
+        str(entry.get("baseUrl") or "").rstrip("/") == base
+        and _base_model(str(entry.get("model") or "")) == _base_model(model)
+        and str(entry.get("apiKey") or "") == api_key
+        for entry in entries
+    ):
+        return None  # already present as one of the pool's own lanes
+
+    entry: dict[str, Any] = {
+        "id": ADMIN_LANE_ID,
+        "baseUrl": base,
+        "apiKey": api_key,
+        "model": model,
+        "label": ADMIN_LANE_LABEL,
+        "enabled": True,
+    }
+    return (entry, provider)
+
+
 def make_pool_provider(config: Config, *, preset: ModelPresetConfig) -> LLMProvider | None:
     """Build a rotating provider over the admin pool, or None when unused."""
     if _pool_disabled():
@@ -317,6 +383,9 @@ def make_pool_provider(config: Config, *, preset: ModelPresetConfig) -> LLMProvi
         )
         lane.generation = generation
         lanes.append((entry, lane))
+    admin_lane = _admin_pool_lane(config, preset=preset, entries=entries)
+    if admin_lane is not None:
+        lanes.append(admin_lane)
     if not lanes:
         return None
     return PoolProvider(lanes, generation=generation)
