@@ -182,15 +182,18 @@ if [ ! -d "${WINE_PREFIX}/drive_c" ]; then
   sleep 5
 fi
 
-# Fully settle the prefix before installing anything. Wine 9+ rebuilds the whole
-# prefix on first boot (the update takes minutes and is CPU-bound); starting the
-# MT5 installer concurrently makes both slower and can push the install past its
-# deadline. This second wineboot blocks until that work is done.
-log "settling wine prefix ..."
+# Let the prefix finish initialising before installing anything. Wine 9+ does a
+# lot of one-time work on first boot (registry, .NET stubs, prefix rebuild);
+# starting the MT5 installer concurrently makes both slower and can push the
+# install past its deadline.
+#
+# This is strictly BEST-EFFORT and must never block: ``wineserver -w`` waits for
+# the wineserver to go idle, which on a fresh prefix can take a long time, so it
+# is bounded by ``timeout``. A prefix that is still busy is harmless — the MT5
+# installer just queues behind it.
+log "settling wine prefix (best effort) ..."
 if command -v wineserver >/dev/null 2>&1; then
-  "$WINE_BIN" wineboot --update >/dev/null 2>&1 || true
-  # -w waits for the wineserver to finish, i.e. for the prefix to be quiet.
-  wineserver -w >/dev/null 2>&1 || true
+  timeout 180 wineserver -w >/dev/null 2>&1 || true
 fi
 
 # --------------------------------------------------------------------------- #
