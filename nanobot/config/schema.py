@@ -13,8 +13,10 @@ from nanobot.cron.types import CronSchedule
 
 if TYPE_CHECKING:
     from nanobot.agent.tools.browser import BrowserToolsConfig
+    from nanobot.agent.tools.captcha import CaptchaSolverToolConfig
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
     from nanobot.agent.tools.filesystem import FileToolsConfig
+    from nanobot.agent.tools.human_browser import HumanBrowserToolConfig
     from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
     from nanobot.agent.tools.self import MyToolConfig
     from nanobot.agent.tools.shell import ExecToolConfig
@@ -546,6 +548,16 @@ class ToolsConfig(Base):
     browser: "BrowserToolsConfig" = Field(
         default_factory=lambda: _lazy_default("nanobot.agent.tools.browser", "BrowserToolsConfig"),
     )
+    human_browser: "HumanBrowserToolConfig" = Field(
+        default_factory=lambda: _lazy_default(
+            "nanobot.agent.tools.human_browser", "HumanBrowserToolConfig"
+        ),
+    )
+    captcha_solver: "CaptchaSolverToolConfig" = Field(
+        default_factory=lambda: _lazy_default(
+            "nanobot.agent.tools.captcha", "CaptchaSolverToolConfig"
+        ),
+    )
     max_session_messages_per_minute: int = Field(default=6, ge=1)
     restrict_to_workspace: bool = False  # policy intent: keep tool access inside workspace when possible
     webui_allow_local_service_access: bool = Field(
@@ -827,8 +839,10 @@ def _resolve_tool_config_refs() -> None:
     import sys
 
     from nanobot.agent.tools.browser import BrowserToolsConfig
+    from nanobot.agent.tools.captcha import CaptchaSolverToolConfig
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
     from nanobot.agent.tools.filesystem import FileToolsConfig
+    from nanobot.agent.tools.human_browser import HumanBrowserToolConfig
     from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
     from nanobot.agent.tools.self import MyToolConfig
     from nanobot.agent.tools.shell import ExecToolConfig
@@ -845,6 +859,8 @@ def _resolve_tool_config_refs() -> None:
     mod.MyToolConfig = MyToolConfig  # type: ignore[attr-defined]
     mod.ImageGenerationToolConfig = ImageGenerationToolConfig  # type: ignore[attr-defined]
     mod.BrowserToolsConfig = BrowserToolsConfig  # type: ignore[attr-defined]
+    mod.HumanBrowserToolConfig = HumanBrowserToolConfig  # type: ignore[attr-defined]
+    mod.CaptchaSolverToolConfig = CaptchaSolverToolConfig  # type: ignore[attr-defined]
 
     ToolsConfig.model_rebuild()
     Config.model_rebuild()

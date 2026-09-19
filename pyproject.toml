@@ -64,6 +64,10 @@ dependencies = [
     # in built images and the memory/Dream/git-store suites all errored.
     "dulwich>=0.21.0,<1.0.0",
     "novita-sandbox>=2.1.0,<3.0.0",
+    # pydoll drives Chromium over CDP for the human_browser tool. The agent image
+    # ships no browser, so that tool attaches to an existing Chrome rather than
+    # launching one.
+    "pydoll-python>=2.27.0,<3.0.0",
     "websockets>=15.0.0,<16.0.0",
     # Trading: Alpaca paper trading + strategy engine
     "alpaca-py>=0.30.0",
