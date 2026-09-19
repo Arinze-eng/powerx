@@ -55,6 +55,9 @@ from typing import Any
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
 DISPLAY_NUM = os.environ.get("MT5_DISPLAY_NUM", "99")
+METAEDITOR_MARKER = MT5_ROOT / ".metaeditor_path"
+# Where find_terminal() caches the resolved terminal path, so repeated calls do
+# not re-walk the Wine prefix.
 TERMINAL_MARKER = MT5_ROOT / ".terminal_path"
 LOGIN_STATE = MT5_ROOT / ".login.json"
 
@@ -144,20 +147,36 @@ def find_terminal() -> Path | None:
 
 
 def _find_exe(directory: Path, name: str) -> Path | None:
-    """Find a Windows .exe case-insensitively inside a Wine drive_c.
+    """Find a Windows .exe *directly inside* directory, case-insensitively.
 
-    Linux paths are case-sensitive and MT5 ships ``MetaEditor64.exe`` /
-    ``Terminal64.exe`` with capital letters, while everything in this file was
-    written in lowercase. Matching literally therefore never found MetaEditor on a
-    perfectly good install, so the chain check reported ``metaeditor64.exe``
-    missing and ``compile`` refused forever. Always compare case-folded.
+    Linux paths are case-sensitive and MT5 ships ``MetaEditor64.exe`` with
+    capital letters while everything here is lowercase, so a literal match never
+    found it on a good install.
+
+    This is deliberately a SHALLOW scan. The tree-walking version used
+    ``rglob("*")``, and a Wine ``drive_c`` holds tens of thousands of files
+    (MQL5/ alone has thousands), so every call burned seconds of stat() traffic
+    and pushed ``compile`` past the sandbox timeout — which surfaced as
+    "the tool was not responding" and made the agent hand the .mq5 back to the
+    user. MetaEditor always sits next to terminal64.exe, so shallow is also
+    correct.
     """
     wanted = name.lower()
-    if not directory.exists():
-        return None
     try:
-        for candidate in directory.rglob("*"):
-            if candidate.is_file() and candidate.name.lower() == wanted:
+        for entry in directory.iterdir():
+            if entry.is_file() and entry.name.lower() == wanted:
+                return entry
+    except OSError:  # pragma: no cover - defensive
+        return None
+    return None
+
+
+def _find_exe_deep(directory: Path, name: str) -> Path | None:
+    """Bounded last-resort search, restricted to ``*.exe``."""
+    wanted = name.lower()
+    try:
+        for candidate in directory.rglob("*.exe"):
+            if candidate.name.lower() == wanted:
                 return candidate
     except OSError:  # pragma: no cover - defensive
         return None
@@ -165,17 +184,46 @@ def _find_exe(directory: Path, name: str) -> Path | None:
 
 
 def find_metaeditor(terminal: Path | None = None) -> Path | None:
-    """Locate MetaEditor64.exe (the ONLY MQL5 compiler) case-insensitively."""
+    """Locate MetaEditor64.exe (the ONLY MQL5 compiler). Cached + case-folded.
+
+    Resolution order is cheap-first, and the result is memoised in a marker file
+    like the terminal path so repeated compiles never re-walk the prefix.
+    """
+    if METAEDITOR_MARKER.exists():
+        cached = Path(METAEDITOR_MARKER.read_text(encoding="utf-8").strip())
+        if cached.is_file():
+            return cached
+        try:
+            METAEDITOR_MARKER.unlink()
+        except OSError:
+            pass
+
     if terminal is None:
         terminal = find_terminal()
     if terminal is None:
         return None
-    # Sits next to terminal64.exe in the MetaTrader 5 Program Files directory.
-    found = _find_exe(terminal.parent, "metaeditor64.exe")
-    if found is not None:
-        return found
+
     drive_c = WINE_PREFIX / "drive_c"
-    return _find_exe(drive_c, "metaeditor64.exe") if drive_c.exists() else None
+    found = _find_exe(terminal.parent, "metaeditor64.exe")
+    if found is None:
+        for rel in (
+            "Program Files/MetaTrader 5",
+            "Program Files/MetaQuotes Terminal 5",
+        ):
+            found = _find_exe(drive_c / rel, "metaeditor64.exe")
+            if found is not None:
+                break
+    if found is None:
+        found = _find_exe_deep(drive_c, "metaeditor64.exe")
+
+    if found is not None:
+        try:
+            METAEDITOR_MARKER.parent.mkdir(parents=True, exist_ok=True)
+            METAEDITOR_MARKER.write_text(str(found), encoding="utf-8")
+        except OSError:
+            pass
+        return found
+    return None
 
 
 def terminal_running() -> bool:

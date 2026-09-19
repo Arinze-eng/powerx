@@ -88,18 +88,25 @@ _ALL_ACTIONS = sorted(
 #: Generous per-action timeouts. Installing Wine + MT5 genuinely takes minutes,
 #: so ``install`` only ever kick-starts a detached process (see above) and
 #: readiness is reported by ``status``.
+#:
+#: These ceilings are deliberately high. A sandbox command that times out returns
+#: NO JSON at all, and a model given an empty failure consistently invents a
+#: reason — historically "the mt5_sandbox tool was not responding because the
+#: MT5/Wine container was not initialized" — and hands the .mq5 back to the user.
+#: The first MetaEditor run inside a cold prefix legitimately takes minutes, so
+#: ``compile`` gets nearly the full 900 s sandbox cap rather than 360 s.
 _TIMEOUTS: dict[str, int] = {
     "install": _INSTALL_COMMAND_TIMEOUT,
-    "status": 90,
+    "status": 180,
     "start": 900,
     "stop": 60,
-    "doctor": 120,
-    "compile": 360,
-    "candles": 180,
-    "history": 180,
-    "run": 180,
+    "doctor": 300,
+    "compile": 900,
+    "candles": 300,
+    "history": 300,
+    "run": 300,
 }
-_DEFAULT_TIMEOUT = 120
+_DEFAULT_TIMEOUT = 300
 
 
 def _sandbox_tool(ctx: ToolContext | None) -> Any:
@@ -462,21 +469,68 @@ class MT5SandboxTool(Tool):
             payload["password"] = "***"
 
         if payload.get("ok") is False:
-            # The chain-not-installed case is the one that used to be silently
-            # swallowed: the model saw a bare compile failure and started "fixing"
-            # the MQL5 source instead of provisioning Wine + MT5. Make the required
-            # next action impossible to miss so the installation rules are followed.
-            if payload.get("stage") == "not_installed":
-                missing = ", ".join(payload.get("missing") or []) or "unknown"
-                return ToolResult.error(
-                    "MT5 CHAIN NOT INSTALLED — this is not a code error, do NOT edit "
-                    f"or 'fix' the .mq5. Missing: {missing}. An .mq5 can only be built "
-                    "by MetaEditor inside the installed Wine + MT5 chain, so follow the "
-                    "installation rules first:\n"
-                    "  1. mt5_sandbox(action='install')   # starts the detached install\n"
-                    "  2. mt5_sandbox(action='status')    # poll until stage='done' (~2-25 min)\n"
-                    f"  3. mt5_sandbox(action='{action}', ...)  # retry only after done"
-                )
+            # The chain-not-installed case must not be returned as a plain error.
+            # Given an error, models consistently "helpfully" hand the .mq5 back to
+            # the user to compile locally — the exact failure being fixed. So the
+            # tool PROVISIONS for them: kick off the detached install in the same
+            # call and report that it started, which leaves "install first" as the
+            # only forward path and nothing to negotiate around.
+            if payload.get("stage") == "not_installed" and action != "install":
+                return await self._auto_provision(sandbox, action, payload)
             return ToolResult.error(json.dumps(payload))
 
         return json.dumps(payload)
+
+    async def _auto_provision(
+        self, sandbox: Any, action: str, refusal: dict[str, Any]
+    ) -> str:
+        """Start the detached install for the caller, then tell them to poll.
+
+        Handing back an error is what produced the "the compiler is unavailable,
+        please compile this locally" refusals: a model offered a concrete
+        alternative always takes it. So the tool does the required first step
+        itself and returns a *started, keep waiting* result instead of a problem
+        to route around. The install is detached (the sandbox caps any single
+        command at 900 s while a full Wine + MT5 install takes far longer).
+        """
+        missing = ", ".join(refusal.get("missing") or []) or "the MT5 chain"
+        kick = build_cli_command("install", {})
+        kick_command = f"{bootstrap_command()} >/dev/null 2>&1 || true; {kick}"
+        try:
+            await sandbox.execute(
+                action="run", command=kick_command, timeout=_TIMEOUTS["install"]
+            )
+        except Exception as exc:  # noqa: BLE001 - transport-level failure
+            logger.warning("mt5_sandbox: auto-provision failed ({})", exc)
+            return ToolResult.error(
+                f"MT5 is not installed ({missing}) and starting the install failed: "
+                f"{type(exc).__name__}: {exc}. Retry action='install'. Do NOT ask the "
+                "user to compile the .mq5 by hand — the sandbox can build it."
+            )
+
+        return json.dumps(
+            {
+                "ok": False,
+                "stage": "installing",
+                "auto_provisioned": True,
+                "requested_action": action,
+                "was_missing": refusal.get("missing") or [],
+                "message": (
+                    f"MT5 was not installed ({missing}), so this call started the "
+                    "Wine + MetaTrader 5 + MetaEditor install in the sandbox for you. "
+                    "It runs detached and takes ~2-25 minutes."
+                ),
+                "next": (
+                    "Poll mt5_sandbox(action='status') until stage='done', then retry "
+                    f"action='{action}'. Do NOT edit, rewrite, or hand back the .mq5 "
+                    "while provisioning is in progress, and do NOT tell the user to "
+                    "compile it locally — this sandbox compiles it."
+                ),
+                "do_not": [
+                    "ask the user to compile in a local MetaEditor",
+                    "return 'corrected' .mq5 source instead of compiling it",
+                    "claim the compiler is unavailable",
+                    "re-run action='install' (already running)",
+                ],
+            }
+        )

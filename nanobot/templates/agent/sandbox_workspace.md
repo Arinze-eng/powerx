@@ -95,6 +95,18 @@ is missing it refuses with `stage="not_installed"` and lists what is absent.
 "fix" the `.mq5`, never hand it back, never claim MQL5 cannot be compiled. Just
 install, poll `status` to `stage="done"`, and retry the compile.
 
+If you call `compile` first anyway, the tool **auto-provisions for you** and
+returns `stage="installing"` with `auto_provisioned: true`. That is a normal,
+expected result — it does **not** mean the compiler is unavailable. Your only
+next step is to poll `status` and retry. Never respond to `installing` by:
+
+* saying the `mt5_sandbox` tool is "not responding" or "unavailable";
+* claiming the "MT5/Wine container was not initialized";
+* handing the user "corrected" `.mq5` source to compile in a local MetaEditor.
+
+Provisioning takes minutes. Poll `status`; do not conclude it failed because it
+has not finished.
+
 `doctor` reports readiness. Read `error`/`log` from the returned JSON — MetaEditor
 writes its log as UTF-16 and the CLI already decodes it, so do not read the raw
 .log yourself. Sources must live under the terminal's MQL5 data tree or you must

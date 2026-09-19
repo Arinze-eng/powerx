@@ -1,19 +1,48 @@
 #!/bin/sh
 dir="$HOME/.nanobot"
 
-# Platform bootstrap (Render, Northflank, or any host that sets
-# PLATFORM_BOOTSTRAP=true). Initializes the on-disk config from the committed
-# template (wiring secrets via ${VAR} env vars) and recovers runtime env vars
-# from Supabase so a wiped platform env self-heals. Logs each decision so a
-# failed start is diagnosable in platform logs. Privilege dropping is handled
-# below, for every root start (not just here).
+# ---------------------------------------------------------------------------
+# Cron persistence: the platform volume, NOT Supabase.
 #
-# Egress policy (2026-09-10): on hosts with a PERSISTENT disk (Northflank),
-# the continuous Supabase backup sidecars are disabled — cron jobs and chat
-# history live safely on the volume. Set NANOBOT_SUPABASE_BACKUP=true to force
-# the backup/restore flows even there (e.g. one-off migration off Render).
+# The cron store (workspace/cron/jobs.json) is ordinary on-disk state. On a
+# platform that mounts a persistent volume there is nothing to synchronise:
+# writing the store to Supabase and reading it back at boot costs egress and
+# adds a failure mode (a stale cloud copy can resurrect deleted jobs, and a
+# silent sync failure looks exactly like "cron just stopped firing"). So on a
+# persistent disk cron is left entirely on the volume and the Supabase cron
+# path is not used at all.
+#
+# Northflank is the persistent-volume platform for this deployment, so it is
+# treated as persistent by DEFAULT; set NANOBOT_PERSISTENT_DISK explicitly to
+# override in either direction. Render's free tier has no disk, so it keeps the
+# legacy Supabase flow.
+# ---------------------------------------------------------------------------
+# Persistent-disk detection is done by LOOKING, not by trusting an env var:
+# Northflank does not reliably export `NORTHFLANK=true`, so a platform check can
+# silently miss and drop cron onto the Supabase path even though a real volume is
+# mounted. We compare the filesystem device id of the data dir against the
+# container root: a different device means a volume is mounted at or above it.
+# (Uses stat rather than awk/findmnt so it works in the slim busybox-ish image.)
+_fs_device_of() {
+    stat -c %d "$1" 2>/dev/null || stat -f %d "$1" 2>/dev/null || echo ""
+}
+
+_data_dir_is_mounted() {
+    target="$1"
+    root_dev=$(_fs_device_of /)
+    target_dev=$(_fs_device_of "$target")
+    [ -n "$root_dev" ] && [ -n "$target_dev" ] && [ "$root_dev" != "$target_dev" ]
+}
+
 PERSISTENT_DISK=false
+mkdir -p "$dir" 2>/dev/null || true
+if _data_dir_is_mounted "$dir"; then
+    PERSISTENT_DISK=true
+    echo "[entrypoint] persistent volume detected at $dir — cron jobs stay on disk"
+fi
+# An explicit operator setting always wins, in either direction.
 [ "$NANOBOT_PERSISTENT_DISK" = "true" ] && PERSISTENT_DISK=true
+[ "$NANOBOT_PERSISTENT_DISK" = "false" ] && PERSISTENT_DISK=false
 if [ "$RENDER" = "true" ] || [ "$NORTHFLANK" = "true" ]; then
     # Keep the legacy flags working as the bootstrap switch too.
     PLATFORM_BOOTSTRAP=true

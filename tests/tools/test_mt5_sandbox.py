@@ -616,27 +616,65 @@ def test_require_installed_chain_passes_when_the_chain_exists(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_not_installed_refusal_surfaces_as_actionable_guidance():
-    """The tool must translate stage=not_installed into an unmistakable directive.
+async def test_not_installed_refusal_auto_provisions_instead_of_erroring():
+    """A missing chain must START the install, not return an error to route around.
 
-    This is the model-facing half of the fix: the error has to say "install first,
-    do not edit the .mq5", otherwise the agent defaults to treating it as a code
-    problem and tries to fix the script casually.
+    This is the regression that produced the user-visible failure. When ``compile``
+    returned an error saying MT5 was not installed, the model did the "helpful"
+    thing and told the user to compile the .mq5 in their own MetaEditor:
+
+        "Since the mt5_sandbox (compiler) is currently unavailable to me, I have
+         corrected the code for you below. You can copy this into your local
+         MetaEditor and compile it."
+
+    An error invites a workaround, so the tool now performs the mandatory first
+    step itself and returns a *provisioning started* result, which leaves polling
+    as the only next action.
     """
     payload = (
         '{"ok": false, "stage": "not_installed", "missing": ["wine", "metaeditor64.exe"],'
         ' "error": "chain missing"}\n[exit_code=5]'
     )
-    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox(payload)}))
+    sandbox = _FakeSandbox(payload)
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
 
     result = await tool.execute(action="compile", file="/home/user/MyEA.mq5")
 
-    text = str(result)
-    assert result.is_error
-    assert "NOT INSTALLED" in text
-    assert "not a code error" in text
-    assert "action='install'" in text
-    assert "status" in text
+    import json as _json
+
+    body = _json.loads(str(result))
+    assert body["ok"] is False
+    assert body["stage"] == "installing"
+    assert body["auto_provisioned"] is True
+    assert body["requested_action"] == "compile"
+
+    # The install must actually have been kicked off in the sandbox: the refusal
+    # costs one forwarded call, auto-provisioning the install costs a second.
+    assert len(sandbox.calls) == 2, f"expected refusal + install kick: {sandbox.calls}"
+    second = str(sandbox.calls[1].get("command", ""))
+    assert "install" in second
+
+    # And the guidance must forbid the old escape hatches.
+    text = str(result).lower()
+    assert "do not" in text
+    assert "local metaeditor" in text or "compile it locally" in text
+    assert body["stage"] == "installing"
+
+
+@pytest.mark.asyncio
+async def test_install_action_itself_does_not_recurse_into_auto_provision():
+    """action='install' must not auto-provision itself forever."""
+    payload = (
+        '{"ok": true, "detached": true, "stage": "in_progress"}\n[exit_code=0]'
+    )
+    sandbox = _FakeSandbox(payload)
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+
+    result = await tool.execute(action="install")
+
+    # Exactly one forwarded call: install must not trigger a second one.
+    assert len(sandbox.calls) == 1
+    assert "detached" in str(result)
 
 
 def test_tool_description_mandates_install_before_compile():
