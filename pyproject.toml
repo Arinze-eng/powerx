@@ -74,6 +74,7 @@ dependencies = [
     "smartmoneyconcepts>=0.0.27",
     "hmmlearn>=0.3.0",
     "yfinance>=0.2.40",
+    "mplfinance>=0.12.10b0",
     "matplotlib>=3.8.0",
 ]
 
