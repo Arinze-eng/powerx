@@ -143,7 +143,8 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
         for flag in ("login", "password", "server"):
             if kwargs.get(flag) not in (None, ""):
                 parts += [f"--{flag}", _sh(kwargs[flag])]
-        if kwargs.get("portable"):
+        # A seeded login is only honoured in portable mode.
+        if kwargs.get("login") or kwargs.get("portable"):
             parts += ["--portable"]
     elif action == "login":
         for flag in ("login", "password", "server"):

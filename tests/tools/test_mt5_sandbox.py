@@ -86,6 +86,22 @@ def test_install_command_points_at_the_sandbox_installer():
     assert "--script" in cmd and "install_mt5_sandbox.sh" in cmd
 
 
+def test_start_command_seeds_login_and_portable_mode():
+    cmd = build_cli_command(
+        "start", {"login": 1111291280, "password": "pw", "server": "Forex Hedged USD"}
+    )
+    assert "--login 1111291280" in cmd
+    assert "--server 'Forex Hedged USD'" in cmd
+    # Portable mode is what makes the seeded login take effect.
+    assert "--portable" in cmd
+
+
+def test_start_without_credentials_omits_portable():
+    cmd = build_cli_command("start", {"wait": 60})
+    assert "--portable" not in cmd
+    assert "--wait 60" in cmd
+
+
 def test_order_command_includes_levels():
     cmd = build_cli_command(
         "order", {"symbol": "EURUSD", "side": "buy", "volume": 0.1, "sl": 1.05, "tp": 1.2}

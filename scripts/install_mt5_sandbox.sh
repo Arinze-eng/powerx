@@ -84,6 +84,50 @@ apt_install() {
 # --------------------------------------------------------------------------- #
 # 1. Base packages
 # --------------------------------------------------------------------------- #
+# WINE VERSION MATTERS. Debian's packaged Wine 8.0 cannot run the MetaTrader5
+# bridge at all: the first broker call aborts with
+#   "Call from ... to unimplemented function ucrtbase.dll.crealf"
+# Wine 9+ implements crealf (and the other C99 complex-math ucrtbase entry
+# points the bridge uses), so we install WineHQ's stable build. Without this the
+# terminal installs fine and then *every* IPC call dies, which is a confusing
+# failure to debug later.
+install_winehq() {
+  # Only meaningful on Debian/Ubuntu with passwordless sudo; otherwise fall back
+  # to the distro Wine, which is enough for the terminal but not the bridge.
+  command -v apt-get >/dev/null 2>&1 || return 1
+  $SUDO dpkg --add-architecture i386 >/dev/null 2>&1 || return 1
+  $SUDO mkdir -pm755 /etc/apt/keyrings >/dev/null 2>&1 || return 1
+  $SUDO wget -q -O /etc/apt/keyrings/winehq-archive.key \
+      https://dl.winehq.org/wine-builds/winehq.key >/dev/null 2>&1 || return 1
+
+  # Pick the sources file matching this distro's codename.
+  local codename="bookworm"
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    codename="${VERSION_CODENAME:-bookworm}"
+  fi
+  $SUDO wget -q -NP /etc/apt/sources.list.d/ \
+      "https://dl.winehq.org/wine-builds/debian/dists/${codename}/winehq-${codename}.sources" \
+      >/dev/null 2>&1 || return 1
+
+  export DEBIAN_FRONTEND=noninteractive
+  $SUDO apt-get update -qq >/dev/null 2>&1 || return 1
+  $SUDO apt-get install -y -qq --install-recommends winehq-stable >/dev/null 2>&1 || return 1
+  return 0
+}
+
+WINE_MAJOR=0
+if command -v wine >/dev/null 2>&1; then
+  WINE_MAJOR=$(wine --version 2>/dev/null | sed 's/[^0-9]*\([0-9]*\).*/\1/' || echo 0)
+fi
+
+# Reinstall via WineHQ when missing or too old for the bridge (< 9).
+if [ "${WINE_MAJOR:-0}" -lt 9 ]; then
+  log "wine ${WINE_MAJOR} is too old for the MetaTrader5 bridge; installing WineHQ stable ..."
+  install_winehq || log "WARN: WineHQ install failed; continuing with the distro wine"
+fi
+
 if ! command -v wine >/dev/null 2>&1 && ! command -v wine64 >/dev/null 2>&1; then
   log "installing wine / xvfb / winbind ..."
   apt_install wine64 wine32 wine xvfb winbind cabextract p7zip-full \

@@ -178,6 +178,24 @@ def require_bridge():  # noqa: ANN201
 # --------------------------------------------------------------------------- #
 # subcommands
 # --------------------------------------------------------------------------- #
+def _bridge_imports_under_wine() -> bool:
+    """Verify the bridge really imports by running a child through Wine."""
+    winpy = win_python()
+    if winpy is None:
+        return False
+    try:
+        proc = subprocess.run(
+            [wine_bin(), str(winpy), "-c", "import MetaTrader5; print('ok')"],
+            capture_output=True,
+            text=True,
+            env=wine_env(),
+            timeout=180,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return "ok" in (proc.stdout or "")
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
     terminal = find_terminal()
 
@@ -220,7 +238,8 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         "terminal_path": str(terminal) if terminal else None,
         "terminal_running": terminal_running(),
         "windows_python": str(winpy) if winpy else None,
-        "python_bridge": mt5_module() is not None or winpy is not None,
+        "python_bridge": winpy is not None,
+        "bridge_imports_in_wine": _bridge_imports_under_wine() if winpy else False,
         "running_under_wine": under_wine(),
         "mt5_root": str(MT5_ROOT),
     }
@@ -255,6 +274,63 @@ def cmd_install(args: argparse.Namespace) -> int:
         text=tail,
         code=0 if proc.returncode == 0 else 2,
     )
+
+
+def _bridge_probe() -> dict[str, Any] | None:
+    """Ask the Wine-side bridge for account info and return the parsed JSON.
+
+    ``start`` runs on the Linux python, which can NEVER import MetaTrader5 (the
+    package is Windows-only). Probing the module locally would therefore always
+    look "not ready" and the terminal would be reported as unconnected even when
+    it is fine. So readiness is delegated to a child invocation of this same
+    script, which the re-exec layer automatically routes through Wine.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "account"],
+            capture_output=True,
+            text=True,
+            timeout=240,
+            env=wine_env(),
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return _extract_json(proc.stdout)
+
+
+def _extract_json(text: str) -> dict[str, Any] | None:
+    """Parse the last balanced ``{...}`` object out of mixed process output."""
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_str = False
+        escaped = False
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(text[start : idx + 1])
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(parsed, dict):
+                        return parsed
+                    break
+        start = text.find("{", start + 1)
+    return None
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -305,20 +381,13 @@ def cmd_start(args: argparse.Namespace) -> int:
     deadline = time.time() + int(args.wait)
     ready = False
     while time.time() < deadline:
-        mt5 = mt5_module()
-        if mt5 is not None:
-            try:
-                if mt5.initialize():
-                    # A terminal with no account still initialises; confirm we
-                    # actually have one before reporting success.
-                    if mt5.account_info() is not None:
-                        ready = True
-                    mt5.shutdown()
-                    if ready:
-                        break
-            except Exception:
-                pass
-        time.sleep(3)
+        probe = _bridge_probe()
+        # A terminal with no account still returns account=null; require an
+        # actual account before declaring the stack ready for quotes/orders.
+        if probe and probe.get("ok") and probe.get("account"):
+            ready = True
+            break
+        time.sleep(5)
 
     return emit(
         {
