@@ -278,12 +278,20 @@ class MT5SandboxTool(Tool):
 
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
-        """Enabled only when an execution sandbox is available.
+        """Always register the tool; availability is decided at execute() time.
 
-        Without a sandbox there is nowhere safe to run Wine/MT5, and this tool
-        refuses to fall back to the host by design.
+        WHY NOT GATE ON THE SANDBOX HERE: ``enabled()`` is evaluated by the loader
+        while it iterates the tool classes, i.e. BEFORE the registry is populated.
+        ``_sandbox_tool()`` therefore always returns None at this point and the
+        tool was silently dropped from the schema — the model never saw
+        ``mt5_sandbox`` exist and kept telling users "the sandbox cannot compile
+        MQL5 / mql.exe is Windows-native, compile it yourself".
+
+        The tool is harmless when no sandbox is configured: ``execute()``
+        resolves the sandbox per call and returns a clear error instead of
+        falling back to the host. Advertising the capability is what matters.
         """
-        return _sandbox_tool(ctx) is not None
+        return True
 
     @property
     def name(self) -> str:

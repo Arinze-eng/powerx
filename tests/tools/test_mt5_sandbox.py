@@ -58,10 +58,30 @@ def test_tool_is_discoverable_and_named():
     assert MT5SandboxTool().name == "mt5_sandbox"
 
 
-def test_enabled_requires_a_sandbox():
+def test_enabled_is_true_even_without_a_sandbox_yet():
+    """The tool must ALWAYS be registered.
+
+    ``enabled()`` runs during loading, before the registry is populated, so a
+    sandbox lookup here always fails and would silently drop the tool from the
+    schema — which is exactly what happened: the model never saw `mt5_sandbox`
+    and told users it could not compile MQL5. Availability is decided in
+    execute(), which returns a clear error when no sandbox is configured rather
+    than falling back to the host.
+    """
     assert MT5SandboxTool.enabled(_ctx({"novita_sandbox": _FakeSandbox()})) is True
-    assert MT5SandboxTool.enabled(_ctx({})) is False
-    assert MT5SandboxTool.enabled(None) is False
+    assert MT5SandboxTool.enabled(_ctx({})) is True
+    assert MT5SandboxTool.enabled(None) is True
+
+
+def test_tool_is_advertised_in_the_registry_without_a_sandbox(tmp_path):
+    """A real load must surface the tool even with no sandbox configured."""
+    from nanobot.config.schema import ToolsConfig
+
+    registry = ToolRegistry()
+    registry.register(
+        MT5SandboxTool.create(ToolContext(config=ToolsConfig(), workspace=str(tmp_path)))
+    )
+    assert registry.has("mt5_sandbox")
 
 
 def test_create_carries_context():
