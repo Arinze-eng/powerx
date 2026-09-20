@@ -552,36 +552,59 @@ def cmd_start(args: argparse.Namespace) -> int:
     # Pre-seed credentials so the terminal can auto-connect on boot. MT5 will not
     # expose symbols/quotes over IPC until it has an account, and there is no GUI
     # to type one into — the CLI is the only way in.
+    #
+    # IMPORTANT (verified in a Wine 10 + MT5 build 6204 sandbox):
+    #
+    # * ``/login:X /password:Y /server:Z`` on the command line does NOT work. The
+    #   official docs list only ``/login:``, ``/config:``, ``/profile:`` and
+    #   ``/portable``; an unrecognised switch is silently ignored ("the default
+    #   value will be used"), so the terminal boots with no account and never
+    #   emits a single Network log line.
+    # * Writing ``common.ini`` is not enough either. MT5 reads it (it appends its
+    #   own ``Environment=`` key to the file it loaded) but does not treat a
+    #   plain ``common.ini`` as an authorization source on a fresh prefix.
+    # * What DOES work is an explicit ``/config:<file>`` with all three of
+    #   Login / Password / Server under ``[Common]``. That reliably produced:
+    #     Network  '10012768157': previous successful authorization
+    #     Network  '10012768157': terminal synchronized ... 12375 symbols
+    #     Network  '10012768157': trading has been enabled, demo account
+    #
+    # ``/config:`` files are used read-only, which is fine and actually desirable
+    # here: the platform must not rewrite our credentials file.
     if getattr(args, "login", None) and args.password and args.server:
-        # In /portable mode the terminal resolves config/ RELATIVE TO ITS OWN
-        # INSTALL DIRECTORY (C:\Program Files\MetaTrader 5\config), NOT to
-        # MT5_ROOT. Writing only to MT5_ROOT/config meant the seeded account was
-        # never read, so the terminal booted with no account and the readiness
-        # probe timed out with "Terminal is up but has no account".
-        # Write both locations: the install-dir copy is the one /portable reads.
         common_ini = (
             "[Common]\n"
             f"Login={int(args.login)}\n"
             f"Password={args.password}\n"
             f"Server={args.server}\n"
             "KeepPrivate=1\n"
+            "NewsEnable=0\n"
+            "CertInstall=1\n"
+            "\n"
+            "[Experts]\n"
+            "AllowLiveTrading=1\n"
+            "AllowDllImport=0\n"
+            "Enabled=1\n"
         )
+        # Keep a copy at MT5_ROOT/config for humans and for non-portable boots.
         cfg_dir = MT5_ROOT / "config"
         cfg_dir.mkdir(parents=True, exist_ok=True)
         (cfg_dir / "common.ini").write_text(common_ini, encoding="utf-8")
 
-        portable_cfg_dir = terminal.parent / "config"
-        try:
-            portable_cfg_dir.mkdir(parents=True, exist_ok=True)
-            (portable_cfg_dir / "common.ini").write_text(common_ini, encoding="utf-8")
-        except OSError as exc:
-            # Not fatal: the roaming-profile path still applies without /portable.
-            print(f"warning: could not seed {portable_cfg_dir}: {exc}", file=sys.stderr)
+        # The file actually handed to the terminal via /config: lives inside the
+        # prefix so it is reachable through a stable C:\ path.
+        launcher_dir = WINE_PREFIX / "drive_c" / "mt5cfg"
+        launcher_dir.mkdir(parents=True, exist_ok=True)
+        launcher_ini = launcher_dir / "powerx.ini"
+        launcher_ini.write_text(common_ini, encoding="utf-8")
+        launch_config_arg = "/config:C:\\mt5cfg\\powerx.ini"
 
-        # Portable mode makes the terminal read config/ from its install dir.
+        # Portable mode keeps the data tree in the install dir, which is the path
+        # the installer prepares (Common\MQL5\Include and friends).
         portable = True
     else:
         portable = bool(getattr(args, "portable", False))
+        launch_config_arg = None
 
     if not terminal_running():
         # Make sure a display exists even if the installer did not leave Xvfb up.
@@ -595,6 +618,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         launch = [wine_bin(), str(terminal)]
         if portable:
             launch.append("/portable")
+        if launch_config_arg:
+            launch.append(launch_config_arg)
         subprocess.Popen(
             launch,
             env=wine_env(),
@@ -633,7 +658,10 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 
 def cmd_stop(_: argparse.Namespace) -> int:
-    subprocess.run(["pkill", "-f", "terminal64.exe"], capture_output=True)
+    # ``-x`` matches the exact process name. Never use ``pkill -f terminal64``:
+    # ``-f`` matches the whole command line, which includes the shell running
+    # this very command, so stopping the terminal also killed the caller.
+    subprocess.run(["pkill", "-x", "terminal64.exe"], capture_output=True)
     return emit({"ok": True, "stopped": True}, text="terminal stopped")
 
 
@@ -1200,7 +1228,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("start", help="launch the terminal headless")
-    p.add_argument("--wait", type=int, default=180)
+    # Authorization against a broker is not instant: in sandbox testing the
+    # terminal needed ~130s to go from boot to "trading has been enabled" for a
+    # MetaQuotes demo account (IP discovery -> TCP connect -> auth -> symbol
+    # sync of ~12k symbols). The default wait must comfortably exceed that or
+    # ``start`` reports failure for a login that is still in flight.
+    p.add_argument("--wait", type=int, default=300)
     p.add_argument("--login", required=False)
     p.add_argument("--password", required=False)
     p.add_argument("--server", required=False)
