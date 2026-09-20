@@ -577,9 +577,19 @@ MT5_DIR="${WINE_PREFIX}/drive_c/Program Files/MetaTrader 5"
 if [ -d "${MT5_DIR}" ] && [ ! -d "${MT5_DIR}/MQL5/Include" ]; then
   log "materialising MQL5 standard library (first terminal launch)"
   set +e
-  timeout 180 wine "${MT5_DIR}/terminal64.exe" >/dev/null 2>&1
+  # On a cold prefix the terminal's very first start can take several minutes
+  # (it unpacks the MQL5 tree and probes the network). 180 s was not enough and
+  # routinely tripped the timeout.
+  #
+  # ``|| true`` is REQUIRED and is not belt-and-braces: bash runs the ERR trap
+  # regardless of ``set +e`` — that flag only disables the implicit exit, not the
+  # trap. Without it the ``timeout`` exit status of 124 reaches ``_on_error`` and
+  # marks the whole (otherwise successful) install as
+  # ``failed|installer exited with code 124``, even though terminal64.exe, the
+  # Wine prefix and all 237 stdlib headers are in place.
+  timeout "${MT5_LAUNCH_TIMEOUT:-600}" wine "${MT5_DIR}/terminal64.exe" >/dev/null 2>&1 || true
   sleep 10
-  pkill -f terminal64 >/dev/null 2>&1
+  pkill -f terminal64 >/dev/null 2>&1 || true
   set -e
   if [ -d "${MT5_DIR}/MQL5/Include" ]; then
     log "MQL5 standard library ready ($(find "${MT5_DIR}/MQL5/Include" -name '*.mqh' | wc -l) headers)"
