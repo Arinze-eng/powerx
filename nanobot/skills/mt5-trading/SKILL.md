@@ -117,6 +117,34 @@ After compiling an EA, `action="experts"` tails the Experts journal and
 `action="logs"` tails the terminal log — together they are the full read/fix
 loop for runtime errors.
 
+## A clean compile does NOT mean the EA is right
+
+MetaEditor only checks syntax and symbols. A real submitted EA compiled with
+`0 errors, 0 warnings` and still had **eight** defects, none of which the
+compiler can see. When you are asked to "fix" an `.mq5`, run this checklist in
+addition to the compile loop — silently-wrong trading logic is far more
+expensive than a compile error.
+
+| Anti-pattern (seen in the wild) | Why it is wrong | Fix |
+|---|---|---|
+| `ArraySetAsSeries(a,true)` **after** `CopyBuffer(...,a)` | `CopyBuffer` fills oldest→first, so re-flagging afterwards leaves `a[0]` as the **oldest** bar. Every signal is inverted and it still compiles. | Set `ArraySetAsSeries` on the destination **before** `CopyBuffer`. |
+| `CopyBuffer(h,0,0,3,a)` with no return check | On a cold start it returns `-4`/fewer bars and leaves `a` empty, so `a[0]` is an out-of-range read at runtime. | `if(CopyBuffer(...) != n) return;` |
+| `x <= y == false` | Parses as `(x <= y) == false`. Reads as "not crossed", is actually "not-above" — the opposite of the intended cross test. | Write `!(x <= y)` or the explicit negation. |
+| `iMA(...)` result never checked | `OnInit` returns `INIT_SUCCEEDED` with `INVALID_HANDLE`s; the first `CopyBuffer` then fails forever. | Validate every handle, `return INIT_FAILED` otherwise. |
+| `if(PositionsTotal() > 0) return;` | `PositionsTotal()` is the **whole account**. Any other EA or a manual trade blocks this one permanently. | Count only positions matching your magic number + symbol. |
+| No `trade.SetExpertMagicNumber(...)` | Orders are unattributable, so the filter above and `close_all` cannot identify them. | Set a magic number and filter on it. |
+| SL/TP computed from `ASK` for a **sell** | A short is filled at `BID`; measuring stops from the other side misprices risk by the spread (and can produce `10016 invalid stops`). | Use `ASK` for buys, `BID` for sells. |
+| `trade.Buy(...)` return value ignored | A rejected order is invisible; the EA looks idle. | Check the bool and log `trade.ResultRetcode()`/`ResultRetcodeDescription()`. |
+| Lot size not normalised | Brokers reject volumes off `SYMBOL_VOLUME_STEP` / below `SYMBOL_VOLUME_MIN` with `10014`. | Clamp+round to min/max/step. |
+| No `IndicatorRelease()` in `OnDeinit` | Handle leak across recompiles. | Release every handle. |
+
+Note `#include <Trade\Trade.mqh>` with a **backslash** is accepted by MetaEditor
+(verified), so it is a style issue, not a bug — do not "fix" it into a
+`error 106` by changing paths you have not tested.
+
+When you rewrite an EA for these reasons, **compile the result before reporting
+it**: the fixed version above builds with `0 errors, 0 warnings, 478 ms`.
+
 ## Trading
 
 `order`, `close`, and `close_all` move real money and are **disabled unless the

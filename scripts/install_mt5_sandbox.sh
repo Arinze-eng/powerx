@@ -597,7 +597,12 @@ fi
 # ---------------------------------------------------------------------------
 MT5_DIR="${WINE_PREFIX}/drive_c/Program Files/MetaTrader 5"
 if [ -d "${MT5_DIR}" ] && [ ! -d "${MT5_DIR}/MQL5/Include" ]; then
-  log "materialising MQL5 standard library (first terminal launch)"
+  # MUST be a `status` write, not just a `log` line: this phase is the single
+  # longest step left (up to MT5_LAUNCH_TIMEOUT, 600 s by default) and the old
+  # marker stayed on `bridge`, so an agent polling `status` saw a 10-minute-old
+  # stage and reasonably concluded the installer had wedged — which is exactly
+  # the misdiagnosis recorded in this file's own history.
+  status mql5stdlib "materialising MQL5 standard library (first terminal launch)"
   set +e
   # On a cold prefix the terminal's very first start can take several minutes
   # (it unpacks the MQL5 tree and probes the network). 180 s was not enough and
@@ -611,7 +616,44 @@ if [ -d "${MT5_DIR}" ] && [ ! -d "${MT5_DIR}/MQL5/Include" ]; then
   # Wine prefix and all 237 stdlib headers are in place.
   timeout "${MT5_LAUNCH_TIMEOUT:-600}" wine "${MT5_DIR}/terminal64.exe" >/dev/null 2>&1 || true
   sleep 10
-  pkill -f terminal64 >/dev/null 2>&1 || true
+  # Kill the terminal WITHOUT pattern-matching command lines.
+  #
+  # `pkill -f terminal64` is the classic self-kill: `-f` also matches (a) the
+  # shell running this script and (b) `wineserver`, whose argv contains the
+  # prefix path — either takes down the session mid-install.
+  # `pkill -x terminal64.exe` is the opposite failure: it matches nothing,
+  # because Wine starts the exe through its loader so the kernel comm is `main`
+  # or `start.exe`, so the terminal would simply keep running.
+  #
+  # So resolve the PIDs from /proc the same way scripts/mt5_cli.py does: a
+  # process counts only when one of its argv fields IS the terminal path.
+  python3 - <<'PYEOF' || true
+import os, signal
+me = os.getpid()
+targets = set()
+try:
+    entries = os.listdir("/proc")
+except OSError:
+    entries = []
+for entry in entries:
+    if not entry.isdigit():
+        continue
+    pid = int(entry)
+    if pid == me:
+        continue
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            args = [a.decode("utf-8", "replace") for a in fh.read().split(b"\x00") if a]
+    except OSError:
+        continue
+    if any(a.lower().endswith("terminal64.exe") for a in args):
+        targets.add(pid)
+for pid in targets:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+PYEOF
   set -e
   if [ -d "${MT5_DIR}/MQL5/Include" ]; then
     log "MQL5 standard library ready ($(find "${MT5_DIR}/MQL5/Include" -name '*.mqh' | wc -l) headers)"
@@ -638,6 +680,7 @@ fi
 # no extra flags. Best-effort: never fail an otherwise-good install over it.
 # ---------------------------------------------------------------------------
 if [ -d "${MT5_DIR}/MQL5/Include" ]; then
+  status mql5mirror "mirroring the MQL5 standard library into the data tree"
   COMMON_MQL5="${WINE_PREFIX}/drive_c/users/${USER:-user}/AppData/Roaming/MetaQuotes/Terminal/Common/MQL5"
   case "${WINE_PREFIX}" in
     *users/*) : ;;  # already namespaced; keep default
