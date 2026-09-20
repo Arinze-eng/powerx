@@ -148,7 +148,11 @@ with `NOVITA_SANDBOX_MEMORY_MB=4096`) and the installer refuses to start below
 | `status` stuck on `wineprefix` | Wine's first boot does one-time registry work; it is slow but bounded. Keep polling. |
 | `stage="failed"`, `insufficient memory` | Sandbox too small. Raise `NOVITA_SANDBOX_MEMORY_MB` and recreate. |
 | `start` returns `ipc_ready=false` | No broker login. Pass `login`/`password`/`server` to `start`. |
-| `unimplemented function ucrtbase.dll.crealf` | Wine < 9. The installer pins Wine 10; re-run `install`. |
+| `unimplemented function ucrtbase.dll.crealf` | **numpy 2.x**, not the MT5 package. Wine's builtin `ucrtbase.dll` has no `crealf`; numpy 2.x calls it at import. The installer pins `numpy<2` (verified: 2.4.6 aborts, 1.26.4 imports). `winetricks vcrun2022` and `DllOverrides`→native do **not** fix it. |
+| bridge call hangs until the 900 s command timeout, no error | Wine started `winedbg` on an unimplemented call and is waiting on a dialog nobody can answer. The installer sets `HKCU\Software\Wine\WineDbg\ShowCrashDialog=0` so it aborts fast. |
+| `order` fails with `AttributeError: ... 'SYMBOL_FILLING_FOK'` | Old bug, now fixed: the package exports only `ORDER_FILLING_*`. `filling_mode` is a bitmask (1=FOK, 2=IOC, 4=RETURN); `order`/`close` retry each supported mode. |
+| `retcode: 10018, "Market closed"` | **Not a code bug.** The request reached the broker and was answered correctly. FX/metals are shut on weekends — find a live symbol before concluding trading is broken. |
+| `stop` reports success but the terminal is still up | Old bug, now fixed: Wine runs the terminal with comm `main`, so `pkill -x terminal64.exe` matched nothing. PIDs now come from `/proc/*/cmdline`. Never use `pkill -f terminal64` — it matches the calling shell and `wineserver`. |
 | `bridge_imports_in_wine=false` in `doctor` | Windows python or the `MetaTrader5` wheel failed to install; check `log_tail`. |
 | `mt5_cli.py must run inside Wine` | Do not invoke the CLI's bridge actions directly on Linux python — always go through `mt5_sandbox`. |
 

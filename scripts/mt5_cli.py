@@ -47,6 +47,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -228,10 +229,14 @@ def find_metaeditor(terminal: Path | None = None) -> Path | None:
 
 
 def terminal_running() -> bool:
-    result = subprocess.run(
-        ["pgrep", "-f", "terminal64.exe"], capture_output=True, text=True
-    )
-    return result.returncode == 0 and bool(result.stdout.strip())
+    """Whether the MT5 terminal process is alive.
+
+    Uses :func:`_terminal_pids` rather than ``pgrep -f``: the latter also matches
+    the ``bash -lc`` that invoked us whenever its command string mentions
+    ``terminal64.exe``, which made ``start`` believe a dead terminal was running
+    (and made ``pkill -f`` kill the caller).
+    """
+    return bool(_terminal_pids())
 
 
 def mt5_module():  # noqa: ANN201 - returns module or None
@@ -657,12 +662,84 @@ def cmd_start(args: argparse.Namespace) -> int:
     )
 
 
-def cmd_stop(_: argparse.Namespace) -> int:
-    # ``-x`` matches the exact process name. Never use ``pkill -f terminal64``:
-    # ``-f`` matches the whole command line, which includes the shell running
-    # this very command, so stopping the terminal also killed the caller.
-    subprocess.run(["pkill", "-x", "terminal64.exe"], capture_output=True)
-    return emit({"ok": True, "stopped": True}, text="terminal stopped")
+def _terminal_pids() -> list[int]:
+    """PIDs of the running MT5 terminal, found without shell self-matches.
+
+    Two traps, both measured in the sandbox:
+
+    * ``pkill -x terminal64.exe`` NEVER matches. Wine starts the terminal through
+      its ``loader``, so the kernel comm is ``main``/truncated and the exact-name
+      match finds nothing. ``stop`` therefore looked like it worked while the
+      terminal stayed up: ``pgrep -x terminal64.exe | wc -l`` returned 0 while
+      ``pgrep -f terminal64.exe`` returned 4.
+    * ``pkill -f terminal64`` is the opposite failure: ``-f`` matches the whole
+      command line, which includes the invoking ``bash -lc`` — so it killed the
+      caller instead of the terminal (and killed my own sandbox commands twice).
+
+    So read /proc directly and require the *executable* argument to be the
+    terminal, which a monitoring shell never is.
+    """
+    pids: list[int] = []
+    me = os.getpid()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return pids
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as handle:
+                parts = [p.decode("utf-8", "replace")
+                         for p in handle.read().split(b"\x00") if p]
+        except OSError:
+            continue
+        # The terminal's own argv[0] is the Windows path; a `bash -lc '...'`
+        # wrapper only ever has it embedded mid-string, never as its program.
+        program = parts[0] if parts else ""
+        if program.lower().endswith("terminal64.exe"):
+            pids.append(pid)
+            continue
+        # Wine also runs the exe as `start.exe /exec <path>/terminal64.exe ...`
+        # and as `wine terminal64.exe`; catch the trailing-arg forms too.
+        for arg in parts[1:]:
+            if arg.lower().endswith("terminal64.exe") and not program.endswith("bash"):
+                pids.append(pid)
+                break
+    return pids
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    """Stop the terminal by PID, never by a command-line pattern.
+
+    A pattern-based kill either misses (``-x``) or suicides (``-f``); see
+    :func:`_terminal_pids`.
+    """
+    killed: list[int] = []
+    for pid in _terminal_pids():
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except OSError:
+            continue
+    # Give the terminal time to close its IPC socket, then force.
+    time.sleep(3)
+    for pid in _terminal_pids():
+        try:
+            os.kill(pid, signal.SIGKILL)
+            if pid not in killed:
+                killed.append(pid)
+        except OSError:
+            continue
+    remaining = _terminal_pids()
+    return emit(
+        {"ok": not remaining, "stopped": killed, "still_running": remaining},
+        text=f"stopped {len(killed)} terminal process(es)"
+        + (f", {len(remaining)} still running" if remaining else ""),
+    )
 
 
 def cmd_login(args: argparse.Namespace) -> int:
@@ -791,16 +868,81 @@ def cmd_symbol(args: argparse.Namespace) -> int:
     return emit({"ok": True, "symbol": info._asdict()})
 
 
-def _order_send(mt5, request: dict[str, Any]) -> dict[str, Any]:
-    result = mt5.order_send(request)
-    if result is None:
-        return {"ok": False, "error": str(mt5.last_error()), "request": request}
-    payload = {"ok": result.retcode == mt5.TRADE_RETCODE_DONE, "retcode": result.retcode,
-               "comment": result.comment, "order": result.order, "deal": result.deal}
-    if not payload["ok"]:
-        payload["request"] = request
+# ``SymbolInfo.filling_mode`` is a BITMASK of the modes the symbol accepts.
+#
+# The MetaTrader5 python module does NOT export ``SYMBOL_FILLING_FOK`` /
+# ``SYMBOL_FILLING_IOC`` — only ``ORDER_FILLING_*`` (verified against 5.0.6180:
+# ``[n for n in dir(mt5) if "FILLING" in n]`` returns exactly
+# ``ORDER_FILLING_BOC/FOK/IOC/RETURN``). Referencing the SYMBOL_ names raised
+# ``AttributeError: module 'MetaTrader5' has no attribute 'SYMBOL_FILLING_FOK'``
+# and killed every single ``order`` call, so trading was unreachable even though
+# login, quotes and the account all worked. The flag values come from the
+# terminal's SYMBOL_FILLING_MODE enum.
+SYMBOL_FILLING_FOK_FLAG = 1
+SYMBOL_FILLING_IOC_FLAG = 2
+SYMBOL_FILLING_RETURN_FLAG = 4
+
+#: Broker rejects a request whose type_filling the symbol does not support.
+RETCODE_UNSUPPORTED_FILLING = 10030
+
+
+def filling_candidates(mt5, info: Any) -> list[int]:
+    """Every ``ORDER_FILLING_*`` the symbol supports, most preferred first.
+
+    Guessing one mode is not enough: a FOK-only symbol rejects an IOC request
+    with retcode 10030, and the previous code then reported a trade failure for
+    what was purely a mode mismatch.
+    """
+    mask = int(getattr(info, "filling_mode", 0) or 0)
+    out: list[int] = []
+    # IOC first: it is the mode that succeeds on both market and closing orders
+    # at MetaQuotes, while FOK can fail on fast-moving symbols.
+    if mask & SYMBOL_FILLING_IOC_FLAG:
+        out.append(mt5.ORDER_FILLING_IOC)
+    if mask & SYMBOL_FILLING_FOK_FLAG:
+        out.append(mt5.ORDER_FILLING_FOK)
+    if mask & SYMBOL_FILLING_RETURN_FLAG:
+        out.append(mt5.ORDER_FILLING_RETURN)
+    if not out:
+        # Zero/unknown mask: try the order the broker is most likely to accept.
+        out = [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
+    return out
+
+
+def _order_send(mt5, request: dict[str, Any],
+                fillings: list[int] | None = None) -> dict[str, Any]:
+    """Send a trade request, retrying every supported filling mode.
+
+    Only retcode 10030 ("unsupported filling mode") triggers a retry — a
+    rejection for insufficient margin, invalid stops or a market closure is a
+    real answer, and resending it would just spam the broker.
+    """
+    last: dict[str, Any] | None = None
+    for filling in (fillings or [request.get("type_filling", mt5.ORDER_FILLING_RETURN)]):
+        req = dict(request)
+        req["type_filling"] = filling
+        result = mt5.order_send(req)
+        if result is None:
+            last = {"ok": False, "error": str(mt5.last_error()), "request": req}
+            continue
+        payload: dict[str, Any] = {
+            "ok": result.retcode == mt5.TRADE_RETCODE_DONE,
+            "retcode": result.retcode,
+            "comment": result.comment,
+            "order": result.order,
+            "deal": result.deal,
+            "filling_used": filling,
+        }
+        if payload["ok"]:
+            return payload
+        payload["request"] = req
         payload["last_error"] = str(mt5.last_error())
-    return payload
+        last = payload
+        if result.retcode != RETCODE_UNSUPPORTED_FILLING:
+            return payload
+    if last is None:
+        return {"ok": False, "error": "no filling mode was attempted", "request": request}
+    return last
 
 
 def cmd_order(args: argparse.Namespace) -> int:
@@ -824,13 +966,9 @@ def cmd_order(args: argparse.Namespace) -> int:
     else:
         return fail("side must be buy or sell", code=1)
 
-    # Filling mode has to match what the broker's symbol actually supports.
-    filling_name = getattr(info, "filling_mode", 0)
-    filling = mt5.ORDER_FILLING_RETURN
-    if filling_name == mt5.SYMBOL_FILLING_FOK:
-        filling = mt5.ORDER_FILLING_FOK
-    elif filling_name == mt5.SYMBOL_FILLING_IOC:
-        filling = mt5.ORDER_FILLING_IOC
+    # Filling has to be one the symbol actually supports, and the choice is a
+    # bitmask lookup, not a constant comparison — see filling_candidates().
+    fillings = filling_candidates(mt5, info)
 
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -842,14 +980,14 @@ def cmd_order(args: argparse.Namespace) -> int:
         "magic": int(args.magic),
         "comment": args.comment or "powerx-mt5",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": filling,
+        "type_filling": fillings[0],
     }
     if args.sl is not None:
         request["sl"] = float(args.sl)
     if args.tp is not None:
         request["tp"] = float(args.tp)
 
-    payload = _order_send(mt5, request)
+    payload = _order_send(mt5, request, fillings)
     code = 0 if payload["ok"] else 3
     note = "order filled" if payload["ok"] else f"order rejected: {payload.get('comment')}"
     return emit(payload, text=note, code=code)
@@ -880,7 +1018,10 @@ def cmd_close(args: argparse.Namespace) -> int:
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_RETURN,
     }
-    payload = _order_send(mt5, request)
+    # Hard-coding ORDER_FILLING_RETURN made every close fail with retcode 10030
+    # on symbols that only advertise FOK/IOC, so resolve it from the symbol.
+    payload = _order_send(mt5, request,
+                          filling_candidates(mt5, mt5.symbol_info(pos.symbol)))
     return emit(payload, text="position closed" if payload["ok"] else "close failed",
                 code=0 if payload["ok"] else 3)
 
@@ -892,14 +1033,13 @@ def cmd_close_all(args: argparse.Namespace) -> int:
     positions = mt5.positions_get() or []
     results = []
     for pos in positions:
-        ns = argparse.Namespace(
-            ticket=pos.ticket, volume=None, deviation=args.deviation, magic=args.magic
-        )
-        # Reuse the single-close path so filling/order-type logic stays identical.
         tick = mt5.symbol_info_tick(pos.symbol)
         if tick is None:
             results.append({"ticket": pos.ticket, "ok": False, "error": "no tick"})
             continue
+        # Filling mode is per-symbol, so the metadata has to be fetched for each
+        # position rather than assumed.
+        info = mt5.symbol_info(pos.symbol)
         closing_long = pos.type == mt5.POSITION_TYPE_BUY
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -914,7 +1054,12 @@ def cmd_close_all(args: argparse.Namespace) -> int:
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_RETURN,
         }
-        results.append({"ticket": pos.ticket, **_order_send(mt5, request)})
+        # Same filling-mode resolution as a single close: a hard-coded
+        # ORDER_FILLING_RETURN is rejected (10030) on FOK/IOC-only symbols.
+        fillings = filling_candidates(mt5, info) if info is not None else None
+        if fillings:
+            request["type_filling"] = fillings[0]
+        results.append({"ticket": pos.ticket, **_order_send(mt5, request, fillings)})
     ok = all(r.get("ok") for r in results) if results else True
     return emit({"ok": ok, "closed": len(results), "results": results},
                 text=f"closed {len(results)} position(s)", code=0 if ok else 3)

@@ -554,8 +554,30 @@ if [ -f "${WIN_PY}" ]; then
     "$WINE_BIN" "${WIN_PY}" "${GETPIP}" --no-warn-script-location >/dev/null 2>&1 \
       || log "WARN: pip bootstrap failed"
   fi
+  # numpy MUST be pinned below 2.
+  #
+  # Wine 10's *builtin* ucrtbase.dll does not implement the C99 complex-math
+  # entry points (crealf/cimagf/...). numpy 2.x calls crealf from its compiled
+  # _multiarray_umath during import, so `import MetaTrader5` — which imports
+  # numpy — died with
+  #   wine: Call from ... to unimplemented function ucrtbase.dll.crealf, aborting
+  # Measured in the sandbox: `import numpy` alone (2.4.6) aborts; after
+  # `pip install "numpy<2"` the bridge imports cleanly
+  # (`BRIDGE_IMPORT_OK 5.0.6180 1.26.4`).
+  #
+  # Installing the genuine Microsoft ucrtbase via `winetricks vcrun2022` does NOT
+  # fix it — verified: vcrun2022 exits 0, ucrtbase.dll is byte-identical before
+  # and after, and the abort still fires. Do not re-try that route.
+  #
+  # This is why every MT5 bridge call used to hang until the sandbox command
+  # timeout: Wine reacts to an unimplemented function by starting winedbg, which
+  # on a headless box waits forever for nobody. The registry key below makes such
+  # a call abort immediately instead of hanging, so a broken bridge reports an
+  # error rather than silently burning 900 seconds.
+  timeout 120 "$WINE_BIN" reg add 'HKCU\Software\Wine\WineDbg' \
+      /v ShowCrashDialog /t REG_DWORD /d 0 /f >/dev/null 2>&1 || true
   "$WINE_BIN" "${WIN_PY}" -m pip install --no-input --disable-pip-version-check \
-      MetaTrader5 pandas numpy >/dev/null 2>&1 \
+      "numpy<2" MetaTrader5 pandas >/dev/null 2>&1 \
     || log "WARN: MetaTrader5 install inside Wine failed"
 else
   log "WARN: Windows Python was not installed; the MT5 bridge is unavailable"
