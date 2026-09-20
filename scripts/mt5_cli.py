@@ -553,18 +553,32 @@ def cmd_start(args: argparse.Namespace) -> int:
     # expose symbols/quotes over IPC until it has an account, and there is no GUI
     # to type one into — the CLI is the only way in.
     if getattr(args, "login", None) and args.password and args.server:
-        cfg_dir = MT5_ROOT / "config"
-        cfg_dir.mkdir(parents=True, exist_ok=True)
-        (cfg_dir / "common.ini").write_text(
+        # In /portable mode the terminal resolves config/ RELATIVE TO ITS OWN
+        # INSTALL DIRECTORY (C:\Program Files\MetaTrader 5\config), NOT to
+        # MT5_ROOT. Writing only to MT5_ROOT/config meant the seeded account was
+        # never read, so the terminal booted with no account and the readiness
+        # probe timed out with "Terminal is up but has no account".
+        # Write both locations: the install-dir copy is the one /portable reads.
+        common_ini = (
             "[Common]\n"
             f"Login={int(args.login)}\n"
             f"Password={args.password}\n"
             f"Server={args.server}\n"
-            "KeepPrivate=1\n",
-            encoding="utf-8",
+            "KeepPrivate=1\n"
         )
-        # Portable mode makes the terminal read config/ from MT5_ROOT instead of
-        # the prefix's roaming profile, which is what lets the seeded login win.
+        cfg_dir = MT5_ROOT / "config"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        (cfg_dir / "common.ini").write_text(common_ini, encoding="utf-8")
+
+        portable_cfg_dir = terminal.parent / "config"
+        try:
+            portable_cfg_dir.mkdir(parents=True, exist_ok=True)
+            (portable_cfg_dir / "common.ini").write_text(common_ini, encoding="utf-8")
+        except OSError as exc:
+            # Not fatal: the roaming-profile path still applies without /portable.
+            print(f"warning: could not seed {portable_cfg_dir}: {exc}", file=sys.stderr)
+
+        # Portable mode makes the terminal read config/ from its install dir.
         portable = True
     else:
         portable = bool(getattr(args, "portable", False))
