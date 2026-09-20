@@ -73,6 +73,17 @@ COPY scripts/nanobot_launcher.sh scripts/
 COPY scripts/supabase_env_sync.py scripts/
 COPY scripts/supabase_cron_sync.py scripts/
 COPY scripts/supabase_chat_sync.py scripts/
+# Both are invoked by entrypoint.sh with an `[ -f ... ]` guard. scripts/ is
+# copied file by file (not wholesale), so anything missing here is silently
+# skipped at runtime: backfill_chat_owners.py has been a permanent no-op in the
+# image for that reason, meaning legacy chats were never reconciled to their
+# owners despite the code existing.
+COPY scripts/backfill_chat_owners.py scripts/
+# Required by entrypoint.sh's cron-durability audit. scripts/ is copied file by
+# file (not wholesale), so a new helper is INVISIBLE in the image until it is
+# listed here — the first deploy of print_cron_store.py silently produced no
+# audit line for exactly this reason.
+COPY scripts/print_cron_store.py scripts/
 COPY --from=webui-builder /app/nanobot/web/dist/ nanobot/web/dist/
 RUN NANOBOT_SKIP_WEBUI_BUILD=1 uv pip install --python "$VIRTUAL_ENV/bin/python" --no-cache .
 
