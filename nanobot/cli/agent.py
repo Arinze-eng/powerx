@@ -29,6 +29,7 @@ _CLASSIC_DEPENDENCIES = {
         "nanobot.utils.restart",
         "consume_restart_notice_from_env",
     ),
+    "get_cron_store_path": ("nanobot.config.paths", "get_cron_store_path"),
     "is_default_workspace": ("nanobot.config.paths", "is_default_workspace"),
     "sync_workspace_templates": ("nanobot.utils.helpers", "sync_workspace_templates"),
 }
@@ -141,6 +142,7 @@ def agent(
     agent_loop_class = _classic_dependency("AgentLoop")
     stream_renderer_class = _classic_dependency("StreamRenderer")
     consume_restart_notice_from_env = _classic_dependency("consume_restart_notice_from_env")
+    get_cron_store_path = _classic_dependency("get_cron_store_path")
     is_default_workspace = _classic_dependency("is_default_workspace")
     sync_workspace_templates = _classic_dependency("sync_workspace_templates")
 
@@ -156,12 +158,16 @@ def agent(
 
     bus = MessageBus()
 
-    # Preserve existing single-workspace installs, but keep custom workspaces clean.
+    # The cron store lives on the durable volume, NOT in the workspace: the
+    # workspace is container-local on Northflank and is deleted by every deploy,
+    # which is why user jobs never survived long enough to fire. See
+    # get_cron_store_path() for the full history. Only the default workspace
+    # participates, so custom/test workspaces never leak jobs into the shared
+    # durable store.
     if is_default_workspace(runtime_config.workspace_path):
         _migrate_cron_store(runtime_config)
 
-    # Create cron service with workspace-scoped store
-    cron_store_path = runtime_config.workspace_path / "cron" / "jobs.json"
+    cron_store_path = get_cron_store_path()
     cron = CronService(cron_store_path)
     tools = ToolRegistry()
     mcp_provider = MCPProvider.from_config(runtime_config, tools)

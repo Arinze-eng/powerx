@@ -93,3 +93,27 @@ def get_persistent_data_dir(namespace: str | None = None) -> Path:
         except OSError:
             base = get_runtime_subdir("persistent")
     return ensure_dir(base / namespace) if namespace else base
+
+
+def get_cron_store_path() -> Path:
+    """Return the cron job store path: ALWAYS on the durable volume.
+
+    This used to be ``workspace_path / "cron" / "jobs.json"``. That was the
+    single reason user cron jobs never fired in production: the workspace is
+    ``$HOME/.nanobot/workspace``, which on Northflank is **container
+    filesystem**, not the mounted 6 GB volume (the volume is at ``/data``).
+    Every deploy or restart recreated the container from the image, deleting
+    ``jobs.json`` along with it, so the scheduler started with an empty job
+    list forever.
+
+    It is written this way deliberately so the failure is impossible to repeat
+    by accident: cron is now stored beside ``plan_memory``/``memoize``/
+    ``reflection``, the same durable root every other piece of long-lived state
+    already uses, and it follows ``POWERX_DATA_DIR`` like they do.
+
+    Note the in-process ``heartbeat`` job kept firing throughout the outage
+    because it is registered programmatically at boot rather than read from the
+    wiped file — which is exactly why the symptom looked like "the scheduler is
+    alive but my reminders never happen".
+    """
+    return ensure_dir(get_persistent_data_dir("cron")) / "jobs.json"

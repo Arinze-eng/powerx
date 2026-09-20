@@ -43,6 +43,36 @@ fi
 # An explicit operator setting always wins, in either direction.
 [ "$NANOBOT_PERSISTENT_DISK" = "true" ] && PERSISTENT_DISK=true
 [ "$NANOBOT_PERSISTENT_DISK" = "false" ] && PERSISTENT_DISK=false
+
+# ---------------------------------------------------------------------------
+# Resolve + announce the real cron store, and verify it is on the volume.
+#
+# This exists because `NANOBOT_PERSISTENT_DISK=true` was set while the cron
+# store was still under $HOME/.nanobot/workspace — i.e. the deployment claimed
+# to be durable and then skipped the Supabase restore, but the file it was
+# trusting was container-local and deleted on every deploy. Silently believing
+# an env var is how "cron stopped firing" survived a whole release cycle.
+# So: print the resolved path, print whether the volume really backs it, and
+# warn loudly when the two disagree.
+# ---------------------------------------------------------------------------
+CRON_STORE=""
+for _py in /app/.venv/bin/python3 python3; do
+    if [ -f /app/scripts/print_cron_store.py ] && command -v "$_py" >/dev/null 2>&1; then
+        CRON_STORE=$("$_py" /app/scripts/print_cron_store.py 2>/dev/null || true)
+        [ -n "$CRON_STORE" ] && break
+    fi
+done
+if [ -n "$CRON_STORE" ]; then
+    echo "[entrypoint] cron store: $CRON_STORE"
+    CRON_DIR=$(dirname "$CRON_STORE")
+    if _data_dir_is_mounted "$CRON_DIR"; then
+        echo "[entrypoint] cron store is on a mounted volume — durable across deploys"
+    elif [ "$PERSISTENT_DISK" = "true" ]; then
+        echo "[entrypoint] WARNING: NANOBOT_PERSISTENT_DISK=true but $CRON_DIR is on the" \
+             "container filesystem; cron jobs WILL be lost on redeploy. Mount the volume" \
+             "at that path or set POWERX_DATA_DIR to the volume." >&2
+    fi
+fi
 if [ "$RENDER" = "true" ] || [ "$NORTHFLANK" = "true" ]; then
     # Keep the legacy flags working as the bootstrap switch too.
     PLATFORM_BOOTSTRAP=true

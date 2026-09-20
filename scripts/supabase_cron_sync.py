@@ -177,14 +177,34 @@ class CronSync:
         return 1
 
 
+def _default_cron_store() -> str:
+    """Locate the cron store the same way the app does.
+
+    Two defects fixed here:
+
+    * The old default was ``$NANOBOT_DATA_DIR/workspace/cron/jobs.json`` — the
+      ephemeral container path that the app no longer uses (and whose loss is
+      why cron "stopped firing"). It now follows POWERX_DATA_DIR / /data, i.e.
+      the durable volume, matching nanobot.config.paths.get_cron_store_path().
+    * ``NANOBOT_WORKSPACE_DIR`` was used as the store path directly, but it is a
+      *directory*, so a restore wrote JSON to a dir-shaped path and a backup
+      silently found nothing. It is now treated as the legacy directory it is.
+    """
+    override = (os.getenv("POWERX_DATA_DIR") or "").strip()
+    if override:
+        return os.path.join(os.path.expanduser(override), "cron", "jobs.json")
+    if os.path.isdir("/data") and os.access("/data", os.W_OK):
+        return os.path.join("/data", "powerx", "cron", "jobs.json")
+    data_dir = (os.getenv("NANOBOT_DATA_DIR") or "").strip() or os.path.join(
+        os.path.expanduser("~"), ".nanobot"
+    )
+    return os.path.join(data_dir, "persistent", "cron", "jobs.json")
+
+
 def main() -> int:
     url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
     service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-    data_dir = os.getenv("NANOBOT_DATA_DIR", "").strip() or os.path.join(
-        os.path.expanduser("~"), ".nanobot"
-    )
-    workspace = os.getenv("NANOBOT_WORKSPACE_DIR", "").strip()
-    cron_store = workspace or os.path.join(data_dir, "workspace", "cron", "jobs.json")
+    cron_store = _default_cron_store()
 
     parser = argparse.ArgumentParser(description="Persist nanobot cron jobs to Supabase")
     parser.add_argument("--store", default=cron_store,

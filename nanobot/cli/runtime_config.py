@@ -1,5 +1,7 @@
 """Configuration loading and diagnostics shared by CLI commands."""
 
+import time
+from contextlib import suppress
 from pathlib import Path
 
 import typer
@@ -162,16 +164,43 @@ def _load_inspection_config(
 
 
 def _migrate_cron_store(config: "Config") -> None:
-    """One-time migration: move legacy global cron store into the workspace."""
-    from nanobot.config.paths import get_cron_dir
+    """One-time migration: consolidate the cron store onto the durable volume.
 
-    legacy_path = get_cron_dir() / "jobs.json"
-    new_path = config.workspace_path / "cron" / "jobs.json"
-    if legacy_path.is_file() and not new_path.exists():
-        new_path.parent.mkdir(parents=True, exist_ok=True)
-        import shutil
+    Direction matters, and this function previously ran the wrong way — it moved
+    ``jobs.json`` OUT of the instance data dir and INTO the workspace, which on
+    Northflank relocated user jobs from a survivable path to one that is deleted
+    by every deploy. It now pulls the store toward `get_cron_store_path()`
+    (the persistent volume) from either historical location, and keeps the
+    source files in place as ``*.migrated-*`` so a bad copy is recoverable.
 
-        shutil.move(str(legacy_path), str(new_path))
+    The workspace copy is only adopted when the durable store is still empty,
+    so an existing volume-backed job list is never clobbered by a stale
+    container-local file.
+    """
+    from nanobot.config.paths import get_cron_dir, get_cron_store_path
+    import shutil
+
+    dest = get_cron_store_path()
+    if dest.exists():
+        return
+
+    sources = [
+        config.workspace_path / "cron" / "jobs.json",   # wrong-place era
+        get_cron_dir() / "jobs.json",                   # original era
+    ]
+    for src in sources:
+        if not src.is_file():
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dest))
+        except OSError:
+            continue
+        # Keep the original beside its old home rather than deleting it: if the
+        # durable path is ever misconfigured, the jobs must still be findable.
+        with suppress(OSError):
+            src.rename(src.with_name(f"{src.name}.migrated-{int(time.time())}"))
+        return
 
 
 def _provider_setup_error(config: Config) -> str | None:

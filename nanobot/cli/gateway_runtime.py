@@ -34,7 +34,7 @@ from nanobot.cli.webui_support import (
     _webui_display_url,
     _webui_endpoint_reachable,
 )
-from nanobot.config.paths import is_default_workspace
+from nanobot.config.paths import get_cron_store_path, is_default_workspace
 from nanobot.config.schema import Config
 from nanobot.gateway.runtime import GatewayInstance
 from nanobot.security.network import is_loopback_host
@@ -408,12 +408,13 @@ def _run_gateway(
     gateway_runtime = GatewayRuntime(paths=instance.paths)
     gateway_start_options = instance.start_options(port=port)
 
-    # Preserve existing single-workspace installs, but keep custom workspaces clean.
+    # Cron is volume-backed for the same reason as in agent.py — see
+    # get_cron_store_path(). The workspace path was ephemeral and silently lost
+    # every scheduled job on redeploy.
     if is_default_workspace(config.workspace_path):
         _migrate_cron_store(config)
 
-    # Create cron service with workspace-scoped store
-    cron_store_path = config.workspace_path / "cron" / "jobs.json"
+    cron_store_path = get_cron_store_path()
     cron = CronService(cron_store_path)
     trigger_store = LocalTriggerStore(config.workspace_path)
 

@@ -28,6 +28,7 @@ from nanobot.config.schema import Config
 from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
 from nanobot.cron.types import CronJob, CronPayload
 from nanobot.cron.webui_metadata import cron_proactive_delivery_metadata
+from nanobot.config.paths import get_cron_store_path
 from nanobot.providers.factory import ProviderSnapshot, make_provider, provider_signature
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
@@ -40,6 +41,21 @@ from nanobot.webui.metadata import (
 )
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_durable_cron_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Pin the durable volume root into ``tmp_path`` for every test here.
+
+    ``get_cron_store_path()`` now resolves to the *persistent* root
+    (``POWERX_DATA_DIR``, else ``/data/powerx``). Without this fixture the CLI
+    tests below would create and mutate the real durable store on whatever
+    machine runs them — including a production container, where ``/data`` IS the
+    mounted volume. Redirecting it also gives each test its own store.
+    """
+    root = tmp_path / "volume"
+    monkeypatch.setenv("POWERX_DATA_DIR", str(root))
+    return root
 
 
 def _without_rendered_line_breaks(output: str) -> str:
@@ -1680,7 +1696,7 @@ def test_agent_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: Pa
     result = runner.invoke(app, ["agent", "-m", "hello", "-c", str(config_file)])
 
     assert result.exit_code == 0
-    assert seen["cron_store"] == config.workspace_path / "cron" / "jobs.json"
+    assert seen["cron_store"] == get_cron_store_path()
 
 
 def test_agent_workspace_override_does_not_migrate_legacy_cron(
@@ -1733,7 +1749,7 @@ def test_agent_workspace_override_does_not_migrate_legacy_cron(
     )
 
     assert result.exit_code == 0
-    assert seen["cron_store"] == override / "cron" / "jobs.json"
+    assert seen["cron_store"] == get_cron_store_path()
     assert legacy_file.exists()
     assert not (override / "cron" / "jobs.json").exists()
 
@@ -1788,7 +1804,7 @@ def test_agent_custom_config_workspace_does_not_migrate_legacy_cron(
     result = runner.invoke(app, ["agent", "-m", "hello", "-c", str(config_file)])
 
     assert result.exit_code == 0
-    assert seen["cron_store"] == custom_workspace / "cron" / "jobs.json"
+    assert seen["cron_store"] == get_cron_store_path()
     assert legacy_file.exists()
     assert not (custom_workspace / "cron" / "jobs.json").exists()
 
@@ -2829,7 +2845,7 @@ def test_gateway_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: 
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
 
     assert isinstance(result.exception, _StopGatewayError)
-    assert seen["cron_store"] == config.workspace_path / "cron" / "jobs.json"
+    assert seen["cron_store"] == get_cron_store_path()
 
 
 def test_gateway_unbound_agent_cron_runs_general_path(
@@ -3368,7 +3384,7 @@ def test_gateway_workspace_override_does_not_migrate_legacy_cron(
     )
 
     assert isinstance(result.exception, _StopGatewayError)
-    assert seen["cron_store"] == override / "cron" / "jobs.json"
+    assert seen["cron_store"] == get_cron_store_path()
     assert legacy_file.exists()
     assert not (override / "cron" / "jobs.json").exists()
 
@@ -3404,13 +3420,13 @@ def test_gateway_custom_config_workspace_does_not_migrate_legacy_cron(
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
 
     assert isinstance(result.exception, _StopGatewayError)
-    assert seen["cron_store"] == custom_workspace / "cron" / "jobs.json"
+    assert seen["cron_store"] == get_cron_store_path()
     assert legacy_file.exists()
     assert not (custom_workspace / "cron" / "jobs.json").exists()
 
 
 def test_migrate_cron_store_moves_legacy_file(tmp_path: Path) -> None:
-    """Legacy global jobs.json is moved into the workspace on first run."""
+    """The legacy global jobs.json is adopted into the durable volume store."""
     from nanobot.cli.runtime_config import _migrate_cron_store
 
     legacy_dir = tmp_path / "global" / "cron"
@@ -3420,34 +3436,132 @@ def test_migrate_cron_store_moves_legacy_file(tmp_path: Path) -> None:
 
     config = Config()
     config.agents.defaults.workspace = str(tmp_path / "workspace")
-    workspace_cron = config.workspace_path / "cron" / "jobs.json"
+    dest = get_cron_store_path()
 
     with patch("nanobot.config.paths.get_cron_dir", return_value=legacy_dir):
         _migrate_cron_store(config)
 
-    assert workspace_cron.exists()
-    assert workspace_cron.read_text() == '{"jobs": []}'
+    assert dest.exists()
+    assert dest.read_text() == '{"jobs": []}'
+    # The source is kept aside rather than deleted, so a misconfigured durable
+    # path cannot silently destroy the only copy of a user's jobs.
     assert not legacy_file.exists()
+    assert list(legacy_dir.glob("jobs.json.migrated-*"))
 
 
-def test_migrate_cron_store_skips_when_workspace_file_exists(tmp_path: Path) -> None:
-    """Migration does not overwrite an existing workspace cron store."""
+def test_migrate_cron_store_adopts_the_wrong_place_era(tmp_path: Path) -> None:
+    """Jobs left in the ephemeral workspace are rescued onto the volume.
+
+    This is the regression that broke cron: for a release the store lived under
+    ``workspace/cron/jobs.json``, which is container-local. Migration must pick
+    that file up, not just the pre-dating global one.
+    """
     from nanobot.cli.runtime_config import _migrate_cron_store
-
-    legacy_dir = tmp_path / "global" / "cron"
-    legacy_dir.mkdir(parents=True)
-    (legacy_dir / "jobs.json").write_text('{"old": true}')
 
     config = Config()
     config.agents.defaults.workspace = str(tmp_path / "workspace")
     workspace_cron = config.workspace_path / "cron" / "jobs.json"
     workspace_cron.parent.mkdir(parents=True)
-    workspace_cron.write_text('{"new": true}')
+    workspace_cron.write_text('{"jobs": [{"id": "kept"}]}')
 
-    with patch("nanobot.config.paths.get_cron_dir", return_value=legacy_dir):
-        _migrate_cron_store(config)
+    dest = get_cron_store_path()
+    _migrate_cron_store(config)
 
-    assert workspace_cron.read_text() == '{"new": true}'
+    assert dest.read_text() == '{"jobs": [{"id": "kept"}]}'
+
+
+def test_migrate_cron_store_never_clobbers_the_durable_store(tmp_path: Path) -> None:
+    """An existing volume-backed store always wins over a stale local file."""
+    from nanobot.cli.runtime_config import _migrate_cron_store
+
+    dest = get_cron_store_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text('{"durable": true}')
+
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+    stale = config.workspace_path / "cron" / "jobs.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text('{"stale": true}')
+
+    _migrate_cron_store(config)
+
+    assert dest.read_text() == '{"durable": true}'
+    # Untouched, so an operator can still recover it by hand.
+    assert stale.read_text() == '{"stale": true}'
+
+
+def test_cron_jobs_survive_a_restart(tmp_path: Path) -> None:
+    """End-to-end contract: a job created in one process fires in a later one.
+
+    The production symptom was "cron never fires" while the in-process
+    `heartbeat` job kept running, because the store lived on container-local
+    storage that a redeploy deletes. This asserts the durable path round-trips a
+    job and that a FRESH service instance schedules and runs it — the exact
+    behaviour every deploy depends on.
+    """
+    from nanobot.cron.service import CronService
+    from nanobot.cron.types import CronSchedule
+
+    store = get_cron_store_path()
+
+    async def _create() -> int:
+        """Process 1: add a job, persist it, then shut down (the 'deploy')."""
+        service = CronService(store)
+        await service.start()
+        job = service.add_job(
+            name="standup-reminder",
+            schedule=CronSchedule(kind="cron", expr="0 9 * * 1-5", tz="Africa/Lagos"),
+            message="standup",
+            session_key="websocket:probe-chat",
+            origin_channel="websocket",
+            origin_chat_id="probe-chat",
+        )
+        service.stop()
+        assert job.state.next_run_at_ms is not None
+        return job.state.next_run_at_ms
+
+    next_run = asyncio.run(_create())
+    assert store.exists(), "cron store must live on the durable volume"
+    assert store.parent == get_cron_store_path().parent
+
+    # --- process 2: a brand-new service reading the same volume path ---------
+    fired: list[str] = []
+
+    async def _reload_and_run() -> None:
+        async def _on_job(_job) -> None:
+            fired.append(_job.name)
+
+        second = CronService(store, on_job=_on_job)
+        await second.start()
+        # The reloaded job must carry its persisted schedule, not a reset one.
+        reloaded = second.list_jobs()
+        assert [j.name for j in reloaded] == ["standup-reminder"]
+        assert reloaded[0].state.next_run_at_ms == next_run
+        # Execute it through the public path rather than waiting for 09:00.
+        assert await second.run_job(reloaded[0].id, force=True) is True
+        second.stop()
+
+    asyncio.run(_reload_and_run())
+    assert fired == ["standup-reminder"], (
+        "a persisted job must be loaded and executed by the next process"
+    )
+
+
+def test_cron_store_path_is_not_the_workspace() -> None:
+    """Guard the regression directly: cron must never live under the workspace.
+
+    `workspace_path` is container-local on Northflank, which is precisely what
+    deleted every user job. Asserting the durable store sits outside it is cheap
+    insurance against repeating that change.
+    """
+    from nanobot.config.paths import get_persistent_data_dir
+
+    store = get_cron_store_path()
+    assert store.name == "jobs.json"
+    assert get_persistent_data_dir("cron") == store.parent
+    ephemeral = Path.home() / ".nanobot" / "workspace"
+    assert not str(store).startswith(str(ephemeral))
 
 
 def test_gateway_uses_configured_port_when_cli_flag_is_missing(monkeypatch, tmp_path: Path) -> None:
