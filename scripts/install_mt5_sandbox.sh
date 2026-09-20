@@ -588,6 +588,39 @@ if [ -d "${MT5_DIR}" ] && [ ! -d "${MT5_DIR}/MQL5/Include" ]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# Mirror the standard library into the terminal DATA tree.
+#
+# MetaEditor resolves ``#include <Trade/Trade.mqh>`` against the MQL5 data
+# directory that owns the SOURCE file, NOT against ``--include``. Sources are
+# conventionally written to the data tree
+#   <prefix>/drive_c/users/<u>/AppData/Roaming/MetaQuotes/Terminal/Common/MQL5/Experts/
+# and MetaEditor then looks for the sibling
+#   .../Common/MQL5/Include/Trade/Trade.mqh
+# which the installer ships EMPTY. The result is
+#   error 106: file '...\Common\MQL5\Include\Trade\Trade.mqh' not found
+# even though the library exists under ``Program Files/MetaTrader 5/MQL5/Include``
+# and even when ``--include`` points straight at it. That error reads like a bug
+# in the user's .mq5, so agents edited working code instead of fixing the tree.
+# Keeping both trees populated makes a plain ``#include <Trade/...>`` compile with
+# no extra flags. Best-effort: never fail an otherwise-good install over it.
+# ---------------------------------------------------------------------------
+if [ -d "${MT5_DIR}/MQL5/Include" ]; then
+  COMMON_MQL5="${WINE_PREFIX}/drive_c/users/${USER:-user}/AppData/Roaming/MetaQuotes/Terminal/Common/MQL5"
+  case "${WINE_PREFIX}" in
+    *users/*) : ;;  # already namespaced; keep default
+  esac
+  mkdir -p "${COMMON_MQL5}/Include"
+  # ``-n`` so a broker-provided header is never clobbered by the stock one.
+  cp -rn "${MT5_DIR}/MQL5/Include/." "${COMMON_MQL5}/Include/" 2>/dev/null || true
+  _hdr=$(find "${COMMON_MQL5}/Include" -name '*.mqh' 2>/dev/null | wc -l)
+  if [ "${_hdr}" -gt 0 ]; then
+    log "MQL5 data-tree include ready (${_hdr} headers at ${COMMON_MQL5}/Include)"
+  else
+    log "WARN: could not mirror MQL5 standard library into the data tree"
+  fi
+fi
+
 status done "install complete: prefix=${WINE_PREFIX} win_python=${WIN_PY}"
 printf '{"ok": true, "stage": "done", "wine_prefix": "%s", "mt5_root": "%s", "windows_python": "%s"}\n' \
   "${WINE_PREFIX}" "${MT5_ROOT}" "${WIN_PY}"

@@ -76,14 +76,10 @@ success.
 
 ### Where sources must live
 
-MetaEditor resolves `#include <Trade/Trade.mqh>` relative to the terminal it is
-invoked from. Two consequences, both verified:
-
-* Put sources under the terminal's **MQL5 data tree** (below), and
-* If you compile a file from anywhere else, pass `include=` pointing at the
-  MQL5 `Include` directory (`--include` on the CLI). Without it you get
-  `error 106: file 'Include\Trade\Trade.mqh' not found`, which is a *path*
-  problem, not a code problem.
+MetaEditor resolves `#include <Trade/Trade.mqh>` relative to the **MQL5 data
+tree that owns the source file** — not relative to the terminal binary, and not
+relative to `--include`. Put sources under the data tree below and the include
+resolves implicitly:
 
 ```text
 # terminal data dir (where Experts/ and Include/ belong)
@@ -93,10 +89,21 @@ invoked from. Two consequences, both verified:
 ~/.wine-mt5/drive_c/Program Files/MetaTrader 5/
 ```
 
-The installer ships only a stub `MQL5/Experts` — MetaQuotes pushes the full
-standard library on first broker sync. A self-contained EA compiles with no
-setup; anything using `<Trade/…>`, `<Arrays/…>` etc. needs either that sync or
-an `include=` path to a library you provide.
+The installer now mirrors the full standard library into that data tree's
+`Include/`, and the CLI re-mirrors it before every compile, so a plain
+`#include <Trade/…>` compiles with **no extra flags**.
+
+Two traps, both verified and both now handled automatically:
+
+* Passing an explicit `include=`/`--include` pointing at the install dir makes
+  MetaEditor concatenate the flag with the source-relative path and fail on a
+  doubled path — `error 106: file '…\Include\Include\Trade\Trade.mqh' not
+  found`. Prefer letting the implicit data-tree lookup work.
+* A broker may push newer headers on first sync. The mirror uses copy-if-absent,
+  so broker-supplied headers are never clobbered.
+
+Either way an `error 106` is a *path* problem, not a code problem — never edit
+the user's `.mq5` to work around it.
 
 Verified end to end in a sandbox: a self-contained `Plain.mq5` compiled to a
 6186-byte `Plain.ex5` with `Result: 0 errors, 0 warnings, 335 ms elapsed,
@@ -154,3 +161,10 @@ with `NOVITA_SANDBOX_MEMORY_MB=4096`) and the installer refuses to start below
 - Total install time with the stack above: **~2 minutes** (terminal + MetaEditor
   + Windows Python bridge), producing
   `Program Files/MetaTrader 5/terminal64.exe` and `MetaEditor64.exe`.
+- A **library-using** EA compiles cleanly once the data tree holds the standard
+  library. Re-verified 2026-09-20 on Debian 12 / 4 GB / wineserver 10.0:
+  `TradeEA.mq5` (**`#include <Trade/Trade.mqh>` + `CSymbolInfo`**) →
+  `Result: 0 errors, 0 warnings, 402 ms elapsed` → `TradeEA.ex5` 14 662 bytes,
+  with **no** `--include` flag. Generic compile errors still surface normally
+  (`error 256: undeclared identifier`, `error 157: ')' - expression expected`),
+  so the read → edit → recompile loop is intact.

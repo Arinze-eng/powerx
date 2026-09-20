@@ -46,6 +46,7 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -953,6 +954,66 @@ def require_installed_chain(action: str) -> int | None:
     )
 
 
+def _ensure_data_tree_includes(metaeditor: Path, src: Path) -> bool:
+    """Mirror the stock MQL5 standard library into the source's data tree.
+
+    MetaEditor resolves ``#include <Trade/Trade.mqh>`` relative to the MQL5 data
+    directory that owns the source file. The installer creates that directory but
+    leaves its ``Include`` folder empty (the real headers are unpacked next to the
+    terminal in ``Program Files``), and ``--include`` does NOT override this. The
+    resulting ``error 106: ... Include\\Trade\\Trade.mqh  not found`` looks like a
+    defect in the user's ``.mq5`` and reliably sends agents off editing working
+    code — the exact trap this helper closes.
+
+    Returns ``True`` when the library is present in the data tree afterwards, so
+    the caller can safely drop its own ``/include:`` flag (which would otherwise
+    make MetaEditor build a doubled path and fail all over again).
+
+    Best-effort by design: a read-only or alien layout must never turn a compile
+    into a crash, so every filesystem error is swallowed.
+    """
+    try:
+        stdlib = metaeditor.parent / "MQL5" / "Include"
+        if not stdlib.is_dir():
+            return False
+
+        # Walk up from the source to the MQL5 data root (the parent of Experts/
+        # Include/ Scripts/ ...). Sources are normally placed under it, but a
+        # source compiled from an arbitrary path still needs a sane target.
+        data_root: Path | None = None
+        for parent in [src.parent, *src.parents]:
+            if parent.name == "MQL5":
+                data_root = parent
+                break
+        if data_root is None:
+            data_root = (
+                WINE_PREFIX
+                / "drive_c"
+                / "users"
+                / "user"
+                / "AppData"
+                / "Roaming"
+                / "MetaQuotes"
+                / "Terminal"
+                / "Common"
+                / "MQL5"
+            )
+
+        target = data_root / "Include"
+        target.mkdir(parents=True, exist_ok=True)
+        for item in stdlib.rglob("*.mqh"):
+            rel = item.relative_to(stdlib)
+            dest = target / rel
+            if dest.exists():
+                continue  # never clobber a broker-supplied header
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(item, dest)
+        return any(target.rglob("*.mqh"))
+    except Exception:
+        print("mt5: MQL5 data-tree include mirror skipped", file=sys.stderr)
+        return False
+
+
 def cmd_compile(args: argparse.Namespace) -> int:
     """Compile an MQL5 source file via MetaEditor's command-line interface.
 
@@ -988,6 +1049,30 @@ def cmd_compile(args: argparse.Namespace) -> int:
             stdlib = metaeditor.parent / "MQL5" / "Include"
         if stdlib.is_dir():
             include = f"/include:{stdlib}"
+
+    # Self-heal the MQL5 data tree before compiling.
+    #
+    # MetaEditor resolves angle-bracket includes such as ``<Trade/Trade.mqh>``
+    # against the MQL5 data directory that owns the SOURCE file, not against
+    # ``--include``. The installer ships that tree's ``Include`` folder empty, so
+    # a source living under the conventional
+    # ``.../MetaQuotes/Terminal/Common/MQL5/Experts/`` path fails with
+    #   error 106: file '...\Common\MQL5\Include\Trade\Trade.mqh' not found
+    # even though the library exists in the install dir and even when
+    # ``--include`` points straight at it. That message reads like a bug in the
+    # user's code, which is precisely how it misleads. Mirroring the stock
+    # library in makes a plain ``#include <Trade/...>`` compile with no flags.
+    mirrored = _ensure_data_tree_includes(metaeditor, src)
+
+    # Passing an explicit ``/include:`` for the stock library actively BREAKS a
+    # normal angle-bracket include: MetaEditor concatenates the flag with the
+    # source-relative path and then reports a doubled, nonexistent path
+    #   error 106: file '...\Include\Include\Trade\Trade.mqh' not found
+    # Once the data tree holds the library, the implicit lookup is both correct
+    # and sufficient, so drop the auto-added flag. An caller-supplied --include
+    # is still honoured verbatim (that is their explicit intent).
+    if mirrored and not args.include:
+        include = ""
 
     log_path = src.with_suffix(".log")
     if log_path.exists():
