@@ -62,7 +62,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-21.2"
+CLI_VERSION = "2026-09-21.3"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -98,6 +98,13 @@ _LOG_TAIL_MAX_CHARS = 4_000
 _PROBE_TIMEOUT = 90
 #: Budget for list-heavy payloads (``symbols`` inventories).
 _LIST_PAYLOAD_BUDGET = 6_000
+
+#: Widest broker UTC offset a quote clock may sit at, for deciding whether the
+#: server is streaming. See ``cmd_symbols``: MT5 reports tick time in server
+#: time, and the bench box is UTC, so the newest tick of a LIVE session leads the
+#: box clock by that offset (measured +3 h on MetaQuotes-Demo). Anything beyond a
+#: full zone range is not an offset, it is a market that stopped ticking.
+_ZONE_SKEW_TOLERANCE_S = 14 * 3600
 
 
 # --------------------------------------------------------------------------- #
@@ -1003,22 +1010,59 @@ def cmd_symbols(args: argparse.Namespace) -> int:
 
     needle = (getattr(args, "filter", "") or "").strip().upper()
     # The terminal only streams symbols it knows about; the list is complete
-    # without symbol_select, but selecting guarantees tick data for the ones we
-    # then report on.
+    # without symbol_select.
     infos = mt5.symbols_get() or []
+
+    # MEASURED FAILURE (2026-09-21, live MetaQuotes-Demo, 04:41 UTC, terminal log
+    # "GMT+0"): the first version of this compared a tick's ``time`` against the
+    # SANDBOX clock and reported ``last_tick_age_s: -10798`` — a negative age, a
+    # quote from the future. MT5 returns tick time in SERVER time (measured:
+    # box 04:41 UTC, tick 07:41, so this server is UTC+3), so subtracting the box
+    # clock produced a nonsense age that could never exceed ``fresh_seconds``:
+    # the market_open flag was true for every symbol no matter what.
+    #
+    # Two clocks, two questions, so measure both against the broker's own clock:
+    #   * age vs the newest tick on the server -> "is THIS symbol stale versus
+    #     the rest of the market" (skew cancels out exactly, no timezone maths);
+    #   * newest tick vs the box clock -> "is the server streaming at all", which
+    #     is what separates a live session from a frozen weekend close. A live
+    #     quote sits at the broker's UTC offset (bounded by the real zone range),
+    #     while a closed market's newest quote is behind the box clock by the
+    #     whole gap — ~48 h over a weekend, which no offset can explain away.
+    ticks: dict[str, int] = {}
+    for info in infos:
+        name = getattr(info, "name", "")
+        if needle and name.upper().find(needle) == -1:
+            continue
+        tick = mt5.symbol_info_tick(name)
+        ticks[name] = int(getattr(tick, "time", 0) or 0)
+    latest = max(ticks.values()) if ticks else 0
     now = time.time()
+    ahead = (latest - now) if latest else 0
+    # Conservative by construction: the bench is a UTC box and the demo server
+    # this CLI is aimed at runs at UTC+3 (measured), so requiring the newest
+    # quote to lead the box clock by no more than a full zone range keeps a live
+    # session marked open while a weekend close (-48 h) and an empty feed (0)
+    # both read as closed. ``broker_clock_skew_s`` is reported either way, so a
+    # server outside that band is visible rather than silently mislabelled.
+    streaming = bool(latest) and -int(args.fresh_seconds) <= ahead <= _ZONE_SKEW_TOLERANCE_S
+
     rows: list[dict[str, Any]] = []
     for info in infos:
         name = getattr(info, "name", "")
-        if needle and needle not in name.upper():
+        if name not in ticks:
             continue
         trade_mode = int(getattr(info, "trade_mode", 0) or 0)
         if getattr(args, "tradable", False) and trade_mode == 0:
             # trade_mode 0 == SYMBOL_TRADE_MODE_DISABLED
             continue
-        tick = mt5.symbol_info_tick(name)
-        tick_time = int(getattr(tick, "time", 0) or 0)
-        fresh = bool(tick_time and (now - tick_time) < int(args.fresh_seconds))
+        tick_time = ticks[name]
+        age = (latest - tick_time) if (latest and tick_time) else None
+        fresh = bool(
+            streaming
+            and age is not None
+            and age <= int(args.fresh_seconds)
+        )
         if getattr(args, "tradable", False) and not fresh:
             continue
         rows.append(
@@ -1033,7 +1077,10 @@ def cmd_symbols(args: argparse.Namespace) -> int:
                 "digits": int(getattr(info, "digits", 0) or 0),
                 "filling_mode": int(getattr(info, "filling_mode", 0) or 0),
                 "market_open": fresh,
-                "last_tick_age_s": int(now - tick_time) if tick_time else None,
+                # Age measured against the broker's newest tick, never the box
+                # clock, so it is meaningful across timezones.
+                "last_tick_age_s": age,
+                "last_tick_time": tick_time or None,
             }
         )
 
@@ -1045,14 +1092,21 @@ def cmd_symbols(args: argparse.Namespace) -> int:
         "total_symbols": total,
         "matching": len(rows),
         "market_open_now": sum(1 for r in rows if r["market_open"]),
+        "broker_latest_tick_time": latest or None,
+        "broker_clock_skew_s": int(ahead) if latest else None,
+        "sandbox_clock_skew_s": int(ahead) if latest else None,
+        "server_streaming": streaming,
         "filter": needle or None,
         "symbols": shipped,
         "note": (
-            "Choose a symbol with market_open=true. FX/metals/indices follow "
-            "broker sessions and are closed at weekends; if market_open_now is 0, "
-            "every instrument on this server is closed right now, so an order will "
-            "be rejected with retcode 10018 'Market closed' (which is plumbing "
-            "success, not a bug in the bridge)."
+            "Choose a symbol with market_open=true. Tick times are SERVER time "
+            "(this server ran ~3 h ahead of the box clock when measured), so "
+            "last_tick_age_s is measured against the broker's newest tick and "
+            "never against the box clock. market_open also requires the server to "
+            "be streaming at all (see server_streaming / broker_clock_skew_s); if "
+            "market_open_now is 0 the session is closed, so an order will come "
+            "back as retcode 10018 'Market closed' — that is plumbing success, "
+            "not a bug in the bridge."
         ),
     }
     if len(rows) > len(shipped):

@@ -23,6 +23,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import time
 import types
 from pathlib import Path
 
@@ -322,6 +323,106 @@ def test_fit_payload_trims_a_symbol_list_too(cli):
     assert rendered.startswith("{")
     assert json.loads(rendered)["symbols"]
     assert payload["truncated"] is True
+
+
+class FakeSymbolsMT5:
+    """Enough of the module for ``cmd_symbols``, with a broker clock ~3 h ahead.
+
+    MEASURED FAILURE (2026-09-21, live MetaQuotes-Demo, Sunday): the first version
+    of ``symbols`` compared each tick's ``time`` against the SANDBOX clock and
+    reported ``last_tick_age_s: -10798`` — a negative age, a quote from the
+    future. Broker server time runs ahead of the box, so every frozen weekend
+    quote looked newer than "now", all 26 FX symbols were labelled
+    ``market_open: true``, and the flag meant nothing. A trade picked from that
+    list could only ever die with retcode 10018 "Market closed".
+
+    FX is exactly the case that matters: MetaQuotes-Demo carries no crypto, so
+    the agent has to pick from the FX list, and it has to know whether that list
+    is live.
+    """
+
+    def __init__(self, tick_times):
+        # tick_times: symbol name -> tick epoch seconds (0 == never ticked)
+        self._tick_times = tick_times
+
+    def symbols_get(self):
+        return [
+            types.SimpleNamespace(
+                name=name, path=f"Forex\\{name}", trade_mode=4, visible=True,
+                volume_min=0.01, volume_step=0.01, spread=1, digits=5,
+                filling_mode=1,
+            )
+            for name in self._tick_times
+        ]
+
+    def symbol_info_tick(self, name):
+        return types.SimpleNamespace(time=self._tick_times.get(name, 0))
+
+
+def _symbols_payload(cli, monkeypatch, capsys, tick_times, **kwargs):
+    monkeypatch.setattr(
+        cli, "require_bridge", lambda: (FakeSymbolsMT5(tick_times), None)
+    )
+    args = types.SimpleNamespace(
+        filter=kwargs.pop("filter", ""), tradable=kwargs.pop("tradable", False),
+        limit=kwargs.pop("limit", 50), fresh_seconds=kwargs.pop("fresh_seconds", 300),
+    )
+    assert cli.cmd_symbols(args) == 0
+    return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+
+def test_symbols_age_ignores_sandbox_clock_skew(cli, monkeypatch, capsys):
+    """A stale quote must never read as fresh just because the box clock lags."""
+    skew = 10_800  # measured: broker server time ~3 h ahead of the sandbox
+    latest = int(time.time()) + skew
+    payload = _symbols_payload(
+        cli, monkeypatch, capsys,
+        {"EURUSD": latest, "USDJPY": latest - 7_200, "GBPUSD": 0},
+    )
+
+    ages = {row["name"]: row["last_tick_age_s"] for row in payload["symbols"]}
+    # Every age is measured against the broker's newest tick, so none is negative.
+    assert ages["EURUSD"] == 0
+    assert ages["USDJPY"] == 7_200
+    assert all(v is None or v >= 0 for v in ages.values())
+    # GBPUSD never ticked: unknown age, and therefore not market-open.
+    assert ages["GBPUSD"] is None
+
+    open_now = {row["name"] for row in payload["symbols"] if row["market_open"]}
+    assert open_now == {"EURUSD"}
+    assert payload["market_open_now"] == 1
+    # The skew itself is reported so the agent can see why it looked wrong.
+    assert 10_700 <= payload["sandbox_clock_skew_s"] <= 10_900
+
+
+def test_symbols_tradable_filter_excludes_stale_weekend_quotes(cli, monkeypatch, capsys):
+    """``tradable=true`` is the pre-trade check: it must not hand back a dead symbol."""
+    latest = int(time.time()) + 10_800
+    payload = _symbols_payload(
+        cli, monkeypatch, capsys,
+        {
+            "AUDUSD": latest,          # ticking now
+            "NZDUSD": latest - 60,     # within fresh_seconds
+            "USDCAD": latest - 9_000,  # weekend-frozen
+            "USDCHF": 0,               # never ticked
+        },
+        tradable=True,
+    )
+    assert {row["name"] for row in payload["symbols"]} == {"AUDUSD", "NZDUSD"}
+    assert payload["matching"] == 2
+    assert payload["market_open_now"] == 2
+
+
+def test_symbols_reports_zero_open_when_the_whole_server_is_closed(cli, monkeypatch, capsys):
+    """Sunday FX: say so plainly, so a later 10018 is read as session, not bug."""
+    latest = int(time.time()) + 10_800
+    payload = _symbols_payload(
+        cli, monkeypatch, capsys,
+        {"EURUSD": latest - 80_000, "USDJPY": latest - 79_000},
+    )
+    assert payload["market_open_now"] == 0
+    assert all(row["market_open"] is False for row in payload["symbols"])
+    assert "10018" in payload["note"]
 
 
 def test_cmd_logs_reports_missing_logs_instead_of_empty_json(cli, tmp_path, monkeypatch, capsys):
