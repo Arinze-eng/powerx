@@ -298,6 +298,19 @@ def test_bootstrap_downloads_both_scripts():
     assert "install_mt5_sandbox.sh" in cmd
 
 
+def test_bootstrap_cache_busts_the_raw_cdn():
+    """GitHub raw served a stale CLI for minutes after a push.
+
+    Measured: a fix already on main was still failing live because the sandbox
+    kept downloading the previous revision, which sends debugging effort at code
+    that is no longer running. Each URL needs a unique query string.
+    """
+    cmd = bootstrap_command()
+    assert "mt5_cli.py?ts=" in cmd
+    assert "install_mt5_sandbox.sh?ts=" in cmd
+    assert "--retry" in cmd
+
+
 # --------------------------------------------------------------------------- #
 # payload parsing
 # --------------------------------------------------------------------------- #

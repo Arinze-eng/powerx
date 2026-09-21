@@ -173,10 +173,22 @@ def _missing_from_text(text: str) -> list[str]:
 
 def bootstrap_command() -> str:
     """Idempotently fetch the CLI + installer into the sandbox."""
+    # The cache-buster is load-bearing, not decoration.
+    #
+    # MEASURED FAILURE (2026-09-21): raw.githubusercontent.com served a stale
+    # ``mt5_cli.py`` for several minutes after a push — the sandbox kept fetching
+    # the previous revision, so a fix that was already on main (and covered by
+    # tests) still produced the OLD failure live. That is a uniquely expensive
+    # trap here: the whole point of this bootstrap is "a fixed CLI ships without
+    # rebuilding the sandbox", and a cached edge response makes it silently
+    # untrue, sending the agent off to debug code that is no longer running.
+    # A unique query string gives the CDN a URL it has never cached.
+    bust = "$(date +%s)"
     return (
         f"mkdir -p {_MT5_HOME}/bin && "
-        f"curl -fsSL {_RAW_BASE}/mt5_cli.py -o {_CLI_PATH} && "
-        f"curl -fsSL {_RAW_BASE}/install_mt5_sandbox.sh -o {_INSTALLER_PATH} && "
+        f"curl -fsSL --retry 3 '{_RAW_BASE}/mt5_cli.py?ts={bust}' -o {_CLI_PATH} && "
+        f"curl -fsSL --retry 3 '{_RAW_BASE}/install_mt5_sandbox.sh?ts={bust}' "
+        f"-o {_INSTALLER_PATH} && "
         f"chmod +x {_CLI_PATH} {_INSTALLER_PATH} && "
         f"python3 {_CLI_PATH} doctor"
     )
