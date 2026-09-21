@@ -50,15 +50,35 @@ from nanobot.agent.tools.context import ToolContext
 #: Raw GitHub base for the two sandbox-side scripts. The sandbox has internet
 #: access (the Novita tool creates boxes with ``allow_internet_access=True``), so
 #: bootstrapping by URL avoids shipping megabytes of tooling in the image.
+#:
+#: NOTE: this is only the LAST-RESORT source. The sandbox's egress path caches by
+#: URL *path* and ignores both query strings and ``Cache-Control: no-cache``, so
+#: a branch-name URL can serve a revision that is several pushes old. See
+#: ``bootstrap_command`` for the ordered, verified source list.
 _RAW_BASE = os.getenv(
     "MT5_SCRIPT_RAW_BASE",
     "https://raw.githubusercontent.com/Arinze-eng/powerx/main/scripts",
 )
 
+#: Owner/repo used to resolve ``main`` to a commit SHA before downloading.
+_REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
+
+#: Version of the sandbox-side CLI this tool requires.
+#:
+#: MUST be kept equal to ``CLI_VERSION`` in ``scripts/mt5_cli.py``. The bootstrap
+#: refuses a download that does not carry this exact marker, which is what stops
+#: a cached/stale revision from being executed silently: instead of debugging
+#: code that is no longer running, the caller gets a loud warning and a retry
+#: against a different source. Bump BOTH constants together whenever the CLI's
+#: contract with this tool changes.
+_CLI_VERSION = "2026-09-21.2"
+
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
 _CLI_PATH = f"{_MT5_HOME}/bin/mt5_cli.py"
 _INSTALLER_PATH = f"{_MT5_HOME}/bin/install_mt5_sandbox.sh"
+#: Where the bootstrap's stderr is captured so its warnings can be surfaced.
+_BOOTSTRAP_LOG = f"{_MT5_HOME}/bin/.bootstrap.log"
 
 #: The execution sandbox caps every command at 900 s, but a full Wine + MT5 +
 #: bridge install genuinely takes longer. ``install`` therefore starts the
@@ -187,14 +207,61 @@ def bootstrap_command() -> str:
     # shell, and a single-quoted ``$(date +%s)`` reaches curl literally (and curl
     # then rejects the URL, while ``|| true`` hides it — leaving the STALE file in
     # place, i.e. the exact bug this is meant to prevent).
-    return (
-        f"mkdir -p {_MT5_HOME}/bin && "
-        f'curl -fsSL --retry 3 "{_RAW_BASE}/mt5_cli.py?ts=$(date +%s)" -o {_CLI_PATH} && '
-        f'curl -fsSL --retry 3 "{_RAW_BASE}/install_mt5_sandbox.sh?ts=$(date +%s)" '
-        f"-o {_INSTALLER_PATH} && "
-        f"chmod +x {_CLI_PATH} {_INSTALLER_PATH} && "
-        f"python3 {_CLI_PATH} doctor"
+    return _BOOTSTRAP_TEMPLATE.format(
+        home=_MT5_HOME,
+        cli=_CLI_PATH,
+        installer=_INSTALLER_PATH,
+        repo=_REPO,
+        raw_base=_RAW_BASE,
+        version=_CLI_VERSION,
     )
+
+
+#: Bootstrap shell. ``{...}`` placeholders are filled by ``bootstrap_command``.
+#:
+#: MEASURED FAILURE (2026-09-21) — the reason this is not a one-line curl:
+#:
+#: The point of bootstrapping by URL is that a fixed CLI ships without rebuilding
+#: the sandbox. That silently stopped being true: the sandbox's egress path
+#: caches ``raw.githubusercontent.com`` responses **by path**, so
+#: ``.../main/scripts/mt5_cli.py`` kept returning a revision several pushes old.
+#: Neither a unique ``?ts=`` query string nor ``Cache-Control: no-cache`` helped
+#: (both were measured). The effect was maximally confusing: a fix that was on
+#: main, covered by tests and verified from the host still produced the OLD
+#: failure live, so the fix looked wrong when it was simply not running.
+#:
+#: What was measured to work:
+#:   * a commit-pinned raw URL (``/<sha>/scripts/...``) — never cached, because
+#:     that exact URL had never been requested before, and
+#:   * the GitHub API.
+#:
+#: So: resolve ``main`` to a SHA through the API, download the pinned URL, and
+#: VERIFY the result carries the ``CLI_VERSION`` this tool requires. Only if that
+#: fails do we fall back to the branch URL — and a version mismatch on every
+#: source is reported loudly instead of executing unknown code.
+_BOOTSTRAP_TEMPLATE = """\
+mkdir -p {home}/bin
+_want='{version}'
+_fetch() {{ curl -fsSL --retry 2 "$1" -o "$2" 2>/dev/null && grep -q "CLI_VERSION = [\\"']$_want[\\"']" "$2"; }}
+_sha=$(curl -fsSL 'https://api.github.com/repos/{repo}/commits/main' 2>/dev/null \
+  | python3 -c "import sys,json;print((json.load(sys.stdin) or {{}}).get('sha',''))" 2>/dev/null)
+_ok=''
+for _base in "https://raw.githubusercontent.com/{repo}/$_sha/scripts" "{raw_base}"; do
+  if _fetch "$_base/mt5_cli.py" {cli}; then
+    _ok=1
+    curl -fsSL --retry 2 "$_base/install_mt5_sandbox.sh" -o {installer} 2>/dev/null
+    break
+  fi
+done
+chmod +x {cli} {installer} 2>/dev/null
+if [ -z "$_ok" ]; then
+  echo "WARNING: could not fetch mt5_cli.py version $_want (a cached copy of an" >&2
+  echo "older revision may be in use). Retry, or set MT5_SCRIPT_RAW_BASE." >&2
+else
+  echo "mt5_cli.py $_want ready" >&2
+fi
+python3 {cli} doctor\
+"""
 
 
 def _sh(value: Any) -> str:
@@ -492,7 +559,17 @@ class MT5SandboxTool(Tool):
         command = build_cli_command(action, kwargs)
         # Always refresh the CLI before using it so a fixed bridge ships without
         # rebuilding the sandbox or the image.
-        full_command = f"{bootstrap_command()} >/dev/null 2>&1 || true; {command}"
+        #
+        # Stdout is discarded (the bootstrap's last step prints the doctor JSON,
+        # which must not be mistaken for this action's result) but the bootstrap's
+        # STDERR is kept and echoed at the end: it carries the "could not fetch
+        # the expected CLI version" warning, and that warning is exactly what a
+        # "no JSON result" failure needs to be interpretable. Trailing stderr
+        # cannot confuse the parser, which scans for the first balanced JSON.
+        full_command = (
+            f"{bootstrap_command()} >/dev/null 2>{_BOOTSTRAP_LOG} || true; "
+            f"{command}; tail -c 400 {_BOOTSTRAP_LOG} 1>&2"
+        )
         timeout = int(kwargs.get("timeout") or _TIMEOUTS.get(action, _DEFAULT_TIMEOUT))
 
         try:

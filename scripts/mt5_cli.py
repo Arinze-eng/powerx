@@ -54,6 +54,16 @@ import time
 from pathlib import Path
 from typing import Any
 
+#: Contract version of this CLI, checked by the host-side bootstrap before a
+#: downloaded copy is used. MUST be bumped together with ``_CLI_VERSION`` in
+#: ``nanobot/agent/tools/mt5_sandbox.py`` whenever the tool/CLI contract changes.
+#:
+#: WHY: the sandbox's network path caches GitHub raw responses by path, so a
+#: branch URL can quietly deliver a revision several pushes old. The bootstrap
+#: greps for this marker so a stale file is rejected instead of executed — the
+#: agent then sees a loud warning rather than debugging code that is not running.
+CLI_VERSION = "2026-09-21.2"
+
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
 DISPLAY_NUM = os.environ.get("MT5_DISPLAY_NUM", "99")
