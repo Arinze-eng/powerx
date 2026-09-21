@@ -1,9 +1,10 @@
 """Two sandbox fixes, proven without touching the live provider APIs.
 
-1) Novita RAM: every spawned sandbox must default to a 2 GB box even when the
+1) Novita RAM: every spawned sandbox must default to a 4 GB box even when the
    admin configured nothing — previously _template_sizing() returned None and
    sandboxes silently fell back to the stock ~486 MB "base" image (OOM on any
-   real build/OCR). Explicit env/config still wins.
+   real build/OCR); 2 GB then OOM-killed the Wine + MetaTrader 5 stack.
+   Explicit env/config still wins.
 
 2) Upstash OCR resilience: tesseract install must be best-effort per package
    group (not one combined apt/apk call that aborts on Alpine's missing
@@ -25,29 +26,30 @@ from nanobot.agent.tools.novita_sandbox import (
     DEFAULT_TEMPLATE_MEMORY_MB,
     NovitaSandboxTool,
     _TELEGRAM_IMAGE_SCRIPT,
+    _TEMPLATE_CACHE,
     _install_tesseract_resilient,
 )
 
 
 # ---------------------------------------------------------------------------
-# 1. Novita RAM default = 2 GB
+# 1. Novita RAM default = 4 GB (Wine + MT5 needs it)
 # ---------------------------------------------------------------------------
 
 
 class TestNovitaRamDefault:
     def test_constants(self) -> None:
-        assert DEFAULT_TEMPLATE_MEMORY_MB == 2048
+        assert DEFAULT_TEMPLATE_MEMORY_MB == 4096
         assert DEFAULT_TEMPLATE_CPU == 2
 
-    def test_unconfigured_defaults_to_2gb(self, monkeypatch) -> None:
-        # No env vars, no execution config => automatic 2 GB sizing.
+    def test_unconfigured_defaults_to_4gb(self, monkeypatch) -> None:
+        # No env vars, no execution config => automatic 4 GB sizing.
         for var in ("NOVITA_SANDBOX_CPU_COUNT", "NOVITA_SANDBOX_MEMORY_MB"):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setattr(NovitaSandboxTool, "_execution_config", staticmethod(lambda: None))
         sizing = NovitaSandboxTool._template_sizing()
         assert sizing is not None
         cpu, memory = sizing
-        assert memory == 2048
+        assert memory == 4096
         assert cpu == 2
 
     def test_env_override_wins(self, monkeypatch) -> None:
@@ -76,8 +78,8 @@ class TestNovitaRamDefault:
 
     def test_desired_alias_for_default(self, monkeypatch) -> None:
         monkeypatch.setattr(NovitaSandboxTool, "_execution_config", staticmethod(lambda: None))
-        alias = NovitaSandboxTool._desired_alias((2, 2048))
-        assert alias == "powerx-base-2g-c2"
+        alias = NovitaSandboxTool._desired_alias((2, 4096))
+        assert alias == "powerx-base-4g-c2"
 
 
 class FakeTemplateAPI:
@@ -114,17 +116,19 @@ class FakeClient:
 
 
 class TestResolveTemplate:
-    def test_builds_2g_template_when_absent(self, monkeypatch) -> None:
+    def test_builds_4g_template_when_absent(self, monkeypatch) -> None:
         for var in ("NOVITA_SANDBOX_TEMPLATE", "NOVITA_SANDBOX_CPU_COUNT", "NOVITA_SANDBOX_MEMORY_MB"):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setattr(NovitaSandboxTool, "_execution_config", staticmethod(lambda: None))
+        _TEMPLATE_CACHE.clear()  # module-level cache must not leak across tests
         tmpl = FakeTemplateAPI(existing={"base"})  # only base exists initially
         client = FakeClient(tmpl)
         tool = NovitaSandboxTool.__new__(NovitaSandboxTool)
         alias = tool._resolve_template(client)
-        assert alias == "powerx-base-2g-c2"
-        # It actually requested a 2048 MB build.
-        assert tmpl.built and tmpl.built[-1]["memory_mb"] == 2048
+        assert alias == "powerx-base-4g-c2"
+        # It actually requested a 4096 MB build (Wine + MT5 OOM-killed on 2 GB).
+        assert tmpl.built and tmpl.built[-1]["memory_mb"] == 4096
+        assert tmpl.built[-1]["cpu"] == 2
 
     def test_explicit_template_overrides_all(self, monkeypatch) -> None:
         monkeypatch.setenv("NOVITA_SANDBOX_TEMPLATE", "my-custom")
@@ -136,10 +140,11 @@ class TestResolveTemplate:
         for var in ("NOVITA_SANDBOX_TEMPLATE", "NOVITA_SANDBOX_CPU_COUNT", "NOVITA_SANDBOX_MEMORY_MB"):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setattr(NovitaSandboxTool, "_execution_config", staticmethod(lambda: None))
-        tmpl = FakeTemplateAPI(existing={"base", "powerx-base-2g-c2"})
+        _TEMPLATE_CACHE.clear()
+        tmpl = FakeTemplateAPI(existing={"base", "powerx-base-4g-c2"})
         tool = NovitaSandboxTool.__new__(NovitaSandboxTool)
         alias = tool._resolve_template(FakeClient(tmpl))
-        assert alias == "powerx-base-2g-c2"
+        assert alias == "powerx-base-4g-c2"
         assert tmpl.built == []  # did NOT rebuild an existing template
 
     def test_build_failure_prefers_existing_sized_then_base(self, monkeypatch) -> None:
@@ -147,16 +152,18 @@ class TestResolveTemplate:
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setattr(NovitaSandboxTool, "_execution_config", staticmethod(lambda: None))
         # Build always fails; a 4g template exists so we should use it, not base.
+        _TEMPLATE_CACHE.clear()
         tmpl = FakeTemplateAPI(existing={"base", "powerx-base-4g"}, build_raises=True)
         tool = NovitaSandboxTool.__new__(NovitaSandboxTool)
         alias = tool._resolve_template(FakeClient(tmpl))
-        assert alias in {"powerx-base-2g-c2", "powerx-base-4g"}  # never silently 'base' here
+        assert alias in {"powerx-base-4g-c2", "powerx-base-4g"}  # never silently 'base' here
         assert alias != "base"
 
     def test_total_failure_falls_back_to_base_not_crash(self, monkeypatch) -> None:
         for var in ("NOVITA_SANDBOX_TEMPLATE", "NOVITA_SANDBOX_CPU_COUNT", "NOVITA_SANDBOX_MEMORY_MB"):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setattr(NovitaSandboxTool, "_execution_config", staticmethod(lambda: None))
+        _TEMPLATE_CACHE.clear()
         tmpl = FakeTemplateAPI(existing={"base"}, build_raises=True)
         tool = NovitaSandboxTool.__new__(NovitaSandboxTool)
         alias = tool._resolve_template(FakeClient(tmpl))

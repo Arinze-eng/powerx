@@ -21,6 +21,7 @@ on 2026-09-20, then fixed. The MT5 module is faked, so no Wine/network is needed
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import types
 from pathlib import Path
@@ -172,6 +173,173 @@ def test_terminal_running_uses_proc_scan(cli):
 # --------------------------------------------------------------------------- #
 # 4. fixtures used by the sandbox verification run
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# 3b. credential handling + log payloads
+#
+# Both reproduced against a live Novita sandbox on 2026-09-21, immediately after
+# a successful Wine + MT5 install, driving the exact code path the agent uses.
+# --------------------------------------------------------------------------- #
+def _log(path: Path, text: str, encoding: str = "utf-8") -> Path:
+    path.write_bytes(text.encode(encoding))
+    return path
+
+
+def test_tail_decodes_utf16le_terminal_logs(cli, tmp_path):
+    """MT5 writes UTF-16LE; reading it as UTF-8 produced NUL-interleaved garbage.
+
+    That garbage cost ~2 characters per real character and then ~6 more when
+    JSON-escaped, which is what pushed ``logs`` output past the sandbox's output
+    cap and destroyed its JSON.
+    """
+    log = _log(
+        tmp_path / "20260921.log",
+        "IL\t0\t04:29:48.588\tLiveUpdate\tdownloaded successfully\n",
+        encoding="utf-16-le",
+    )
+    # BOM-less UTF-16 is the real shape of the terminal log's first write.
+    (tmp_path / "20260921.log").write_bytes(b"\xff\xfe" + log.read_bytes())
+    tail = cli._tail(tmp_path / "20260921.log", 40)
+    assert "\x00" not in tail
+    assert "LiveUpdate" in tail
+    assert "downloaded successfully" in tail
+
+
+def test_tail_detects_bomless_utf16(cli, tmp_path):
+    log = _log(tmp_path / "metaeditor.log", "Compile\tSymbolInfoSample.mq5\t0 errors\n",
+               encoding="utf-16-le")
+    tail = cli._tail(log, 40)
+    assert "\x00" not in tail
+    assert "0 errors" in tail
+
+
+def test_log_payload_always_fits_the_sandbox_output_cap(cli, tmp_path):
+    """A truncated JSON is unparseable, so the payload must be trimmed, not cut.
+
+    Measured: ``logs --lines 60`` over three UTF-16 logs serialized to ~43 000
+    characters. The sandbox wrapper keeps only the last 16 000, which sliced off
+    the JSON's opening brace; the host-side parser then found nothing and told
+    the agent "MT5 command produced no JSON result", i.e. that the install was
+    broken. Trimming the tails keeps the JSON whole.
+    """
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    for name in ("20260921.log", "metaeditor.log", "old.log"):
+        body = "\n".join(
+            f"IL\t0\t04:29:48.588\tLiveUpdate\tline {i} with enough text to add up"
+            for i in range(400)
+        )
+        (logs / name).write_bytes(b"\xff\xfe" + body.encode("utf-16-le"))
+
+    payload = cli._log_payload(logs, "*.log", 60)
+    rendered = json.dumps(payload, default=str)
+    # Under the CLI's own budget, and therefore far under the wrapper's cap.
+    assert len(rendered) <= cli._LOG_PAYLOAD_BUDGET
+    assert len(rendered) <= 16_000
+    assert payload["truncated"] is True
+    # The head -- the opening brace -- must survive, and it must re-parse.
+    assert rendered.startswith("{")
+    assert json.loads(rendered)["files"]
+    assert "\x00" not in rendered
+
+
+def test_cmd_logs_reports_missing_logs_instead_of_empty_json(cli, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "MT5_ROOT", tmp_path / "mt5")
+    monkeypatch.setattr(cli, "WINE_PREFIX", tmp_path / "wine")
+    code = cli.cmd_logs(types.SimpleNamespace(lines=20))
+    assert code == 2
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["ok"] is False
+    assert "start" in payload["error"]
+
+
+def test_start_restarts_a_terminal_that_lacks_credentials(cli, monkeypatch, tmp_path):
+    """THE credential bug: ``start`` skipped its launch when ANY terminal was up.
+
+    The installer leaves a credential-less terminal running while it materialises
+    the MQL5 library. ``start`` then saw ``terminal_running() == True``, skipped
+    the launch, and never applied the ``/config:`` file it had just written -- so
+    login/password/server were silently discarded and the terminal never
+    authorized. The reply even told the agent to pass credentials it had passed.
+    """
+    stopped: list[int] = []
+    launched: list[list[str]] = []
+
+    monkeypatch.setattr(cli, "find_terminal", lambda: tmp_path / "terminal64.exe")
+    monkeypatch.setattr(cli, "wine_bin", lambda: "wine")
+    monkeypatch.setattr(cli, "wine_env", lambda: {})
+    monkeypatch.setattr(cli, "MT5_ROOT", tmp_path / "mt5")
+    monkeypatch.setattr(cli, "WINE_PREFIX", tmp_path / "wine")
+    # A terminal is up, but it was launched WITHOUT /config:.
+    monkeypatch.setattr(cli, "_terminal_processes", lambda: [(4242, ["wine", "/t/terminal64.exe"])])
+    monkeypatch.setattr(cli, "_terminal_has_credentials", lambda: False)
+    def fake_stop() -> list[int]:
+        stopped.append(4242)
+        return [4242]
+
+    monkeypatch.setattr(cli, "_stop_terminal_processes", fake_stop)
+    # After the kill no terminal is left, so the launch must actually happen.
+    monkeypatch.setattr(cli, "terminal_running", lambda: not stopped)
+    monkeypatch.setattr(cli, "_bridge_probe", lambda timeout=None: {"ok": True, "account": None})
+
+    def fake_popen(cmd, **kwargs):
+        launched.append(list(cmd))
+        return types.SimpleNamespace(pid=1)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0))
+    monkeypatch.setattr(cli.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(cli.time, "time", lambda: 0.0)
+
+    code = cli.cmd_start(
+        types.SimpleNamespace(
+            login=10012768157, password="Wa-xU8Ct", server="MetaQuotes-Demo", wait=0, portable=False
+        )
+    )
+    # The stale terminal was reclaimed...
+    assert stopped == [4242]
+    # ...and ours was launched WITH the credentials file.
+    assert launched, "start must relaunch when the running terminal has no credentials"
+    assert any(arg.startswith("/config:") for arg in launched[0])
+    assert "/portable" in launched[0]
+    # Not ready (the fake probe reports no account), but the hint must no longer
+    # tell the agent to supply credentials it already supplied.
+    assert code == 2
+
+
+def test_start_keeps_a_terminal_that_already_has_credentials(cli, monkeypatch, tmp_path):
+    """No needless restart: a credential-carrying, connected terminal is reused."""
+    launched: list[list[str]] = []
+    monkeypatch.setattr(cli, "find_terminal", lambda: tmp_path / "terminal64.exe")
+    monkeypatch.setattr(cli, "wine_bin", lambda: "wine")
+    monkeypatch.setattr(cli, "MT5_ROOT", tmp_path / "mt5")
+    monkeypatch.setattr(cli, "WINE_PREFIX", tmp_path / "wine")
+    monkeypatch.setattr(cli, "_terminal_processes", lambda: [(1, ["wine", "/t/terminal64.exe"])])
+    monkeypatch.setattr(cli, "_terminal_has_credentials", lambda: True)
+    monkeypatch.setattr(
+        cli, "_bridge_probe",
+        lambda timeout=None: {"ok": True, "account": {"login": 10012768157, "server": "MetaQuotes-Demo"}},
+    )
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda cmd, **k: launched.append(list(cmd)))
+    code = cli.cmd_start(
+        types.SimpleNamespace(
+            login=10012768157, password="Wa-xU8Ct", server="MetaQuotes-Demo", wait=30, portable=False
+        )
+    )
+    assert code == 0
+    assert launched == []
+
+
+def test_status_distinguishes_credential_less_terminal(cli):
+    src = CLI_PATH.read_text(encoding="utf-8")
+    assert "terminal_has_credentials" in src
+
+
+def test_start_hint_no_longer_misattributes_the_failure(cli):
+    """With credentials supplied, the hint must not ask for them again."""
+    src = CLI_PATH.read_text(encoding="utf-8")
+    assert "Credentials were written and the terminal was launched with" in src
+
+
 def test_mq5_fixtures_are_present():
     fix = Path(__file__).resolve().parent / "fixtures" / "mt5"
     complex_src = (fix / "ComplexEA.mq5").read_text(encoding="utf-8")

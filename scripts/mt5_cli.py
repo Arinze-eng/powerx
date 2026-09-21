@@ -69,6 +69,24 @@ TIMEFRAMES = {
     "D1": "TIMEFRAME_D1", "W1": "TIMEFRAME_W1", "MN1": "TIMEFRAME_MN1",
 }
 
+#: Upper bound on the JSON this CLI prints for a log-reading command.
+#:
+#: MEASURED FAILURE (2026-09-21, real Novita sandbox): the execution sandbox
+#: wrapper keeps only the LAST ``_MAX_RESULT_CHARS`` (16 000) characters of a
+#: command's output. ``logs --lines 60`` produced ~43 000 characters of JSON
+#: (MT5 logs are UTF-16LE, so every real character arrived as TWO NUL-interleaved
+#: characters and then expanded into a 6-character ``\u00XX`` escape each), the
+#: head of the JSON -- including its opening ``{`` -- was sliced off, and the
+#: host-side parser found no JSON at all. The agent was then told "MT5 command
+#: produced no JSON result ... run action='install' first", which is nonsense
+#: after a successful install. Keeping the whole payload under this budget makes
+#: that impossible; the tails are trimmed instead.
+_LOG_PAYLOAD_BUDGET = 7_000
+#: Per-file cap for a single log tail (before the whole-payload budget above).
+_LOG_TAIL_MAX_CHARS = 4_000
+#: How long one readiness probe may block inside ``start``.
+_PROBE_TIMEOUT = 90
+
 
 # --------------------------------------------------------------------------- #
 # helpers
@@ -451,6 +469,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         "installed": installed,
         "terminal_path": str(terminal) if terminal else None,
         "terminal_running": running,
+        # Distinguishes the installer's credential-less "materialise the MQL5
+        # library" terminal from one that was launched with our /config: file.
+        # Without this an agent polling status sees only "terminal_running": true
+        # and reasonably but wrongly assumes the terminal is usable.
+        "terminal_has_credentials": _terminal_has_credentials() if running else False,
         "windows_python": str(winpy) if winpy else None,
         "windows_python_bytes": _wine_python_bytes(),
         "log_tail": _tail(log_path, int(args.lines)),
@@ -492,7 +515,7 @@ def _wine_python_bytes() -> int:
     return total
 
 
-def _bridge_probe() -> dict[str, Any] | None:
+def _bridge_probe(timeout: int = _PROBE_TIMEOUT) -> dict[str, Any] | None:
     """Ask the Wine-side bridge for account info and return the parsed JSON.
 
     ``start`` runs on the Linux python, which can NEVER import MetaTrader5 (the
@@ -500,13 +523,19 @@ def _bridge_probe() -> dict[str, Any] | None:
     look "not ready" and the terminal would be reported as unconnected even when
     it is fine. So readiness is delegated to a child invocation of this same
     script, which the re-exec layer automatically routes through Wine.
+
+    ``timeout`` is bounded and configurable because an unbounded probe is itself
+    a hang: ``mt5.initialize()`` blocks for the full IPC timeout (~240 s) when the
+    terminal is up but not authorized, so ONE probe used to swallow the entire
+    ``--wait`` window and the loop never re-checked a terminal that was still
+    authorizing.
     """
     try:
         proc = subprocess.run(
             [sys.executable, str(Path(__file__).resolve()), "account"],
             capture_output=True,
             text=True,
-            timeout=240,
+            timeout=max(5, int(timeout)),
             env=wine_env(),
         )
     except (subprocess.SubprocessError, OSError):
@@ -576,7 +605,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     #
     # ``/config:`` files are used read-only, which is fine and actually desirable
     # here: the platform must not rewrite our credentials file.
-    if getattr(args, "login", None) and args.password and args.server:
+    credentials = bool(getattr(args, "login", None) and args.password and args.server)
+    if credentials:
         common_ini = (
             "[Common]\n"
             f"Login={int(args.login)}\n"
@@ -611,6 +641,48 @@ def cmd_start(args: argparse.Namespace) -> int:
         portable = bool(getattr(args, "portable", False))
         launch_config_arg = None
 
+    # A terminal that is already up is NOT automatically the right terminal.
+    #
+    # MEASURED FAILURE (2026-09-21, real Novita sandbox): ``start`` was given
+    # login/password/server, wrote both ini files correctly, and then skipped the
+    # launch because *a* terminal was running -- the one the installer leaves
+    # behind while it materialises the MQL5 library (it only kills it once
+    # ``timeout 600 wine terminal64.exe`` returns, so it is frequently still alive
+    # when the agent calls ``start``). That terminal has no ``/config:`` argument,
+    # so it booted with no account and never authorized. The command still
+    # reported ok=false with the hint "Pass login/password/server", which is
+    # actively misleading -- the agent HAD passed them and had no way to tell that
+    # they were dropped on the floor.
+    #
+    # So: when credentials are supplied, the terminal that serves them must have
+    # been launched with our ``/config:`` file. If it was not, restart it.
+    restarted_for_credentials = False
+    if credentials and _terminal_has_credentials():
+        # Already launched with credentials. If it is also live, report success
+        # immediately instead of re-waiting the full --wait window.
+        quick = _bridge_probe(timeout=min(60, max(15, int(args.wait))))
+        if quick and quick.get("ok") and quick.get("account"):
+            return emit(
+                {
+                    "ok": True,
+                    "terminal_path": str(terminal),
+                    "running": True,
+                    "ipc_ready": True,
+                    "portable": portable,
+                    "reused_running_terminal": True,
+                    "account_login": (quick.get("account") or {}).get("login"),
+                    "hint": None,
+                },
+                text="terminal already running and connected",
+            )
+    elif credentials and _terminal_processes():
+        stale = _stop_terminal_processes()
+        restarted_for_credentials = True
+        print(
+            f"restarted terminal process(es) {stale} so /config: credentials apply",
+            file=sys.stderr,
+        )
+
     if not terminal_running():
         # Make sure a display exists even if the installer did not leave Xvfb up.
         subprocess.run(
@@ -636,7 +708,10 @@ def cmd_start(args: argparse.Namespace) -> int:
     deadline = time.time() + int(args.wait)
     ready = False
     while time.time() < deadline:
-        probe = _bridge_probe()
+        # Bounded probe: an unbounded one (240 s) could consume the entire --wait
+        # window in a single call, so the loop never got a second look at a
+        # terminal that was still authorizing.
+        probe = _bridge_probe(timeout=min(_PROBE_TIMEOUT, max(15, int(deadline - time.time()))))
         # A terminal with no account still returns account=null; require an
         # actual account before declaring the stack ready for quotes/orders.
         if probe and probe.get("ok") and probe.get("account"):
@@ -644,47 +719,55 @@ def cmd_start(args: argparse.Namespace) -> int:
             break
         time.sleep(5)
 
-    return emit(
-        {
-            "ok": ready,
-            "terminal_path": str(terminal),
-            "running": terminal_running(),
-            "ipc_ready": ready,
-            "portable": portable,
-            "hint": None
-            if ready
-            else "Terminal is up but has no account. Pass login/password/server to "
+    payload: dict[str, Any] = {
+        "ok": ready,
+        "terminal_path": str(terminal),
+        "running": terminal_running(),
+        "ipc_ready": ready,
+        "portable": portable,
+        "credentials_applied": credentials,
+        "restarted_stale_terminal": restarted_for_credentials,
+    }
+    if ready:
+        payload["hint"] = None
+    elif credentials:
+        # Credentials WERE supplied: telling the agent to supply them again is the
+        # bug that made this look unfixable. Point at the real next step instead.
+        payload["hint"] = (
+            "Credentials were written and the terminal was launched with "
+            f"/config: but no account appeared within {int(args.wait)}s. Check the "
+            "terminal log with action='logs' for 'authorization failed' / 'invalid "
+            "account' lines, and confirm the server name matches the account "
+            f"(got server={args.server!r}, login={args.login!r}). The account must "
+            "exist on that server; MetaQuotes-Demo logins are created by the "
+            "MetaQuotes demo registration, not by this platform."
+        )
+    else:
+        payload["hint"] = (
+            "Terminal is up but has no account. Pass login/password/server to "
             "action='start' (or use action='login') so MT5 can connect; quotes and "
-            "orders need a broker account.",
-        },
+            "orders need a broker account."
+        )
+    return emit(
+        payload,
         text="terminal ready" if ready else "terminal started but not connected to an account",
         code=0 if ready else 2,
     )
 
 
-def _terminal_pids() -> list[int]:
-    """PIDs of the running MT5 terminal, found without shell self-matches.
+def _terminal_processes() -> list[tuple[int, list[str]]]:
+    """``(pid, argv)`` for every running MT5 terminal process.
 
-    Two traps, both measured in the sandbox:
-
-    * ``pkill -x terminal64.exe`` NEVER matches. Wine starts the terminal through
-      its ``loader``, so the kernel comm is ``main``/truncated and the exact-name
-      match finds nothing. ``stop`` therefore looked like it worked while the
-      terminal stayed up: ``pgrep -x terminal64.exe | wc -l`` returned 0 while
-      ``pgrep -f terminal64.exe`` returned 4.
-    * ``pkill -f terminal64`` is the opposite failure: ``-f`` matches the whole
-      command line, which includes the invoking ``bash -lc`` — so it killed the
-      caller instead of the terminal (and killed my own sandbox commands twice).
-
-    So read /proc directly and require the *executable* argument to be the
-    terminal, which a monitoring shell never is.
+    Same /proc-based discovery as :func:`_terminal_pids`, but the argv is kept so
+    callers can tell *how* the terminal was launched -- specifically whether it
+    was given our ``/config:`` credentials file.
     """
-    pids: list[int] = []
+    found: list[tuple[int, list[str]]] = []
     me = os.getpid()
     try:
         entries = os.listdir("/proc")
     except OSError:
-        return pids
+        return found
     for entry in entries:
         if not entry.isdigit():
             continue
@@ -697,19 +780,63 @@ def _terminal_pids() -> list[int]:
                          for p in handle.read().split(b"\x00") if p]
         except OSError:
             continue
-        # The terminal's own argv[0] is the Windows path; a `bash -lc '...'`
-        # wrapper only ever has it embedded mid-string, never as its program.
         program = parts[0] if parts else ""
         if program.lower().endswith("terminal64.exe"):
-            pids.append(pid)
+            found.append((pid, parts))
             continue
-        # Wine also runs the exe as `start.exe /exec <path>/terminal64.exe ...`
-        # and as `wine terminal64.exe`; catch the trailing-arg forms too.
         for arg in parts[1:]:
             if arg.lower().endswith("terminal64.exe") and not program.endswith("bash"):
-                pids.append(pid)
+                found.append((pid, parts))
                 break
-    return pids
+    return found
+
+
+def _terminal_has_credentials() -> bool:
+    """True when a running terminal was launched with our ``/config:`` file.
+
+    A terminal started WITHOUT it (the installer's own "materialise the MQL5
+    library" launch, or an older credential-less ``start``) boots with no account
+    and will never authorize, no matter how correct the credentials are. That
+    distinction is the whole reason ``start`` used to look like it ignored the
+    login/password/server arguments.
+    """
+    for _, argv in _terminal_processes():
+        for arg in argv:
+            if arg.startswith("/config:") or arg.lower() == "/config:":
+                return True
+    return False
+
+
+def _stop_terminal_processes() -> list[int]:
+    """SIGTERM then SIGKILL every terminal process; return the PIDs handled."""
+    handled: list[int] = []
+    for pid, _ in _terminal_processes():
+        try:
+            os.kill(pid, signal.SIGTERM)
+            handled.append(pid)
+        except OSError:
+            continue
+    if handled:
+        time.sleep(3)
+        for pid, _ in _terminal_processes():
+            try:
+                os.kill(pid, signal.SIGKILL)
+                if pid not in handled:
+                    handled.append(pid)
+            except OSError:
+                continue
+        # The IPC socket lingers briefly; a relaunch that races it fails to bind.
+        time.sleep(2)
+    return handled
+
+
+def _terminal_pids() -> list[int]:
+    """PIDs of the running MT5 terminal, found without shell self-matches.
+
+    Kept as the public seam used by ``stop`` and the tests; the scanning lives in
+    :func:`_terminal_processes`.
+    """
+    return [pid for pid, _ in _terminal_processes()]
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -718,22 +845,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     A pattern-based kill either misses (``-x``) or suicides (``-f``); see
     :func:`_terminal_pids`.
     """
-    killed: list[int] = []
-    for pid in _terminal_pids():
-        try:
-            os.kill(pid, signal.SIGTERM)
-            killed.append(pid)
-        except OSError:
-            continue
-    # Give the terminal time to close its IPC socket, then force.
-    time.sleep(3)
-    for pid in _terminal_pids():
-        try:
-            os.kill(pid, signal.SIGKILL)
-            if pid not in killed:
-                killed.append(pid)
-        except OSError:
-            continue
+    killed = _stop_terminal_processes()
     remaining = _terminal_pids()
     return emit(
         {"ok": not remaining, "stopped": killed, "still_running": remaining},
@@ -1296,40 +1408,118 @@ def cmd_compile(args: argparse.Namespace) -> int:
     )
 
 
-def _tail(path: Path, lines: int) -> str:
-    if not path.exists():
-        return ""
+def _read_log_text(path: Path) -> str:
+    """Decode an MT5 log file, honouring its encoding.
+
+    MEASURED FAILURE (2026-09-21, real Novita sandbox): MT5 writes its terminal
+    and MetaEditor logs as UTF-16LE. Reading them with
+    ``read_text(encoding="utf-8", errors="replace")`` did not fail loudly -- it
+    produced NUL-interleaved garbage::
+
+        L\\x00i\\x00v\\x00e\\x00U\\x00p\\x00d\\x00a\\x00t\\x00e
+
+    Every real character therefore cost two characters in the payload and six
+    more when JSON-escaped -- roughly a 6x blow-up that pushed ``logs`` output
+    past the sandbox's output cap and destroyed the JSON (see
+    ``_LOG_PAYLOAD_BUDGET``). Decode by BOM, and fall back to the NUL-density
+    heuristic for BOM-less files (MetaEditor's log has no BOM).
+    """
     try:
-        content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        raw = path.read_bytes()
     except OSError:
         return ""
-    return "\n".join(content[-lines:])
+    if raw.startswith(b"\xff\xfe"):
+        return raw[2:].decode("utf-16-le", "replace")
+    if raw.startswith(b"\xfe\xff"):
+        return raw[2:].decode("utf-16-be", "replace")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", "replace")
+    # No BOM: UTF-16LE text is mostly ASCII bytes separated by NULs.
+    if raw:
+        sample = raw[:4096]
+        if sample.count(0) > len(sample) // 4:
+            return raw.decode("utf-16-le", "replace")
+    return raw.decode("utf-8", "replace")
+
+
+def _tail(path: Path, lines: int, max_chars: int = _LOG_TAIL_MAX_CHARS) -> str:
+    """Last ``lines`` lines of a log, decoded properly and capped in length."""
+    text = _read_log_text(path)
+    if not text:
+        return ""
+    content = text.replace("\x00", "").splitlines()
+    tail = "\n".join(content[-max(1, int(lines)):])
+    if len(tail) > max_chars:
+        tail = "...\n" + tail[-max_chars:]
+    return tail
+
+
+def _fit_log_payload(payload: dict[str, Any], budget: int = _LOG_PAYLOAD_BUDGET) -> dict[str, Any]:
+    """Trim log tails until the serialized payload fits the sandbox's output cap.
+
+    A truncated JSON is worse than a short one: the host-side parser cannot
+    recover it and reports "no JSON result", which the agent misreads as a broken
+    install. Trimming here always leaves parseable JSON, and ``truncated`` says
+    so explicitly.
+    """
+    if len(json.dumps(payload, default=str)) <= budget:
+        payload.setdefault("truncated", False)
+        return payload
+    payload["truncated"] = True
+    tails = payload.get("tail") or {}
+    # Halve the longest tail until it fits (or nothing is left to trim).
+    while tails and len(json.dumps(payload, default=str)) > budget:
+        longest = max(tails, key=lambda key: len(tails[key]))
+        if len(tails[longest]) <= 200:
+            tails.pop(longest, None)
+            payload["omitted"] = payload.get("omitted", 0) + 1
+            continue
+        tails[longest] = tails[longest][len(tails[longest]) // 2:]
+    if len(json.dumps(payload, default=str)) > budget:
+        # Worst case (a pathologically long key set) -- keep the structure, drop
+        # the bodies, and say where to read them instead.
+        payload["tail"] = {}
+        payload["note"] = (
+            "Log tails omitted to keep the JSON parseable. Read them in the sandbox "
+            f"directly: tail -n {payload.get('requested_lines') or 40} <file>"
+        )
+    return payload
+
+
+def _log_payload(directory: Path, pattern: str, lines: int) -> dict[str, Any]:
+    candidates = [p for p in sorted(directory.rglob(pattern))] if directory.exists() else []
+    payload: dict[str, Any] = {
+        "ok": bool(candidates),
+        "files": [str(p) for p in candidates[-5:]],
+        "requested_lines": int(lines),
+        "tail": {str(p): _tail(p, int(lines)) for p in candidates[-3:]},
+    }
+    return _fit_log_payload(payload)
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
-    logs_dir = MT5_ROOT / "logs"
-    candidates = [p for p in sorted(logs_dir.rglob("*.log"))] if logs_dir.exists() else []
-    if not candidates:
+    payload = _log_payload(MT5_ROOT / "logs", "*.log", int(args.lines))
+    if not payload["files"]:
         # Fall back to the logs shipped inside the Wine prefix.
-        candidates = [p for p in sorted(WINE_PREFIX.rglob("logs/*.log"))][-5:]
-    payload = {
-        "ok": bool(candidates),
-        "files": [str(p) for p in candidates[-5:]],
-        "tail": {str(p): _tail(p, int(args.lines)) for p in candidates[-3:]},
-    }
-    return emit(payload, code=0 if candidates else 2)
+        payload = _log_payload(WINE_PREFIX, "logs/*.log", int(args.lines))
+    if not payload["files"]:
+        return emit(
+            {
+                "ok": False,
+                "error": "No MT5 logs found yet. Run action='start' (with "
+                "login/password/server) so the terminal boots and writes its log.",
+                "searched": [str(MT5_ROOT / "logs"), str(WINE_PREFIX / "logs")],
+            },
+            text="error: no MT5 logs found yet",
+            code=2,
+        )
+    return emit(payload, code=0)
 
 
 def cmd_experts(args: argparse.Namespace) -> int:
-    base = MT5_ROOT / "MQL5" / "Logs"
-    candidates = [p for p in sorted(base.rglob("*.log"))] if base.exists() else []
-    payload = {
-        "ok": bool(candidates),
-        "files": [str(p) for p in candidates[-5:]],
-        "tail": {str(p): _tail(p, int(args.lines)) for p in candidates[-3:]},
-    }
+    payload = _log_payload(MT5_ROOT / "MQL5" / "Logs", "*.log", int(args.lines))
     return emit(payload, text="\n".join(payload["tail"].values())[-4000:],
-                code=0 if candidates else 2)
+                code=0 if payload["ok"] else 2)
 
 
 def cmd_run(args: argparse.Namespace) -> int:

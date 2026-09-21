@@ -352,8 +352,14 @@ class MT5SandboxTool(Tool):
             "Wine + Xvfb + MT5 + python bridge install inside the sandbox), then poll "
             "action='status' until stage='done' (a full install takes ~2-25 min; "
             "sandbox commands are timeout-capped so the install is never run inline). "
-            "Only then call action='start' (pass login/password/server so the terminal "
-            "connects) or action='compile'. 'compile' REFUSES with stage='not_installed' "
+            "Only then call action='start' WITH login/password/server — all three in "
+            "ONE call; that writes the terminal's /config: credentials file. A "
+            "terminal left running from the install (status shows "
+            "terminal_has_credentials=false) is reclaimed and relaunched automatically, "
+            "so never conclude the credentials are unusable: if ok=false, read the "
+            "hint — it names the real cause (broker server mismatch, or the account "
+            "not existing on that server). "
+            "'compile' REFUSES with stage='not_installed' "
             "until the chain exists — that refusal is NOT a source-code error: never try "
             "to fix or compile the .mq5 by any other means, just install first. "
             "Read/fix loop: use 'compile' to build an .mq5 with MetaEditor (returns the "
@@ -372,9 +378,9 @@ class MT5SandboxTool(Tool):
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": _ALL_ACTIONS},
-                "login": {"type": "integer", "description": "MT5 account number (action=login)."},
-                "password": {"type": "string", "description": "MT5 password (action=login)."},
-                "server": {"type": "string", "description": "Broker server, e.g. 'ICMarkets-Demo' (action=login)."},
+                "login": {"type": "integer", "description": "MT5 account number (action=login, or action=start to connect on boot)."},
+                "password": {"type": "string", "description": "MT5 password (action=login, or action=start). Pass login+password+server together or none of them."},
+                "server": {"type": "string", "description": "Broker server, e.g. 'ICMarkets-Demo' or 'MetaQuotes-Demo' (action=login, or action=start)."},
                 "path": {"type": "string", "description": "Explicit terminal64.exe path override (action=login)."},
                 "symbol": {"type": "string", "description": "Trading symbol, e.g. EURUSD (quote/candles/symbol/order)."},
                 "symbols": {"type": "string", "description": "Space/comma separated symbols for action=quote."},

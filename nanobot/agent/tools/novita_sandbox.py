@@ -142,10 +142,16 @@ def _git_creds_script() -> str:
 
 #: Automatic Novita sandbox sizing when the admin configured none. The stock
 #: "base" image ships ~486 MB which OOM-kills builds/OCR, so we default every
-#: spawned sandbox to a 2 GB box. Env (NOVITA_SANDBOX_MEMORY_MB / _CPU_COUNT) or
-#: execution.novita_template still override these; see _template_sizing().
+#: spawned sandbox to 4 GB. 2 GB was not enough for the documented heavy task —
+#: the Wine + MetaTrader 5 stack (MT5 docs/mt5-sandbox-login.md) needs ~4 GB:
+#: a 2 GB box is OOM-killed mid-prefix-build or when the terminal plus the
+#: MetaTrader5 bridge load numpy, which users saw as "the MT5 install hangs /
+#: the trade never happens". Env (NOVITA_SANDBOX_MEMORY_MB / _CPU_COUNT) or
+#: execution.novita_template still override these; see _template_sizing(). The
+#: admin UI default and the verified MT5 template (`powerx-base-4g-c2`) are
+#: both 4 GB, so this keeps the code path in step with the documentation.
 DEFAULT_TEMPLATE_CPU = 2
-DEFAULT_TEMPLATE_MEMORY_MB = 2048
+DEFAULT_TEMPLATE_MEMORY_MB = 4096
 
 _TELEGRAM_IMAGE_SCRIPT = r'''import json
 import os
@@ -1410,11 +1416,12 @@ class NovitaSandboxTool(Tool):
         Priority: NOVITA_SANDBOX_CPU_COUNT + NOVITA_SANDBOX_MEMORY_MB env vars
         (deployment-level), then the admin-saved execution.novita_template
         config. When NEITHER is set we now default to a sane sized box
-        (DEFAULT_TEMPLATE_CPU / DEFAULT_TEMPLATE_MEMORY_MB = 2 vCPU / 2 GB)
+        (DEFAULT_TEMPLATE_CPU / DEFAULT_TEMPLATE_MEMORY_MB = 2 vCPU / 4 GB)
         instead of returning None. Returning None previously let sandboxes fall
         back to the stock "base" image (~486 MB), which OOM-kills any nontrivial
-        build/OCR. So an admin who loads nothing still gets 2 GB per sandbox;
-        explicit config always overrides this default.
+        build/OCR; 2 GB then OOM-killed the Wine + MetaTrader 5 stack. So an
+        admin who loads nothing still gets 4 GB per sandbox; explicit config
+        always overrides this default.
         """
         cpu = memory = None
         try:
@@ -1437,8 +1444,9 @@ class NovitaSandboxTool(Tool):
                     cpu = int(getattr(template, "cpu_count", 2) or 2)
                 if memory is None:
                     memory = int(getattr(template, "memory_mb", 0) or 0)
-        # Nothing configured anywhere: apply the automatic 2 GB default rather
-        # than dropping to the tiny stock base image.
+        # Nothing configured anywhere: apply the automatic 4 GB default rather
+        # than dropping to the tiny stock base image (or the 2 GB that killed
+        # the Wine + MT5 install).
         if not memory:
             memory = DEFAULT_TEMPLATE_MEMORY_MB
         if not cpu:

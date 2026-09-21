@@ -608,14 +608,25 @@ if [ -d "${MT5_DIR}" ] && [ ! -d "${MT5_DIR}/MQL5/Include" ]; then
   # (it unpacks the MQL5 tree and probes the network). 180 s was not enough and
   # routinely tripped the timeout.
   #
-  # ``|| true`` is REQUIRED and is not belt-and-braces: bash runs the ERR trap
-  # regardless of ``set +e`` — that flag only disables the implicit exit, not the
-  # trap. Without it the ``timeout`` exit status of 124 reaches ``_on_error`` and
-  # marks the whole (otherwise successful) install as
-  # ``failed|installer exited with code 124``, even though terminal64.exe, the
-  # Wine prefix and all 237 stdlib headers are in place.
-  timeout "${MT5_LAUNCH_TIMEOUT:-600}" wine "${MT5_DIR}/terminal64.exe" >/dev/null 2>&1 || true
-  sleep 10
+  # MEASURED FAILURE (2026-09-21, real Novita sandbox): the old form here was
+  # ``timeout "${MT5_LAUNCH_TIMEOUT:-600}" wine terminal64.exe``, which HOLDS THE
+  # TERMINAL ALIVE for up to ten minutes (this run was still downloading an
+  # ``mt5onnx64`` LiveUpdate payload 80 s in). ``status`` flips to
+  # ``done`` the moment the tree exists, so the agent calls ``start`` while that
+  # credential-less terminal is still running -- and the old ``cmd_start`` skipped
+  # its own launch whenever *any* terminal was up, silently discarding the
+  # login/password/server it had just been given. MT5 then never authorized, and
+  # the agent was told to "pass login/password/server" that it HAD passed.
+  #
+  # So: launch it in the background, wait only for the tree, and kill it before
+  # reporting success. ``start`` is the only command that may own a live terminal.
+  nohup wine "${MT5_DIR}/terminal64.exe" >/dev/null 2>&1 &
+  launch_deadline=$(( $(date +%s) + ${MT5_LAUNCH_TIMEOUT:-600} ))
+  while [ ! -d "${MT5_DIR}/MQL5/Include" ] && [ "$(date +%s)" -lt "${launch_deadline}" ]; do
+    sleep 5
+  done
+  # Give the unpack a beat to finish writing, then reclaim the terminal.
+  sleep 5
   # Kill the terminal WITHOUT pattern-matching command lines.
   #
   # `pkill -f terminal64` is the classic self-kill: `-f` also matches (a) the
@@ -628,31 +639,45 @@ if [ -d "${MT5_DIR}" ] && [ ! -d "${MT5_DIR}/MQL5/Include" ]; then
   # So resolve the PIDs from /proc the same way scripts/mt5_cli.py does: a
   # process counts only when one of its argv fields IS the terminal path.
   python3 - <<'PYEOF' || true
-import os, signal
-me = os.getpid()
-targets = set()
-try:
-    entries = os.listdir("/proc")
-except OSError:
-    entries = []
-for entry in entries:
-    if not entry.isdigit():
-        continue
-    pid = int(entry)
-    if pid == me:
-        continue
+import os, signal, sys, time
+
+def terminal_pids():
+    found = set()
+    me = os.getpid()
     try:
-        with open(f"/proc/{pid}/cmdline", "rb") as fh:
-            args = [a.decode("utf-8", "replace") for a in fh.read().split(b"\x00") if a]
+        entries = os.listdir("/proc")
     except OSError:
-        continue
-    if any(a.lower().endswith("terminal64.exe") for a in args):
-        targets.add(pid)
-for pid in targets:
+        entries = []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                args = [a.decode("utf-8", "replace") for a in fh.read().split(b"\x00") if a]
+        except OSError:
+            continue
+        if any(a.lower().endswith("terminal64.exe") for a in args):
+            found.add(pid)
+    return found
+
+for pid in terminal_pids():
     try:
         os.kill(pid, signal.SIGKILL)
     except OSError:
         pass
+
+# `stage=done` must mean NO terminal is running: a leftover credential-less
+# terminal is exactly what made `start` silently drop the user's credentials.
+for _ in range(10):
+    if not terminal_pids():
+        break
+    time.sleep(1)
+left = terminal_pids()
+if left:
+    print(f"WARN: terminal still running after kill: {sorted(left)}", file=sys.stderr)
 PYEOF
   set -e
   if [ -d "${MT5_DIR}/MQL5/Include" ]; then
