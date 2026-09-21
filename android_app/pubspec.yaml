@@ -55,3 +55,8 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
+  assets:
+    # Brand artwork rasterised from webui/public/brand/nanobot_mark.svg by
+    # tool/generate_brand_assets.sh, so the APK wears the web's own mark.
+    - assets/brand/

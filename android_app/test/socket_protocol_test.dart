@@ -637,6 +637,70 @@ void main() {
     expect(isRecoverableTurnError('unknown type: \'foo\''), isFalse);
   });
 
+  test('a message for an unsubscribed chat is preceded by its attach frame',
+      () async {
+    // Production failure this locks in: a socket that creates a chat and posts
+    // into it receives `goal_status` and then nothing at all, because the
+    // gateway fans a chat's turn frames out only to the sockets that are
+    // ATTACHED to that chat. Frames are ordered on the wire, so the attach has
+    // to be written first.
+    await sock.connect();
+    sock.sendMessage('chat-A', 'run the task');
+    await pumpEventQueue();
+
+    final iAttach = gw.inbound.indexWhere(
+        (f) => f['type'] == 'attach' && f['chat_id'] == 'chat-A');
+    final iMessage = gw.inbound.indexWhere(
+        (f) => f['type'] == 'message' && f['content'] == 'run the task');
+    expect(iAttach, isNonNegative,
+        reason: 'an unattached chat must be subscribed before posting');
+    expect(iMessage, greaterThan(iAttach),
+        reason: 'the subscribe frame must reach the gateway first');
+
+    // Once the server has confirmed the subscription, posting again must not
+    // re-send the attach (the gateway logs a noisy duplicate otherwise).
+    gw.send({'event': 'attached', 'chat_id': 'chat-A'});
+    await pumpEventQueue();
+    final before = gw.attachCountFor('chat-A');
+    sock.sendMessage('chat-A', 'second task');
+    await pumpEventQueue();
+    expect(gw.attachCountFor('chat-A'), before);
+  });
+
+  test('a message queued offline reaches the gateway after the re-subscribe',
+      () async {
+    // The outbox used to flush ahead of the post-reconnect re-attach, so a
+    // buffered task landed on an unsubscribed socket: it ran server-side and
+    // streamed to nobody, and the app sat on a spinner.
+    await sock.connect();
+    const chatId = 'chat-A';
+    await sock.attach(chatId);
+    await pumpEventQueue();
+
+    await gw.dropConnection();
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+    sock.sendMessage(chatId, 'queued while offline');
+    expect(sock.isConnected, isFalse);
+
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while (DateTime.now().isBefore(deadline)) {
+      if (gw.inbound.any(
+          (f) => f['type'] == 'message' && f['content'] == 'queued while offline')) {
+        break;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    await pumpEventQueue();
+
+    final iMessage = gw.inbound.lastIndexWhere(
+        (f) => f['type'] == 'message' && f['content'] == 'queued while offline');
+    final iAttach = gw.inbound.lastIndexWhere(
+        (f) => f['type'] == 'attach' && f['chat_id'] == chatId);
+    expect(iMessage, isNonNegative, reason: 'the queued task must not be lost');
+    expect(iAttach, lessThan(iMessage),
+        reason: 'the reconnect must re-subscribe before the buffered task');
+  });
+
   test('voice note transcription correlates result and error frames', () async {
     await sock.connect();
     final chatId = await sock.newChat();

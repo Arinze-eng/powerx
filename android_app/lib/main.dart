@@ -10,8 +10,10 @@ import 'screens/auth_screen.dart';
 import 'screens/home_screen.dart';
 import 'screens/settings_screen.dart';
 import 'state/app_state.dart';
+import 'state/theme_controller.dart';
 import 'theme/app_theme.dart';
 import 'theme/palette.dart';
+import 'theme/tokens.dart';
 import 'widgets/brand.dart';
 
 /// Global crash fence.
@@ -46,14 +48,6 @@ void main() {
   runZonedGuarded(
     () {
       WidgetsFlutterBinding.ensureInitialized();
-      SystemChrome.setSystemUIOverlayStyle(
-        const SystemUiOverlayStyle(
-          statusBarColor: Colors.transparent,
-          systemNavigationBarColor: Palette.bg0,
-          statusBarIconBrightness: Brightness.light,
-          systemNavigationBarIconBrightness: Brightness.light,
-        ),
-      );
       runApp(const PowerXApp());
     },
     (error, stack) {
@@ -69,34 +63,70 @@ class PowerXApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ChangeNotifierProvider(
-      create: (_) => AppState()..init(),
-      child: MaterialApp(
-        title: PowerXConfig.appName,
-        debugShowCheckedModeBanner: false,
-        theme: AppTheme.build(),
-        home: const _RootGate(),
-        routes: {
-          '/auth': (_) => const AuthScreen(),
-          '/home': (_) => const HomeScreen(),
-          '/settings': (_) => const SettingsScreen(),
-        },
-        builder: (context, child) {
-          // Never let the OS font-scaling setting break the layout: clamp it
-          // to a sane range so tall accessibility settings cannot overflow
-          // the composer or the status pill.
-          final mq = MediaQuery.of(context);
-          return MediaQuery(
-            data: mq.copyWith(
-              textScaler: mq.textScaler.clamp(
-                minScaleFactor: 0.85,
-                maxScaleFactor: 1.3,
-              ),
-            ),
-            child: child ?? const SizedBox.shrink(),
-          );
-        },
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => ThemeController()..load()),
+        ChangeNotifierProvider(create: (_) => AppState()..init()),
+      ],
+      child: const _App(),
+    );
+  }
+}
+
+/// The root widget below the providers: resolves the active scheme once and
+/// hands it to both `MaterialApp` and the legacy [Palette] facade.
+///
+/// The facade is pointed at the resolved palette *before* the subtree builds,
+/// which is what lets every screen that still reads `Palette.bg0` follow the
+/// theme without each one being rewritten first.
+class _App extends StatelessWidget {
+  const _App();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = context.watch<ThemeController>();
+    final dark = theme.isDark;
+    Palette.activate(dark ? WebPalette.dark : WebPalette.light);
+
+    // Status/navigation bars follow the scheme, the way the web's
+    // `meta[name=theme-color]` swap does.
+    SystemChrome.setSystemUIOverlayStyle(
+      SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        systemNavigationBarColor: Palette.bg0,
+        statusBarIconBrightness: dark ? Brightness.light : Brightness.dark,
+        systemNavigationBarIconBrightness:
+            dark ? Brightness.light : Brightness.dark,
       ),
+    );
+
+    return MaterialApp(
+      title: PowerXConfig.appName,
+      debugShowCheckedModeBanner: false,
+      theme: AppTheme.light(),
+      darkTheme: AppTheme.dark(),
+      themeMode: theme.mode,
+      home: const _RootGate(),
+      routes: {
+        '/auth': (_) => const AuthScreen(),
+        '/home': (_) => const HomeScreen(),
+        '/settings': (_) => const SettingsScreen(),
+      },
+      builder: (context, child) {
+        // Never let the OS font-scaling setting break the layout: clamp it
+        // to a sane range so tall accessibility settings cannot overflow
+        // the composer or the status pill.
+        final mq = MediaQuery.of(context);
+        return MediaQuery(
+          data: mq.copyWith(
+            textScaler: mq.textScaler.clamp(
+              minScaleFactor: 0.85,
+              maxScaleFactor: 1.3,
+            ),
+          ),
+          child: child ?? const SizedBox.shrink(),
+        );
+      },
     );
   }
 }
@@ -143,10 +173,11 @@ class _SplashViewState extends State<SplashView>
 
   @override
   Widget build(BuildContext context) {
+    final p = context.palette;
     return Scaffold(
-      backgroundColor: Palette.bg0,
+      backgroundColor: p.background,
       body: DecoratedBox(
-        decoration: const BoxDecoration(gradient: Palette.heroGlow),
+        decoration: BoxDecoration(gradient: Palette.heroGlow),
         child: Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -156,32 +187,32 @@ class _SplashViewState extends State<SplashView>
                   begin: 0.96,
                   end: 1.04,
                 ).animate(CurvedAnimation(parent: _c, curve: Curves.easeInOut)),
-                child: const BrandMark(size: 92),
+                child: const BrandMark(size: 84, radius: WebRadii.panel),
               ),
-              const SizedBox(height: 24),
-              const Text(
+              const SizedBox(height: 22),
+              Text(
                 PowerXConfig.appName,
                 style: TextStyle(
-                  fontSize: 26,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 1.2,
-                  color: Palette.textPrimary,
+                  fontSize: 28,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 1.4,
+                  color: p.foreground,
                 ),
               ),
-              const SizedBox(height: 8),
-              const Text(
+              const SizedBox(height: 6),
+              Text(
                 PowerXConfig.tagline,
-                style: TextStyle(fontSize: 13, color: Palette.textTertiary),
+                style: TextStyle(fontSize: 13, color: p.mutedForeground),
               ),
-              const SizedBox(height: 34),
+              const SizedBox(height: 32),
               FadeTransition(
                 opacity: Tween(begin: 0.3, end: 1.0).animate(_c),
-                child: const SizedBox(
-                  width: 26,
-                  height: 26,
+                child: SizedBox(
+                  width: 24,
+                  height: 24,
                   child: CircularProgressIndicator(
-                    strokeWidth: 2.4,
-                    color: Palette.accent,
+                    strokeWidth: 2.2,
+                    color: p.primary,
                   ),
                 ),
               ),

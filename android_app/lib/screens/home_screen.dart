@@ -6,7 +6,12 @@ import '../state/app_state.dart';
 import '../theme/palette.dart';
 import '../utils/session_groups.dart';
 import '../widgets/brand.dart';
+import '../widgets/sidebar.dart';
+import '../widgets/sidebar_actions.dart';
+import '../widgets/theme_toggle.dart';
 import 'chat_screen.dart';
+import 'settings_screen.dart';
+import 'settings_sections.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -56,16 +61,149 @@ class _HomeScreenState extends State<HomeScreen> {
     if (mounted) context.read<AppState>().loadSessions();
   }
 
+  /// True while a delete round-trip is in flight, so the menu cannot be
+  /// fired twice for the same conversation.
+  bool _deleting = false;
+
+  /// Delete with full feedback: the gateway refuses (HTTP 200 +
+  /// `blocked_by_automations`) when scheduled automations are attached, so the
+  /// user is told exactly what blocks the delete and offered a force option.
+  Future<void> _delete(SessionSummary session) async {
+    if (_deleting) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder:
+          (_) => AlertDialog(
+            title: const Text('Delete conversation?'),
+            content: Text(
+              '"${session.displayTitle}" and its history will be '
+              'removed. This cannot be undone.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, true),
+                child:  Text(
+                  'Delete',
+                  style: TextStyle(color: Palette.danger),
+                ),
+              ),
+            ],
+          ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _deleting = true);
+    try {
+      final result = await context.read<AppState>().deleteSession(session);
+      if (!mounted) return;
+      if (result.deleted) {
+        _snack('Conversation deleted.');
+        return;
+      }
+      if (result.blockedByAutomations) {
+        final names =
+            result.automations.isEmpty
+                ? 'a scheduled automation'
+                : result.automations.join(', ');
+        final force = await showDialog<bool>(
+          context: context,
+          builder:
+              (_) => AlertDialog(
+                title: const Text('Automation attached'),
+                content: Text(
+                  'This chat still has $names attached. Delete the '
+                  'conversation and its automations?',
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('Keep'),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child:  Text(
+                      'Delete both',
+                      style: TextStyle(color: Palette.danger),
+                    ),
+                  ),
+                ],
+              ),
+        );
+        if (force == true && mounted) {
+          final forced = await context.read<AppState>().deleteSession(
+            session,
+            deleteAutomations: true,
+          );
+          if (!mounted) return;
+          _snack(
+            forced.deleted
+                ? 'Conversation and automations deleted.'
+                : 'The server did not delete this conversation.',
+          );
+        }
+        return;
+      }
+      _snack('The server did not delete this conversation.');
+    } catch (e) {
+      if (mounted) _snack('Delete failed: $e');
+    } finally {
+      if (mounted) setState(() => _deleting = false);
+    }
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
     return Scaffold(
       key: _scaffold,
       backgroundColor: Palette.bg0,
-      drawer: _SessionsDrawer(
-        state: state,
-        onNew: () => _newChat(),
-        onOpen: _openSession,
+      drawer: SidebarPanel(
+        sessions: state.sessions,
+        sessionsLoading: state.sessionsLoading,
+        activeKey: null,
+        newChatActive: true,
+        socketStatus: state.socketStatus,
+        credits: state.credits,
+        footer: _CreditStrip(
+          state: state,
+          onTap: () {
+            _scaffold.currentState?.closeDrawer();
+            Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const SettingsScreen()),
+            );
+          },
+        ),
+        onNewChat: () => _newChat(),
+        onOpenSession: _openSession,
+        onCloseDrawer: () => _scaffold.currentState?.closeDrawer(),
+        onRequestDelete: _delete,
+        onOpenSection: (action) {
+          _scaffold.currentState?.closeDrawer();
+          switch (action) {
+            case SidebarAction.newChat:
+              _newChat();
+            case SidebarAction.search:
+              break;
+            default:
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder:
+                      (_) => SettingsScreen(
+                        initialSection: SettingsSection.fromId(action.sectionId),
+                      ),
+                ),
+              );
+          }
+        },
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: () => _newChat(),
@@ -167,6 +305,7 @@ class _WorkspaceBar extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 6),
+          const ThemeToggleButton(),
           IconButton(
             onPressed: onSearch,
             icon: const Icon(Icons.search_rounded, size: 21),
@@ -274,7 +413,7 @@ class _TasksView extends StatelessWidget {
             sliver: SliverToBoxAdapter(
               child: Row(
                 children: [
-                  const Text(
+                   Text(
                     'RECENT',
                     style: TextStyle(
                       color: Palette.textTertiary,
@@ -285,7 +424,7 @@ class _TasksView extends StatelessWidget {
                   ),
                   const Spacer(),
                   if (state.sessionsLoading)
-                    const SizedBox(
+                     SizedBox(
                       width: 13,
                       height: 13,
                       child: CircularProgressIndicator(
@@ -309,14 +448,14 @@ class _TasksView extends StatelessWidget {
                     const SizedBox(height: 18),
                     Text(
                       'Hi ${state.greetingName}',
-                      style: const TextStyle(
+                      style:  TextStyle(
                         fontSize: 20,
                         fontWeight: FontWeight.w800,
                         color: Palette.textPrimary,
                       ),
                     ),
                     const SizedBox(height: 8),
-                    const Text(
+                     Text(
                       'No tasks yet. Start one and it keeps running\n'
                       'in the cloud even if you close the app.',
                       textAlign: TextAlign.center,
@@ -366,7 +505,7 @@ class _AgentView extends StatelessWidget {
         Center(
           child: Text(
             'Hi ${state.greetingName}',
-            style: const TextStyle(
+            style:  TextStyle(
               fontSize: 24,
               fontWeight: FontWeight.w800,
               color: Palette.textPrimary,
@@ -374,7 +513,7 @@ class _AgentView extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 8),
-        const Center(
+         Center(
           child: Text(
             'Assign a task. It runs in the cloud and keeps going\n'
             'even when this app is closed.',
@@ -394,7 +533,7 @@ class _AgentView extends StatelessWidget {
           style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(50)),
         ),
         const SizedBox(height: 26),
-        const Text(
+         Text(
           'TRY ASKING FOR',
           style: TextStyle(
             color: Palette.textTertiary,
@@ -447,7 +586,7 @@ class _QuickTile extends StatelessWidget {
               const SizedBox(height: 7),
               Text(
                 label,
-                style: const TextStyle(
+                style:  TextStyle(
                   color: Palette.textSecondary,
                   fontSize: 12.5,
                   fontWeight: FontWeight.w600,
@@ -483,7 +622,7 @@ class _TaskRow extends StatelessWidget {
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Padding(
+                 Padding(
                   padding: EdgeInsets.only(top: 2),
                   child: Icon(
                     Icons.chat_bubble_outline_rounded,
@@ -500,7 +639,7 @@ class _TaskRow extends StatelessWidget {
                         session.displayTitle,
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
+                        style:  TextStyle(
                           fontSize: 14.5,
                           height: 1.3,
                           color: Palette.textPrimary,
@@ -512,7 +651,7 @@ class _TaskRow extends StatelessWidget {
                           session.preview,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
+                          style:  TextStyle(
                             fontSize: 12,
                             color: Palette.textTertiary,
                           ),
@@ -525,7 +664,7 @@ class _TaskRow extends StatelessWidget {
                   const SizedBox(width: 8),
                   Text(
                     relativeDayLabel(session.updatedAt!),
-                    style: const TextStyle(
+                    style:  TextStyle(
                       fontSize: 11,
                       color: Palette.textTertiary,
                     ),
@@ -583,7 +722,7 @@ class _StarterCard extends StatelessWidget {
                   children: [
                     Text(
                       prompt.title,
-                      style: const TextStyle(
+                      style:  TextStyle(
                         fontSize: 14.5,
                         fontWeight: FontWeight.w700,
                         color: Palette.textPrimary,
@@ -594,7 +733,7 @@ class _StarterCard extends StatelessWidget {
                       prompt.subtitle,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
+                      style:  TextStyle(
                         fontSize: 12.5,
                         color: Palette.textTertiary,
                       ),
@@ -602,7 +741,7 @@ class _StarterCard extends StatelessWidget {
                   ],
                 ),
               ),
-              const Icon(
+               Icon(
                 Icons.arrow_outward_rounded,
                 size: 16,
                 color: Palette.textTertiary,
@@ -615,477 +754,38 @@ class _StarterCard extends StatelessWidget {
   }
 }
 
-/// History drawer: search, new chat, conversations grouped by recency, credit
-/// balance and the account row.
-class _SessionsDrawer extends StatefulWidget {
-  const _SessionsDrawer({
-    required this.state,
-    required this.onNew,
-    required this.onOpen,
-  });
-  final AppState state;
-  final VoidCallback onNew;
-  final void Function(SessionSummary) onOpen;
-
-  @override
-  State<_SessionsDrawer> createState() => _SessionsDrawerState();
-}
-
-class _SessionsDrawerState extends State<_SessionsDrawer> {
-  final TextEditingController _query = TextEditingController();
-  String _filter = '';
-  bool _deleting = false;
-
-  @override
-  void dispose() {
-    _query.dispose();
-    super.dispose();
-  }
-
-  List<SessionSummary> get _visible =>
-      filterSessions(widget.state.sessions, _filter);
-
-  /// Delete with full feedback: the gateway refuses (HTTP 200 +
-  /// `blocked_by_automations`) when scheduled automations are attached, so the
-  /// user is told exactly what blocks the delete and offered a force option.
-  Future<void> _delete(SessionSummary session) async {
-    if (_deleting) return;
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder:
-          (_) => AlertDialog(
-            title: const Text('Delete conversation?'),
-            content: Text(
-              '"${session.displayTitle}" and its history will be '
-              'removed. This cannot be undone.',
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('Cancel'),
-              ),
-              TextButton(
-                onPressed: () => Navigator.pop(context, true),
-                child: const Text(
-                  'Delete',
-                  style: TextStyle(color: Palette.danger),
-                ),
-              ),
-            ],
-          ),
-    );
-    if (confirmed != true || !mounted) return;
-
-    setState(() => _deleting = true);
-    try {
-      final result = await widget.state.deleteSession(session);
-      if (!mounted) return;
-      if (result.deleted) {
-        _snack('Conversation deleted.');
-        return;
-      }
-      if (result.blockedByAutomations) {
-        final names =
-            result.automations.isEmpty
-                ? 'a scheduled automation'
-                : result.automations.join(', ');
-        final force = await showDialog<bool>(
-          context: context,
-          builder:
-              (_) => AlertDialog(
-                title: const Text('Automation attached'),
-                content: Text(
-                  'This chat still has $names attached. Delete the '
-                  'conversation and its automations?',
-                ),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(context, false),
-                    child: const Text('Keep'),
-                  ),
-                  TextButton(
-                    onPressed: () => Navigator.pop(context, true),
-                    child: const Text(
-                      'Delete both',
-                      style: TextStyle(color: Palette.danger),
-                    ),
-                  ),
-                ],
-              ),
-        );
-        if (force == true && mounted) {
-          final forced = await widget.state.deleteSession(
-            session,
-            deleteAutomations: true,
-          );
-          if (!mounted) return;
-          _snack(
-            forced.deleted
-                ? 'Conversation and automations deleted.'
-                : 'The server did not delete this conversation.',
-          );
-        }
-        return;
-      }
-      _snack('The server did not delete this conversation.');
-    } catch (e) {
-      if (mounted) _snack('Delete failed: $e');
-    } finally {
-      if (mounted) setState(() => _deleting = false);
-    }
-  }
-
-  void _snack(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final state = widget.state;
-    final rows = _visible;
-    final groups = groupSessions(rows);
-
-    return Drawer(
-      backgroundColor: Palette.bg1,
-      child: SafeArea(
-        child: Column(
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 14, 8, 4),
-              child: Row(
-                children: [
-                  const BrandWordmark(fontSize: 15),
-                  const Spacer(),
-                  IconButton(
-                    onPressed: () => Navigator.of(context).pop(),
-                    icon: const Icon(Icons.close_rounded),
-                    tooltip: 'Close',
-                  ),
-                ],
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(14, 6, 14, 8),
-              child: SizedBox(
-                width: double.infinity,
-                child: FilledButton.icon(
-                  onPressed: widget.onNew,
-                  icon: const Icon(Icons.add_rounded, size: 19),
-                  label: const Text('New task'),
-                  style: FilledButton.styleFrom(
-                    minimumSize: const Size.fromHeight(46),
-                  ),
-                ),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 14),
-              child: TextField(
-                controller: _query,
-                onChanged: (v) => setState(() => _filter = v),
-                style: const TextStyle(fontSize: 14),
-                decoration: InputDecoration(
-                  isDense: true,
-                  hintText: 'Search conversations',
-                  prefixIcon: const Icon(
-                    Icons.search_rounded,
-                    size: 18,
-                    color: Palette.textTertiary,
-                  ),
-                  suffixIcon:
-                      _filter.isEmpty
-                          ? null
-                          : IconButton(
-                            icon: const Icon(Icons.clear_rounded, size: 18),
-                            onPressed: () {
-                              _query.clear();
-                              setState(() => _filter = '');
-                            },
-                          ),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 11,
-                  ),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
-                    borderSide: BorderSide.none,
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 6),
-            Expanded(
-              child:
-                  state.sessionsLoading && state.sessions.isEmpty
-                      ? const Center(
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2.4,
-                          color: Palette.accent,
-                        ),
-                      )
-                      : RefreshIndicator(
-                        onRefresh: () => state.loadSessions(),
-                        color: Palette.accent,
-                        backgroundColor: Palette.bg2,
-                        child: ListView(
-                          padding: const EdgeInsets.fromLTRB(8, 4, 8, 12),
-                          children: [
-                            for (final g in groups) ...[
-                              Padding(
-                                padding: const EdgeInsets.fromLTRB(
-                                  10,
-                                  14,
-                                  10,
-                                  6,
-                                ),
-                                child: Text(
-                                  g.label,
-                                  style: const TextStyle(
-                                    color: Palette.textTertiary,
-                                    fontSize: 11.5,
-                                    fontWeight: FontWeight.w700,
-                                    letterSpacing: 0.7,
-                                  ),
-                                ),
-                              ),
-                              for (final s in g.rows)
-                                _SessionTile(
-                                  key: ValueKey(s.key),
-                                  session: s,
-                                  onTap: () => widget.onOpen(s),
-                                  onDelete: () => _delete(s),
-                                ),
-                            ],
-                            if (rows.isEmpty)
-                              Padding(
-                                padding: const EdgeInsets.all(26),
-                                child: Center(
-                                  child: Text(
-                                    state.sessions.isEmpty
-                                        ? 'No conversations yet.\nStart a new chat to begin.'
-                                        : 'No matches for "$_filter"',
-                                    textAlign: TextAlign.center,
-                                    style: const TextStyle(
-                                      color: Palette.textTertiary,
-                                      fontSize: 13.5,
-                                      height: 1.5,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                          ],
-                        ),
-                      ),
-            ),
-            const Divider(height: 1),
-            _CreditStrip(state: state),
-            _AccountRow(
-              state: state,
-              onSettings: () {
-                Navigator.of(context).pop();
-                Navigator.of(context).pushNamed('/settings');
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// One conversation row: title, preview, recency and a delete action.
-class _SessionTile extends StatelessWidget {
-  const _SessionTile({
-    super.key,
-    required this.session,
-    required this.onTap,
-    required this.onDelete,
-  });
-  final SessionSummary session;
-  final VoidCallback onTap;
-  final VoidCallback onDelete;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 2),
-      child: Material(
-        color: Colors.transparent,
-        borderRadius: BorderRadius.circular(11),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(11),
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(10, 9, 4, 9),
-            child: Row(
-              children: [
-                const Icon(
-                  Icons.chat_bubble_outline_rounded,
-                  size: 16,
-                  color: Palette.textTertiary,
-                ),
-                const SizedBox(width: 11),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        session.displayTitle,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Palette.textPrimary,
-                          fontSize: 14,
-                        ),
-                      ),
-                      if (session.preview.isNotEmpty) ...[
-                        const SizedBox(height: 2),
-                        Text(
-                          session.preview,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Palette.textTertiary,
-                            fontSize: 12,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-                PopupMenuButton<String>(
-                  icon: const Icon(
-                    Icons.more_vert_rounded,
-                    color: Palette.textTertiary,
-                    size: 18,
-                  ),
-                  tooltip: 'Options',
-                  onSelected: (v) {
-                    if (v == 'delete') onDelete();
-                  },
-                  itemBuilder:
-                      (_) => const [
-                        PopupMenuItem(
-                          value: 'delete',
-                          child: Row(
-                            children: [
-                              Icon(
-                                Icons.delete_outline_rounded,
-                                size: 17,
-                                color: Palette.danger,
-                              ),
-                              SizedBox(width: 8),
-                              Text('Delete'),
-                            ],
-                          ),
-                        ),
-                      ],
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 class _CreditStrip extends StatelessWidget {
-  const _CreditStrip({required this.state});
+  const _CreditStrip({required this.state, required this.onTap});
   final AppState state;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     final c = state.credits;
     return InkWell(
-      onTap: () {
-        Navigator.of(context).pop();
-        Navigator.of(context).pushNamed('/settings');
-      },
+      onTap: onTap,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 11),
         child: Row(
           children: [
-            const Icon(Icons.bolt_rounded, size: 18, color: Palette.warning),
+             Icon(Icons.bolt_rounded, size: 18, color: Palette.warning),
             const SizedBox(width: 8),
             Text(
               c != null ? '${c.total} credits' : 'Credits',
-              style: const TextStyle(
+              style:  TextStyle(
                 color: Palette.textSecondary,
                 fontWeight: FontWeight.w600,
                 fontSize: 13.5,
               ),
             ),
             const Spacer(),
-            const Icon(
+             Icon(
               Icons.chevron_right_rounded,
               color: Palette.textTertiary,
               size: 20,
             ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class _AccountRow extends StatelessWidget {
-  const _AccountRow({required this.state, required this.onSettings});
-  final AppState state;
-  final VoidCallback onSettings;
-
-  @override
-  Widget build(BuildContext context) {
-    final name =
-        state.displayName?.isNotEmpty == true
-            ? state.displayName!
-            : (state.email ?? 'Signed in');
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 10),
-      child: Row(
-        children: [
-          ChatAvatar(isAssistant: false, initial: state.greetingName, size: 34),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Palette.textPrimary,
-                    fontSize: 13.5,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                if (state.displayName?.isNotEmpty == true &&
-                    (state.email ?? '').isNotEmpty)
-                  Text(
-                    state.email!,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: Palette.textTertiary,
-                      fontSize: 11.5,
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          IconButton(
-            icon: const Icon(Icons.settings_outlined, size: 20),
-            tooltip: 'Settings',
-            onPressed: onSettings,
-          ),
-          IconButton(
-            icon: const Icon(Icons.logout_rounded, size: 20),
-            tooltip: 'Sign out',
-            onPressed: () => state.signOut(),
-          ),
-        ],
       ),
     );
   }

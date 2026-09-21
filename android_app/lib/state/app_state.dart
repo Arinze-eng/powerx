@@ -10,9 +10,14 @@ import '../services/device_id.dart';
 import '../services/gateway_api.dart';
 import '../services/nanobot_socket.dart';
 import '../services/pending_sends.dart';
+import '../services/settings_api.dart';
 import '../services/supabase_auth.dart';
 
 enum AppStatus { loading, unauthenticated, authenticating, authenticated, error }
+
+/// Mirrors `webui/src/lib/types.ts` `ConnectionStatus`, so the badge reads the
+/// same on both clients.
+enum AppSocketStatus { idle, connecting, open, reconnecting, closed, error }
 
 /// Gateway token TTL is short (300 s observed). Refresh well before expiry,
 /// mirroring the WebUI constants (margin 30 s, minimum delay 5 s).
@@ -91,6 +96,84 @@ class AppState extends ChangeNotifier {
 
   /// Whether the chat socket is currently connected.
   bool socketConnected = false;
+
+  /// Socket state for the connection badge, mirroring the web's
+  /// `ConnectionStatus` union so the indicator reads the same on both clients.
+  AppSocketStatus socketStatus = AppSocketStatus.idle;
+
+  // ---- Settings ---------------------------------------------------------
+  /// REST client for the gateway's settings surface. Reads go over HTTP,
+  /// writes go over the chat socket (see [mutate]).
+  final SettingsApi settingsApi = SettingsApi();
+
+  SettingsSnapshot? settings;
+  bool settingsLoading = false;
+  String? settingsError;
+  List<NanobotFeature> features = const [];
+  List<SkillInfo> skills = const [];
+  List<McpPreset> mcpPresets = const [];
+  List<PairingRequestInfo> pairing = const [];
+  List<CliAppInfo> cliApps = const [];
+  List<AutomationJob> automations = const [];
+  AppVersionInfo? appVersion;
+
+  /// Load the whole settings surface in one round trip. Individual failures are
+  /// tolerated: the account that has not enabled image generation still gets a
+  /// usable Models/Appearance page rather than an error screen.
+  Future<void> loadSettings() async {
+    final api = _apiToken;
+    if (api == null) return;
+    settingsLoading = true;
+    settingsError = null;
+    notifyListeners();
+    final sb = accessToken;
+    try {
+      settings = await settingsApi.fetchSettings(api, sb);
+    } catch (e) {
+      settingsError = e.toString();
+    }
+    Future<void> soft<T>(Future<T> Function() run, void Function(T) keep) async {
+      try {
+        keep(await run());
+      } catch (_) {
+        // Optional section: leave the previous value in place.
+      }
+    }
+
+    await Future.wait([
+      soft(() => settingsApi.fetchFeatures(api, sb), (v) => features = v),
+      soft(() => settingsApi.fetchSkills(api, sb), (v) => skills = v),
+      soft(() => settingsApi.fetchMcpPresets(api, sb), (v) => mcpPresets = v),
+      soft(() => settingsApi.fetchPairing(api, sb), (v) => pairing = v),
+      soft(() => settingsApi.fetchVersion(api, sb), (v) => appVersion = v),
+    ]);
+    settingsLoading = false;
+    notifyListeners();
+  }
+
+  /// Refresh just the settings document after a successful write.
+  Future<void> refreshSettings() async {
+    final api = _apiToken;
+    if (api == null) return;
+    try {
+      settings = await settingsApi.fetchSettings(api, accessToken);
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Run one WebUI mutation over the authenticated socket.
+  ///
+  /// This is the *only* channel the gateway accepts settings writes on: a plain
+  /// HTTP POST to `/api/settings/**` is rejected with
+  /// `405 WebUI mutations require an authenticated WebSocket`. Routing every
+  /// write through here is what keeps the app at parity with the browser.
+  Future<Map<String, dynamic>> mutate(
+    String action,
+    Map<String, dynamic> payload,
+  ) async {
+    final sock = await ensureSocket();
+    return sock.mutate(action, payload);
+  }
 
   /// Discover Supabase config from the gateway and restore any saved session.
   Future<void> init() async {
@@ -664,6 +747,7 @@ class AppState extends ChangeNotifier {
         // Offline / gateway down: keep the socket object. Outbound frames are
         // queued and flushed on the automatic reconnect, so a message typed
         // during a blip is not lost mid-task.
+        socketStatus = AppSocketStatus.error;
       }
     }
     return sock;

@@ -78,7 +78,7 @@ class _AuthScreenState extends State<AuthScreen> {
     return Scaffold(
       backgroundColor: Palette.bg0,
       body: DecoratedBox(
-        decoration: const BoxDecoration(gradient: Palette.heroGlow),
+        decoration:  BoxDecoration(gradient: Palette.heroGlow),
         child: SafeArea(
           child: Center(
             child: SingleChildScrollView(
@@ -91,7 +91,7 @@ class _AuthScreenState extends State<AuthScreen> {
                     const SizedBox(height: 12),
                     const Center(child: BrandMark(size: 76)),
                     const SizedBox(height: 20),
-                    const Center(
+                     Center(
                       child: Text(
                         PowerXConfig.appName,
                         style: TextStyle(
@@ -108,7 +108,7 @@ class _AuthScreenState extends State<AuthScreen> {
                         _isSignUp
                             ? 'Create your account'
                             : 'Welcome back — sign in to continue',
-                        style: const TextStyle(
+                        style:  TextStyle(
                           color: Palette.textTertiary,
                           fontSize: 13.5,
                         ),
@@ -128,7 +128,7 @@ class _AuthScreenState extends State<AuthScreen> {
                       onSubmitted: (_) => _submit(),
                       decoration: InputDecoration(
                         labelText: 'Password',
-                        prefixIcon: const Icon(
+                        prefixIcon:  Icon(
                           Icons.lock_outline,
                           color: Palette.textTertiary,
                         ),
@@ -150,7 +150,7 @@ class _AuthScreenState extends State<AuthScreen> {
                         false,
                       ),
                       const SizedBox(height: 8),
-                      const Padding(
+                       Padding(
                         padding: EdgeInsets.only(left: 4),
                         child: Text(
                           "Enter your friend's email as a referral code and get "
@@ -197,7 +197,7 @@ class _AuthScreenState extends State<AuthScreen> {
                           _isSignUp
                               ? 'Already have an account?'
                               : 'New to ${PowerXConfig.appName}?',
-                          style: const TextStyle(
+                          style:  TextStyle(
                             color: Palette.textTertiary,
                             fontSize: 13.5,
                           ),
@@ -210,7 +210,7 @@ class _AuthScreenState extends State<AuthScreen> {
                               }),
                           child: Text(
                             _isSignUp ? 'Sign in' : 'Create one',
-                            style: const TextStyle(
+                            style:  TextStyle(
                               fontWeight: FontWeight.w700,
                               color: Palette.accentSoft,
                             ),

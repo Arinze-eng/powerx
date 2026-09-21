@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Native-feel splash: solid dark brand color, no white flash on cold start. -->
+<!-- Native-feel splash: the web app's own canvas colour (values/colors.xml
+     in light mode, values-night/colors.xml in dark), so the cold start is the
+     first paint of the app theme rather than a flash of an unrelated colour. -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:drawable="@color/powerx_splash" />
 </layer-list>

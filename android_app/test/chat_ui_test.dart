@@ -51,7 +51,7 @@ void main() {
                 padding: const EdgeInsets.fromLTRB(10, 9, 4, 9),
                 child: Row(
                   children: [
-                    const Icon(Icons.chat_bubble_outline_rounded,
+                    Icon(Icons.chat_bubble_outline_rounded,
                         size: 16, color: Palette.textTertiary),
                     const SizedBox(width: 11),
                     Expanded(
@@ -61,18 +61,18 @@ void main() {
                           Text(s.displayTitle,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
+                              style: TextStyle(
                                   color: Palette.textPrimary, fontSize: 14)),
                           if (s.preview.isNotEmpty)
                             Text(s.preview,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
+                                style: TextStyle(
                                     color: Palette.textTertiary, fontSize: 12)),
                         ],
                       ),
                     ),
-                    const Icon(Icons.more_vert_rounded,
+                    Icon(Icons.more_vert_rounded,
                         color: Palette.textTertiary, size: 18),
                   ],
                 ),
@@ -125,7 +125,7 @@ void main() {
                 Padding(
                   padding: const EdgeInsets.fromLTRB(10, 14, 10, 6),
                   child: Text(g.label,
-                      style: const TextStyle(
+                      style: TextStyle(
                           color: Palette.textTertiary,
                           fontSize: 11.5,
                           fontWeight: FontWeight.w700)),
@@ -155,7 +155,7 @@ void main() {
         (tester) async {
       await tester.pumpWidget(MaterialApp(
         theme: AppTheme.build(),
-        home: const Scaffold(
+        home: Scaffold(
           backgroundColor: Palette.bg0,
           body: Column(
             mainAxisAlignment: MainAxisAlignment.center,

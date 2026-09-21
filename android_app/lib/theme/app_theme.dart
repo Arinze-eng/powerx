@@ -1,346 +1,412 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 
-import 'palette.dart';
+import 'tokens.dart';
 
-/// Builds the single dark "coffee" theme used across the app.
+/// Builds the two themes the WebUI ships — the warm "paper" light theme and the
+/// warm brown dark theme — from [WebPalette].
 ///
-/// Everything visual — colour scheme, typography, app bar, inputs, buttons,
-/// dialogs, drawers — is derived here so individual widgets stay lean and
-/// consistent.
+/// Nothing here invents a colour: every value is a web token, so a change in
+/// `webui/src/globals.css` maps to one edit in `theme/tokens.dart`. Buttons,
+/// inputs, dialogs, sheets, switches and the markdown sheet are all derived
+/// from those tokens so the native client reads as the same product as the web
+/// app rather than a lookalike.
 class AppTheme {
   const AppTheme._();
 
-  static ThemeData build() {
-    const scheme = ColorScheme(
-      brightness: Brightness.dark,
-      primary: Palette.accent,
-      onPrimary: Colors.white,
-      primaryContainer: Palette.accentDeep,
-      onPrimaryContainer: Palette.textPrimary,
-      secondary: Palette.accentSoft,
-      onSecondary: Colors.white,
-      secondaryContainer: Palette.bg3,
-      onSecondaryContainer: Palette.textPrimary,
-      tertiary: Palette.warning,
-      onTertiary: Colors.white,
-      error: Palette.danger,
-      onError: Colors.white,
-      surface: Palette.bg0,
-      onSurface: Palette.textPrimary,
-      surfaceContainerLowest: Palette.bg0,
-      surfaceContainerLow: Palette.bg1,
-      surfaceContainer: Palette.bg2,
-      surfaceContainerHigh: Palette.bg3,
-      surfaceContainerHighest: Palette.bg4,
-      onSurfaceVariant: Palette.textSecondary,
-      outline: Palette.border,
-      outlineVariant: Palette.borderSoft,
-      shadow: Color(0xFF000000),
-      scrim: Color(0xFF000000),
-      inverseSurface: Palette.textPrimary,
-      onInverseSurface: Palette.bg0,
-      inversePrimary: Palette.accentDeep,
+  static ThemeData light() => _build(WebPalette.light);
+  static ThemeData dark() => _build(WebPalette.dark);
+
+  /// Theme for an explicit [ThemeMode] + platform brightness.
+  static ThemeData forMode(ThemeMode mode, Brightness platform) {
+    return isDark(mode, platform) ? dark() : light();
+  }
+
+  /// Whether [mode] resolves to the dark scheme on a device whose system
+  /// setting is [platform] — the same rule `useTheme.ts` applies with
+  /// `prefers-color-scheme`.
+  static bool isDark(ThemeMode mode, Brightness platform) {
+    switch (mode) {
+      case ThemeMode.light:
+        return false;
+      case ThemeMode.dark:
+        return true;
+      case ThemeMode.system:
+        return platform == Brightness.dark;
+    }
+  }
+
+  /// The token set that [mode] resolves to — what `Palette.activate` needs and
+  /// what the theme tests assert on.
+  static WebPalette paletteFor(ThemeMode mode, Brightness platform) =>
+      isDark(mode, platform) ? WebPalette.dark : WebPalette.light;
+
+  /// Kept for callers that just need "the app theme" (defaults to dark, which
+  /// is what the product screenshots and the deployment default to).
+  static ThemeData build([Brightness brightness = Brightness.dark]) =>
+      brightness == Brightness.dark ? dark() : light();
+
+  static ThemeData _build(WebPalette p) {
+    final scheme = ColorScheme(
+      brightness: p.brightness,
+      primary: p.primary,
+      onPrimary: p.primaryForeground,
+      primaryContainer: p.secondary,
+      onPrimaryContainer: p.foreground,
+      secondary: p.secondary,
+      onSecondary: p.secondaryForeground,
+      secondaryContainer: p.accent,
+      onSecondaryContainer: p.accentForeground,
+      tertiary: p.highlight,
+      onTertiary: p.primaryForeground,
+      error: p.destructive,
+      onError: p.destructiveForeground,
+      surface: p.background,
+      onSurface: p.foreground,
+      surfaceContainerLowest: p.background,
+      surfaceContainerLow: p.card,
+      surfaceContainer: p.card,
+      surfaceContainerHigh: p.accent,
+      surfaceContainerHighest: p.sidebarSelected,
+      onSurfaceVariant: p.mutedForeground,
+      outline: p.border,
+      outlineVariant: p.border,
+      shadow: const Color(0xFF000000),
+      scrim: const Color(0xFF000000),
+      inverseSurface: p.foreground,
+      onInverseSurface: p.background,
+      inversePrimary: p.primary,
     );
 
     final base = ThemeData(
       useMaterial3: true,
-      brightness: Brightness.dark,
+      brightness: p.brightness,
       colorScheme: scheme,
-      scaffoldBackgroundColor: Palette.bg0,
-      canvasColor: Palette.bg1,
-      dividerColor: Palette.borderSoft,
-      fontFamily: 'Roboto',
-      // InkRipple instead of InkSparkle: the sparkle shader is noticeably
-      // expensive on low-end Android GPUs and re-rasterises on every tap.
+      scaffoldBackgroundColor: p.background,
+      canvasColor: p.card,
+      dividerColor: p.border,
+      disabledColor: p.mutedForeground.withValues(alpha: 0.5),
+      // Web uses the system stack; on Android that is Roboto, so we never ship
+      // a bundled font just to look "designed".
       splashFactory: InkRipple.splashFactory,
+      extensions: <ThemeExtension<dynamic>>[WebPaletteHolder(p)],
+    );
+
+    final controlShape = RoundedRectangleBorder(
+      borderRadius: WebRadii.controlAll,
     );
 
     return base.copyWith(
-      // A shared, GPU-cheap route transition keeps navigation feeling
-      // continuous instead of dropping frames on the default platform one.
       pageTransitionsTheme: const PageTransitionsTheme(
         builders: {
           TargetPlatform.android: FadeForwardsPageTransitionsBuilder(),
           TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
         },
       ),
-      appBarTheme: const AppBarTheme(
-        backgroundColor: Palette.bg1,
-        surfaceTintColor: Colors.transparent,
-        foregroundColor: Palette.textPrimary,
-        elevation: 0,
-        scrolledUnderElevation: 0,
-        centerTitle: true,
-        titleTextStyle: TextStyle(
-          color: Palette.textPrimary,
-          fontSize: 17,
-          fontWeight: FontWeight.w700,
-          letterSpacing: 0.2,
-        ),
-      ),
       textTheme: base.textTheme
-          .apply(
-            bodyColor: Palette.textPrimary,
-            displayColor: Palette.textPrimary,
-          )
+          .apply(bodyColor: p.foreground, displayColor: p.foreground)
           .copyWith(
-            titleMedium: const TextStyle(
-              color: Palette.textPrimary,
-              fontWeight: FontWeight.w700,
-              fontSize: 16,
+            titleMedium: TextStyle(
+              color: p.foreground,
+              fontWeight: FontWeight.w500,
+              fontSize: WebType.body,
             ),
-            bodyMedium: const TextStyle(
-              color: Palette.textPrimary,
-              fontSize: 14.5,
-              height: 1.4,
+            bodyMedium: TextStyle(
+              color: p.foreground,
+              fontSize: WebType.body,
+              height: 1.45,
             ),
-            labelLarge: const TextStyle(
-              color: Palette.textPrimary,
-              fontWeight: FontWeight.w600,
-              fontSize: 14,
+            bodySmall: TextStyle(
+              color: p.mutedForeground,
+              fontSize: WebType.rowDescription,
+              height: 1.5,
+            ),
+            labelLarge: TextStyle(
+              color: p.foreground,
+              fontWeight: FontWeight.w500,
+              fontSize: WebType.body,
             ),
           ),
-      iconTheme: const IconThemeData(color: Palette.textSecondary, size: 22),
-      drawerTheme: const DrawerThemeData(
-        backgroundColor: Palette.bg1,
+      // Thread header: quiet 12px title on the canvas, exactly like the web
+      // `ThreadHeader` (no elevation, no colour block).
+      appBarTheme: AppBarTheme(
+        backgroundColor: p.background,
         surfaceTintColor: Colors.transparent,
+        foregroundColor: p.foreground,
         elevation: 0,
-        width: 312,
+        scrolledUnderElevation: 0,
+        centerTitle: false,
+        titleSpacing: 0,
+        titleTextStyle: TextStyle(
+          color: p.mutedForeground,
+          fontSize: WebType.headerTitle,
+          fontWeight: FontWeight.w500,
+        ),
+        iconTheme: IconThemeData(color: p.mutedForeground, size: 18),
       ),
-      dividerTheme: const DividerThemeData(
-        color: Palette.borderSoft,
+      iconTheme: IconThemeData(color: p.mutedForeground, size: 20),
+      dividerTheme: DividerThemeData(
+        color: p.border.withValues(alpha: 0.45),
         thickness: 1,
         space: 1,
       ),
-      cardTheme: const CardThemeData(
-        color: Palette.bg2,
+      drawerTheme: DrawerThemeData(
+        backgroundColor: p.sidebar,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        width: WebSpace.sidebarWidth,
+        shape: const RoundedRectangleBorder(),
+      ),
+      cardTheme: CardThemeData(
+        color: p.card,
         surfaceTintColor: Colors.transparent,
         elevation: 0,
         margin: EdgeInsets.zero,
+        shape: RoundedRectangleBorder(borderRadius: WebRadii.panelAll),
       ),
-      listTileTheme: const ListTileThemeData(
-        iconColor: Palette.textTertiary,
-        textColor: Palette.textPrimary,
-        contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 2),
+      listTileTheme: ListTileThemeData(
+        iconColor: p.mutedForeground,
+        textColor: p.foreground,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
       ),
       inputDecorationTheme: InputDecorationTheme(
         filled: true,
-        fillColor: Palette.bg3,
+        fillColor: p.isDark ? p.card : p.background,
         isDense: true,
-        hintStyle: const TextStyle(color: Palette.textTertiary, fontSize: 14.5),
-        labelStyle: const TextStyle(color: Palette.textSecondary),
-        floatingLabelStyle: const TextStyle(color: Palette.accentSoft),
+        hintStyle: TextStyle(
+          color: p.mutedForeground.withValues(alpha: 0.8),
+          fontSize: 14,
+        ),
+        labelStyle: TextStyle(color: p.mutedForeground),
+        floatingLabelStyle: TextStyle(color: p.foreground),
         contentPadding: const EdgeInsets.symmetric(
-          horizontal: 14,
-          vertical: 14,
+          horizontal: 12,
+          vertical: 12,
         ),
         border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(14),
-          borderSide: const BorderSide(color: Palette.border),
+          borderRadius: WebRadii.controlAll,
+          borderSide: BorderSide(color: p.input),
         ),
         enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(14),
-          borderSide: const BorderSide(color: Palette.border),
+          borderRadius: WebRadii.controlAll,
+          borderSide: BorderSide(color: p.input),
         ),
         focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(14),
-          borderSide: const BorderSide(color: Palette.accent, width: 1.4),
+          borderRadius: WebRadii.controlAll,
+          borderSide: BorderSide(color: p.ring, width: 1.4),
         ),
         errorBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(14),
-          borderSide: const BorderSide(color: Palette.danger),
+          borderRadius: WebRadii.controlAll,
+          borderSide: BorderSide(color: p.destructive),
         ),
       ),
+      // Filled = the web's `variant="default"`: near-black on light, near-white
+      // on dark, 40px tall, 12px radius, 14px medium label.
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
-          backgroundColor: Palette.accent,
-          foregroundColor: Colors.white,
-          disabledBackgroundColor: Palette.bg3,
-          disabledForegroundColor: Palette.textTertiary,
-          textStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
+          backgroundColor: p.primary,
+          foregroundColor: p.primaryForeground,
+          disabledBackgroundColor: p.primary.withValues(alpha: 0.5),
+          disabledForegroundColor: p.primaryForeground.withValues(alpha: 0.6),
+          minimumSize: const Size(0, 40),
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          textStyle: const TextStyle(
+            fontSize: WebType.body,
+            fontWeight: FontWeight.w500,
           ),
+          shape: controlShape,
         ),
       ),
       outlinedButtonTheme: OutlinedButtonThemeData(
         style: OutlinedButton.styleFrom(
-          foregroundColor: Palette.accentSoft,
-          side: const BorderSide(color: Palette.border),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
+          foregroundColor: p.foreground,
+          backgroundColor: p.background,
+          minimumSize: const Size(0, 40),
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          side: BorderSide(color: p.input),
+          textStyle: const TextStyle(
+            fontSize: WebType.body,
+            fontWeight: FontWeight.w500,
           ),
+          shape: controlShape,
         ),
       ),
       textButtonTheme: TextButtonThemeData(
-        style: TextButton.styleFrom(foregroundColor: Palette.accentSoft),
+        style: TextButton.styleFrom(
+          foregroundColor: p.foreground,
+          minimumSize: const Size(0, 36),
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          textStyle: const TextStyle(
+            fontSize: WebType.body,
+            fontWeight: FontWeight.w500,
+          ),
+          shape: controlShape,
+        ),
       ),
       iconButtonTheme: IconButtonThemeData(
         style: IconButton.styleFrom(
-          foregroundColor: Palette.textSecondary,
-          highlightColor: Palette.accentWash,
+          foregroundColor: p.mutedForeground,
+          highlightColor: p.quietFill,
         ),
-      ),
-      floatingActionButtonTheme: const FloatingActionButtonThemeData(
-        backgroundColor: Color(0xFFF2F2F4),
-        foregroundColor: Color(0xFF101012),
-        elevation: 2,
-        highlightElevation: 3,
       ),
       chipTheme: ChipThemeData(
-        backgroundColor: Palette.bg3,
-        selectedColor: Palette.accentWash,
-        side: const BorderSide(color: Palette.border),
-        labelStyle: const TextStyle(
-          color: Palette.textSecondary,
-          fontSize: 12.5,
-        ),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        backgroundColor: p.card,
+        selectedColor: p.accent,
+        side: BorderSide(color: p.hairline),
+        labelStyle: TextStyle(color: p.foreground, fontSize: 12.5),
+        shape: RoundedRectangleBorder(borderRadius: WebRadii.pillAll),
       ),
       dialogTheme: DialogThemeData(
-        backgroundColor: Palette.bg2,
+        backgroundColor: p.popover,
         surfaceTintColor: Colors.transparent,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-        titleTextStyle: const TextStyle(
-          color: Palette.textPrimary,
-          fontSize: 17,
-          fontWeight: FontWeight.w700,
+        shape: RoundedRectangleBorder(borderRadius: WebRadii.modalAll),
+        titleTextStyle: TextStyle(
+          color: p.foreground,
+          fontSize: WebType.dialogTitle,
+          fontWeight: FontWeight.w600,
+          letterSpacing: -0.4,
         ),
-        contentTextStyle: const TextStyle(
-          color: Palette.textSecondary,
+        contentTextStyle: TextStyle(
+          color: p.mutedForeground,
           fontSize: 14,
-          height: 1.4,
+          height: 1.5,
         ),
       ),
-      bottomSheetTheme: const BottomSheetThemeData(
-        backgroundColor: Palette.bg2,
+      bottomSheetTheme: BottomSheetThemeData(
+        backgroundColor: p.popover,
         surfaceTintColor: Colors.transparent,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(
+            top: Radius.circular(WebRadii.panel),
+          ),
         ),
       ),
       snackBarTheme: SnackBarThemeData(
-        backgroundColor: Palette.bg4,
-        contentTextStyle: const TextStyle(color: Palette.textPrimary),
+        backgroundColor: p.foreground,
+        contentTextStyle: TextStyle(color: p.background, fontSize: 13),
         behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        shape: RoundedRectangleBorder(borderRadius: WebRadii.controlAll),
       ),
       popupMenuTheme: PopupMenuThemeData(
-        color: Palette.bg3,
+        color: p.popover,
         surfaceTintColor: Colors.transparent,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        textStyle: const TextStyle(color: Palette.textPrimary, fontSize: 14),
+        elevation: 6,
+        shape: RoundedRectangleBorder(borderRadius: WebRadii.floatingAll),
+        textStyle: TextStyle(color: p.foreground, fontSize: 13.5),
       ),
       tooltipTheme: TooltipThemeData(
         decoration: BoxDecoration(
-          color: Palette.bg4,
-          borderRadius: BorderRadius.circular(8),
+          color: p.popover,
+          borderRadius: WebRadii.floatingAll,
+          border: Border.all(color: p.hairline),
         ),
-        textStyle: const TextStyle(color: Palette.textPrimary, fontSize: 12),
+        textStyle: TextStyle(color: p.foreground, fontSize: 12),
       ),
-      progressIndicatorTheme: const ProgressIndicatorThemeData(
-        color: Palette.accent,
-        linearTrackColor: Palette.bg3,
+      progressIndicatorTheme: ProgressIndicatorThemeData(
+        color: p.primary,
+        linearTrackColor: p.accent,
       ),
+      // Switches keep the web's single blue control (#2997FF).
       switchTheme: SwitchThemeData(
         thumbColor: WidgetStateProperty.resolveWith(
-          (states) =>
-              states.contains(WidgetState.selected)
-                  ? Palette.accent
-                  : Palette.textTertiary,
+          (states) => states.contains(WidgetState.selected)
+              ? Colors.white
+              : p.card,
         ),
         trackColor: WidgetStateProperty.resolveWith(
-          (states) =>
-              states.contains(WidgetState.selected)
-                  ? Palette.accentWash
-                  : Palette.bg3,
+          (states) => states.contains(WidgetState.selected)
+              ? p.toggleOn
+              : p.mutedForeground.withValues(alpha: 0.30),
         ),
+        trackOutlineColor: const WidgetStatePropertyAll(Colors.transparent),
       ),
       scrollbarTheme: ScrollbarThemeData(
         thumbColor: WidgetStatePropertyAll(
-          Palette.textTertiary.withValues(alpha: 0.35),
+          p.mutedForeground.withValues(alpha: 0.26),
         ),
-        thickness: const WidgetStatePropertyAll(3),
-        radius: const Radius.circular(3),
+        thickness: const WidgetStatePropertyAll(4),
+        radius: const Radius.circular(4),
       ),
-      textSelectionTheme: const TextSelectionThemeData(
-        cursorColor: Palette.accent,
-        selectionColor: Palette.accentWash,
-        selectionHandleColor: Palette.accent,
+      textSelectionTheme: TextSelectionThemeData(
+        cursorColor: p.foreground,
+        selectionColor: p.primary.withValues(alpha: 0.15),
+        selectionHandleColor: p.primary,
       ),
     );
   }
 
-  /// Markdown styling shared by assistant answers.
+  /// Markdown styling shared by assistant answers, mirroring the web's
+  /// `.markdown-content` prose rules (same --foreground for user and assistant,
+  /// 1.625 line-height, code on a muted slab).
   static MarkdownStyleSheet markdown(BuildContext context) {
+    final p = WebPalette.of(context);
     return MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
-      p: const TextStyle(
-        color: Palette.textPrimary,
-        fontSize: 15,
-        height: 1.45,
+      p: TextStyle(
+        color: p.foreground,
+        fontSize: WebType.message,
+        height: 1.6,
       ),
-      h1: const TextStyle(
-        color: Palette.textPrimary,
+      h1: TextStyle(
+        color: p.foreground,
         fontSize: 21,
-        fontWeight: FontWeight.w800,
+        fontWeight: FontWeight.w700,
+        height: 1.3,
       ),
-      h2: const TextStyle(
-        color: Palette.textPrimary,
+      h2: TextStyle(
+        color: p.foreground,
         fontSize: 18,
-        fontWeight: FontWeight.w700,
+        fontWeight: FontWeight.w600,
+        height: 1.3,
       ),
-      h3: const TextStyle(
-        color: Palette.textPrimary,
+      h3: TextStyle(
+        color: p.foreground,
         fontSize: 16,
-        fontWeight: FontWeight.w700,
+        fontWeight: FontWeight.w600,
+        height: 1.3,
       ),
-      strong: const TextStyle(
-        color: Palette.textPrimary,
-        fontWeight: FontWeight.w700,
-      ),
-      em: const TextStyle(
-        color: Palette.textSecondary,
-        fontStyle: FontStyle.italic,
-      ),
-      a: const TextStyle(
-        color: Palette.accentSoft,
+      strong: TextStyle(color: p.foreground, fontWeight: FontWeight.w600),
+      em: TextStyle(color: p.foreground, fontStyle: FontStyle.italic),
+      a: TextStyle(
+        color: p.foreground,
         decoration: TextDecoration.underline,
+        decorationColor: p.mutedForeground,
       ),
-      listBullet: const TextStyle(
-        color: Palette.textPrimary,
-        fontSize: 15,
-        height: 1.45,
+      listBullet: TextStyle(
+        color: p.foreground,
+        fontSize: WebType.message,
+        height: 1.6,
       ),
-      blockquote: const TextStyle(
-        color: Palette.textSecondary,
-        fontSize: 14.5,
-        height: 1.4,
+      blockquote: TextStyle(
+        color: p.mutedForeground,
+        fontSize: 14,
+        height: 1.6,
       ),
-      blockquoteDecoration: const BoxDecoration(
-        color: Palette.bg3,
-        borderRadius: BorderRadius.all(Radius.circular(8)),
-        border: Border(left: BorderSide(color: Palette.accent, width: 3)),
+      blockquoteDecoration: BoxDecoration(
+        color: Colors.transparent,
+        border: Border(
+          left: BorderSide(
+            color: p.mutedForeground.withValues(alpha: 0.35),
+            width: 3,
+          ),
+        ),
       ),
-      code: const TextStyle(
-        color: Palette.accentSoft,
+      blockquotePadding: const EdgeInsets.only(left: 12),
+      code: TextStyle(
+        color: p.isDark ? const Color(0xFFF0B27A) : const Color(0xFFB45309),
         fontSize: 13.5,
         backgroundColor: Colors.transparent,
       ),
       codeblockPadding: const EdgeInsets.all(12),
       codeblockDecoration: BoxDecoration(
-        color: Palette.scrim(0.55),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Palette.borderSoft),
+        color: p.accent,
+        borderRadius: BorderRadius.circular(WebRadii.compact),
+        border: Border.all(color: p.hairlineSoft),
       ),
-      tableBorder: TableBorder.all(color: Palette.border, width: 1),
-      tableHead: const TextStyle(
-        color: Palette.textPrimary,
-        fontWeight: FontWeight.w700,
-      ),
-      tableBody: const TextStyle(color: Palette.textSecondary, fontSize: 13.5),
-      horizontalRuleDecoration: const BoxDecoration(
-        border: Border(top: BorderSide(color: Palette.border)),
+      tableBorder: TableBorder.all(color: p.hairlineSoft),
+      tableHead: TextStyle(color: p.foreground, fontWeight: FontWeight.w600),
+      tableBody: TextStyle(color: p.mutedForeground, fontSize: 13.5),
+      horizontalRuleDecoration: BoxDecoration(
+        border: Border(top: BorderSide(color: p.hairlineSoft)),
       ),
     );
   }

@@ -23,6 +23,7 @@ import '../state/app_state.dart';
 import '../theme/app_theme.dart';
 import '../theme/palette.dart';
 import '../widgets/brand.dart';
+import '../widgets/theme_toggle.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key, this.session, this.initialPrompt});
@@ -126,7 +127,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       final path =
           '${dir.path}/voice-${DateTime.now().microsecondsSinceEpoch}.m4a';
       await _recorder.start(
-        const RecordConfig(
+         RecordConfig(
           // m4a/AAC is in the gateway's allowed audio MIME list and is
           // universally supported by Android encoders.
           encoder: AudioEncoder.aacLc,
@@ -405,6 +406,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         _chatId = id;
         state.rememberChat(id);
         state.rememberOpenChat(id);
+        // Subscribe before anything can be sent: the gateway only streams a
+        // chat's turn to sockets attached to it.
+        unawaited(sock.attach(id));
         _registerView();
         setState(() => _connected = true);
       } catch (e) {
@@ -1113,6 +1117,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (_chatId == null) {
         _chatId = await _socket!.newChat();
         state.rememberChat(_chatId!);
+        // Subscribe to the chat we just created, so this device receives the
+        // turn it is about to start (and any turn resuming from before).
+        unawaited(_socket!.attach(_chatId!));
       }
       _registerView();
       setState(() => _connected = _socket!.isConnected);
@@ -1256,7 +1263,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   },
                 ),
                 ListTile(
-                  leading: const Icon(
+                  leading:  Icon(
                     Icons.copy_all_rounded,
                     size: 20,
                     color: Palette.textSecondary,
@@ -1353,7 +1360,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   : 'Ready',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
+              style:  TextStyle(
                 fontSize: 11,
                 height: 1.3,
                 color: Palette.textTertiary,
@@ -1370,7 +1377,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             completed: _justCompleted,
           ),
           if (!_connected)
-            const Padding(
+             Padding(
               padding: EdgeInsets.only(right: 2),
               child: Tooltip(
                 message: 'Reconnecting…',
@@ -1381,6 +1388,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 ),
               ),
             ),
+          const ThemeToggleButton(),
           IconButton(
             icon: const Icon(Icons.more_horiz_rounded, size: 21),
             tooltip: 'More',
@@ -1395,7 +1403,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               width: double.infinity,
               color: Palette.bg3,
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-              child: const Row(
+              child:  Row(
                 children: [
                   Icon(
                     Icons.cloud_off_rounded,
@@ -1415,7 +1423,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           Expanded(
             child:
                 _loadingHistory
-                    ? const Center(
+                    ?  Center(
                       child: CircularProgressIndicator(
                         strokeWidth: 2.4,
                         color: Palette.accent,
@@ -1482,14 +1490,14 @@ class _EmptyChat extends StatelessWidget {
             const SizedBox(height: 20),
             Text(
               'Hi $greetingName',
-              style: const TextStyle(
+              style:  TextStyle(
                 fontSize: 21,
                 fontWeight: FontWeight.w800,
                 color: Palette.textPrimary,
               ),
             ),
             const SizedBox(height: 8),
-            const Text(
+             Text(
               'Ask a question, attach a file, or describe a task.\n'
               'I can research, write, analyse data and build things.',
               textAlign: TextAlign.center,
@@ -1603,7 +1611,7 @@ class _Bubble extends StatelessWidget {
             if (message.text.isNotEmpty)
               SelectableText(
                 message.text,
-                style: const TextStyle(
+                style:  TextStyle(
                   color: Palette.userText,
                   fontSize: 15,
                   height: 1.4,
@@ -1674,7 +1682,7 @@ class _Bubble extends StatelessWidget {
                 ),
               ),
             if (!message.streaming && message.hasError)
-              const Padding(
+               Padding(
                 padding: EdgeInsets.only(top: 6),
                 child: Icon(
                   Icons.error_outline,
@@ -1687,7 +1695,7 @@ class _Bubble extends StatelessWidget {
                 padding: const EdgeInsets.only(top: 6),
                 child: Text(
                   _footer(message)!,
-                  style: const TextStyle(
+                  style:  TextStyle(
                     color: Palette.textTertiary,
                     fontSize: 11,
                   ),
@@ -1770,7 +1778,7 @@ class _StepStatus extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (status == 'running') {
-      return const Padding(
+      return  Padding(
         padding: EdgeInsets.only(top: 2),
         child: SizedBox(
           width: 12,
@@ -1783,9 +1791,9 @@ class _StepStatus extends StatelessWidget {
       );
     }
     if (status == 'error') {
-      return const Icon(Icons.error_outline, size: 14, color: Palette.danger);
+      return  Icon(Icons.error_outline, size: 14, color: Palette.danger);
     }
-    return const Icon(
+    return  Icon(
       Icons.check_circle_outline,
       size: 14,
       color: Palette.success,
@@ -1855,7 +1863,7 @@ class _ThinkingPanelState extends State<_ThinkingPanel> {
                     ),
                   ),
                   const Spacer(),
-                  const Icon(
+                   Icon(
                     Icons.psychology_alt_outlined,
                     size: 14,
                     color: Palette.textTertiary,
@@ -1871,7 +1879,7 @@ class _ThinkingPanelState extends State<_ThinkingPanel> {
                 widget.reasoning.length > 4000
                     ? '${widget.reasoning.substring(0, 4000)}…'
                     : widget.reasoning,
-                style: const TextStyle(
+                style:  TextStyle(
                   color: Palette.textTertiary,
                   fontSize: 12,
                   height: 1.4,
@@ -1942,7 +1950,7 @@ class _MediaLink extends StatelessWidget {
                 (_, child, prog) =>
                     prog == null
                         ? child
-                        : const SizedBox(
+                        :  SizedBox(
                           width: 120,
                           height: 120,
                           child: Center(
@@ -2083,7 +2091,7 @@ class _ComposerState extends State<_Composer> {
       top: false,
       child: Container(
         padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
-        decoration: const BoxDecoration(
+        decoration:  BoxDecoration(
           color: Palette.bg0,
           border: Border(top: BorderSide(color: Palette.borderSoft)),
         ),
@@ -2137,7 +2145,7 @@ class _ComposerState extends State<_Composer> {
                       if (widget.recording)
                         const _PulsingDot()
                       else
-                        const SizedBox(
+                         SizedBox(
                           width: 14,
                           height: 14,
                           child: CircularProgressIndicator(
@@ -2151,7 +2159,7 @@ class _ComposerState extends State<_Composer> {
                           widget.recording
                               ? 'Listening… tap to stop'
                               : 'Transcribing voice note…',
-                          style: const TextStyle(
+                          style:  TextStyle(
                             fontSize: 13,
                             color: Palette.textPrimary,
                             fontWeight: FontWeight.w600,
@@ -2162,7 +2170,7 @@ class _ComposerState extends State<_Composer> {
                         Text(
                           '${(widget.recordSeconds ~/ 60).toString().padLeft(2, '0')}:'
                           '${(widget.recordSeconds % 60).toString().padLeft(2, '0')}',
-                          style: const TextStyle(
+                          style:  TextStyle(
                             fontSize: 13,
                             color: Palette.danger,
                             fontWeight: FontWeight.w700,
@@ -2240,7 +2248,7 @@ class _ComposerState extends State<_Composer> {
                       minLines: 1,
                       maxLines: 5,
                       textInputAction: TextInputAction.newline,
-                      style: const TextStyle(
+                      style:  TextStyle(
                         color: Palette.textPrimary,
                         fontSize: 15,
                       ),
@@ -2251,7 +2259,7 @@ class _ComposerState extends State<_Composer> {
                                     ? 'Stopping task…'
                                     : 'Working on your task…')
                                 : 'Assign a task or ask anything',
-                        hintStyle: const TextStyle(
+                        hintStyle:  TextStyle(
                           color: Palette.textTertiary,
                           fontSize: 15,
                         ),
@@ -2358,7 +2366,7 @@ class _PulsingDotState extends State<_PulsingDot>
       child: Container(
         width: 12,
         height: 12,
-        decoration: const BoxDecoration(
+        decoration:  BoxDecoration(
           color: Palette.danger,
           shape: BoxShape.circle,
         ),
@@ -2395,7 +2403,7 @@ class _ToolChip extends StatelessWidget {
               const SizedBox(width: 6),
               Text(
                 label,
-                style: const TextStyle(
+                style:  TextStyle(
                   color: Palette.textSecondary,
                   fontSize: 12.5,
                   fontWeight: FontWeight.w600,
@@ -2450,7 +2458,7 @@ class _PendingTile extends StatelessWidget {
                           _shortName(attachment.name),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
+                          style:  TextStyle(
                             color: Palette.textTertiary,
                             fontSize: 9,
                           ),
@@ -2463,7 +2471,7 @@ class _PendingTile extends StatelessWidget {
           Positioned.fill(
             child: ColoredBox(
               color: Palette.scrim(0.5),
-              child: const Center(
+              child:  Center(
                 child: SizedBox(
                   width: 18,
                   height: 18,
@@ -2481,7 +2489,7 @@ class _PendingTile extends StatelessWidget {
               message: attachment.errorText ?? 'Upload failed',
               child: ColoredBox(
                 color: Palette.scrim(0.55),
-                child: const Center(
+                child:  Center(
                   child: Icon(
                     Icons.error_outline,
                     color: Palette.danger,
@@ -2497,7 +2505,7 @@ class _PendingTile extends StatelessWidget {
           child: GestureDetector(
             onTap: onRemove,
             child: Container(
-              decoration: const BoxDecoration(
+              decoration:  BoxDecoration(
                 color: Palette.accentDeep,
                 shape: BoxShape.circle,
               ),
@@ -2536,7 +2544,7 @@ class _StatusPill extends StatelessWidget {
     Widget? content;
     if (busy) {
       content = _pill(
-        const SizedBox(
+         SizedBox(
           width: 10,
           height: 10,
           child: CircularProgressIndicator(
@@ -2549,7 +2557,7 @@ class _StatusPill extends StatelessWidget {
     } else if (completed) {
       // Static, non-animating confirmation that the task completed.
       content = _pill(
-        const Icon(Icons.check_circle, size: 13, color: Palette.success),
+         Icon(Icons.check_circle, size: 13, color: Palette.success),
         'done',
       );
     }
@@ -2579,7 +2587,7 @@ class _StatusPill extends StatelessWidget {
           const SizedBox(width: 6),
           Text(
             label,
-            style: const TextStyle(fontSize: 11, color: Palette.textSecondary),
+            style:  TextStyle(fontSize: 11, color: Palette.textSecondary),
           ),
         ],
       ),
@@ -2615,7 +2623,7 @@ class _FileChips extends StatelessWidget {
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Icon(
+                   Icon(
                     Icons.insert_drive_file_outlined,
                     size: 14,
                     color: Palette.accentSoft,
@@ -2623,13 +2631,13 @@ class _FileChips extends StatelessWidget {
                   const SizedBox(width: 5),
                   Text(
                     _fileBaseName(p),
-                    style: const TextStyle(
+                    style:  TextStyle(
                       color: Palette.textPrimary,
                       fontSize: 12,
                     ),
                   ),
                   const SizedBox(width: 4),
-                  const Icon(
+                   Icon(
                     Icons.download_rounded,
                     size: 14,
                     color: Palette.textTertiary,

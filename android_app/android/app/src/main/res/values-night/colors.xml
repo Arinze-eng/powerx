@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Window / splash colour for DARK mode: the WebUI's dark canvas token
+         (`--background: 30 8% 19%` = #34302D) — the exact warm brown the web
+         app renders behind a chat. -->
+    <color name="powerx_splash">#34302D</color>
+</resources>

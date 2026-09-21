@@ -330,6 +330,19 @@ class NanobotSocket {
         cancelOnError: true,
       );
       _startHeartbeat();
+      // Subscriptions are per-connection, so every chat the UI still cares
+      // about has to be re-registered on a fresh socket. Without this a
+      // connection opened directly (cold start, resume) is subscribed to
+      // nothing and its own turn's stream never arrives.
+      //
+      // This runs BEFORE the outbox flush on purpose: a user message buffered
+      // while the socket was down would otherwise reach the gateway ahead of
+      // the attach, and the gateway fans a chat's turn frames out only to the
+      // sockets attached to it — the task would run and stream to nobody.
+      for (final cid in _wantedChats.toList()) {
+        _attachedChats.remove(cid);
+        _send({'type': 'attach', 'chat_id': cid});
+      }
       await _flushOutbox();
       // Replay any task the user issued before the app was killed. This runs
       // before onConnectionChanged so the resend is on the wire ahead of the
@@ -371,14 +384,10 @@ class NanobotSocket {
       _reconnectTimer = null;
       if (_closedByUser) return;
       try {
+        // connect() itself re-subscribes every wanted chat BEFORE it flushes
+        // the outbox, so a task buffered while offline is never written to the
+        // gateway ahead of the attach that makes its stream come back here.
         await connect();
-        // Re-subscribe every chat the UI still cares about. The server replays
-        // goal_status + the running turn's wall clock for runs in flight, which
-        // is what makes a backgrounded task resume instead of staying frozen.
-        for (final cid in _wantedChats.toList()) {
-          _attachedChats.remove(cid);
-          _send({'type': 'attach', 'chat_id': cid});
-        }
         // A task typed while offline / before a process kill must still go
         // out now that we are back.
         await _flushPendingSends();
@@ -433,10 +442,10 @@ class NanobotSocket {
       _attachedChats.clear();
       onConnectionChanged?.call(false);
       try {
+        // connect() re-subscribes every wanted chat before flushing the
+        // outbox; doing it again here would put a bare attach AFTER a buffered
+        // task, which is the ordering that loses the stream.
         await connect();
-        for (final cid in _wantedChats.toList()) {
-          _send({'type': 'attach', 'chat_id': cid});
-        }
         return isConnected;
       } catch (_) {
         _scheduleReconnect();
@@ -1080,6 +1089,15 @@ class NanobotSocket {
     // connect instead of vanishing, and it is cleared the moment the gateway
     // answers `message_accepted` or starts streaming.
     _trackPendingSend(chatId, content, media: media, turnId: turnId);
+    // Subscription gate. The gateway delivers a chat's turn frames only to the
+    // sockets it has *attached* to that chat — a socket that merely creates a
+    // chat and posts to it gets `goal_status` and then nothing (verified
+    // against production with two sockets). Frames are ordered on a websocket,
+    // so sending the attach first guarantees the subscription is registered
+    // before the turn starts and the answer streams back to this device.
+    if (!_attachedChats.contains(chatId)) {
+      _send({'type': 'attach', 'chat_id': chatId});
+    }
     _send({
       'type': 'message',
       'chat_id': chatId,
