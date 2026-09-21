@@ -75,7 +75,7 @@ _TRADING_ACTIONS = frozenset({"order", "close", "close_all"})
 _READ_ONLY_ACTIONS = frozenset(
     {
         "status", "doctor", "account", "quote", "candles", "positions", "orders",
-        "history", "symbol", "logs", "experts", "run",
+        "history", "symbol", "symbols", "logs", "experts", "run",
     }
 )
 
@@ -103,6 +103,7 @@ _TIMEOUTS: dict[str, int] = {
     "doctor": 300,
     "compile": 900,
     "candles": 300,
+    "symbols": 300,
     "history": 300,
     "run": 300,
 }
@@ -228,6 +229,13 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
         ]
     elif action == "history":
         parts += ["--days", str(int(kwargs.get("days") or 7))]
+    elif action == "symbols":
+        if kwargs.get("filter"):
+            parts += ["--filter", _sh(kwargs["filter"])]
+        if kwargs.get("tradable"):
+            parts += ["--tradable"]
+        if kwargs.get("limit"):
+            parts += ["--limit", str(int(kwargs["limit"]))]
     elif action == "symbol":
         parts += [_sh(kwargs.get("symbol") or "")]
     elif action == "order":
@@ -365,6 +373,12 @@ class MT5SandboxTool(Tool):
             "Read/fix loop: use 'compile' to build an .mq5 with MetaEditor (returns the "
             "compiler errors), and 'logs'/'experts' to tail the terminal and Experts "
             "journal. "
+            "BEFORE trading or fetching candles for an instrument, call action='symbols' "
+            "with tradable=true: brokers offer only part of the MT5 universe (a "
+            "MetaQuotes-Demo account carries NO crypto, so BTCUSD/ETHUSD fail with "
+            "'symbol not found' — that is not a bridge fault). Pick a symbol whose "
+            "market_open is true; if none is, every instrument on that server is closed "
+            "right now and an order will come back as retcode 10018 'Market closed'. "
             f"Actions: {', '.join(_ALL_ACTIONS)}. "
             "Trading actions (order, close, close_all) require MT5_ALLOW_TRADING to be "
             "enabled and return the broker retcode; a rejected order is reported with "
@@ -383,6 +397,9 @@ class MT5SandboxTool(Tool):
                 "server": {"type": "string", "description": "Broker server, e.g. 'ICMarkets-Demo' or 'MetaQuotes-Demo' (action=login, or action=start)."},
                 "path": {"type": "string", "description": "Explicit terminal64.exe path override (action=login)."},
                 "symbol": {"type": "string", "description": "Trading symbol, e.g. EURUSD (quote/candles/symbol/order)."},
+                "filter": {"type": "string", "description": "action=symbols: case-insensitive substring to match symbol names."},
+                "tradable": {"type": "boolean", "description": "action=symbols: only list symbols that are enabled AND have a fresh tick (market open now)."},
+                "limit": {"type": "integer", "description": "action=symbols: max rows to return (default 60)."},
                 "symbols": {"type": "string", "description": "Space/comma separated symbols for action=quote."},
                 "timeframe": {"type": "string", "description": "M1..MN1 (action=candles)."},
                 "count": {"type": "integer", "description": "Number of bars (action=candles)."},

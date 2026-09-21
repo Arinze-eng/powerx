@@ -86,6 +86,8 @@ _LOG_PAYLOAD_BUDGET = 7_000
 _LOG_TAIL_MAX_CHARS = 4_000
 #: How long one readiness probe may block inside ``start``.
 _PROBE_TIMEOUT = 90
+#: Budget for list-heavy payloads (``symbols`` inventories).
+_LIST_PAYLOAD_BUDGET = 6_000
 
 
 # --------------------------------------------------------------------------- #
@@ -969,6 +971,86 @@ def cmd_history(args: argparse.Namespace) -> int:
     return emit({"ok": True, "count": len(deals), "deals": [d._asdict() for d in deals]})
 
 
+def cmd_symbols(args: argparse.Namespace) -> int:
+    """Discover what can actually be traded, instead of guessing symbol names.
+
+    MEASURED FAILURE (2026-09-21, live MetaQuotes-Demo account): the agent was
+    asked to trade and reached for ``BTCUSD``/``ETHUSD`` because they are the
+    obvious 24/7 instruments. MetaQuotes-Demo does NOT carry crypto at all, so
+    every attempt died with ``symbol BTCUSD not found: (-4, 'Terminal: Not
+    found')`` and ``copy_rates_from_pos failed: (-1, 'Terminal: Call failed')``
+    — errors that read like a broken bridge rather than "that instrument is not
+    offered here". There was no way to ask the terminal what it does offer, so
+    the trade step was effectively unreachable without guessing.
+
+    Reports name, group, trade mode, lot limits and whether the market has
+    produced a tick recently (i.e. is open right now) — the two things needed to
+    pick a workable symbol.
+    """
+    mt5, err = require_bridge()
+    if err is not None:
+        return err
+
+    needle = (getattr(args, "filter", "") or "").strip().upper()
+    # The terminal only streams symbols it knows about; the list is complete
+    # without symbol_select, but selecting guarantees tick data for the ones we
+    # then report on.
+    infos = mt5.symbols_get() or []
+    now = time.time()
+    rows: list[dict[str, Any]] = []
+    for info in infos:
+        name = getattr(info, "name", "")
+        if needle and needle not in name.upper():
+            continue
+        trade_mode = int(getattr(info, "trade_mode", 0) or 0)
+        if getattr(args, "tradable", False) and trade_mode == 0:
+            # trade_mode 0 == SYMBOL_TRADE_MODE_DISABLED
+            continue
+        tick = mt5.symbol_info_tick(name)
+        tick_time = int(getattr(tick, "time", 0) or 0)
+        fresh = bool(tick_time and (now - tick_time) < int(args.fresh_seconds))
+        if getattr(args, "tradable", False) and not fresh:
+            continue
+        rows.append(
+            {
+                "name": name,
+                "group": str(getattr(info, "path", "") or "").split("\\")[0],
+                "trade_mode": trade_mode,
+                "visible": bool(getattr(info, "visible", False)),
+                "volume_min": float(getattr(info, "volume_min", 0) or 0),
+                "volume_step": float(getattr(info, "volume_step", 0) or 0),
+                "spread": int(getattr(info, "spread", 0) or 0),
+                "digits": int(getattr(info, "digits", 0) or 0),
+                "filling_mode": int(getattr(info, "filling_mode", 0) or 0),
+                "market_open": fresh,
+                "last_tick_age_s": int(now - tick_time) if tick_time else None,
+            }
+        )
+
+    rows.sort(key=lambda r: (not r["market_open"], r["name"]))
+    total = len(infos)
+    shipped = rows[: max(1, int(args.limit))]
+    payload: dict[str, Any] = {
+        "ok": True,
+        "total_symbols": total,
+        "matching": len(rows),
+        "market_open_now": sum(1 for r in rows if r["market_open"]),
+        "filter": needle or None,
+        "symbols": shipped,
+        "note": (
+            "Choose a symbol with market_open=true. FX/metals/indices follow "
+            "broker sessions and are closed at weekends; if market_open_now is 0, "
+            "every instrument on this server is closed right now, so an order will "
+            "be rejected with retcode 10018 'Market closed' (which is plumbing "
+            "success, not a bug in the bridge)."
+        ),
+    }
+    if len(rows) > len(shipped):
+        payload["truncated"] = True
+        payload["note"] += f" Showing {len(shipped)} of {len(rows)}; pass --limit/--filter."
+    return emit(_fit_payload(payload, _LIST_PAYLOAD_BUDGET))
+
+
 def cmd_symbol(args: argparse.Namespace) -> int:
     mt5, err = require_bridge()
     if err is not None:
@@ -1454,35 +1536,51 @@ def _tail(path: Path, lines: int, max_chars: int = _LOG_TAIL_MAX_CHARS) -> str:
     return tail
 
 
-def _fit_log_payload(payload: dict[str, Any], budget: int = _LOG_PAYLOAD_BUDGET) -> dict[str, Any]:
-    """Trim log tails until the serialized payload fits the sandbox's output cap.
+def _fit_payload(payload: dict[str, Any], budget: int = _LOG_PAYLOAD_BUDGET) -> dict[str, Any]:
+    """Trim a payload until its serialized JSON fits the sandbox's output cap.
 
     A truncated JSON is worse than a short one: the host-side parser cannot
     recover it and reports "no JSON result", which the agent misreads as a broken
     install. Trimming here always leaves parseable JSON, and ``truncated`` says
     so explicitly.
     """
-    if len(json.dumps(payload, default=str)) <= budget:
+    def size() -> int:
+        return len(json.dumps(payload, default=str))
+
+    if size() <= budget:
         payload.setdefault("truncated", False)
         return payload
     payload["truncated"] = True
+
+    # Log tails: halve the longest entry until it fits.
     tails = payload.get("tail") or {}
-    # Halve the longest tail until it fits (or nothing is left to trim).
-    while tails and len(json.dumps(payload, default=str)) > budget:
+    while tails and size() > budget:
         longest = max(tails, key=lambda key: len(tails[key]))
         if len(tails[longest]) <= 200:
             tails.pop(longest, None)
             payload["omitted"] = payload.get("omitted", 0) + 1
             continue
         tails[longest] = tails[longest][len(tails[longest]) // 2:]
-    if len(json.dumps(payload, default=str)) > budget:
+
+    # Lists (e.g. symbols): drop from the end until it fits.
+    for key in ("symbols", "deals", "positions", "orders"):
+        items = payload.get(key)
+        while isinstance(items, list) and len(items) > 1 and size() > budget:
+            items.pop()
+
+    if size() > budget:
         # Worst case (a pathologically long key set) -- keep the structure, drop
         # the bodies, and say where to read them instead.
-        payload["tail"] = {}
+        if tails:
+            payload["tail"] = {}
+        for key in ("symbols", "deals", "positions", "orders"):
+            if payload.get(key):
+                payload[key] = []
         payload["note"] = (
-            "Log tails omitted to keep the JSON parseable. Read them in the sandbox "
-            f"directly: tail -n {payload.get('requested_lines') or 40} <file>"
-        )
+            str(payload.get("note") or "")
+            + " Bodies omitted to keep this JSON parseable: raise --limit, or read "
+            "them in the sandbox directly."
+        ).strip()
     return payload
 
 
@@ -1494,7 +1592,7 @@ def _log_payload(directory: Path, pattern: str, lines: int) -> dict[str, Any]:
         "requested_lines": int(lines),
         "tail": {str(p): _tail(p, int(lines)) for p in candidates[-3:]},
     }
-    return _fit_log_payload(payload)
+    return _fit_payload(payload)
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
@@ -1605,6 +1703,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("symbol", help="symbol metadata")
     p.add_argument("symbol")
     p.set_defaults(func=cmd_symbol)
+
+    p = sub.add_parser("symbols", help="list the symbols this server offers")
+    p.add_argument("--filter", default="", help="case-insensitive substring match")
+    p.add_argument("--tradable", action="store_true",
+                   help="only symbols that are enabled and have a fresh tick")
+    p.add_argument("--limit", type=int, default=60)
+    p.add_argument("--fresh-seconds", type=int, default=900,
+                   help="a tick younger than this means the market is open")
+    p.set_defaults(func=cmd_symbols)
 
     p = sub.add_parser("order", help="send a market order")
     p.add_argument("--symbol", required=True)

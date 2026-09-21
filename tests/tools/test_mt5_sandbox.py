@@ -262,6 +262,26 @@ def test_order_command_includes_levels():
     assert "--sl 1.05" in cmd and "--tp 1.2" in cmd
 
 
+def test_symbols_action_is_read_only_and_discovers_instruments():
+    """The agent must be able to ask what the server actually offers.
+
+    Measured live (MetaQuotes-Demo, 2026-09-21): the agent reached for BTCUSD
+    because crypto is the obvious 24/7 instrument, and MetaQuotes-Demo carries no
+    crypto at all — every attempt failed with "symbol not found: (-4, 'Terminal:
+    Not found')" and "copy_rates_from_pos failed: (-1, 'Terminal: Call failed')",
+    which read like a broken bridge. Without a discovery action the trade step was
+    unreachable by guessing.
+    """
+    from nanobot.agent.tools.mt5_sandbox import _READ_ONLY_ACTIONS
+
+    assert "symbols" in _READ_ONLY_ACTIONS
+    assert build_cli_command("symbols", {}).endswith("mt5_cli.py symbols")
+    cmd = build_cli_command("symbols", {"tradable": True, "limit": 25, "filter": "USD"})
+    assert "--tradable" in cmd
+    assert "--limit 25" in cmd
+    assert "--filter USD" in cmd
+
+
 def test_quote_accepts_space_separated_symbols():
     cmd = build_cli_command("quote", {"symbols": "EURUSD GBPUSD"})
     assert cmd.rstrip().endswith("EURUSD GBPUSD")

@@ -242,6 +242,27 @@ def test_log_payload_always_fits_the_sandbox_output_cap(cli, tmp_path):
     assert "\x00" not in rendered
 
 
+def test_fit_payload_trims_a_symbol_list_too(cli):
+    """The same cap applies to any list payload, not just log tails."""
+    payload = cli._fit_payload(
+        {
+            "ok": True,
+            "symbols": [
+                {"name": f"SYMBOL{i:04d}", "group": "Forex", "trade_mode": 4,
+                 "volume_min": 0.01, "market_open": True}
+                for i in range(400)
+            ],
+            "note": "choose a symbol with market_open=true",
+        },
+        budget=cli._LIST_PAYLOAD_BUDGET,
+    )
+    rendered = json.dumps(payload, default=str)
+    assert len(rendered) <= cli._LIST_PAYLOAD_BUDGET
+    assert rendered.startswith("{")
+    assert json.loads(rendered)["symbols"]
+    assert payload["truncated"] is True
+
+
 def test_cmd_logs_reports_missing_logs_instead_of_empty_json(cli, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, "MT5_ROOT", tmp_path / "mt5")
     monkeypatch.setattr(cli, "WINE_PREFIX", tmp_path / "wine")
