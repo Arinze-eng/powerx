@@ -204,7 +204,7 @@ def apply_render_execution_env(config: Any) -> Any:
         if vcpus is not None and int(getattr(vercel, "vcpus", 2) or 2) == 2:
             vercel.vcpus = vcpus
         timeout_ms = _positive_int(_env("NANOBOT_VERCEL_TIMEOUT_MS"), maximum=2_700_000)
-        if timeout_ms is not None and timeout_ms >= 60_000 and int(getattr(vercel, "timeout_ms", 300_000) or 300_000) == 300_000:
+        if timeout_ms is not None and timeout_ms >= 60_000 and int(getattr(vercel, "timeout_ms", 1_800_000) or 1_800_000) == 1_800_000:
             vercel.timeout_ms = timeout_ms
         _fill(vercel, "fetch_allow_hosts", _env("NANOBOT_VERCEL_FETCH_ALLOW_HOSTS"))
     return config

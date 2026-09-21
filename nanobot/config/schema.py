@@ -509,11 +509,16 @@ class VercelExecutionConfig(Base):
     token: str = Field(default="", repr=False)
     api_url: str = "https://api.vercel.com"
     team_id: str = ""
+    # Optional. When empty the backend discovers a project from the token
+    # (preferring Vercel's ``vercel-sandbox-default-project``). The API requires
+    # a projectId to create a sandbox, so a value is always resolved before then.
     project_id: str = ""
     runtime: Literal["node22", "node24", "python3.13"] = "node22"
     vcpus: int = Field(default=2, ge=1, le=8)
-    # Vercel caps one sandbox at 45 minutes of wall-clock lifetime.
-    timeout_ms: int = Field(default=300_000, ge=60_000, le=2_700_000)
+    # This is the sandbox's entire lifetime, not a single command's budget; a
+    # generous default keeps a long task from being reaped mid-run, and the
+    # task-end release path stops the sandbox early anyway.
+    timeout_ms: int = Field(default=1_800_000, ge=60_000, le=2_700_000)
     fetch_allow_hosts: str = ""
     # Vercel sandboxes are cheap to recreate and bill only for active CPU, so
     # persistence defaults OFF: a finished task stops the sandbox and the next
