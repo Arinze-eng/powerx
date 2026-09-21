@@ -27,6 +27,7 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.agent.tools.upstash_backend import UpstashError, UpstashExecutionBackend
 from nanobot.agent.tools.runloop_backend import RunloopError, RunloopExecutionBackend, runloop_devbox_name
+from nanobot.agent.tools.vercel_backend import VercelError, VercelExecutionBackend, vercel_sandbox_name
 from nanobot.agent.tools.vps_backend import VPSExecutionBackend
 from nanobot.config.paths import get_data_dir, get_workspace_path
 from nanobot.utils.file_share import (
@@ -63,6 +64,11 @@ _DAYTONA_SNAPSHOT_BUDGET = 150
 _DAYTONA_RELEASE_RESET_BUDGET = 90
 _RUNLOOP_KEEP_ALIVE_BUDGET = 60
 _RUNLOOP_RELEASE_RESET_BUDGET = 90
+# Vercel Sandbox bills by active CPU only, so the win from stopping a finished
+# task's sandbox is smaller than for the always-on backends — the budgets stay
+# short so a wedged stop can never delay the finished task's reply.
+_VERCEL_KEEP_ALIVE_BUDGET = 45
+_VERCEL_RELEASE_RESET_BUDGET = 60
 _WORKSPACE = "/workspace"
 _OCR_DIR = f"{_WORKSPACE}/.nanobot"
 #: GitHub credentials are materialised inside the sandbox as a sourced env file
@@ -569,6 +575,38 @@ class _RunloopDevboxStore(_SandboxStore):
 
 _RUNLOOP_STORE = _RunloopDevboxStore()
 
+
+class _VercelSandboxStore(_SandboxStore):
+    """Disk-indexed session → Vercel sandbox id map (no in-process handles needed)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        path = os.getenv("NANOBOT_DATA_DIR", "").strip()
+        base = Path(path).expanduser() if path else Path.home() / ".nanobot"
+        # Point the inherited persistence at a dedicated index file.
+        self._index_path = base / "vercel_sandboxes.json"
+        try:
+            raw = json.loads(self._index_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self._ids = {str(k): str(v) for k, v in raw.items() if v}
+        except (OSError, ValueError):
+            pass
+
+    def set_id(self, key: str, sandbox_id: str) -> None:
+        """Persist a session → sandbox id mapping without a live handle."""
+        with self._lock:
+            self._ids[key] = str(sandbox_id)
+            try:
+                self._index_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self._index_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(self._ids, indent=2), encoding="utf-8")
+                tmp.replace(self._index_path)
+            except OSError:
+                logger.warning("Could not persist Vercel sandbox index")
+
+
+_VERCEL_STORE = _VercelSandboxStore()
+
 # Alias cache for dynamically built Novita templates (desired alias → usable alias).
 _TEMPLATE_CACHE: dict[str, str] = {}
 _TEMPLATE_BUILD_LOCK = threading.Lock()
@@ -708,6 +746,8 @@ class NovitaSandboxTool(Tool):
             return bool(getattr(execution.daytona, "api_key", "").strip())
         if backend == "runloop":
             return bool(getattr(execution.runloop, "api_key", "").strip())
+        if backend == "vercel":
+            return bool(getattr(execution.vercel, "token", "").strip())
         return bool(os.getenv("NOVITA_API_KEY", "").strip()) and Novita is not None
 
     @classmethod
@@ -727,6 +767,8 @@ class NovitaSandboxTool(Tool):
             return "daytona", getattr(execution, "daytona", None)
         if backend == "runloop":
             return "runloop", getattr(execution, "runloop", None)
+        if backend == "vercel":
+            return "vercel", getattr(execution, "vercel", None)
         return "novita", None
 
     def backend_name(self) -> str:
@@ -1960,6 +2002,15 @@ class NovitaSandboxTool(Tool):
             backend.last_devbox_id = stored_id
         return backend
 
+    def _vercel_backend(self, config: Any, key: str) -> VercelExecutionBackend:
+        backend = VercelExecutionBackend(config, sandbox_name=vercel_sandbox_name(key))
+        # Seed the persisted sandbox id (if any) so ensure_sandbox verifies that
+        # exact sandbox directly instead of re-resolving it by name each op.
+        stored_id = _VERCEL_STORE.sandbox_id(key)
+        if stored_id:
+            backend.last_sandbox_id = stored_id
+        return backend
+
     async def release_upstash_sandbox(self, session_key: str | None = None) -> None:
         """Kill the session's ephemeral sandbox (Daytona / Upstash) once its task has finished.
 
@@ -2028,6 +2079,35 @@ class NovitaSandboxTool(Tool):
                 _RUNLOOP_STORE.remove(key)
                 return
             if selected_backend != "upstash" or backend_config is None:
+                if selected_backend == "vercel" and backend_config is not None:
+                    key = session_key or _session_key()
+                    sandbox_id = _VERCEL_STORE.sandbox_id(key)
+                    if not sandbox_id:
+                        return
+                    backend = self._vercel_backend(backend_config, key)
+                    if getattr(backend, "persist_workspace", False):
+                        # Persistence opted in: keep the sandbox alive for the
+                        # next task by renewing its timeout window; its own
+                        # deadline remains the final backstop.
+                        async def _bg_vercel_keep_alive() -> None:
+                            try:
+                                await asyncio.wait_for(
+                                    backend.keep_alive(sandbox_id), timeout=_VERCEL_KEEP_ALIVE_BUDGET
+                                )
+                            except Exception:
+                                logger.debug("Background Vercel keep-alive failed", exc_info=True)
+
+                        asyncio.get_running_loop().create_task(_bg_vercel_keep_alive())
+                        return
+                    # Default: Vercel bills only while the sandbox is alive and
+                    # recreating one costs a sub-second provision, so a finished
+                    # task stops the sandbox instead of leaving it running.
+                    with suppress(Exception):
+                        await asyncio.wait_for(
+                            backend.reset(sandbox_id), timeout=_VERCEL_RELEASE_RESET_BUDGET
+                        )
+                    _VERCEL_STORE.remove(key)
+                    return
                 return
             key = session_key or _session_key()
             box_id = _UPSTASH_STORE.sandbox_id(key)
@@ -2238,6 +2318,186 @@ class NovitaSandboxTool(Tool):
             "apk_decompile": 780,
             "apk_build": 780,
         }.get(action, 300)
+
+    async def _execute_vercel(
+        self, action: str, kwargs: dict[str, Any], config: Any, session_key: str
+    ) -> ToolResult | str:
+        """Run the shared sandbox action contract on a Vercel Sandbox."""
+        budget = self._vercel_action_budget(action, kwargs)
+        try:
+            return await asyncio.wait_for(
+                self._execute_vercel_inner(action, kwargs, config, session_key), timeout=budget
+            )
+        except asyncio.TimeoutError:
+            return ToolResult.error(
+                "The Vercel Sandbox operation did not finish in time. Wait a moment, then "
+                "either retry the same step or reset the sandbox first."
+            )
+
+    @staticmethod
+    def _vercel_action_budget(action: str, kwargs: dict[str, Any]) -> int:
+        # Hard watchdog: whatever the underlying slow path (cold sandbox,
+        # provisioning, a wedged HTTP request), the AI's turn must never block
+        # indefinitely. ``run``/``install``/``fetch_url`` track the caller's own
+        # timeout plus margin; fixed budgets cover the rest. Vercel provisions
+        # in roughly a second, so the fixed budgets are tighter than Runloop's.
+        if action in {"run", "install", "fetch_url"}:
+            try:
+                requested = int(kwargs.get("timeout") or 0)
+            except (TypeError, ValueError):
+                requested = 0
+            default = 600 if action == "install" else 150
+            return max(300, min(max(requested, default), _MAX_TIMEOUT)) + 120
+        return {
+            "reset": 120,
+            "read": 180,
+            "write": 300,
+            "upload": 420,
+            "list": 150,
+            "download_url": 420,
+        }.get(action, 240)
+
+    async def _execute_vercel_inner(
+        self, action: str, kwargs: dict[str, Any], config: Any, session_key: str
+    ) -> ToolResult | str:
+        key = session_key or "unknown"
+        backend = self._vercel_backend(config, key)
+        try:
+            if action == "reset":
+                # Stop the user's sandbox immediately; a fresh sandbox is created
+                # on the next operation. The stored id is cleared even if the
+                # remote call fails, so nothing lingers.
+                sandbox_id = _VERCEL_STORE.sandbox_id(key)
+                with suppress(Exception):
+                    await backend.reset(sandbox_id)
+                _VERCEL_STORE.remove(key)
+                return "Vercel Sandbox reset. A new sandbox will be created for the next operation."
+            if action not in {"run", "read", "write", "upload", "fetch_url", "install", "list", "download_url"}:
+                return ToolResult.error("Unknown sandbox action")
+            async with _VERCEL_STORE.lock_for(key):
+                if action == "run":
+                    command = str(kwargs.get("command") or "").strip()
+                    if not command:
+                        return ToolResult.error("command is required")
+                    timeout = max(1, min(int(kwargs.get("timeout") or 120), _MAX_TIMEOUT))
+                    # Seed once per session, then source the credential file so
+                    # git/gh/curl authenticate (the sandbox does not inherit the
+                    # backend environment).
+                    if not getattr(backend, "_nb_creds_seeded", False):
+                        await self._seed_git_credentials(backend, backend.workspace)
+                        backend._nb_creds_seeded = True
+                    output = await backend.run(_git_creds_source_for(backend.workspace) + command, timeout=timeout)
+                    if getattr(backend, "last_sandbox_id", ""):
+                        _VERCEL_STORE.set_id(key, backend.last_sandbox_id)
+                    return output
+                if action == "install":
+                    raw_packages = str(kwargs.get("packages") or "").strip()
+                    packages = [part for part in re.split(r"[\s,]+", raw_packages) if part]
+                    timeout = max(30, min(int(kwargs.get("timeout") or 600), _MAX_TIMEOUT))
+                    result = await backend.install_packages(packages, timeout=timeout)
+                    if getattr(backend, "last_sandbox_id", ""):
+                        _VERCEL_STORE.set_id(key, backend.last_sandbox_id)
+                    return f"Vercel Sandbox package installation result:\n{result}"
+                if action == "read":
+                    return await backend.read(str(kwargs.get("path") or ""))
+                if action == "write":
+                    content = str(kwargs.get("content") or "")
+                    if len(content) > _MAX_CONTENT_CHARS:
+                        return ToolResult.error(
+                            f"content exceeds {_MAX_CONTENT_CHARS} characters. Do NOT retry with the same payload: "
+                            "instead split the file into sequential write ops (first op writes the head, "
+                            'then {"action":"run","command":"cat >> \\"<path>\\" << \'PX_EOF\'\\n...\\nPX_EOF"} '
+                            "appends each following chunk; use a unique heredoc marker)."
+                        )
+                    path = str(kwargs.get("path") or "")
+                    await backend.write(path, content)
+                    if getattr(backend, "last_sandbox_id", ""):
+                        _VERCEL_STORE.set_id(key, backend.last_sandbox_id)
+                    return f"Wrote {len(content)} characters to {path} in the Vercel workspace."
+                if action == "upload":
+                    source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
+                    if not self._local_attachment_allowed(source):
+                        return ToolResult.error("source must be inside the nanobot media/data directory")
+                    if not source.is_file():
+                        return ToolResult.error("source file does not exist")
+                    if source.stat().st_size > _MAX_UPLOAD_BYTES:
+                        return ToolResult.error("source file exceeds 200 MiB")
+                    path = str(kwargs.get("path") or "")
+                    await backend.write_bytes(path, await asyncio.to_thread(source.read_bytes))
+                    if getattr(backend, "last_sandbox_id", ""):
+                        _VERCEL_STORE.set_id(key, backend.last_sandbox_id)
+                    return f"Uploaded {source.name} to {path} in the Vercel workspace."
+                if action == "fetch_url":
+                    url = str(kwargs.get("url") or "").strip()
+                    if not url:
+                        return ToolResult.error("url is required for fetch_url")
+                    parsed = urlparse(url)
+                    if is_gofile_url(url):
+                        try:
+                            resolved = await resolve_gofile_download(url, timeout_seconds=int(kwargs.get("timeout") or 150))
+                        except GoFileError as exc:
+                            return ToolResult.error(f"could not resolve gofile.io link: {exc}")
+                        item = resolved[0]
+                        real_name = re.sub(r"[^A-Za-z0-9._-]", "_", str(item.get("name") or "gofile_file")) or "gofile_file"
+                        try:
+                            data = await request_file(item, timeout_seconds=int(kwargs.get("timeout") or 150))
+                        except GoFileError as exc:
+                            return ToolResult.error(f"could not download gofile.io file: {exc}")
+                        dest = str(kwargs.get("path") or "").strip() or f"{real_name}"
+                        await backend.write_bytes(dest, data)
+                        if getattr(backend, "last_sandbox_id", ""):
+                            _VERCEL_STORE.set_id(key, backend.last_sandbox_id)
+                        return f"Fetched remote file to {dest} in the Vercel workspace. Use action=read or run commands to analyze it."
+                    if parsed.scheme != "https" or parsed.netloc not in {"onlyfiles.com", "gofile.io"}:
+                        if not backend._is_host_allowed((parsed.netloc or "").lower()):
+                            return ToolResult.error(
+                                "url must be an HTTPS onlyfiles.com / gofile.io URL, or a host on the "
+                                "Vercel fetch_allow_hosts list"
+                            )
+                    dest_path = str(kwargs.get("path") or "").strip()
+                    fetched = await backend.fetch_url(url, dest_path, timeout=int(kwargs.get("timeout") or 150))
+                    if getattr(backend, "last_sandbox_id", ""):
+                        _VERCEL_STORE.set_id(key, backend.last_sandbox_id)
+                    return f"Fetched remote file to {fetched} in the Vercel workspace. Use action=read or run commands to analyze it."
+                if action == "list":
+                    return await backend.list(str(kwargs.get("path") or ""))
+                if action == "download_url":
+                    path = str(kwargs.get("path") or "")
+                    destination = self._artifact_destination(path)
+                    downloaded = await backend.download(path, destination)
+                    if getattr(backend, "last_sandbox_id", ""):
+                        _VERCEL_STORE.set_id(key, backend.last_sandbox_id)
+                    try:
+                        shared = await upload_shared_artifact(downloaded)
+                    except (FileShareError, OnlyFilesError) as exc:
+                        return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
+                    host_label = shared.get("host", "onlyfiles")
+                    direct = shared.get("download_url") or shared["url"]
+                    fallback = shared.get("page_url") or shared["url"]
+                    return (
+                        f"Downloaded remote artifact to local path: {downloaded}\n"
+                        f"Direct-download link ({host_label}) - tap opens the download immediately:\n"
+                        f"{direct}\n"
+                        f"Permanent page link (fallback if the direct link ever stops working):\n"
+                        f"{fallback}\n"
+                        "Give the user this link and do NOT paste the file contents into "
+                        "your reply. The file may also be attached directly via the "
+                        "message tool's media parameter when direct attachment delivery "
+                        "is available. Prefer a single clear download link over dumping "
+                        "raw text."
+                    )
+            return ToolResult.error("Unknown sandbox action")
+        except SandboxBusyError:
+            return ToolResult.error(
+                "A previous Vercel Sandbox operation for this session is still running and did not finish in time. "
+                "Wait a moment, then either retry the same step or reset the sandbox first."
+            )
+        except VercelError as exc:
+            logger.warning("Vercel Sandbox operation failed: {}", str(exc)[:300])
+            return ToolResult.error(f"Vercel Sandbox error: {str(exc)[:500]}")
+        except Exception as exc:
+            logger.exception("Vercel Sandbox operation failed")
+            return ToolResult.error(f"Vercel Sandbox error: {type(exc).__name__}: {str(exc)[:500]}")
 
     async def _execute_runloop(
         self, action: str, kwargs: dict[str, Any], config: Any, session_key: str
@@ -2716,6 +2976,12 @@ class NovitaSandboxTool(Tool):
             ctx = current_request_context()
             session_key = (ctx.session_key or f"{ctx.channel}:{ctx.chat_id}") if ctx is not None else _session_key()
             return await self._execute_runloop(action, kwargs, backend_config, session_key)
+        if selected_backend == "vercel":
+            if backend_config is None or not str(backend_config.token or "").strip():
+                return ToolResult.error("Vercel execution is selected but no token is configured")
+            ctx = current_request_context()
+            session_key = (ctx.session_key or f"{ctx.channel}:{ctx.chat_id}") if ctx is not None else _session_key()
+            return await self._execute_vercel(action, kwargs, backend_config, session_key)
         key = _session_key()
         try:
             if action == "reset":

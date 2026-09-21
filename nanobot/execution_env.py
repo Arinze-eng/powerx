@@ -54,6 +54,7 @@ def apply_render_execution_env(config: Any) -> Any:
     upstash = getattr(execution, "upstash", None)
     daytona = getattr(execution, "daytona", None)
     runloop = getattr(execution, "runloop", None)
+    vercel = getattr(execution, "vercel", None)
     # Credential-only overlay: env never changes which backend is selected.
     if (_env("NANOBOT_EXECUTION_BACKEND") or "").lower() not in {
         "novita",
@@ -61,6 +62,7 @@ def apply_render_execution_env(config: Any) -> Any:
         "upstash",
         "daytona",
         "runloop",
+        "vercel",
     }:
         return config
 
@@ -187,4 +189,22 @@ def apply_render_execution_env(config: Any) -> Any:
         if keep_alive is not None and keep_alive >= 60 and int(getattr(runloop, "keep_alive_seconds", 3600) or 3600) == 3600:
             runloop.keep_alive_seconds = keep_alive
         _fill(runloop, "fetch_allow_hosts", _env("NANOBOT_RUNLOOP_FETCH_ALLOW_HOSTS"))
+    # Vercel Sandbox overlay (used when the deployment selects the Vercel
+    # backend). Same credential-only, fill-blanks rule as every other provider:
+    # an admin-saved token/endpoint wins, env restores what is missing.
+    if vercel is not None:
+        _fill(vercel, "token", _env("NANOBOT_VERCEL_TOKEN") or _env("VERCEL_TOKEN"))
+        _fill(vercel, "api_url", _env("NANOBOT_VERCEL_API_URL"))
+        _fill(vercel, "team_id", _env("NANOBOT_VERCEL_TEAM_ID") or _env("VERCEL_TEAM_ID"))
+        _fill(vercel, "project_id", _env("NANOBOT_VERCEL_PROJECT_ID") or _env("VERCEL_PROJECT_ID"))
+        runtime = _env("NANOBOT_VERCEL_RUNTIME")
+        if runtime and str(getattr(vercel, "runtime", "") or "").strip() in {"", "node22"}:
+            vercel.runtime = runtime
+        vcpus = _positive_int(_env("NANOBOT_VERCEL_VCPUS"), maximum=8)
+        if vcpus is not None and int(getattr(vercel, "vcpus", 2) or 2) == 2:
+            vercel.vcpus = vcpus
+        timeout_ms = _positive_int(_env("NANOBOT_VERCEL_TIMEOUT_MS"), maximum=2_700_000)
+        if timeout_ms is not None and timeout_ms >= 60_000 and int(getattr(vercel, "timeout_ms", 300_000) or 300_000) == 300_000:
+            vercel.timeout_ms = timeout_ms
+        _fill(vercel, "fetch_allow_hosts", _env("NANOBOT_VERCEL_FETCH_ALLOW_HOSTS"))
     return config

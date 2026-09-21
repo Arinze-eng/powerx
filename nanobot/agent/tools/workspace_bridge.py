@@ -377,6 +377,13 @@ async def _stage_remote_backend(
         )
 
         backend = RunloopExecutionBackend(backend_config, devbox_name=runloop_devbox_name(key))
+    elif backend_name == "vercel" and backend_config is not None:
+        from nanobot.agent.tools.vercel_backend import (
+            VercelExecutionBackend,
+            vercel_sandbox_name,
+        )
+
+        backend = VercelExecutionBackend(backend_config, sandbox_name=vercel_sandbox_name(key))
 
     if backend is None:
         logger.debug("workspace_bridge: no backend instance for {}", backend_name)
@@ -504,12 +511,14 @@ async def sandbox_workspace_root() -> str | None:
         daytona_backend,
         runloop_backend,
         upstash_backend,
+        vercel_backend,
     )
 
     mapping = {
         "daytona": daytona_backend.WORKSPACE,
         "runloop": runloop_backend.WORKSPACE,
         "upstash": upstash_backend.WORKSPACE,
+        "vercel": vercel_backend.WORKSPACE,
     }
     return mapping.get(backend_name)
 

@@ -13,7 +13,7 @@ _LEGACY_DEFAULT_MAX_TOOL_ITERATIONS = 80
 _DEFAULT_REASONING_EFFORT = "max"
 _DEFAULT_RENDER_MODEL = "gemini-3.1-flash-lite"
 
-_VALID_EXECUTION_BACKENDS = ("novita", "vps", "upstash", "daytona", "runloop")
+_VALID_EXECUTION_BACKENDS = ("novita", "vps", "upstash", "daytona", "runloop", "vercel")
 # Matches ExecutionBackendConfig.backend default in nanobot/config/schema.py.
 _DEFAULT_EXECUTION_BACKEND = "novita"
 

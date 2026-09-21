@@ -498,6 +498,30 @@ class RunloopExecutionConfig(Base):
     persist_workspace: bool = True
 
 
+class VercelExecutionConfig(Base):
+    """Administrator-configured Vercel Sandbox target for sandbox-backed execution.
+
+    Vercel Sandbox provides ephemeral Linux microVMs billed by *active CPU*
+    (idle I/O time is excluded), so it is the cheapest backend for many short,
+    bursty code-execution calls. A single sandbox lives at most 45 minutes.
+    """
+
+    token: str = Field(default="", repr=False)
+    api_url: str = "https://api.vercel.com"
+    team_id: str = ""
+    project_id: str = ""
+    runtime: Literal["node22", "node24", "python3.13"] = "node22"
+    vcpus: int = Field(default=2, ge=1, le=8)
+    # Vercel caps one sandbox at 45 minutes of wall-clock lifetime.
+    timeout_ms: int = Field(default=300_000, ge=60_000, le=2_700_000)
+    fetch_allow_hosts: str = ""
+    # Vercel sandboxes are cheap to recreate and bill only for active CPU, so
+    # persistence defaults OFF: a finished task stops the sandbox and the next
+    # operation provisions a fresh one. Turn it on to keep files across tasks
+    # (the sandbox is then left running until its own timeout reaps it).
+    persist_workspace: bool = False
+
+
 class NovitaTemplateConfig(Base):
     """Per-deployment Novita sandbox sizing (CPU/RAM).
 
@@ -514,7 +538,7 @@ class NovitaTemplateConfig(Base):
 class ExecutionBackendConfig(Base):
     """Select the remote execution provider used by sandbox-compatible tasks."""
 
-    backend: Literal["novita", "vps", "upstash", "daytona", "runloop"] = "novita"
+    backend: Literal["novita", "vps", "upstash", "daytona", "runloop", "vercel"] = "novita"
     # Who picked ``backend``. This is recorded instead of inferred from which
     # credentials happen to sit on disk, so an administrator's explicit choice
     # can never be silently reverted by a durable deployment environment value.
@@ -526,6 +550,7 @@ class ExecutionBackendConfig(Base):
     upstash: UpstashExecutionConfig = Field(default_factory=UpstashExecutionConfig)
     daytona: DaytonaExecutionConfig = Field(default_factory=DaytonaExecutionConfig)
     runloop: RunloopExecutionConfig = Field(default_factory=RunloopExecutionConfig)
+    vercel: VercelExecutionConfig = Field(default_factory=VercelExecutionConfig)
     novita_template: NovitaTemplateConfig = Field(default_factory=NovitaTemplateConfig)
 
 
