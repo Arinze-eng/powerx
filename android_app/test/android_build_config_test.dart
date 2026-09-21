@@ -16,6 +16,11 @@
 //     federated plugin source, so the Android kernel snapshot failed to compile
 //     even though the plugin is Linux-only.
 //
+//  3. Malformed resource XML. `--` is not allowed inside an XML comment, so a
+//     comment quoting a CSS custom property name (a backticked
+//     `--background: 30 8% 19%`) failed ':app:mergeReleaseResources' with
+//     "The string "--" is not permitted within comments".
+//
 // These are cheap file assertions, but they run in the normal `flutter test`
 // step, which means a regression fails fast and loudly instead of costing a
 // full Gradle cycle to discover.
@@ -23,6 +28,7 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:xml/xml.dart';
 
 /// Minimum Android API level the manifest merger will accept.
 ///
@@ -91,6 +97,36 @@ void main() {
             'break the Dart kernel snapshot compile for every platform target — '
             'including Android APK builds.',
       );
+    });
+
+    test('every Android resource XML is well formed', () {
+      // Regression: a comment containing a CSS custom-property name (for
+      // example a backticked `--background: 30 8% 19%`) is illegal XML —
+      // "--" is not permitted inside a comment. Nothing in `flutter analyze`
+      // or the widget tests parses these files, so the mistake survived a
+      // green local run and only surfaced in CI as
+      //   Execution failed for task ':app:mergeReleaseResources'.
+      // Parsing them here turns that into a fast, local failure.
+      final resDir = Directory('android/app/src/main/res');
+      expect(resDir.existsSync(), isTrue);
+
+      final xmlFiles = resDir
+          .listSync(recursive: true)
+          .whereType<File>()
+          .where((f) => f.path.endsWith('.xml'))
+          .toList();
+      expect(xmlFiles, isNotEmpty,
+          reason: 'the Android res directory should carry XML resources');
+
+      for (final file in xmlFiles) {
+        final raw = file.readAsStringSync();
+        expect(
+          () => XmlDocument.parse(raw),
+          returnsNormally,
+          reason: '${file.path} is not well-formed XML, so Gradle\'s resource '
+              'merger will fail the release APK build',
+        );
+      }
     });
 
     test('the microphone permission the recorder depends on is declared', () {
