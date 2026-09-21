@@ -1,125 +1,192 @@
 ---
 name: pdf-quality
-description: "Produce polished, publication-quality PDF documents (reports, notes, assignments, study guides) using LaTeX/pdflatex or HTML→PDF, with real charts embedded in the document. Use whenever the user asks for a PDF, report, write-up, or 'make it look professional'."
+description: "Produce publication-quality PDF documents: reports, notes, assignments, study guides, proposals, contracts, whitepapers, invoices. Typesets with pdflatex (LaTeX) — never plain text — with real charts, diagrams, and sourced images embedded in the document. Use whenever the user asks for a PDF, a report, a document, a write-up, or 'make it look professional'."
 metadata: {"nanobot":{"emoji":"📄","requires":{"bins":["python3"]}}}
 ---
 
-# High-Quality PDF Generation
+# Publication-Quality PDF Production
 
-You can and should produce beautiful, professional PDFs. A full toolchain is available in the
-sandbox — `pdflatex`/`xelatex`, Python (`matplotlib`, `pandas`, `reportlab`), and headless Chrome
-for HTML→PDF. **Never hand the user raw LaTeX source as the deliverable.** The output is always a
-finished `.pdf`. If content needs a figure/chart, render it and embed it *in* the PDF.
+Every PDF you produce must look like it was designed by a person who cares. The output is
+always a finished, typeset `.pdf` — **never** raw text, never a `.tex`/`.html`/`.md` file handed
+over as the deliverable, never a wall of unstyled paragraphs.
 
-## Decide the engine
+## The one rule that matters
 
-| Situation | Engine |
-|---|---|
-| Academic/formal doc, math, equations, references, multi-page reports | **LaTeX** (`pdflatex` / `xelatex`) |
-| Data-heavy report with many charts, tables, styling control | **HTML + CSS → PDF** (headless Chrome / WeasyPrint) |
-| Programmatic/simple layout, invoices, forms | **ReportLab** or **WeasyPrint** |
-| Markdown-first then typeset | pandoc → LaTeX, or md → HTML → PDF |
+**Typeset with LaTeX (`pdflatex`).** A PDF is a typesetting target, not a text dump. If you find
+yourself writing a PDF with plain text, default margins, and no structure, stop and do it
+properly. `pdflatex` is the primary engine; there is no "just write the text" fallback.
 
-Prefer LaTeX when the user wants something that looks like a proper paper/handout. Prefer
-HTML→PDF when you want modern typography/layout with less boilerplate. Either way: compile to PDF.
+| Route | When | Notes |
+|---|---|---|
+| **`pdflatex` / `xelatex`** | **Default for everything** — reports, assignments, notes, guides, proposals, whitepapers, contracts, letters | Real typography, page numbers, headers, TOC, captions, vector figures |
+| HTML + CSS → PDF (headless Chrome / WeasyPrint) | Only when the user explicitly wants a web-style/branded marketing layout that LaTeX handles badly (heavy colour blocks, flexbox-style grids) | Still a *designed* document: set `@page { margin: 18mm }`, fonts, colours, page numbers |
+| ReportLab | Only for generated forms/invoices where every coordinate matters | Last resort |
 
-## Toolchain check & install (idempotent)
+Never use `fpdf`/`reportlab` to dump paragraphs, and never ship a PDF whose pages are plain
+unstyled text. If `pdflatex` genuinely cannot be installed, say so and use the HTML→PDF route
+with a full design pass — do not silently degrade to plain text.
+
+## Toolchain (install once, idempotently)
 
 ```bash
-which pdflatex xelatex pandoc 2>/dev/null
-pip show matplotlib pandas reportlab weasyprint >/dev/null 2>&1 || pip install --quiet matplotlib pandas reportlab
+which pdflatex xelatex || apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+  texlive-latex-base texlive-latex-recommended texlive-latex-extra texlive-fonts-recommended \
+  texlive-pictures texlive-science fonts-liberation
+python3 -c "import matplotlib, PIL" 2>/dev/null || pip install -q matplotlib pillow
+which dot || apt-get install -y -qq graphviz   # only if you need graph diagrams
 ```
-If `pdflatex` is missing and cannot be installed on a read-only rootfs, fall back to
-**HTML→PDF** (WeasyPrint or headless Chromium) — do not give up on producing a PDF.
-Install options if needed:
+`texlive-latex-extra` matters: it carries `titlesec`, `fancyhdr`, `booktabs`, `tcolorbox`,
+`enumitem`, and `mdframed`; `texlive-fonts-recommended` + `lmodern` provide the Latin Modern
+fonts (`\usepackage{lmodern}` fails without them). Never leave LaTeX to auto-install packages at
+compile time.
+
+**A missing `.sty` is not a reason to downgrade.** If the log says ``File `x.sty' not found``,
+find and install the providing package, then recompile:
 ```bash
-apt-get update && apt-get install -y texlive-latex-extra texlive-fonts-recommended   # LaTeX
-apt-get update && apt-get install -y fonts-liberation                                # nicer fonts
-pip install weasyprint                                                               # HTML→PDF
+grep -m1 "not found" doc.log                      # which package is missing
+apt-get install -y -qq texlive-latex-extra texlive-fonts-recommended texlive-pictures lmodern
+# only if still missing: drop that \usepackage and use a plain equivalent
 ```
+An HTML→PDF fallback is allowed **only** when LaTeX genuinely cannot be installed at all — and
+then it must still be fully designed. Leave a note in chat saying which route you took and why.
 
-## LaTeX quality bar (this is what "high quality" means)
+## Non-negotiables for every document
 
-- Use a clean preamble; set geometry, readable font size, headers/footers, page numbers.
-- Structure with `\section`/`\subsection`; use `titlesec`, `fancyhdr`, `geometry`, `booktabs`.
-- Typeset math properly (`amsmath`), never paste ASCII formulas.
-- Tables via `booktabs` (`\toprule/\midrule/\bottomrule`) — no ugly vertical grids.
-- Figures/graphs via `\includegraphics` from generated PNG/PDF images (see below).
-- Consistent spacing, captioned figures/tables, a title block with author/date.
-- Hyperlinks + TOC for longer docs (`hyperref`, `\tableofcontents`).
+1. **Title block** — title, subtitle where it helps, author/subject, date. Never start with body text.
+2. **A designed preamble** — sane margins, serif body at 10–11pt, section styling, page numbers,
+   and a running header/footer. Copy the default below and adjust; do not invent a bare document.
+3. **Structure** — `\section` / `\subsection`, `\tableofcontents` for anything over ~4 pages.
+4. **Visual elements** — at least one of: chart, table (booktabs), diagram, figure, or a callout box.
+   A multi-page report with zero visuals is a failed deliverable.
+5. **Captions on every figure and table** — numbered, descriptive, referenced in the prose.
+6. **No raw ASCII maths** — typeset with `amsmath` (`\frac`, `\sum`, `\int`, aligned environments).
+7. **Compile clean** — read the `.log`, fix every error, then compile twice.
 
-### Solid default preamble
+### Default preamble (start here, then tailor)
+
 ```latex
 \documentclass[11pt,a4paper]{article}
 \usepackage[margin=2.2cm]{geometry}
+\usepackage[T1]{fontenc}\usepackage[utf8]{inputenc}\usepackage{lmodern}
 \usepackage{graphicx}\usepackage{booktabs}\usepackage{amsmath,amssymb}
-\usepackage{caption}\usepackage{fancyhdr}\usepackage[dvipsnames]{xcolor}
-\usepackage{hyperref}\usepackage{lmodern}
-\pagestyle{fancy}\fancyhf{}\fancyfoot[C]{\thepage}
-\title{Your Title}\author{Author}\date{\today}
+\usepackage{caption}\usepackage{enumitem}\usepackage[dvipsnames]{xcolor}
+\usepackage{fancyhdr}\usepackage{titlesec}\usepackage{tcolorbox}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=NavyBlue,urlcolor=NavyBlue}
+\pagestyle{fancy}\fancyhf{}
+\fancyhead[L]{\small\textcolor{gray}{Document Title}}
+\fancyfoot[C]{\thepage}
+\titleformat{\section}{\Large\bfseries\color{NavyBlue}}{\thesection}{0.6em}{}
+\title{Title}\author{Author}\date{\today}
 \begin{document}\maketitle
-% \tableofcontents % for long docs
-...
+% \tableofcontents
 \end{document}
 ```
-Compile: `pdflatex -interaction=nonstopmode doc.tex && pdflatex doc.tex` (twice for refs/TOC).
-Use `xelatex` instead when you need custom system fonts or Unicode.
 
-## Charts & graphs — generate then embed
+**Design the look to the brief.** Ask/derive the audience and tone, then pick a palette (e.g. navy
++ slate + one accent; or a warm editorial ink/ochre). Keep one accent colour, use it for headings
+and rule lines, keep body text near-black (`black!85`) rather than pure black. Business/formal →
+serif (Latin Modern/Charter), conservative. Creative → a display face for headings via `xelatex`.
 
-When anything benefits from a visual (trends, comparisons, distributions, geometry), make a
-proper plot and put it IN the PDF. Do not describe data in prose when a chart is clearer.
+### Reusable design constructs (use them instead of plain paragraphs)
+
+```latex
+% Key-points callout
+\begin{tcolorbox}[colback=NavyBlue!5,colframe=NavyBlue,title=\textbf{Key takeaways},arc=2mm]
+\begin{itemize}[leftmargin=1.1em]\item ...\end{itemize}\end{tcolorbox}
+
+% Booktabs table
+\begin{table}[h]\centering\small
+\begin{tabular}{lrr}\toprule
+Item & Value & Share \\ \midrule
+A & 120 & 40\% \\ \bottomrule
+\end{tabular}
+\caption{Descriptive caption.}\end{table}
+```
+
+## Images — source them, don't draw squares
+
+When the document benefits from a photo, illustration, or logo, **fetch a real one**. The sandbox
+has network access: use `curl`, `web_search`/`image search` for candidate URLs, then download.
+
+### How to source internet images properly
+
+1. **Know what you need first.** Write the shot: "modern hospital reception, wide, no logos,
+   landscape" — not "a picture of healthcare".
+2. **Search keyless, licensed sources first** (no API key needed, safe to embed with attribution):
+   - **Wikimedia Commons / Wikipedia** — the best default; free licences, stable direct URLs.
+     ```bash
+     curl -s "https://commons.wikimedia.org/w/api.php?action=query&generator=search\
+&gsrsearch=filetype:bitmap%20solar%20panel%20rooftop&gsrlimit=8&gsrnamespace=6\
+&prop=imageinfo&iiprop=url|extmetadata|size&iiurlwidth=1600&format=json" \
+       | python3 -c "import json,sys;d=json.load(sys.stdin);[print(p['imageinfo'][0]['thumburl'],'|',p['imageinfo'][0]['extmetadata'].get('LicenseShortName',{}).get('value','?')) for p in d['query']['pages'].values()]"
+     ```
+   - **Openverse** (`https://api.openverse.org/v1/images/?q=...&license_type=commercial`) — CC
+     images across Flickr, museums, etc. Keyless, returns `url` + `license`.
+   - **Unsplash/Pexels** if a key exists (`UNSPLASH_ACCESS_KEY` / `PEXELS_API_KEY`) — best quality
+     for modern editorial looks. **Never scrape or hotlink an arbitrary Google Images result**:
+     unknown licence and it breaks the "don't fabricate/steal" rule.
+3. **Verify the file before you use it** — fatal silent failure otherwise:
+   ```bash
+   curl -fsSL --max-time 60 -A "Mozilla/5.0" -o img.jpg "$URL"
+   python3 -c "from PIL import Image; im=Image.open('img.jpg'); print(im.format, im.size); \
+assert im.format in ('JPEG','PNG','WEBP','GIF') and min(im.size) >= 600"
+   ```
+   If that raises (`UnidentifiedImageError` means you downloaded an HTML page), pick the next
+   candidate. Never `\includegraphics` an unverified file — that is how you get a 1×1 blank or a
+   black box in the PDF.
+4. **Prepare it for print**: crop to the aspect you need, resize so the long edge is ~1600–2000px,
+   convert to a print-safe file, and keep it *inside* the document folder:
+   ```bash
+   convert img.jpg -resize 1800x1800\> -strip -quality 88 figure-1.jpg
+   ```
+   Vector (SVG) → `rsvg-convert -f pdf` or `inkscape --export-type=pdf` and include the PDF.
+5. **Credit it.** Figure caption carries the source and licence
+   (`\caption{... Source: Wikimedia Commons, CC BY-SA 4.0}`) and the references section lists the
+   full attribution with the URL. `pdflatex` cannot include a JPEG unless it is baseline; if
+   `graphicx` complains about a PNG/JPG, `convert` it once more.
+6. **Layout with images**: `width=\linewidth` for full-width figures; two images side by side with
+   `\subfloat`/`minipage`; text wrap with `wrapfig` for a portrait photo; a full-bleed cover with
+   `\includegraphics[width=\paperwidth]` inside `tikz` `\node[inner sep=0pt]`. Always `\centering`
+   and always a caption.
+7. If the user asks for an image the internet shouldn't supply (a specific private person, a
+   trademarked logo they don't own), generate a placeholder or ask — do not embed a wrong face.
+
+### Charts and diagrams (generate locally, embed as vector)
 
 ```python
-import matplotlib
-matplotlib.use("Agg")                      # headless
+import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 fig, ax = plt.subplots(figsize=(7,4), dpi=200)
-ax.plot(x, y, lw=2, color="#1f77b4")
-ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_title("...")
-ax.grid(alpha=.3); fig.tight_layout()
-fig.savefig("/workspace/plot.pdf")         # vector -> crisp in LaTeX
-fig.savefig("/workspace/plot.png", dpi=200) # fallback raster
+ax.plot(x, y, lw=2, color="#1F3A5F"); ax.grid(alpha=.3)
+ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_title("Clear, specific title")
+fig.tight_layout(); fig.savefig("fig-plot.pdf")   # vector -> crisp in LaTeX
 ```
-Embed in LaTeX:
-```latex
-\begin{figure}[h]\centering
-\includegraphics[width=\linewidth]{plot.pdf}
-\caption{Descriptive caption.}\label{fig:plot}
-\end{figure}
-```
-Style guidance: legible fonts, labeled axes, a title, muted palette, gridlines, save at
-`dpi>=200` or as vector (`.pdf`/`.svg`). One clear message per figure.
+- **Diagrams/flowcharts** — Graphviz (`dot -Tpdf flow.dot -o flow.pdf`) or TikZ for precise control:
+  ```latex
+  \usepackage{tikz}\usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+  \begin{tikzpicture}[node distance=1.4cm,box/.style={draw,rounded corners,fill=NavyBlue!8,
+    minimum width=2.6cm,minimum height=0.9cm,align=center},->,>=Stealth]
+  \node[box](a){Input}; \node[box,right=of a](b){Process}; \node[box,right=of b](c){Output};
+  \draw(a)--(b); \draw(b)--(c);
+  \end{tikzpicture}
+  ```
+- **Geometry/annotated figures** — TikZ; **data-heavy multi-chart pages** — matplotlib gridspec.
+- Style: muted palette matching the document accent, labelled axes, no chartjunk, `dpi>=200`.
 
-## HTML → PDF route (modern look, easy styling)
+## Compile, verify, deliver
 
-Write semantic HTML + CSS (Tailwind CDN or plain CSS), then print to PDF:
 ```bash
-# WeasyPrint
-python3 -c "from weasyprint import HTML; HTML('doc.html').write_pdf('doc.pdf')"
-# or headless Chromium for pixel-perfect web rendering
-chromium --headless --no-sandbox --disable-gpu --print-to-pdf=/workspace/doc.pdf /workspace/doc.html
+pdflatex -interaction=nonstopmode -halt-on-error doc.tex >/dev/null 2>&1 || sed -n '/^!/,/^l\.[0-9]/p' doc.log
+pdflatex -interaction=nonstopmode doc.tex >/dev/null   # 2nd pass for refs/TOC/page numbers
+pdfinfo doc.pdf | head -5          # confirm page count
+pdftoppm -png -r 70 -f 1 -l 1 doc.pdf /tmp/page   # eyeball page 1
 ```
-Good for branded reports, dashboards exported to PDF, and rich layouts. Embed `<img>` of your
-generated charts; keep colors print-safe; set `@page { margin: 18mm }`.
-
-## Student-facing defaults (important)
-
-Many users are students — optimize for clarity and learning:
-- Clear headings, short paragraphs, worked examples, step-by-step derivations.
-- Define terms on first use; include a summary/key-points box.
-- Diagrams/charts wherever they aid understanding.
-- Proper citations/references section for academic work; never fabricate sources.
-- Readable serif body font, generous margins, page numbers, a cover/title block.
-- Keep it honest: if a number or fact is uncertain, verify or state the assumption.
-
-## Definition of done (verify before delivering)
-
-1. The file compiles/renders with **no errors**; open it to confirm pages exist.
-2. It is a **real `.pdf`** artifact under `/workspace/` — not `.tex`/`.html` handed over raw.
-3. Fonts, margins, headers/footers, page numbers present; figures render (not black boxes).
-4. Any required charts are embedded and legible.
-5. Deliver the PDF path and briefly note structure (sections, figures). Offer tweaks.
-
-Do NOT expose internal temp paths or paste the whole LaTeX/HTML source into chat unless asked —
-the deliverable is the compiled PDF.
+Definition of done — all must hold before you deliver:
+1. It is a **real `.pdf`**, compiled with zero errors, and `pdfinfo` reports the expected pages.
+2. Title block, headers/footers, page numbers, TOC (if long) are present.
+3. At least one figure/table/chart/diagram is embedded, captioned, and legible (not a black box).
+4. Fonts are embedded and text is selectable (`pdffonts doc.pdf`).
+5. No page is a plain wall of text; nothing overflows the margins.
+6. You deliver the PDF path, then one or two lines on structure and figures. Never paste the
+   LaTeX source into chat and never hand over the `.tex`/`.html` as the deliverable.

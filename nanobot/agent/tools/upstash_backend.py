@@ -51,6 +51,78 @@ _MAX_SYNC_EXEC_TIMEOUT = 270
 # Upstash boxes keep their working files under this workspace root.
 WORKSPACE = "/workspace/home"
 
+# ---------------------------------------------------------------------------
+# Latency / liveness budgets.
+#
+# These are deliberately tighter than the values they replaced. A wedged
+# Upstash account (box quota exhausted, control plane slow or not answering)
+# used to walk `GET /v2/box/{id}` -> `find_box` (list every box) -> restart ->
+# `wait_ready` (90s) -> create, on EVERY single command, with no ceiling. One
+# sandbox command could therefore hold the agent's turn for many minutes and
+# several commands in a row made the whole deployment look frozen — the
+# "Upstash hangs the entire system / box limit" report.
+#
+# Now: every wait below is individually capped, `ensure_box` has a total
+# ceiling, and three consecutive transport failures open a per-endpoint
+# circuit breaker so the follow-up calls fail instantly and visibly instead of
+# re-waiting. Other backends (novita, daytona, runloop, vps) are untouched.
+_ENSURE_FAST_PATH_BUDGET = 30   # one tracked box: GET status + wait when warm
+_ENSURE_FULL_BUDGET = 75        # list / create / restart path, end to end
+_WAIT_READY_BUDGET = 60         # status polling after a restart
+_WAIT_READY_HARD_MARGIN = 30    # absolute ceiling on top of that budget
+_TRANSPORT_SLACK = 30           # transport allowance on top of an exec budget
+_INSTALL_TOTAL_BUDGET = 600     # cumulative ceiling for one install_packages()
+_BREAKER_THRESHOLD = 3          # consecutive transport failures that trip it
+_BREAKER_COOLDOWN = 60          # seconds the breaker stays open
+
+# Per-endpoint circuit breaker state: {base_url: {"fails": int, "reason": str,
+# "opened_at": float}}. Only *transport* failures (ClientError / timeout) count
+# — an HTTP 4xx/5xx answer proves the control plane is alive and must never
+# trip the breaker.
+_BREAKER: dict[str, dict[str, Any]] = {}
+
+
+def _breaker_entry(base_url: str) -> dict[str, Any]:
+    return _BREAKER.setdefault(base_url, {"fails": 0, "reason": "", "opened_at": 0.0})
+
+
+def breaker_retry_in(base_url: str) -> float:
+    """Seconds the caller must wait before talking to ``base_url`` again (0 = go)."""
+    entry = _breaker_entry(base_url)
+    opened_at = float(entry.get("opened_at") or 0.0)
+    if not opened_at:
+        return 0.0
+    try:
+        now = asyncio.get_running_loop().time()
+    except RuntimeError:
+        now = 0.0
+    elapsed = now - opened_at
+    if elapsed >= _BREAKER_COOLDOWN:
+        # Cooldown served: half-open. Clear it so the next call probes the
+        # endpoint, and a failure re-opens it immediately.
+        entry["opened_at"] = 0.0
+        entry["fails"] = _BREAKER_THRESHOLD - 1
+        return 0.0
+    return max(0.0, _BREAKER_COOLDOWN - elapsed)
+
+
+def breaker_record_success(base_url: str) -> None:
+    entry = _breaker_entry(base_url)
+    entry["fails"] = 0
+    entry["reason"] = ""
+    entry["opened_at"] = 0.0
+
+
+def breaker_record_failure(base_url: str, reason: str) -> None:
+    entry = _breaker_entry(base_url)
+    entry["fails"] = int(entry.get("fails") or 0) + 1
+    entry["reason"] = reason
+    if entry["fails"] >= _BREAKER_THRESHOLD and not entry.get("opened_at"):
+        try:
+            entry["opened_at"] = asyncio.get_running_loop().time()
+        except RuntimeError:
+            entry["opened_at"] = 0.01
+
 _ALLOWED_RUNTIMES = {
     "python", "node", "golang", "ruby", "rust",
     "python-alpine", "node-alpine", "golang-alpine", "ruby-alpine", "rust-alpine",
@@ -196,6 +268,18 @@ class UpstashExecutionBackend:
         timeout: int = 120,
         raw_response: bool = False,
     ) -> Any:
+        # Circuit breaker: when the endpoint has failed at the transport level
+        # three times in a row there is no point waiting out another full
+        # timeout on every command — fail fast with an actionable message and
+        # let the caller (and the user) see what is actually wrong.
+        cooldown = breaker_retry_in(self.base_url)
+        if cooldown > 0:
+            reason = str(_breaker_entry(self.base_url).get("reason") or "no response")
+            raise UpstashError(
+                f"Upstash Box is not responding ({reason}). Skipping this call for another "
+                f"{int(cooldown)}s instead of hanging on it. Check the Upstash dashboard for box "
+                "quota/status, or switch the execution backend in Admin -> Execution settings."
+            )
         url = f"{self.base_url}{path}"
         try:
             async with session.request(
@@ -207,6 +291,7 @@ class UpstashExecutionBackend:
             ) as resp:
                 if raw_response:
                     payload_bytes = await resp.read()
+                    breaker_record_success(self.base_url)
                     if resp.status >= 400:
                         raise UpstashError(
                             f"{method} {path} failed with HTTP {resp.status}: "
@@ -214,6 +299,9 @@ class UpstashExecutionBackend:
                         )
                     return payload_bytes
                 text = await resp.text()
+                # Any completed response proves the control plane is alive, which
+                # is exactly what the breaker tracks (status codes do not count).
+                breaker_record_success(self.base_url)
                 try:
                     data = json.loads(text) if text else {}
                 except ValueError:
@@ -241,11 +329,13 @@ class UpstashExecutionBackend:
                     raise UpstashError(f"{method} {path} failed with HTTP {resp.status}: {detail}")
                 return data
         except aiohttp.ClientError as exc:
+            breaker_record_failure(self.base_url, f"{method} {path}: {type(exc).__name__}")
             raise UpstashError(f"Upstash Box transport error: {type(exc).__name__}") from None
         except (asyncio.TimeoutError, TimeoutError) as exc:
             # A wall-clock timeout on ANY Upstash call must surface as a typed
             # UpstashError (never a bare asyncio.TimeoutError) so callers retry
             # coherently instead of seeing a foreign exception type.
+            breaker_record_failure(self.base_url, f"{method} {path}: timed out after {timeout + 30}s")
             raise UpstashError(
                 f"Upstash Box request timed out (budget={timeout + 30}s)"
             ) from None
@@ -290,22 +380,106 @@ class UpstashExecutionBackend:
             raise last_exc
 
     async def wait_ready(self, session: aiohttp.ClientSession, box_id: str, timeout: int = 120) -> None:
-        deadline = asyncio.get_running_loop().time() + timeout
+        start = asyncio.get_running_loop().time()
+        timeout = max(1, min(int(timeout), _WAIT_READY_BUDGET))
+        deadline = start + timeout
+        # Absolute ceiling: the status-polling loop may restart the box once, but
+        # it can never run past this even if the endpoint keeps answering with a
+        # resumable status. Previously a box stuck in "stopped" restarted the
+        # deadline on every pass and could poll indefinitely.
+        hard_deadline = start + timeout + _WAIT_READY_HARD_MARGIN
         restarted = False
         while True:
             data = await self._request(session, "GET", f"/v2/box/{box_id}", timeout=30)
             status = str(data.get("status") or "").lower()
             if status in {"running", "idle", "ready", "active"}:
                 return
+            now = asyncio.get_running_loop().time()
             if status in self._RESUMABLE_STATUSES and not restarted:
                 restarted = True
-                await self._restart_box(session, box_id)
-                if asyncio.get_running_loop().time() >= deadline:
-                    deadline = asyncio.get_running_loop().time() + 90
+                try:
+                    await self._restart_box(session, box_id)
+                except UpstashError as exc:
+                    raise UpstashError(
+                        f"Upstash box {box_id} is {status or 'stopped'} and could not be restarted: {exc}"
+                    ) from None
+                if now >= deadline:
+                    deadline = min(now + 90, hard_deadline)
                 continue
-            if asyncio.get_running_loop().time() >= deadline:
-                raise UpstashError(f"Upstash box {box_id} was not ready in time (status={status or 'unknown'})")
+            if now >= deadline or now >= hard_deadline:
+                raise UpstashError(
+                    f"Upstash box {box_id} was not ready in time (status={status or 'unknown'}). "
+                    "The box is left alone; the next command retries it."
+                )
             await asyncio.sleep(1)
+
+    # Substrings Upstash uses when a create is refused because the account has
+    # no box slots left.
+    _BOX_LIMIT_HINTS = ("limit", "quota", "maximum", "too many", "exceed", "capacity")
+
+    @classmethod
+    def _looks_like_box_limit(cls, detail: str) -> bool:
+        lowered = (detail or "").lower()
+        return any(hint in lowered for hint in cls._BOX_LIMIT_HINTS)
+
+    async def _prune_dead_boxes(self, session: aiohttp.ClientSession) -> int:
+        """Delete this account's *dead* powerx boxes to reclaim quota slots.
+
+        Only boxes in a terminal state are touched (``deleted``/``deleting``/
+        ``error``): they are already gone from the user's point of view and
+        routinely keep occupying a slot in the account's box count. Live or
+        stopped boxes — which may hold a user's workspace — are never reaped.
+        """
+        try:
+            data = await self._request(session, "GET", "/v2/box", timeout=30)
+        except UpstashError:
+            return 0
+        boxes = data.get("boxes") if isinstance(data, dict) else None
+        if not isinstance(boxes, list):
+            boxes = data if isinstance(data, list) else []
+        pruned = 0
+        for box in boxes:
+            if not isinstance(box, dict):
+                continue
+            name = str(box.get("name") or "")
+            status = str(box.get("status") or "").lower()
+            box_id = str(box.get("id") or "")
+            if not box_id or not name.startswith("px-"):
+                continue
+            if status not in {"deleted", "deleting", "error"}:
+                continue
+            try:
+                await self._request(session, "DELETE", f"/v2/box/{box_id}", timeout=30)
+                pruned += 1
+            except UpstashError:
+                continue
+        return pruned
+
+    async def _create_box(self, session: aiohttp.ClientSession, body: dict[str, Any]) -> str:
+        """Create the box, recovering once from an exhausted box quota.
+
+        An exhausted Upstash box quota used to be terminal: every subsequent
+        command re-entered create, failed, and the account looked permanently
+        wedged ("box limit"). We now reap dead powerx boxes and retry exactly
+        once, and otherwise raise an error the user can act on.
+        """
+        try:
+            created = await self._request(session, "POST", "/v2/box", body=body, timeout=_ENSURE_FULL_BUDGET)
+        except UpstashError as exc:
+            if not self._looks_like_box_limit(str(exc)):
+                raise
+            pruned = await self._prune_dead_boxes(session)
+            if not pruned:
+                raise UpstashError(
+                    f"{exc} Upstash reports no free box slots and no dead boxes were available to "
+                    "reap. Delete unused boxes in the Upstash dashboard, or disable "
+                    "upstashPersistWorkspace in Admin -> Execution settings, then retry."
+                ) from None
+            created = await self._request(session, "POST", "/v2/box", body=body, timeout=_ENSURE_FULL_BUDGET)
+        box_id = str((created or {}).get("id") or "")
+        if not box_id:
+            raise UpstashError("Upstash Box create returned no box id")
+        return box_id
 
     async def ensure_box(self, session: aiohttp.ClientSession) -> str:
         # Fast path: verify the exact box we already track (the caller seeds
@@ -315,10 +489,10 @@ class UpstashExecutionBackend:
         if self.last_box_id:
             box_id = self.last_box_id
             try:
-                data = await self._request(session, "GET", f"/v2/box/{box_id}", timeout=30)
+                data = await self._request(session, "GET", f"/v2/box/{box_id}", timeout=_ENSURE_FAST_PATH_BUDGET)
                 status = str(data.get("status") or "").lower()
                 if status not in {"deleted", "deleting", "error"}:
-                    await self.wait_ready(session, box_id, timeout=90)
+                    await self.wait_ready(session, box_id, timeout=_WAIT_READY_BUDGET)
                     return box_id
             except UpstashError:
                 pass  # stale id — fall through to the list/create path
@@ -327,7 +501,7 @@ class UpstashExecutionBackend:
         if existing is not None:
             box_id = str(existing.get("id") or "")
             if box_id:
-                await self.wait_ready(session, box_id, timeout=90)
+                await self.wait_ready(session, box_id, timeout=_WAIT_READY_BUDGET)
                 self.last_box_id = box_id
                 return box_id
         body: dict[str, Any] = {
@@ -339,11 +513,8 @@ class UpstashExecutionBackend:
         # (process crash, forgotten reset), ask Upstash to reap the box once it
         # expires. The API accepts unknown fields silently on some revisions.
         body["ttl"] = self.ttl_s
-        created = await self._request(session, "POST", "/v2/box", body=body, timeout=90)
-        box_id = str(created.get("id") or "")
-        if not box_id:
-            raise UpstashError("Upstash Box create returned no box id")
-        await self.wait_ready(session, box_id, timeout=120)
+        box_id = await self._create_box(session, body)
+        await self.wait_ready(session, box_id, timeout=_WAIT_READY_BUDGET)
         self.last_box_id = box_id
         if self.persist_workspace:
             # A brand-new box is empty. Restore the last workspace snapshot so a
@@ -367,9 +538,19 @@ class UpstashExecutionBackend:
     _SNAPSHOT_MAX_BYTES = 150 * 1024 * 1024
 
     def _archive_box_name(self) -> str:
-        """Dedicated long-lived box that stores workspace snapshots."""
-        digest = hashlib.sha256(f"archive:{self.box_name}".encode("utf-8")).hexdigest()[:10]
-        return f"px-archive-{digest}"
+        """The single, account-wide box that stores workspace snapshots.
+
+        This used to be per session (one archive box per session box), so every
+        session created a SECOND box the first time it ran a task and, with
+        workspace persistence on, nothing ever deleted either one. On an account
+        with a finite box quota that is a slow-motion outage: slots fill up,
+        ``POST /v2/box`` starts failing, and every sandbox command enters the
+        create/retry path — the "box limit / system not responding" report.
+        Snapshots are already namespaced by the session's own box name
+        (``snapshots/<box>.tgz``), so ONE shared archive box is sufficient and
+        box usage stays at one per active session.
+        """
+        return "px-archive-shared"
 
     def _archive_backend(self) -> "UpstashExecutionBackend":
         archive = UpstashExecutionBackend(self.config, box_name=self._archive_box_name())
@@ -511,9 +692,29 @@ class UpstashExecutionBackend:
             raise ValueError("command is required")
         if len(command) > _MAX_COMMAND_CHARS:
             raise ValueError(f"command exceeds {_MAX_COMMAND_CHARS} characters")
-        async with aiohttp.ClientSession() as session:
-            box_id = await self.ensure_box(session)
-            result = await self._exec(session, box_id, command, timeout)
+        # HARD end-to-end deadline. The command budget bounds the command; this
+        # bounds the WHOLE call including box lifecycle (ensure + wait_ready +
+        # restart). Without it a slow control plane could stretch one sandbox
+        # command into five-plus minutes and stall the agent's turn — the
+        # "Upstash hangs the entire system" report. A timeout here abandons the
+        # call (never leaves the turn waiting) and the box id is re-resolved on
+        # the next command.
+        bounded = max(1, min(int(timeout), _MAX_SYNC_EXEC_TIMEOUT))
+
+        async def _work() -> dict[str, Any]:
+            async with aiohttp.ClientSession() as session:
+                box_id = await self.ensure_box(session)
+                return await self._exec(session, box_id, command, timeout)
+
+        try:
+            result = await asyncio.wait_for(_work(), timeout=bounded + _ENSURE_FULL_BUDGET + _TRANSPORT_SLACK)
+        except (asyncio.TimeoutError, TimeoutError):
+            self.last_box_id = ""
+            raise UpstashError(
+                f"Upstash Box command exceeded its hard budget of "
+                f"{bounded + _ENSURE_FULL_BUDGET + _TRANSPORT_SLACK}s (box lifecycle included) and was "
+                "abandoned instead of left hanging. Retry, or use a shorter command."
+            ) from None
         return self._render(result)
 
     async def read(self, path: str) -> str:
@@ -687,10 +888,22 @@ class UpstashExecutionBackend:
         for item in cleaned:
             chunks.append(_manager_clause(shlex.quote(item)))
         outputs: list[str] = []
+        # Cumulative ceiling across the whole call. Each individual exec is
+        # already capped, but a request naming a dozen packages used to chain a
+        # dozen 270s budgets one after another — a single "install these" turn
+        # could legitimately run for an hour and read to the user as a hung
+        # sandbox. The install stops at the ceiling and says so.
+        started = asyncio.get_running_loop().time()
         update_out = await self.run(update_cmd, timeout=per_call)
         if "[exit_code=" in update_out and "exit_code=0" not in update_out:
             return f"Upstash Box package installation result:\n[index refresh]\n{update_out}"
         for index, clause in enumerate(chunks):
+            if asyncio.get_running_loop().time() - started >= _INSTALL_TOTAL_BUDGET:
+                outputs.append(
+                    f"[install budget of {_INSTALL_TOTAL_BUDGET}s exhausted — remaining packages "
+                    "skipped; re-run to continue]"
+                )
+                break
             out = await self.run(clause, timeout=per_call)
             outputs.append(f"[{cleaned[index]}]\n{out}")
             if "[exit_code=" in out and "exit_code=0" not in out:
