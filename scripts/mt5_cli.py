@@ -1758,10 +1758,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 #: Actions that need the MetaTrader5 bridge (i.e. must run inside Wine).
+#:
+#: Every action that touches ``MetaTrader5`` MUST be listed here. A missing entry
+#: does not fail loudly — it runs the command on the Linux python, where the
+#: bridge import is impossible, and answers with the generic refusal
+#: "mt5_cli.py must run inside Wine". Measured live: ``symbols`` was added
+#: without this entry and returned exactly that, which reads like a broken
+#: install rather than a dispatch bug.
 _BRIDGE_ACTIONS = frozenset(
     {
         "login", "account", "quote", "candles", "positions", "orders",
-        "history", "symbol", "order", "close", "close_all", "run",
+        "history", "symbol", "symbols", "order", "close", "close_all", "run",
     }
 )
 

@@ -170,6 +170,67 @@ def test_terminal_running_uses_proc_scan(cli):
     assert "return bool(_terminal_pids())" in src
 
 
+def test_every_bridge_action_is_reenacted_under_wine(cli):
+    """A bridge action missing from ``_BRIDGE_ACTIONS`` fails as a fake install.
+
+    It does not raise: the command runs on the Linux python, where importing
+    ``MetaTrader5`` is impossible, and returns the generic refusal "mt5_cli.py
+    must run inside Wine". Measured live with the newly added ``symbols`` action,
+    which read like a broken install rather than a dispatch miss.
+    """
+    import ast
+
+    source = CLI_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    def callees(node: ast.AST) -> set[str]:
+        out: set[str] = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                fn = child.func
+                if isinstance(fn, ast.Name):
+                    out.add(fn.id)
+                elif isinstance(fn, ast.Attribute):
+                    out.add(fn.attr)
+        return out
+
+    funcs = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    needs_bridge = {"require_bridge"}
+
+    # Fixpoint: a function needs the bridge if it calls one that does.
+    changed = True
+    while changed:
+        changed = False
+        for name, node in funcs.items():
+            if name in needs_bridge:
+                continue
+            if callees(node) & needs_bridge:
+                needs_bridge.add(name)
+                changed = True
+
+    parser = cli.build_parser()
+    actions = {}
+    for sub in parser._subparsers._group_actions:  # noqa: SLF001 - test introspection
+        for name, subparser in sub.choices.items():
+            actions[name] = subparser.get_default("func")
+    assert actions, "no subcommands discovered"
+
+    missing = []
+    for action, func in actions.items():
+        if func is None:
+            continue
+        if func.__name__ in needs_bridge and action not in cli._BRIDGE_ACTIONS:
+            missing.append(action)
+    assert missing == [], f"bridge actions missing from _BRIDGE_ACTIONS: {missing}"
+
+    # And the reverse: nothing is re-exec'd through Wine without needing it.
+    assert "symbols" in cli._BRIDGE_ACTIONS
+
+
 # --------------------------------------------------------------------------- #
 # 4. fixtures used by the sandbox verification run
 # --------------------------------------------------------------------------- #
