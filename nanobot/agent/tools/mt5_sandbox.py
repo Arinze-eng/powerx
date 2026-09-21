@@ -183,11 +183,14 @@ def bootstrap_command() -> str:
     # rebuilding the sandbox", and a cached edge response makes it silently
     # untrue, sending the agent off to debug code that is no longer running.
     # A unique query string gives the CDN a URL it has never cached.
-    bust = "$(date +%s)"
+    # Double quotes, NOT single: the command is interpreted by the sandbox's
+    # shell, and a single-quoted ``$(date +%s)`` reaches curl literally (and curl
+    # then rejects the URL, while ``|| true`` hides it — leaving the STALE file in
+    # place, i.e. the exact bug this is meant to prevent).
     return (
         f"mkdir -p {_MT5_HOME}/bin && "
-        f"curl -fsSL --retry 3 '{_RAW_BASE}/mt5_cli.py?ts={bust}' -o {_CLI_PATH} && "
-        f"curl -fsSL --retry 3 '{_RAW_BASE}/install_mt5_sandbox.sh?ts={bust}' "
+        f'curl -fsSL --retry 3 "{_RAW_BASE}/mt5_cli.py?ts=$(date +%s)" -o {_CLI_PATH} && '
+        f'curl -fsSL --retry 3 "{_RAW_BASE}/install_mt5_sandbox.sh?ts=$(date +%s)" '
         f"-o {_INSTALLER_PATH} && "
         f"chmod +x {_CLI_PATH} {_INSTALLER_PATH} && "
         f"python3 {_CLI_PATH} doctor"

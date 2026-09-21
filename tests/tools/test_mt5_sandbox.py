@@ -309,6 +309,12 @@ def test_bootstrap_cache_busts_the_raw_cdn():
     assert "mt5_cli.py?ts=" in cmd
     assert "install_mt5_sandbox.sh?ts=" in cmd
     assert "--retry" in cmd
+    # The command is run by the sandbox's shell, so the substitution must stay
+    # expandable: single quotes would send "$(date +%s)" to curl literally, curl
+    # would reject the URL, and the "|| true" would leave the stale file in place.
+    assert '"' in cmd
+    assert "'" not in cmd
+    assert "$(date +%s)" in cmd
 
 
 # --------------------------------------------------------------------------- #
