@@ -16,6 +16,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../models.dart';
+import '../utils/turn_fence.dart';
 import '../services/chat_cache.dart';
 import '../services/gateway_api.dart';
 import '../services/nanobot_socket.dart';
@@ -68,7 +69,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _resyncInFlight = false;
   /// Short post-completion reconcile window (see [_armSettleWatch]).
   Timer? _settleWatch;
+
+  /// Which `active turn` a canonical transcript snapshot may believe. The
+  /// gateway replays a killed run's wall-clock on every attach, so the
+  /// transcript can claim a turn that no longer exists; see [TurnFence].
+  final TurnFence _fence = TurnFence();
   Timer? _stopWatchTimer; // bounded grace window after a /stop request
+  /// Canonical-transcript hydration retry (see [_startHydration]).
+  Timer? _hydrateTimer;
+  int _hydrateAttempt = 0;
+  bool _hydrateSatisfied = false;
   bool _justCompleted = false; // shows the settled "done" check in the pill
   Timer? _completedFadeTimer;
   Timer? _cacheTimer; // debounced local transcript persistence
@@ -287,6 +297,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     } catch (_) {
       if (mounted) setState(() => _connected = false);
     }
+    _startHydration();
     await _resync();
   }
 
@@ -396,6 +407,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         }
       }
       if (mounted) setState(() => _loadingHistory = false);
+      // A turn may have finished while the app was closed, and the gateway can
+      // take a minute or more to expose its transcript. Keep pulling until the
+      // answer is really there.
+      _startHydration(restart: true);
       await _attachAndWatch();
     } else {
       try {
@@ -447,17 +462,36 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
     if (live != null) _liveTurn = live;
 
+    final sockActive =
+        _chatId != null && (_socket?.isTurnActive(_chatId!) ?? false);
+    // A snapshot's active turn is only believed with the socket's backing once
+    // a ghost run has been released for this chat. Without that fence a
+    // released ghost run is re-adopted on every transcript fetch and the busy
+    // state becomes permanent.
+    final believeActive = _fence.shouldBelieve(
+      history.activeTurnId,
+      socketActive: sockActive,
+    );
     setState(() {
       _messages
         ..clear()
         ..addAll(merged);
-      if (history.activeTurnId != null) {
+      if (believeActive) {
         _remoteRunning = true;
         _lastEventAt = DateTime.now();
       }
     });
+    // The server's own transcript now carries a settled answer and no run this
+    // client believes in: hydration has nothing left to recover until the next
+    // turn starts.
+    if (!believeActive &&
+        history.messages.any(
+            (m) => m.role == Role.assistant && m.text.trim().isNotEmpty)) {
+      _hydrateSatisfied = true;
+      _stopHydration();
+    }
     _scheduleCacheWrite();
-    if (history.activeTurnId != null) {
+    if (believeActive) {
       // The turn is genuinely running server-side. Re-arm the live bubble and
       // make sure it is subscribed, so steps and stream keep arriving rather
       // than the transcript sitting frozen mid-task.
@@ -528,7 +562,29 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
     };
     sock.onTurnActivity = (chatId) {
-      if (chatId == _chatId) _touchActivity();
+      if (chatId != _chatId) return;
+      _touchActivity();
+      // A real turn frame is proof the server is running this chat's turn.
+      // The socket only fires this for genuine turn events (never for a plain
+      // terminal message), so a run that had been released as a ghost comes
+      // straight back into the busy state — and any fence against it is void,
+      // because the run is demonstrably alive.
+      _fence.noteServedFrame();
+      _ensureLiveTurn();
+      if (!_remoteRunning && mounted) {
+        setState(() => _remoteRunning = true);
+      }
+      _startResyncWatch();
+      _updateWakelock();
+    };
+    // The server says this chat's transcript gained rows. Re-pull it: this is
+    // the same trigger the WebUI uses for its canonical history refresh, and it
+    // is what makes a task that finished elsewhere appear here without the
+    // user having to type anything.
+    sock.onThreadChanged = (chatId) {
+      if (!mounted || chatId != _chatId) return;
+      _startHydration();
+      unawaited(_resync(force: true));
     };
     sock.onErrorEvent = (chatId, detail) {
       if (!mounted) return;
@@ -641,6 +697,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       },
       onTurnEnd: (summary) {
         _touchActivity();
+        // A ghost release: the socket gave up on a running claim nothing ever
+        // corroborated. Fence it so the transcript reconcile that follows
+        // (which still reports that stale active turn) cannot re-open it.
+        if (summary.ghost) {
+          // Nothing real ended here: the next transcript fetch (which still
+          // reports that stale active turn) must fence it, not adopt it.
+          _fence.noteGhostRun();
+        }
         // Terminal for the turn: ALWAYS terminate the busy state, even when
         // no live bubble exists (e.g. the turn ran while the screen was
         // closed). Skipping this is what let the green indicator keep
@@ -897,6 +961,53 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _lastEventAt = DateTime.now();
   }
 
+  /// Backoff for the canonical-transcript hydration retry, in seconds.
+  ///
+  /// The gateway does not write a turn's transcript rows the instant the turn
+  /// ends (measured against production: the HTTP thread snapshot was still
+  /// empty 90-140 s after `turn_end`). A single fetch on reopen therefore races
+  /// the server's write and loses — which is exactly why a task that had
+  /// finished looked like it produced no result at all.
+  static const List<int> _hydrateBackoff = <int>[
+    3, 5, 8, 12, 18, 25, 30, 30, 30, 30, 30, 30
+  ];
+
+  /// Keep pulling the authoritative transcript until it actually contains the
+  /// answer, instead of trusting one fetch that raced the server's write.
+  ///
+  /// Mirrors the WebUI, which re-fetches its canonical history on every
+  /// non-metadata `session_updated`, on every return to the foreground, and
+  /// after every turn end — never just once.
+  void _startHydration({bool restart = false}) {
+    if (_chatId == null) return;
+    if (restart) {
+      _hydrateTimer?.cancel();
+      _hydrateTimer = null;
+      _hydrateAttempt = 0;
+      _hydrateSatisfied = false;
+    }
+    if (_hydrateSatisfied) return;
+    _scheduleHydrateTick();
+  }
+
+  void _scheduleHydrateTick() {
+    if (!mounted || _hydrateTimer != null || _hydrateSatisfied) return;
+    if (_hydrateAttempt >= _hydrateBackoff.length) return;
+    final wait = Duration(seconds: _hydrateBackoff[_hydrateAttempt]);
+    _hydrateTimer = Timer(wait, () async {
+      _hydrateTimer = null;
+      _hydrateAttempt++;
+      if (!mounted || _chatId == null || _hydrateSatisfied) return;
+      await _resync(force: true);
+      if (mounted && !_hydrateSatisfied) _scheduleHydrateTick();
+    });
+  }
+
+  void _stopHydration() {
+    _hydrateTimer?.cancel();
+    _hydrateTimer = null;
+  }
+
   /// Periodic safety net while a turn is running.
   ///
   /// It NEVER force-clears a running turn (that is what stopped long tasks
@@ -939,6 +1050,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   /// perceived at all, guaranteeing the result lands without user input.
   void _armSettleWatch() {
     _settleWatch?.cancel();
+    // The short window is for a terminal event we actually saw: the answer is
+    // usually in the transcript within a few seconds then. The long hydration
+    // retry covers the cases where the write lands much later.
+    _startHydration();
     var ticks = 0;
     _settleWatch = Timer.periodic(const Duration(seconds: 6), (t) {
       ticks++;
@@ -1294,6 +1409,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _flushTimer?.cancel();
     _resyncTimer?.cancel();
     _settleWatch?.cancel();
+    _hydrateTimer?.cancel();
     _stopWatchTimer?.cancel();
     _recordTick?.cancel();
     // Never leave the mic open: a recorder outliving the screen keeps the

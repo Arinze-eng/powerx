@@ -56,7 +56,23 @@ class TurnSummary {
   final int? latencyMs;
   final List<String> media;
   final String? turnId;
-  const TurnSummary({this.usage, this.latencyMs, this.media = const [], this.turnId});
+
+  /// True when this summary does NOT describe a real turn ending: the socket
+  /// released a `goal_status: running` claim that nothing ever corroborated.
+  ///
+  /// The gateway replays a run's persisted wall-clock on attach, so a task
+  /// abandoned when its owning socket died looks "running" forever. The UI has
+  /// to be taken out of the busy state, but it must also remember that the
+  /// release was a ghost — otherwise the next transcript fetch (which still
+  /// reports that stale active turn) puts it straight back into it.
+  final bool ghost;
+  const TurnSummary({
+    this.usage,
+    this.latencyMs,
+    this.media = const [],
+    this.turnId,
+    this.ghost = false,
+  });
 }
 
 /// A completed `webui_response` for a socket mutation.
@@ -246,6 +262,25 @@ class NanobotSocket {
   /// that carry one (goal_status running, message, turn_end).
   final Map<String, String> _currentTurnIds = {};
   final Map<String, Completer<String>> _pendingNewChat = {};
+  /// Chats whose attach replay claimed `goal_status: running` while this client
+  /// had no reason of its own to believe a turn was live (no pending send of
+  /// ours, no locally known run). The gateway replays a persisted/abandoned
+  /// run wall-clock on every attach, so such a claim is only a HINT until a
+  /// real turn frame confirms it — otherwise a task abandoned hours ago leaves
+  /// the app spinning forever with a stop button the server answers with
+  /// "No active task to stop."
+  final Map<String, Timer> _unconfirmedRuns = {};
+  /// When the last REAL turn frame arrived per chat. A `goal_status: running`
+  /// claim is corroborated by a frame this recent — the only honest signal,
+  /// because "we already thought this chat was active" survives a reconnect and
+  /// is exactly what a ghost run looks like.
+  final Map<String, DateTime> _lastTurnFrameAt = {};
+  /// A frame this recent means the server really is running this chat's turn.
+  static const Duration corroborationWindow = Duration(seconds: 20);
+  /// How long an unconfirmed `goal_status: running` claim is believed without
+  /// any corroborating turn frame. A healthy but quiet long task can legitimately
+  /// emit nothing for ~a minute, so this is deliberately generous.
+  static Duration unconfirmedRunWindow = const Duration(seconds: 90);
   final Random _rng = Random();
 
   /// Connectivity notifications for the app layer.
@@ -254,10 +289,18 @@ class NanobotSocket {
   void Function(String chatId, String status)? onGoalStatus;
   /// Session list should refresh.
   void Function()? onSessionsChanged;
+  /// A chat's *transcript* changed server-side (a turn produced persisted
+  /// rows). The WebUI refreshes its canonical history here, so the native app
+  /// does the same instead of waiting for the user to type again.
+  void Function(String chatId)? onThreadChanged;
   /// Model name changed server-side.
   void Function(String model)? onModelUpdated;
   /// Any turn-level event arrived for a chat (used to keep long tasks warm).
   void Function(String chatId)? onTurnActivity;
+  /// Every frame on the wire, in both directions, for diagnosis. Direction is
+  /// `out` / `replay` / `in`. Unset in the app; only diagnostics set it, so
+  /// production pays nothing.
+  void Function(String direction, String frame)? frameLogger;
   /// Server-reported error with no attached view (connection-level).
   void Function(String? chatId, String detail)? onErrorEvent;
 
@@ -467,7 +510,9 @@ class NanobotSocket {
       return;
     }
     try {
-      ch.sink.add(jsonEncode(frame));
+      final raw = jsonEncode(frame);
+      frameLogger?.call('out', raw);
+      ch.sink.add(raw);
     } catch (_) {
       _queueFrame(jsonEncode(frame));
       _onDisconnect();
@@ -489,6 +534,7 @@ class NanobotSocket {
     _outbox.clear();
     for (final raw in pending) {
       try {
+        frameLogger?.call('out', raw);
         _channel?.sink.add(raw);
       } catch (_) {
         _outbox.insert(0, raw);
@@ -530,7 +576,9 @@ class NanobotSocket {
     for (final s in _pendingSends) {
       var written = false;
       try {
-        _channel?.sink.add(jsonEncode(s.toWireFrame()));
+        final raw = jsonEncode(s.toWireFrame());
+        frameLogger?.call('replay', raw);
+        _channel?.sink.add(raw);
         written = _channel != null;
       } catch (_) {
         written = false;
@@ -661,6 +709,7 @@ class NanobotSocket {
 
   void _onData(dynamic raw) {
     _lastInboundAt = DateTime.now();
+    if (raw is String) frameLogger?.call('in', raw);
     // A malformed or unexpected frame must never propagate: an exception
     // raised inside the stream listener tears down the socket (and, before
     // the global crash fence, the whole Android process). Catch everything,
@@ -702,6 +751,7 @@ class NanobotSocket {
         }
         break;
       case 'delta':
+        _confirmRun(chatId);
         onTurnActivity?.call(chatId ?? '');
         if (chatId != null) {
           _lastActedChatId = chatId;
@@ -712,6 +762,7 @@ class NanobotSocket {
         _view(chatId)?.onDelta((ev['text'] ?? '') as String);
         break;
       case 'reasoning_delta':
+        _confirmRun(chatId);
         onTurnActivity?.call(chatId ?? '');
         _view(chatId)?.onReasoningDelta((ev['text'] ?? '') as String);
         break;
@@ -719,12 +770,14 @@ class NanobotSocket {
         _view(chatId)?.onReasoningEnd();
         break;
       case 'stream_end':
+        _confirmRun(chatId);
         // NOT terminal: a turn contains many answer streams. The event may
         // carry the authoritative buffered `text` for the stream that ended.
         final v = _view(chatId);
         v?.onStreamEnd(ev['text'] is String ? ev['text'] as String : null);
         break;
       case 'message_accepted':
+        _confirmRun(chatId);
         // Canonical turn ownership for a locally submitted message. The origin
         // client already rendered the optimistic bubble, so we only adopt the
         // run state (never echo the text back as a second user bubble).
@@ -747,6 +800,7 @@ class NanobotSocket {
         _handleFileEdit(ev, chatId);
         break;
       case 'turn_end':
+        _confirmRun(chatId);
         _endTurn(chatId,
             usage: _numMap(ev['usage']),
             latencyMs: ev['latency_ms'] is num
@@ -767,6 +821,7 @@ class NanobotSocket {
               // reopening a finished task cannot re-fire its results.
               break;
             }
+            final oursPending = _pendingSends.any((x) => x.chatId == chatId);
             if (replayTurnId != null && replayTurnId.isNotEmpty) {
               _currentTurnIds[chatId] = replayTurnId;
             }
@@ -775,17 +830,44 @@ class NanobotSocket {
             _activeTurns.add(chatId);
             // The gateway is executing this chat's turn — stop re-sending.
             _confirmPendingSend(chatId, null);
+            // Corroboration, three ways: we are about to send this chat's
+            // message ourselves, the gateway tagged the claim with a turn id,
+            // or a real turn frame for this chat arrived moments ago. Anything
+            // else is the attach replay of a persisted run wall-clock — a task
+            // whose owning socket died — and is believed only until a real
+            // frame backs it up, so it cannot leave the app spinning forever
+            // behind a stop button the server answers "No active task to stop."
+            final sinceFrame = _lastTurnFrameAt[chatId];
+            final corroborated = oursPending ||
+                replayTurnId != null ||
+                (sinceFrame != null &&
+                    DateTime.now().difference(sinceFrame) <
+                        corroborationWindow);
+            if (corroborated) {
+              _confirmRun(chatId);
+            } else {
+              _armUnconfirmedRun(chatId);
+            }
           }
           onGoalStatus?.call(chatId, status);
           if (status == 'idle') {
             // Terminal for the current turn. Cancellation/direct runs may
             // have no turn_end, so idle is still terminal.
+            _confirmRun(chatId);
             _endTurn(chatId, usage: null, latencyMs: null);
+            onThreadChanged?.call(chatId);
           }
         }
         break;
       case 'session_updated':
         onSessionsChanged?.call();
+        // `scope: metadata` is a title/rename touch; any other scope means the
+        // transcript itself gained rows. The WebUI re-fetches its canonical
+        // history here for exactly this reason, so the native app does too.
+        final updateScope = (ev['scope'] ?? '').toString();
+        if (chatId != null && updateScope != 'metadata') {
+          onThreadChanged?.call(chatId);
+        }
         break;
       case 'user_message':
         if (chatId != null) _lastActedChatId = chatId;
@@ -846,6 +928,7 @@ class NanobotSocket {
   }
 
   void _handleMessageEvent(Map<String, dynamic> ev, String? chatId) {
+    _confirmRun(chatId);
     final kind = ev['kind'] as String?;
     final v = _view(chatId);
     if (v == null) return;
@@ -919,6 +1002,7 @@ class NanobotSocket {
   }
 
   void _handleFileEdit(Map<String, dynamic> ev, String? chatId) {
+    _confirmRun(chatId);
     final v = _view(chatId);
     if (v == null) return;
     final edits = ev['edits'];
@@ -954,6 +1038,10 @@ class NanobotSocket {
       _completedTurnIds[chatId] = turnId;
     }
     _currentTurnIds.remove(chatId);
+    // The turn is over: a `goal_status: running` replay arriving after this is
+    // by definition stale (probe-measured: the gateway replays a finished run
+    // on the next attach), so it must not count as corroborated.
+    _lastTurnFrameAt.remove(chatId);
     if (!_activeTurns.remove(chatId)) {
       // Terminal event for a turn we did not think was active. Two cases:
       // (a) duplicate/late terminal event — already finalized, ignore;
@@ -1051,6 +1139,8 @@ class NanobotSocket {
   /// Forget all client-side state for a chat that was deleted server-side, so
   /// a later re-attach cannot resurrect a stale busy indicator.
   void dropChat(String chatId) {
+    _unconfirmedRuns.remove(chatId)?.cancel();
+    _lastTurnFrameAt.remove(chatId);
     _views.remove(chatId);
     _attachedChats.remove(chatId);
     _wantedChats.remove(chatId);
@@ -1125,6 +1215,42 @@ class NanobotSocket {
 
   /// Whether a turn for [chatId] was active and finalized since [listen].
   bool sawTurnEnd(String chatId) => _finalizedTurns.contains(chatId);
+
+  /// A real turn frame arrived for [chatId]: any unconfirmed running claim is
+  /// now corroborated, so it never expires.
+  void _confirmRun(String? chatId) {
+    if (chatId == null) return;
+    _unconfirmedRuns.remove(chatId)?.cancel();
+    _lastTurnFrameAt[chatId] = DateTime.now();
+  }
+
+  /// Arm the confirmation window for a running claim we cannot corroborate.
+  void _armUnconfirmedRun(String chatId) {
+    _unconfirmedRuns.remove(chatId)?.cancel();
+    _unconfirmedRuns[chatId] = Timer(unconfirmedRunWindow, () {
+      _unconfirmedRuns.remove(chatId);
+      if (!_activeTurns.contains(chatId)) return;
+      // Nothing arrived to back the claim: the run the gateway replayed is
+      // gone (the socket that owned it was killed). Release the UI and tell the
+      // app to pull the authoritative transcript, so the finished answer still
+      // lands instead of the screen hanging on a ghost turn.
+      _activeTurns.remove(chatId);
+      _currentTurnIds.remove(chatId);
+      _lastTurnFrameAt.remove(chatId);
+      _finalizedTurns.add(chatId);
+      final v = _view(chatId);
+      // `ghost: true` tells the UI this was NOT a real turn ending, so it must
+      // not let the next transcript fetch — which still reports the stale
+      // active turn — put it back into the busy state.
+      v?.onTurnEnd(const TurnSummary(ghost: true));
+      v?.onUsage(null);
+      onSessionsChanged?.call();
+      onThreadChanged?.call(chatId);
+    });
+  }
+
+  /// Whether [chatId] has an unconfirmed running claim pending corroboration.
+  bool hasUnconfirmedRun(String chatId) => _unconfirmedRuns.containsKey(chatId);
 
   // ---- Voice notes (audio -> text) ---------------------------------------
 
@@ -1298,6 +1424,11 @@ class NanobotSocket {
   }
 
   void close() {
+    for (final t in _unconfirmedRuns.values) {
+      t.cancel();
+    }
+    _unconfirmedRuns.clear();
+    _lastTurnFrameAt.clear();
     _closedByUser = true;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;

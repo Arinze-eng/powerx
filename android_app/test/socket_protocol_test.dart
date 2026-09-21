@@ -71,6 +71,10 @@ class FakeGateway {
         final ch = _conn!;
         ch.sink.add(jsonEncode(
             {'event': 'attached', 'chat_id': frame['chat_id']}));
+        if (staleRunningReplay) {
+          sendStaleRunning(frame['chat_id'] as String);
+          break;
+        }
         if (backgroundResume && frame['chat_id'] == resumeChatId) {
           resumeChatId = null; // fire once
           // Replay of an in-flight turn for a late joiner (what the real
@@ -105,6 +109,18 @@ class FakeGateway {
 
   bool backgroundResume = false;
   String? resumeChatId;
+
+  /// Replay ONLY `goal_status: running` on attach — the shape the production
+  /// gateway sends for a run whose owning socket was killed. No `turn_id`, and
+  /// nothing else ever follows it.
+  bool staleRunningReplay = false;
+
+  void sendStaleRunning(String chatId) => send({
+        'event': 'goal_status',
+        'chat_id': chatId,
+        'status': 'running',
+        'started_at': 1000.0,
+      });
 
   void send(Map<String, dynamic> ev) => _conn?.sink.add(jsonEncode(ev));
 
@@ -731,5 +747,185 @@ void main() {
       'detail': 'duration',
     });
     await expectLater(failing, throwsA(isA<StateError>()));
+  });
+
+  group('stale running replays and transcript refreshes', () {
+    setUp(() =>
+        NanobotSocket.unconfirmedRunWindow = const Duration(milliseconds: 800));
+    tearDown(() =>
+        NanobotSocket.unconfirmedRunWindow = const Duration(seconds: 90));
+
+    // Start a chat on one socket, then hand back a BRAND-NEW socket attached to
+    // the same chat — the exact shape of "app killed mid-task, user reopens
+    // it": a fresh process with no local knowledge of the run, so `attach`
+    // really hits the wire (on a chat this socket already confirmed, it would
+    // short-circuit and the gateway would never replay anything).
+    Future<NanobotSocket> reopen(String chatId, Recorder rec) async {
+      final reopened = NanobotSocket(
+        wsBase: 'ws://127.0.0.1:${gw.port}',
+        tokenProvider: () async => const WsToken('test-token', '/'),
+      );
+      addTearDown(reopened.close);
+      await reopened.connect();
+      reopened.listen(chatId, rec.view());
+      await reopened.attach(chatId);
+      await pumpEventQueue();
+      expect(gw.attachCountFor(chatId), 1,
+          reason: 'a reopened process must genuinely re-subscribe');
+      return reopened;
+    }
+
+    test('an uncorroborated running replay releases the chat, never hangs',
+        () async {
+      gw.staleRunningReplay = true;
+      await sock.connect();
+      final chatId = await sock.newChat();
+      // The app died with the task still registered as running server-side.
+      sock.close();
+
+      // The gateway replays `goal_status: running` with no turn id and nothing
+      // else ever arrives. The claim must expire instead of spinning forever
+      // behind a stop button the server answers "No active task to stop."
+      final rec = Recorder();
+      final app = await reopen(chatId, rec);
+      expect(app.isTurnActive(chatId), isTrue,
+          reason: 'the claim is believed while it is still fresh');
+      expect(app.hasUnconfirmedRun(chatId), isTrue);
+
+      await Future<void>.delayed(const Duration(milliseconds: 1500));
+      await pumpEventQueue();
+      expect(app.isTurnActive(chatId), isFalse,
+          reason: 'an unbacked claim must not leave the app busy forever');
+      expect(rec.turnEnds, isNotEmpty,
+          reason: 'the UI has to be told the ghost turn is over');
+    });
+
+    test('a real turn frame corroborates the replay so the run survives',
+        () async {
+      gw.staleRunningReplay = true;
+      await sock.connect();
+      final chatId = await sock.newChat();
+      sock.close();
+
+      final rec = Recorder();
+      final app = await reopen(chatId, rec);
+      expect(app.hasUnconfirmedRun(chatId), isTrue);
+
+      // A genuinely running but quiet task does emit eventually: any turn
+      // frame proves the run is alive, so the window is cancelled.
+      gw.send({
+        'event': 'message',
+        'chat_id': chatId,
+        'kind': 'tool_hint',
+        'text': 'novita_sandbox({"action": "run"})',
+      });
+      await pumpEventQueue();
+      expect(app.hasUnconfirmedRun(chatId), isFalse);
+
+      await Future<void>.delayed(const Duration(milliseconds: 1500));
+      await pumpEventQueue();
+      expect(app.isTurnActive(chatId), isTrue,
+          reason: 'a corroborated long task must never be cut short');
+      expect(rec.turnEnds, isEmpty);
+    });
+
+    test('a stale replay after a real turn ended is not corroborated',
+        () async {
+      // Probe-measured production sequence: a turn runs and ends, then the
+      // SAME client (after a reconnect) is told the chat is running again
+      // because the gateway replays the persisted run wall-clock. The frame
+      // that ended the turn must not count as corroboration, or the app sits
+      // in a busy state the server will never resolve.
+      await sock.connect();
+      final chatId = await sock.newChat();
+      final rec = Recorder();
+      sock.listen(chatId, rec.view());
+
+      sock.sendMessage(chatId, 'do the thing');
+      await pumpEventQueue();
+      gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+      gw.send({'event': 'delta', 'chat_id': chatId, 'text': 'done'});
+      gw.send({'event': 'turn_end', 'chat_id': chatId, 'turn_id': 't-1'});
+      await pumpEventQueue();
+      expect(sock.isTurnActive(chatId), isFalse);
+
+      // The stale replay is uncorroborated by anything recent -> it expires.
+      gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+      await pumpEventQueue();
+      expect(sock.isTurnActive(chatId), isTrue,
+          reason: 'the claim is believed while it is still fresh');
+      expect(sock.hasUnconfirmedRun(chatId), isTrue);
+
+      await Future<void>.delayed(const Duration(milliseconds: 1500));
+      await pumpEventQueue();
+      expect(sock.isTurnActive(chatId), isFalse,
+          reason: 'a finished run replayed as running must not hang the app');
+      expect(rec.turnEnds.length, greaterThanOrEqualTo(2));
+    });
+
+    test('a claim backed by a recent real frame is never armed', () async {
+      await sock.connect();
+      final chatId = await sock.newChat();
+      final rec = Recorder();
+      sock.listen(chatId, rec.view());
+      sock.sendMessage(chatId, 'do the thing');
+      await pumpEventQueue();
+
+      // A frame just arrived for this chat: the run is demonstrably alive, so
+      // the replay needs no independent proof.
+      gw.send({'event': 'delta', 'chat_id': chatId, 'text': 'working'});
+      await pumpEventQueue();
+      gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+      await pumpEventQueue();
+      expect(sock.hasUnconfirmedRun(chatId), isFalse);
+
+      await Future<void>.delayed(const Duration(milliseconds: 1500));
+      await pumpEventQueue();
+      expect(sock.isTurnActive(chatId), isTrue,
+          reason: 'a live quiet run must never be cut short');
+      expect(rec.turnEnds, isEmpty);
+    });
+
+    test('releasing a ghost run reports it as a ghost, not a real turn end',
+        () async {
+      gw.staleRunningReplay = true;
+      await sock.connect();
+      final chatId = await sock.newChat();
+      sock.close();
+
+      final rec = Recorder();
+      final app = await reopen(chatId, rec);
+      expect(app.hasUnconfirmedRun(chatId), isTrue);
+      await Future<void>.delayed(const Duration(milliseconds: 1500));
+      await pumpEventQueue();
+      expect(rec.turnEnds, isNotEmpty);
+      expect(rec.turnEnds.last.ghost, isTrue,
+          reason: 'the UI must know it may not re-adopt the stale snapshot');
+    });
+
+    test('a thread-scoped session_updated refreshes the transcript', () async {
+      await sock.connect();
+      final chatId = await sock.newChat();
+      var threadRefreshes = 0;
+      var sessionRefreshes = 0;
+      sock.onThreadChanged = (_) => threadRefreshes++;
+      sock.onSessionsChanged = () => sessionRefreshes++;
+
+      // A title/rename touch must not trigger a transcript fetch.
+      gw.send({
+        'event': 'session_updated',
+        'chat_id': chatId,
+        'scope': 'metadata',
+      });
+      await pumpEventQueue();
+      expect(sessionRefreshes, 1);
+      expect(threadRefreshes, 0);
+
+      // A real transcript write must.
+      gw.send(
+          {'event': 'session_updated', 'chat_id': chatId, 'scope': 'thread'});
+      await pumpEventQueue();
+      expect(threadRefreshes, 1);
+    });
   });
 }

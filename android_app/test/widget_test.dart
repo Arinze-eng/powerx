@@ -108,6 +108,122 @@ void main() {
       expect(history.messages[3].text, 'answer B');
     });
 
+    test('keeps the answer text when the answer row also carries reasoning', () {
+      // Regression: the real persisted transcript stamps the reasoning tail
+      // onto the answer row. The old parser saw a non-empty `reasoning` and
+      // treated the whole row as reasoning-only, dropping "LONG-OK-1" — the
+      // reported "finished task shows no results after reopening the app".
+      final history = ThreadHistory.parse({
+        'schemaVersion': 2,
+        'sessionKey': 'websocket:e2604311',
+        'active_turn_id': null,
+        'has_pending_tool_calls': true,
+        'completed_turn_ids': ['t1'],
+        'messages': [
+          {
+            'id': 'u-1',
+            'role': 'user',
+            'content': 'run sleep 60 then reply LONG-OK-1',
+            'turnId': 't1',
+            'turnPhase': 'user',
+            'turnSeq': 1,
+          },
+          {
+            'id': 'as-2',
+            'role': 'assistant',
+            'content': '',
+            'reasoning': 'We need to run sleep 60 using the shell tool.',
+            'turnId': 't1',
+            'turnPhase': 'reasoning',
+            'turnSeq': 42,
+          },
+          {
+            'id': 'tr-3',
+            'role': 'tool',
+            'kind': 'trace',
+            'content': 'novita_sandbox({"action": "run", "command": "sleep 60"})',
+            'traces': ['novita_sandbox({"action": "run", "command": "sleep 60"})'],
+            'toolEvents': [
+              {
+                'version': 1,
+                'phase': 'end',
+                'call_id': 'call-4c5e',
+                'name': 'novita_sandbox',
+                'arguments': {'action': 'run', 'command': 'sleep 60'},
+                'result': '\n[exit_code=0]',
+              },
+            ],
+            'turnId': 't1',
+            'turnPhase': 'activity',
+            'turnSeq': 46,
+          },
+          {
+            'id': 'as-4',
+            'role': 'assistant',
+            'content': 'LONG-OK-1',
+            'reasoning': 'Now reply exactly LONG-OK-1.',
+            'turnId': 't1',
+            'turnPhase': 'answer',
+            'turnSeq': 54,
+            'latencyMs': 163285,
+          },
+        ],
+      });
+
+      expect(history.messages.length, 2);
+      final assistant = history.messages.last;
+      expect(assistant.text, 'LONG-OK-1');
+      expect(assistant.segments, ['LONG-OK-1']);
+      expect(assistant.activity.length, 1);
+      expect(assistant.activity.first.name, 'novita_sandbox');
+      // Both reasoning fragments survive: the reasoning row and the tail the
+      // server stamped onto the answer row.
+      expect(assistant.reasoning, contains('We need to run sleep 60'));
+      expect(assistant.reasoning, contains('Now reply exactly LONG-OK-1.'));
+      expect(assistant.latencyMs, 163285);
+    });
+
+    test('orders a turn by turnSeq when every row carries one', () {
+      final history = ThreadHistory.parse({
+        'messages': [
+          {'role': 'user', 'content': 'go', 'turnId': 't1', 'turnPhase': 'user', 'turnSeq': 1},
+          {'role': 'assistant', 'content': 'done', 'turnId': 't1', 'turnPhase': 'answer', 'turnSeq': 30},
+          {'role': 'tool', 'kind': 'trace', 'content': 'read_file({"path": "."})', 'turnId': 't1', 'turnPhase': 'activity', 'turnSeq': 12},
+        ],
+      });
+      expect(history.messages.length, 2);
+      final assistant = history.messages.last;
+      expect(assistant.activity.length, 1);
+      expect(assistant.text, 'done');
+    });
+
+    test('does not duplicate reasoning repeated on the answer row', () {
+      final history = ThreadHistory.parse({
+        'messages': [
+          {'role': 'user', 'content': 'go', 'turnId': 't1', 'turnPhase': 'user', 'turnSeq': 1},
+          {
+            'role': 'assistant',
+            'content': '',
+            'reasoning': 'Only one thought.',
+            'turnId': 't1',
+            'turnPhase': 'reasoning',
+            'turnSeq': 2,
+          },
+          {
+            'role': 'assistant',
+            'content': 'answer',
+            'reasoning': 'Only one thought.',
+            'turnId': 't1',
+            'turnPhase': 'answer',
+            'turnSeq': 3,
+          },
+        ],
+      });
+      final assistant = history.messages.last;
+      expect(assistant.text, 'answer');
+      expect(assistant.reasoning, 'Only one thought.');
+    });
+
     test('reports active turn for resume detection', () {
       final history = ThreadHistory.parse({
         'messages': [

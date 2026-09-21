@@ -87,6 +87,43 @@ class ActivityStep {
     }
   }
 
+  /// Render one `tool_events[]` entry the way the WebUI's
+  /// `formatToolCallTrace` does, e.g. `read_file({"path": "."})`.
+  ///
+  /// Used to recognise a persisted `traces[]` line that merely restates a tool
+  /// event, so the same call is never rendered as two activity rows.
+  static String? traceLineFromToolEvent(Map event) {
+    final name = (event['name'] ?? event['tool'] ?? '').toString();
+    if (name.isEmpty) return null;
+    final args = event['arguments'] ?? event['args'];
+    if (args is String && args.trim().isNotEmpty) return '$name($args)';
+    if (args is Map) {
+      final encoded = jsonEncode(args);
+      return encoded == '{}' ? '$name()' : '$name($encoded)';
+    }
+    if (args is List) {
+      final encoded = jsonEncode(args);
+      return encoded == '[]' ? '$name()' : '$name($encoded)';
+    }
+    return '$name()';
+  }
+
+  /// Normalise a trace line so two renderings of the same call compare equal —
+  /// the Dart twin of the WebUI's `canonicalToolTrace`.
+  static String canonicalTrace(String line) {
+    final trimmed = line.trim();
+    final match = RegExp(r'^([a-zA-Z0-9_.\-]+)\((.*)\)$').firstMatch(trimmed);
+    if (match == null) return trimmed;
+    final name = match.group(1)!;
+    final args = match.group(2)!.trim();
+    if (args.isEmpty) return '$name()';
+    try {
+      return '$name(${jsonEncode(jsonDecode(args))})';
+    } catch (_) {
+      return trimmed;
+    }
+  }
+
   static String summarizeArgs(dynamic args) {
     if (args is! Map) return '';
     for (final k in [
@@ -600,6 +637,30 @@ class ThreadHistory {
     String? curTurnId;
     var stepOrder = 0;
 
+    // The persisted transcript is authoritative in `turnSeq` order — the WebUI
+    // sorts every row by it before rendering (orderMessagesByTurnSeq). Rows
+    // arrive mostly sorted already, but a reasoning row can be stamped after an
+    // activity row it actually precedes. Sorting is only safe when EVERY row
+    // carries a finite `turnSeq`; otherwise the array order is all we have.
+    final rows = raw
+        .whereType<Map>()
+        .map((e) => Map<String, dynamic>.from(e))
+        .toList();
+    if (rows.isNotEmpty && rows.every((r) => r['turnSeq'] is num)) {
+      final indexed = <MapEntry<int, Map<String, dynamic>>>[
+        for (var i = 0; i < rows.length; i++) MapEntry(i, rows[i]),
+      ];
+      indexed.sort((a, b) {
+        final bySeq = (a.value['turnSeq'] as num)
+            .toInt()
+            .compareTo((b.value['turnSeq'] as num).toInt());
+        return bySeq != 0 ? bySeq : a.key - b.key;
+      });
+      rows
+        ..clear()
+        ..addAll(indexed.map((e) => e.value));
+    }
+
     void flush() {
       if (curAssistant != null && !curAssistant!.isEmpty) {
         curAssistant!.dropEmptyTrailingSegment();
@@ -624,9 +685,7 @@ class ThreadHistory {
       return curAssistant!;
     }
 
-    for (final item in raw) {
-      if (item is! Map) continue;
-      final m = Map<String, dynamic>.from(item);
+    for (final m in rows) {
       final role = (m['role'] ?? '').toString();
       final phase = (m['turnPhase'] ?? '').toString();
       final kind = (m['kind'] ?? '').toString();
@@ -654,13 +713,16 @@ class ThreadHistory {
         // Persisted traces carry pre-rendered lines and/or raw tool events.
         final toolEvents = m['toolEvents'];
         var added = false;
+        final renderedFromEvents = <String>{};
         if (toolEvents is List) {
           for (final te in toolEvents) {
             if (te is! Map) continue;
-            final step = ActivityStep.fromToolEvent(
-              Map<String, dynamic>.from(te),
-              order: stepOrder++,
-            );
+            final event = Map<String, dynamic>.from(te);
+            final line = ActivityStep.traceLineFromToolEvent(event);
+            if (line != null) {
+              renderedFromEvents.add(ActivityStep.canonicalTrace(line));
+            }
+            final step = ActivityStep.fromToolEvent(event, order: stepOrder++);
             if (step != null) {
               t.activity.add(step);
               added = true;
@@ -674,32 +736,69 @@ class ThreadHistory {
         } else if (content.trim().isNotEmpty) {
           lines.addAll(content.split('\n').where((l) => l.trim().isNotEmpty));
         }
-        if (lines.isNotEmpty) {
-          for (final line in lines) {
-            t.activity.add(ActivityStep.fromTraceLine(line.trim(),
-                id: '${ActivityStep.traceIdPrefix}$stepOrder',
-                order: stepOrder++));
-          }
-        } else if (!added && kind == 'progress' && content.trim().isEmpty) {
+        // A persisted `traces[]` line that only restates a tool event must not
+        // become a second row — the WebUI's mergeToolProgressTraceLines drops
+        // traces already covered by tool events for exactly this reason.
+        final seenTraces = <String>{};
+        var traceAdded = false;
+        for (final line in lines) {
+          final key = ActivityStep.canonicalTrace(line);
+          if (renderedFromEvents.contains(key) || !seenTraces.add(key)) continue;
+          t.activity.add(ActivityStep.fromTraceLine(line.trim(),
+              id: '${ActivityStep.traceIdPrefix}$stepOrder',
+              order: stepOrder++));
+          traceAdded = true;
+        }
+        if (!traceAdded &&
+            !added &&
+            kind == 'progress' &&
+            content.trim().isEmpty) {
           // empty progress breadcrumb — skip silently
         }
         continue;
       }
 
       if (role == 'assistant') {
-        if (phase == 'reasoning' ||
-            (m['reasoning'] is String && (m['reasoning'] as String).isNotEmpty)) {
-          final t = ensureAssistant(turnId, seq);
-          final r = (m['reasoning'] ?? '') as String;
-          if (r.isNotEmpty) t.reasoning = t.reasoning.isEmpty ? r : '${t.reasoning}\n\n$r';
-          if (content.isNotEmpty && r.isEmpty && phase == 'reasoning') {
-            t.reasoning = t.reasoning.isEmpty ? content : '${t.reasoning}\n\n$content';
+        // `turnPhase` is authoritative. This guard used to treat ANY row with a
+        // non-empty `reasoning` as reasoning-only and skip it, but the server
+        // also stamps the reasoning tail onto the ANSWER row — a real persisted
+        // row is turnPhase "answer", content "LONG-OK-1", reasoning "Now reply
+        // exactly LONG-OK-1.". The answer text was silently dropped, which is
+        // why a task that had already finished showed no result when the app
+        // was reopened.
+        //
+        // The WebUI splits such a row into two units (assistantHasInlineReasoning
+        // -> reasoningOnlyMessageFromAnswer + stripInlineReasoning in
+        // lib/activity-timeline.ts). The native bubble keeps both, in the same
+        // order, on one card.
+        final reasonText =
+            m['reasoning'] is String ? m['reasoning'] as String : '';
+        final hasAnswerText = content.trim().isNotEmpty;
+        final hasReasoning = reasonText.trim().isNotEmpty;
+        final isAnswerPhase = phase == 'answer' ||
+            phase == 'complete' ||
+            phase == 'completed' ||
+            phase == 'final';
+        final reasoningOnly =
+            phase == 'reasoning' || (!isAnswerPhase && !hasAnswerText);
+        if (reasoningOnly) {
+          final r = hasReasoning ? reasonText : content;
+          if (r.trim().isNotEmpty) {
+            final t = ensureAssistant(turnId, seq);
+            if (!_reasoningAlready(t.reasoning, r)) {
+              t.reasoning = t.reasoning.isEmpty ? r : '${t.reasoning}\n\n$r';
+            }
           }
           continue;
         }
         // answer / complete / everything else that carries text
         final t = ensureAssistant(turnId, seq);
-        if (content.trim().isNotEmpty) {
+        if (hasReasoning && !_reasoningAlready(t.reasoning, reasonText)) {
+          t.reasoning = t.reasoning.isEmpty
+              ? reasonText
+              : '${t.reasoning}\n\n$reasonText';
+        }
+        if (hasAnswerText) {
           t.segments.add(content);
         }
         if (media.isNotEmpty) {
@@ -721,6 +820,19 @@ class ThreadHistory {
       activeTurnId: payload['active_turn_id'] as String?,
       hasPendingToolCalls: payload['has_pending_tool_calls'] == true,
     );
+  }
+
+  /// Whether [incoming] reasoning is already present in [existing].
+  ///
+  /// The transcript can carry the same reasoning twice — once on the reasoning
+  /// row and once, as a tail, on the answer row — and folding it in twice would
+  /// double the visible thought block.
+  static bool _reasoningAlready(String existing, String incoming) {
+    final b = normalizeAssistantText(incoming);
+    if (b.isEmpty) return true;
+    final a = normalizeAssistantText(existing);
+    if (a.isEmpty) return false;
+    return a == b || a.contains(b);
   }
 
   static List<String> _mediaUrls(Map m) {
