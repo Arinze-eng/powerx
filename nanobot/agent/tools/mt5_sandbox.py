@@ -71,7 +71,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-21.3"
+_CLI_VERSION = "2026-09-21.4"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -465,6 +465,10 @@ class MT5SandboxTool(Tool):
             "Trading actions (order, close, close_all) require MT5_ALLOW_TRADING to be "
             "enabled and return the broker retcode; a rejected order is reported with "
             "code 3 and its reason rather than raising. "
+            "After an order, verify it: retcode 10009 means the broker executed it, "
+            "'positions' then lists the open position and 'history' the closed deals "
+            "(newest first, window anchored to the BROKER's clock — tick time is "
+            "server time, so never compare it to the sandbox clock). "
             "All output is JSON: read it, fix errors, retry."
         )
 

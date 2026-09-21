@@ -24,6 +24,7 @@ import importlib.util
 import json
 import os
 import time
+from datetime import datetime, timedelta, timezone
 import types
 from pathlib import Path
 
@@ -423,6 +424,122 @@ def test_symbols_reports_zero_open_when_the_whole_server_is_closed(cli, monkeypa
     assert payload["market_open_now"] == 0
     assert all(row["market_open"] is False for row in payload["symbols"])
     assert "10018" in payload["note"]
+
+
+class _Deal:
+    """The MetaTrader5 wrapper returns namedtuples, so deals carry ``_asdict``."""
+
+    def __init__(self, **fields):
+        self._fields = fields
+
+    def _asdict(self):
+        return dict(self._fields)
+
+
+class FakeHistoryMT5:
+    """A terminal whose ticks run ``offset`` seconds ahead of this box."""
+
+    def __init__(self, offset, deals=()):
+        self._offset = offset
+        self._deals = list(deals)
+        self.window = None
+
+    def symbol_info_tick(self, name):
+        if name != "EURUSD":
+            return None
+        return types.SimpleNamespace(time=int(time.time()) + self._offset)
+
+    def symbols_get(self):
+        return [types.SimpleNamespace(name="EURUSD")]
+
+    def history_deals_get(self, start, end):
+        self.window = (start, end)
+        return [_Deal(**d) for d in self._deals]
+
+    def last_error(self):
+        return "fake-last-error"
+
+
+def test_history_window_is_anchored_to_the_broker_clock(cli, monkeypatch, capsys):
+    """THE missing-trade bug: a window built from the box clock hid the deals.
+
+    Measured live: a buy filled with retcode 10009 and showed up in ``positions``,
+    but ``history --days 1`` and ``--days 7`` returned only the account's opening
+    deposit. The MetaTrader5 wrapper hands the datetimes to the terminal as
+    SERVER time (UTC+3 here), so ``datetime.now()`` from the UTC box asked for a
+    window ending three hours in the broker's past — every deal of that session
+    was outside it.
+    """
+    offset = 10_799
+    fake = FakeHistoryMT5(offset)
+    monkeypatch.setattr(cli, "require_bridge", lambda: (fake, None))
+
+    assert cli.cmd_history(types.SimpleNamespace(days=1)) == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    start, end = fake.window
+    box_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    # The window must end at or beyond the BROKER's now, not the box's.
+    assert end >= box_now + timedelta(seconds=offset)
+    assert abs((end - start) - timedelta(days=1)) == timedelta(0)
+    assert abs(payload["server_clock_offset_s"] - offset) <= 2
+    assert payload["window"]["timezone"] == "broker server time"
+
+
+def test_history_window_never_ends_in_the_past_when_the_market_is_closed(cli, monkeypatch, capsys):
+    """A stale (weekend) tick is not an offset, so it must not shrink the window."""
+    fake = FakeHistoryMT5(-400_000)  # newest tick 4.6 days old: market closed
+    monkeypatch.setattr(cli, "require_bridge", lambda: (fake, None))
+
+    assert cli.cmd_history(types.SimpleNamespace(days=2)) == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    start, end = fake.window
+    box_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    assert payload["server_clock_offset_s"] == 0
+    assert end > box_now
+    # Deals are reported newest-first so trimming a long window drops the oldest.
+    assert payload["order"] == "newest_first"
+
+
+def test_history_puts_the_newest_deal_first(cli, monkeypatch, capsys):
+    fake = FakeHistoryMT5(
+        10_799,
+        deals=[
+            {"ticket": 1, "time": 1_000, "symbol": "EURUSD", "profit": 0.0},
+            {"ticket": 2, "time": 9_000, "symbol": "GBPUSD", "profit": -0.02},
+            {"ticket": 3, "time": 5_000, "symbol": "USDJPY", "profit": 0.01},
+        ],
+    )
+    monkeypatch.setattr(cli, "require_bridge", lambda: (fake, None))
+
+    assert cli.cmd_history(types.SimpleNamespace(days=7)) == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert [d["ticket"] for d in payload["deals"]] == [2, 3, 1]
+    assert payload["count"] == 3
+
+
+def test_history_payload_stays_under_the_sandbox_output_cap(cli, monkeypatch, capsys):
+    """A month of deals must not push the JSON past the wrapper's 16 000 chars."""
+    fake = FakeHistoryMT5(
+        10_799,
+        deals=[
+            {"ticket": i, "time": i, "symbol": f"SYM{i:03d}", "profit": float(i),
+             "comment": "a long enough comment to add up over many deals"}
+            for i in range(600)
+        ],
+    )
+    monkeypatch.setattr(cli, "require_bridge", lambda: (fake, None))
+
+    assert cli.cmd_history(types.SimpleNamespace(days=30)) == 0
+    raw = capsys.readouterr().out.strip().splitlines()[-1]
+    assert len(raw) <= cli._LIST_PAYLOAD_BUDGET
+    assert len(raw) <= 16_000
+    payload = json.loads(raw)
+    assert payload["truncated"] is True
+    # The newest deals survive the trim, the oldest are dropped.
+    assert payload["deals"][0]["ticket"] == 599
+    assert payload["count"] == 600
 
 
 def test_cmd_logs_reports_missing_logs_instead_of_empty_json(cli, tmp_path, monkeypatch, capsys):

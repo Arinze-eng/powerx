@@ -62,7 +62,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-21.3"
+CLI_VERSION = "2026-09-21.4"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -974,18 +974,83 @@ def cmd_orders(_: argparse.Namespace) -> int:
     return emit({"ok": True, "count": len(orders), "orders": [o._asdict() for o in orders]})
 
 
+def _server_clock_offset(mt5: Any) -> int:
+    """Seconds the broker's clock runs ahead of this box's clock, or 0 if unknown.
+
+    The MetaTrader5 python wrapper takes naive datetimes as SERVER time (it
+    forwards them as-is to the terminal), while the box runs on UTC. So a history
+    window built from the box clock is really asking for a window that ended
+    three hours in the broker's past — which is why ``history`` could not see the
+    deals that had been placed seconds earlier.
+
+    Measured on MetaQuotes-Demo, 2026-09-21: ticks ran 10 799 s (UTC+3) ahead of
+    the box. A tick that is further off than any real UTC offset can explain is
+    not an offset, it is a market that stopped ticking (weekend close, dead
+    feed), so it is rejected and the caller falls back to the box clock.
+    """
+    probes = ("EURUSD", "GBPUSD", "USDJPY", "USDCHF", "XAUUSD")
+    latest = 0
+    for name in probes:
+        try:
+            tick = mt5.symbol_info_tick(name)
+        except Exception:  # noqa: BLE001 - a missing probe symbol is not fatal
+            continue
+        latest = max(latest, int(getattr(tick, "time", 0) or 0))
+    if not latest:
+        # The usual majors are not guaranteed to exist on every server.
+        for info in (mt5.symbols_get() or [])[:200]:
+            tick = mt5.symbol_info_tick(getattr(info, "name", ""))
+            latest = max(latest, int(getattr(tick, "time", 0) or 0))
+    offset = int(latest - time.time()) if latest else 0
+    return offset if -_ZONE_SKEW_TOLERANCE_S <= offset <= _ZONE_SKEW_TOLERANCE_S else 0
+
+
 def cmd_history(args: argparse.Namespace) -> int:
+    """Deals in a window that is anchored to the BROKER's clock, not the box's.
+
+    MEASURED FAILURE (2026-09-21, live MetaQuotes-Demo): a market buy filled with
+    retcode 10009 and appeared in ``positions``, but ``history --days 1`` and
+    ``--days 7`` both returned only the account's opening deposit. The window was
+    ``datetime.now() - days`` .. ``datetime.now()`` from the UTC box, while the
+    terminal reads those datetimes as SERVER time (UTC+3 here) — so the window
+    ended three hours in the broker's past and every deal of this session fell
+    outside it. The agent could place a trade and then find no record of it: the
+    exact "it says it traded but I cannot check" failure this CLI exists to fix.
+    """
     mt5, err = require_bridge()
     if err is not None:
         return err
     import datetime as _dt
 
-    end = _dt.datetime.now()
+    offset = _server_clock_offset(mt5)
+    box_now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    server_now = box_now + _dt.timedelta(seconds=offset)
+    # The window ends in the FUTURE on purpose. A deal that has already been
+    # closed cannot be hidden by a clock that is off — a wrong or unavailable
+    # server offset can only ever shift the window further back, and the margin
+    # absorbs it. Only the lookback the caller asked for is honoured.
+    end = server_now + _dt.timedelta(hours=6)
     start = end - _dt.timedelta(days=int(args.days))
     deals = mt5.history_deals_get(start, end)
     if deals is None:
         return fail(f"history_deals_get failed: {mt5.last_error()}", code=2)
-    return emit({"ok": True, "count": len(deals), "deals": [d._asdict() for d in deals]})
+    # Newest first. ``_fit_payload`` trims a list from the END, so the order has
+    # to be descending for a long window to drop the oldest deals rather than the
+    # ones the agent just placed.
+    rows = sorted((d._asdict() for d in deals), key=lambda d: d.get("time", 0), reverse=True)
+    payload = {
+        "ok": True,
+        "count": len(rows),
+        "order": "newest_first",
+        "server_clock_offset_s": offset,
+        "window": {
+            "from": start.isoformat(sep=" ", timespec="seconds"),
+            "to": end.isoformat(sep=" ", timespec="seconds"),
+            "timezone": "broker server time",
+        },
+        "deals": rows,
+    }
+    return emit(_fit_payload(payload, _LIST_PAYLOAD_BUDGET))
 
 
 def cmd_symbols(args: argparse.Namespace) -> int:
