@@ -116,14 +116,46 @@ def test_chat_fails_over_on_quota_error_code() -> None:
     assert asyncio.run(pool.chat(_MESSAGES)).content == "b-answer"
 
 
-def test_chat_returns_last_error_when_every_lane_fails() -> None:
-    first = _lane("a", [LLMResponse(content=None, error_kind="rate_limit")])
-    second = _lane("b", [LLMResponse(content=None, error_kind="server_error")])
+def test_chat_reports_a_transient_error_over_a_terminal_one() -> None:
+    # Exactly the production shape: a primary lane that is rate-limited and a
+    # lane whose key was rejected. The 401 is the dead lane's own problem - the
+    # pool parks it - so the rate limit is what actually blocked the request and
+    # the one worth reporting. Surfacing the 401 sent the operator chasing a key
+    # while the real cause was upstream overload.
+    healthy = _lane("primary", [LLMResponse(content=None, error_kind="rate_limit")])
+    dead = _lane("dead", [LLMResponse(content=None, error_status_code=401)])
+    pool = _provider(healthy, dead)
+    assert asyncio.run(pool.chat(_MESSAGES)).error_kind == "rate_limit"
+
+
+def test_chat_returns_the_first_error_when_every_lane_fails_terminally() -> None:
+    # With only terminal failures on offer the first lane tried is reported:
+    # parking rotates a newly dead lane to the back of the order, so the last
+    # lane's error says the least about the pool's health.
+    first = _lane("a", [LLMResponse(content=None, error_status_code=401)])
+    second = _lane("b", [LLMResponse(content=None, error_status_code=402)])
     pool = _provider(first, second)
     response = asyncio.run(pool.chat(_MESSAGES))
-    assert response.error_kind == "server_error"
+    assert response.error_status_code == 401
     assert first[1].calls == 1
     assert second[1].calls == 1
+
+
+def test_chat_error_is_stable_however_the_lanes_rotate() -> None:
+    # A dead lane is parked after its first failure, which rotates it to the
+    # back of the order. The reported error must not change with the rotation.
+    healthy = _lane("primary", [LLMResponse(content=None, error_status_code=503)])
+    dead = _lane("dead", [LLMResponse(content=None, error_status_code=401)])
+    pool = _provider(healthy, dead)
+    assert asyncio.run(pool.chat(_MESSAGES)).error_status_code == 503
+    assert asyncio.run(pool.chat(_MESSAGES)).error_status_code == 503
+
+
+def test_stream_reports_a_transient_error_over_a_terminal_one() -> None:
+    healthy = _lane("primary", [LLMResponse(content=None, error_kind="overloaded")])
+    dead = _lane("dead", [LLMResponse(content=None, error_status_code=401)])
+    pool = _provider(healthy, dead)
+    assert asyncio.run(pool.chat_stream(_MESSAGES)).error_kind == "overloaded"
 
 
 def test_chat_does_not_rotate_on_a_real_answer() -> None:

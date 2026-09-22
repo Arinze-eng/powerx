@@ -295,6 +295,35 @@ def _pool_disabled() -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _pool_signature() -> tuple[object, ...]:
+    """Signature of the admin pool's *active* lanes.
+
+    The pool decides whether the active provider is a rotating set of lanes or
+    the single configured provider, so adding, enabling, disabling, or removing
+    a lane changes the provider chain. It was left out of
+    :func:`provider_signature`, which made ``ModelRuntimeResolver.refresh()``
+    treat a rebuilt provider as "unchanged" and discard it: the running gateway
+    kept serving the lanes frozen at container start, so disabling a dead lane
+    in the admin panel did nothing until the next restart. That is how a lane
+    with a rejected key stayed in rotation and kept answering every request with
+    its own 401.
+    """
+    if _pool_disabled():
+        return ("pool-disabled",)
+    from nanobot.provider_pool import enabled_entries
+
+    lanes = tuple(
+        (
+            str(entry.get("id") or ""),
+            str(entry.get("baseUrl") or ""),
+            str(entry.get("apiKey") or ""),
+            str(entry.get("model") or ""),
+        )
+        for entry in enabled_entries()
+    )
+    return ("pool", lanes)
+
+
 #: Lane id/label for the configured main provider when it joins the pool.
 ADMIN_LANE_ID = "admin-main"
 ADMIN_LANE_LABEL = "Admin (main provider)"
@@ -502,6 +531,9 @@ def provider_signature(
         resolved.context_window_tokens,
         getattr(p, "proxy", None) if p else None,
         p.thinking_style if p else None,
+        _pool_signature(),
+        # The fallback signatures stay the *last* element: callers index the
+        # tuple positionally and read `signature[-1]` for them.
         tuple(_fallback_signature(fallback) for fallback in fallback_presets),
     )
 

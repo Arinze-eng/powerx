@@ -151,7 +151,18 @@ def _lane_timeout_s() -> float | None:
 
 
 class PoolProvider(LLMProvider):
-    """Rotate chat requests across pool lanes, failing over on transient errors."""
+    """Rotate chat requests across pool lanes, failing over on transient errors.
+
+    When every lane fails, the caller is handed a *transient* failure if any
+    lane produced one, and only falls back to a terminal lane failure (403/401
+    key rejection, 402 out of credit) when nothing else was on offer. A terminal
+    failure says "this lane is unusable" - the pool already handles that by
+    parking the lane - while a transient one (rate limit, overload, timeout) is
+    what is actually blocking the request, so it is the one worth showing.
+    Reporting whatever lane happened to be tried last was how a lane with a
+    rejected key kept answering every request with its own 401 while the honest
+    cause was the primary lane being rate-limited.
+    """
 
     supports_progress_deltas = True
 
@@ -198,6 +209,28 @@ class PoolProvider(LLMProvider):
         return kind in _TERMINAL_LANE_KINDS or (
             isinstance(status, int) and status in _TERMINAL_LANE_STATUS
         )
+
+    @staticmethod
+    def _best_failure(
+        first_failure: LLMResponse | None,
+        transient: LLMResponse | None,
+    ) -> LLMResponse:
+        """The failure worth reporting once every lane has failed.
+
+        A transient failure (rate limit, overload, timeout, connection) is what
+        actually blocked the request, so it wins over a terminal one (401/402/
+        403, the lane's own key or credit problem) - the pool already parks the
+        terminal lane, and reporting its 401 told the operator nothing about the
+        real blocker. With only terminal failures on offer, the first lane's
+        error is reported rather than the last: parking rotates a dead lane to
+        the back of the order, so the last lane tried says the least about the
+        pool's health.
+        """
+        if transient is not None:
+            return transient
+        if first_failure is not None:
+            return first_failure
+        return LLMResponse(content=None, error_kind="connection")
 
     def _park_window_s(self, response: LLMResponse | None) -> float:
         """Parking window for a failure: long for a terminal, short otherwise."""
@@ -285,7 +318,8 @@ class PoolProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
-        last: LLMResponse | None = None
+        first_failure: LLMResponse | None = None
+        transient: LLMResponse | None = None
         for entry, provider in self._order():
             response = await self._call_lane(
                 lambda p=provider, e=entry: p.chat(
@@ -302,8 +336,11 @@ class PoolProvider(LLMProvider):
             if not self._should_failover(response):
                 return response
             self._park(entry, response)
-            last = response
-        return last if last is not None else LLMResponse(content=None, error_kind="connection")
+            if first_failure is None:
+                first_failure = response
+            if transient is None and not self._is_terminal_failure(response):
+                transient = response
+        return self._best_failure(first_failure, transient)
 
     async def chat_stream(
         self,
@@ -318,7 +355,8 @@ class PoolProvider(LLMProvider):
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        last: LLMResponse | None = None
+        first_failure: LLMResponse | None = None
+        transient: LLMResponse | None = None
         streamed = False
 
         async def _track(delta: str) -> None:
@@ -347,8 +385,11 @@ class PoolProvider(LLMProvider):
             if streamed or not self._should_failover(response):
                 return response
             self._park(entry, response)
-            last = response
-        return last if last is not None else LLMResponse(content=None, error_kind="connection")
+            if first_failure is None:
+                first_failure = response
+            if transient is None and not self._is_terminal_failure(response):
+                transient = response
+        return self._best_failure(first_failure, transient)
 
     def get_default_model(self) -> str:
         if self._lanes:

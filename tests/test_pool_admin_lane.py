@@ -126,3 +126,40 @@ def test_no_pool_means_the_main_provider_is_used_alone(
     provider = make_provider(_config(tmp_path))
 
     assert not isinstance(provider, PoolProvider)
+
+
+def test_provider_signature_tracks_pool_lane_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A pool edit must change the provider signature.
+
+    The signature is how the runtime resolver decides whether a rebuilt provider
+    replaces the live one. With the pool left out of it, disabling the lane with
+    the rejected key in the admin panel was treated as "nothing changed": the
+    gateway kept rotating over the lanes it froze at container start, so that
+    lane's 401 kept being the answer until the next restart.
+    """
+    from nanobot.providers.factory import provider_signature
+
+    config = _config(tmp_path)
+
+    # Baseline: no pool configured at all. The environment is shared between
+    # tests, so the variable has to be removed rather than assumed absent.
+    monkeypatch.delenv("PROVIDER-POOL-JSON", raising=False)
+    without_pool = provider_signature(config)
+
+    _pool_env(monkeypatch, [_POOL_LANE])
+    with_lane = provider_signature(config)
+    assert with_lane != without_pool
+
+    _pool_env(monkeypatch, [dict(_POOL_LANE, enabled=False)])
+    disabled = provider_signature(config)
+    assert disabled != with_lane
+
+    # Back to the same state: the signature is stable, so unrelated refreshes
+    # still leave the live provider untouched.
+    _pool_env(monkeypatch, [_POOL_LANE])
+    assert provider_signature(config) == with_lane
+
+    monkeypatch.setenv("PROVIDER-POOL-DISABLED", "1")
+    assert provider_signature(config) != with_lane
