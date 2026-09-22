@@ -1591,3 +1591,83 @@ def test_a_small_branded_servers_dat_is_not_reported_as_absent(monkeypatch, tmp_
     # Unregistered/small: undecidable, never a false alarm.
     monkeypatch.setattr(cli, "installed_broker_key", lambda *a, **k: "explicit")
     assert cli._terminal_has_broker_servers(terminal) is None
+
+
+def test_a_route_placeholder_key_is_never_mistaken_for_the_build(monkeypatch, tmp_path):
+    """``explicit`` names the ROUTE an install took, not the build it laid down.
+
+    MEASURED 2026-09-22 (Deriv box, ``dbx_34TAiSoAkC56fnFUCFu7u``): ``.broker_key``
+    read ``explicit`` -- the caller had supplied the installer URL -- beside an
+    ``.installed.url`` holding Deriv's REGISTERED installer URL, on a terminal whose
+    branded ``servers.dat`` is 43,804 B. Honouring the placeholder made ``doctor``
+    report ``terminal_has_broker_servers: false`` for a terminal that was at that
+    moment streaming 722 Deriv symbols. The URL that actually landed decides it.
+    """
+    cli = _broker_cli(
+        monkeypatch,
+        tmp_path,
+        broker_key="explicit",
+        brands=("MetaTrader 5 Terminal",),
+    )
+    cli.INSTALLED_URL_FILE.write_text(
+        "https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe",
+        encoding="utf-8",
+    )
+    assert cli.installed_broker_key() == "deriv"
+    assert cli._broker_build_by_key("explicit") is None
+
+    cfg = (
+        cli.WINE_PREFIX
+        / "drive_c"
+        / "Program Files"
+        / "MetaTrader 5 Terminal"
+        / "Config"
+    )
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "servers.dat").write_bytes(b"x" * 43_804)
+    terminal = cli.find_terminal(prefer_key="deriv")
+    assert cli._terminal_has_broker_servers(terminal) is True
+
+
+def test_an_unregistered_url_is_never_guessed_into_a_build(monkeypatch, tmp_path):
+    """Recovering from a placeholder key must not invent a broker.
+
+    A URL that matches no registry entry leaves the build genuinely unnamed, so the
+    placeholder is handed back and the answer stays undecidable rather than becoming
+    a confident wrong one.
+    """
+    cli = _broker_cli(
+        monkeypatch,
+        tmp_path,
+        broker_key="explicit",
+        brands=("MetaTrader 5 SOMEBROKER",),
+    )
+    cli.INSTALLED_URL_FILE.write_text(
+        "https://example.invalid/mt5/somebroker5setup.exe", encoding="utf-8"
+    )
+    assert cli._broker_build_by_url("https://example.invalid/mt5/x.exe") is None
+    assert cli.installed_broker_key() == "explicit"
+
+    # The registered URLs still match exactly, so the recovery is real and not a
+    # blanket "any URL identifies a build".
+    assert cli._broker_build_by_url(cli.GENERIC_INSTALLER_URL)["key"] == "metaquotes"
+    assert cli._broker_build_by_url(cli.DEFAULT_INSTALLER_URL)["key"] == "exness"
+
+
+def test_a_recorded_build_still_outranks_the_url_on_disk(monkeypatch, tmp_path):
+    """The installer's record stays authoritative when it names a build.
+
+    Two builds coexist in one prefix, so the URL alone cannot say which terminal
+    ``find_terminal`` hands out. Only a PLACEHOLDER record yields to the URL.
+    """
+    cli = _broker_cli(
+        monkeypatch,
+        tmp_path,
+        broker_key="exness",
+        brands=("MetaTrader 5 EXNESS", "MetaTrader 5 Terminal"),
+    )
+    cli.INSTALLED_URL_FILE.write_text(
+        "https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe",
+        encoding="utf-8",
+    )
+    assert cli.installed_broker_key() == "exness"

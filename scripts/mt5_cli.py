@@ -62,7 +62,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-22.11"
+CLI_VERSION = "2026-09-22.12"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -135,6 +135,22 @@ _ZONE_SKEW_TOLERANCE_S = 14 * 3600
 #: in :data:`BROKER_BUILDS`). Read by :func:`installed_broker_key` so a requested
 #: server can be checked against the terminal that is actually on disk.
 BROKER_KEY_FILE = MT5_ROOT / ".broker_key"
+
+#: The installer URL that actually LANDED on disk (the installer writes it the
+#: moment it starts downloading a build). Read by :func:`installed_broker_key`,
+#: because a recorded key that names the ROUTE an install took is not a build and
+#: must not make a decidable build undecidable.
+INSTALLED_URL_FILE = MT5_ROOT / ".installed.url"
+
+#: Recorded ``.broker_key`` values that name the route, not the build.
+#:
+#: ``unknown`` is the installer's ``${MT5_BROKER_KEY:-unknown}`` default (nobody
+#: named a broker); ``explicit`` is what this CLI records when the caller supplied
+#: the installer URL itself instead of naming a server. MEASURED 2026-09-22: a
+#: Deriv box carried ``.broker_key=explicit`` beside the REGISTERED Deriv installer
+#: URL, so ``doctor`` called a 722-symbol Deriv terminal undecidable while the URL
+#: on disk named the build outright.
+_NON_ANSWER_BROKER_KEYS = frozenset({"unknown", "explicit"})
 
 #: The installer URL a detached ``install`` is laying down right now, written when
 #: the install is launched and compared with ``.installed.url`` by
@@ -285,30 +301,75 @@ def _broker_build_by_key(key: str | None) -> dict[str, Any] | None:
     return None
 
 
+def _broker_build_by_url(url: str | None) -> dict[str, Any] | None:
+    """The registered build whose installer URL is exactly ``url``.
+
+    Exact (after strip) and case-sensitive on the URL itself: a near-miss must not
+    be reported as a build, or ``doctor`` would name the wrong terminal. Used only
+    to recover from a ``.broker_key`` that names a route instead of a build.
+    """
+    wanted = (url or "").strip()
+    if not wanted:
+        return None
+    for build in broker_builds():
+        if str(build.get("url") or "").strip() == wanted:
+            return build
+    if wanted == GENERIC_INSTALLER_URL:
+        # The generic build is registered with an EMPTY url (it IS MT5's own default
+        # installer), so the loop above can never match it -- yet a caller who passed
+        # that URL explicitly did land the generic build. Naming it turns
+        # ``_terminal_has_broker_servers`` from undecidable into a real answer
+        # (False), which is the one case where the generic build is the honest name.
+        return _broker_build_by_key("metaquotes")
+    return None
+
+
+def _installed_url() -> str:
+    """The installer URL on disk, or "" when the installer never recorded one."""
+    try:
+        return INSTALLED_URL_FILE.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
 def installed_broker_key(terminal: Path | None = None) -> str | None:
-    """Which build is installed: the installer's record first, dir name second.
+    """Which build is installed: the installer's record first, then the URL, then dir.
 
     The record is authoritative because two builds coexist in one prefix (a branded
     installer refuses to overwrite a generic install), so the mere presence of a
-    directory says nothing about which terminal ``find_terminal`` hands out.
+    directory says nothing about which terminal ``find_terminal`` hands out -- but
+    only when the record actually names a build. See
+    :data:`_NON_ANSWER_BROKER_KEYS`: a placeholder is skipped in favour of the two
+    signals that can still decide it, the URL that landed and the directory name.
     """
     try:
         recorded = BROKER_KEY_FILE.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         recorded = ""
-    # "unknown" is the installer's placeholder for "the caller named no broker", from
-    # ``${MT5_BROKER_KEY:-unknown}``. It is a NON-answer: honouring it masks the
-    # dir-name fallback below, which can still identify the build. MEASURED
-    # 2026-09-22: a bare install left .broker_key=unknown beside an Exness terminal,
-    # and doctor reported installed_broker="unknown" for a build it could have named.
-    if recorded and recorded.lower() != "unknown":
+    if recorded and recorded.lower() not in _NON_ANSWER_BROKER_KEYS:
         return recorded
+
+    # A placeholder key names the route the install took, not the build it laid
+    # down, so it must not short-circuit the two signals that DO name a build.
+    # MEASURED 2026-09-22: a bare install left ``.broker_key=unknown`` beside an
+    # Exness terminal, and a Deriv install left ``.broker_key=explicit`` beside the
+    # registered Deriv URL -- ``doctor`` reported ``installed_broker="unknown"`` for
+    # a build the directory named, then ``terminal_has_broker_servers: false`` for a
+    # terminal streaming 722 symbols.
+    by_url = _broker_build_by_url(_installed_url())
+    if by_url is not None:
+        return str(by_url["key"])
 
     if terminal is None:
         terminal = find_terminal()
-    if terminal is None:
-        return None
-    return broker_key_from_dir_name(terminal.parent.name)
+    if terminal is not None:
+        named = broker_key_from_dir_name(terminal.parent.name)
+        if named:
+            return named
+
+    # Nothing here can name the build: hand the placeholder back rather than
+    # inventing one, so the caller still sees that an install happened.
+    return recorded or None
 
 
 def broker_key_from_dir_name(dir_name: str) -> str | None:
@@ -1095,11 +1156,7 @@ def _pending_install_target() -> str:
         return ""
     if not target:
         return ""
-    try:
-        landed = (MT5_ROOT / ".installed.url").read_text(encoding="utf-8").strip()
-    except OSError:
-        landed = ""
-    return target if target != landed else ""
+    return target if target != _installed_url() else ""
 
 
 def cmd_status(args: argparse.Namespace) -> int:
