@@ -62,7 +62,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-22.6"
+CLI_VERSION = "2026-09-22.7"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -1054,7 +1054,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         raw = status_path.read_text(encoding="utf-8", errors="replace").strip()
         stage, _, message = raw.partition("|")
 
-    terminal = find_terminal()
+    # Same rule as doctor: report the terminal of the broker that is RECORDED, not
+    # whichever the filesystem lists (or the marker cached) first. Live 2026-09-22:
+    # after switching the box back to the generic build, status still named the
+    # Exness terminal it was no longer using.
+    terminal = find_terminal(prefer_key=installed_broker_key())
     winpy = win_python()
     running = terminal_running()
     installed = bool(terminal and winpy is not None)

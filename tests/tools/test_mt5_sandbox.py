@@ -1388,7 +1388,9 @@ def test_the_generic_url_matches_the_installer_default():
     assert f"${{MT5_INSTALLER_URL:-{cli.GENERIC_INSTALLER_URL}}}" in script
 
 
-def test_doctor_resolves_the_terminal_of_the_recorded_broker(monkeypatch, tmp_path):
+def test_doctor_and_status_name_the_terminal_of_the_recorded_broker(
+    monkeypatch, tmp_path
+):
     """Recorded broker and reported terminal path must describe the SAME build.
 
     Live 2026-09-22: after switching a box to the Exness build, ``doctor`` reported
@@ -1428,6 +1430,18 @@ def test_doctor_resolves_the_terminal_of_the_recorded_broker(monkeypatch, tmp_pa
     # generic one that happens to sort first on disk.
     assert "MetaTrader 5 EXNESS" in captured["terminal_path"]
     assert captured["terminal_path"] == str(cli.find_terminal(prefer_key="exness"))
+
+    # `status` names the same terminal: it is what an operator reads to decide
+    # whether the box they are looking at is the one they think it is. The marker is
+    # put back on the generic build first, because doctor's own lookup re-caches it
+    # and would otherwise hide the stale value this asserts about.
+    cli.TERMINAL_MARKER.write_text(
+        str(cli.WINE_PREFIX / "drive_c" / "Program Files" / "MetaTrader 5"
+            / "terminal64.exe"),
+        encoding="utf-8",
+    )
+    cli.cmd_status(argparse.Namespace(lines=5))
+    assert "MetaTrader 5 EXNESS" in captured["terminal_path"]
 
 
 def test_known_server_prefixes_match_the_cli_registry(monkeypatch, tmp_path):
