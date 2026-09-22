@@ -58,11 +58,23 @@ DISPLAY_NUM="${MT5_DISPLAY_NUM:-99}"
 # broker it will trade on.
 #
 # ``MT5_INSTALLER_URL`` stays as the fallback for a generic/MetaQuotes demo
-# account (MetaQuotes-Demo resolves itself); set ``MT5_BROKER_INSTALLER_URL``
-# for a real broker. Broker CDN slugs are ``<company>.ltd``-style -- Exness is
+# account (MetaQuotes-Demo resolves itself); ``MT5_BROKER_INSTALLER_URL`` is for
+# a real broker. Broker CDN slugs are ``<company>.ltd``-style -- Exness is
 # ``exness.technologies.ltd`` -> exness5setup.exe.
+#
+# The BROKER build is the DEFAULT, not the generic one. A bare install used to
+# produce the generic MetaQuotes terminal, which carries no broker server list and
+# so can never log in to a real broker -- silently, with zero ``Network`` lines
+# and a ``-10005 IPC timeout`` from the bridge that blames Wine. Defaulting to the
+# broker build means an install with no arguments is a *working* install. Exness
+# is this deployment's broker; override MT5_BROKER_INSTALLER_URL for another one.
 MT5_INSTALLER_URL="${MT5_INSTALLER_URL:-https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe}"
-MT5_BROKER_INSTALLER_URL="${MT5_BROKER_INSTALLER_URL:-}"
+MT5_BROKER_INSTALLER_URL="${MT5_BROKER_INSTALLER_URL:-https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe}"
+# Explicit opt-in to the generic MetaQuotes build. Only a MetaQuotes-Demo account
+# can use it; a real broker cannot log in on it at all.
+if [ "${MT5_GENERIC_INSTALLER:-0}" = "1" ]; then
+  MT5_BROKER_INSTALLER_URL=""
+fi
 # Where the broker's install lands. The branded installer always uses
 # "MetaTrader 5 <BRAND>" as the directory name and refuses to overwrite a generic
 # install, so the two can coexist and the terminal finder must know both names.

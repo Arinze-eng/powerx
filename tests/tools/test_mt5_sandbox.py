@@ -898,11 +898,39 @@ def test_broker_installer_url_is_forwarded_to_the_installer():
     assert "MetaTrader 5 EXNESS" in cmd
 
 
-def test_install_without_broker_url_stays_generic():
-    """No broker configured -> no env vars, so MetaQuotes-demo installs work."""
+def test_install_without_broker_url_emits_no_env_override():
+    """No broker passed -> the CLI sets nothing, so the *script's* default wins.
+
+    The script defaults to the broker-branded build (see
+    ``test_installer_script_defaults_to_the_broker_build``); the CLI must not
+    override it with an empty value, which would force the generic terminal.
+    """
     cmd = build_cli_command("install", {})
     assert "MT5_BROKER_INSTALLER_URL" not in cmd
     assert "MT5_BROKER_DIR_NAME" not in cmd
+
+
+def test_installer_script_defaults_to_the_broker_build():
+    """A bare install must produce a terminal that can actually log in.
+
+    MEASURED FAILURE (2026-09-22): with ``MT5_BROKER_INSTALLER_URL`` defaulting to
+    empty, a bare install fetched MetaQuotes' generic build, whose ``servers.dat``
+    has no broker entries. ``Exness-MT5Trial9`` then had nothing to resolve to, so
+    MT5 skipped the connection silently -- zero ``Network`` log lines, then
+    ``-10005 IPC timeout`` from the bridge. Two sandboxes were spent on this.
+
+    So the default is now the deployment's broker (Exness), and the generic build
+    is an explicit opt-in.
+    """
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
+    ).read_text(encoding="utf-8")
+    assert (
+        'MT5_BROKER_INSTALLER_URL="${MT5_BROKER_INSTALLER_URL:-https://download.mql5.com/'
+        'cdn/web/exness.technologies.ltd/mt5/exness5setup.exe}"' in script
+    ), "the installer script must default to the Exness-branded MT5 build"
+    # ...and the generic build must remain reachable on request.
+    assert 'MT5_GENERIC_INSTALLER' in script
 
 
 def test_tool_schema_advertises_the_broker_installer_params():

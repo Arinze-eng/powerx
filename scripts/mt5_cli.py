@@ -481,11 +481,17 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         "running_under_wine": under_wine(),
         "mt5_root": str(MT5_ROOT),
     }
-    ready = bool(
+    installed = bool(
         info["wine_installed"] and info["prefix_ready"] and terminal and winpy is not None
     )
+    # A GENERIC terminal is installed but cannot trade a broker: MT5 skips the
+    # login entirely and the bridge reports -10005. Reporting
+    # ``ready_for_trading: true`` there is what made this trap silent, so gate it
+    # on broker servers when they are positively known to be missing. ``None``
+    # means "not inspected" and must not block a healthy install.
+    ready = installed and has_broker_servers is not False
     info["ready_for_trading"] = ready
-    if ready and has_broker_servers is False:
+    if installed and has_broker_servers is False:
         # Say this LOUDLY. The chain is complete and every other probe is green,
         # yet a broker login will silently never happen.
         info["warning"] = (
