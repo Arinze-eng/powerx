@@ -1524,3 +1524,37 @@ def test_an_unknown_broker_key_does_not_mask_the_install_directory(
         monkeypatch, tmp_path, broker_key="unknown", brands=("MetaTrader 5 EXNESS",)
     )
     assert cli.installed_broker_key() == "exness"
+
+
+def test_a_small_branded_servers_dat_is_not_reported_as_absent(monkeypatch, tmp_path):
+    """A byte count is not evidence of absence.
+
+    MEASURED 2026-09-22: Deriv's branded ``servers.dat`` is 43,804 B -- SMALLER than
+    the generic build's ~50 KB -- so the old ``size > 100_000`` line reported
+    ``terminal_has_broker_servers: false`` for a terminal that was at that moment
+    streaming 722 Deriv symbols. Only the registered GENERIC build is known to carry
+    no broker servers; an unregistered build is undecidable (None), which is not a
+    false.
+    """
+    cli = _broker_cli(
+        monkeypatch, tmp_path, broker_key="exness", brands=("MetaTrader 5 EXNESS",)
+    )
+    cfg = (
+        cli.WINE_PREFIX
+        / "drive_c"
+        / "Program Files"
+        / "MetaTrader 5 EXNESS"
+        / "Config"
+    )
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "servers.dat").write_bytes(b"x" * 43_804)
+    terminal = cli.find_terminal(prefer_key="exness")
+    assert cli._terminal_has_broker_servers(terminal) is True
+
+    # The registered generic build really does carry none.
+    monkeypatch.setattr(cli, "installed_broker_key", lambda *a, **k: "metaquotes")
+    assert cli._terminal_has_broker_servers(terminal) is False
+
+    # Unregistered/small: undecidable, never a false alarm.
+    monkeypatch.setattr(cli, "installed_broker_key", lambda *a, **k: "explicit")
+    assert cli._terminal_has_broker_servers(terminal) is None

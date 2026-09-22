@@ -767,7 +767,25 @@ def _terminal_has_broker_servers(terminal: Path | None) -> bool | None:
         size = servers.stat().st_size
     except OSError:
         return None
-    return size > 100_000
+    if size > 100_000:
+        return True
+    # SIZE ALONE CANNOT REFUTE A BRANDED BUILD. The 100 KB line was drawn from
+    # Exness (~234 KB) vs generic (~50 KB), but a branded terminal may ship a
+    # SMALLER database than the generic one -- MEASURED 2026-09-22: Deriv's
+    # servers.dat is 43,804 B, and `doctor` reported
+    # `terminal_has_broker_servers: false` while that same terminal was streaming
+    # 722 Deriv symbols. A byte count is not evidence of absence, and asserting
+    # "this build carries no broker servers" about a build that demonstrably has
+    # them is the exact wrong signal this whole area exists to remove.
+    #
+    # So ask the REGISTRY what build this is instead. A registered build with a
+    # broker URL is branded and carries its broker's servers; the registered
+    # generic build (empty URL) is the one case known to carry none. Anything
+    # unregistered is reported as undecidable (None) rather than as a false.
+    build = _broker_build_by_key(installed_broker_key(terminal) or "")
+    if build is not None:
+        return bool(build.get("url"))
+    return None
 
 
 def _terminal_network_lines(
