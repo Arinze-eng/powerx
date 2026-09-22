@@ -136,9 +136,21 @@ document is about. An unknown server is never blocked preflight (`None`), becaus
 the CLI must not refuse what it cannot reason about.
 
 A second tell, when the login still produces no account: **zero `Network` lines**
-in `logs/<date>.log` means the name never resolved. A wrong password *does* write
-a `Network` line, so `start` reports `failure: "no_network_activity"` with the
-build to install rather than pretending the credentials were wrong.
+in `logs/<date>.log`. An unresolvable name writes none — MT5 skips the connection
+— while a wrong password writes one (`authorization failed`). `start` reports
+`failure: "no_network_activity"` for the empty case.
+
+Caveat, measured 2026-09-22: **zero lines is a signal, not proof.** A generic
+MetaQuotes terminal that logged in *successfully* (balance read back over IPC)
+also wrote zero `Network` lines, so an empty log cannot on its own convict the
+server name. What can is the build: `start` compares `installed_broker_key()`
+against `broker_for_server(server)` and reports
+`failure: "server_not_in_terminal"` only for a real mismatch; otherwise the
+`no_network_activity` hint gives both readings and both next steps.
+
+Note the log is **UTF-16LE** — plain `grep Network logs/<date>.log` matches
+nothing even when the lines exist. The CLI's own reader auto-detects the
+encoding; if you inspect by hand, `iconv -f UTF-16LE` first.
 
 ### How to see this coming next time
 
@@ -146,14 +158,20 @@ build to install rather than pretending the credentials were wrong.
 
 ```json
 {"terminal_has_broker_servers": false,
+ "installed_broker": "metaquotes",
+ "supported_server_prefixes": ["exness", "metaquotes"],
  "ready_for_trading": true,
  "warning": "This terminal is the GENERIC MetaQuotes build: its Config/servers.dat
-             carries no broker server list, so a broker server name cannot be
-             resolved and logins will silently never even be attempted ..."}
+             carries no broker server list, so a BROKER server name cannot be
+             resolved and a broker login will silently never even be attempted ...
+             For a real broker, install the build that carries it:
+             'install --server <broker server name>' ..."}
 ```
 
-`ready_for_trading: true` with `terminal_has_broker_servers: false` means the
-chain is installed but **broker login is impossible**. Trust the second field.
+`terminal_has_broker_servers: false` with `installed_broker: "metaquotes"` means
+a **real broker cannot log in** on this terminal; MetaQuotes' own demo servers
+can (measured). The fix is `install --server <the broker's server>`, not a
+hand-set URL.
 
 ### Two traps this creates
 
@@ -272,9 +290,10 @@ $ python3 ~/.mt5/bin/mt5_cli.py account
 4. `doctor` → confirm `installed_broker` matches and `terminal_has_broker_servers`
    is `true`.
 5. `start` with login/password/server.
-6. `account` → expect `balance`. On `-10005`, read `logs/<date>.log`: **zero
-   `Network` lines means the server name did not resolve** (wrong build), while a
-   `Network` line without an authorization means credentials.
+6. `account` → expect `balance`. On `-10005`, read `logs/<date>.log` (it is
+   UTF-16, so `iconv` it or use `action='logs'`). A `Network` line without an
+   authorization means credentials; no line at all is ambiguous — trust
+   `installed_broker` against the server's broker instead of the line count.
 7. Confirm the broker server name is exact — e.g. `Exness-MT5Trial9`, not
    `Exness-MT5Trial`. A near-miss fails like a wrong password.
 

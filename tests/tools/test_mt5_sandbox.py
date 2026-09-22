@@ -1280,19 +1280,112 @@ def test_sandbox_polling_never_exceeds_120_seconds():
     assert cli._PROBE_TIMEOUT < 120
 
 
-def test_start_diagnoses_an_unresolvable_server_from_the_log():
-    """Zero ``Network`` lines is MT5's only tell for "cannot resolve this server".
+def test_a_failed_login_blames_the_build_only_when_the_build_is_really_wrong(
+    monkeypatch, tmp_path
+):
+    """MEASURED 2026-09-22: a SUCCESSFUL login wrote zero ``Network`` lines.
 
-    It is the one failure mode with no error anywhere: a wrong password DOES write a
-    ``Network`` line ("authorization failed"), an unresolvable server writes none.
-    The two need opposite fixes, so the timeout payload names the difference.
+    The generic MetaQuotes terminal authorized on MetaQuotes-Demo (``account``
+    returned balance 99 996.48 USD) and its log still held no ``Network`` line --
+    so "zero Network lines" cannot be reported as proof that the server did not
+    resolve. A build mismatch is what justifies that claim, and it is checked
+    directly (`installed_broker_key` vs `broker_for_server`) instead of inferred.
     """
-    source = (
-        Path(__file__).resolve().parents[2] / "scripts" / "mt5_cli.py"
+    cli = _broker_cli(
+        monkeypatch, tmp_path, broker_key="metaquotes", brands=("MetaTrader 5",)
+    )
+    terminal = cli.find_terminal()
+
+    # 1. The terminal matches the server: zero Network lines is NOT a diagnosis.
+    matched = cli.login_failure_diagnosis(
+        terminal, "MetaQuotes-Demo", "10012768157", 90, []
+    )
+    assert matched["failure"] == "no_network_activity"
+    assert "ZERO Network lines" in matched["hint"]
+    assert "cannot resolve" in matched["hint"]
+    # ...and it must offer the credential reading too, not only "install a build".
+    assert "credential" in matched["hint"]
+    assert "already matches" in matched["hint"]
+
+    # 2. A real mismatch is stated as one.
+    mismatched = cli.login_failure_diagnosis(
+        terminal, "Exness-MT5Trial9", "477199408", 90, []
+    )
+    assert mismatched["failure"] == "server_not_in_terminal"
+    assert "metaquotes build" in mismatched["hint"]
+
+    # 3. Network lines present: the log shows an attempt, so it is credentials.
+    credential = cli.login_failure_diagnosis(
+        terminal, "MetaQuotes-Demo", "10012768157", 90, ["Network '1': authorization failed"]
+    )
+    assert credential["failure"] is None
+    assert "authorization failed" in credential["hint"]
+
+
+def test_a_broker_switch_is_not_reported_as_done_before_it_has_started(
+    monkeypatch, tmp_path
+):
+    """MEASURED 2026-09-22: the first poll of a re-install answered ``stage="done"``.
+
+    ``installed`` is true either way -- the PREVIOUS broker's terminal is still on
+    disk -- and the install marker had just been deleted for the new run, so a
+    switch looked finished with an empty log and no ``.broker_key``. An agent polling
+    that stops waiting for a terminal that is not there yet, then logs in against the
+    old build.
+    """
+    import argparse
+
+    cli = _broker_cli(
+        monkeypatch, tmp_path, broker_key="metaquotes", brands=("MetaTrader 5",)
+    )
+    # A windows python is what makes `installed` true -- i.e. what used to force
+    # "done" regardless of the install that is actually in flight.
+    winpy = tmp_path / "python.exe"
+    winpy.write_bytes(b"MZ")
+    monkeypatch.setenv("MT5_WIN_PYTHON", str(winpy))
+    mt5_root = tmp_path / ".mt5"
+
+    captured: dict[str, Any] = {}
+
+    def _capture(payload: dict[str, Any], **_kw: Any) -> int:
+        captured.clear()
+        captured.update(payload)
+        return 0
+
+    monkeypatch.setattr(cli, "emit", _capture)
+
+    # 1. A switch to the Exness build is in flight.
+    (mt5_root / ".installed.url").write_text(cli.GENERIC_INSTALLER_URL, encoding="utf-8")
+    (mt5_root / ".install.target").write_text(
+        cli.broker_for_server("Exness-MT5Trial9")["url"], encoding="utf-8"
+    )
+    (mt5_root / "install.status").write_text("starting|new build", encoding="utf-8")
+    cli.cmd_status(argparse.Namespace(lines=5))
+    assert captured["stage"] != "done"
+    assert captured["in_progress"] is True
+    assert captured["installing_target"].endswith("exness5setup.exe")
+
+    # 2. Once that build has landed, status reports done again.
+    (mt5_root / ".installed.url").write_text(
+        cli.broker_for_server("Exness-MT5Trial9")["url"], encoding="utf-8"
+    )
+    cli.cmd_status(argparse.Namespace(lines=5))
+    assert captured["stage"] == "done"
+    assert captured["installing_target"] is None
+
+
+def test_the_generic_url_matches_the_installer_default():
+    """A divergence would make every install look permanently pending.
+
+    ``_pending_install_target`` compares the URL this CLI recorded against the one
+    the shell installer wrote into ``.installed.url``; if the two defaults drift the
+    comparison never matches and a healthy install never reports done.
+    """
+    cli = _load_cli_module()
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
     ).read_text(encoding="utf-8")
-    assert "def _terminal_network_lines(" in source
-    assert '"failure"] = "no_network_activity"' in source
-    assert "ZERO Network lines" in source
+    assert f"${{MT5_INSTALLER_URL:-{cli.GENERIC_INSTALLER_URL}}}" in script
 
 
 def test_known_server_prefixes_match_the_cli_registry(monkeypatch, tmp_path):

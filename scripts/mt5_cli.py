@@ -66,6 +66,16 @@ CLI_VERSION = "2026-09-22.6"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
+
+#: The generic (MetaQuotes) installer used when a server resolves to no specific
+#: broker build. Kept byte-identical to the default in
+#: ``scripts/install_mt5_sandbox.sh``: the installer records the URL it used in
+#: ``.installed.url`` and :func:`_pending_install_target` compares that string with
+#: the target recorded here, so a divergence would make every install look
+#: permanently pending.
+GENERIC_INSTALLER_URL = (
+    "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
+)
 DISPLAY_NUM = os.environ.get("MT5_DISPLAY_NUM", "99")
 METAEDITOR_MARKER = MT5_ROOT / ".metaeditor_path"
 # Where find_terminal() caches the resolved terminal path, so repeated calls do
@@ -110,6 +120,12 @@ _ZONE_SKEW_TOLERANCE_S = 14 * 3600
 #: in :data:`BROKER_BUILDS`). Read by :func:`installed_broker_key` so a requested
 #: server can be checked against the terminal that is actually on disk.
 BROKER_KEY_FILE = MT5_ROOT / ".broker_key"
+
+#: The installer URL a detached ``install`` is laying down right now, written when
+#: the install is launched and compared with ``.installed.url`` by
+#: :func:`_pending_install_target`. Without it a broker SWITCH reads as "done" on
+#: the first poll, because the PREVIOUS build's terminal is still on disk.
+INSTALL_TARGET_FILE = MT5_ROOT / ".install.target"
 
 
 # --------------------------------------------------------------------------- #
@@ -844,16 +860,25 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     info["ready_for_trading"] = ready
     if installed and has_broker_servers is False:
         # Say this LOUDLY. The chain is complete and every other probe is green,
-        # yet a broker login will silently never happen.
+        # yet a BROKER login will silently never happen -- the generic build carries
+        # no broker server list. (MetaQuotes' own demo servers are the exception:
+        # MEASURED 2026-09-22, a generic terminal authorized on MetaQuotes-Demo and
+        # read back balance 99 996.48 USD, so this warning is about real brokers.)
         info["warning"] = (
             "This terminal is the GENERIC MetaQuotes build: its Config/servers.dat "
-            "carries no broker server list, so a broker server name cannot be "
-            "resolved and logins will silently never even be attempted (zero "
-            "'Network' lines in the terminal log, then '-10005 IPC timeout' from "
-            "the bridge). Re-install with a broker-branded installer, e.g. "
-            "MT5_BROKER_INSTALLER_URL=https://download.mql5.com/cdn/web/"
-            "exness.technologies.ltd/mt5/exness5setup.exe and "
-            "MT5_BROKER_DIR_NAME='MetaTrader 5 EXNESS'."
+            "carries no broker server list, so a BROKER server name cannot be "
+            "resolved and a broker login will silently never even be attempted "
+            "('-10005 IPC timeout' from the bridge, and no Network lines in the "
+            "terminal log -- though a successful login can write none either, so "
+            "compare installed_broker with the server's broker rather than trusting "
+            "the line count). MetaQuotes' own demo servers are the exception and do "
+            "resolve here. For a real broker, install the build that carries it: "
+            "'install --server <broker server name>' -- e.g. 'install --server "
+            "Exness-MT5Trial9' fetches "
+            "https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/"
+            "exness5setup.exe. For a broker that is not registered, pass its own "
+            "installer with --broker-installer-url / --broker-dir-name, or export "
+            "MT5_BROKER_BUILDS."
         )
         text = "MT5 chain ready, but the generic terminal cannot log in to a broker"
     elif ready:
@@ -928,6 +953,29 @@ def cmd_install(args: argparse.Namespace) -> int:
         # install legitimately runs longer. Holding one command open would be
         # killed mid-install and leave a half-built prefix. So the installer is
         # launched with nohup/setsid and the caller polls ``status`` instead.
+        #
+        # Record WHICH build this run is laying down. On a broker switch the
+        # previous build's terminal is still on disk, so ``status`` would see
+        # installed=True and answer "done" for an install that has not started --
+        # MEASURED 2026-09-22: a re-install reported stage=done on the first poll
+        # with an empty log and no .broker_key, which is exactly the signal that
+        # makes an agent stop waiting for a terminal that is not there yet.
+        # Precedence mirrors the installer's own: a broker URL first, then an
+        # explicit generic URL, then the default the script would use.
+        install_target = str(
+            env.get("MT5_BROKER_INSTALLER_URL")
+            or env.get("MT5_INSTALLER_URL")
+            or GENERIC_INSTALLER_URL
+        )
+        try:
+            (MT5_ROOT / INSTALL_TARGET_FILE.name).write_text(
+                install_target, encoding="utf-8"
+            )
+            status_path.write_text(
+                "starting|a new build is being installed", encoding="utf-8"
+            )
+        except OSError:
+            pass
         inner = f"bash {shlex.quote(str(script))} > {shlex.quote(str(log_path))} 2>&1"
         quoted = shlex.quote(inner)
         proc = subprocess.run(
@@ -969,6 +1017,28 @@ def cmd_install(args: argparse.Namespace) -> int:
     )
 
 
+def _pending_install_target() -> str:
+    """The URL a running install is laying down, when it is NOT what landed yet.
+
+    Empty string means "nothing pending": either no install has been started, or the
+    build on disk IS the one that was asked for. A broker switch is the case this
+    exists for -- installing Exness while the MetaQuotes terminal is still present
+    used to report ``stage="done"`` (``installed`` is true either way) and hand back
+    a green result for a terminal that had not been replaced.
+    """
+    try:
+        target = INSTALL_TARGET_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if not target:
+        return ""
+    try:
+        landed = (MT5_ROOT / ".installed.url").read_text(encoding="utf-8").strip()
+    except OSError:
+        landed = ""
+    return target if target != landed else ""
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     """Report install progress and overall stack readiness (pollable)."""
     status_path = MT5_ROOT / "install.status"
@@ -985,11 +1055,24 @@ def cmd_status(args: argparse.Namespace) -> int:
     failed = stage == "failed"
     done = installed or stage == "done"
 
-    if status_path.exists():
-        # An install log that is still growing means the detached installer is
-        # alive; that is the only reliable "in progress" signal.
-        pass
-    in_progress = (not done) and (not failed) and _installer_alive()
+    # A DIFFERENT build is being installed than the one on disk: the terminal that
+    # "installed" is describing is the previous broker's, so this install is not
+    # done whatever the stale marker says.
+    pending_target = _pending_install_target()
+    if pending_target and not failed:
+        done = False
+        if stage in ("done", "unknown"):
+            stage = "installing"
+            message = (
+                "a different build is being installed; the terminal on disk is still "
+                "the previous one"
+            )
+
+    in_progress = (
+        not done
+        and not failed
+        and (bool(pending_target) or _installer_alive())
+    )
 
     if not status_path.exists() and not done:
         stage, message = "not_started", "no install has been run in this sandbox"
@@ -1000,6 +1083,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "message": message,
         "in_progress": in_progress,
         "installed": installed,
+        "installing_target": pending_target or None,
         "terminal_path": str(terminal) if terminal else None,
         "terminal_running": running,
         # Distinguishes the installer's credential-less "materialise the MQL5
@@ -1301,35 +1385,23 @@ def cmd_start(args: argparse.Namespace) -> int:
         # Credentials WERE supplied: telling the agent to supply them again is the
         # bug that made this look unfixable. Point at the real next step instead.
         #
-        # ZERO ``Network`` lines in the terminal log is the specific tell for "this
-        # terminal cannot resolve this server": MT5 does not error, it just never
-        # attempts the connection. That is a different failure from wrong
-        # credentials (which DO produce a Network line) and needs a different fix --
-        # installing the build that carries this broker's servers.
+        # WHICH hint is honest depends on the build that is actually installed, not
+        # on the log alone. An unresolvable server IS one cause of "no account
+        # appeared" -- MT5 skips the connection without an error -- but the Network
+        # count cannot prove it: MEASURED 2026-09-22 (generic MetaQuotes build,
+        # Runloop devbox, MT5 build 6207) a login that SUCCEEDED -- `account`
+        # returned balance 99 996.48 USD -- wrote ZERO Network lines. So zero lines
+        # is a signal, not a diagnosis, and the build mismatch is checked separately
+        # (preflight_server refuses it up front; this is the belt-and-braces case).
         network_lines = _terminal_network_lines(terminal, login=args.login)
-        payload["terminal_network_lines"] = len(network_lines)
-        payload["hint"] = (
-            "Credentials were written and the terminal was launched with "
-            f"/config: but no account appeared within {int(args.wait)}s. Check the "
-            "terminal log with action='logs' for 'authorization failed' / 'invalid "
-            "account' lines, and confirm the server name matches the account "
-            f"(got server={args.server!r}, login={args.login!r}). The account must "
-            "exist on that server; MetaQuotes-Demo logins are created by the "
-            "MetaQuotes demo registration, not by this platform."
+        diagnosis = login_failure_diagnosis(
+            terminal, args.server, args.login, args.wait, network_lines
         )
-        if not network_lines:
-            payload["failure"] = "no_network_activity"
-            payload["hint"] = (
-                "The terminal log has ZERO Network lines for "
-                f"server={args.server!r}, which is how MT5 reports a server name it "
-                "cannot resolve: it skips the connection silently (no error, then "
-                "'-10005 IPC timeout' from the bridge). The installed terminal is "
-                f"the {installed_broker_key(terminal) or 'unknown'} build and carries "
-                "only its own broker's servers. Install the build for this broker "
-                "and retry: action='install' with server="
-                f"{args.server!r} (add broker_installer_url from the broker's own "
-                "'Download MT5' page if it is not a registered broker)."
-            )
+        payload["terminal_network_lines"] = len(network_lines)
+        payload["installed_broker"] = diagnosis["installed_broker"]
+        if diagnosis["failure"]:
+            payload["failure"] = diagnosis["failure"]
+        payload["hint"] = diagnosis["hint"]
     else:
         payload["hint"] = (
             "Terminal is up but has no account. Pass login/password/server to "
@@ -1341,6 +1413,82 @@ def cmd_start(args: argparse.Namespace) -> int:
         text="terminal ready" if ready else "terminal started but not connected to an account",
         code=0 if ready else 2,
     )
+
+
+def login_failure_diagnosis(
+    terminal: Path | None,
+    server: str | None,
+    login: str | int | None,
+    wait: int | str | None,
+    network_lines: list[str],
+) -> dict[str, Any]:
+    """``{"failure", "hint", "installed_broker"}`` for a credentialed login that
+    produced no account within ``wait`` seconds.
+
+    WHY THIS IS ITS OWN FUNCTION: it is the one place that decides *why* a login
+    failed, and the wrong answer sends the fix to the wrong layer -- "bad password"
+    and "this terminal cannot resolve that server" need opposite repairs.
+
+    ZERO ``Network`` lines is the tell for an unresolvable server name -- MT5 skips
+    the connection with no error at all -- but it is a SIGNAL, NOT PROOF:
+    MEASURED 2026-09-22 (generic MetaQuotes build, Runloop devbox, MT5 build 6207)
+    a login that SUCCEEDED -- ``account`` returned balance 99 996.48 USD on
+    MetaQuotes-Demo -- wrote ZERO Network lines. So the build that is installed is
+    checked directly instead of being inferred from the log, and only a real
+    build/server mismatch is reported as one.
+    """
+    installed_broker = installed_broker_key(terminal)
+    requested_build = broker_for_server(server)
+    wrong_build = bool(
+        requested_build
+        and installed_broker
+        and requested_build["key"] != installed_broker
+    )
+    credentials_hint = (
+        "Credentials were written and the terminal was launched with "
+        f"/config: but no account appeared within {int(wait or 0)}s. Check the "
+        "terminal log with action='logs' for 'authorization failed' / 'invalid "
+        "account' lines, and confirm the server name matches the account "
+        f"(got server={server!r}, login={login!r}). The account must exist on that "
+        "server; MetaQuotes-Demo logins are created by the MetaQuotes demo "
+        "registration, not by this platform."
+    )
+    if wrong_build:
+        return {
+            "failure": "server_not_in_terminal",
+            "installed_broker": installed_broker,
+            "hint": (
+                f"The installed terminal is the {installed_broker} build, which "
+                "carries only that broker's servers, but login was attempted on "
+                f"server={server!r} ({requested_build['label']}). Install the build "
+                f"for this server and retry: action='install' with server={server!r} "
+                "(add broker_installer_url from the broker's own 'Download MT5' page "
+                "if it is not a registered broker)."
+            ),
+        }
+    if not network_lines:
+        return {
+            "failure": "no_network_activity",
+            "installed_broker": installed_broker,
+            "hint": (
+                "No account appeared and the terminal log has ZERO Network lines for "
+                f"server={server!r}. Two causes, and the log cannot separate them: "
+                "(1) a server name this build cannot resolve -- MT5 skips the "
+                "connection silently -- or (2) the terminal logged nothing for a "
+                "connection it did attempt (measured: a generic MetaQuotes terminal "
+                "logged zero Network lines on a login that worked). Which build owns "
+                f"server={server!r}? doctor reports installed_broker="
+                f"{installed_broker!r}. If that terminal is generic or belongs to "
+                "another broker, install the matching build with action='install' "
+                f"server={server!r}; if it already matches, treat this as a credential "
+                "or server-name mismatch: " + credentials_hint
+            ),
+        }
+    return {
+        "failure": None,
+        "installed_broker": installed_broker,
+        "hint": credentials_hint,
+    }
 
 
 def _terminal_processes() -> list[tuple[int, list[str]]]:
