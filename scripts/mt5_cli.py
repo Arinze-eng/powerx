@@ -62,7 +62,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-21.4"
+CLI_VERSION = "2026-09-22.5"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -144,10 +144,42 @@ def wine_env() -> dict[str, str]:
 
 
 def wine_bin() -> str:
+    """Pick a Wine launcher that actually EXECUTES on this kernel.
+
+    MEASURED FAILURE (2026-09-22, Runloop devbox, Debian 12, WineHQ 10.0):
+    ``/usr/bin/wine`` is a 32-bit ELF. On a kernel with no IA32 emulation
+    (``/proc/sys/abi/ldt16`` absent, ``ia32`` missing from /proc/cpuinfo) even
+    the 32-bit ``ld-linux.so.2`` fails with ``Exec format error``, so every
+    ``wine`` call died instantly — including ``wineboot``, which aborted the
+    installer at exit code 2 and left a prefix with no ``drive_c``.
+
+    ``which`` is not a sufficient check: it only proves the file exists and is
+    +x, which was true for the unusable 32-bit launcher. Probe it instead.
+
+    This costs nothing on a normal host: a working ``wine`` answers
+    ``--version`` on the first try and is returned unchanged. 64-bit-only is
+    sufficient here because ``mt5setup.exe``, the embeddable Windows python and
+    the ``MetaTrader5`` win_amd64 wheels are all 64-bit PE/amd64 — verified by
+    reading the installer's PE header (machine 0x8664).
+    """
+    fallback = ""
     for candidate in ("wine", "wine64"):
-        if subprocess.run(["which", candidate], capture_output=True).returncode == 0:
+        if subprocess.run(["which", candidate], capture_output=True).returncode != 0:
+            continue
+        if not fallback:
+            fallback = candidate
+        try:
+            probe = subprocess.run(
+                [candidate, "--version"],
+                capture_output=True,
+                env=wine_env(),
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0 and (probe.stdout or probe.stderr).strip():
             return candidate
-    return "wine"
+    return fallback or "wine"
 
 
 def win_python() -> Path | None:
@@ -169,6 +201,19 @@ def win_python() -> Path | None:
 
 
 def find_terminal() -> Path | None:
+    """Locate the MT5 terminal, PREFERRING the broker-branded build.
+
+    MEASURED FAILURE (2026-09-22, Runloop devbox): when a broker-branded terminal
+    ("MetaTrader 5 EXNESS") and the generic MetaQuotes one ("MetaTrader 5") both
+    exist in the prefix, an unqualified ``rglob`` returns whichever the
+    filesystem lists first. Picking the generic build silently breaks logins: its
+    ``servers.dat`` has no broker server list, so the broker's server name cannot
+    be resolved and the terminal never authorizes (no ``Network`` log line, then
+    ``-10005 IPC timeout`` from this bridge).
+
+    The branded build is therefore resolved explicitly, by the same
+    ``MT5_BROKER_DIR_NAME`` the installer honours, before any generic fallback.
+    """
     if TERMINAL_MARKER.exists():
         cached = Path(TERMINAL_MARKER.read_text(encoding="utf-8").strip())
         if cached.exists():
@@ -176,6 +221,34 @@ def find_terminal() -> Path | None:
     drive_c = WINE_PREFIX / "drive_c"
     if not drive_c.exists():
         return None
+
+    # 1) Broker-branded install, named exactly as the installer laid it down.
+    brand = os.environ.get("MT5_BROKER_DIR_NAME", "MetaTrader 5 EXNESS")
+    preferred = drive_c / "Program Files" / brand / "terminal64.exe"
+    if preferred.exists():
+        try:
+            TERMINAL_MARKER.write_text(str(preferred), encoding="utf-8")
+        except OSError:
+            pass
+        return preferred
+
+    # 2) Any other "MetaTrader 5 <BRAND>" install, before the bare generic one.
+    #    Sorted so the choice is deterministic rather than filesystem order.
+    try:
+        candidates = sorted(
+            p for p in (drive_c / "Program Files").glob("MetaTrader 5 *")
+            if (p / "terminal64.exe").exists()
+        )
+    except OSError:
+        candidates = []
+    if candidates:
+        chosen = candidates[0] / "terminal64.exe"
+        try:
+            TERMINAL_MARKER.write_text(str(chosen), encoding="utf-8")
+        except OSError:
+            pass
+        return chosen
+
     for exe in drive_c.rglob("terminal64.exe"):
         try:
             TERMINAL_MARKER.write_text(str(exe), encoding="utf-8")
@@ -333,6 +406,32 @@ def _bridge_imports_under_wine() -> bool:
     return "ok" in (proc.stdout or "")
 
 
+def _terminal_has_broker_servers(terminal: Path | None) -> bool | None:
+    """Whether the installed terminal ships a broker server list.
+
+    THE FAILURE THIS DETECTS (measured 2026-09-22): MetaQuotes' GENERIC terminal
+    carries no broker servers, so a broker server name (e.g. ``Exness-MT5Trial9``)
+    has nothing to resolve to. MT5 then skips the connection entirely -- the log
+    gets ZERO ``Network`` lines and the bridge reports ``-10005 IPC timeout``,
+    which points at Wine/IPC and sends you debugging the wrong layer for hours.
+
+    A broker-branded installer embeds its servers: the Exness build's
+    ``servers.dat`` is ~234 KB against the generic ~50 KB. Size is a crude but
+    reliable signal, and it is the only thing readable without MT5's own parser
+    (the file is not plain text; a string scan finds only the copyright line).
+
+    Returns None when there is no terminal to inspect.
+    """
+    if terminal is None:
+        return None
+    servers = terminal.parent / "Config" / "servers.dat"
+    try:
+        size = servers.stat().st_size
+    except OSError:
+        return None
+    return size > 100_000
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
     terminal = find_terminal()
 
@@ -364,6 +463,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
 
     wine_version = _which_version(wine_bin())
     winpy = win_python()
+    has_broker_servers = _terminal_has_broker_servers(terminal)
     info = {
         "ok": True,
         "wine": wine_version,
@@ -374,6 +474,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         "display": f":{DISPLAY_NUM}",
         "terminal_path": str(terminal) if terminal else None,
         "terminal_running": terminal_running(),
+        "terminal_has_broker_servers": has_broker_servers,
         "windows_python": str(winpy) if winpy else None,
         "python_bridge": winpy is not None,
         "bridge_imports_in_wine": _bridge_imports_under_wine() if winpy else False,
@@ -384,7 +485,21 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         info["wine_installed"] and info["prefix_ready"] and terminal and winpy is not None
     )
     info["ready_for_trading"] = ready
-    if ready:
+    if ready and has_broker_servers is False:
+        # Say this LOUDLY. The chain is complete and every other probe is green,
+        # yet a broker login will silently never happen.
+        info["warning"] = (
+            "This terminal is the GENERIC MetaQuotes build: its Config/servers.dat "
+            "carries no broker server list, so a broker server name cannot be "
+            "resolved and logins will silently never even be attempted (zero "
+            "'Network' lines in the terminal log, then '-10005 IPC timeout' from "
+            "the bridge). Re-install with a broker-branded installer, e.g. "
+            "MT5_BROKER_INSTALLER_URL=https://download.mql5.com/cdn/web/"
+            "exness.technologies.ltd/mt5/exness5setup.exe and "
+            "MT5_BROKER_DIR_NAME='MetaTrader 5 EXNESS'."
+        )
+        text = "MT5 chain ready, but the generic terminal cannot log in to a broker"
+    elif ready:
         text = "MT5 stack ready"
     elif not info["wine_installed"]:
         text = "wine not installed — run: mt5_cli.py install"

@@ -31,7 +31,42 @@ set -euo pipefail
 MT5_ROOT="${MT5_ROOT:-$HOME/.mt5}"
 WINE_PREFIX="${WINE_PREFIX:-$HOME/.wine-mt5}"
 DISPLAY_NUM="${MT5_DISPLAY_NUM:-99}"
+# The BROKER's own MT5 installer, not MetaQuotes' generic one.
+#
+# MEASURED FAILURE (2026-09-22, Runloop devbox, Wine 10.0, MT5 build 6207):
+# the generic MetaQuotes terminal CANNOT log in to a broker at all. Its
+# ``Config/servers.dat`` contains only
+#   "Copyright 2000-2026, MetaQuotes Ltd."  +  "Servers"
+# i.e. no server list. MT5 resolves a broker server name (``Exness-MT5Trial9``)
+# to a host through ``servers.dat``/``dnsperf.dat``; with no entry the name is
+# unresolvable and the terminal silently SKIPS the connection instead of failing.
+#
+# The symptom is uniquely confusing, which is why this comment is long:
+#   * the terminal starts fine, loads our /config: file
+#     ("successfully initialized from start config") and reports
+#     "launched with C:\mt5cfg\powerx.ini"  -- so everything LOOKS right;
+#   * the log contains ZERO ``Network`` lines. A working login writes three
+#     ("authorized on <server>", "terminal synchronized ...", "trading has been
+#     enabled"). Their absence -- not an error -- is the only tell.
+#   * the Python bridge then fails with ``(-10005, 'IPC timeout')``, because the
+#     terminal never authorizes and so never exposes an account over IPC. That
+#     error points at Wine/IPC and sends you debugging the wrong layer.
+#
+# A broker-branded installer embeds that broker's server list in servers.dat
+# (verified: the Exness build ships a 234 KB servers.dat vs the generic 50 KB,
+# and logged in first try). So the terminal a deployment installs MUST match the
+# broker it will trade on.
+#
+# ``MT5_INSTALLER_URL`` stays as the fallback for a generic/MetaQuotes demo
+# account (MetaQuotes-Demo resolves itself); set ``MT5_BROKER_INSTALLER_URL``
+# for a real broker. Broker CDN slugs are ``<company>.ltd``-style -- Exness is
+# ``exness.technologies.ltd`` -> exness5setup.exe.
 MT5_INSTALLER_URL="${MT5_INSTALLER_URL:-https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe}"
+MT5_BROKER_INSTALLER_URL="${MT5_BROKER_INSTALLER_URL:-}"
+# Where the broker's install lands. The branded installer always uses
+# "MetaTrader 5 <BRAND>" as the directory name and refuses to overwrite a generic
+# install, so the two can coexist and the terminal finder must know both names.
+MT5_BROKER_DIR_NAME="${MT5_BROKER_DIR_NAME:-MetaTrader 5 EXNESS}"
 # MetaTrader5's PyPI wheels are Windows-only, so the bridge needs a Windows
 # python inside the Wine prefix (see section 5 below).
 MT5_WINPY_VERSION="${MT5_WINPY_VERSION:-3.11.9}"
@@ -244,10 +279,29 @@ resolve_wine10_version() {
   printf '10.0.0.0~%s-1' "${codename}"
 }
 
-WINE_MAJOR=0
-if command -v wine >/dev/null 2>&1; then
-  WINE_MAJOR=$(wine --version 2>/dev/null | sed 's/[^0-9]*\([0-9]*\).*/\1/' || echo 0)
-fi
+# Report the Wine major version from whichever launcher actually runs.
+#
+# ``wine --version`` is used first for parity with the rest of the file, but on a
+# kernel without IA32 support that binary cannot execute at all (see the
+# WINE_BIN selection below), so wine64 is consulted as a fallback. Without this
+# the version read as 0 and the script concluded Wine was missing even when a
+# perfectly good WineHQ 10 was installed — sending it into a pointless
+# reinstall.
+wine_major() {
+  local out major bin
+  for bin in wine wine64; do
+    command -v "$bin" >/dev/null 2>&1 || continue
+    out=$(env -u WINEDEBUG timeout 60 "$bin" --version 2>/dev/null) || continue
+    major=$(printf '%s' "$out" | sed 's/[^0-9]*\([0-9]*\).*/\1/')
+    if [ -n "$major" ] && [ "$major" != "0" ]; then
+      printf '%s' "$major"
+      return 0
+    fi
+  done
+  printf '0'
+}
+
+WINE_MAJOR=$(wine_major)
 
 # Supporting tools are installed FIRST and independently of wine. They must not
 # be gated on "wine is missing": WineHQ provides wine itself, so installing it
@@ -273,7 +327,7 @@ if [ "${WINE_MAJOR:-0}" -lt 9 ] || [ "${WINE_MAJOR:-0}" -ge 11 ]; then
   install_winehq || log "WARN: WineHQ install failed"
   # apt may have swapped the binaries; re-read the version so the prefix rebuild
   # below (and the doctor report) sees the version actually in place.
-  WINE_MAJOR=$(wine --version 2>/dev/null | sed 's/[^0-9]*\([0-9]*\).*/\1/' || echo 0)
+  WINE_MAJOR=$(wine_major)
   if [ "${WINE_MAJOR:-0}" -ge 11 ]; then
     log "WARN: wine is still ${WINE_MAJOR} after the WineHQ install; MT5 may refuse to run"
   fi
@@ -289,13 +343,56 @@ if ! command -v wine >/dev/null 2>&1 && ! command -v wine64 >/dev/null 2>&1; the
   apt_install wine64 wine32 wine || apt_install wine || true
 fi
 
-if command -v wine >/dev/null 2>&1; then
-  WINE_BIN=wine
-elif command -v wine64 >/dev/null 2>&1; then
-  WINE_BIN=wine64
-else
-  log "FATAL: wine is not available after install"
-  exit 3
+# Pick a Wine launcher that actually EXECUTES on this kernel.
+#
+# MEASURED FAILURE (2026-09-22, Runloop devbox, Debian 12, WineHQ 10.0):
+# ``/usr/bin/wine`` is a 32-bit ELF. This kernel has no IA32 emulation
+# (``/proc/sys/abi/ldt16`` is absent and ``ia32`` is missing from
+# /proc/cpuinfo), so the 32-bit loader itself fails:
+#
+#   /usr/bin/wine: cannot execute binary file: Exec format error
+#   /lib/ld-linux.so.2: cannot execute binary file: Exec format error
+#
+# ``command -v wine`` happily returned 0 for that dead binary, so the script
+# selected it, ``wineboot`` died immediately, and the ERR trap reported
+# ``failed|installer exited with code 2`` with the log's last line still reading
+# "initialising wine prefix ..." — a misdiagnosis that looks like an OOM or a
+# hung prefix rather than a broken launcher.
+#
+# So probe the candidate instead of trusting ``which``. A working ``wine``
+# (i.e. every normal host) passes on the first try and is used unchanged;
+# otherwise fall through to 64-bit wine64, which is sufficient because
+# mt5setup.exe, the embeddable Windows python and the MetaTrader5 win_amd64
+# wheels are all 64-bit (mt5setup.exe's PE header reports machine 0x8664).
+_wine_works() {
+  local bin="$1"
+  command -v "$bin" >/dev/null 2>&1 || return 1
+  env -u WINEDEBUG timeout 60 "$bin" --version >/dev/null 2>&1
+}
+
+WINE_BIN=""
+for _cand in wine wine64; do
+  if _wine_works "$_cand"; then
+    WINE_BIN="$_cand"
+    break
+  fi
+done
+
+if [ -z "${WINE_BIN}" ]; then
+  # Last resort: name a real binary so the doctor report shows something, and say
+  # plainly that it does not execute.
+  if command -v wine64 >/dev/null 2>&1; then
+    WINE_BIN=wine64
+  elif command -v wine >/dev/null 2>&1; then
+    WINE_BIN=wine
+  else
+    log "FATAL: wine is not available after install"
+    exit 3
+  fi
+  log "WARN: ${WINE_BIN} is present but does not execute on this kernel"
+fi
+if [ "${WINE_BIN}" != "wine" ]; then
+  log "using ${WINE_BIN} (the 'wine' launcher does not run here)"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -310,6 +407,43 @@ if command -v Xvfb >/dev/null 2>&1; then
   export DISPLAY=":${DISPLAY_NUM}"
 else
   log "WARN: Xvfb missing; MT5 may fail to start without a display"
+fi
+
+# --------------------------------------------------------------------------- #
+# 2b. winbindd — required for the terminal's IPC
+# --------------------------------------------------------------------------- #
+# The package alone is NOT enough. Wine's named-pipe implementation for the
+# MetaTrader terminal goes through winbind, and installing ``winbind`` only drops
+# the binaries on disk — nothing starts the daemon. Without it the terminal still
+# boots and logs in, but the Python bridge cannot attach:
+#
+#   mt5.initialize() -> False (-10005, 'IPC timeout')
+#
+# which reads as a broken bridge and sends you debugging IPC/Wine instead of a
+# missing daemon. Verified 2026-09-22: starting winbindd made the bridge attach
+# immediately on the same running terminal.
+#
+# Best-effort by design: it must never fail an otherwise-good install, and on a
+# host where winbindd is already up this is a no-op.
+if command -v winbindd >/dev/null 2>&1 || [ -x /usr/sbin/winbindd ]; then
+  if ! pgrep -x winbindd >/dev/null 2>&1; then
+    status winbind "starting winbindd (required for MT5 terminal IPC)"
+    # A minimal smb.conf keeps winbindd from refusing to start on a box that has
+    # never been joined to a domain.
+    if [ ! -s /etc/samba/smb.conf ]; then
+      $SUDO mkdir -p /etc/samba 2>/dev/null || true
+      printf '[global]\n\tworkgroup = WORKGROUP\n\tsecurity = guest\n\twinbind use default domain = yes\n' \
+        | $SUDO tee /etc/samba/smb.conf >/dev/null 2>&1 || true
+    fi
+    $SUDO /usr/sbin/winbindd -D >/dev/null 2>&1 || \
+      $SUDO winbindd -D >/dev/null 2>&1 || true
+    sleep 2
+    if pgrep -x winbindd >/dev/null 2>&1; then
+      log "winbindd running (MT5 IPC available)"
+    else
+      log "WARN: winbindd did not start; the MT5 bridge may report IPC timeout"
+    fi
+  fi
 fi
 
 # --------------------------------------------------------------------------- #
@@ -415,15 +549,33 @@ fi
 # --------------------------------------------------------------------------- #
 # 4. MT5 terminal
 # --------------------------------------------------------------------------- #
+# Install the BROKER's terminal when one is configured, else the generic build.
+#
+# See the MT5_BROKER_INSTALLER_URL note at the top of this file: the generic
+# MetaQuotes terminal carries no broker server list, cannot resolve a broker
+# server name, and therefore never authorizes — silently, with no Network log
+# line and an IPC timeout from the bridge. A broker-branded installer embeds
+# that broker's servers and logs in first try.
 mkdir -p "${MT5_ROOT}"
-INSTALLER="${MT5_ROOT}/mt5setup.exe"
 DONE_MARKER="${MT5_ROOT}/.installed"
+
+if [ -n "${MT5_BROKER_INSTALLER_URL}" ]; then
+  INSTALLER="${MT5_ROOT}/broker_setup.exe"
+  # Distinct marker: switching broker (or to generic) must re-run the install
+  # rather than short-circuit on a marker written by a different terminal.
+  DONE_MARKER="${MT5_ROOT}/.installed.broker"
+  TERM_DISPLAY_NAME="${MT5_BROKER_DIR_NAME}"
+else
+  INSTALLER="${MT5_ROOT}/mt5setup.exe"
+  TERM_DISPLAY_NAME="MetaTrader 5"
+fi
 
 if [ ! -f "${DONE_MARKER}" ]; then
   if [ ! -s "${INSTALLER}" ]; then
     status download "downloading the MT5 installer ..."
-    curl -fsSL --retry 3 --max-time 600 -o "${INSTALLER}" "${MT5_INSTALLER_URL}" \
-      || wget -q -O "${INSTALLER}" "${MT5_INSTALLER_URL}" \
+    _dl_url="${MT5_BROKER_INSTALLER_URL:-${MT5_INSTALLER_URL}}"
+    curl -fsSL --retry 3 --max-time 600 -o "${INSTALLER}" "${_dl_url}" \
+      || wget -q -O "${INSTALLER}" "${_dl_url}" \
       || { status failed "could not download the MT5 installer"; exit 4; }
   fi
 
@@ -476,14 +628,29 @@ if [ ! -f "${DONE_MARKER}" ]; then
 
   # Wine 9+ unpacks the terminal noticeably slower than Wine 8 did, so allow a
   # generous window (5 minutes) after the installer returns.
+  #
+  # Wait for the terminal in the DIRECTORY THIS INSTALLER TARGETS, not just any
+  # terminal64.exe anywhere in the prefix: the generic and branded builds coexist
+  # ("MetaTrader 5" vs "MetaTrader 5 EXNESS"), so a bare ``find`` would match the
+  # OTHER build's binary, conclude success, and hand the bridge a terminal that
+  # cannot reach the broker — reintroducing exactly the silent no-authorization
+  # failure this change fixes.
+  _want_dir="${WINE_PREFIX}/drive_c/Program Files/${TERM_DISPLAY_NAME}"
   for _ in $(seq 1 60); do
-    if find "${WINE_PREFIX}/drive_c" -iname 'terminal64.exe' 2>/dev/null | grep -q .; then
+    if [ -f "${_want_dir}/terminal64.exe" ]; then
+      break
+    fi
+    # A branded installer refuses to overwrite an existing generic install; if it
+    # ever landed elsewhere, fall back to a deep search so we do not fail a
+    # genuinely good install.
+    if find "${WINE_PREFIX}/drive_c" -maxdepth 3 -iname 'terminal64.exe' 2>/dev/null | grep -q .; then
       break
     fi
     sleep 5
   done
 
-  if find "${WINE_PREFIX}/drive_c" -iname 'terminal64.exe' 2>/dev/null | grep -q .; then
+  if [ -f "${_want_dir}/terminal64.exe" ] \
+     || find "${WINE_PREFIX}/drive_c" -maxdepth 3 -iname 'terminal64.exe' 2>/dev/null | grep -q .; then
     touch "${DONE_MARKER}"
     status mt5 "MT5 terminal installed"
   else
@@ -595,7 +762,7 @@ fi
 # let it build the tree, then stop it. Best-effort: a failure here must not
 # mark the whole install failed, since the chain is otherwise usable.
 # ---------------------------------------------------------------------------
-MT5_DIR="${WINE_PREFIX}/drive_c/Program Files/MetaTrader 5"
+MT5_DIR="${WINE_PREFIX}/drive_c/Program Files/${TERM_DISPLAY_NAME}"
 if [ -d "${MT5_DIR}" ] && [ ! -d "${MT5_DIR}/MQL5/Include" ]; then
   # MUST be a `status` write, not just a `log` line: this phase is the single
   # longest step left (up to MT5_LAUNCH_TIMEOUT, 600 s by default) and the old
@@ -620,7 +787,7 @@ if [ -d "${MT5_DIR}" ] && [ ! -d "${MT5_DIR}/MQL5/Include" ]; then
   #
   # So: launch it in the background, wait only for the tree, and kill it before
   # reporting success. ``start`` is the only command that may own a live terminal.
-  nohup wine "${MT5_DIR}/terminal64.exe" >/dev/null 2>&1 &
+  nohup "$WINE_BIN" "${MT5_DIR}/terminal64.exe" >/dev/null 2>&1 &
   launch_deadline=$(( $(date +%s) + ${MT5_LAUNCH_TIMEOUT:-600} ))
   while [ ! -d "${MT5_DIR}/MQL5/Include" ] && [ "$(date +%s)" -lt "${launch_deadline}" ]; do
     sleep 5

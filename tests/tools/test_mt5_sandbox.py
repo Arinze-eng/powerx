@@ -866,3 +866,158 @@ def test_skill_documents_the_installation_rule():
     assert "installation rule" in skill.lower()
     assert "not_installed" in skill
     assert "Never" in skill
+
+# --------------------------------------------------------------------------- #
+# broker login: the servers.dat trap
+# --------------------------------------------------------------------------- #
+def test_broker_installer_url_is_forwarded_to_the_installer():
+    """A broker-branded installer is the ONLY way a real broker can log in.
+
+    MEASURED FAILURE (2026-09-22, real Runloop devbox): MetaQuotes' GENERIC
+    terminal ships a ``Config/servers.dat`` with no broker entries (50 544 B,
+    containing only the MetaQuotes copyright). A broker server name such as
+    ``Exness-MT5Trial9`` therefore has nothing to resolve to, MT5 silently skips
+    the connection, the terminal log gets ZERO ``Network`` lines, and the bridge
+    reports ``-10005 IPC timeout`` -- an error that points at Wine/IPC and sends
+    you debugging the wrong layer. The Exness-branded installer embeds the broker
+    servers (234 324 B) and logs in first try.
+
+    This pins that the tool passes the URL and directory name through as the
+    env vars the installer already reads.
+    """
+    cmd = build_cli_command(
+        "install",
+        {
+            "broker_installer_url": "https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe",
+            "broker_dir_name": "MetaTrader 5 EXNESS",
+        },
+    )
+    assert "MT5_BROKER_INSTALLER_URL=" in cmd
+    assert "exness5setup.exe" in cmd
+    assert "MT5_BROKER_DIR_NAME=" in cmd
+    assert "MetaTrader 5 EXNESS" in cmd
+
+
+def test_install_without_broker_url_stays_generic():
+    """No broker configured -> no env vars, so MetaQuotes-demo installs work."""
+    cmd = build_cli_command("install", {})
+    assert "MT5_BROKER_INSTALLER_URL" not in cmd
+    assert "MT5_BROKER_DIR_NAME" not in cmd
+
+
+def test_tool_schema_advertises_the_broker_installer_params():
+    props = MT5SandboxTool().parameters["properties"]
+    assert "broker_installer_url" in props
+    assert "broker_dir_name" in props
+
+
+def test_find_terminal_prefers_the_broker_branded_build(tmp_path, monkeypatch):
+    """Both terminals coexist; the generic one must never win.
+
+    The branded installer refuses to overwrite a generic install, so a prefix can
+    hold ``MetaTrader 5`` AND ``MetaTrader 5 EXNESS`` at once. An unqualified
+    ``rglob("terminal64.exe")`` returns whichever the filesystem lists first --
+    and picking the generic build silently reintroduces the no-authorization
+    failure. Ordering is therefore explicit.
+    """
+    cli = _load_cli_module()
+
+    generic = tmp_path / "drive_c" / "Program Files" / "MetaTrader 5"
+    branded = tmp_path / "drive_c" / "Program Files" / "MetaTrader 5 EXNESS"
+    for d in (generic, branded):
+        d.mkdir(parents=True)
+        (d / "terminal64.exe").write_bytes(b"MZ")
+
+    monkeypatch.setattr(cli, "WINE_PREFIX", tmp_path)
+    monkeypatch.setattr(cli, "TERMINAL_MARKER", tmp_path / "marker")
+    monkeypatch.setattr(cli, "DISPLAY_NUM", "99")
+
+    assert cli.find_terminal() == branded / "terminal64.exe"
+
+
+def test_broker_server_probe_flags_the_generic_terminal(tmp_path):
+    """The probe that turns a silent failure into a loud one.
+
+    Size is the only readable signal: servers.dat is not plain text (a string
+    scan finds just the copyright), so the generic 50 KB build and the branded
+    234 KB build are told apart by size.
+    """
+    cli = _load_cli_module()
+
+    generic = tmp_path / "MetaTrader 5"
+    (generic / "Config").mkdir(parents=True)
+    (generic / "terminal64.exe").write_bytes(b"MZ")
+    (generic / "Config" / "servers.dat").write_bytes(b"\x00" * 50_544)
+    assert cli._terminal_has_broker_servers(generic / "terminal64.exe") is False
+
+    branded = tmp_path / "MetaTrader 5 EXNESS"
+    (branded / "Config").mkdir(parents=True)
+    (branded / "terminal64.exe").write_bytes(b"MZ")
+    (branded / "Config" / "servers.dat").write_bytes(b"\x00" * 234_324)
+    assert cli._terminal_has_broker_servers(branded / "terminal64.exe") is True
+
+    assert cli._terminal_has_broker_servers(None) is None
+
+
+def test_cli_version_matches_the_tool_pin():
+    """The bootstrap refuses a CLI whose marker does not match this tool."""
+    from nanobot.agent.tools.mt5_sandbox import _CLI_VERSION
+
+    assert _load_cli_module().CLI_VERSION == _CLI_VERSION
+
+
+# --------------------------------------------------------------------------- #
+# the wine64 launcher trap
+# --------------------------------------------------------------------------- #
+def test_installer_probes_wine_instead_of_trusting_which():
+    """``command -v wine`` succeeds for a binary that cannot execute.
+
+    MEASURED FAILURE (2026-09-22, Runloop devbox): WineHQ's /usr/bin/wine is a
+    32-bit ELF. That kernel has no IA32 emulation (/proc/sys/abi/ldt16 absent,
+    ia32 missing from /proc/cpuinfo), so even the 32-bit loader fails with
+    "cannot execute binary file: Exec format error". ``command -v`` still
+    returned 0, the script selected the dead launcher, wineboot died instantly,
+    and the ERR trap reported "exited with code 2" while the log's last line
+    still read "initialising wine prefix" -- which reads like an OOM, not a
+    broken launcher. The launcher must be PROBED.
+    """
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
+    ).read_text()
+
+    assert "_wine_works" in script
+    # The probe must actually run the binary, not just stat it.
+    assert '"$bin" --version' in script
+    # Selection must consult the probe, not a bare command -v.
+    assert 'for _cand in wine wine64' in script
+    assert 'if _wine_works "$_cand"' in script
+    # The MQL5-library launch must use the resolved launcher, never a bare `wine`.
+    assert 'nohup "$WINE_BIN"' in script
+    assert 'nohup wine "' not in script
+
+
+def test_installer_starts_winbindd_not_just_installs_it():
+    """The package on disk is not a running daemon.
+
+    Wine's named-pipe support for the terminal needs winbind. Installing the
+    ``winbind`` package only drops binaries; nothing starts the daemon and no
+    smb.conf exists, so the bridge reports ``-10005 IPC timeout`` against a
+    terminal that is otherwise perfectly healthy.
+    """
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
+    ).read_text()
+
+    assert "winbindd" in script
+    assert "pgrep -x winbindd" in script
+    assert "/usr/sbin/winbindd -D" in script
+    assert "smb.conf" in script
+
+
+def test_installer_waits_on_the_directory_it_actually_installed():
+    """A bare find can match the OTHER terminal and report false success."""
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
+    ).read_text()
+    assert "TERM_DISPLAY_NAME" in script
+    assert 'Program Files/${TERM_DISPLAY_NAME}' in script

@@ -71,7 +71,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-21.4"
+_CLI_VERSION = "2026-09-22.5"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -273,6 +273,17 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
     parts = ["python3", _CLI_PATH, action]
 
     if action == "install":
+        # A broker-branded installer is REQUIRED for any real broker account:
+        # the generic MetaQuotes terminal ships no broker server list, cannot
+        # resolve a broker server name, and silently never authorizes (see the
+        # installer's MT5_BROKER_INSTALLER_URL note). Passed as an env prefix
+        # because that is how the installer already reads it.
+        broker_url = kwargs.get("broker_installer_url")
+        if broker_url:
+            parts.insert(0, f"MT5_BROKER_INSTALLER_URL={_sh(broker_url)}")
+        broker_dir = kwargs.get("broker_dir_name")
+        if broker_dir:
+            parts.insert(0, f"MT5_BROKER_DIR_NAME={_sh(broker_dir)}")
         parts += ["--script", _INSTALLER_PATH]
         if kwargs.get("timeout"):
             parts += ["--timeout", str(int(kwargs["timeout"]))]
@@ -505,6 +516,8 @@ class MT5SandboxTool(Tool):
                 "timeout": {"type": "integer", "description": "Command timeout override in seconds."},
                 "foreground": {"type": "boolean", "description": "action=install: run inline instead of detached. Only safe when no command-timeout ceiling applies."},
                 "portable": {"type": "boolean", "description": "action=start: launch the terminal in portable mode so a seeded config/login is used."},
+                "broker_installer_url": {"type": "string", "description": "action=install: URL of the BROKER's branded MT5 installer (e.g. https://download.mql5.com/cdn/web/<broker-slug>/mt5/<name>setup.exe). STRONGLY recommended for any real broker: MetaQuotes' generic terminal ships no broker server list, so broker logins silently never happen (zero 'Network' log lines, then '-10005 IPC timeout' from the bridge)."},
+                "broker_dir_name": {"type": "string", "description": "action=install: install directory name the branded installer creates, e.g. 'MetaTrader 5 EXNESS'. Pair with broker_installer_url."},
                 "dry_run": {"type": "boolean", "description": "For order/close: validate inputs and report the planned request without sending."},
             },
             "required": ["action"],

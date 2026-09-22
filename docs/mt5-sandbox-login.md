@@ -1,5 +1,12 @@
 # MT5 in a Novita sandbox — verified bring-up & login
 
+> **Logging in to a real BROKER?** Read
+> [`mt5-broker-login.md`](./mt5-broker-login.md) first. The generic MetaQuotes
+> terminal documented here cannot authorize a broker account at all: it ships no
+> broker server list, so the login is silently never attempted (zero `Network`
+> log lines, then `-10005 IPC timeout` from the bridge). That document covers the
+> branded-installer fix plus the wine64 launcher trap.
+
 Everything here was verified end-to-end on 2026-09-20 in a real sandbox
 (Wine 10.0, MT5 build 6204, `powerx-base-4g-c2` template, 4 GB RAM).
 
