@@ -79,6 +79,54 @@ MT5_WINE_SERIES="${MT5_WINE_SERIES:-10}"
 
 log() { printf '[mt5-install] %s\n' "$*" >&2; }
 
+# Download a URL to a file, retrying on ANY failure.
+#
+# WHY THIS IS NOT JUST `curl --retry 3`: curl's --retry only retries *transient
+# transport* failures (connect timeouts, resets, 5xx). It does NOT retry on an
+# HTTP 4xx — and the MQL5 CDN intermittently answers 404 for a URL that returns
+# 200 moments later. One such blip therefore aborted the entire install with
+# "could not download the MT5 installer", which reads like a network block but is
+# pure CDN flakiness (reproduced on both Runloop and Novita, 2026-09-22).
+#
+# The size floor matters too: curl -f still leaves a truncated file behind on a
+# dropped connection, and a CDN error page is a valid 200. Requiring >= min_bytes
+# rejects both, so a "successful" download is always a plausible binary.
+fetch_url() {
+  local url="$1" dest="$2" min_bytes="${3:-1000000}"
+  local tries="${MT5_DOWNLOAD_TRIES:-5}" delay="${MT5_DOWNLOAD_BACKOFF:-5}"
+  local i=1 size=0
+
+  while [ "${i}" -le "${tries}" ]; do
+    rm -f "${dest}"
+
+    # Primary: curl. Secondary: wget — a different TLS/HTTP stack, so a curl-only
+    # failure (stale keep-alive connection, TLS hiccup) can still succeed here.
+    if curl -fsSL --connect-timeout 20 --max-time 600 -o "${dest}" "${url}" 2>/dev/null; then
+      size="$(stat -c %s "${dest}" 2>/dev/null || echo 0)"
+      if [ "${size}" -ge "${min_bytes}" ]; then
+        return 0
+      fi
+      log "WARN: ${url} returned only ${size} bytes (< ${min_bytes}); retrying"
+    fi
+
+    if wget -q --timeout=60 --tries=1 -O "${dest}" "${url}" 2>/dev/null; then
+      size="$(stat -c %s "${dest}" 2>/dev/null || echo 0)"
+      if [ "${size}" -ge "${min_bytes}" ]; then
+        return 0
+      fi
+    fi
+
+    log "WARN: download attempt ${i}/${tries} failed for ${url}"
+    rm -f "${dest}"
+    if [ "${i}" -lt "${tries}" ]; then
+      sleep "${delay}"
+    fi
+    i=$((i + 1))
+  done
+
+  return 1
+}
+
 # Bump the prefix if it was built by a Wine that MT5 refuses (>= 11).
 # MetaTrader's anti-debug check fires on Wine 11's prefix, and Wine 10 cannot
 # read an 11-built prefix, so the only reliable path is a rebuild.
@@ -574,9 +622,10 @@ if [ ! -f "${DONE_MARKER}" ]; then
   if [ ! -s "${INSTALLER}" ]; then
     status download "downloading the MT5 installer ..."
     _dl_url="${MT5_BROKER_INSTALLER_URL:-${MT5_INSTALLER_URL}}"
-    curl -fsSL --retry 3 --max-time 600 -o "${INSTALLER}" "${_dl_url}" \
-      || wget -q -O "${INSTALLER}" "${_dl_url}" \
-      || { status failed "could not download the MT5 installer"; exit 4; }
+    # MT5's installer is ~5 MB (branded) to ~24 MB (generic); require a plausible
+    # size so a truncated/error-page "200" is not mistaken for the real thing.
+    fetch_url "${_dl_url}" "${INSTALLER}" 1000000 \
+      || { status failed "could not download the MT5 installer from ${_dl_url}"; exit 4; }
   fi
 
   # ------------------------------------------------------------------ #
@@ -596,9 +645,8 @@ if [ ! -f "${DONE_MARKER}" ]; then
       status gecko "downloading Wine-Gecko (needed by the MT5 web installer) ..."
       # Try a small list of versions so one 404 does not fail the whole install.
       for ver in ${MT5_GECKO_VERSION}; do
-        curl -fsSL --retry 2 --max-time 600 -o "${GECKO_MSI}" \
-          "https://dl.winehq.org/wine/wine-gecko/${ver}/wine-gecko-${ver}-x86_64.msi" \
-          && break || rm -f "${GECKO_MSI}"
+        fetch_url "https://dl.winehq.org/wine/wine-gecko/${ver}/wine-gecko-${ver}-x86_64.msi" \
+          "${GECKO_MSI}" 1000000 && break || rm -f "${GECKO_MSI}"
       done
     fi
     if [ -s "${GECKO_MSI}" ]; then
@@ -623,12 +671,7 @@ if [ ! -f "${DONE_MARKER}" ]; then
   # diagnosable failure with the installer's own output attached.
   MT5_SETUP_TIMEOUT="${MT5_SETUP_TIMEOUT:-900}"
   MT5_SETUP_LOG="${MT5_ROOT}/mt5setup.log"
-  WINEDLLOVERRIDES="mscoree=" timeout "${MT5_SETUP_TIMEOUT}" \
-    env -u WINEDEBUG "$WINE_BIN" "${INSTALLER}" /auto >"${MT5_SETUP_LOG}" 2>&1 || true
 
-  # Wine 9+ unpacks the terminal noticeably slower than Wine 8 did, so allow a
-  # generous window (5 minutes) after the installer returns.
-  #
   # Wait for the terminal in the DIRECTORY THIS INSTALLER TARGETS, not just any
   # terminal64.exe anywhere in the prefix: the generic and branded builds coexist
   # ("MetaTrader 5" vs "MetaTrader 5 EXNESS"), so a bare ``find`` would match the
@@ -636,21 +679,61 @@ if [ ! -f "${DONE_MARKER}" ]; then
   # cannot reach the broker — reintroducing exactly the silent no-authorization
   # failure this change fixes.
   _want_dir="${WINE_PREFIX}/drive_c/Program Files/${TERM_DISPLAY_NAME}"
-  for _ in $(seq 1 60); do
-    if [ -f "${_want_dir}/terminal64.exe" ]; then
+  _have_terminal() {
+    [ -f "${_want_dir}/terminal64.exe" ] \
+      || find "${WINE_PREFIX}/drive_c" -maxdepth 3 -iname 'terminal64.exe' 2>/dev/null | grep -q .
+  }
+
+  # Run the installer in the BACKGROUND and poll for the terminal WHILE it works.
+  #
+  # WHY NOT BLOCK FIRST, POLL AFTER: blocking on the installer and only then
+  # looking for terminal64.exe means a sandbox slow enough to exceed
+  # MT5_SETUP_TIMEOUT gets the installer killed mid-write, the poll finds nothing,
+  # and the script reports "terminal64.exe was not produced" for an install that
+  # was actually progressing normally. Reproduced 2026-09-22: the identical
+  # command, re-run manually, succeeded in ~4 minutes. Polling concurrently turns
+  # that false failure into a success while still bounding a genuine hang.
+  WINEDLLOVERRIDES="mscoree=" timeout "${MT5_SETUP_TIMEOUT}" \
+    env -u WINEDEBUG "$WINE_BIN" "${INSTALLER}" /auto >"${MT5_SETUP_LOG}" 2>&1 &
+  _installer_pid=$!
+
+  _term_found=0
+  _grace_deadline=0
+  while :; do
+    if _have_terminal; then
+      _term_found=1
       break
     fi
-    # A branded installer refuses to overwrite an existing generic install; if it
-    # ever landed elsewhere, fall back to a deep search so we do not fail a
-    # genuinely good install.
-    if find "${WINE_PREFIX}/drive_c" -maxdepth 3 -iname 'terminal64.exe' 2>/dev/null | grep -q .; then
+    if kill -0 "${_installer_pid}" 2>/dev/null; then
+      sleep 5
+      continue
+    fi
+    # The installer has returned. Wine 9+ unpacks the terminal noticeably slower
+    # than Wine 8 did, so allow a generous 5-minute window for the tree to land.
+    if [ "${_grace_deadline}" -eq 0 ]; then
+      _grace_deadline=$(( $(date +%s) + 300 ))
+    fi
+    if [ "$(date +%s)" -ge "${_grace_deadline}" ]; then
       break
     fi
     sleep 5
   done
 
-  if [ -f "${_want_dir}/terminal64.exe" ] \
-     || find "${WINE_PREFIX}/drive_c" -maxdepth 3 -iname 'terminal64.exe' 2>/dev/null | grep -q .; then
+  # Reap the installer so nothing lingers past this block. If we broke out early
+  # (terminal already present) give it a short grace to exit on its own, then
+  # terminate it — it has done its job.
+  if kill -0 "${_installer_pid}" 2>/dev/null; then
+    _reap_deadline=$(( $(date +%s) + 120 ))
+    while kill -0 "${_installer_pid}" 2>/dev/null && [ "$(date +%s)" -lt "${_reap_deadline}" ]; do
+      sleep 5
+    done
+    if kill -0 "${_installer_pid}" 2>/dev/null; then
+      kill "${_installer_pid}" 2>/dev/null || true
+    fi
+    wait "${_installer_pid}" 2>/dev/null || true
+  fi
+
+  if _have_terminal; then
     touch "${DONE_MARKER}"
     status mt5 "MT5 terminal installed"
   else
@@ -691,8 +774,8 @@ if [ ! -f "${WIN_PY}" ]; then
   status winpython "installing embeddable Windows Python ${MT5_WINPY_VERSION} ..."
   WINPY_ZIP="${MT5_ROOT}/python-embed.zip"
   if [ ! -s "${WINPY_ZIP}" ]; then
-    curl -fsSL --retry 3 --max-time 900 -o "${WINPY_ZIP}" \
-      "https://www.python.org/ftp/python/${MT5_WINPY_VERSION}/python-${MT5_WINPY_VERSION}-embed-amd64.zip" \
+    fetch_url "https://www.python.org/ftp/python/${MT5_WINPY_VERSION}/python-${MT5_WINPY_VERSION}-embed-amd64.zip" \
+      "${WINPY_ZIP}" 5000000 \
       || { log "FATAL: could not download embeddable Windows Python"; exit 7; }
   fi
   mkdir -p "${WIN_PY_DIR}"
@@ -717,7 +800,7 @@ if [ -f "${WIN_PY}" ]; then
   # Bootstrap pip (the embeddable zip has none) then install the bridge.
   if ! "$WINE_BIN" "${WIN_PY}" -m pip --version >/dev/null 2>&1; then
     GETPIP="${MT5_ROOT}/get-pip.py"
-    [ -s "${GETPIP}" ] || curl -fsSL --retry 3 -o "${GETPIP}" https://bootstrap.pypa.io/get-pip.py || true
+    [ -s "${GETPIP}" ] || fetch_url "https://bootstrap.pypa.io/get-pip.py" "${GETPIP}" 100000 || true
     "$WINE_BIN" "${WIN_PY}" "${GETPIP}" --no-warn-script-location >/dev/null 2>&1 \
       || log "WARN: pip bootstrap failed"
   fi
