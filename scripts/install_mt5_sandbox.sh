@@ -743,6 +743,112 @@ if [ "${_TERMINAL_ALREADY_INSTALLED}" -eq 0 ]; then
   MT5_SETUP_TIMEOUT="${MT5_SETUP_TIMEOUT:-900}"
   MT5_SETUP_LOG="${MT5_ROOT}/mt5setup.log"
 
+  # ------------------------------------------------------------------ #
+  # Stalled-download watchdog (the Novita hang)
+  # ------------------------------------------------------------------ #
+  # MEASURED (2026-09-22, Novita, Wine 10.0): bounding the installer is not
+  # enough, because MT5's web installer does not FAIL -- it STOPS. It picks ONE
+  # download mirror and, when that mirror completes the TCP handshake but never
+  # moves data, Wine's downloader blocks in a plain ``read`` forever: 0% CPU,
+  # zero bytes written into the prefix, and one ESTABLISHED socket with empty
+  # queues in both directions. Measured wedged for 20 minutes; the only thing that
+  # ended it was MT5_SETUP_TIMEOUT, after which the old code then waited ANOTHER
+  # 300 s of unpack grace for a terminal that was never coming.
+  #
+  # This is NOT a DNS problem, and DNS fixes do not move it. Measured on that box:
+  #   * the MQL5 CDN name resolves IPv6-first (``2a01:f680:21:1::85``) and the
+  #     sandbox has no IPv6 egress at all; pinning the CDN names to an edge that
+  #     answers in 0.7 s (``45.94.185.85``) in the prefix's own hosts file changed
+  #     NOTHING -- the installer went straight back to the same wedged peer;
+  #   * the wedged peer was ``148.113.1.241:443``, an address that appears in no
+  #     DNS answer we could find, i.e. the mirror list is embedded in the
+  #     installer and reached as a literal IP;
+  #   * ``ip route add blackhole 148.113.1.241/32`` -- making that one peer
+  #     unreachable -- let the SAME installer finish the entire 736 MB terminal in
+  #     ~40 s, because it falls through to a mirror that works.
+  # The sandbox's own network was never at fault: ``curl`` fetched the 5 MB
+  # installer from the CDN in 0.68 s, three times running, while the installer sat
+  # at zero bytes.
+  #
+  # So: watch for progress (prefix growth OR CPU time) and, when the installer
+  # stalls, blackhole the peer it is wedged on and try again. Each attempt is then
+  # bounded by MT5_STALL_SECONDS instead of by MT5_SETUP_TIMEOUT, and a stalled
+  # attempt no longer collects the unpack grace -- an installer that was killed
+  # having written nothing has failed NOW, and 300 more seconds cannot change it.
+  #
+  # INERT ON A HEALTHY BACKEND. Runloop's install completes in ~4 minutes and
+  # never goes MT5_STALL_SECONDS without progress, so none of this runs there: the
+  # first attempt is byte-for-byte the command that already ships.
+  MT5_STALL_SECONDS="${MT5_STALL_SECONDS:-120}"
+  MT5_INSTALL_ATTEMPTS="${MT5_INSTALL_ATTEMPTS:-3}"
+  # Wine 9+ unpacks the terminal noticeably slower than Wine 8 did, so an
+  # installer that exited on its own still gets a generous window -- but the window
+  # is driven by GROWTH now, so it ends when the tree stops landing.
+  MT5_UNPACK_GRACE="${MT5_UNPACK_GRACE:-300}"
+
+  # Every process the installer spawned: the ``timeout`` wrapper, wine's
+  # start.exe, and the ``main`` process that actually owns the sockets. Tracked by
+  # DESCENT from our own background pid, deliberately NOT with
+  # ``pgrep -f broker_setup.exe``: a name-based match also hits any shell whose
+  # *command line* contains that name, and killing this script's own shell
+  # mid-install is a distinctly unpleasant way to fail (reproduced while building
+  # this fix).
+  _descendants() {
+    local frontier="$1" all="" next pid
+    while [ -n "${frontier}" ]; do
+      next=""
+      for pid in ${frontier}; do
+        next="${next} $(pgrep -P "${pid}" 2>/dev/null | tr '\n' ' ')"
+      done
+      all="${all} ${next}"
+      frontier="${next}"
+    done
+    printf '%s' "${all}"
+  }
+
+  # CPU jiffies burned by the installer tree -- the companion signal to prefix
+  # growth, so a download that is genuinely working is never mistaken for a stall.
+  _installer_cpu() {
+    local total=0 pid v
+    for pid in $1; do
+      [ -r "/proc/${pid}/stat" ] || continue
+      v="$(awk '{print $14 + $15}' "/proc/${pid}/stat" 2>/dev/null || true)"
+      [ -n "${v}" ] && total=$(( total + v ))
+    done
+    printf '%s' "${total}"
+  }
+
+  # Remote peers the installer tree holds a connection to, port stripped. The
+  # sandbox's own service addresses are excluded so the platform's control
+  # connection can never be blackholed.
+  _installer_peers() {
+    local pid out=""
+    for pid in $1; do
+      out="${out}$(ss -tnpH 2>/dev/null | grep -F "pid=${pid}," | awk '{print $5}' || true)"$'\n'
+    done
+    printf '%s\n' "${out}" \
+      | sed 's/:[0-9]*$//' \
+      | grep -E '^[0-9a-fA-F.:]+$' \
+      | grep -vE '^(127\.|169\.254\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|192\.0\.2\.|::1$|fe80:)' \
+      | sort -u
+  }
+
+  # Make one wedged peer unreachable so the installer falls through to another
+  # mirror. Sandbox-local and ephemeral, and deliberately NOT undone: the peer is
+  # by definition one this sandbox cannot download from.
+  _blackhole_peer() {
+    [ -n "$1" ] || return 1
+    if ip route add blackhole "$1" 2>/dev/null; then
+      log "blackholed the stalled download peer $1"
+      return 0
+    fi
+    if sudo -n ip route add blackhole "$1" 2>/dev/null; then
+      log "blackholed the stalled download peer $1 (sudo)"
+      return 0
+    fi
+    return 1
+  }
+
   # Wait for the terminal in the DIRECTORY THIS INSTALLER TARGETS, not just any
   # terminal64.exe anywhere in the prefix: the generic and branded builds coexist
   # ("MetaTrader 5" vs "MetaTrader 5 EXNESS"), so a bare ``find`` would match the
@@ -764,45 +870,111 @@ if [ "${_TERMINAL_ALREADY_INSTALLED}" -eq 0 ]; then
   # was actually progressing normally. Reproduced 2026-09-22: the identical
   # command, re-run manually, succeeded in ~4 minutes. Polling concurrently turns
   # that false failure into a success while still bounding a genuine hang.
-  WINEDLLOVERRIDES="mscoree=" timeout "${MT5_SETUP_TIMEOUT}" \
-    env -u WINEDEBUG "$WINE_BIN" "${INSTALLER}" /auto >"${MT5_SETUP_LOG}" 2>&1 &
-  _installer_pid=$!
-
   _term_found=0
-  _grace_deadline=0
-  while :; do
-    if _have_terminal; then
-      _term_found=1
-      break
+  _attempt=1
+  _last_attempt_log="${MT5_SETUP_LOG}"
+  while [ "${_attempt}" -le "${MT5_INSTALL_ATTEMPTS}" ]; do
+    # One log per attempt: the stalling attempt's own output is the evidence that
+    # it stalled, so a retry must not overwrite it.
+    if [ "${_attempt}" -eq 1 ]; then
+      _last_attempt_log="${MT5_SETUP_LOG}"
+    else
+      _last_attempt_log="${MT5_ROOT}/mt5setup.attempt${_attempt}.log"
+      status mt5 "retrying the MT5 install (attempt ${_attempt}/${MT5_INSTALL_ATTEMPTS}) ..."
     fi
-    if kill -0 "${_installer_pid}" 2>/dev/null; then
-      sleep 5
-      continue
-    fi
-    # The installer has returned. Wine 9+ unpacks the terminal noticeably slower
-    # than Wine 8 did, so allow a generous 5-minute window for the tree to land.
-    if [ "${_grace_deadline}" -eq 0 ]; then
-      _grace_deadline=$(( $(date +%s) + 300 ))
-    fi
-    if [ "$(date +%s)" -ge "${_grace_deadline}" ]; then
-      break
-    fi
-    sleep 5
-  done
 
-  # Reap the installer so nothing lingers past this block. If we broke out early
-  # (terminal already present) give it a short grace to exit on its own, then
-  # terminate it — it has done its job.
-  if kill -0 "${_installer_pid}" 2>/dev/null; then
-    _reap_deadline=$(( $(date +%s) + 120 ))
+    WINEDLLOVERRIDES="mscoree=" timeout "${MT5_SETUP_TIMEOUT}" \
+      env -u WINEDEBUG "$WINE_BIN" "${INSTALLER}" /auto >>"${_last_attempt_log}" 2>&1 &
+    _installer_pid=$!
+    _pids="${_installer_pid}"
+    _stall_deadline=$(( $(date +%s) + MT5_STALL_SECONDS ))
+    _last_size=$(du -sk "${WINE_PREFIX}" 2>/dev/null | awk '{print $1}')
+    _last_cpu=0
+    _stalled=0
+
+    while :; do
+      if _have_terminal; then
+        _term_found=1
+        break
+      fi
+      if ! kill -0 "${_installer_pid}" 2>/dev/null; then
+        # The installer returned on its own; the unpack window below decides.
+        break
+      fi
+      _pids="${_installer_pid} $(_descendants "${_installer_pid}")"
+      _size=$(du -sk "${WINE_PREFIX}" 2>/dev/null | awk '{print $1}')
+      _cpu="$(_installer_cpu "${_pids}")"
+      if [ "${_size:-0}" -gt "$(( ${_last_size:-0} + 256 ))" ] \
+        || [ "${_cpu:-0}" -gt "$(( ${_last_cpu:-0} + 20 ))" ]; then
+        _last_size="${_size:-0}"
+        _last_cpu="${_cpu:-0}"
+        _stall_deadline=$(( $(date +%s) + MT5_STALL_SECONDS ))
+      fi
+      if [ "$(date +%s)" -ge "${_stall_deadline}" ]; then
+        _stalled=1
+        _peers="$(_installer_peers "${_pids}")"
+        log "MT5 installer moved no data and burned no CPU for ${MT5_STALL_SECONDS}s (peers: $(printf '%s' "${_peers}" | tr '\n' ' '))"
+        _blackholed=0
+        for _peer in ${_peers}; do
+          if _blackhole_peer "${_peer}"; then
+            _blackholed=$(( _blackholed + 1 ))
+          fi
+        done
+        for _p in ${_pids}; do kill "${_p}" 2>/dev/null || true; done
+        if [ "${_blackholed}" -eq 0 ]; then
+          # Nothing to blackhole means the next attempt would wedge on the same
+          # peer for another MT5_STALL_SECONDS. Fail now instead of spending it.
+          log "WARN: could not identify or blackhole the stalled peer; not retrying"
+          MT5_INSTALL_ATTEMPTS="${_attempt}"
+        fi
+        break
+      fi
+      sleep 10
+    done
+
+    # Reap the installer tree so nothing lingers past this attempt. If we broke
+    # out because the terminal appeared, give it a short grace to exit on its own
+    # -- it has done its job.
+    _reap_deadline=$(( $(date +%s) + 60 ))
     while kill -0 "${_installer_pid}" 2>/dev/null && [ "$(date +%s)" -lt "${_reap_deadline}" ]; do
+      if _have_terminal; then
+        _term_found=1
+        break
+      fi
       sleep 5
     done
-    if kill -0 "${_installer_pid}" 2>/dev/null; then
-      kill "${_installer_pid}" 2>/dev/null || true
-    fi
+    kill "${_installer_pid}" 2>/dev/null || true
+    for _p in ${_pids}; do kill "${_p}" 2>/dev/null || true; done
     wait "${_installer_pid}" 2>/dev/null || true
-  fi
+    if [ "${_term_found}" -eq 1 ]; then
+      break
+    fi
+
+    # The installer is gone and there is no terminal. An installer that exited on
+    # its own still gets the generous unpack window; one that was KILLED (by this
+    # watchdog, or by its own MT5_SETUP_TIMEOUT) gets none at all.
+    if [ "${_stalled}" -eq 0 ]; then
+      _unpack_deadline=$(( $(date +%s) + MT5_UNPACK_GRACE ))
+      _last_size=$(du -sk "${WINE_PREFIX}" 2>/dev/null | awk '{print $1}')
+      while [ "$(date +%s)" -lt "${_unpack_deadline}" ]; do
+        if _have_terminal; then
+          _term_found=1
+          break
+        fi
+        _size=$(du -sk "${WINE_PREFIX}" 2>/dev/null | awk '{print $1}')
+        if [ "${_size:-0}" -gt "$(( ${_last_size:-0} + 256 ))" ]; then
+          _last_size="${_size:-0}"
+          _unpack_deadline=$(( $(date +%s) + MT5_UNPACK_GRACE ))
+        fi
+        sleep 5
+      done
+      if [ "${_term_found}" -eq 1 ]; then
+        break
+      fi
+    fi
+
+    _attempt=$(( _attempt + 1 ))
+  done
 
   if _have_terminal; then
     touch "${DONE_MARKER}"
@@ -813,14 +985,27 @@ if [ "${_TERMINAL_ALREADY_INSTALLED}" -eq 0 ]; then
     status mt5 "MT5 terminal installed"
   else
     # Surface the installer's own output so the failure is actionable instead of
-    # looking like a silent no-op.
+    # looking like a silent no-op -- AND land it in install.log.
+    #
+    # MEASURED (2026-09-22): a box whose install failed with
+    # ``failed|installer exited with code 126`` had NO install.log at all, because
+    # this branch only ever wrote to stderr. From outside the sandbox the only way
+    # to read stderr is to have been the caller, so a box that had already finished
+    # and been idled could not be diagnosed at all. install.log is the one file
+    # that survives every path out of this script, so the installer's tail belongs
+    # in it.
+    {
+      printf '[mt5-install] installer output (%s, last 2000 bytes):\n' "${_last_attempt_log}"
+      tr -d '\000' <"${_last_attempt_log}" 2>/dev/null | tail -c 2000
+      printf '\n'
+    } >>"${MT5_ROOT}/install.log" 2>/dev/null || true
     {
       printf '{"ok": false, "stage": "failed", "error": "terminal64.exe was not produced",\n'
-      printf ' "installer_log": "'
-      tr -d '\000' <"${MT5_SETUP_LOG}" 2>/dev/null | tail -c 900 | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '
+      printf ' "attempts": %s, "installer_log": "' "${_attempt}"
+      tr -d '\000' <"${_last_attempt_log}" 2>/dev/null | tail -c 900 | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '
       printf '"}\n'
     } >&2
-    status failed "terminal64.exe was not produced (installer log: ${MT5_SETUP_LOG})"
+    status failed "terminal64.exe was not produced after ${_attempt} attempt(s) (installer log: ${_last_attempt_log})"
     exit 5
   fi
 fi
