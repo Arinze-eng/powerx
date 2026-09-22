@@ -67,14 +67,29 @@ CLI_VERSION = "2026-09-22.7"
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
 
-#: The generic (MetaQuotes) installer used when a server resolves to no specific
-#: broker build. Kept byte-identical to the default in
-#: ``scripts/install_mt5_sandbox.sh``: the installer records the URL it used in
-#: ``.installed.url`` and :func:`_pending_install_target` compares that string with
-#: the target recorded here, so a divergence would make every install look
-#: permanently pending.
+#: The generic (MetaQuotes) installer: the build a MetaQuotes-Demo account needs.
+#: Selected explicitly (``--server MetaQuotes-Demo``/``MT5_GENERIC_INSTALLER=1``);
+#: it is NOT what a caller who names no broker gets.
 GENERIC_INSTALLER_URL = (
     "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
+)
+
+#: What the installer INSTALLS when the caller names no broker at all.
+#:
+#: MUST stay byte-identical to ``MT5_BROKER_INSTALLER_URL``'s default in
+#: ``scripts/install_mt5_sandbox.sh``, because that default is what actually lands
+#: on disk and gets recorded in ``.installed.url``. :func:`_pending_install_target`
+#: compares the two strings, so a divergence makes a FINISHED install look
+#: permanently pending.
+#:
+#: MEASURED 2026-09-22 (Runloop devbox): a bare ``install`` piped the script's own
+#: default (Exness) onto disk while this file recorded ``GENERIC_INSTALLER_URL``.
+#: The two markers could never converge, so ``status`` reported
+#: ``stage="installing", in_progress=true`` forever even though the script's own
+#: ``install.status`` already read ``done`` -- a poll loop that can never terminate,
+#: i.e. exactly the "it hangs" symptom this whole mechanism exists to remove.
+DEFAULT_INSTALLER_URL = (
+    "https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe"
 )
 DISPLAY_NUM = os.environ.get("MT5_DISPLAY_NUM", "99")
 METAEDITOR_MARKER = MT5_ROOT / ".metaeditor_path"
@@ -262,7 +277,12 @@ def installed_broker_key(terminal: Path | None = None) -> str | None:
         recorded = BROKER_KEY_FILE.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         recorded = ""
-    if recorded:
+    # "unknown" is the installer's placeholder for "the caller named no broker", from
+    # ``${MT5_BROKER_KEY:-unknown}``. It is a NON-answer: honouring it masks the
+    # dir-name fallback below, which can still identify the build. MEASURED
+    # 2026-09-22: a bare install left .broker_key=unknown beside an Exness terminal,
+    # and doctor reported installed_broker="unknown" for a build it could have named.
+    if recorded and recorded.lower() != "unknown":
         return recorded
 
     if terminal is None:
@@ -971,7 +991,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         install_target = str(
             env.get("MT5_BROKER_INSTALLER_URL")
             or env.get("MT5_INSTALLER_URL")
-            or GENERIC_INSTALLER_URL
+            or DEFAULT_INSTALLER_URL
         )
         try:
             (MT5_ROOT / INSTALL_TARGET_FILE.name).write_text(

@@ -1452,3 +1452,75 @@ def test_known_server_prefixes_match_the_cli_registry(monkeypatch, tmp_path):
         assert cli.broker_for_server(prefix) is not None
     assert _server_is_known("SomeOtherBroker-Demo") is False
     assert _server_is_known(None) is False
+
+
+def test_the_recorded_default_matches_what_a_bare_install_lands():
+    """A bare ``install`` records the build the SCRIPT will actually lay down.
+
+    MEASURED 2026-09-22 (Runloop devbox): the CLI recorded ``GENERIC_INSTALLER_URL``
+    as ``.install.target`` while the installer's own default (``MT5_BROKER_INSTALLER_URL``
+    -> the Exness build) is what landed on disk. The two markers could never converge,
+    so ``status`` answered ``stage="installing", in_progress=true`` forever even
+    though the script's ``install.status`` already read ``done``: a poll loop with no
+    terminating state, which is the "it hangs" symptom itself. The old test only
+    pinned ``MT5_INSTALLER_URL``'s default -- the one that does NOT land for a bare
+    install -- so the divergence shipped.
+    """
+    cli = _load_cli_module()
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
+    ).read_text(encoding="utf-8")
+    assert f"${{MT5_BROKER_INSTALLER_URL:-{cli.DEFAULT_INSTALLER_URL}}}" in script
+    # The two defaults must not collapse into one: a bare install lands the Exness
+    # build, and MetaQuotes-Demo needs the generic one.
+    assert cli.DEFAULT_INSTALLER_URL != cli.GENERIC_INSTALLER_URL
+
+
+def test_a_bare_install_converges_instead_of_polling_forever(monkeypatch, tmp_path):
+    """``status`` must reach ``done`` for an install that named no broker."""
+    import argparse
+
+    cli = _broker_cli(monkeypatch, tmp_path, brands=("MetaTrader 5 EXNESS",))
+    winpy = tmp_path / "python.exe"
+    winpy.write_bytes(b"MZ")
+    monkeypatch.setenv("MT5_WIN_PYTHON", str(winpy))
+    mt5_root = tmp_path / ".mt5"
+
+    captured: dict[str, Any] = {}
+
+    def _capture(payload: dict[str, Any], **_kw: Any) -> int:
+        captured.clear()
+        captured.update(payload)
+        return 0
+
+    monkeypatch.setattr(cli, "emit", _capture)
+
+    # What a bare install leaves behind: the script's default build on disk, and the
+    # same URL recorded as the target, so the comparison matches.
+    (mt5_root / ".installed.url").write_text(
+        cli.DEFAULT_INSTALLER_URL, encoding="utf-8"
+    )
+    (mt5_root / ".install.target").write_text(
+        cli.DEFAULT_INSTALLER_URL, encoding="utf-8"
+    )
+    (mt5_root / "install.status").write_text("done|install complete", encoding="utf-8")
+    cli.cmd_status(argparse.Namespace(lines=5))
+    assert captured["stage"] == "done"
+    assert captured["installing_target"] is None
+    assert captured["in_progress"] is False
+
+
+def test_an_unknown_broker_key_does_not_mask_the_install_directory(
+    monkeypatch, tmp_path
+):
+    """``unknown`` is a NON-answer and must fall through to the directory name.
+
+    The installer writes ``${MT5_BROKER_KEY:-unknown}`` when the caller named no
+    broker. Honouring that literal masked the dir-name fallback, so ``doctor``
+    reported ``installed_broker: "unknown"`` for a terminal whose directory
+    ("MetaTrader 5 EXNESS") names the build outright -- MEASURED 2026-09-22.
+    """
+    cli = _broker_cli(
+        monkeypatch, tmp_path, broker_key="unknown", brands=("MetaTrader 5 EXNESS",)
+    )
+    assert cli.installed_broker_key() == "exness"
