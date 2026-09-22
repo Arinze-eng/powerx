@@ -1671,3 +1671,127 @@ def test_a_recorded_build_still_outranks_the_url_on_disk(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     assert cli.installed_broker_key() == "exness"
+
+
+# --------------------------------------------------------------------------- #
+# A stalled download mirror is a hang, not a slow install
+# --------------------------------------------------------------------------- #
+def _installer_script_text() -> str:
+    return (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
+    ).read_text(encoding="utf-8")
+
+
+def test_a_stalled_mirror_is_bounded_by_the_watchdog_not_the_setup_timeout():
+    """A wedged mirror must cost MT5_STALL_SECONDS, not MT5_SETUP_TIMEOUT.
+
+    MEASURED FAILURE (2026-09-22, Novita, Wine 10.0): ``mt5setup.exe /auto``
+    established TCP to ``148.113.1.241:443`` and then moved NOTHING for 20
+    minutes -- 0% CPU, zero bytes into the prefix, one ESTABLISHED socket with
+    empty queues. Wine's downloader has no timeout of its own, so the only bound
+    was ``MT5_SETUP_TIMEOUT=900``; after that the script waited a further 300 s of
+    unpack grace for a terminal that was never coming. An install with a bad
+    mirror therefore took ~20 minutes to report a failure that was decidable in
+    the first two.
+    """
+    script = _installer_script_text()
+    assert 'MT5_STALL_SECONDS="${MT5_STALL_SECONDS:-120}"' in script
+    assert 'MT5_INSTALL_ATTEMPTS="${MT5_INSTALL_ATTEMPTS:-3}"' in script
+    # The installer must live INSIDE an attempts loop, not be launched once.
+    assert 'while [ "${_attempt}" -le "${MT5_INSTALL_ATTEMPTS}" ]; do' in script
+    # ...and the stall branch must name the peer it is wedged on, so the failure
+    # is diagnosable from install.log alone.
+    assert "moved no data and burned no CPU for ${MT5_STALL_SECONDS}s" in script
+    assert "peers: $(printf '%s' \"${_peers}\" | tr '\\n' ' ')" in script
+
+
+def test_the_watchdog_blackholes_the_wedged_peer_then_retries():
+    """Making one peer unreachable is what lets the install fall through.
+
+    NOT a DNS fix: the mirror list is embedded in the installer and reached as a
+    literal IP. Measured on that box -- pinning the MQL5 CDN names in the prefix's
+    hosts file changed nothing (the installer went straight back to the same
+    wedged peer), while ``ip route add blackhole 148.113.1.241/32`` let the SAME
+    installer finish the whole 736 MB terminal in ~40 s.
+    """
+    script = _installer_script_text()
+    assert "ip route add blackhole" in script
+    # Needs root, which a sandbox may only have through sudo.
+    assert "sudo -n ip route add blackhole" in script
+    # Each identified peer is blackholed, and a failure to blackhole stops the
+    # retry loop instead of spending another MT5_STALL_SECONDS on the same peer.
+    assert 'if _blackhole_peer "${_peer}"; then' in script
+    assert 'MT5_INSTALL_ATTEMPTS="${_attempt}"' in script
+
+
+def test_the_watchdog_never_blackholes_the_sandbox_service_addresses():
+    """Blackholing the platform's control connection would kill the sandbox.
+
+    The peer list is taken from the installer's OWN process tree and then filtered,
+    so a service address (the link-local metadata/API ranges Novita uses) can never
+    reach ``ip route add blackhole`` even if it turns up in ``ss`` output.
+    """
+    script = _installer_script_text()
+    assert "169\\.254\\." in script
+    assert "192\\.0\\.2\\." in script
+    assert "::1$" in script
+    # The peers come from the installer tree, by DESCENT from our own pid -- never
+    # from a name match, which would also hit this script's own shell.
+    assert "_descendants() {" in script
+    assert "pgrep -P" in script
+    assert "pgrep -f 'broker_setup" not in script
+
+
+def test_a_killed_installer_gets_no_unpack_grace():
+    """A killed installer wrote nothing, so 300 more seconds cannot change that.
+
+    The unpack window exists for an installer that EXITED on its own and left Wine
+    unpacking the tree behind it. Waiting it out after a stall (or after the
+    installer's own timeout reaped it) is the second half of the 20-minute hang.
+    """
+    script = _installer_script_text()
+    assert 'if [ "${_stalled}" -eq 0 ]; then' in script
+    assert "_unpack_deadline=$(( $(date +%s) + MT5_UNPACK_GRACE ))" in script
+    # The gate must come before the window it guards.
+    assert script.index('if [ "${_stalled}" -eq 0 ]; then') < script.index(
+        "_unpack_deadline=$(( $(date +%s) + MT5_UNPACK_GRACE ))"
+    )
+    # ...and the fixed 300 s grace that ignored the installer's fate is gone.
+    assert "_grace_deadline=$(( $(date +%s) + 300 ))" not in script
+
+
+def test_a_healthy_backend_never_reaches_the_watchdog():
+    """Runloop works; the first attempt must stay the command that already ships.
+
+    The watchdog is only ever consulted when the installer has gone
+    MT5_STALL_SECONDS without growing the prefix or burning CPU, which a healthy
+    install (~4 minutes on Runloop) never does. Attempt 1 must therefore still log
+    to the plain ``mt5setup.log``, exactly as before.
+    """
+    script = _installer_script_text()
+    assert '_last_attempt_log="${MT5_SETUP_LOG}"' in script
+    # Only a retry gets a suffixed log; attempt 1 must not.
+    assert 'mt5setup.attempt${_attempt}.log' in script
+    assert "attempt ${_attempt}/${MT5_INSTALL_ATTEMPTS}" in script
+    # The installer's own timeout stays as the outer bound.
+    assert 'MT5_SETUP_TIMEOUT="${MT5_SETUP_TIMEOUT:-900}"' in script
+
+
+def test_a_failed_install_always_lands_its_log_in_install_log():
+    """``install.log`` is the one file that survives every path out of the script.
+
+    MEASURED (2026-09-22): a box whose install failed with
+    ``failed|installer exited with code 126`` had NO install.log at all, because
+    the failing branch only ever wrote to stderr -- unreadable from outside a
+    sandbox that has already finished and been idled. Two boxes were spent on that
+    diagnosis.
+    """
+    script = _installer_script_text()
+    assert '} >>"${MT5_ROOT}/install.log" 2>/dev/null || true' in script
+    assert "installer output (%s, last 2000 bytes)" in script
+    # The status line must say how many attempts were spent and which log holds
+    # the evidence.
+    assert (
+        'status failed "terminal64.exe was not produced after ${_attempt} attempt(s) '
+        '(installer log: ${_last_attempt_log})"' in script
+    )
