@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-22.9"
+_CLI_VERSION = "2026-09-22.10"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -363,7 +363,7 @@ def validate_broker_installer_url(url: str) -> str | None:
 #: (the CLI is authoritative about what it installs; this only decides whether the
 #: tool can finish an install on its own). MetaQuotes' own demo servers resolve on
 #: the generic build, which needs no broker URL at all.
-_KNOWN_SERVER_PREFIXES = ("metaquotes", "exness")
+_KNOWN_SERVER_PREFIXES = ("metaquotes", "exness", "deriv")
 
 
 def _server_is_known(server: str | None) -> bool:

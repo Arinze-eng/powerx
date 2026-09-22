@@ -1445,13 +1445,46 @@ def test_doctor_and_status_name_the_terminal_of_the_recorded_broker(
 
 
 def test_known_server_prefixes_match_the_cli_registry(monkeypatch, tmp_path):
-    """The tool's auto-install list must match what the CLI can actually resolve."""
+    """The tool's auto-install list must match what the CLI can actually resolve.
+
+    Read from the registry rather than from a literal list: a broker added to
+    ``BROKER_BUILDS`` (or the registry growing a prefix) must appear here too, or the
+    tool refuses a server the CLI could have installed for -- the "it asks the user
+    for an installer URL that we already know" failure.
+    """
     cli = _broker_cli(monkeypatch, tmp_path)
-    for prefix in ("MetaQuotes-Demo", "Exness-MT5Trial9"):
-        assert _server_is_known(prefix) is True
-        assert cli.broker_for_server(prefix) is not None
+    registry_prefixes = {
+        prefix for build in cli.broker_builds() for prefix in (build.get("match") or ())
+    }
+    assert registry_prefixes
+    for prefix in registry_prefixes:
+        assert _server_is_known(f"{prefix.capitalize()}-Demo") is True, prefix
+        assert cli.broker_for_server(f"{prefix.capitalize()}-Demo") is not None, prefix
+
     assert _server_is_known("SomeOtherBroker-Demo") is False
     assert _server_is_known(None) is False
+
+
+def test_deriv_is_registered_with_its_measured_slug_and_directory(monkeypatch, tmp_path):
+    """The two Deriv values that could not have been guessed, pinned.
+
+    MEASURED 2026-09-22 on a live Runloop devbox: the installer slug is
+    ``deriv.com.limited`` (deriv.com / deriv.ltd / deriv.markets / deriv.me / deriv
+    all 404) and the directory it creates is "MetaTrader 5 Terminal", NOT the usual
+    "MetaTrader 5 <BRAND>". Both are load-bearing: the installer waits for
+    terminal64.exe in that exact directory, and the dir name is how a build is
+    identified when no ``.broker_key`` was written.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    build = cli.broker_for_server("Deriv-Demo")
+    assert build is not None and build["key"] == "deriv"
+    assert build["url"] == (
+        "https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe"
+    )
+    assert build["dir_name"] == "MetaTrader 5 Terminal"
+    assert cli.broker_key_from_dir_name("MetaTrader 5 Terminal") == "deriv"
+    # A Deriv server must never resolve to the generic build.
+    assert build["url"] != cli.GENERIC_INSTALLER_URL
 
 
 def test_the_recorded_default_matches_what_a_bare_install_lands():

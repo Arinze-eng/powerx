@@ -62,7 +62,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-22.9"
+CLI_VERSION = "2026-09-22.10"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -186,6 +186,25 @@ BROKER_BUILDS: tuple[dict[str, Any], ...] = (
             "mt5/exness5setup.exe"
         ),
         "dir_name": "MetaTrader 5 EXNESS",
+    },
+    {
+        "key": "deriv",
+        "label": "Deriv",
+        "match": ("deriv",),
+        "url": (
+            "https://download.mql5.com/cdn/web/deriv.com.limited/"
+            "mt5/deriv5setup.exe"
+        ),
+        # MEASURED 2026-09-22 on a live Runloop devbox, and worth reading twice:
+        # Deriv's installer does NOT use the usual "MetaTrader 5 <BRAND>" pattern --
+        # it creates "MetaTrader 5 Terminal". That name is load-bearing on both
+        # sides: the installer waits for terminal64.exe in this exact directory
+        # before declaring success, and find_terminal separate it from the other
+        # builds by the same string. A wrong value here silently reintroduces the
+        # coexistence failure. The slug is equally unguessable: deriv.com, deriv.ltd,
+        # deriv.markets, deriv.me and deriv all return 404; only deriv.com.limited
+        # (taken from Deriv's own download page) returns 200.
+        "dir_name": "MetaTrader 5 Terminal",
     },
 )
 
