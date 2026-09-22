@@ -1388,6 +1388,48 @@ def test_the_generic_url_matches_the_installer_default():
     assert f"${{MT5_INSTALLER_URL:-{cli.GENERIC_INSTALLER_URL}}}" in script
 
 
+def test_doctor_resolves_the_terminal_of_the_recorded_broker(monkeypatch, tmp_path):
+    """Recorded broker and reported terminal path must describe the SAME build.
+
+    Live 2026-09-22: after switching a box to the Exness build, ``doctor`` reported
+    ``installed_broker: "exness"`` next to the GENERIC terminal's path, read that
+    terminal's empty ``servers.dat``, and warned that broker login was impossible --
+    about a build the box was not using. Two builds coexist, so a plain
+    ``find_terminal()`` returns whichever the filesystem lists first.
+    """
+    import argparse
+
+    cli = _broker_cli(
+        monkeypatch,
+        tmp_path,
+        broker_key="exness",
+        brands=("MetaTrader 5", "MetaTrader 5 EXNESS"),
+    )
+    # The stale-cache half of the failure: the marker still points at the generic
+    # build the box was installed with BEFORE the switch, which is what made
+    # `doctor` describe the wrong terminal.
+    cli.TERMINAL_MARKER.write_text(
+        str(cli.WINE_PREFIX / "drive_c" / "Program Files" / "MetaTrader 5"
+            / "terminal64.exe"),
+        encoding="utf-8",
+    )
+    captured: dict[str, Any] = {}
+
+    def _capture(payload: dict[str, Any], **_kw: Any) -> int:
+        captured.clear()
+        captured.update(payload)
+        return 0
+
+    monkeypatch.setattr(cli, "emit", _capture)
+    cli.cmd_doctor(argparse.Namespace())
+
+    assert captured["installed_broker"] == "exness"
+    # The reported terminal is the one that broker's build lives in -- not the
+    # generic one that happens to sort first on disk.
+    assert "MetaTrader 5 EXNESS" in captured["terminal_path"]
+    assert captured["terminal_path"] == str(cli.find_terminal(prefer_key="exness"))
+
+
 def test_known_server_prefixes_match_the_cli_registry(monkeypatch, tmp_path):
     """The tool's auto-install list must match what the CLI can actually resolve."""
     cli = _broker_cli(monkeypatch, tmp_path)

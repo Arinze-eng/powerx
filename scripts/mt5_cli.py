@@ -789,7 +789,13 @@ def _terminal_network_lines(
 
 
 def cmd_doctor(_: argparse.Namespace) -> int:
-    terminal = find_terminal()
+    # Resolve the terminal for the broker that is RECORDED, not just "a terminal":
+    # two builds coexist in one prefix, and the order the filesystem lists them in is
+    # not the installer's record. Live 2026-09-22: after switching this box to the
+    # Exness build, doctor reported installed_broker="exness" next to the GENERIC
+    # terminal's path, then read that terminal's empty servers.dat and warned that a
+    # broker login was impossible -- about a build the box was not using.
+    terminal = find_terminal(prefer_key=installed_broker_key())
 
     def _which_version(binary: str) -> str | None:
         """Return ``<binary> --version`` output, or None when it is absent.
