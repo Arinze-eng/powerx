@@ -89,7 +89,9 @@ async def test_image_command_charges_one_step_and_sends_puter_result(monkeypatch
     )
 
     assert handled is True
-    channel._supabase.charge_step.assert_awaited_once_with(account, "telegram:puter:-100123:7", 1)
+    channel._supabase.charge_step.assert_awaited_once_with(
+        account, "telegram:puter:-100123:7", 1, amount=1
+    )
     channel._supabase.puter_generate.assert_awaited_once_with(
         account, "generate_image", "a blue robot"
     )
@@ -145,7 +147,9 @@ async def test_image_edit_command_forwards_attached_image_and_sends_result(monke
     )
 
     assert handled is True
-    channel._supabase.charge_step.assert_awaited_once_with(account, "telegram:puter-edit:-100123:7", 1)
+    channel._supabase.charge_step.assert_awaited_once_with(
+        account, "telegram:puter-edit:-100123:7", 1, amount=1
+    )
     channel._supabase.puter_edit_image.assert_awaited_once()
     edit_args = channel._supabase.puter_edit_image.await_args.args
     assert edit_args[0] == account

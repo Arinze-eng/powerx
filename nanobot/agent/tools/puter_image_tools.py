@@ -166,6 +166,9 @@ class PuterGenerateImageTool(Tool):
                 {"agentx_user_id": user_id},
                 f"webui:puter-generate:{user_id}",
                 1,
+                # Flat price: one credit per generation, as this path has always
+                # charged - not a whole agent step.
+                amount=1,
             )
         except Exception as exc:
             logger.debug("puter image step charge failed: {}", exc)
@@ -301,6 +304,7 @@ class PuterEditImageTool(Tool):
                 {"agentx_user_id": user_id},
                 f"webui:puter-edit:{user_id}",
                 1,
+                amount=1,
             )
         except Exception as exc:
             logger.debug("puter edit step charge failed: {}", exc)

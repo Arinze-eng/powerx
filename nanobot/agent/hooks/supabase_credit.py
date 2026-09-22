@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import uuid4
 
 from loguru import logger
 
@@ -16,6 +17,22 @@ from nanobot.supabase_auth import SupabaseAuth, SupabaseAuthError
 
 class CreditExhaustedError(SupabaseAuthError):
     """Raised before a model iteration when the user cannot pay for another step."""
+
+
+def _stopped_for_billing(exc: SupabaseAuthError, surface: str) -> CreditExhaustedError:
+    """Turn a failed step charge into the error that stops the task.
+
+    A refusal ("Insufficient credits") is the user's cue to top up. Anything
+    else - a transport failure, a 5xx that outlived the retries - stops the task
+    just the same, because no step can run unbilled, but it must not tell the
+    user to buy credits for what was an infrastructure problem.
+    """
+    detail = str(exc)[:400]
+    if "insufficient" in detail.lower():
+        return CreditExhaustedError(f"{detail} Add credit to keep using the {surface}.")
+    return CreditExhaustedError(
+        f"{detail} Billing could not be confirmed for this step, so the task was stopped."
+    )
 
 
 def log_cost_meter(
@@ -89,6 +106,13 @@ class SupabaseCreditHook(AgentHook):
         self.charged_steps = 0
         # Resolved once and cached: the account every step is charged to.
         self._account: dict[str, Any] | None = None
+        # The step RPC is idempotent per (task_ref, step), so the reference has
+        # to be unique per turn. A turn with no message id (WebUI, API) would
+        # otherwise keep "turn" in the reference and every later turn in the
+        # same session would come back as already_charged - billed once, then
+        # free. The per-turn token is stable across this turn's own steps, so a
+        # retried step still cannot be charged twice.
+        self._turn_token = str(context.message_id or uuid4().hex[:12])
 
     async def _resolve_account(self) -> dict[str, Any] | None:
         """Look up the Telegram account for this turn (used by API-bridge turns)."""
@@ -148,15 +172,12 @@ class SupabaseCreditHook(AgentHook):
         finished balance cannot start a task at all.
         """
         task_ref = (
-            f"nanobot:{self._context.session_key or self._context.chat_id}:"
-            f"{self._context.message_id or 'turn'}"
+            f"nanobot:{self._context.session_key or self._context.chat_id}:{self._turn_token}"
         )
         try:
             await self._supabase.charge_step(self._account, task_ref, step_no)
         except SupabaseAuthError as exc:
-            raise CreditExhaustedError(
-                f"{str(exc)[:400]} Add credit to keep using the agent."
-            ) from exc
+            raise _stopped_for_billing(exc, "agent") from exc
         self.charged_steps = step_no
 
     async def after_run(self, context: AgentRunHookContext) -> None:
@@ -204,6 +225,10 @@ class ApiCreditHook(AgentHook):
         # step runs so an empty balance stops the request mid-task.
         self.charged_steps = 0
         self._account: dict[str, Any] | None = None
+        # Unique per turn, for the same reason as the Telegram/WebUI hook: the
+        # RPC is idempotent per (task_ref, step), and an API session reuses its
+        # reference across requests.
+        self._turn_token = str(self._context.message_id or uuid4().hex[:12])
 
     async def before_iteration(self, context: AgentHookContext) -> None:
         if not self._supabase.enabled:
@@ -223,14 +248,12 @@ class ApiCreditHook(AgentHook):
         metadata = self._context.metadata or {}
         task_ref = (
             f"api:{metadata.get('api_key_id') or 'key'}:"
-            f"{self._context.session_key or self._context.chat_id}"
+            f"{self._context.session_key or self._context.chat_id}:{self._turn_token}"
         )
         try:
             await self._supabase.charge_step(self._account, task_ref, step_no)
         except SupabaseAuthError as exc:
-            raise CreditExhaustedError(
-                f"{str(exc)[:400]} Add credit to keep using the API."
-            ) from exc
+            raise _stopped_for_billing(exc, "API") from exc
         self.charged_steps = step_no
 
     async def after_run(self, context: AgentRunHookContext) -> None:

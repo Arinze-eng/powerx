@@ -1923,6 +1923,8 @@ class TelegramChannel(BaseChannel):
             account,
             f"telegram:puter-edit:{message.chat_id}:{message.message_id}",
             1,
+            # Flat price: one credit per edit, as this path has always charged.
+            amount=1,
         )
         result = await self._supabase.puter_edit_image(account, prompt, input_images)
         media_path = self._save_puter_media(
@@ -2000,6 +2002,9 @@ class TelegramChannel(BaseChannel):
                     account,
                     f"telegram:puter:{message.chat_id}:{message.message_id}",
                     1,
+                    # Flat price: one credit per generation, as this path has
+                    # always charged.
+                    amount=1,
                 )
                 result = await self._supabase.puter_generate(account, action, prompt)
                 media_path = self._save_puter_media(

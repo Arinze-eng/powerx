@@ -1,4 +1,4 @@
--- Per-step credit deduction, done inside Postgres.
+-- Per-step credit deduction, priced and deducted inside Postgres.
 --
 -- Billing used to be "count steps in the app, drain once when the task ends".
 -- That had two problems:
@@ -13,82 +13,21 @@
 -- a user with nothing left cannot start one at all, because the first step's
 -- charge is what starts it.
 --
--- Balance order: daily -> granted -> purchased. Daily credits expire, so they
--- are spent first; purchased credits never expire and are spent last.
-
-create table if not exists public.credit_step_charges (
-    task_ref text not null,
-    step_no integer not null,
-    user_id uuid not null,
-    amount integer not null,
-    remaining integer not null,
-    created_at timestamptz not null default now(),
-    primary key (task_ref, step_no)
-);
-
-comment on table public.credit_step_charges is
-    'One row per billed agent step: the idempotency key that stops a retried or '
-    'duplicated step from being charged twice.';
-
--- Service-role callers only; RLS on with no policies, so no client can read it.
-alter table public.credit_step_charges enable row level security;
-
-
--- Remaining balance as a single jsonb value. No rows leave Postgres, so a
--- pre-flight check costs nothing in egress.
-create or replace function public.credit_balance(p_user uuid)
-returns jsonb
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-    v_daily integer;
-    v_granted integer;
-    v_purchased integer;
-    v_rate integer;
-    v_total integer;
-begin
-    if p_user is null then
-        return jsonb_build_object('success', false, 'error', 'a user id is required');
-    end if;
-
-    select coalesce(daily_credits, 0),
-           coalesce(granted_credits, 0),
-           coalesce(purchased_credits, 0),
-           greatest(coalesce(drain_rate, 1), 1)
-      into v_daily, v_granted, v_purchased, v_rate
-      from public.profiles
-     where id = p_user;
-
-    if not found then
-        return jsonb_build_object('success', false, 'error', 'profile not found');
-    end if;
-
-    v_total := v_daily + v_granted + v_purchased;
-
-    return jsonb_build_object(
-        'success', true,
-        'remaining', v_total,
-        'daily', v_daily,
-        'granted', v_granted,
-        'purchased', v_purchased,
-        'drain_rate', v_rate,
-        'step_cost', 3 * v_rate,
-        -- The start gate: a finished balance can never begin a task.
-        'can_start', v_total >= (3 * v_rate)
-    );
-end;
-$$;
-
-
--- Charge one step. Returns jsonb so the caller gets a decision and a balance in
--- one round trip, and never sees a credit row.
+-- The database already owned most of this. `consume_cloud_task_step_credits`
+-- debits through `consume_credits` - which refreshes the daily allowance,
+-- spends purchased -> granted -> daily, and writes `credit_ledger` - is
+-- idempotent per (user, task_ref, step_no) through `cloud_task_step_charges`,
+-- and converts the reservation taken before sandbox provisioning into the first
+-- step's debit. None of that is re-implemented here, so the bot, the Cloud Mode
+-- reservations and the ledger keep agreeing with each other.
 --
--- p_amount <= 0 means "charge the standard step cost", which the function reads
--- from the user's drain_rate itself. That keeps the drain-rate lookup off the
--- application side entirely - it used to be a separate `profiles` GET with its
--- own cache just to avoid the egress.
+-- The one thing it would not do is price a step: `p_amount <= 0` was rejected as
+-- an invalid request, so a caller had to read `profiles.drain_rate` first to
+-- learn the step cost, and that read was the egress. Relaxing the guard is the
+-- whole change: `p_amount <= 0` now means "the standard step price", read from
+-- the caller's own drain rate. A caller with a flat price of its own (Puter
+-- media costs one credit, not a step) still passes it explicitly.
+
 create or replace function public.consume_cloud_task_step_credits(
     p_user uuid,
     p_amount integer,
@@ -98,134 +37,160 @@ create or replace function public.consume_cloud_task_step_credits(
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
-as $$
+set search_path to ''
+as $function$
 declare
-    v_daily integer;
-    v_granted integer;
-    v_purchased integer;
-    v_rate integer;
-    v_amount integer;
-    v_total integer;
-    v_spend integer;
-    v_left integer;
-    v_remaining integer;
-    v_task_ref text;
-    v_step_no integer;
-    v_previous public.credit_step_charges%rowtype;
+  v_existing public.cloud_task_step_charges%rowtype;
+  v_parent public.cloud_task_charges%rowtype;
+  v_result jsonb;
+  v_balance integer;
+  v_amount integer;
+  v_rate integer;
 begin
-    if p_user is null then
-        return jsonb_build_object('success', false, 'error', 'a user id is required');
-    end if;
+  if p_user is null or p_step_no <= 0
+     or length(trim(coalesce(p_task_ref, ''))) = 0
+     or length(p_task_ref) > 160 then
+    return jsonb_build_object('success', false, 'error', 'Invalid Cloud Mode step charge request');
+  end if;
 
-    v_task_ref := coalesce(nullif(btrim(p_task_ref), ''), 'unscoped');
-    v_step_no := greatest(coalesce(p_step_no, 1), 1);
-
-    -- Idempotency: a retried step is answered from the original charge instead
-    -- of billing a second time.
-    select * into v_previous
-      from public.credit_step_charges
-     where task_ref = v_task_ref and step_no = v_step_no;
-
-    if found then
-        if v_previous.user_id <> p_user then
-            return jsonb_build_object(
-                'success', false,
-                'error', 'this step reference belongs to another account'
-            );
-        end if;
-        return jsonb_build_object(
-            'success', true,
-            'idempotent', true,
-            'charged', v_previous.amount,
-            'remaining', v_previous.remaining,
-            'step_no', v_step_no
-        );
-    end if;
-
-    -- Lock the balance row for the whole deduction so two concurrent steps
-    -- cannot both spend the same credits.
-    select coalesce(daily_credits, 0),
-           coalesce(granted_credits, 0),
-           coalesce(purchased_credits, 0),
-           greatest(coalesce(drain_rate, 1), 1)
-      into v_daily, v_granted, v_purchased, v_rate
+  -- p_amount <= 0 is "charge the standard step cost", read here so that pricing
+  -- a step costs no profiles GET on the application side.
+  if coalesce(p_amount, 0) <= 0 then
+    select greatest(coalesce(drain_rate, 1), 1)
+      into v_rate
       from public.profiles
-     where id = p_user
-       for update;
-
-    if not found then
-        return jsonb_build_object('success', false, 'error', 'profile not found');
-    end if;
-
-    v_amount := case
-        when coalesce(p_amount, 0) > 0 then p_amount
-        else 3 * v_rate
-    end;
-    v_amount := greatest(v_amount, 1);
-
-    v_total := v_daily + v_granted + v_purchased;
-
-    -- Refuse rather than part-charge: the caller stops the task before the step
-    -- runs, so nobody pays for work that never happened.
-    if v_total < v_amount then
-        return jsonb_build_object(
-            'success', false,
-            'error', 'Insufficient credits: this step costs '
-                     || v_amount || ' and the balance is ' || v_total,
-            'remaining', v_total,
-            'required', v_amount,
-            'drain_rate', v_rate,
-            'step_no', v_step_no
-        );
-    end if;
-
-    -- Daily first: it expires. Purchased last: it never does. v_total >=
-    -- v_amount was checked above, so the draw-down never under-runs.
-    v_left := v_amount;
-
-    v_spend := least(v_daily, v_left);
-    v_daily := v_daily - v_spend;
-    v_left := v_left - v_spend;
-
-    v_spend := least(v_granted, v_left);
-    v_granted := v_granted - v_spend;
-    v_left := v_left - v_spend;
-
-    v_spend := least(v_purchased, v_left);
-    v_purchased := v_purchased - v_spend;
-    v_left := v_left - v_spend;
-
-    v_remaining := v_daily + v_granted + v_purchased;
-
-    update public.profiles
-       set daily_credits = v_daily,
-           granted_credits = v_granted,
-           purchased_credits = v_purchased
      where id = p_user;
+    v_amount := 3 * coalesce(v_rate, 1);
+  else
+    v_amount := p_amount;
+  end if;
 
-    insert into public.credit_step_charges (task_ref, step_no, user_id, amount, remaining)
-    values (v_task_ref, v_step_no, p_user, v_amount, v_remaining)
-    on conflict (task_ref, step_no) do nothing;
+  perform pg_catalog.pg_advisory_xact_lock(hashtext(p_user::text));
 
+  select * into v_existing
+  from public.cloud_task_step_charges
+  where user_id = p_user and task_ref = p_task_ref and step_no = p_step_no
+  for update;
+
+  if found then
     return jsonb_build_object(
-        'success', true,
-        'idempotent', false,
-        'charged', v_amount,
-        'remaining', v_remaining,
-        'daily', v_daily,
-        'granted', v_granted,
-        'purchased', v_purchased,
-        'drain_rate', v_rate,
-        'step_no', v_step_no
+      'success', true,
+      'already_charged', true,
+      'step_no', p_step_no,
+      'amount', v_existing.amount,
+      'balance', coalesce(v_existing.balance_after, 0),
+      'status', 'charged'
     );
+  end if;
+
+  -- The reservation created before sandbox provisioning is the first step's
+  -- debit. Convert it into a step charge rather than consuming credits again.
+  if p_step_no = 1 then
+    select * into v_parent
+    from public.cloud_task_charges
+    where user_id = p_user and task_ref = p_task_ref
+    for update;
+
+    if found and v_parent.status = 'reserved' and v_parent.amount = v_amount then
+      update public.cloud_task_charges
+      set status = 'charged', charged_at = coalesce(charged_at, now())
+      where user_id = p_user and task_ref = p_task_ref;
+
+      insert into public.cloud_task_step_charges
+        (user_id, task_ref, step_no, amount, balance_after, source)
+      values
+        (p_user, p_task_ref, p_step_no, v_amount, v_parent.balance_after, 'reservation');
+
+      return jsonb_build_object(
+        'success', true,
+        'already_charged', false,
+        'reserved_step', true,
+        'step_no', p_step_no,
+        'amount', v_amount,
+        'balance', coalesce(v_parent.balance_after, 0),
+        'status', 'charged'
+      );
+    end if;
+  end if;
+
+  v_result := public.consume_credits(
+    p_user,
+    v_amount,
+    'cloud_mode',
+    'Novita Cloud step ' || p_task_ref || '#' || p_step_no
+  );
+
+  if coalesce((v_result->>'success')::boolean, false) is not true then
+    return v_result || jsonb_build_object('step_no', p_step_no, 'status', 'rejected');
+  end if;
+
+  v_balance := coalesce((v_result->>'balance')::integer, 0);
+  insert into public.cloud_task_step_charges
+    (user_id, task_ref, step_no, amount, balance_after, source)
+  values
+    (p_user, p_task_ref, p_step_no, v_amount, v_balance, 'step');
+
+  return v_result || jsonb_build_object(
+    'already_charged', false,
+    'step_no', p_step_no,
+    'amount', v_amount,
+    'status', 'charged'
+  );
 end;
-$$;
+$function$;
 
 
+-- Remaining balance as one jsonb answer, so a pre-flight check ships no rows.
+--
+-- Read-only: nothing is debited here. `step_cost` is the same 3 x drain_rate the
+-- step RPC charges, and `can_start` is the gate - a balance below one step can
+-- never begin a task, because the first iteration's charge would be refused.
+create or replace function public.credit_balance(p_user uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path to ''
+as $function$
+declare
+  v_daily integer;
+  v_granted integer;
+  v_purchased integer;
+  v_rate integer;
+  v_total integer;
+begin
+  if p_user is null then
+    return jsonb_build_object('success', false, 'error', 'a user id is required');
+  end if;
+
+  select coalesce(daily_credits, 0)::integer,
+         coalesce(granted_credits, 0)::integer,
+         coalesce(purchased_credits, 0)::integer,
+         greatest(coalesce(drain_rate, 1), 1)
+    into v_daily, v_granted, v_purchased, v_rate
+    from public.profiles
+   where id = p_user;
+
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'profile not found');
+  end if;
+
+  v_total := v_daily + v_granted + v_purchased;
+
+  return jsonb_build_object(
+    'success', true,
+    'remaining', v_total,
+    'daily', v_daily,
+    'granted', v_granted,
+    'purchased', v_purchased,
+    'drain_rate', v_rate,
+    'step_cost', 3 * v_rate,
+    -- The start gate: a finished balance can never begin a task.
+    'can_start', v_total >= (3 * v_rate)
+  );
+end;
+$function$;
+
+-- The balance of an arbitrary user is not a client-facing read: service role
+-- only, which is what the bot's billing calls use.
 revoke all on function public.credit_balance(uuid) from public, anon, authenticated;
-revoke all on function public.consume_cloud_task_step_credits(uuid, integer, text, integer)
-    from public, anon, authenticated;
 grant execute on function public.credit_balance(uuid) to service_role;
-grant execute on function public.consume_cloud_task_step_credits(uuid, integer, text, integer)
-    to service_role;

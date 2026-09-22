@@ -23,8 +23,12 @@ class FakeSupabase:
         self.edited: list[list[object]] = []
         self.failure: Exception | None = None
 
-    async def charge_step(self, account: dict[str, str], task_ref: str, step_no: int) -> dict[str, object]:
-        self.charged.append({"account": account, "task_ref": task_ref, "step_no": step_no})
+    async def charge_step(
+        self, account: dict[str, str], task_ref: str, step_no: int, amount: int = 0
+    ) -> dict[str, object]:
+        self.charged.append(
+            {"account": account, "task_ref": task_ref, "step_no": step_no, "amount": amount}
+        )
         if self.failure is not None:
             raise self.failure
         return {"success": True, "balance": 10}

@@ -1194,9 +1194,10 @@ class SupabaseAuth:
         """Deduct one step's credits inside Postgres, before the step runs.
 
         ``amount <= 0`` lets the RPC apply the user's own step cost, so no
-        ``profiles`` read is needed to learn the drain rate. Raises
-        :class:`SupabaseAuthError` when the step cannot be paid, which the agent
-        loop turns into an immediate stop.
+        ``profiles`` read is needed to learn the drain rate. A flat-priced
+        operation passes its price instead - a Puter image generation costs one
+        credit, not a step's worth. Raises :class:`SupabaseAuthError` when the
+        step cannot be paid, which the agent loop turns into an immediate stop.
         """
         if not account.get("agentx_user_id"):
             raise SupabaseAuthError("Use /signup or /signin first")

@@ -15,12 +15,15 @@ class FakeSupabase:
     enabled = True
 
     def __init__(self) -> None:
-        # One RPC per billed step: (account, task_ref, step_no).
-        self.step_calls: list[tuple[dict[str, str], str, int]] = []
+        # One RPC per billed step: (account, task_ref, step_no, amount), where
+        # amount 0 means "let the RPC apply the user's step cost".
+        self.step_calls: list[tuple[dict[str, str], str, int, int]] = []
         self.failure: Exception | None = None
 
-    async def charge_step(self, account: dict[str, str], task_ref: str, step_no: int) -> dict[str, object]:
-        self.step_calls.append((account, task_ref, step_no))
+    async def charge_step(
+        self, account: dict[str, str], task_ref: str, step_no: int, amount: int = 0
+    ) -> dict[str, object]:
+        self.step_calls.append((account, task_ref, step_no, amount))
         if self.failure is not None:
             raise self.failure
         return {"success": True, "balance": 10}
@@ -44,10 +47,35 @@ async def test_credit_hook_charges_every_step_before_it_runs(monkeypatch) -> Non
     await hook.after_run(run_ctx)
     account = {"agentx_user_id": "user-1"}
     assert fake.step_calls == [
-        (account, "nanobot:telegram:42:7", 1),
-        (account, "nanobot:telegram:42:7", 2),
+        # amount 0 = the RPC prices the step itself, so no profiles read here.
+        (account, "nanobot:telegram:42:7", 1, 0),
+        (account, "nanobot:telegram:42:7", 2, 0),
     ]
     assert hook.charged_steps == 2
+
+
+@pytest.mark.asyncio
+async def test_credit_hook_bills_every_turn_of_a_session(monkeypatch) -> None:
+    """Two turns of one session must not share a step reference.
+
+    The RPC is idempotent per (task_ref, step): a shared reference would bill
+    the first turn and then answer every later turn as already_charged - paid
+    once, then free.
+    """
+    fake = FakeSupabase()
+    monkeypatch.setattr(supabase_credit, "SupabaseAuth", lambda: fake)
+    for _ in range(2):
+        hook = supabase_credit.SupabaseCreditHook(AgentTurnHookContext(
+            channel="websocket",
+            chat_id="user-1",
+            session_key="websocket:user-1",
+            metadata={"supabase_user_id": "user-1"},
+        ))
+        await hook.before_iteration(AgentHookContext(iteration=0, messages=[]))
+    refs = [call[1] for call in fake.step_calls]
+    assert len(refs) == 2
+    assert len(set(refs)) == 2
+    assert all(ref.startswith("nanobot:websocket:user-1:") for ref in refs)
 
 
 @pytest.mark.asyncio

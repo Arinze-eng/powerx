@@ -86,6 +86,21 @@ async def test_charge_step_lets_the_rpc_apply_the_drain_rate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_charge_step_passes_a_flat_price_through() -> None:
+    """A flat-priced operation (Puter media) keeps its own price, not a step's."""
+    client = FakeSupabase()
+    await client.charge_step(
+        {"agentx_user_id": "11111111-1111-1111-1111-111111111111"},
+        "telegram:puter:-100123:7",
+        1,
+        amount=1,
+    )
+    call = next(call for call in client.calls if call[1] == "/rest/v1/rpc/consume_cloud_task_step_credits")
+    assert call[3]["p_amount"] == 1
+    assert call[3]["p_step_no"] == 1
+
+
+@pytest.mark.asyncio
 async def test_balance_is_one_rpc_and_reports_the_start_gate() -> None:
     client = FakeSupabase()
     result = await client.balance({"agentx_user_id": "11111111-1111-1111-1111-111111111111"})
