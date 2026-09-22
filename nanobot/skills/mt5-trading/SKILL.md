@@ -13,12 +13,38 @@ is ~800 MB and the terminal is an amd64 GUI app.
 
 ## The one rule that matters
 
-**`install` returns immediately.** A full Wine + MT5 + bridge install needs
-~10–25 minutes, but every sandbox command is capped (900 s on Novita). So the
-installer is launched *detached* and you poll `status` until it finishes.
+**`install` waits for you now — never hand the wait back to the user.**
 
-Do **not** retry `install` in a loop, and do not assume a `status` call that
-still says `in_progress` has failed. Poll patiently.
+A full Wine + MT5 + bridge install needs ~10–25 minutes, but every sandbox command
+is capped (900 s on Novita). So the installer runs *detached* and the tool polls
+`status` internally until it hits a terminal stage, then returns **once**.
+
+That means:
+
+* **Never** say "it's installing, tell me when to check again."
+* **Never** ask "should I check the status now?" — that is the stall this
+  playbook exists to prevent.
+* **Never** stop at `stage="installing"` and wait for the user to prompt you.
+  You own the wait. Poll `status` yourself, in a loop, until `stage="done"`.
+* A `status` that still says an in-progress stage has **not** failed. Keep going.
+
+Do **not** retry `install` in a loop either — one call is enough, and re-running it
+while an install is live is wasted work.
+
+### When the wait budget runs out
+
+The internal wait is capped (`MT5_INSTALL_WAIT_SECONDS`, default 1500 s). If it
+returns `poll_timeout: true`, the install is **progressing, not broken**. Call
+`action='status'` again immediately and keep polling. Do not restart, do not
+re-run `install`, do not ask the user anything.
+
+### Broker installer URLs are validated
+
+`broker_installer_url` is checked **before** the sandbox is touched. A slug with a
+missing TLD (e.g. `exness.technologies` instead of `exness.technologies.ltd`) is
+rejected with a clear message instead of burning a two-minute Wine install and
+then dying as `could not download the MT5 installer`. If you see a rejection, fix
+the slug from the broker's own "Download MT5" page — do not retry the same URL.
 
 ## The installation rule (this is what you were getting wrong)
 
@@ -48,16 +74,15 @@ fix that, and compile again.
 ## Canonical workflow
 
 ```
-1. mt5_sandbox(action="install")            # starts the detached install
-2. mt5_sandbox(action="status")             # poll every few minutes
-     -> stage="bootstrap"|"wine"|"wineprefix"|"download"|"mt5"|"winpython"|"bridge"
-     -> stage="done"  (installed=true)      # proceed
+1. mt5_sandbox(action="install")            # installs AND waits to a terminal stage
+     -> stage="done"  (installed=true)      # proceed immediately
      -> stage="failed"                      # read message + log_tail, fix, retry install
-3. mt5_sandbox(action="start", login=<acct>, password=<pw>, server="<broker-server>")
+     -> poll_timeout=true                   # still running: poll status again, keep waiting
+2. mt5_sandbox(action="start", login=<acct>, password=<pw>, server="<broker-server>")
      -> launches terminal64.exe under Xvfb in portable mode with the login seeded
      -> returns ipc_ready=true once the account is live
-4. mt5_sandbox(action="account")            # confirm balance/equity/currency
-5. mt5_sandbox(action="quote", symbols="EURUSD XAUUSD")
+3. mt5_sandbox(action="account")            # confirm balance/equity/currency
+4. mt5_sandbox(action="quote", symbols="EURUSD XAUUSD")
    mt5_sandbox(action="candles", symbol="EURUSD", timeframe="M15", count=200)
 ```
 

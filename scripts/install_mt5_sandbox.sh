@@ -94,20 +94,49 @@ log() { printf '[mt5-install] %s\n' "$*" >&2; }
 fetch_url() {
   local url="$1" dest="$2" min_bytes="${3:-1000000}"
   local tries="${MT5_DOWNLOAD_TRIES:-5}" delay="${MT5_DOWNLOAD_BACKOFF:-5}"
-  local i=1 size=0
+  local i=1 size=0 code=""
 
   while [ "${i}" -le "${tries}" ]; do
     rm -f "${dest}"
 
     # Primary: curl. Secondary: wget — a different TLS/HTTP stack, so a curl-only
     # failure (stale keep-alive connection, TLS hiccup) can still succeed here.
-    if curl -fsSL --connect-timeout 20 --max-time 600 -o "${dest}" "${url}" 2>/dev/null; then
-      size="$(stat -c %s "${dest}" 2>/dev/null || echo 0)"
-      if [ "${size}" -ge "${min_bytes}" ]; then
-        return 0
-      fi
-      log "WARN: ${url} returned only ${size} bytes (< ${min_bytes}); retrying"
-    fi
+    #
+    # The HTTP code is captured so a DEFINITIVE client error (404/403/410) can be
+    # told apart from a transient one. A wrong URL never becomes right, so
+    # retrying it just delays the diagnosis; a 5xx or a connection reset very
+    # often does clear on the next attempt.
+    #
+    # `code` is normalised to 3 digits: curl already prints `000` when it cannot
+    # connect, so appending another would yield `000000`. Take the LAST 3 chars.
+    code="$(curl -sSL --connect-timeout 20 --max-time 600 -o "${dest}" \
+      -w '%{http_code}' "${url}" 2>/dev/null)"
+    code="${code: -3}"
+    [ -n "${code}" ] || code="000"
+
+    case "${code}" in
+      2*)
+        size="$(stat -c %s "${dest}" 2>/dev/null || echo 0)"
+        if [ "${size}" -ge "${min_bytes}" ]; then
+          return 0
+        fi
+        log "WARN: ${url} returned only ${size} bytes (< ${min_bytes}); retrying"
+        ;;
+      404|403|410)
+        # Not retryable: the resource is not there. Surface the URL so a typo (a
+        # dropped TLD in a broker slug is the common case) is immediately visible.
+        log "FATAL: ${url} returned HTTP ${code} — the URL is wrong, not slow. "\
+"Check the broker installer slug; retrying cannot fix a 404."
+        rm -f "${dest}"
+        return 2
+        ;;
+      000)
+        log "WARN: could not connect to ${url} (attempt ${i}/${tries})"
+        ;;
+      *)
+        log "WARN: ${url} returned HTTP ${code} (attempt ${i}/${tries})"
+        ;;
+    esac
 
     if wget -q --timeout=60 --tries=1 -O "${dest}" "${url}" 2>/dev/null; then
       size="$(stat -c %s "${dest}" 2>/dev/null || echo 0)"
@@ -624,8 +653,13 @@ if [ ! -f "${DONE_MARKER}" ]; then
     _dl_url="${MT5_BROKER_INSTALLER_URL:-${MT5_INSTALLER_URL}}"
     # MT5's installer is ~5 MB (branded) to ~24 MB (generic); require a plausible
     # size so a truncated/error-page "200" is not mistaken for the real thing.
-    fetch_url "${_dl_url}" "${INSTALLER}" 1000000 \
-      || { status failed "could not download the MT5 installer from ${_dl_url}"; exit 4; }
+    _dl_rc=0
+    fetch_url "${_dl_url}" "${INSTALLER}" 1000000 || _dl_rc=$?
+    case "${_dl_rc}" in
+      0) : ;;
+      2) status failed "broker installer URL is wrong (404): ${_dl_url} — check the broker slug (e.g. exness.technologies.ltd, not exness.technologies)"; exit 4 ;;
+      *) status failed "could not download the MT5 installer from ${_dl_url}"; exit 4 ;;
+    esac
   fi
 
   # ------------------------------------------------------------------ #

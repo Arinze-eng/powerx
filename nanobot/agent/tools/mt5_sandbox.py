@@ -35,10 +35,12 @@ Safety model
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import shlex
+import time
 from pathlib import Path
 from typing import Any
 
@@ -268,6 +270,94 @@ def _sh(value: Any) -> str:
     return shlex.quote(str(value))
 
 
+#: A broker-branded MT5 installer URL, as published on the broker's own
+#: "Download MT5" page. Exness is ``exness.technologies.ltd``.
+#:
+#: WHY THIS IS VALIDATED AT ALL: the slug is easy to get subtly wrong, and
+#: getting it wrong is *silent*. A missing TLD (``exness.technologies``) still
+#: looks like a perfectly good URL, and the CDN answers a flat 404 — so the
+#: install burns two minutes on Wine, then dies with "could not download the MT5
+#: installer", which reads like a network fault rather than a typo. Reproduced
+#: 2026-09-22: an agent-supplied URL with the ``.ltd`` dropped 404'd five times
+#: in a row while the correct URL returned 200 and 5,156,488 bytes.
+_BROKER_URL_RE = re.compile(
+    r"^https://download\.mql5\.com/cdn/web/(?P<slug>[A-Za-z0-9][A-Za-z0-9.\-]*)/mt5/(?P<name>[A-Za-z0-9._\-]+)\.exe$"
+)
+
+#: Broker slugs verified to work, so a legitimate slug is never second-guessed.
+#: Exness is the one this deployment uses; the value is the full slug.
+_KNOWN_GOOD_SLUGS = frozenset({"exness.technologies.ltd"})
+
+#: A slug's final label should look like a public suffix. This is what catches the
+#: real failure: ``exness.technologies`` and ``exness.technologies.ltd`` both have
+#: dots, so a naive "does it have a dot" test passes the broken one. The last label
+#: is what differs — ``ltd`` is suffix-shaped, ``technologies`` is not.
+_SUFFIX_RE = re.compile(r"^[A-Za-z]{2,12}$")
+
+#: Multi-label public suffixes where the second-to-last label is generic, e.g.
+#: ``example.co.uk`` / ``broker.com.br``. Not exhaustive — it only needs to avoid
+#: false rejections, since the fallback is a warning-free pass for known slugs.
+_GENERIC_SLDS = frozenset({"co", "com", "org", "net", "gov", "ac", "edu"})
+
+#: Stages that mean "stop waiting" — the installer will not progress further.
+#: ``done`` is success; ``failed`` is a real install error with a log tail.
+_TERMINAL_STAGES = frozenset({"done", "failed"})
+
+
+def validate_broker_installer_url(url: str) -> str | None:
+    """Return an error message if ``url`` is not a usable broker installer URL.
+
+    Catches the failure *before* the sandbox is touched, so a typo costs zero
+    install time. An empty URL is fine — that selects the generic terminal.
+    """
+    candidate = (url or "").strip()
+    if not candidate:
+        return None
+    if not candidate.startswith("https://"):
+        return (
+            f"broker_installer_url must be https:// (got {candidate!r}). "
+            "MT5 installers are only served over TLS."
+        )
+
+    match = _BROKER_URL_RE.match(candidate)
+    if not match:
+        return (
+            f"broker_installer_url is not a recognised MT5 broker installer URL: "
+            f"{candidate!r}. Expected "
+            "https://download.mql5.com/cdn/web/<broker-slug>/mt5/<name>setup.exe "
+            "(e.g. https://download.mql5.com/cdn/web/exness.technologies.ltd/"
+            "mt5/exness5setup.exe). Copy the link from the broker's own "
+            "'Download MT5' page."
+        )
+
+    slug = match.group("slug")
+    if slug in _KNOWN_GOOD_SLUGS:
+        return None
+
+    labels = slug.split(".")
+    if len(labels) < 2:
+        return (
+            f"broker_installer_url slug {slug!r} has no TLD, which usually means a "
+            "truncated slug (Exness is 'exness.technologies.ltd', not 'exness'). "
+            "Verify the link on the broker's own 'Download MT5' page."
+        )
+
+    last = labels[-1]
+    second_last = labels[-2] if len(labels) >= 2 else ""
+    if not _SUFFIX_RE.match(last) or (
+        len(last) > 6 and second_last.lower() not in _GENERIC_SLDS
+    ):
+        return (
+            f"broker_installer_url slug {slug!r} looks truncated: its final label "
+            f"{last!r} is not TLD-shaped. This is the classic dropped-TLD typo — "
+            "Exness is 'exness.technologies.ltd', and 'exness.technologies' returns "
+            "a permanent 404. Copy the exact link from the broker's own "
+            "'Download MT5' page and retry. If the slug really is correct, pass the "
+            "known-good value and it will not be second-guessed."
+        )
+    return None
+
+
 def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
     """Translate tool kwargs into an ``mt5_cli.py`` invocation."""
     parts = ["python3", _CLI_PATH, action]
@@ -450,9 +540,14 @@ class MT5SandboxTool(Tool):
             "terminal on the application host. "
             "MANDATORY FIRST STEP: any MT5/MQL5 work — including compiling an .mq5 the "
             "user just gave you — MUST begin with action='install' (starts a DETACHED "
-            "Wine + Xvfb + MT5 + python bridge install inside the sandbox), then poll "
-            "action='status' until stage='done' (a full install takes ~2-25 min; "
-            "sandbox commands are timeout-capped so the install is never run inline). "
+            "Wine + Xvfb + MT5 + python bridge install inside the sandbox). action="
+            "'install' then WAITS for the install itself and returns only when it "
+            "reaches a terminal stage (~2-25 min) — so you do NOT need to tell the "
+            "user to check back later, and you must NEVER ask them whether to check "
+            "again: one call finishes the job. If it still reports stage='installing' "
+            "after the wait budget, the install is progressing normally — poll "
+            "action='status' yourself, in a loop, until stage='done', without asking "
+            "the user anything. ",
             "Only then call action='start' WITH login/password/server — all three in "
             "ONE call; that writes the terminal's /config: credentials file. A "
             "terminal left running from the install (status shows "
@@ -565,6 +660,17 @@ class MT5SandboxTool(Tool):
         ):
             return ToolResult.error(f"action={action} requires 'symbol'.")
 
+        # Validate the broker installer URL BEFORE touching the sandbox. A mistyped
+        # slug (e.g. a dropped TLD) is a permanent 404, and discovering it only
+        # after a ~2-minute Wine install wastes the run and misreports the cause as
+        # a download failure. Rejecting it here makes the typo the error message.
+        if action == "install":
+            url_error = validate_broker_installer_url(
+                str(kwargs.get("broker_installer_url") or "")
+            )
+            if url_error:
+                return ToolResult.error(url_error)
+
         sandbox = _sandbox_tool(getattr(self, "_ctx", None))
         if sandbox is None:
             return ToolResult.error(
@@ -650,6 +756,16 @@ class MT5SandboxTool(Tool):
         if "password" in payload:
             payload["password"] = "***"
 
+        # action='install' is detached and reports "installing" immediately. Rather
+        # than handing that back and hoping the model comes back to poll (the stall
+        # this fixes), wait for a terminal stage here so one call does the whole job.
+        if action == "install" and str(payload.get("stage") or "") == "installing":
+            waited = await self._wait_for_install(sandbox)
+            if waited:
+                if "password" in waited:
+                    waited["password"] = "***"
+                payload = waited
+
         if payload.get("ok") is False:
             # The chain-not-installed case must not be returned as a plain error.
             # Given an error, models consistently "helpfully" hand the .mq5 back to
@@ -663,17 +779,72 @@ class MT5SandboxTool(Tool):
 
         return json.dumps(payload)
 
+    async def _wait_for_install(self, sandbox: Any) -> dict[str, Any]:
+        """Poll ``status`` until provisioning reaches a terminal stage.
+
+        WHY THIS EXISTS: ``install`` is detached, so the tool used to hand the model
+        an "installing, go poll" instruction and stop there. A model that then asked
+        the user "should I check again?" produced exactly the stall this fixes — the
+        work was still progressing, but nothing advanced it without a human nudge.
+        Polling here keeps the loop closed inside one tool call: the agent owns the
+        wait instead of delegating it back to the operator.
+
+        Bounded on purpose: a full install is ~2-25 min, and this must never hang a
+        run forever. ``MT5_INSTALL_WAIT_SECONDS`` (default 1500 s / 25 min) caps it.
+        """
+        budget = int(os.getenv("MT5_INSTALL_WAIT_SECONDS", "1500") or 1500)
+        interval = int(os.getenv("MT5_INSTALL_POLL_SECONDS", "30") or 30)
+        deadline = time.monotonic() + budget
+        last: dict[str, Any] = {}
+
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                rendered = await sandbox.execute(
+                    action="run",
+                    command=(
+                        f"{bootstrap_command()} >/dev/null 2>&1 || true; "
+                        f"{build_cli_command('status', {})}"
+                    ),
+                    timeout=min(_TIMEOUTS["status"], max(30, int(remaining))),
+                )
+            except Exception as exc:  # noqa: BLE001 - keep polling on transport blips
+                logger.warning("mt5_sandbox: install poll failed ({})", exc)
+                await asyncio.sleep(interval)
+                continue
+
+            payload = _parse_payload(str(rendered))
+            if payload:
+                last = payload
+                stage = str(payload.get("stage") or "")
+                if stage in _TERMINAL_STAGES:
+                    return payload
+            await asyncio.sleep(interval)
+
+        # Out of budget but not failed — report the last stage honestly so the model
+        # knows this is "still working", not "broken".
+        if last:
+            last = dict(last)
+            last["poll_timeout"] = True
+            last["message"] = (
+                f"Install still running after {budget}s (last stage: "
+                f"{last.get('stage')!r}). It is progressing, not failed — poll "
+                "action='status' again rather than restarting the install."
+            )
+            return last
+        return {"stage": "unknown", "poll_timeout": True}
+
     async def _auto_provision(
         self, sandbox: Any, action: str, refusal: dict[str, Any]
     ) -> str:
-        """Start the detached install for the caller, then tell them to poll.
+        """Start the detached install, then WAIT for it and continue.
 
         Handing back an error is what produced the "the compiler is unavailable,
         please compile this locally" refusals: a model offered a concrete
         alternative always takes it. So the tool does the required first step
-        itself and returns a *started, keep waiting* result instead of a problem
-        to route around. The install is detached (the sandbox caps any single
-        command at 900 s while a full Wine + MT5 install takes far longer).
+        itself. It also now polls to a terminal stage instead of returning
+        "installing" and relying on the model (or the user) to come back — that
+        hand-off is what caused runs to stall mid-provision.
         """
         missing = ", ".join(refusal.get("missing") or []) or "the MT5 chain"
         kick = build_cli_command("install", {})
@@ -690,17 +861,49 @@ class MT5SandboxTool(Tool):
                 "user to compile the .mq5 by hand — the sandbox can build it."
             )
 
+        # Wait for a terminal stage before answering, so the caller does not have to
+        # re-prompt to make progress.
+        result = await self._wait_for_install(sandbox)
+        stage = str(result.get("stage") or "")
+
+        if stage == "done":
+            return json.dumps(
+                {
+                    "ok": True,
+                    "stage": "done",
+                    "auto_provisioned": True,
+                    "requested_action": action,
+                    "was_missing": refusal.get("missing") or [],
+                    "message": (
+                        f"MT5 was not installed ({missing}). The tool installed the "
+                        f"Wine + MetaTrader 5 + MetaEditor chain itself and it is now "
+                        f"ready — no user action was needed."
+                    ),
+                    "next": f"Retry action='{action}' now.",
+                }
+            )
+
+        if stage == "failed":
+            return ToolResult.error(
+                f"MT5 install failed in the sandbox: "
+                f"{result.get('message') or 'unknown error'}. Provisioning started "
+                "automatically; the failure is a real install error, not a missing "
+                "step. Read the log tail before retrying action='install'."
+            )
+
+        # Still running after the budget (or an unrecognised stage): report honestly
+        # and tell the model to keep polling rather than restart anything.
         return json.dumps(
             {
                 "ok": False,
-                "stage": "installing",
+                "stage": stage or "installing",
                 "auto_provisioned": True,
                 "requested_action": action,
                 "was_missing": refusal.get("missing") or [],
                 "message": (
-                    f"MT5 was not installed ({missing}), so this call started the "
-                    "Wine + MetaTrader 5 + MetaEditor install in the sandbox for you. "
-                    "It runs detached and takes ~2-25 minutes."
+                    f"MT5 was not installed ({missing}), so the tool started the "
+                    "Wine + MetaTrader 5 + MetaEditor install and has been polling it. "
+                    f"It is still running after the wait budget (last stage: {stage!r})."
                 ),
                 "next": (
                     "Poll mt5_sandbox(action='status') until stage='done', then retry "
