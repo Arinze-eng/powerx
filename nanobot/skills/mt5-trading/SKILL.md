@@ -15,9 +15,14 @@ is ~800 MB and the terminal is an amd64 GUI app.
 
 **`install` waits for you now — never hand the wait back to the user.**
 
-A full Wine + MT5 + bridge install needs ~10–25 minutes, but every sandbox command
-is capped (900 s on Novita). So the installer runs *detached* and the tool polls
-`status` internally until it hits a terminal stage, then returns **once**.
+A full Wine + MT5 + bridge install needs ~10–25 minutes, but **every sandbox
+command is capped at 120 s** — nothing the tool sends may run longer than that.
+So the installer runs *detached* and the tool polls `status` internally, in
+≤120 s steps, until it hits a terminal stage, then returns **once**.
+
+Keep that ceiling when you run anything by hand: any command you compose (a test
+suite, a probe, a `status`) must finish inside 120 s. Use `timeout 100 …`, and
+split anything longer into separate calls rather than raising the timeout.
 
 That means:
 
@@ -74,7 +79,9 @@ fix that, and compile again.
 ## Canonical workflow
 
 ```
-1. mt5_sandbox(action="install")            # installs AND waits to a terminal stage
+1. mt5_sandbox(action="install", server="<broker-server>")
+                                            # THE SERVER PICKS THE BUILD -- never assume
+                                            # one broker matches the deployment
      -> stage="done"  (installed=true)      # proceed immediately
      -> stage="failed"                      # read message + log_tail, fix, retry install
      -> poll_timeout=true                   # still running: poll status again, keep waiting
@@ -88,6 +95,29 @@ fix that, and compile again.
 
 Quotes and orders **require an account**. A terminal with no login exposes no
 symbols over IPC and `start` reports `ipc_ready=false` with a hint.
+
+## Always pass `server` — the server chooses the terminal build
+
+An MT5 terminal can only resolve a server name that its own `Config/servers.dat`
+carries. A build for broker A therefore **cannot** log in to broker B's server,
+and MT5 does not say so: it skips the connection silently, writes **zero
+`Network` lines**, and the bridge then blocks until its IPC timeout. It looks
+like a frozen terminal.
+
+So the server name is the input, and it goes to `install` as well as `start`:
+
+* `install` with `server` resolves the matching build, installs it, and records
+  which build landed. Do **not** assume the deployment's default broker — that
+  hardcoding is what made a MetaQuotes-Demo account hang against an Exness
+  terminal.
+* `start`/`login` re-check the request against the installed build *before*
+  touching MT5 and refuse in under a second with `failure:
+  "server_not_in_terminal"` rather than hanging.
+* When they refuse for a broker the tool can install, the tool installs that
+  build and **replays the action itself** — one `start` call is enough.
+* For a broker the tool does not know, pass the broker's own download link:
+  `broker_installer_url` + `broker_dir_name`. Never guess a URL — unverified
+  slugs on `download.mql5.com` 404.
 
 ## Compile loop (MQL5)
 
@@ -201,6 +231,9 @@ with `NOVITA_SANDBOX_MEMORY_MB=4096`) and the installer refuses to start below
 | `status` stuck on `wineprefix` | Wine's first boot does one-time registry work; it is slow but bounded. Keep polling. |
 | `stage="failed"`, `insufficient memory` | Sandbox too small. Raise `NOVITA_SANDBOX_MEMORY_MB` and recreate. |
 | `start` returns `ipc_ready=false` | No broker login. Pass `login`/`password`/`server` to `start`. |
+| `failure: "server_not_in_terminal"` | The terminal on the box cannot resolve that server (wrong broker's build). The payload names the build to install — or pass the broker's download link if it is not in the registry. Never retry the same login against the same terminal. |
+| `failure: "no_network_activity"` | The login produced **zero** `Network` lines, so the server name never resolved — a build problem, not credentials. A wrong password *does* write a `Network` line. |
+| A login sits for minutes and then reports `-10005 IPC timeout` | Old signature of this bug, before the preflight refusal existed. Read `logs/<date>.log` for `Network` lines before blaming Wine or IPC. |
 | `unimplemented function ucrtbase.dll.crealf` | **numpy 2.x**, not the MT5 package. Wine's builtin `ucrtbase.dll` has no `crealf`; numpy 2.x calls it at import. The installer pins `numpy<2` (verified: 2.4.6 aborts, 1.26.4 imports). `winetricks vcrun2022` and `DllOverrides`→native do **not** fix it. |
 | bridge call hangs until the 900 s command timeout, no error | Wine started `winedbg` on an unimplemented call and is waiting on a dialog nobody can answer. The installer sets `HKCU\Software\Wine\WineDbg\ShowCrashDialog=0` so it aborts fast. |
 | `order` fails with `AttributeError: ... 'SYMBOL_FILLING_FOK'` | Old bug, now fixed: the package exports only `ORDER_FILLING_*`. `filling_mode` is a bitmask (1=FOK, 2=IOC, 4=RETURN); `order`/`close` retry each supported mode. |

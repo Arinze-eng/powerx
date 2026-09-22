@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-22.5"
+_CLI_VERSION = "2026-09-22.6"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -88,7 +88,7 @@ _BOOTSTRAP_LOG = f"{_MT5_HOME}/bin/.bootstrap.log"
 #: ``status``. Keeping this in sync with the sandbox ceiling matters: if the
 #: install were run inline it would be killed mid-prefix-build.
 _MAX_SANDBOX_COMMAND_TIMEOUT = 900
-_INSTALL_COMMAND_TIMEOUT = 240
+_INSTALL_COMMAND_TIMEOUT = 120
 
 #: Actions that move money. Blocked unless explicitly enabled.
 _TRADING_ACTIONS = frozenset({"order", "close", "close_all"})
@@ -119,17 +119,17 @@ _ALL_ACTIONS = sorted(
 #: ``compile`` gets nearly the full 900 s sandbox cap rather than 360 s.
 _TIMEOUTS: dict[str, int] = {
     "install": _INSTALL_COMMAND_TIMEOUT,
-    "status": 180,
-    "start": 900,
-    "stop": 60,
-    "doctor": 300,
-    "compile": 900,
-    "candles": 300,
-    "symbols": 300,
-    "history": 300,
-    "run": 300,
+    "status": 120,
+    "start": 120,
+    "stop": 120,
+    "doctor": 120,
+    "compile": 120,
+    "candles": 120,
+    "symbols": 120,
+    "history": 120,
+    "run": 120,
 }
-_DEFAULT_TIMEOUT = 300
+_DEFAULT_TIMEOUT = 120
 
 
 def _sandbox_tool(ctx: ToolContext | None) -> Any:
@@ -358,6 +358,19 @@ def validate_broker_installer_url(url: str) -> str | None:
     return None
 
 
+#: Server-name prefixes that resolve to a broker build WITHOUT asking the user for
+#: their broker's download link. Mirrors ``BROKER_BUILDS`` in ``scripts/mt5_cli.py``
+#: (the CLI is authoritative about what it installs; this only decides whether the
+#: tool can finish an install on its own). MetaQuotes' own demo servers resolve on
+#: the generic build, which needs no broker URL at all.
+_KNOWN_SERVER_PREFIXES = ("metaquotes", "exness")
+
+
+def _server_is_known(server: str | None) -> bool:
+    name = (server or "").strip().lower()
+    return bool(name) and any(name.startswith(prefix) for prefix in _KNOWN_SERVER_PREFIXES)
+
+
 def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
     """Translate tool kwargs into an ``mt5_cli.py`` invocation."""
     parts = ["python3", _CLI_PATH, action]
@@ -374,6 +387,14 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
         broker_dir = kwargs.get("broker_dir_name")
         if broker_dir:
             parts.insert(0, f"MT5_BROKER_DIR_NAME={_sh(broker_dir)}")
+        # The SERVER decides which build is installed, so passing it here is what
+        # makes the FIRST install correct for any broker instead of paying for a
+        # re-install after a refused login. The CLI resolves it against the broker
+        # registry and sets MT5_BROKER_INSTALLER_URL / _DIR_NAME / _KEY itself, so
+        # one flag covers every registered broker.
+        server = kwargs.get("server")
+        if server:
+            parts += ["--server", _sh(server)]
         parts += ["--script", _INSTALLER_PATH]
         if kwargs.get("timeout"):
             parts += ["--timeout", str(int(kwargs["timeout"]))]
@@ -384,7 +405,12 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
     elif action == "status":
         parts += ["--lines", str(int(kwargs.get("lines") or 25))]
     elif action == "start":
-        parts += ["--wait", str(int(kwargs.get("wait") or 180))]
+        # The wait MUST fit inside this action's own command ceiling: a command
+        # killed by the sandbox returns no JSON at all, which reads as "the tool is
+        # broken" rather than "the terminal was still authorizing". A login that
+        # outlives it is not lost -- the terminal keeps authorizing in the
+        # background, so the next account/start call sees the account.
+        parts += ["--wait", str(min(int(kwargs.get("wait") or 90), 100))]
         # Credentials can be supplied here so the terminal auto-connects on boot,
         # which is the only way to get IPC without a GUI login.
         for flag in ("login", "password", "server"):
@@ -586,7 +612,7 @@ class MT5SandboxTool(Tool):
                 "action": {"type": "string", "enum": _ALL_ACTIONS},
                 "login": {"type": "integer", "description": "MT5 account number (action=login, or action=start to connect on boot)."},
                 "password": {"type": "string", "description": "MT5 password (action=login, or action=start). Pass login+password+server together or none of them."},
-                "server": {"type": "string", "description": "Broker server, e.g. 'ICMarkets-Demo' or 'MetaQuotes-Demo' (action=login, or action=start)."},
+                "server": {"type": "string", "description": "Broker server the account lives on, e.g. 'Exness-MT5Trial9' or 'MetaQuotes-Demo'. Pass it to action=install as well as start/login: it selects the matching MT5 build, because a terminal can only resolve server names its own build carries."},
                 "path": {"type": "string", "description": "Explicit terminal64.exe path override (action=login)."},
                 "symbol": {"type": "string", "description": "Trading symbol, e.g. EURUSD (quote/candles/symbol/order)."},
                 "filter": {"type": "string", "description": "action=symbols: case-insensitive substring to match symbol names."},
@@ -611,7 +637,7 @@ class MT5SandboxTool(Tool):
                 "timeout": {"type": "integer", "description": "Command timeout override in seconds."},
                 "foreground": {"type": "boolean", "description": "action=install: run inline instead of detached. Only safe when no command-timeout ceiling applies."},
                 "portable": {"type": "boolean", "description": "action=start: launch the terminal in portable mode so a seeded config/login is used."},
-                "broker_installer_url": {"type": "string", "description": "action=install: URL of the BROKER's branded MT5 installer (e.g. https://download.mql5.com/cdn/web/<broker-slug>/mt5/<name>setup.exe). STRONGLY recommended for any real broker: MetaQuotes' generic terminal ships no broker server list, so broker logins silently never happen (zero 'Network' log lines, then '-10005 IPC timeout' from the bridge)."},
+                "broker_installer_url": {"type": "string", "description": "action=install: URL of the BROKER's branded MT5 installer (e.g. https://download.mql5.com/cdn/web/<broker-slug>/mt5/<name>setup.exe). Use it for a broker that 'server' does not already resolve. MetaQuotes' generic terminal ships no broker server list, so broker logins silently never happen (zero 'Network' log lines, then '-10005 IPC timeout' from the bridge)."},
                 "broker_dir_name": {"type": "string", "description": "action=install: install directory name the branded installer creates, e.g. 'MetaTrader 5 EXNESS'. Pair with broker_installer_url."},
                 "dry_run": {"type": "boolean", "description": "For order/close: validate inputs and report the planned request without sending."},
             },
@@ -775,6 +801,18 @@ class MT5SandboxTool(Tool):
             # only forward path and nothing to negotiate around.
             if payload.get("stage") == "not_installed" and action != "install":
                 return await self._auto_provision(sandbox, action, payload)
+            # The OTHER silent dead-end: a terminal that cannot resolve the account's
+            # server name. MT5 does not error, it just never attempts the connection,
+            # so without this the run blocks on the bridge's IPC timeout and looks
+            # frozen. The CLI now detects the mismatch in under a second and names the
+            # build to install, so the tool installs it and replays the action.
+            if (
+                payload.get("failure") == "server_not_in_terminal"
+                and action in ("start", "login")
+            ):
+                return await self._auto_install_for_broker(
+                    sandbox, action, kwargs, payload
+                )
             return ToolResult.error(json.dumps(payload))
 
         return json.dumps(payload)
@@ -832,7 +870,141 @@ class MT5SandboxTool(Tool):
                 "action='status' again rather than restarting the install."
             )
             return last
-        return {"stage": "unknown", "poll_timeout": True}
+        # No poll completed at all (a zero budget, or every attempt failing): the
+        # install is still the only thing that can be true, so say "installing"
+        # rather than "unknown" -- "unknown" reads as "nothing is happening".
+        return {
+            "stage": "installing",
+            "poll_timeout": True,
+            "message": (
+                "The install was started and no status poll completed yet. It is "
+                "progressing, not failed -- poll action='status' again."
+            ),
+        }
+
+    async def _auto_install_for_broker(
+        self,
+        sandbox: Any,
+        action: str,
+        kwargs: dict[str, Any],
+        refusal: dict[str, Any],
+    ) -> str:
+        """Install the MT5 build that can resolve this server, then replay the action.
+
+        WHY THIS EXISTS: the server a user gives decides which broker build is needed,
+        and MT5 refuses to say so -- an unresolvable server name is skipped silently,
+        so the bridge blocks on its IPC timeout and the account call looks frozen.
+        Measured 2026-09-22: a MetaQuotes-Demo login against the Exness terminal sat
+        there for a minute with zero ``Network`` lines in the terminal log.
+
+        The CLI now detects that mismatch in under a second and returns
+        ``failure: server_not_in_terminal`` with the exact install to run, so the tool
+        runs it (once) and replays the original action instead of bouncing the user
+        back to "try installing your broker's terminal".
+        """
+        remedy = refusal.get("remedy") or {}
+        server = kwargs.get("server") or remedy.get("server")
+        install_kwargs: dict[str, Any] = {"server": server}
+        for key in ("broker_installer_url", "broker_dir_name"):
+            value = remedy.get(key)
+            # The placeholder URL in a refusal means "this broker is not registered
+            # yet" -- passing it through would install nothing useful.
+            if value and "<broker-slug>" not in str(value):
+                install_kwargs[key] = value
+
+        if not install_kwargs.get("broker_installer_url") and not _server_is_known(server):
+            return ToolResult.error(
+                json.dumps(
+                    {
+                        **refusal,
+                        "message": (
+                            f"The sandbox terminal cannot resolve server {server!r} and "
+                            "this broker is not in the agent's built-in registry, so the "
+                            "installer URL has to come from the broker's own "
+                            "'Download MT5' page (it is in the link to their MT5 "
+                            "download), or the deployment can register it once with "
+                            "MT5_BROKER_BUILDS='<server-prefix>|<url>|<install dir>'."
+                        ),
+                        "next": (
+                            "Ask the user for their broker's MT5 download link, then "
+                            f"retry action='install' with server={server!r} and "
+                            "broker_installer_url=<that link>."
+                        ),
+                    }
+                )
+            )
+
+        kick = build_cli_command("install", install_kwargs)
+        try:
+            await sandbox.execute(
+                action="run",
+                command=f"{bootstrap_command()} >/dev/null 2>&1 || true; {kick}",
+                timeout=_TIMEOUTS["install"],
+            )
+        except Exception as exc:  # noqa: BLE001 - transport-level failure
+            logger.warning("mt5_sandbox: broker install failed ({})", exc)
+            return ToolResult.error(
+                f"Installing the MT5 build for server {server!r} failed to start: "
+                f"{type(exc).__name__}: {exc}. Retry action='install' with "
+                f"server={server!r}."
+            )
+
+        result = await self._wait_for_install(sandbox)
+        stage = str(result.get("stage") or "")
+        if stage != "done":
+            return ToolResult.error(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "stage": stage or "installing",
+                        "failure": "broker_install_incomplete",
+                        "requested_server": server,
+                        "message": (
+                            f"The terminal this sandbox has cannot resolve server "
+                            f"{server!r}, so the matching MT5 build is being installed. "
+                            f"It is still running (last stage: {stage!r})."
+                        ),
+                        "next": (
+                            "Poll mt5_sandbox(action='status') until stage='done', then "
+                            f"retry action='{action}' with server={server!r}."
+                        ),
+                    }
+                )
+            )
+
+        # Replay the original action against the terminal that now matches the server.
+        replay_kwargs = dict(kwargs)
+        retry_command = (
+            f"{bootstrap_command()} >/dev/null 2>&1 || true; "
+            f"{build_cli_command(action, replay_kwargs)}"
+        )
+        try:
+            rendered = await sandbox.execute(
+                action="run",
+                command=retry_command,
+                timeout=int(kwargs.get("timeout") or _TIMEOUTS.get(action, _DEFAULT_TIMEOUT)),
+            )
+        except Exception as exc:  # noqa: BLE001 - transport-level failure
+            return ToolResult.error(
+                f"The matching MT5 build is installed, but retrying action='{action}' "
+                f"failed: {type(exc).__name__}: {exc}. Retry it now — no further install "
+                "is needed."
+            )
+
+        payload = _parse_payload(str(rendered)) or {}
+        if "password" in payload:
+            payload["password"] = "***"
+        payload["installed_build_for_server"] = server
+        payload["auto_installed_broker_terminal"] = True
+        payload.setdefault(
+            "message",
+            f"The sandbox had a terminal that could not resolve server {server!r}; the "
+            "tool installed the matching MT5 build itself and retried the action. No "
+            "user action was needed.",
+        )
+        if payload.get("ok") is False:
+            return ToolResult.error(json.dumps(payload))
+        return json.dumps(payload)
 
     async def _auto_provision(
         self, sandbox: Any, action: str, refusal: dict[str, Any]

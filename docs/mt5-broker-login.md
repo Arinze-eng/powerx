@@ -59,26 +59,86 @@ Measured table:
 
 ### Fix
 
-Install the **broker's own** MT5 build. Set these on the installer:
+Install the **broker's own** MT5 build. The input is the **server the account
+lives on** — never a broker baked into the deployment:
 
 ```bash
-MT5_BROKER_INSTALLER_URL="https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe"
-MT5_BROKER_DIR_NAME="MetaTrader 5 EXNESS"
+python3 ~/.mt5/bin/mt5_cli.py install --server Exness-MT5Trial9
 ```
+
+`--server` is matched against a registry (`BROKER_BUILDS` in `scripts/mt5_cli.py`)
+that maps a server-name prefix to the build that can resolve it:
+
+| Server prefix | Build | Install dir |
+|---|---|---|
+| `metaquotes` | generic (`MT5_INSTALLER_URL`) | `MetaTrader 5` |
+| `exness` | `exness.technologies.ltd/mt5/exness5setup.exe` | `MetaTrader 5 EXNESS` |
 
 Broker CDN slugs follow `download.mql5.com/cdn/web/<broker-slug>/mt5/<name>setup.exe`.
-Exness is `exness.technologies.ltd`. Find yours from the broker's own
-"Download MT5" page — the slug is in the link.
+Find yours on the broker's own "Download MT5" page — the slug is in the link.
 
-Through the agent tool:
+**Adding a broker needs no code change.** Export the registry from the deployment:
 
-```jsonc
-{"action": "install",
- "broker_installer_url": "https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe",
- "broker_dir_name": "MetaTrader 5 EXNESS"}
+```bash
+MT5_BROKER_BUILDS='icmarkets,ic.markets|https://download.mql5.com/cdn/web/<slug>/mt5/ic.exe|MetaTrader 5 IC Markets'
 ```
 
-Then `start` with login/password/server as before. No other step changes.
+Records are `prefix1,prefix2|<installer-url>|<install-dir>`, separated by `;`.
+Malformed records are ignored rather than failing the command — a bad hint must
+not disable every MT5 action. Only URLs that have actually been fetched belong
+here: guessed slugs on `download.mql5.com` 404 (`icmarkets.ltd`, `xm.global`,
+`trading.point.ltd`, `fbs.markets`, `pepperstone.group` were all tried).
+
+Through the agent tool the same thing is one call — it resolves the build from
+`server`, installs it, and (when the terminal on the box is a different broker's)
+replays the login automatically:
+
+```jsonc
+{"action": "start", "login": 10012768157, "password": "…", "server": "MetaQuotes-Demo"}
+{"action": "install", "server": "Exness-MT5Trial9"}                      // explicit
+{"action": "install", "server": "MyBroker-Demo",
+ "broker_installer_url": "https://…/mybroker5setup.exe",                  // not in the registry
+ "broker_dir_name": "MetaTrader 5 MyBroker"}
+```
+
+`broker_installer_url` / `broker_dir_name` remain for a broker the registry does
+not know; give the tool the broker's own download link and dir name for that.
+
+### Why the server, not the deployment
+
+Branded builds **coexist** in one prefix (the branded installer refuses to
+overwrite another broker's), so "which terminal is this" has to be recorded and
+re-checked, not assumed:
+
+* the installer writes `.installed.url` and `.broker_key` into `$MT5_ROOT`
+* the install is skipped only when the done marker **and** the URL match, so a
+  broker *switch* re-installs instead of short-circuiting on the old marker
+* `.terminal_path` (the resolved-terminal cache) is invalidated when the
+  requested broker differs from the cached one — it was never cleared before, so
+  after a switch `start` booted the **old** broker, silently
+
+### Fail fast on a build that cannot resolve the server
+
+`start` / `login` run `preflight_server()` before touching MT5. When the server
+belongs to a broker whose build is not the one installed — or the installed
+terminal is branded and the server is unknown — the command returns in **under a
+second** instead of blocking:
+
+```json
+{"ok": false, "failure": "server_not_in_terminal",
+ "installed_broker": "exness", "requested_server": "MetaQuotes-Demo",
+ "remedy": {"action": "install", "installer": "…", "dir_name": "MetaTrader 5"}}
+```
+
+Without it, MT5 does not error: it skips the connection and the bridge sits in
+`initialize()` until its IPC timeout, which is exactly the hang this whole
+document is about. An unknown server is never blocked preflight (`None`), because
+the CLI must not refuse what it cannot reason about.
+
+A second tell, when the login still produces no account: **zero `Network` lines**
+in `logs/<date>.log` means the name never resolved. A wrong password *does* write
+a `Network` line, so `start` reports `failure: "no_network_activity"` with the
+build to install rather than pretending the credentials were wrong.
 
 ### How to see this coming next time
 
@@ -202,14 +262,25 @@ $ python3 ~/.mt5/bin/mt5_cli.py account
 
 ## Checklist for a new broker
 
-1. Find the broker's branded MT5 download URL from their site.
-2. `install` with `broker_installer_url` + `broker_dir_name`.
-3. `doctor` → confirm `terminal_has_broker_servers: true`.
-4. `start` with login/password/server.
-5. `account` → expect `balance`; if you get `-10005`, read the terminal log for
-   `Network` lines before touching anything else.
-6. Confirm the broker server name is exact — e.g. `Exness-MT5Trial9`, not
+1. `doctor` → read `installed_broker` and `supported_server_prefixes`. If the
+   broker is already listed, nothing below the `install` step changes.
+2. Not listed? Find the broker's branded MT5 download URL on their site and
+   either export `MT5_BROKER_BUILDS`, or pass `broker_installer_url` +
+   `broker_dir_name` once.
+3. `install --server <broker server name>` (through the tool: `server` on the
+   `install` action). It resolves the build and records which one landed.
+4. `doctor` → confirm `installed_broker` matches and `terminal_has_broker_servers`
+   is `true`.
+5. `start` with login/password/server.
+6. `account` → expect `balance`. On `-10005`, read `logs/<date>.log`: **zero
+   `Network` lines means the server name did not resolve** (wrong build), while a
+   `Network` line without an authorization means credentials.
+7. Confirm the broker server name is exact — e.g. `Exness-MT5Trial9`, not
    `Exness-MT5Trial`. A near-miss fails like a wrong password.
+
+MetaQuotes' own demo servers (`MetaQuotes-Demo`) are the one case that resolves on
+the **generic** build, which is why the registry maps them to `url: ""` (the
+generic installer) rather than to a broker build.
 
 ## Environment notes
 

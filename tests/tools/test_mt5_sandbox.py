@@ -30,7 +30,10 @@ import pytest
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.mt5_sandbox import (
     MT5SandboxTool,
+    _INSTALL_COMMAND_TIMEOUT,
+    _TIMEOUTS,
     _parse_payload,
+    _server_is_known,
     bootstrap_command,
     build_cli_command,
 )
@@ -773,7 +776,7 @@ def test_require_installed_chain_passes_when_the_chain_exists(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_not_installed_refusal_auto_provisions_instead_of_erroring():
+async def test_not_installed_refusal_auto_provisions_instead_of_erroring(monkeypatch):
     """A missing chain must START the install, not return an error to route around.
 
     This is the regression that produced the user-visible failure. When ``compile``
@@ -788,6 +791,11 @@ async def test_not_installed_refusal_auto_provisions_instead_of_erroring():
     step itself and returns a *provisioning started* result, which leaves polling
     as the only next action.
     """
+    # The wait budget is 25 minutes in production, and the fake sandbox answers every
+    # status poll with the same non-terminal payload, so this test would otherwise
+    # stall the suite until that budget expired. Zero keeps exactly the part under
+    # test: the kick-off, and the refusal to hand the model an error to route around.
+    monkeypatch.setenv("MT5_INSTALL_WAIT_SECONDS", "0")
     payload = (
         '{"ok": false, "stage": "not_installed", "missing": ["wine", "metaeditor64.exe"],'
         ' "error": "chain missing"}\n[exit_code=5]'
@@ -1049,3 +1057,249 @@ def test_installer_waits_on_the_directory_it_actually_installed():
     ).read_text()
     assert "TERM_DISPLAY_NAME" in script
     assert 'Program Files/${TERM_DISPLAY_NAME}' in script
+
+
+# --------------------------------------------------------------------------- #
+# broker-agnostic installs: the server decides the build
+# --------------------------------------------------------------------------- #
+def _broker_cli(monkeypatch, tmp_path, *, broker_key=None, brands=(), broker_builds=None):
+    """Load the CLI against an isolated prefix that has ``brands`` installed.
+
+    ``broker_key`` is what the installer would have recorded in ``.broker_key``;
+    None means "an install from before that record existed", which the CLI has to
+    recognise from the install directory name instead.
+
+    ``broker_builds`` is the raw ``MT5_BROKER_BUILDS`` value a deployment would
+    export. It is passed through here rather than set by the caller because this
+    helper clears that variable so the built-in registry is what the other tests
+    see.
+    """
+    import os as _os
+
+    prefix = tmp_path / ".wine-mt5"
+    for brand in brands:
+        d = prefix / "drive_c" / "Program Files" / brand
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "terminal64.exe").write_bytes(b"MZ")
+    (tmp_path / ".mt5").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MT5_ROOT", str(tmp_path / ".mt5"))
+    monkeypatch.setenv("WINE_PREFIX", str(prefix))
+    monkeypatch.delenv("MT5_BROKER_DIR_NAME", raising=False)
+    monkeypatch.delenv("MT5_BROKER_BUILDS", raising=False)
+    if broker_builds is not None:
+        monkeypatch.setenv("MT5_BROKER_BUILDS", broker_builds)
+    cli = _load_cli_module()
+    if broker_key:
+        cli.BROKER_KEY_FILE.write_text(broker_key, encoding="utf-8")
+    assert _os.environ.get("MT5_ROOT") == str(tmp_path / ".mt5")
+    return cli
+
+
+def test_registry_maps_a_server_to_the_build_that_can_resolve_it(monkeypatch, tmp_path):
+    """The server name is the input; a hardcoded broker is what broke this.
+
+    MEASURED FAILURE (2026-09-22): the deployment installed the Exness build by
+    default and then logged in to ``MetaQuotes-Demo``. That name is not in the
+    Exness build's server database, so MT5 never attempted the connection -- zero
+    ``Network`` log lines, then the bridge blocked on its IPC timeout. The account
+    UI simply looked frozen.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+
+    assert cli.broker_for_server("Exness-MT5Trial9")["key"] == "exness"
+    assert cli.broker_for_server("MetaQuotes-Demo")["key"] == "metaquotes"
+    # Case-insensitive: brokers are typed by hand in chat.
+    assert cli.broker_for_server("exness-mt5trial")["key"] == "exness"
+    # Unknown is None, NOT an error: it means "cannot reason about this name".
+    assert cli.broker_for_server("SomeOtherBroker-Demo") is None
+    assert cli.broker_for_server(None) is None
+
+
+def test_preflight_refuses_the_server_this_terminal_cannot_resolve(monkeypatch, tmp_path):
+    """The refusal that replaces a silent 60-second hang with an instant answer."""
+    cli = _broker_cli(
+        monkeypatch, tmp_path, broker_key="exness", brands=("MetaTrader 5 EXNESS",)
+    )
+    terminal = cli.find_terminal()
+
+    refusal = cli.preflight_server(terminal, "MetaQuotes-Demo")
+    assert refusal is not None
+    assert refusal["ok"] is False
+    assert refusal["failure"] == "server_not_in_terminal"
+    assert refusal["installed_broker"] == "exness"
+    assert refusal["requested_server"] == "MetaQuotes-Demo"
+    # The remedy must be runnable without further thought: the generic build needs
+    # no installer URL, so the action alone is enough.
+    assert refusal["remedy"]["action"] == "install"
+    assert refusal["remedy"]["server"] == "MetaQuotes-Demo"
+    assert "MT5_BROKER_BUILDS" in refusal["remedy"].get("note", "")
+
+
+def test_preflight_refuses_a_broker_server_on_the_generic_terminal(monkeypatch, tmp_path):
+    """The original trap, now caught before a login is even attempted."""
+    cli = _broker_cli(
+        monkeypatch, tmp_path, broker_key="metaquotes", brands=("MetaTrader 5",)
+    )
+    terminal = cli.find_terminal()
+
+    refusal = cli.preflight_server(terminal, "Exness-MT5Trial9")
+    assert refusal is not None
+    assert refusal["failure"] == "server_not_in_terminal"
+    assert refusal["installed_broker"] == "metaquotes"
+    # A registered broker comes with its installer URL, so the fix is one call.
+    assert refusal["remedy"]["broker_installer_url"].endswith("exness5setup.exe")
+    assert refusal["remedy"]["broker_dir_name"] == "MetaTrader 5 EXNESS"
+
+
+def test_preflight_allows_the_matching_build(monkeypatch, tmp_path):
+    """The healthy path must stay silent -- a false refusal would be worse."""
+    cli = _broker_cli(
+        monkeypatch, tmp_path, broker_key="exness", brands=("MetaTrader 5 EXNESS",)
+    )
+    terminal = cli.find_terminal()
+    assert cli.preflight_server(terminal, "Exness-MT5Trial9") is None
+    # ...including with no server at all (the terminal is only being started).
+    assert cli.preflight_server(terminal, None) is None
+
+
+def test_preflight_never_blocks_an_unregistered_broker_on_a_generic_terminal(
+    monkeypatch, tmp_path
+):
+    """Unknown broker + generic build: unprovable, so do not refuse.
+
+    Refusing here would break a broker whose build happens to be unregistered but
+    whose servers DO resolve. The bounded wait in ``cmd_start`` reports that case
+    instead (zero ``Network`` lines), which is a diagnosis, not a guess.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path, broker_key="metaquotes", brands=("MetaTrader 5",))
+    assert cli.preflight_server(cli.find_terminal(), "SomeOtherBroker-Demo") is None
+    # ...and with nothing installed at all, install/doctor own that case.
+    cli2 = _broker_cli(monkeypatch, tmp_path / "empty")
+    assert cli2.preflight_server(cli2.find_terminal(), "SomeOtherBroker-Demo") is None
+
+
+def test_env_registry_extends_the_brokers_we_can_install(monkeypatch, tmp_path):
+    """A deployment must be able to add its broker without a code change."""
+    cli = _broker_cli(
+        monkeypatch,
+        tmp_path / "x",
+        broker_builds=(
+            "icmarkets,ic.markets|https://download.mql5.com/cdn/web/ic.example/"
+            "mt5/ic.exe|MetaTrader 5 IC Markets"
+        ),
+    )
+    build = cli.broker_for_server("ICMarkets-Demo")
+    assert build is not None and build["key"] == "icmarkets"
+    assert build["dir_name"] == "MetaTrader 5 IC Markets"
+    # A malformed record is ignored, not fatal: a bad hint must not disable MT5.
+    monkeypatch.setenv("MT5_BROKER_BUILDS", "just-a-prefix;also|bad")
+    assert cli.broker_for_server("Exness-MT5Trial9")["key"] == "exness"
+
+
+def test_find_terminal_honours_the_requested_broker(monkeypatch, tmp_path):
+    """A cached terminal from another broker must not win.
+
+    MEASURED FAILURE (2026-09-22): ``.terminal_path`` is written by ``find_terminal``
+    and was NEVER cleared. Two branded builds coexist in one prefix, so after a
+    broker switch the marker still pointed at the old terminal and ``start`` booted
+    the OLD broker -- silently, because an unresolvable server produces no error.
+    """
+    cli = _broker_cli(
+        monkeypatch,
+        tmp_path,
+        brands=("MetaTrader 5 EXNESS", "MetaTrader 5 XM"),
+    )
+    branded = cli.find_terminal()  # caches the branded build
+    assert branded is not None
+    cli.TERMINAL_MARKER.write_text(str(branded), encoding="utf-8")
+
+    chosen = cli.find_terminal(prefer_key="exness")
+    assert chosen == branded
+    # No preference -> the cache is fine.
+    assert cli.find_terminal() == branded
+
+
+def test_install_forwards_the_server_so_the_first_install_is_correct():
+    """One flag picks the right build, instead of re-installing after a refusal."""
+    cmd = build_cli_command("install", {"server": "MetaQuotes-Demo"})
+    assert "--server" in cmd and "MetaQuotes-Demo" in cmd
+    # Still detached-friendly and still pointed at the sandbox installer.
+    assert "install_mt5_sandbox.sh" in cmd
+
+
+def test_installer_records_which_build_landed_and_for_which_url():
+    """The marker answers "which terminal is this", not just "did it finish".
+
+    Both halves are load-bearing: the CLI reads the key to decide whether a login
+    can be resolved at all, and the URL comparison is what lets a broker SWITCH
+    re-run the install instead of short-circuiting on the previous broker's marker.
+    """
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
+    ).read_text(encoding="utf-8")
+
+    assert ".broker_key" in script
+    assert "MT5_BROKER_KEY" in script
+    assert ".installed.url" in script
+    assert '_PREV_URL}" = "${_RESOLVED_URL}"' in script
+    # A different broker's installer must not be reused from disk.
+    assert 'rm -f "${INSTALLER}"' in script
+
+
+def test_install_clears_the_cached_terminal_and_broker_record():
+    """Switching broker has to invalidate the cache, or the old terminal is reused."""
+    source = (
+        Path(__file__).resolve().parents[2] / "scripts" / "mt5_cli.py"
+    ).read_text(encoding="utf-8")
+
+    assert "for stale in (TERMINAL_MARKER, METAEDITOR_MARKER, BROKER_KEY_FILE):" in source
+
+
+def test_sandbox_polling_never_exceeds_120_seconds():
+    """Every command this tool runs inside the sandbox must fit a 120 s ceiling.
+
+    A command the sandbox kills returns NO JSON at all, which the model reads as
+    "the tool is broken" rather than "it was still working". So the per-action
+    ceilings stay at or under 120 s, and ``start``'s internal wait is capped below
+    it too -- a login that outlives one call is not lost, because the terminal keeps
+    authorizing in the background and the next ``account`` call sees it.
+    """
+    assert _INSTALL_COMMAND_TIMEOUT <= 120
+    for action, timeout in _TIMEOUTS.items():
+        assert timeout <= 120, f"{action} runs for {timeout}s, above the 120s ceiling"
+
+    start_wait = int(
+        build_cli_command("start", {"login": 1, "password": "x", "server": "s"}).split(
+            "--wait"
+        )[1].split()[0]
+    )
+    assert start_wait < 120, "the CLI wait must finish inside the command ceiling"
+
+    cli = _load_cli_module()
+    assert cli._PROBE_TIMEOUT < 120
+
+
+def test_start_diagnoses_an_unresolvable_server_from_the_log():
+    """Zero ``Network`` lines is MT5's only tell for "cannot resolve this server".
+
+    It is the one failure mode with no error anywhere: a wrong password DOES write a
+    ``Network`` line ("authorization failed"), an unresolvable server writes none.
+    The two need opposite fixes, so the timeout payload names the difference.
+    """
+    source = (
+        Path(__file__).resolve().parents[2] / "scripts" / "mt5_cli.py"
+    ).read_text(encoding="utf-8")
+    assert "def _terminal_network_lines(" in source
+    assert '"failure"] = "no_network_activity"' in source
+    assert "ZERO Network lines" in source
+
+
+def test_known_server_prefixes_match_the_cli_registry(monkeypatch, tmp_path):
+    """The tool's auto-install list must match what the CLI can actually resolve."""
+    cli = _broker_cli(monkeypatch, tmp_path)
+    for prefix in ("MetaQuotes-Demo", "Exness-MT5Trial9"):
+        assert _server_is_known(prefix) is True
+        assert cli.broker_for_server(prefix) is not None
+    assert _server_is_known("SomeOtherBroker-Demo") is False
+    assert _server_is_known(None) is False

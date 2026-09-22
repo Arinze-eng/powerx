@@ -62,7 +62,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-22.5"
+CLI_VERSION = "2026-09-22.6"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -95,7 +95,7 @@ _LOG_PAYLOAD_BUDGET = 7_000
 #: Per-file cap for a single log tail (before the whole-payload budget above).
 _LOG_TAIL_MAX_CHARS = 4_000
 #: How long one readiness probe may block inside ``start``.
-_PROBE_TIMEOUT = 90
+_PROBE_TIMEOUT = 45
 #: Budget for list-heavy payloads (``symbols`` inventories).
 _LIST_PAYLOAD_BUDGET = 6_000
 
@@ -105,6 +105,280 @@ _LIST_PAYLOAD_BUDGET = 6_000
 #: box clock by that offset (measured +3 h on MetaQuotes-Demo). Anything beyond a
 #: full zone range is not an offset, it is a market that stopped ticking.
 _ZONE_SKEW_TOLERANCE_S = 14 * 3600
+
+#: Where the installer records WHICH MT5 build it laid down (the key of an entry
+#: in :data:`BROKER_BUILDS`). Read by :func:`installed_broker_key` so a requested
+#: server can be checked against the terminal that is actually on disk.
+BROKER_KEY_FILE = MT5_ROOT / ".broker_key"
+
+
+# --------------------------------------------------------------------------- #
+# broker resolution: which build can resolve which server
+# --------------------------------------------------------------------------- #
+#: Server-name -> the MT5 build whose ``Config/servers.dat`` carries that broker.
+#:
+#: WHY THIS EXISTS (measured 2026-09-22, real Runloop devbox): an MT5 terminal can
+#: only resolve a server name its OWN server database carries. MetaQuotes' GENERIC
+#: build ships an empty list, a branded build carries only its own broker's servers
+#: -- and when a name does not resolve, MT5 does **not** error. It silently skips
+#: the connection: ZERO ``Network`` log lines, then ``-10005 IPC timeout`` from the
+#: bridge, which points at Wine/IPC and costs hours debugging the wrong layer. So
+#: the build must be chosen from the SERVER the account lives on, not from a broker
+#: hardcoded in a deployment. That hardcoding is what made a MetaQuotes-Demo
+#: account hang against an Exness terminal.
+#:
+#: ``match`` entries are server-name prefixes, lowercased. Adding a broker is one
+#: entry here (or ``MT5_BROKER_BUILDS`` in the environment -- see
+#: :func:`_env_broker_builds`); copy the slug from the broker's own "Download MT5"
+#: page. Every ``url`` below was fetched and returned 200 -- guessed slugs 404, so
+#: do not add one you have not fetched.
+BROKER_BUILDS: tuple[dict[str, Any], ...] = (
+    {
+        "key": "metaquotes",
+        "label": "MetaQuotes (generic build)",
+        "match": ("metaquotes",),
+        # Empty URL means "the generic build", i.e. MT5_INSTALLER_URL. MetaQuotes'
+        # own demo servers are treated as the one case that resolves there: a stock
+        # terminal offers them in its registration wizard even with an empty
+        # servers.dat (that is how a MetaQuotes-Demo account gets created at all),
+        # whereas the Exness build's servers.dat carries no MetaQuotes entry --
+        # which is exactly what made it hang.
+        "url": "",
+        "dir_name": "MetaTrader 5",
+    },
+    {
+        "key": "exness",
+        "label": "Exness",
+        "match": ("exness",),
+        "url": (
+            "https://download.mql5.com/cdn/web/exness.technologies.ltd/"
+            "mt5/exness5setup.exe"
+        ),
+        "dir_name": "MetaTrader 5 EXNESS",
+    },
+)
+
+
+def _env_broker_builds() -> list[dict[str, Any]]:
+    """Brokers added through ``MT5_BROKER_BUILDS`` without touching this file.
+
+    Format: ``prefix1,prefix2|installer_url|install_dir_name`` records separated by
+    ``;``. Example::
+
+        MT5_BROKER_BUILDS='icmarkets|https://download.mql5.com/cdn/web/.../x.exe|MetaTrader 5 IC Markets'
+
+    A deployment that trades one broker sets this once instead of waiting for a code
+    change. Malformed records are ignored rather than failing the command -- a broken
+    hint must never take out every MT5 action.
+    """
+    raw = (os.environ.get("MT5_BROKER_BUILDS") or "").strip()
+    builds: list[dict[str, Any]] = []
+    for record in raw.split(";"):
+        record = record.strip()
+        if not record:
+            continue
+        fields = [f.strip() for f in record.split("|")]
+        if len(fields) < 2 or not fields[1]:
+            continue
+        prefixes = tuple(p.strip().lower() for p in fields[0].split(",") if p.strip())
+        if not prefixes:
+            continue
+        dir_name = fields[2] if len(fields) > 2 and fields[2] else "MetaTrader 5"
+        builds.append(
+            {
+                "key": prefixes[0],
+                "label": prefixes[0],
+                "match": prefixes,
+                "url": fields[1],
+                "dir_name": dir_name,
+            }
+        )
+    return builds
+
+
+def broker_builds() -> list[dict[str, Any]]:
+    """Built-in builds, then env-supplied ones (an env entry overrides its key)."""
+    builtin = [dict(b) for b in BROKER_BUILDS]
+    extra = _env_broker_builds()
+    overridden = {b["key"] for b in extra}
+    return [b for b in builtin if b["key"] not in overridden] + extra
+
+
+def broker_for_server(server: str | None) -> dict[str, Any] | None:
+    """The registered build that can resolve ``server``, or None when unknown.
+
+    None is meaningful and must not be read as "no broker": it means this CLI
+    cannot reason about the name, so callers degrade to letting MT5 try.
+    """
+    name = (server or "").strip().lower()
+    if not name:
+        return None
+    best: tuple[int, dict[str, Any]] | None = None
+    for build in broker_builds():
+        for prefix in build.get("match") or ():
+            if name.startswith(prefix):
+                # Most specific prefix wins, so a future "exness.pro" entry can
+                # coexist with "exness".
+                if best is None or len(prefix) > best[0]:
+                    best = (len(prefix), build)
+                break
+    return best[1] if best else None
+
+
+def _broker_build_by_key(key: str | None) -> dict[str, Any] | None:
+    wanted = (key or "").strip().lower()
+    if not wanted:
+        return None
+    for build in broker_builds():
+        if build["key"].lower() == wanted:
+            return build
+    return None
+
+
+def installed_broker_key(terminal: Path | None = None) -> str | None:
+    """Which build is installed: the installer's record first, dir name second.
+
+    The record is authoritative because two builds coexist in one prefix (a branded
+    installer refuses to overwrite a generic install), so the mere presence of a
+    directory says nothing about which terminal ``find_terminal`` hands out.
+    """
+    try:
+        recorded = BROKER_KEY_FILE.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        recorded = ""
+    if recorded:
+        return recorded
+
+    if terminal is None:
+        terminal = find_terminal()
+    if terminal is None:
+        return None
+    return broker_key_from_dir_name(terminal.parent.name)
+
+
+def broker_key_from_dir_name(dir_name: str) -> str | None:
+    """Map an install directory name onto a registry key ("MetaTrader 5 EXNESS")."""
+    folded = (dir_name or "").strip().lower()
+    if not folded:
+        return None
+    for build in broker_builds():
+        if str(build.get("dir_name") or "").strip().lower() == folded:
+            return str(build["key"])
+    return None
+
+
+def resolve_build_for_server(
+    server: str | None, url: str = "", dir_name: str = ""
+) -> dict[str, Any] | None:
+    """Pick the installer build for a requested server, broker-agnostically.
+
+    An explicit ``url`` always wins -- that is the escape hatch for any broker that
+    is not in the registry -- then the registry lookup on the server name.
+    """
+    if url:
+        return {
+            "key": "explicit",
+            "label": "caller-supplied",
+            "match": (),
+            "url": url,
+            "dir_name": dir_name,
+        }
+    found = broker_for_server(server)
+    if found is None:
+        return None
+    build = dict(found)
+    if dir_name:
+        build["dir_name"] = dir_name
+    return build
+
+
+def preflight_server(terminal: Path | None, server: str | None) -> dict[str, Any] | None:
+    """Refuse, in under a second, a login this terminal demonstrably cannot resolve.
+
+    THE HANG THIS PREVENTS (2026-09-22, live): an Exness terminal was asked to log in
+    to ``MetaQuotes-Demo``. That name is not in the build's server database, so MT5
+    never attempted the connection -- the bridge sat on ``initialize()``/``login()``
+    until its IPC timeout and the account UI just looked frozen. A full minute of
+    "nothing is happening" instead of "this terminal cannot resolve this server".
+
+    The decision procedure is sound because a build's server database is its own:
+
+    * unknown server -> ``None``: never block a login this CLI cannot reason about;
+    * server -> broker X, X installed -> ``None`` (proceed);
+    * server -> broker X, a DIFFERENT known build installed -> refuse;
+    * server unknown, a branded build installed -> refuse (a branded build carries
+      only its own broker's servers, so nothing else can resolve there).
+
+    Returns a payload fragment to merge into the command's JSON, or None to proceed.
+    """
+    if not server:
+        return None
+    installed_key = installed_broker_key(terminal)
+    installed_build = _broker_build_by_key(installed_key or "")
+    server_build = broker_for_server(server)
+
+    def _refusal(reason: str) -> dict[str, Any]:
+        remedy: dict[str, Any] = {"action": "install", "server": server}
+        if server_build and server_build.get("url"):
+            remedy["broker_installer_url"] = server_build["url"]
+            remedy["broker_dir_name"] = server_build["dir_name"]
+        else:
+            remedy["broker_installer_url"] = (
+                "https://download.mql5.com/cdn/web/<broker-slug>/mt5/<name>setup.exe"
+            )
+            remedy["note"] = (
+                "This broker is not in the built-in registry, so pass the installer "
+                "URL from its own 'Download MT5' page, or register it once with "
+                "MT5_BROKER_BUILDS='<server-prefix>|<installer-url>|<install-dir>'."
+            )
+        return {
+            "ok": False,
+            "failure": "server_not_in_terminal",
+            "error": reason,
+            "requested_server": server,
+            "installed_broker": installed_key,
+            "installed_terminal": str(terminal) if terminal else None,
+            "server_broker": (server_build or {}).get("key"),
+            "remedy": remedy,
+        }
+
+    if server_build is None:
+        if installed_build is not None and installed_key != "metaquotes":
+            return _refusal(
+                f"server {server!r} is not in this CLI's broker registry, and the "
+                f"installed terminal is the {installed_build['label']} build, which "
+                f"carries only {installed_build['label']}'s own servers. MT5 would "
+                "skip this login silently and the bridge would block until its IPC "
+                "timeout."
+            )
+        return None
+
+    if server_build["key"] == "metaquotes":
+        # MetaQuotes' own demo servers resolve built-in on the GENERIC build and not
+        # on a branded one -- measured: the Exness build carries no MetaQuotes-Demo.
+        if installed_build is not None and installed_key != "metaquotes":
+            return _refusal(
+                f"server {server!r} belongs to MetaQuotes itself, but the installed "
+                f"terminal is the {installed_build['label']} build. MT5 would skip "
+                "this login silently and the bridge would block until its IPC timeout."
+            )
+        return None
+
+    if installed_key is None:
+        # Nothing recorded and no terminal resolved: do not guess about a box that
+        # may not be installed at all (install/doctor own that case).
+        if terminal is None:
+            return None
+    elif installed_key != server_build["key"]:
+        installed_label = (
+            installed_build["label"] if installed_build else f"{installed_key} build"
+        )
+        return _refusal(
+            f"server {server!r} needs the {server_build['label']} build, but the "
+            f"installed terminal is the {installed_label}. MT5 would skip this login "
+            "silently and the bridge would block until its IPC timeout."
+        )
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -200,7 +474,22 @@ def win_python() -> Path | None:
     return None
 
 
-def find_terminal() -> Path | None:
+def _cache_terminal(exe: Path) -> None:
+    """Remember the resolved terminal so repeated calls skip the prefix walk."""
+    try:
+        TERMINAL_MARKER.write_text(str(exe), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _terminal_matches_key(exe: Path, key: str | None) -> bool:
+    """Whether ``exe`` belongs to the requested broker build (no key = any)."""
+    if not key:
+        return True
+    return broker_key_from_dir_name(exe.parent.name) == key
+
+
+def find_terminal(prefer_key: str | None = None) -> Path | None:
     """Locate the MT5 terminal, PREFERRING the broker-branded build.
 
     MEASURED FAILURE (2026-09-22, Runloop devbox): when a broker-branded terminal
@@ -213,12 +502,34 @@ def find_terminal() -> Path | None:
 
     The branded build is therefore resolved explicitly, by the same
     ``MT5_BROKER_DIR_NAME`` the installer honours, before any generic fallback.
+
+    ``prefer_key`` is how a caller says "the server I am about to log in to lives on
+    THAT broker's terminal". It matters because branded builds COEXIST in one prefix
+    (the installer refuses to overwrite another broker's install), so without it the
+    marker's cache hands back the PREVIOUS broker's terminal -- which cannot resolve
+    the new server and then fails silently (see :func:`preflight_server`).
     """
+    drive_c = WINE_PREFIX / "drive_c"
+
+    # 0) The requested broker's build wins outright: of everything on disk it is the
+    #    only terminal that can resolve that broker's server names.
+    if prefer_key:
+        build = _broker_build_by_key(prefer_key)
+        dir_name = str((build or {}).get("dir_name") or "")
+        if dir_name:
+            requested = drive_c / "Program Files" / dir_name / "terminal64.exe"
+            if requested.exists():
+                _cache_terminal(requested)
+                return requested
+
     if TERMINAL_MARKER.exists():
         cached = Path(TERMINAL_MARKER.read_text(encoding="utf-8").strip())
-        if cached.exists():
+        # A cached terminal from a DIFFERENT broker is worse than no cache: it is
+        # the path that produced "wrong terminal, silent no-login", so it must not
+        # short-circuit a request for another broker.
+        if cached.exists() and _terminal_matches_key(cached, prefer_key):
             return cached
-    drive_c = WINE_PREFIX / "drive_c"
+
     if not drive_c.exists():
         return None
 
@@ -226,10 +537,7 @@ def find_terminal() -> Path | None:
     brand = os.environ.get("MT5_BROKER_DIR_NAME", "MetaTrader 5 EXNESS")
     preferred = drive_c / "Program Files" / brand / "terminal64.exe"
     if preferred.exists():
-        try:
-            TERMINAL_MARKER.write_text(str(preferred), encoding="utf-8")
-        except OSError:
-            pass
+        _cache_terminal(preferred)
         return preferred
 
     # 2) Any other "MetaTrader 5 <BRAND>" install, before the bare generic one.
@@ -243,17 +551,11 @@ def find_terminal() -> Path | None:
         candidates = []
     if candidates:
         chosen = candidates[0] / "terminal64.exe"
-        try:
-            TERMINAL_MARKER.write_text(str(chosen), encoding="utf-8")
-        except OSError:
-            pass
+        _cache_terminal(chosen)
         return chosen
 
     for exe in drive_c.rglob("terminal64.exe"):
-        try:
-            TERMINAL_MARKER.write_text(str(exe), encoding="utf-8")
-        except OSError:
-            pass
+        _cache_terminal(exe)
         return exe
     return None
 
@@ -432,6 +734,44 @@ def _terminal_has_broker_servers(terminal: Path | None) -> bool | None:
     return size > 100_000
 
 
+def _terminal_network_lines(
+    terminal: Path | None, login: str | int | None = None
+) -> list[str]:
+    """``Network`` lines from the terminal's own log, newest last.
+
+    THE DISTINCTION THIS MAKES: a WRONG CREDENTIAL produces a ``Network`` line
+    ("authorization failed", "invalid account"), while a server name the installed
+    build cannot resolve produces NOTHING -- no line, no error, just a bridge that
+    blocks until its IPC timeout. Counting these lines is the only way to tell the
+    two apart without MT5's own (binary) server database, and they need opposite
+    fixes: fix the password, versus install the build that carries this broker.
+    """
+    wanted = str(login) if login not in (None, "") else ""
+    directories: list[Path] = []
+    if terminal is not None:
+        directories.append(terminal.parent / "logs")
+    directories.append(MT5_ROOT / "logs")
+
+    found: list[str] = []
+    for directory in directories:
+        try:
+            files = sorted(directory.glob("*.log"))
+        except OSError:
+            continue
+        for path in files:
+            try:
+                text = _read_log_text(path)
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if "network" not in line.lower():
+                    continue
+                if wanted and wanted not in line:
+                    continue
+                found.append(line.strip())
+    return found[-40:]
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
     terminal = find_terminal()
 
@@ -475,6 +815,17 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         "terminal_path": str(terminal) if terminal else None,
         "terminal_running": terminal_running(),
         "terminal_has_broker_servers": has_broker_servers,
+        # WHICH broker this terminal is for. The server name a login will use must
+        # belong to this build, or MT5 skips the login with no error at all -- see
+        # preflight_server, which now refuses that combination up front.
+        "installed_broker": installed_broker_key(terminal),
+        "supported_server_prefixes": sorted(
+            {
+                prefix
+                for build in broker_builds()
+                for prefix in (build.get("match") or ())
+            }
+        ),
         "windows_python": str(winpy) if winpy else None,
         "python_bridge": winpy is not None,
         "bridge_imports_in_wine": _bridge_imports_under_wine() if winpy else False,
@@ -530,6 +881,47 @@ def cmd_install(args: argparse.Namespace) -> int:
         if stale.exists():
             stale.unlink()
 
+    # WHICH BUILD TO INSTALL: derived from the server the account lives on, so this
+    # is broker-agnostic. An explicit URL still wins (any broker, registered or not),
+    # then the registry lookup, then the installer's own default.
+    #
+    # WHY IT MATTERS: a terminal can only resolve server names its own build ships.
+    # Installing the deployment's default build for a server that belongs to another
+    # broker used to produce a terminal that never even attempted the login --
+    # silently, then "IPC timeout" from the bridge. Passing ``--server`` at install
+    # time makes the FIRST install the right one instead of paying for a re-install.
+    env = wine_env()
+    server = getattr(args, "server", None)
+    resolved = resolve_build_for_server(
+        server,
+        url=str(
+            getattr(args, "broker_installer_url", "")
+            or os.environ.get("MT5_BROKER_INSTALLER_URL")
+            or ""
+        ),
+        dir_name=str(getattr(args, "broker_dir_name", "") or ""),
+    )
+    if resolved is not None:
+        if resolved.get("url"):
+            env["MT5_BROKER_INSTALLER_URL"] = str(resolved["url"])
+            env["MT5_BROKER_DIR_NAME"] = str(resolved.get("dir_name") or "MetaTrader 5")
+            env.pop("MT5_GENERIC_INSTALLER", None)
+        else:
+            # The generic build. MetaQuotes' own demo servers resolve on it; a real
+            # broker's do not, and preflight_server will say so before a login runs.
+            env["MT5_GENERIC_INSTALLER"] = "1"
+            env.pop("MT5_BROKER_INSTALLER_URL", None)
+        env["MT5_BROKER_KEY"] = str(resolved["key"])
+        if server:
+            env["MT5_BROKER_SERVER"] = str(server)
+
+    # Switching broker must invalidate the cached terminal path and the recorded
+    # build, or the next command hands out the PREVIOUS broker's terminal -- the
+    # silent no-login trap. (The marker is a pure cache: it is always safe to drop.)
+    for stale in (TERMINAL_MARKER, METAEDITOR_MARKER, BROKER_KEY_FILE):
+        if stale.exists():
+            stale.unlink()
+
     if args.detach:
         # WHY DETACHED: the execution sandbox clamps every single command to a
         # fixed ceiling (900 s on Novita) while a full Wine + MT5 + bridge
@@ -540,7 +932,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         quoted = shlex.quote(inner)
         proc = subprocess.run(
             ["sh", "-c", f"nohup setsid sh -c {quoted} >/dev/null 2>&1 & echo $!"],
-            env=wine_env(),
+            env=env,
             capture_output=True,
             text=True,
         )
@@ -552,6 +944,8 @@ def cmd_install(args: argparse.Namespace) -> int:
                 "pid": pid,
                 "status_file": str(status_path),
                 "log_file": str(log_path),
+                "broker": (resolved or {}).get("key"),
+                "server": server or None,
                 "hint": "Poll action='status' (or mt5_cli.py status) until stage is "
                 "'done' or 'failed'. A full install takes ~10-25 minutes.",
             },
@@ -560,7 +954,6 @@ def cmd_install(args: argparse.Namespace) -> int:
 
     # Foreground mode: only usable when the caller's command ceiling exceeds the
     # install duration (e.g. a local run or a self-hosted box).
-    env = wine_env()
     proc = subprocess.run(
         ["bash", str(script)],
         env=env,
@@ -719,9 +1112,24 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    terminal = find_terminal()
+    # Resolve the terminal for the SERVER being logged in to, not just "a terminal".
+    # Two branded builds coexist in one prefix, and only the one matching the server
+    # can resolve it (see find_terminal / preflight_server).
+    server = getattr(args, "server", None)
+    terminal = find_terminal(prefer_key=(broker_for_server(server) or {}).get("key"))
     if terminal is None:
         return fail("terminal64.exe not found. Run install first.", code=2)
+
+    # Fast refusal, in under a second, for a login this build cannot resolve. Without
+    # it the terminal boots, silently never attempts the connection, and the whole
+    # call blocks on the bridge's IPC timeout -- the "it hangs" symptom.
+    refusal = preflight_server(terminal, server)
+    if refusal is not None:
+        return emit(
+            refusal,
+            text=f"error: {refusal['error']}",
+            code=2,
+        )
 
     # Pre-seed credentials so the terminal can auto-connect on boot. MT5 will not
     # expose symbols/quotes over IPC until it has an account, and there is no GUI
@@ -797,7 +1205,20 @@ def cmd_start(args: argparse.Namespace) -> int:
     # So: when credentials are supplied, the terminal that serves them must have
     # been launched with our ``/config:`` file. If it was not, restart it.
     restarted_for_credentials = False
-    if credentials and _terminal_has_credentials():
+    # Another BROKER's terminal must not stay up while we boot this one: both would
+    # publish an IPC socket and the bridge's attach would pick whichever answers
+    # first -- reporting the wrong broker's account, or none. (Prefight above already
+    # guarantees the requested build exists and matches the server.)
+    if credentials:
+        interlopers = _stop_terminal_processes(keep_terminal=terminal)
+        if interlopers:
+            restarted_for_credentials = True
+            print(
+                f"stopped terminal process(es) {interlopers} from another broker",
+                file=sys.stderr,
+            )
+
+    if credentials and _terminal_has_credentials(terminal):
         # Already launched with credentials. If it is also live, report success
         # immediately instead of re-waiting the full --wait window.
         quick = _bridge_probe(timeout=min(60, max(15, int(args.wait))))
@@ -823,7 +1244,13 @@ def cmd_start(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    if not terminal_running():
+    # "Is a terminal running" is not the question -- "is THIS terminal running" is.
+    # A different broker's terminal is not a substitute and must not suppress the
+    # launch (it was stopped just above when credentials were supplied).
+    _this_terminal_running = any(
+        _process_is_for_terminal(argv, terminal) for _, argv in _terminal_processes()
+    )
+    if not _this_terminal_running:
         # Make sure a display exists even if the installer did not leave Xvfb up.
         subprocess.run(
             ["sh", "-c", f"pgrep -f 'Xvfb :{DISPLAY_NUM}' >/dev/null || "
@@ -873,6 +1300,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     elif credentials:
         # Credentials WERE supplied: telling the agent to supply them again is the
         # bug that made this look unfixable. Point at the real next step instead.
+        #
+        # ZERO ``Network`` lines in the terminal log is the specific tell for "this
+        # terminal cannot resolve this server": MT5 does not error, it just never
+        # attempts the connection. That is a different failure from wrong
+        # credentials (which DO produce a Network line) and needs a different fix --
+        # installing the build that carries this broker's servers.
+        network_lines = _terminal_network_lines(terminal, login=args.login)
+        payload["terminal_network_lines"] = len(network_lines)
         payload["hint"] = (
             "Credentials were written and the terminal was launched with "
             f"/config: but no account appeared within {int(args.wait)}s. Check the "
@@ -882,6 +1317,19 @@ def cmd_start(args: argparse.Namespace) -> int:
             "exist on that server; MetaQuotes-Demo logins are created by the "
             "MetaQuotes demo registration, not by this platform."
         )
+        if not network_lines:
+            payload["failure"] = "no_network_activity"
+            payload["hint"] = (
+                "The terminal log has ZERO Network lines for "
+                f"server={args.server!r}, which is how MT5 reports a server name it "
+                "cannot resolve: it skips the connection silently (no error, then "
+                "'-10005 IPC timeout' from the bridge). The installed terminal is "
+                f"the {installed_broker_key(terminal) or 'unknown'} build and carries "
+                "only its own broker's servers. Install the build for this broker "
+                "and retry: action='install' with server="
+                f"{args.server!r} (add broker_installer_url from the broker's own "
+                "'Download MT5' page if it is not a registered broker)."
+            )
     else:
         payload["hint"] = (
             "Terminal is up but has no account. Pass login/password/server to "
@@ -931,7 +1379,7 @@ def _terminal_processes() -> list[tuple[int, list[str]]]:
     return found
 
 
-def _terminal_has_credentials() -> bool:
+def _terminal_has_credentials(terminal: Path | None = None) -> bool:
     """True when a running terminal was launched with our ``/config:`` file.
 
     A terminal started WITHOUT it (the installer's own "materialise the MQL5
@@ -939,18 +1387,54 @@ def _terminal_has_credentials() -> bool:
     and will never authorize, no matter how correct the credentials are. That
     distinction is the whole reason ``start`` used to look like it ignored the
     login/password/server arguments.
+
+    ``terminal`` restricts the question to THAT terminal. With two branded builds in
+    one prefix, a credential-carrying process belonging to another broker must not
+    be mistaken for this one -- the credentials would apply to the wrong terminal.
     """
     for _, argv in _terminal_processes():
+        if not _process_is_for_terminal(argv, terminal):
+            continue
         for arg in argv:
             if arg.startswith("/config:") or arg.lower() == "/config:":
                 return True
     return False
 
 
-def _stop_terminal_processes() -> list[int]:
-    """SIGTERM then SIGKILL every terminal process; return the PIDs handled."""
+def _process_is_for_terminal(argv: list[str], terminal: Path | None) -> bool:
+    """Whether a process's argv identifies ``terminal`` (None = any terminal).
+
+    Two branded builds COEXIST in one prefix, so "a terminal is running" is not the
+    same as "the terminal I asked for is running". The install-directory name is what
+    distinguishes them in an argv (e.g. ``...\\MetaTrader 5 EXNESS\\terminal64.exe``).
+    """
+    if terminal is None:
+        return True
+    token = terminal.parent.name.strip().lower()
+    if not token:
+        return True
+    return token in " ".join(argv).lower().replace("\\", "/")
+
+
+def _stop_terminal_processes(*, keep_terminal: Path | None = None) -> list[int]:
+    """SIGTERM then SIGKILL terminal processes; return the PIDs handled.
+
+    ``keep_terminal`` spares that one terminal's processes. That is how ``start``
+    clears another BROKER's leftover terminal: both would compete for the bridge's
+    IPC socket, and the one that answers is not necessarily the one the caller asked
+    for -- a silent way to report the wrong broker's account, or none at all.
+    """
+
+    def _targets() -> list[int]:
+        out: list[int] = []
+        for pid, argv in _terminal_processes():
+            if keep_terminal is not None and _process_is_for_terminal(argv, keep_terminal):
+                continue
+            out.append(pid)
+        return out
+
     handled: list[int] = []
-    for pid, _ in _terminal_processes():
+    for pid in _targets():
         try:
             os.kill(pid, signal.SIGTERM)
             handled.append(pid)
@@ -958,7 +1442,7 @@ def _stop_terminal_processes() -> list[int]:
             continue
     if handled:
         time.sleep(3)
-        for pid, _ in _terminal_processes():
+        for pid in _targets():
             try:
                 os.kill(pid, signal.SIGKILL)
                 if pid not in handled:
@@ -995,6 +1479,15 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_login(args: argparse.Namespace) -> int:
+    # Same guard as ``start``: a server this terminal cannot resolve makes
+    # ``mt5.initialize()``/``login()`` block until the IPC timeout, with no error
+    # anywhere in the terminal log. Refuse here, in under a second, with the remedy.
+    server = getattr(args, "server", None)
+    terminal = find_terminal(prefer_key=(broker_for_server(server) or {}).get("key"))
+    refusal = preflight_server(terminal, server)
+    if refusal is not None:
+        return emit(refusal, text=f"error: {refusal['error']}", code=2)
+
     mt5, err = require_bridge()
     if err is not None:
         return err
@@ -1900,6 +2393,23 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("install", help="install Wine + MT5 + python bridge")
     p.add_argument("--script", default=str(Path(__file__).with_name("install_mt5_sandbox.sh")))
     p.add_argument("--timeout", type=int, default=1800)
+    # The SERVER decides which broker build is installed, so this is the argument
+    # that makes a first install correct for ANY broker. Omitted, the installer's
+    # own default build is used and a mismatch is refused by the next start/login
+    # with the exact install to run instead.
+    p.add_argument(
+        "--server",
+        required=False,
+        help="broker server the account lives on, e.g. 'Exness-MT5Trial9' or "
+        "'MetaQuotes-Demo'; selects the matching MT5 build",
+    )
+    p.add_argument(
+        "--broker-installer-url",
+        required=False,
+        default="",
+        help="explicit broker-branded installer URL (overrides the registry)",
+    )
+    p.add_argument("--broker-dir-name", required=False, default="")
     # Detached is the default because sandbox commands are timeout-capped; the
     # caller polls ``status`` instead of holding one long command open.
     p.add_argument("--detach", dest="detach", action="store_true", default=True)
@@ -1911,12 +2421,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("start", help="launch the terminal headless")
-    # Authorization against a broker is not instant: in sandbox testing the
-    # terminal needed ~130s to go from boot to "trading has been enabled" for a
-    # MetaQuotes demo account (IP discovery -> TCP connect -> auth -> symbol
-    # sync of ~12k symbols). The default wait must comfortably exceed that or
-    # ``start`` reports failure for a login that is still in flight.
-    p.add_argument("--wait", type=int, default=300)
+    # Authorization against a broker is not instant -- ~130s from boot to "trading
+    # has been enabled" on a cold prefix (IP discovery -> TCP connect -> auth ->
+    # symbol sync of ~12k symbols). The wait is nevertheless bounded WELL BELOW the
+    # caller's per-command ceiling, because a command the sandbox kills returns no
+    # JSON at all, which reads as "the tool is broken" rather than "still
+    # authorizing". Nothing is lost by returning early: the terminal keeps
+    # authorizing in the background, so the next `account`/`start` call sees it.
+    p.add_argument("--wait", type=int, default=90)
     p.add_argument("--login", required=False)
     p.add_argument("--password", required=False)
     p.add_argument("--server", required=False)

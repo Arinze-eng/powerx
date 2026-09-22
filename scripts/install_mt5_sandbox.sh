@@ -68,6 +68,13 @@ DISPLAY_NUM="${MT5_DISPLAY_NUM:-99}"
 # and a ``-10005 IPC timeout`` from the bridge that blames Wine. Defaulting to the
 # broker build means an install with no arguments is a *working* install. Exness
 # is this deployment's broker; override MT5_BROKER_INSTALLER_URL for another one.
+#
+# INSTALL FOR THE RIGHT BROKER FIRST. ``MT5_BROKER_KEY`` records which build landed
+# (read back by mt5_cli.py's preflight), and ``MT5_BROKER_SERVER`` is the server the
+# account lives on -- mt5_cli.py turns that into the URL + directory name, so
+# ``install --server <server>`` is broker-agnostic and the first install is the
+# correct one. Unset, this deployment's default build is installed and a mismatched
+# login is refused up front with the install to run instead (never a silent hang).
 MT5_INSTALLER_URL="${MT5_INSTALLER_URL:-https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe}"
 MT5_BROKER_INSTALLER_URL="${MT5_BROKER_INSTALLER_URL:-https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe}"
 # Explicit opt-in to the generic MetaQuotes build. Only a MetaQuotes-Demo account
@@ -659,7 +666,25 @@ else
   TERM_DISPLAY_NAME="MetaTrader 5"
 fi
 
-if [ ! -f "${DONE_MARKER}" ]; then
+# WHAT THE MARKER MEANS: "the terminal for THIS url is installed", not "some
+# terminal is installed". Builds coexist in one prefix (a branded installer refuses
+# to overwrite another broker's), so a marker that only says "done" short-circuits a
+# legitimate broker switch and leaves the OLD terminal in place -- which then cannot
+# resolve the new broker's server names and fails silently at login.
+_RESOLVED_URL="${MT5_BROKER_INSTALLER_URL:-${MT5_INSTALLER_URL}}"
+_PREV_URL="$(cat "${MT5_ROOT}/.installed.url" 2>/dev/null || true)"
+if [ -f "${DONE_MARKER}" ] && [ "${_PREV_URL}" = "${_RESOLVED_URL}" ]; then
+  _TERMINAL_ALREADY_INSTALLED=1
+else
+  _TERMINAL_ALREADY_INSTALLED=0
+  # A different broker's installer is on disk under the same filename; keeping it
+  # would install the wrong terminal while reporting success.
+  if [ -n "${_PREV_URL}" ] && [ "${_PREV_URL}" != "${_RESOLVED_URL}" ]; then
+    rm -f "${INSTALLER}"
+  fi
+fi
+
+if [ "${_TERMINAL_ALREADY_INSTALLED}" -eq 0 ]; then
   if [ ! -s "${INSTALLER}" ]; then
     status download "downloading the MT5 installer ..."
     _dl_url="${MT5_BROKER_INSTALLER_URL:-${MT5_INSTALLER_URL}}"
@@ -781,6 +806,10 @@ if [ ! -f "${DONE_MARKER}" ]; then
 
   if _have_terminal; then
     touch "${DONE_MARKER}"
+    printf '%s' "${_RESOLVED_URL}" > "${MT5_ROOT}/.installed.url"
+    # WHICH build landed. Read by mt5_cli.py's preflight, which refuses a login whose
+    # server this build cannot resolve instead of letting it hang on the IPC timeout.
+    printf '%s' "${MT5_BROKER_KEY:-unknown}" > "${MT5_ROOT}/.broker_key"
     status mt5 "MT5 terminal installed"
   else
     # Surface the installer's own output so the failure is actionable instead of
