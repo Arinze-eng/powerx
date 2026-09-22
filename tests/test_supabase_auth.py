@@ -28,7 +28,9 @@ class FakeSupabase(SupabaseAuth):
         if path == "/rest/v1/profiles" and method == "GET":
             return [{"daily_credits": 900, "purchased_credits": 0, "granted_credits": 0, "drain_rate": 5}]
         if path == "/rest/v1/rpc/consume_cloud_task_step_credits":
-            return {"success": True, "balance": 897}
+            return {"success": True, "charged": 15, "remaining": 897}
+        if path == "/rest/v1/rpc/credit_balance":
+            return {"success": True, "remaining": 912, "step_cost": 15, "can_start": True}
         if path == "/functions/v1/pay-verify":
             return {"ok": True, "credits": 1000, "pkg": "starter", "tx_ref": "tx-1"}
         if path == "/auth/v1/token":
@@ -67,17 +69,29 @@ async def test_signin_links_existing_account_and_signout_clears_tokens() -> None
 
 
 @pytest.mark.asyncio
-async def test_charge_step_uses_existing_rpc_and_drain_rate() -> None:
+async def test_charge_step_lets_the_rpc_apply_the_drain_rate() -> None:
+    """The step cost is resolved inside Postgres, never by reading a profile row."""
     client = FakeSupabase()
     result = await client.charge_step({"agentx_user_id": "11111111-1111-1111-1111-111111111111"}, "nanobot:turn-1", 2)
     assert result["success"] is True
     call = next(call for call in client.calls if call[1] == "/rest/v1/rpc/consume_cloud_task_step_credits")
     assert call[3] == {
         "p_user": "11111111-1111-1111-1111-111111111111",
-        "p_amount": 15,
+        # 0 means "use the user's own step cost", so no profiles GET is needed.
+        "p_amount": 0,
         "p_task_ref": "nanobot:turn-1",
         "p_step_no": 2,
     }
+    assert not [c for c in client.calls if c[1] == "/rest/v1/profiles"]
+
+
+@pytest.mark.asyncio
+async def test_balance_is_one_rpc_and_reports_the_start_gate() -> None:
+    client = FakeSupabase()
+    result = await client.balance({"agentx_user_id": "11111111-1111-1111-1111-111111111111"})
+    assert result["can_start"] is True
+    call = next(call for call in client.calls if call[1] == "/rest/v1/rpc/credit_balance")
+    assert call[3] == {"p_user": "11111111-1111-1111-1111-111111111111"}
 
 
 @pytest.mark.asyncio

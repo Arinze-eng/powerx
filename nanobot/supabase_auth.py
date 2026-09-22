@@ -1172,24 +1172,56 @@ class SupabaseAuth:
         self._drain_rates[agentx_user_id] = (rate, _time.time() + self._DRAIN_RATE_TTL)
         return rate
 
-    async def charge_step(self, account: dict[str, Any], task_ref: str, step_no: int, amount: int = 0) -> dict[str, Any]:
+    async def balance(self, account: dict[str, Any]) -> dict[str, Any]:
+        """Remaining credit as one RPC answer - no credit rows are read.
+
+        Used as the start gate: ``can_start`` is what decides whether a new task
+        may begin at all.
+        """
         if not account.get("agentx_user_id"):
             raise SupabaseAuthError("Use /signup or /signin first")
-        if amount <= 0:
-            rate = await self._cached_drain_rate(str(account["agentx_user_id"]))
-            amount = 3 * rate
-        result = await self._request("POST", "/rest/v1/rpc/consume_cloud_task_step_credits", service=True, body={"p_user": account["agentx_user_id"], "p_amount": max(1, int(amount)), "p_task_ref": task_ref, "p_step_no": max(1, int(step_no))})
+        result = await self._request(
+            "POST",
+            "/rest/v1/rpc/credit_balance",
+            service=True,
+            body={"p_user": account["agentx_user_id"]},
+        )
+        if not isinstance(result, dict) or result.get("success") is not True:
+            raise SupabaseAuthError(str((result or {}).get("error") or "Could not read the credit balance"))
+        return result
+
+    async def charge_step(self, account: dict[str, Any], task_ref: str, step_no: int, amount: int = 0) -> dict[str, Any]:
+        """Deduct one step's credits inside Postgres, before the step runs.
+
+        ``amount <= 0`` lets the RPC apply the user's own step cost, so no
+        ``profiles`` read is needed to learn the drain rate. Raises
+        :class:`SupabaseAuthError` when the step cannot be paid, which the agent
+        loop turns into an immediate stop.
+        """
+        if not account.get("agentx_user_id"):
+            raise SupabaseAuthError("Use /signup or /signin first")
+        result = await self._request(
+            "POST",
+            "/rest/v1/rpc/consume_cloud_task_step_credits",
+            service=True,
+            body={
+                "p_user": account["agentx_user_id"],
+                "p_amount": max(0, int(amount)),
+                "p_task_ref": task_ref,
+                "p_step_no": max(1, int(step_no)),
+            },
+        )
         if not isinstance(result, dict) or result.get("success") is not True:
             raise SupabaseAuthError(str((result or {}).get("error") or "Insufficient credits for this step"))
         return result
 
     async def charge_task(self, account: dict[str, Any], task_ref: str, total_steps: int, amount: int = 0) -> dict[str, Any]:
-        """Drain credits ONCE for an entire finished task (no per-step calls).
+        """Legacy lump-sum drain for a whole task, kept for non-loop callers.
 
-        Replaces the per-step ``charge_step`` flow. Reads the user's drain_rate
-        a single time and issues ONE Supabase credit RPC for the whole task,
-        budgeted as ``3 * rate * total_steps``. This keeps egress constant (2
-        calls) no matter how many model iterations the task took.
+        The agent loop no longer uses this: it bills each step through
+        :meth:`charge_step` *before* the step runs, so an empty balance stops
+        the task mid-flight instead of only being noticed once every iteration
+        has already been paid for by the operator. Prefer ``charge_step``.
         """
         if not account.get("agentx_user_id"):
             raise SupabaseAuthError("Use /signup or /signin first")
