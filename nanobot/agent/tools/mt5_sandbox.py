@@ -547,7 +547,7 @@ class MT5SandboxTool(Tool):
             "again: one call finishes the job. If it still reports stage='installing' "
             "after the wait budget, the install is progressing normally — poll "
             "action='status' yourself, in a loop, until stage='done', without asking "
-            "the user anything. ",
+            "the user anything. "
             "Only then call action='start' WITH login/password/server — all three in "
             "ONE call; that writes the terminal's /config: credentials file. A "
             "terminal left running from the install (status shows "
