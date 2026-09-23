@@ -21,7 +21,9 @@ import importlib.util
 import inspect
 import json
 import os
+import sys
 import time
+import types
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -2821,6 +2823,465 @@ def test_the_watcher_reports_a_symbol_it_cannot_price(monkeypatch, tmp_path):
     assert "UNPRICEABLE_STALE" in source
 
 
+# ---------------------------------------------------------------------------
+# The close-retry loop: driven by running the REAL watcher source.
+#
+# Every other guard test asserts on strings or on CLI payloads, which cannot see
+# whether a refused close is actually retried. These run ``_GUARD_WATCH_SOURCE``
+# as the Wine python would, against a fake MetaTrader5 and a clock the test
+# drives -- so a 30 s retry deadline costs no real time and the assertions are
+# about observed behaviour rather than about the shape of the code.
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """A clock the test moves, so retry deadlines pass instantly."""
+
+    def __init__(self, start: float = 1_700_000_000.0) -> None:
+        self.now = float(start)
+        self.slept = 0.0
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        seconds = max(float(seconds), 0.01)
+        self.slept += seconds
+        self.now += seconds
+
+    def strftime(self, *_a: Any, **_k: Any) -> str:
+        return "00:00:00"
+
+
+class _FakeMT5:
+    """Enough of MetaTrader5 to drive the watcher: ticks, positions, order_send.
+
+    ``retcodes`` is the script a broker runs: one entry per send, the last one
+    repeating forever. 10009 closes the position, anything else refuses it and
+    leaves it open -- which is exactly the difference the retry loop exists for.
+    """
+
+    POSITION_TYPE_BUY = 0
+    ORDER_TYPE_BUY = 0
+    ORDER_TYPE_SELL = 1
+    ORDER_FILLING_IOC = 1
+    ORDER_FILLING_FOK = 2
+    ORDER_FILLING_RETURN = 3
+    ORDER_TIME_GTC = 0
+    TRADE_ACTION_DEAL = 1
+
+    def __init__(
+        self,
+        *,
+        retcodes: tuple[int, ...] = (10009,),
+        tickets: tuple[int, ...] = (777,),
+        symbol: str = "EURUSD",
+        bid: float = 1.14190,
+        ask: float = 1.14210,
+        tick_after: tuple[float, float] | None = None,
+        tick_after_sends: int = 1,
+    ) -> None:
+        self.script = list(retcodes) or [10009]
+        self.positions = [
+            types.SimpleNamespace(
+                ticket=ticket, symbol=symbol, type=self.POSITION_TYPE_BUY,
+                volume=0.1, price_open=bid, sl=0.0, tp=0.0,
+            )
+            for ticket in tickets
+        ]
+        self.tick = types.SimpleNamespace(
+            bid=bid, ask=ask, time=1_700_000_000, last=bid, volume=1
+        )
+        self.tick_after = tick_after
+        self.tick_after_sends = tick_after_sends
+        self.sends: list[dict[str, Any]] = []
+        self.initialised = False
+
+    def initialize(self) -> bool:
+        self.initialised = True
+        return True
+
+    def last_error(self) -> tuple[int, str]:
+        return (0, "no error")
+
+    def symbol_select(self, _symbol: str, _enable: bool = True) -> bool:
+        return True
+
+    def symbol_info(self, _symbol: str) -> Any:
+        return types.SimpleNamespace(filling_mode=self.ORDER_FILLING_FOK)
+
+    def symbol_info_tick(self, _symbol: str) -> Any:
+        return self.tick
+
+    def positions_get(self, ticket: int | None = None) -> list[Any]:
+        if ticket is not None:
+            return [p for p in self.positions if p.ticket == int(ticket)]
+        return list(self.positions)
+
+    def order_send(self, request: dict[str, Any]) -> Any:
+        self.sends.append(dict(request))
+        if self.tick_after is not None and len(self.sends) == self.tick_after_sends:
+            # The price moves back INSIDE the level while the refused close is
+            # still pending -- the case that used to abandon the exit.
+            self.tick = types.SimpleNamespace(
+                bid=self.tick_after[0], ask=self.tick_after[1],
+                time=1_700_000_100, last=self.tick_after[0], volume=1,
+            )
+        retcode = self.script.pop(0) if len(self.script) > 1 else self.script[0]
+        if retcode == 10009:
+            self.positions = [
+                p for p in self.positions if p.ticket != int(request.get("position") or 0)
+            ]
+            return types.SimpleNamespace(retcode=10009, comment="done", deal=11)
+        return types.SimpleNamespace(retcode=retcode, comment="market closed", deal=0)
+
+
+def _run_the_watcher(
+    cli: Any,
+    monkeypatch: Any,
+    tmp_path: Path,
+    mt5: _FakeMT5,
+    clock: _FakeClock,
+    rules: list[dict[str, Any]],
+    *,
+    interval_ms: int = 100,
+    max_seconds: int = 100,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], Path]:
+    """Run the embedded watcher once, exactly as the sandbox would.
+
+    Returns (timings-ish payload, event log, rules after the run, guard dir).
+    """
+    guard = cli.GUARD_DIR
+    guard.mkdir(parents=True, exist_ok=True)
+    cli.GUARD_RULES_FILE.write_text(json.dumps(rules), encoding="utf-8")
+    cli.GUARD_EVENTS_FILE.write_text("", encoding="utf-8")
+    if cli.GUARD_STOP_FILE.exists():
+        cli.GUARD_STOP_FILE.unlink()
+
+    fake_time = types.ModuleType("time")
+    fake_time.__dict__.update(
+        {k: v for k, v in vars(time).items() if not k.startswith("__")}
+    )
+    fake_time.time = clock.time
+    fake_time.sleep = clock.sleep
+    fake_time.strftime = clock.strftime
+    monkeypatch.setitem(sys.modules, "time", fake_time)
+    monkeypatch.setitem(sys.modules, "MetaTrader5", mt5)
+    monkeypatch.setattr(sys, "argv", [
+        "guard_watch.py",
+        "--rules", str(cli.GUARD_RULES_FILE),
+        "--events", str(cli.GUARD_EVENTS_FILE),
+        "--state", str(cli.GUARD_STATE_FILE),
+        "--stop-file", str(cli.GUARD_STOP_FILE),
+        "--interval-ms", str(interval_ms),
+        "--max-seconds", str(max_seconds),
+        "--deviation", "30",
+    ])
+
+    namespace: dict[str, Any] = {"__name__": "guard_watch_under_test"}
+    exec(compile(cli._GUARD_WATCH_SOURCE, "<guard_watch>", "exec"), namespace)
+    code = namespace["main"]()
+
+    events = [
+        json.loads(line)
+        for line in cli.GUARD_EVENTS_FILE.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    after = json.loads(cli.GUARD_RULES_FILE.read_text(encoding="utf-8"))
+    state = json.loads(cli.GUARD_STATE_FILE.read_text(encoding="utf-8"))
+    return {"code": code, "state": state, "clock": clock}, events, after, guard
+
+
+def _rule(**overrides: Any) -> dict[str, Any]:
+    rule = {
+        "id": "g-retry", "symbol": "EURUSD", "op": ">=", "price": 1.0,
+        "side": "mid", "once": True,
+    }
+    rule.update(overrides)
+    return rule
+
+
+def test_a_refused_close_is_retried_on_a_persisted_cooldown_then_given_up_loudly(
+    monkeypatch, tmp_path
+):
+    """A persistent refusal must not be silent, and must not retry forever.
+
+    MEASURED 2026-09-23: a refused close stayed armed and was retried only while
+    the price remained beyond the level, with no deadline -- so a position could
+    be abandoned by a price tick and retried 10x a second by a market that was
+    simply closed. The case here is the worst one: the broker refuses every time.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock()
+    mt5 = _FakeMT5(retcodes=(10018,), tickets=(777,))
+
+    _run, events, rules_after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, [_rule()], max_seconds=100
+    )
+
+    failures = [e for e in events if e["event"] == "close_failed"]
+    gives_up = [e for e in events if e["event"] == "close_gave_up"]
+    assert not [e for e in events if e["event"] == "fired"]
+
+    first = [f for f in failures if f["retry_window"] == 1]
+
+    # Bounded: the attempt cap lands before the 30 s deadline, and every attempt
+    # of the first window is counted and marked as a retry after the first.
+    assert len(first) == cli.GUARD_CLOSE_RETRY_MAX_ATTEMPTS == 20
+    assert [f["attempt"] for f in first] == list(range(1, 21))
+    assert first[0]["retry"] is False and all(f["retry"] for f in first[1:])
+
+    # The cooldown is PERSISTED, which it was not: the rules file is re-read each
+    # pass, so a failure that only set ``last_attempt`` in memory re-sent a deal
+    # on every 100 ms poll. The gaps are what prove the fix.
+    gaps = [
+        round(b["trigger_ts"] - a["trigger_ts"], 2)
+        for a, b in zip(first, first[1:])
+    ]
+    assert min(gaps) >= 1.4, gaps
+    # ...and one refused close is one deal sent to the broker, not one per poll.
+    assert len(mt5.sends) == len(failures)
+
+    # The give-up is a real event with the broker's own answer and the tickets
+    # that are still open -- not a line in a log nobody reads.
+    assert len(gives_up) == 1
+    give = gives_up[0]
+    assert give["attempts"] == 20 and give["retcodes"] == [10018]
+    assert give["still_open_tickets"] == [777]
+    assert give["retry_in_s"] == cli.GUARD_CLOSE_RETRY_PARK_SECONDS == 60.0
+
+    # The rule is PARKED rather than retried at speed, then a FRESH window opens
+    # (a weekend gap is minutes away from closable, not never).
+    later = [f for f in failures if f["trigger_ts"] > give["ts"]]
+    assert later, "the rule must come back for another window, not be abandoned"
+    assert all(f["trigger_ts"] >= give["ts"] + 59.0 for f in later)
+    assert later[0]["attempt"] == 1 and later[0]["retry_window"] == 2
+
+    # Nothing was consumed by a failure: the rule is still armed, with the retry
+    # state on it in the file the watcher rewrites.
+    assert [r["id"] for r in rules_after] == ["g-retry"]
+    assert rules_after[0]["gave_up_attempts"] == 20
+    assert rules_after[0]["gave_up_retcodes"] == [10018]
+    assert "gave_up_at" in rules_after[0]
+    assert events[-1]["event"] == "watcher_stop"
+    assert events[-1]["exit_reason"] == "max_seconds"
+
+
+def test_a_refused_close_is_retried_even_after_the_price_leaves_the_level(
+    monkeypatch, tmp_path
+):
+    """A DECIDED close is retried until it is confirmed, not while it triggers.
+
+    The broker refuses the deal on the tick that touched the level and the price
+    ticks straight back inside it. Before the retry loop the rule stopped being
+    evaluated as a close (its condition no longer held), so the position stayed
+    open, the guard stayed live, and nothing said so.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock()
+    mt5 = _FakeMT5(
+        retcodes=(10018, 10009), tickets=(888,),
+        bid=1.09950, ask=1.09970,
+        tick_after=(1.15000, 1.15020),
+    )
+    # Triggered while the price is BELOW 1.10, which it leaves after the refusal.
+    rules = [_rule(price=1.10, op="<=")]
+
+    _run, events, rules_after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, rules, max_seconds=60
+    )
+
+    failures = [e for e in events if e["event"] == "close_failed"]
+    fired = [e for e in events if e["event"] == "fired"]
+    assert len(failures) == 1 and failures[0]["attempt"] == 1
+    assert len(fired) == 1, "the retry must not depend on the price still triggering"
+
+    went_out = fired[0]
+    assert went_out["retry"] is True and went_out["attempt"] == 2
+    assert went_out["pending_seconds"] >= 1.4
+    # It fired on a price that NO LONGER satisfies the rule -- that is the point.
+    assert (went_out["bid"] + went_out["ask"]) / 2.0 > 1.10
+    assert len(mt5.sends) == 2
+
+    # A CONFIRMED close is what consumes the rule, and only then.
+    assert rules_after == []
+    assert mt5.positions == []
+    assert events[-1]["exit_reason"] == "rules_satisfied"
+    assert not [e for e in events if e["event"] == "close_gave_up"]
+
+
+def test_the_watcher_resumes_a_retry_it_inherited_from_the_rules(
+    monkeypatch, tmp_path
+):
+    """A refused close outlives the process that made it.
+
+    The retry lives on the rule, so a watcher that is restarted (a sandbox pause,
+    a re-arm, a crash) picks the attempt up instead of forgetting a deal the
+    broker already refused -- and says that it is doing so.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock()
+    mt5 = _FakeMT5(retcodes=(10009,), tickets=(999,))
+    started = clock.now
+    rules = [_rule(pending_since=started - 10.0, pending_attempts=3,
+                   pending_deadline=started + 20.0)]
+
+    _run, events, rules_after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, rules, max_seconds=30
+    )
+
+    resumed = [e for e in events if e["event"] == "close_retry_resumed"]
+    assert len(resumed) == 1
+    assert resumed[0]["rules"] == [
+        {"rule_id": "g-retry", "symbol": "EURUSD", "attempts": 3}
+    ]
+    fired = [e for e in events if e["event"] == "fired"]
+    assert len(fired) == 1
+    assert fired[0]["retry"] is True and fired[0]["attempt"] == 4
+    assert fired[0]["pending_seconds"] >= 9.0
+    assert rules_after == []
+    assert mt5.positions == []
+
+
+def test_the_cli_and_the_watcher_agree_on_the_retry_constants(monkeypatch, tmp_path):
+    """The retry numbers exist twice and must not drift apart.
+
+    The watcher's copy runs in the sandbox's Wine python and cannot import the
+    CLI's; the CLI's copy is what ``guard status`` uses to say how long a refused
+    close will keep trying. Two copies of a number is a drift waiting to happen,
+    so they are compared here.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    source = cli._GUARD_WATCH_SOURCE
+
+    for name, value in (
+        ("RETRY_COOLDOWN_SECONDS", cli.GUARD_CLOSE_RETRY_COOLDOWN_SECONDS),
+        ("CLOSE_RETRY_DEADLINE_SECONDS", cli.GUARD_CLOSE_RETRY_DEADLINE_SECONDS),
+        ("CLOSE_RETRY_MAX_ATTEMPTS", cli.GUARD_CLOSE_RETRY_MAX_ATTEMPTS),
+        ("CLOSE_RETRY_PARK_SECONDS", cli.GUARD_CLOSE_RETRY_PARK_SECONDS),
+    ):
+        assert f"{name} = {value!r}" in source, name
+
+    # Both bounds are enforced, the terminal event exists, and the retry state is
+    # written to the rules file (the failure path used to leave it in memory).
+    assert "attempt >= CLOSE_RETRY_MAX_ATTEMPTS or now >= deadline" in source
+    assert '"event": "close_gave_up"' in source
+    assert 'rule["pending_attempts"] = attempt' in source
+    assert 'rule["parked_until"] = now + CLOSE_RETRY_PARK_SECONDS' in source
+    assert "pending = bool(rule.get(\"pending_since\"))" in source
+
+
+def test_a_close_the_watcher_is_still_retrying_is_not_a_healthy_status(
+    monkeypatch, tmp_path
+):
+    """ "Armed" and "armed, and the broker has refused my exit" are not the same.
+
+    A caller who asked to be out is still IN, so the status must not read as
+    healthy -- but it must also not send them off to re-arm: the watcher is
+    retrying, and the recovery line says so.
+    """
+    import argparse
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    cli.GUARD_RULES_FILE.write_text(json.dumps([{
+        "id": "g1", "symbol": "EURUSD", "op": ">=", "price": 1.14,
+        "pending_since": now - 4.0, "pending_attempts": 3,
+        "pending_deadline": now + 26.0, "last_attempt": now,
+    }]), encoding="utf-8")
+    cli.GUARD_STATE_FILE.write_text(json.dumps({
+        "status": "running", "heartbeat": now, "polls": 41, "interval_ms": 100,
+        "max_seconds": 0, "prices": {"EURUSD": 1.142}, "rules": 1,
+    }), encoding="utf-8")
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "emit",
+                        lambda payload, **_k: captured.update(payload) or 0)
+    cli.cmd_guard(argparse.Namespace(guard_action="status"))
+
+    assert captured["running"] is True
+    assert captured["ok"] is False
+    assert captured["alert"] == "close_retrying"
+    assert captured["retrying"][0]["rule_id"] == "g1"
+    assert captured["retrying"][0]["attempts"] == 3
+    assert captured["retrying"][0]["trying_for_s"] >= 3.9
+    assert 0.0 <= captured["retrying"][0]["retry_in_s"] <= 1.6
+    assert captured["retrying"][0]["deadline_in_s"] > 20.0
+    assert "not out yet" in captured["warning"]
+    assert "retries on its own" in captured["recovery"]
+
+    # The stopped-watcher alarm still outranks it, and positions carries the same
+    # reading, so the two surfaces cannot disagree.
+    assert cli._guard_summary()["alert"] == "close_retrying"
+    assert cli._guard_summary()["retrying"][0]["attempts"] == 3
+
+
+def test_a_close_the_watcher_gave_up_on_is_an_alarm_carrying_the_brokers_codes(
+    monkeypatch, tmp_path
+):
+    """Giving up is a position that needs the caller, so it is not ok=true."""
+    import argparse
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    cli.GUARD_RULES_FILE.write_text(json.dumps([{
+        "id": "g1", "symbol": "EURUSD", "op": ">=", "price": 1.14,
+        "pending_windows": 1, "gave_up_at": now - 5.0, "gave_up_attempts": 20,
+        "gave_up_retcodes": [10018], "parked_until": now + 55.0,
+    }]), encoding="utf-8")
+    cli.GUARD_STATE_FILE.write_text(json.dumps({
+        "status": "running", "heartbeat": now, "polls": 500, "interval_ms": 100,
+        "max_seconds": 0, "prices": {"EURUSD": 1.142}, "rules": 1,
+    }), encoding="utf-8")
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "emit",
+                        lambda payload, **_k: captured.update(payload) or 0)
+    cli.cmd_guard(argparse.Namespace(guard_action="status"))
+
+    assert captured["ok"] is False
+    assert captured["alert"] == "close_gave_up"
+    assert captured["gave_up"][0]["attempts"] == 20
+    assert captured["gave_up"][0]["retcodes"] == [10018]
+    assert captured["gave_up"][0]["gave_up_s_ago"] >= 4.9
+    assert 50.0 <= captured["gave_up"][0]["next_window_in_s"] <= 55.0
+    assert "STILL OPEN" in captured["warning"]
+    assert "action='close'" in captured["recovery"]
+    assert cli._guard_summary()["alert"] == "close_gave_up"
+
+    # A retrying close and a given-up close are different answers, and gave-up
+    # wins: it is the one that needs a human.
+    cli.GUARD_RULES_FILE.write_text(json.dumps([{
+        "id": "g1", "symbol": "EURUSD", "pending_since": now - 2.0,
+        "pending_attempts": 2, "pending_deadline": now + 28.0,
+        "last_attempt": now, "gave_up_at": now - 300.0, "parked_until": now,
+    }]), encoding="utf-8")
+    assert cli._guard_summary()["alert"] == "close_retrying"
+
+
+def test_the_watcher_writes_its_retry_state_to_the_rules_not_a_stale_copy(
+    monkeypatch, tmp_path
+):
+    """The rule the watcher rewrites is what the CLI reads: no second source.
+
+    ``guard status`` reports the retry from the rules file the watcher keeps, so
+    the state file's view is only a convenience -- and it must agree.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock()
+    mt5 = _FakeMT5(retcodes=(10018,), tickets=(777,))
+
+    run, events, _after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, [_rule()], max_seconds=6
+    )
+
+    assert run["state"]["retrying"] == {"g-retry": 4}, run["state"]
+    assert run["state"]["rules"] == 1
+    assert cli._guard_summary()["retrying"], "the CLI reads the same retry state"
+
+
 def test_guard_ensure_and_the_unpriceable_override_reach_the_cli():
     ensure = build_cli_command(
         "guard", {"guard_action": "ensure", "max_seconds": 600, "interval_ms": 50}
@@ -2878,6 +3339,53 @@ async def test_positions_says_when_a_guard_is_not_actually_watching():
     rendered = str(await tool.execute(action="positions"))
     assert "GUARD NOT WATCHING" not in rendered
     assert "a tick-level guard IS running" in rendered
+
+
+async def test_positions_reports_a_close_the_guard_could_not_get_out():
+    """ "The guard is live" is not the same as "the exit happened".
+
+    A guard that fired and whose close the broker REFUSED has a live watcher and
+    a position that is still open. Reading open risk from the positions payload
+    must therefore say which of those it is, in the same breath.
+    """
+    payload = {
+        "ok": True,
+        "count": 1,
+        "positions": [{"ticket": 1, "symbol": "EURUSD", "sl": 0.0, "tp": 0.0}],
+        "guard": {
+            "live": True, "rules_armed": 1, "alert": "close_retrying",
+            "retrying": [{"rule_id": "g1", "symbol": "EURUSD", "attempts": 3,
+                          "trying_for_s": 4.5, "retry_in_s": 1.0,
+                          "deadline_in_s": 25.5}],
+            "gave_up": [],
+        },
+    }
+    sandbox = _FakeSandbox(json.dumps(payload) + "\n[exit_code=0]")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+
+    rendered = str(await tool.execute(action="positions"))
+
+    assert '"guard_alert": "close_retrying"' in rendered
+    assert '"guard_retrying_close": [{"rule_id": "g1"' in rendered
+    assert "GUARD RETRYING A REFUSED CLOSE" in rendered
+    assert "NOT out yet" in rendered
+
+    # Given up: the caller has to act, and the broker's own refusals travel with
+    # the positions that are still open.
+    payload["guard"] = {
+        "live": True, "rules_armed": 1, "alert": "close_gave_up",
+        "retrying": [],
+        "gave_up": [{"rule_id": "g1", "symbol": "EURUSD", "attempts": 20,
+                     "retcodes": [10018], "gave_up_s_ago": 5.0,
+                     "next_window_in_s": 55.0}],
+    }
+    sandbox.response = json.dumps(payload) + "\n[exit_code=0]"
+    rendered = str(await tool.execute(action="positions"))
+
+    assert '"guard_gave_up_close"' in rendered
+    assert "GUARD COULD NOT CLOSE" in rendered
+    assert "STILL OPEN" in rendered
+    assert "10018" in rendered
 
 
 def test_spawn_reports_the_log_marks_its_callers_tail_from(monkeypatch, tmp_path):

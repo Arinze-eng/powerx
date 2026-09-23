@@ -64,7 +64,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-23.3"
+CLI_VERSION = "2026-09-23.4"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -1858,6 +1858,59 @@ def cmd_candles(args: argparse.Namespace) -> int:
     return emit({"ok": True, "symbol": args.symbol, "timeframe": args.timeframe.upper(), "bars": rows})
 
 
+def _guard_retry_state(rules: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Closes the watcher is RETRYING, and the ones it gave up on.
+
+    A refused close is not just a line in the event log any more: it is retry
+    state on the rule, so "is anything still trying to get me out of this
+    position?" has an answer that does not require reading the tail of a JSONL
+    file. The two cases are kept apart on purpose -- still trying is protection
+    with the broker saying no, given up is a position that needs a human.
+    """
+    armed = _read_guard_rules() if rules is None else rules
+    now = time.time()
+    retrying: list[dict[str, Any]] = []
+    gave_up: list[dict[str, Any]] = []
+    for rule in armed:
+        if not isinstance(rule, dict):
+            continue
+        if rule.get("pending_since"):
+            try:
+                since = float(rule.get("pending_since") or now)
+            except (TypeError, ValueError):
+                since = now
+            try:
+                attempt_at = float(rule.get("last_attempt") or 0.0)
+            except (TypeError, ValueError):
+                attempt_at = 0.0
+            retrying.append({
+                "rule_id": rule.get("id"),
+                "symbol": rule.get("symbol"),
+                "attempts": int(rule.get("pending_attempts") or 0),
+                "trying_for_s": round(now - since, 1),
+                "retry_in_s": round(
+                    max(0.0, attempt_at + GUARD_CLOSE_RETRY_COOLDOWN_SECONDS - now), 1
+                ),
+                "deadline_in_s": round(
+                    float(rule.get("pending_deadline") or now) - now, 1
+                ),
+            })
+        elif rule.get("gave_up_at"):
+            gave_up.append({
+                "rule_id": rule.get("id"),
+                "symbol": rule.get("symbol"),
+                "attempts": int(rule.get("gave_up_attempts") or 0),
+                "retcodes": rule.get("gave_up_retcodes") or [],
+                "gave_up_s_ago": round(
+                    now - float(rule.get("gave_up_at") or now), 1
+                ),
+                "next_window_in_s": round(
+                    max(0.0, float(rule.get("parked_until") or now) - now), 1
+                ),
+            })
+    return {"retrying": retrying, "gave_up": gave_up}
+
+
 def _guard_summary() -> dict[str, Any]:
     """One-line answer to "is anything watching a price right now?".
 
@@ -1869,15 +1922,25 @@ def _guard_summary() -> dict[str, Any]:
     state = _read_guard_state()
     rules = _read_guard_rules()
     live = _guard_is_live(state)
+    retry = _guard_retry_state(rules)
     alert = None
     if rules and not live:
         alert = "guard_not_running"
+    elif live and retry["gave_up"]:
+        # A close the watcher could not get through. The rule is still armed and
+        # will try again, but until it does there is a position that a caller
+        # believes is covered and that is not out yet.
+        alert = "close_gave_up"
+    elif live and retry["retrying"]:
+        alert = "close_retrying"
     elif live and (state or {}).get("unpriceable"):
         alert = "rule_unpriceable"
     return {
         "live": live,
         "rules_armed": len(rules),
         "alert": alert,
+        "retrying": retry["retrying"],
+        "gave_up": retry["gave_up"],
         "exit_reason": None if live else (state or {}).get("exit_reason"),
         "heartbeat_age_s": (
             round(time.time() - float((state or {}).get("heartbeat") or 0.0), 1)
@@ -2374,6 +2437,16 @@ GUARD_LOG_FILE = GUARD_DIR / "watcher.log"
 #: guard log is nothing but Wine noise and a real traceback is unfindable.
 GUARD_ERR_FILE = GUARD_DIR / "watcher.err"
 
+#: Mirrors of the watcher's close-retry constants. They live INSIDE
+#: ``_GUARD_WATCH_SOURCE`` (that source runs under the sandbox's Wine python and
+#: cannot import anything from here), but the CLI has to be able to say how long
+#: a refused close will keep trying, so it needs the numbers too. A test keeps
+#: the two copies equal rather than trusting them to stay in step.
+GUARD_CLOSE_RETRY_COOLDOWN_SECONDS = 1.5
+GUARD_CLOSE_RETRY_DEADLINE_SECONDS = 30.0
+GUARD_CLOSE_RETRY_MAX_ATTEMPTS = 20
+GUARD_CLOSE_RETRY_PARK_SECONDS = 60.0
+
 #: Seconds after which a silent heartbeat means the watcher is dead. The watcher
 #: beats every ``--interval-ms`` loop, so this is ~50 missed loops: long enough
 #: that a slow tick or a busy box is not mistaken for a crash, short enough that
@@ -2426,7 +2499,28 @@ RETCODE_UNSUPPORTED_FILLING = 10030
 #: A rejected close (no money, market closed, requote) keeps the rule ARMED --
 #: silently disarming protection is worse than a retry -- but it is retried on a
 #: cooldown so a persistent rejection cannot spam the broker 10x a second.
+#:
+#: MEASURED 2026-09-23: the cooldown was INERT for the case it was written for.
+#: The rule was only rewritten to the rules file when it fired and was consumed,
+#: so a FAILED attempt's ``last_attempt`` was dropped on the next pass (the rules
+#: file is re-read every loop) and a persistent rejection re-sent a close to the
+#: broker on every 100 ms poll. The retry state below is therefore persisted, and
+#: a test asserts the spacing between consecutive refusals.
 RETRY_COOLDOWN_SECONDS = 1.5
+#: How long a DECIDED close keeps being retried before the watcher says out loud
+#: that it cannot get the position out. A close that was refused is retried until
+#: the broker ACCEPTS it or this deadline passes -- not merely while the rule
+#: happens to stay armed and the price happens to stay beyond the level.
+CLOSE_RETRY_DEADLINE_SECONDS = 30.0
+#: ...or this many attempts, whichever comes first. 20 attempts x the 1.5 s
+#: cooldown is the same 30 s, so whichever the tick rate reaches first is fine.
+CLOSE_RETRY_MAX_ATTEMPTS = 20
+#: After giving up, the rule is PARKED for this long before a fresh retry window
+#: opens. A refusal that does not clear in 30 s is usually a CLOSED MARKET, and a
+#: weekend is minutes-to-days away from being closable rather than never -- so the
+#: rule keeps its position in the queue instead of abandoning it, at one loud
+#: ``close_gave_up`` line per window rather than a refusal storm.
+CLOSE_RETRY_PARK_SECONDS = 60.0
 #: Seconds a rule's symbol may go unpriced before the watcher says so out loud.
 #: A symbol with no tick is a rule that can never be evaluated, and a watcher
 #: that is silent about it is indistinguishable from protection.
@@ -2611,6 +2705,23 @@ def main():
         except Exception:
             pass
 
+    # A refused close is retry state on the RULE, so a watcher that is restarted
+    # (or one that comes up after a sandbox pause) picks the retry up instead of
+    # forgetting a deal the broker already refused once. Said out loud, because
+    # "the guard restarted" and "the guard restarted mid-retry" are different
+    # things to be told.
+    resuming = [
+        {"rule_id": r.get("id"), "symbol": r.get("symbol"),
+         "attempts": int(r.get("pending_attempts") or 0)}
+        for r in read_rules(args.rules)
+        if r.get("pending_since")
+    ]
+    if resuming:
+        append_jsonl(args.events, {
+            "event": "close_retry_resumed", "ts": time.time(), "rules": resuming,
+        })
+        note(f"resuming {len(resuming)} refused close(s): {resuming}")
+
     polls = 0
     exit_reason = "rules_satisfied"
     prices = {}
@@ -2675,7 +2786,27 @@ def main():
             level = float(rule.get("price"))
             rule["last_price"] = price
             rule["last_price_ts"] = now
-            if not triggered(price, op, level):
+            #: A rule can be in one of two states:
+            #:   * armed and waiting -- it acts only while the level is touched;
+            #:   * holding a DECIDED close -- the level was touched and the
+            #:     broker refused the deal. That decision stands, so the retry
+            #:     does NOT depend on the price still sitting beyond the level.
+            #:     MEASURED failure it fixes: a close refused on the touching
+            #:     tick, the price then ticking back inside, and the retry
+            #:     stopping -- a position left open with a live guard, an armed
+            #:     rule, and nothing left to report.
+            pending = bool(rule.get("pending_since"))
+            if not pending and not triggered(price, op, level):
+                continue
+            # A rule that has just given up is PARKED, pending or not. The park is
+            # what stops a broker that refuses every deal from being retried in a
+            # tight loop, and it is what reopens the window later -- usually
+            # because the market that was closed has opened. Checking it only for
+            # pending rules left a hole: the give-up CLEARS the pending state, so
+            # the very next poll re-armed a fresh window and the refusal storm was
+            # back. (Caught by the behavioural test, 2026-09-23: attempts resumed
+            # 1.6 s after the give-up instead of 60 s.)
+            if now < float(rule.get("parked_until") or 0.0):
                 continue
             if now - float(rule.get("last_attempt") or 0.0) < RETRY_COOLDOWN_SECONDS:
                 continue
@@ -2685,6 +2816,12 @@ def main():
             results = close_positions(rule, positions, args.deviation, args.magic)
             close_ts = time.time()
             ok = all(r.get("ok") for r in results) if results else True
+            #: Which close this is: 1 is the trigger itself, 2+ are retries of a
+            #: deal the broker had already refused. ``retry_window`` counts the
+            #: give-up windows before this one, so attempt 1 of window 2 says so.
+            attempt = int(rule.get("pending_attempts") or 0) + 1
+            window_started = float(rule.get("pending_since") or now)
+            retry_window = int(rule.get("pending_windows") or 0) + 1
             append_jsonl(args.events, {
                 "event": "fired" if ok else "close_failed",
                 "rule_id": rule.get("id"), "symbol": symbol, "op": op, "level": level,
@@ -2694,15 +2831,88 @@ def main():
                 "trigger_ts": trigger_ts, "close_ts": close_ts,
                 "latency_ms": round((close_ts - trigger_ts) * 1000.0, 1),
                 "positions_matched": len(positions), "results": results, "polls": polls,
+                "attempt": attempt, "retry": pending, "retry_window": retry_window,
+                "pending_seconds": round(now - window_started, 1) if pending else 0.0,
             })
             if ok:
                 note(
                     f"{rule.get('id')} FIRED {symbol} {op} {level} at {price} "
                     f"({used_side}) -- {len(positions)} position(s), "
                     f"{round((close_ts - trigger_ts) * 1000.0, 1)} ms to fill"
+                    + (
+                        f" (retry {attempt - 1} of {attempt - 1} after "
+                        f"{round(now - window_started, 1)} s: the broker had refused)"
+                        if pending
+                        else ""
+                    )
                 )
+                # The close is CONFIRMED, so the retry state goes with it. Left
+                # behind, it would keep the rule retrying a deal that is done.
+                for key in (
+                    "pending_since", "pending_attempts", "pending_deadline",
+                    "parked_until", "gave_up_at", "gave_up_attempts",
+                    "gave_up_retcodes",
+                ):
+                    if rule.pop(key, None) is not None:
+                        changed = True
             else:
-                note(f"{rule.get('id')} close FAILED at {price}: {results}")
+                # The refusal is remembered on the RULE, and the rules file is
+                # rewritten below, so the retry survives both the next loop pass
+                # (which re-reads the file) and a restart of the watcher.
+                if not pending:
+                    rule["pending_since"] = now
+                    rule["pending_deadline"] = now + CLOSE_RETRY_DEADLINE_SECONDS
+                rule["pending_attempts"] = attempt
+                changed = True
+                deadline = float(
+                    rule.get("pending_deadline")
+                    or (now + CLOSE_RETRY_DEADLINE_SECONDS)
+                )
+                retcodes = sorted(
+                    {r.get("retcode") for r in results if r.get("retcode") is not None}
+                )
+                note(
+                    f"{rule.get('id')} close FAILED at {price} "
+                    f"(attempt {attempt}, {round(now - window_started, 1)} s): {results}"
+                )
+                if attempt >= CLOSE_RETRY_MAX_ATTEMPTS or now >= deadline:
+                    # GIVING UP IS AN EVENT, NOT A SILENCE. The position is still
+                    # open, so the caller is told in one line with the broker's own
+                    # codes and the tickets -- the failure that used to be a
+                    # resume-forever retry or an abandoned position, depending on
+                    # whether the price stayed beyond the level.
+                    still_open = [int(p.ticket) for p in matching_positions(rule)]
+                    rule["pending_windows"] = retry_window
+                    rule["gave_up_at"] = now
+                    rule["gave_up_attempts"] = attempt
+                    rule["gave_up_retcodes"] = retcodes
+                    rule["parked_until"] = now + CLOSE_RETRY_PARK_SECONDS
+                    for key in ("pending_since", "pending_attempts", "pending_deadline"):
+                        rule.pop(key, None)
+                    append_jsonl(args.events, {
+                        "event": "close_gave_up", "ts": now,
+                        "rule_id": rule.get("id"), "symbol": symbol,
+                        "op": op, "level": level, "trigger_price": price,
+                        "attempts": attempt, "retry_window": retry_window,
+                        "retry_seconds": round(now - window_started, 1),
+                        "retcodes": retcodes, "last_results": results,
+                        "still_open_tickets": still_open,
+                        "retry_in_s": CLOSE_RETRY_PARK_SECONDS,
+                        "detail": (
+                            f"the broker refused this close {attempt} time(s) over "
+                            f"{round(now - window_started, 1)} s and the position(s) "
+                            f"{still_open or 'matched by this rule'} are still open. "
+                            "The rule stays armed and opens a fresh retry window "
+                            f"after {int(CLOSE_RETRY_PARK_SECONDS)} s (a closed market "
+                            "is the usual cause, and that close works when it reopens)."
+                        ),
+                    })
+                    note(
+                        f"{rule.get('id')} GAVE UP closing {symbol} after {attempt} "
+                        f"attempts / {round(now - window_started, 1)} s -- still open: "
+                        f"{still_open}, broker said {retcodes}. Still armed; retries "
+                        f"in {int(CLOSE_RETRY_PARK_SECONDS)} s."
+                    )
             if ok and rule.get("once", True):
                 rules = [r for r in rules if r.get("id") != rule.get("id")]
                 changed = True
@@ -2720,20 +2930,39 @@ def main():
             ):
                 exit_reason = "unpriceable_symbol"
                 break
+        armed_now = read_rules(args.rules)
         write_json(args.state, {
             "pid": os.getpid(), "started_at": started, "status": "running",
             "heartbeat": time.time(), "polls": polls, "interval_ms": args.interval_ms,
             "max_seconds": int(args.max_seconds),
-            "prices": prices, "rules": len(read_rules(args.rules)),
+            "prices": prices, "rules": len(armed_now),
             "unpriceable": {s: round(t, 1) for s, t in unpriced_since.items()},
+            # A close that is being retried is the difference between "armed" and
+            # "armed and already trying to get out", so it is in the live state.
+            "retrying": {
+                str(r.get("id")): int(r.get("pending_attempts") or 0)
+                for r in armed_now if r.get("pending_since")
+            },
+            "gave_up": [
+                str(r.get("id")) for r in armed_now if r.get("gave_up_at")
+            ],
         })
         time.sleep(max(0.01, args.interval_ms / 1000.0))
 
+    # The rules at exit, read once: a watcher can stop with retry state still on
+    # them (a crash, a stop request, a re-arm), and that state is the difference
+    # between "the guard is gone" and "the guard is gone mid-retry".
+    final_rules = read_rules(args.rules)
     write_json(args.state, {
         "pid": os.getpid(), "started_at": started, "status": "finished",
         "exit_reason": exit_reason, "finished_at": time.time(),
         "heartbeat": time.time(), "polls": polls,
-        "rules": len(read_rules(args.rules)),
+        "rules": len(final_rules),
+        "retrying": {
+            str(r.get("id")): int(r.get("pending_attempts") or 0)
+            for r in final_rules if r.get("pending_since")
+        },
+        "gave_up": [str(r.get("id")) for r in final_rules if r.get("gave_up_at")],
     })
     append_jsonl(args.events, {
         "event": "watcher_stop", "ts": time.time(), "exit_reason": exit_reason,
@@ -3174,10 +3403,21 @@ def cmd_guard(args: argparse.Namespace) -> int:
                     for e in failed_now
                 ]
                 payload.pop("error", None)
+                # The refusal does NOT end the attempt: the close is retry state on
+                # the rule, the rule is not consumed, and the watcher keeps trying
+                # -- so this must not read as "the guard tried once and stopped".
+                state_now = _read_guard_state()
+                payload["retrying"] = _guard_retry_state()
+                payload["guard_live"] = _guard_is_live(state_now)
                 payload["message"] = (
                     "The level was already satisfied, the guard fired on the first "
                     "tick, and the CLOSE WAS REJECTED -- the position is still "
-                    "open. Read 'close_failed' for the broker's answer."
+                    "open. Read 'close_failed' for the broker's answer. The rule is "
+                    "NOT consumed and the watcher retries the close every "
+                    f"{GUARD_CLOSE_RETRY_COOLDOWN_SECONDS} s for up to "
+                    f"{int(GUARD_CLOSE_RETRY_DEADLINE_SECONDS)} s; poll guard "
+                    "action='events' for 'fired' (it got out) or 'close_gave_up' "
+                    "(it could not)."
                 )
                 return emit(
                     payload,
@@ -3223,6 +3463,45 @@ def cmd_guard(args: argparse.Namespace) -> int:
                     "mounted and that Wine can start the Windows python."
                 )
             return emit(payload, text="guard failed to start", code=2)
+
+        # LIVE, and a close of it was ALREADY refused. The watcher is up and
+        # retrying, which is why "armed" alone would be the wrong answer here:
+        # the caller asked to be OUT, and is not out. The retry is reported on the
+        # same fields the status action uses, so arm and status never disagree.
+        retry = _guard_retry_state()
+        payload["retrying"] = retry["retrying"]
+        payload["gave_up"] = retry["gave_up"]
+        if retry["gave_up"] or retry["retrying"]:
+            payload["ok"] = False
+            payload["alert"] = (
+                "close_gave_up" if retry["gave_up"] else "close_retrying"
+            )
+            payload["recovery"] = (
+                "read guard events, then check action='positions'"
+                if retry["gave_up"]
+                else "nothing to do yet -- the watcher retries on its own"
+            )
+            payload["warning"] = (
+                "the guard is live but has NOT got the position out: "
+                + "; ".join(
+                    (
+                        f"{g['rule_id']} on {g['symbol']} refused {g['attempts']} "
+                        f"time(s) (retcodes {g['retcodes']})"
+                    )
+                    for g in retry["gave_up"]
+                )
+                + "; ".join(
+                    (
+                        f"{r['rule_id']} on {r['symbol']} refused {r['attempts']} "
+                        f"time(s) so far, next retry in {r['retry_in_s']} s"
+                    )
+                    for r in retry["retrying"]
+                )
+                + ". Poll action='guard', guard_action='events' for 'fired' (it got "
+                "out) or 'close_gave_up' (it could not), and do not read this level "
+                "as covered until the position is gone."
+            )
+            return emit(payload, text="guard armed, but the close was refused")
         return emit(payload, text=f"guard armed ({len(payload['rules'])} rule(s))")
 
     if subcommand in ("status", "ensure"):
@@ -3344,17 +3623,30 @@ def cmd_guard(args: argparse.Namespace) -> int:
         # used to come back ok=True, which reads as "everything is fine" while
         # the level is being watched by nobody -- the one answer this action must
         # never give.
+        retry = _guard_retry_state(rules)
         alarm = None
         if rules and not live:
             alarm = "guard_not_running"
+        elif live and retry["gave_up"]:
+            # The guard IS running and could NOT get the position out. Reporting
+            # that as a healthy status is the same lie as a dead-while-armed
+            # guard reported as fine: a caller who asked to be out is still in.
+            alarm = "close_gave_up"
+        elif live and retry["retrying"]:
+            alarm = "close_retrying"
         elif live and unpriceable:
             alarm = "rule_unpriceable"
         payload = {
+            # A refused close is not a healthy status even when the watcher is
+            # retrying it: the caller asked to be out and is still in. Everything
+            # that is not ok carries the field that says why, and how to recover.
             "ok": alarm is None,
             "running": live,
             "state": state,
             "rules_armed": len(rules),
             "rules": rules,
+            "retrying": retry["retrying"],
+            "gave_up": retry["gave_up"],
             "interval_ms": (state or {}).get("interval_ms"),
             "polls": (state or {}).get("polls"),
             "prices": (state or {}).get("prices") or {},
@@ -3374,7 +3666,18 @@ def cmd_guard(args: argparse.Namespace) -> int:
         }
         if alarm:
             payload["alert"] = alarm
-            payload["recovery"] = "guard action='ensure' (or arm again)"
+            payload["recovery"] = {
+                "close_gave_up": (
+                    "read guard events for close_gave_up, check positions, and close "
+                    "the position by hand (action='close') or fix what the broker "
+                    "refused; the rule retries on its own"
+                ),
+                "close_retrying": (
+                    "nothing to do yet -- the watcher retries on its own; poll "
+                    "guard status (or events) for fired, or for close_gave_up if the "
+                    "broker keeps refusing"
+                ),
+            }.get(alarm, "guard action='ensure' (or arm again)")
             if alarm == "guard_not_running":
                 payload["exit_reason"] = (state or {}).get("exit_reason")
                 payload["warning"] = (
@@ -3386,6 +3689,33 @@ def cmd_guard(args: argparse.Namespace) -> int:
                         else ""
                     )
                     + ". Nothing will close on these levels until it runs again."
+                )
+            elif alarm == "close_gave_up":
+                payload["warning"] = (
+                    "the guard is running but could NOT close: "
+                    + "; ".join(
+                        f"{g['rule_id']} on {g['symbol']} refused "
+                        f"{g['attempts']} time(s) (retcodes {g['retcodes']}) and "
+                        f"{g['gave_up_s_ago']} s ago"
+                        for g in retry["gave_up"]
+                    )
+                    + ". The position(s) are STILL OPEN. The rule stays armed and "
+                    f"opens a fresh retry window in {retry['gave_up'][0]['next_window_in_s']} s "
+                    "(a closed market is the usual cause); read action='guard' "
+                    "guard_action='events' for close_gave_up, and check "
+                    "action='positions' before believing this level is covered."
+                )
+            elif alarm == "close_retrying":
+                payload["warning"] = (
+                    "the guard fired and the broker REFUSED the close: "
+                    + "; ".join(
+                        f"{r['rule_id']} on {r['symbol']}, {r['attempts']} attempt(s) "
+                        f"over {r['trying_for_s']} s, next in {r['retry_in_s']} s"
+                        for r in retry["retrying"]
+                    )
+                    + ". It keeps retrying until the broker accepts or "
+                    f"{int(GUARD_CLOSE_RETRY_DEADLINE_SECONDS)} s passes, then logs "
+                    "close_gave_up. The position(s) are not out yet."
                 )
             else:
                 payload["warning"] = (

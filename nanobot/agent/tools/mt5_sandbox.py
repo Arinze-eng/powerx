@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-23.3"
+_CLI_VERSION = "2026-09-23.4"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -999,6 +999,13 @@ class MT5SandboxTool(Tool):
                 "guard_live": bool(guard.get("live")),
                 "guard_rules_armed": int(guard.get("rules_armed") or 0),
                 "guard_alert": guard.get("alert"),
+                # A fired rule whose close the broker REFUSED is not covered
+                # ground: the level was touched, the guard did its job, and the
+                # position is still open while the watcher retries. Carried in the
+                # same payload as the positions, because it changes what the
+                # caller should do next.
+                "guard_retrying_close": guard.get("retrying") or [],
+                "guard_gave_up_close": guard.get("gave_up") or [],
                 "unprotected_tickets": unprotected,
             }
             if unprotected:
@@ -1029,6 +1036,35 @@ class MT5SandboxTool(Tool):
                     + ". Nothing will close at those levels until it is restarted. "
                     "Restart it with action='guard', guard_action='ensure', then "
                     "re-read positions before trusting those levels."
+                )
+            elif guard.get("alert") == "close_gave_up":
+                payload["warning"] = (
+                    "GUARD COULD NOT CLOSE: the level was touched, the watcher sent "
+                    "the close, and the broker refused it repeatedly -- these "
+                    "position(s) are STILL OPEN. "
+                    + "; ".join(
+                        f"{g.get('rule_id')} on {g.get('symbol')}: "
+                        f"{g.get('attempts')} refusal(s), retcodes {g.get('retcodes')}"
+                        for g in (guard.get("gave_up") or [])
+                    )
+                    + f". The rule stays armed and retries in "
+                    f"{(guard.get('gave_up') or [{}])[0].get('next_window_in_s')} s "
+                    "(a closed market is the usual cause). Read action='guard' "
+                    "guard_action='events' for close_gave_up, and close by hand "
+                    "(action='close') if you need out now."
+                )
+            elif guard.get("alert") == "close_retrying":
+                payload["warning"] = (
+                    "GUARD RETRYING A REFUSED CLOSE: the watcher is up and the "
+                    "broker refused its exit, so the position(s) are NOT out yet. "
+                    + "; ".join(
+                        f"{r.get('rule_id')} on {r.get('symbol')}: "
+                        f"{r.get('attempts')} attempt(s) over {r.get('trying_for_s')} s, "
+                        f"next in {r.get('retry_in_s')} s"
+                        for r in (guard.get("retrying") or [])
+                    )
+                    + ". It keeps retrying until the broker accepts or the deadline "
+                    "passes; poll guard events for 'fired' or 'close_gave_up'."
                 )
             elif guard.get("alert") == "rule_unpriceable":
                 payload["warning"] = (
