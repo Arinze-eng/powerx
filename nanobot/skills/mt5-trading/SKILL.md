@@ -312,6 +312,41 @@ else — that list is the exact shape of the original complaint.
   of 3600 s is what stopped guards whose level had not arrived yet. `max_seconds`
   is honoured only when it is positive, and `ensure` inherits the budget the
   guard was armed with when the call does not restate one.
+* **The guard reads every tick that was RECORDED, not one sample per loop.**
+  MEASURED 2026-09-23, live: EURUSD recorded 37131 ticks in 60 s (618.85 tick/s)
+  while the watcher looked 10 times a second, so ~98% of the ticks were never
+  examined and a level touched inside a 100 ms gap was invisible. The watcher now
+  reads the recorded stream (`copy_ticks_from`) on each pass. `status` carries
+  `ticks_scanned` per symbol; every event carries it too, and a fire names the
+  tick that actually crossed (`crossing_msc`, `crossing_price`,
+  `crossing_age_ms`). **`ticks_scanned: {}` on a symbol you know is trading means
+  the scan is not reaching the stream** — investigate before claiming coverage.
+* **A level touched and already back inside is REPORTED, never acted on.** The
+  event is `level_touched_then_reverted` (`touch_price`, `touch_age_ms`,
+  `price_now`), at most one line per rule per 5 s. Seeing the tick must not
+  become acting on the tick: the price is back inside the level, so a close now
+  would fill at a price the caller never asked to be out at. Closes still fire on
+  the LIVE tick only. When someone asks "did it touch X", this event is the
+  answer — and it is not a reason to say the position was closed.
+* **`status` can OBSERVE instead of assert.** `wait_seconds` (capped at 120 s,
+  with `poll_seconds`) blocks until the event log grows, then returns the event
+  with `observed`, `observed_event`, `waited_s`, `samples`; when nothing happens
+  it returns `observed: false` with the same fields rather than a claim that all
+  is well. ANY new event ends the wait — a `close_failed`, a `close_gave_up` or a
+  `watcher_stop` matters as much as a `fired`. Use it when the caller asks you to
+  watch, instead of polling in a loop.
+* **The tick stream is stamped in the TERMINAL's clock, not the sandbox's.**
+  MEASURED 2026-09-23, live: the tick clock ran **10799 s (~3 h) ahead** of
+  `time.time()` inside Wine, and comparing the two made the every-tick scan
+  silently empty — it asked for "ticks since now − 3 s" and was answered with
+  20000 rows of history, every one older than the live tick, so `ticks_scanned`
+  was `{}` on a guard that otherwise looked healthy. Anything that compares a
+  tick stamp to `time.time()` is wrong; age a tick against another tick.
+* The ceiling that remains: `symbol_info_tick` inside Wine costs **334.7 µs**
+  (~2988 polls/s) and returns ONE tick per call, so polling faster buys nothing
+  beyond that. A sub-poll spike through a level is still only catchable by an
+  MQL5 EA's `OnTick`. The guard's *precision* is bounded by the poll; its
+  *blindness* to recorded ticks is not.
 * **A stopped guard with rules still armed is an ALARM, not a status.** `status`
   answers `ok: false` with `alert: "guard_not_running"`, the `exit_reason`, the
   `heartbeat_age_s`, and `recovery: "guard action='ensure'"`. Never report the
