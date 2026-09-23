@@ -2918,6 +2918,9 @@ class _FakeMT5:
     ORDER_FILLING_RETURN = 3
     ORDER_TIME_GTC = 0
     TRADE_ACTION_DEAL = 1
+    COPY_TICKS_ALL = 0
+    COPY_TICKS_TRADE = 1
+    COPY_TICKS_INFO = 2
 
     def __init__(
         self,
@@ -2929,8 +2932,13 @@ class _FakeMT5:
         ask: float = 1.14210,
         tick_after: tuple[float, float] | None = None,
         tick_after_sends: int = 1,
+        ticks: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
+        tick_after_polls: tuple[int, float, float] | None = None,
     ) -> None:
         self.script = list(retcodes) or [10009]
+        self.poll_count = 0
+        self.swapped = False
+        self.tick_after_polls = tick_after_polls
         self.positions = [
             types.SimpleNamespace(
                 ticket=ticket, symbol=symbol, type=self.POSITION_TYPE_BUY,
@@ -2939,8 +2947,14 @@ class _FakeMT5:
             for ticket in tickets
         ]
         self.tick = types.SimpleNamespace(
-            bid=bid, ask=ask, time=1_700_000_000, last=bid, volume=1
+            bid=bid, ask=ask, time=1_700_000_000, last=bid, volume=1,
+            time_msc=1_700_000_000_000,
         )
+        #: The RECORDED tick stream, as dicts keyed like the MT5 rows
+        #: (``time_msc`` in ms, ``bid``/``ask``). Empty by default: a fake that
+        #: has no stream must behave exactly like a terminal that cannot serve
+        #: one, which is the fallback every pre-existing test relies on.
+        self.ticks = list(ticks or ())
         self.tick_after = tick_after
         self.tick_after_sends = tick_after_sends
         self.sends: list[dict[str, Any]] = []
@@ -2960,7 +2974,39 @@ class _FakeMT5:
         return types.SimpleNamespace(filling_mode=self.ORDER_FILLING_FOK)
 
     def symbol_info_tick(self, _symbol: str) -> Any:
+        self.poll_count += 1
+        if (
+            self.tick_after_polls is not None
+            and not self.swapped
+            and self.poll_count > int(self.tick_after_polls[0])
+        ):
+            # The market moves onto the level AFTER the first look, which is what
+            # makes the tick SCAN run: on the pass a symbol is first seen the scan
+            # is only armed at the current tick, so a crossing can only be named
+            # on a later pass. Swapping on the first call reproduces that.
+            self.swapped = True
+            self.tick = types.SimpleNamespace(
+                bid=float(self.tick_after_polls[1]),
+                ask=float(self.tick_after_polls[2]),
+                time=1_700_000_200, last=float(self.tick_after_polls[1]), volume=1,
+                time_msc=self.tick.time_msc + 200,
+            )
         return self.tick
+
+    def copy_ticks_from(self, _symbol: str, since: Any, _limit: int = 20000,
+                        _flags: int = 0) -> list[dict[str, Any]]:
+        """The RECORDED stream, which is the point of the tick scan.
+
+        Returns every fake tick at or after ``since`` (seconds), so a test can
+        put ticks in the gap between two polls -- exactly what a 10 Hz sample of
+        a ~619 tick/s feed throws away -- and assert what the watcher did with
+        them. An empty ``ticks`` list is the default, so every older test keeps
+        exercising the degradation path where the read is simply unavailable.
+        """
+        if not self.ticks:
+            return []
+        floor_msc = int(float(since) * 1000.0)
+        return [t for t in self.ticks if int(t["time_msc"]) >= floor_msc]
 
     def positions_get(self, ticket: int | None = None) -> list[Any]:
         if ticket is not None:
@@ -3087,7 +3133,17 @@ def test_a_refused_close_is_retried_on_a_persisted_cooldown_then_given_up_loudly
         round(b["trigger_ts"] - a["trigger_ts"], 2)
         for a, b in zip(first, first[1:])
     ]
-    assert min(gaps) >= 1.4, gaps
+    # The opening burst is FAST. A refusal is usually transient -- a requote, or a
+    # price that moved under a market order -- and the flat 1.5 s cooldown this
+    # replaced sat on a deal the broker would have taken ~300 ms later.
+    burst = gaps[: cli.GUARD_CLOSE_RETRY_FAST_ATTEMPTS - 1]
+    assert burst and all(g <= 0.5 for g in burst), gaps
+    # ...and the burst is BOUNDED, which is what stops "fast" becoming the 10 Hz
+    # refusal storm this whole retry state was written to remove. Once the burst
+    # is spent the cadence settles back to the flat cooldown, so a HARD refusal
+    # (a closed market) is not hammered any harder than it used to be.
+    settled = gaps[cli.GUARD_CLOSE_RETRY_FAST_ATTEMPTS - 1:]
+    assert settled and all(g >= 1.4 for g in settled), gaps
     # ...and one refused close is one deal sent to the broker, not one per poll.
     assert len(mt5.sends) == len(failures)
 
@@ -3147,7 +3203,9 @@ def test_a_refused_close_is_retried_even_after_the_price_leaves_the_level(
 
     went_out = fired[0]
     assert went_out["retry"] is True and went_out["attempt"] == 2
-    assert went_out["pending_seconds"] >= 1.4
+    # The FIRST retry of a window goes out on the fast cooldown, not the flat
+    # 1.5 s one: this deal was refused and then accepted one burst-step later.
+    assert 0.0 < went_out["pending_seconds"] <= 0.5
     # It fired on a price that NO LONGER satisfies the rule -- that is the point.
     assert (went_out["bid"] + went_out["ask"]) / 2.0 > 1.10
     assert len(mt5.sends) == 2
@@ -3326,9 +3384,205 @@ def test_the_watcher_writes_its_retry_state_to_the_rules_not_a_stale_copy(
         cli, monkeypatch, tmp_path, mt5, clock, [_rule()], max_seconds=6
     )
 
-    assert run["state"]["retrying"] == {"g-retry": 4}, run["state"]
+    # The COUNT is not the assertion -- how many attempts fit in the window is a
+    # consequence of the cadence -- so it is derived from the events: state and
+    # rules must agree on the same attempt number, whatever that number is.
+    failures = [e for e in events if e["event"] == "close_failed"]
+    attempts = [f["attempt"] for f in failures if f["retry_window"] == 1]
+    assert attempts, events
+    assert run["state"]["retrying"] == {"g-retry": max(attempts)}, run["state"]
     assert run["state"]["rules"] == 1
+    on_disk = json.loads(cli.GUARD_RULES_FILE.read_text(encoding="utf-8"))
+    assert on_disk[0]["pending_attempts"] == max(attempts)
     assert cli._guard_summary()["retrying"], "the CLI reads the same retry state"
+
+
+def test_a_level_touched_and_reverted_between_polls_is_reported_and_not_closed(
+    monkeypatch, tmp_path
+):
+    """The tick the 10 Hz sample could not see is REPORTED, and NOT acted on.
+
+    MEASURED 2026-09-23 on a live box: EURUSD records ~619 tick/s and the watcher
+    looked 10 times a second, so ~98% of ticks were never examined and a level
+    touched and reverted inside a 100 ms gap was invisible. This is that tick --
+    and the decision it must produce is the OPPOSITE of a fire: the price is back
+    inside the level, so closing now would fill at a price the caller never asked
+    to be out at. Seeing the tick must not become acting on the tick.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock()
+    # The level is 1.15. The live price never reaches it; ONE recorded tick does.
+    mt5 = _FakeMT5(
+        bid=1.14190, ask=1.14210,
+        ticks=[
+            {"time_msc": 1_700_000_000_400, "bid": 1.15000, "ask": 1.15000},
+            {"time_msc": 1_700_000_000_600, "bid": 1.14200, "ask": 1.14220},
+        ],
+    )
+
+    _run, events, rules_after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, [_rule(price=1.15)], max_seconds=2
+    )
+
+    assert not [e for e in events if e["event"] == "fired"], events
+    assert mt5.sends == [], "a reverted touch must not send a deal"
+
+    near = [e for e in events if e["event"] == "level_touched_then_reverted"]
+    assert len(near) == 1, events
+    miss = near[0]
+    assert miss["rule_id"] == "g-retry" and miss["level"] == 1.15
+    # mid of (1.14190, 1.14210) -- the price it is back INSIDE the level at.
+    assert miss["touch_price"] == 1.15 and miss["price_now"] == pytest.approx(1.14200)
+    assert miss["ticks_scanned"] >= 1
+    assert "NOT closing" in miss["detail"]
+
+    # Reported, not consumed: the rule is still armed and still watching.
+    assert [r["id"] for r in rules_after] == ["g-retry"]
+
+
+def test_the_scan_never_counts_a_tick_from_before_the_rule_was_armed(
+    monkeypatch, tmp_path
+):
+    """No backfill: history is not this rule's crossing.
+
+    On the pass a symbol is first seen the scan is ARMED at the tick already
+    visible rather than walked backwards. Without that, the first pass would read
+    the lookback window as ticks it had just watched and invent a crossing that
+    happened before the rule existed -- and report it as a near miss or, worse,
+    attach it to a real fire as the trigger.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock()
+    # Satisfied ALREADY, with a crossing-looking tick stamped BEFORE the live one.
+    mt5 = _FakeMT5(
+        bid=1.15000, ask=1.15000,
+        ticks=[{"time_msc": 1_699_999_999_000, "bid": 1.16000, "ask": 1.16000}],
+    )
+
+    _run, events, _after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, [_rule(price=1.15)], max_seconds=1
+    )
+
+    fired = [e for e in events if e["event"] == "fired"]
+    assert len(fired) == 1, events
+    # It fires on the LIVE tick, and claims no crossing from the pre-arm history.
+    assert "crossing_msc" not in fired[0]
+    assert "crossing_price" not in fired[0]
+    assert not [e for e in events if e["event"] == "level_touched_then_reverted"]
+
+
+def test_a_fire_names_the_tick_that_actually_crossed(monkeypatch, tmp_path):
+    """The reported trigger is the tick that crossed, not the poll that noticed.
+
+    A fire whose ``trigger_price`` is the poll sample says "we sampled this"; the
+    crossing fields say how long the level had really been crossed. That is the
+    difference the recorded stream buys, and it is reported WITHOUT changing what
+    the deal is sent at: the order still uses the live tick.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock()
+    mt5 = _FakeMT5(
+        # Below the level on the first look, at it afterwards -- so the scan is
+        # armed on pass 1 and the crossing is named on pass 2.
+        bid=1.14190, ask=1.14210,
+        tick_after_polls=(1, 1.15030, 1.15050),
+        # Stamped BETWEEN the first poll's tick (…000) and the poll that noticed
+        # (…200) -- i.e. in the gap the loop samples over.
+        ticks=[{"time_msc": 1_700_000_000_150, "bid": 1.15, "ask": 1.15}],
+    )
+
+    _run, events, _after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, [_rule(price=1.15)], max_seconds=2
+    )
+
+    fired = [e for e in events if e["event"] == "fired"]
+    assert len(fired) == 1, events
+    event = fired[0]
+    assert event["crossing_msc"] == 1_700_000_000_150
+    assert event["crossing_price"] == 1.15
+    assert event["crossing_age_ms"] >= 0.0
+    assert event["ticks_scanned"] >= 1
+    # The crossing sits BETWEEN the first poll's tick and the poll that noticed
+    # it, which is the whole claim: it happened in the gap the old loop sampled
+    # over, and it is now named instead of lost.
+    assert event["crossing_msc"] > 1_700_000_000_000
+    assert event["crossing_msc"] < mt5.tick.time_msc
+    # And the deal still went out at the live price, not the historical one.
+    assert mt5.sends and mt5.sends[0]["price"] == pytest.approx(1.15030)
+
+
+def test_guard_watch_returns_the_moment_something_happens(monkeypatch, tmp_path):
+    """A blocking status OBSERVES the exit instead of asserting it is monitored.
+
+    "The guard is monitoring" is a claim until something watches it. This is the
+    watch: it samples and returns the moment the event log grows, carrying the
+    event, so the caller can report what HAPPENED rather than what is configured.
+    """
+    import threading
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    cli.GUARD_EVENTS_FILE.write_text("", encoding="utf-8")
+
+    def write_fire() -> None:
+        with cli.GUARD_EVENTS_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "event": "fired", "rule_id": "g-watch", "symbol": "EURUSD",
+                "trigger_price": 1.15, "latency_ms": 146.1,
+            }) + "\n")
+
+    timer = threading.Timer(0.3, write_fire)
+    timer.start()
+    try:
+        watched = cli._guard_wait(5.0, 0.2)
+    finally:
+        timer.cancel()
+
+    assert watched["timed_out"] is False
+    assert watched["observed_event"] == "fired"
+    assert watched["observed"][-1]["latency_ms"] == 146.1
+    assert watched["samples"] >= 1
+    # It returned because of the event, not because the budget ran out.
+    assert watched["waited_s"] < 5.0
+    assert "observed 'fired'" in watched["note"]
+
+
+def test_guard_watch_says_when_nothing_happened(monkeypatch, tmp_path):
+    """"Nothing happened" must be reported as nothing, never as an event.
+
+    A watch that timed out and a watch that saw a fire are different answers, and
+    conflating them is how a caller ends up reporting coverage it never observed.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    cli.GUARD_EVENTS_FILE.write_text("", encoding="utf-8")
+
+    watched = cli._guard_wait(0.5, 0.2)
+
+    assert watched["timed_out"] is True
+    assert watched["observed"] == [] and watched["observed_event"] is None
+    assert watched["samples"] >= 1
+    assert "nothing happened" in watched["note"]
+    # The cap is stated in the answer, and it respects the sandbox ceiling.
+    assert watched["capped_at_s"] == cli.GUARD_MAX_WAIT_SECONDS <= 120.0
+
+
+def test_guard_watch_reaches_the_cli_and_the_wait_is_bounded(monkeypatch, tmp_path):
+    """The tool passes the watch through, and the wait can never outrun its cap."""
+    watched = build_cli_command(
+        "guard",
+        {"guard_action": "status", "wait_seconds": 30, "poll_seconds": 2},
+    )
+    assert "--wait-seconds 30" in watched
+    assert "--poll-seconds 2" in watched
+
+    # No wait asked for -> no flag, so a plain status stays a snapshot.
+    plain = build_cli_command("guard", {"guard_action": "status"})
+    assert "--wait-seconds" not in plain
+
+    # The cap is enforced CLI-side, so a caller asking for an hour cannot hold a
+    # sandbox command open past the ceiling and get killed mid-wait with no JSON.
+    assert _broker_cli(monkeypatch, tmp_path).GUARD_MAX_WAIT_SECONDS <= 120.0
 
 
 def test_guard_ensure_and_the_unpriceable_override_reach_the_cli():

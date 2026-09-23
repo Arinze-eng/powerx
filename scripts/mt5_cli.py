@@ -64,7 +64,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-23.5"
+CLI_VERSION = "2026-09-23.6"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -2446,6 +2446,24 @@ GUARD_CLOSE_RETRY_COOLDOWN_SECONDS = 1.5
 GUARD_CLOSE_RETRY_DEADLINE_SECONDS = 30.0
 GUARD_CLOSE_RETRY_MAX_ATTEMPTS = 20
 GUARD_CLOSE_RETRY_PARK_SECONDS = 60.0
+#: The first few retries after a refusal go out FAST, then the cadence falls
+#: back to ``GUARD_CLOSE_RETRY_COOLDOWN_SECONDS``. MEASURED 2026-09-23: a
+#: refusal is usually transient (a requote, a price that moved under a
+#: market order), and the flat 1.5 s cooldown made a deal that would have been
+#: accepted 300 ms later sit for 1.5 s -- 20 attempts spread over 29.4 s. A fast
+#: opening burst costs nothing when the refusal is real, because the burst is
+#: bounded and the give-up deadline and park still apply.
+GUARD_CLOSE_RETRY_FAST_ATTEMPTS = 4
+GUARD_CLOSE_RETRY_FAST_COOLDOWN_SECONDS = 0.25
+#: How far back each loop rereads recorded ticks, and the floor on how long a
+#: touch has to have lasted before it is worth reporting as a near miss.
+GUARD_TICK_SCAN_LOOKBACK_SECONDS = 3.0
+GUARD_NEAR_MISS_COOLDOWN_SECONDS = 5.0
+#: The ceiling on one blocking ``guard status --wait-seconds`` call. A caller
+#: wants to watch in real time, not to hold a sandbox command open forever:
+#: the wait is capped here and the answer says it timed out, so the model can
+#: poll again instead of being killed by a command timeout mid-wait.
+GUARD_MAX_WAIT_SECONDS = 120.0
 
 #: Seconds after which a silent heartbeat means the watcher is dead. The watcher
 #: beats every ``--interval-ms`` loop, so this is ~50 missed loops: long enough
@@ -2521,6 +2539,38 @@ CLOSE_RETRY_MAX_ATTEMPTS = 20
 #: rule keeps its position in the queue instead of abandoning it, at one loud
 #: ``close_gave_up`` line per window rather than a refusal storm.
 CLOSE_RETRY_PARK_SECONDS = 60.0
+#: The opening burst of a retry window: the first few refusals are re-sent on
+#: ``CLOSE_RETRY_FAST_COOLDOWN_SECONDS`` before the cadence settles back to
+#: ``RETRY_COOLDOWN_SECONDS``. A refusal is usually transient -- a requote, or a
+#: price that moved under a market order -- so a flat 1.5 s cooldown sat on a
+#: deal the broker would have taken 300 ms later. MEASURED 2026-09-23 with the
+#: fast burst in place: attempts 1-4 land ~0.3 s apart and the rest keep the
+#: 1.5 s spacing, so a transience that clears immediately is out ~5x sooner
+#: while a hard refusal still stops at the same deadline and park.
+CLOSE_RETRY_FAST_ATTEMPTS = 4
+CLOSE_RETRY_FAST_COOLDOWN_SECONDS = 0.25
+#: How far back each loop rereads RECORDED ticks.
+#:
+#: WHY THIS EXISTS, MEASURED 2026-09-23 on a live box: ``symbol_info_tick``
+#: returns ONE tick, and the loop reached it 10 times a second, while EURUSD was
+#: recording 37131 ticks in 60 s (618.85 tick/s). The guard therefore never
+#: looked at ~98% of the ticks that arrived, and a level touched and reverted
+#: inside a 100 ms gap was invisible. (A 2 s probe saw 7 ticks arrive where
+#: ``symbol_info_tick`` would have shown 1.)
+#:
+#: NOTE the ceiling this cannot fix, measured the same day: ``symbol_info_tick``
+#: inside Wine costs 334.7 us, i.e. ~2988 polls/s is the absolute limit for a
+#: Python poll of MT5 -- and no poll rate buys more than one price per call. So
+#: the answer to the missed ticks is not to poll faster (which the API cannot),
+#: it is to read the ticks that were RECORDED since the last poll and stop
+#: discarding them. The interval stays where it is; the blindness goes.
+TICK_SCAN_LOOKBACK_SECONDS = 3.0
+#: A touch that reverted between two polls is REPORTED but does NOT fire: the
+#: price is already back inside the level, so acting on it would close at a price
+#: the user never asked to be out at. It is throttled so a level being grazed
+#: repeatedly cannot flood the event log -- one line per rule per this many
+#: seconds, carrying the touch price, how long the touch lasted and how long ago.
+NEAR_MISS_COOLDOWN_SECONDS = 5.0
 #: Seconds a rule's symbol may go unpriced before the watcher says so out loud.
 #: A symbol with no tick is a rule that can never be evaluated, and a watcher
 #: that is silent about it is indistinguishable from protection.
@@ -2654,6 +2704,65 @@ def triggered(price, op, level):
     return False
 
 
+def recorded_ticks(symbol, since, limit=20000):
+    """Ticks RECORDED since ``since``, or ``[]`` when the read is unavailable.
+
+    ``symbol_info_tick`` answers "what is the price now" with ONE tick, so a loop
+    that calls it every 100 ms never sees the ticks it skipped -- MEASURED
+    2026-09-23, ~98% of a 618.85 tick/s feed. This reads the recorded stream
+    instead, so the loop can name the tick that actually crossed a level.
+
+    Degrades to an empty list rather than raising: an older terminal, a symbol
+    without tick history, or a transient IPC error must cost the rule its
+    precision, never its protection. The caller falls back to the poll sample.
+    """
+    fn = getattr(mt5, "copy_ticks_from", None)
+    if fn is None:
+        return []
+    try:
+        ticks = fn(symbol, int(since), int(limit), mt5.COPY_TICKS_ALL)
+    except Exception:
+        return []
+    if ticks is None or len(ticks) == 0:
+        return []
+    return ticks
+
+
+def row_price(row, side):
+    """The rule's side of one recorded tick (rows index, they are not objects)."""
+    try:
+        bid = float(row["bid"])
+        ask = float(row["ask"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    if side == "bid":
+        return bid
+    if side == "ask":
+        return ask
+    if bid <= 0.0 or ask <= 0.0:
+        return None
+    return (bid + ask) / 2.0
+
+
+def first_crossing(rows, op, level, side):
+    """The FIRST recorded tick that satisfies the level, as (msc, price).
+
+    "First" is the point: the reported trigger is the tick that actually crossed,
+    not the poll that happened to notice afterwards.
+    """
+    for row in rows:
+        price = row_price(row, side)
+        if price is None:
+            continue
+        if triggered(price, op, level):
+            try:
+                msc = int(row["time_msc"])
+            except (KeyError, IndexError, TypeError, ValueError):
+                msc = 0
+            return msc, price
+    return None, None
+
+
 def note(message):
     """One human-readable line on stdout, which is redirected to the log.
 
@@ -2731,6 +2840,20 @@ def main():
     unpriced_since = {}
     unpriced_reported = set()
     ever_priced = set()
+    #: Symbol -> the ``time_msc`` of the last recorded tick already examined. The
+    #: scan is bounded by this rather than by the poll, so a tick is counted once
+    #: however many polls land inside the same second, and a slow loop (a stalled
+    #: box, a retry burst) still walks every tick it missed instead of skipping
+    #: them. ``ticks_seen`` is the running count, which is what lets the status
+    #: answer "is this guard actually looking, or merely alive".
+    scanned_to_msc = {}
+    ticks_seen = {}
+    #: Rule id -> when its last near-miss line was written, so a level being
+    #: grazed by a fast market writes one line, not one per loop. The matching
+    #: ``near_miss_last`` is what the state file publishes, so a caller can see
+    #: the touch the guard saw and chose not to act on.
+    near_miss_reported = {}
+    near_miss_last = {}
     while True:
         now = time.time()
         # ``--max-seconds 0`` (the default) means NO limit: an exit at a price has
@@ -2786,6 +2909,52 @@ def main():
             level = float(rule.get("price"))
             rule["last_price"] = price
             rule["last_price_ts"] = now
+
+            # ---- every tick, not just the one we happened to poll ---------------
+            # ``price`` above is ONE tick. MEASURED 2026-09-23: this feed records
+            # 618.85 tick/s and the loop reaches it 10 times a second, so ~98% of
+            # the ticks were never looked at. Read what was recorded since the
+            # last look so the guard can (a) name the tick that actually crossed
+            # when it fires, and (b) say out loud when a level was TOUCHED and is
+            # already back inside.
+            #
+            # DELIBERATELY NOT A NEW TRIGGER. A touch that reverted is reported,
+            # never acted on: the price is back inside the level, so closing now
+            # would fill at a price the caller never asked to be out at. Only the
+            # LIVE tick fires, exactly as before -- what changes is that the guard
+            # is no longer blind, and its answer is evidence instead of a sample.
+            live_hit = triggered(price, op, level)
+            scan_msc = None
+            scan_price = None
+            # ``or int(now * 1000)`` matters: a tick without a millisecond stamp
+            # (an older terminal, a stub) would otherwise floor the scan at 0 and
+            # the very next pass would treat the whole lookback window as ticks
+            # this rule had just seen -- inventing a crossing that happened before
+            # the rule existed. Absent a stamp, "now" is the honest floor.
+            tick_msc = int(getattr(tick, "time_msc", 0) or 0) or int(now * 1000)
+            if symbol not in scanned_to_msc:
+                # Arm the scan at the tick already visible: ticks recorded BEFORE
+                # the rule existed are not this rule's crossing, and backfilling
+                # them would invent a touch that never happened while armed.
+                scanned_to_msc[symbol] = tick_msc
+            else:
+                rows = recorded_ticks(symbol, now - TICK_SCAN_LOOKBACK_SECONDS)
+                fresh = []
+                floor = int(scanned_to_msc.get(symbol) or 0)
+                for row in rows:
+                    try:
+                        row_msc = int(row["time_msc"])
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        continue
+                    if row_msc > floor:
+                        fresh.append(row)
+                if fresh:
+                    scanned_to_msc[symbol] = max(
+                        int(r["time_msc"]) for r in fresh
+                    )
+                    ticks_seen[symbol] = ticks_seen.get(symbol, 0) + len(fresh)
+                scan_msc, scan_price = first_crossing(fresh, op, level, used_side)
+
             #: A rule can be in one of two states:
             #:   * armed and waiting -- it acts only while the level is touched;
             #:   * holding a DECIDED close -- the level was touched and the
@@ -2796,7 +2965,47 @@ def main():
             #:     stopping -- a position left open with a live guard, an armed
             #:     rule, and nothing left to report.
             pending = bool(rule.get("pending_since"))
-            if not pending and not triggered(price, op, level):
+            if not pending and not live_hit:
+                if scan_msc is not None:
+                    # TOUCHED AND ALREADY BACK INSIDE. This is the tick the old
+                    # loop never saw, and it is the one case where seeing it does
+                    # NOT mean acting on it: the price is no longer beyond the
+                    # level, so a close now would fill somewhere the caller never
+                    # asked to be out at. Report it, do not fire. Throttled, so a
+                    # level being grazed by a fast market writes one line rather
+                    # than one per 100 ms loop.
+                    rule_id = str(rule.get("id"))
+                    if now - float(near_miss_reported.get(rule_id) or 0.0) >= \
+                            NEAR_MISS_COOLDOWN_SECONDS:
+                        near_miss_reported[rule_id] = now
+                        age_ms = round(max(0.0, now * 1000.0 - scan_msc), 1)
+                        near_miss_last[rule_id] = {
+                            "symbol": symbol, "op": op, "level": level,
+                            "side": used_side, "touch_price": scan_price,
+                            "touch_age_ms": age_ms, "seen_at": now,
+                            "back_inside_at": price,
+                        }
+                        append_jsonl(args.events, {
+                            "event": "level_touched_then_reverted", "ts": now,
+                            "rule_id": rule_id, "symbol": symbol, "op": op,
+                            "level": level, "side": used_side,
+                            "touch_price": scan_price, "touch_age_ms": age_ms,
+                            "price_now": price,
+                            "ticks_scanned": int(ticks_seen.get(symbol, 0)),
+                            "detail": (
+                                f"{symbol} {op} {level} was touched at "
+                                f"{scan_price} ({round(age_ms)} ms ago) and is back "
+                                f"at {price}. NOT closing: the level is no longer "
+                                "touched, and a close now would fill at a price "
+                                "the caller did not ask to be out at. The rule is "
+                                "still armed."
+                            ),
+                        })
+                        note(
+                            f"{rule_id} NEAR MISS {symbol} {op} {level}: touched "
+                            f"{scan_price} {round(age_ms)} ms ago, back at {price} "
+                            "-- reported, NOT closed"
+                        )
                 continue
             # A rule that has just given up is PARKED, pending or not. The park is
             # what stops a broker that refuses every deal from being retried in a
@@ -2808,7 +3017,21 @@ def main():
             # 1.6 s after the give-up instead of 60 s.)
             if now < float(rule.get("parked_until") or 0.0):
                 continue
-            if now - float(rule.get("last_attempt") or 0.0) < RETRY_COOLDOWN_SECONDS:
+            # The opening burst of a retry window is FAST, then the cadence
+            # settles back to RETRY_COOLDOWN_SECONDS. A refusal is usually
+            # transient -- a requote, or a price that moved under a market order
+            # -- and a flat 1.5 s cooldown sat on a deal the broker would have
+            # taken 300 ms later. The burst is bounded by
+            # CLOSE_RETRY_FAST_ATTEMPTS, so a HARD refusal (a closed market, an
+            # impossible volume) loses nothing: it still stops at the same
+            # deadline and parks for the same 60 s.
+            tried = int(rule.get("pending_attempts") or 0)
+            cooldown = (
+                CLOSE_RETRY_FAST_COOLDOWN_SECONDS
+                if 0 < tried < CLOSE_RETRY_FAST_ATTEMPTS
+                else RETRY_COOLDOWN_SECONDS
+            )
+            if now - float(rule.get("last_attempt") or 0.0) < cooldown:
                 continue
             rule["last_attempt"] = now
             trigger_ts = time.time()
@@ -2822,6 +3045,20 @@ def main():
             attempt = int(rule.get("pending_attempts") or 0) + 1
             window_started = float(rule.get("pending_since") or now)
             retry_window = int(rule.get("pending_windows") or 0) + 1
+            #: The tick that ACTUALLY crossed, named from the recorded stream
+            #: rather than inferred from the poll that noticed. ``trigger_price``
+            #: stays the price at the decision (it is what the order used); these
+            #: say how long the level had really been crossed, which is the
+            #: difference between "we saw it" and "we sampled it".
+            crossing = (
+                {
+                    "crossing_msc": scan_msc,
+                    "crossing_price": scan_price,
+                    "crossing_age_ms": round(max(0.0, now * 1000.0 - scan_msc), 1),
+                }
+                if scan_msc is not None
+                else {}
+            )
             append_jsonl(args.events, {
                 "event": "fired" if ok else "close_failed",
                 "rule_id": rule.get("id"), "symbol": symbol, "op": op, "level": level,
@@ -2833,6 +3070,8 @@ def main():
                 "positions_matched": len(positions), "results": results, "polls": polls,
                 "attempt": attempt, "retry": pending, "retry_window": retry_window,
                 "pending_seconds": round(now - window_started, 1) if pending else 0.0,
+                "ticks_scanned": int(ticks_seen.get(symbol, 0)),
+                **crossing,
             })
             if ok:
                 note(
@@ -2946,6 +3185,13 @@ def main():
             "gave_up": [
                 str(r.get("id")) for r in armed_now if r.get("gave_up_at")
             ],
+            # PROOF THE GUARD IS LOOKING, not merely alive. ``ticks_scanned`` is
+            # how many recorded ticks this symbol has had examined, and
+            # ``near_miss`` is the last level that was touched and already back
+            # inside -- the tick the old 10 Hz sample could not see. Both are in
+            # the state so "is it watching?" is answered with a count.
+            "ticks_scanned": dict(ticks_seen),
+            "near_miss": dict(near_miss_last),
         })
         time.sleep(max(0.01, args.interval_ms / 1000.0))
 
@@ -2963,6 +3209,8 @@ def main():
             for r in final_rules if r.get("pending_since")
         },
         "gave_up": [str(r.get("id")) for r in final_rules if r.get("gave_up_at")],
+        "ticks_scanned": dict(ticks_seen),
+        "near_miss": dict(near_miss_last),
     })
     append_jsonl(args.events, {
         "event": "watcher_stop", "ts": time.time(), "exit_reason": exit_reason,
@@ -3028,6 +3276,128 @@ def _guard_events(limit: int) -> list[dict[str, Any]]:
         except ValueError:
             continue
     return out
+
+
+def _guard_event_lines() -> list[str]:
+    """The event log as raw lines (UTF-8, unlike the UTF-16 Wine logs).
+
+    Read as text rather than through ``_log_line_count`` on purpose: that helper
+    exists for the UTF-16LE terminal logs, and counting the events file through
+    it would decode a UTF-8 file with the wrong codec and shift every mark.
+    """
+    try:
+        return GUARD_EVENTS_FILE.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return []
+
+
+def _guard_events_after(mark: int) -> list[dict[str, Any]]:
+    """Every event written after the first ``mark`` lines of the event log."""
+    out: list[dict[str, Any]] = []
+    for line in _guard_event_lines()[max(0, int(mark)):]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+#: Events worth ending a blocking wait for, worst first. A wait exists to catch
+#: the thing the caller is not there to see, so anything that changes what the
+#: caller must do next belongs here.
+_GUARD_WATCH_EVENTS = (
+    "fired",
+    "close_failed",
+    "close_gave_up",
+    "close_retry_resumed",
+    "level_touched_then_reverted",
+    "rule_unpriceable",
+    "rule_priceable",
+    "watcher_stop",
+)
+
+
+def _guard_wait(seconds: float, poll_seconds: float) -> dict[str, Any]:
+    """Block, sampling the guard, until something happens or the budget runs out.
+
+    WHY THIS EXISTS: "the guard is monitoring" is a CLAIM until something
+    observes it. A status call that returns instantly says what is true now and
+    nothing about whether anything happens next, so a caller reports
+    "monitoring" and moves on -- and the exit is then only discovered by
+    accident, on some later turn, by which time the caller has been describing
+    a guard as protection without having seen it do anything.
+
+    This call OBSERVES. It samples the guard every ``poll_seconds`` and returns
+    the moment the event log grows (a fire, a refused close, a resumed retry, a
+    level touched and reverted, the watcher stopping) -- or when the budget runs
+    out, and it says which of the two it was, so "nothing happened" is never
+    reported as "something happened".
+
+    Bounded at ``GUARD_MAX_WAIT_SECONDS`` deliberately. A caller wants real-time
+    watching, not a sandbox command held open until the command timeout kills
+    it mid-wait: the cap is returned in the answer, so the caller polls again
+    instead of the wait being cut off with nothing to show.
+    """
+    budget = max(0.0, min(float(seconds or 0.0), GUARD_MAX_WAIT_SECONDS))
+    poll = max(0.2, float(poll_seconds or 1.0))
+    started = time.time()
+    deadline = started + budget
+    mark = len(_guard_event_lines())
+    state = _read_guard_state()
+    live = _guard_is_live(state)
+    samples = 0
+    observed: list[dict[str, Any]] = []
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0.0:
+            break
+        time.sleep(min(poll, remaining))
+        samples += 1
+        observed = _guard_events_after(mark)
+        if observed:
+            break
+        state = _read_guard_state()
+        was_live = live
+        live = _guard_is_live(state)
+        if was_live and not live:
+            # The watcher died while this call was watching it. That is an
+            # OBSERVATION, not a timeout: the armed levels are now watched by
+            # nobody, and a wait that reported "timed out, nothing happened"
+            # would be exactly the silence this guard work exists to remove.
+            observed = [{
+                "event": "watcher_stop",
+                "ts": time.time(),
+                "exit_reason": (state or {}).get("exit_reason"),
+                "detail": "the watcher stopped while this call was watching it",
+            }]
+            break
+    watched_seconds = round(time.time() - started, 2)
+    return {
+        "observed": observed,
+        "observed_event": observed[-1].get("event") if observed else None,
+        "waited_s": watched_seconds,
+        "samples": samples,
+        "poll_seconds": poll,
+        "timed_out": not observed,
+        "capped_at_s": GUARD_MAX_WAIT_SECONDS,
+        "running": _guard_is_live(state),
+        "state": state,
+        "note": (
+            f"nothing happened in {watched_seconds} s of watching ({samples} "
+            "samples): no fire, no refused close, no near miss, and the watcher "
+            "is still up. This is an observation, not a claim."
+            if not observed
+            else (
+                f"observed '{observed[-1].get('event')}' after "
+                f"{watched_seconds} s ({samples} samples)."
+            )
+        ),
+    }
 
 
 def _last_exit_reason() -> str | None:
@@ -3508,6 +3878,19 @@ def cmd_guard(args: argparse.Namespace) -> int:
         state = _read_guard_state()
         live = _guard_is_live(state)
         rules = _read_guard_rules()
+        # A WAIT IS DONE FIRST, so everything below is computed from what the
+        # guard looks like AFTER it, not before. Watching and then reporting the
+        # pre-watch snapshot is the failure mode this ordering avoids: the whole
+        # point is that the answer describes the thing that happened.
+        watched: dict[str, Any] | None = None
+        if subcommand == "status" and float(getattr(args, "wait_seconds", 0.0) or 0.0) > 0:
+            watched = _guard_wait(
+                float(getattr(args, "wait_seconds", 0.0) or 0.0),
+                float(getattr(args, "poll_seconds", 1.0) or 1.0),
+            )
+            state = watched["state"]
+            live = _guard_is_live(state)
+            rules = _read_guard_rules()
         if subcommand == "ensure" and rules and not live and _guard_python() is None:
             return fail(
                 "the Windows python is not in the Wine prefix, so the guard cannot "
@@ -3650,6 +4033,14 @@ def cmd_guard(args: argparse.Namespace) -> int:
             "interval_ms": (state or {}).get("interval_ms"),
             "polls": (state or {}).get("polls"),
             "prices": (state or {}).get("prices") or {},
+            # Every recorded tick the watcher has LOOKED AT, per symbol. This is
+            # the difference between "the watcher is alive" and "the watcher is
+            # watching": ``polls`` counts loop passes, which is one price sample
+            # each, while this counts the recorded ticks behind them.
+            "ticks_scanned": (state or {}).get("ticks_scanned") or {},
+            # The last level that was TOUCHED and was already back inside when it
+            # was looked at. Reported, never acted on -- see the watcher.
+            "near_miss": (state or {}).get("near_miss") or {},
             "unpriceable": unpriceable,
             "heartbeat_age_s": (
                 round(time.time() - float((state or {}).get("heartbeat") or 0.0), 1)
@@ -3724,6 +4115,17 @@ def cmd_guard(args: argparse.Namespace) -> int:
                     + f" (dark for {max(unpriceable.values())} s at last beat). A "
                     "rule on an unpriced symbol can never fire."
                 )
+        if watched is not None:
+            payload["watched"] = watched
+            # An observed fire is not a failure and an observed timeout is not
+            # one either -- but a refused close or a watcher that died WHILE
+            # being watched are, and the caller must not be told "ok" because
+            # the earlier snapshot happened to look healthy.
+            if watched["observed_event"] in (
+                "close_failed", "close_gave_up", "watcher_stop",
+            ):
+                payload["ok"] = False
+                payload.setdefault("alert", watched["observed_event"])
         if not live:
             payload["last_events"] = _guard_events(5)
         return emit(payload)
@@ -4670,6 +5072,25 @@ def build_parser() -> argparse.ArgumentParser:
              "waits for it, and says so in the event log)",
     )
     p.add_argument("--lines", type=int, default=20, help="events to return")
+    p.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "status only: instead of answering instantly, WATCH the guard for "
+            "this many seconds and return the moment something happens (a fire, "
+            "a refused close, a resumed retry, a level touched and reverted, the "
+            f"watcher stopping). Capped at {int(GUARD_MAX_WAIT_SECONDS)} s. "
+            "Timing out is a normal answer and is reported as one, so "
+            "'monitoring' is an observation rather than a claim."
+        ),
+    )
+    p.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=1.0,
+        help="status --wait-seconds: how often to sample the guard (default 1 s)",
+    )
     p.set_defaults(func=cmd_guard)
 
     p = sub.add_parser("compile", help="compile .mq5 via MetaEditor")
