@@ -2955,6 +2955,11 @@ class _FakeMT5:
         #: has no stream must behave exactly like a terminal that cannot serve
         #: one, which is the fallback every pre-existing test relies on.
         self.ticks = list(ticks or ())
+        #: Every ``since`` the watcher asked the recorded stream for, in seconds.
+        #: Recorded so a test can assert WHICH CLOCK the request was expressed in:
+        #: the terminal stamps ticks in its own (server) time, so a window built
+        #: from this process's clock asks a question about the wrong hours.
+        self.tick_windows: list[float] = []
         self.tick_after = tick_after
         self.tick_after_sends = tick_after_sends
         self.sends: list[dict[str, Any]] = []
@@ -3003,6 +3008,7 @@ class _FakeMT5:
         them. An empty ``ticks`` list is the default, so every older test keeps
         exercising the degradation path where the read is simply unavailable.
         """
+        self.tick_windows.append(float(since))
         if not self.ticks:
             return []
         floor_msc = int(float(since) * 1000.0)
@@ -3509,6 +3515,84 @@ def test_a_fire_names_the_tick_that_actually_crossed(monkeypatch, tmp_path):
     assert event["crossing_msc"] < mt5.tick.time_msc
     # And the deal still went out at the live price, not the historical one.
     assert mt5.sends and mt5.sends[0]["price"] == pytest.approx(1.15030)
+
+
+def test_the_tick_scan_asks_in_the_tick_clock_not_this_processs(monkeypatch, tmp_path):
+    """The scan is expressed in the TICK clock, because that is the one the rows use.
+
+    MEASURED 2026-09-23 on a live box, and the reason the first live run of this
+    scan reported ``ticks_scanned: {}``: the terminal stamps ticks in the SERVER's
+    time, which ran 10799 s (~3 h) AHEAD of the box. The scan asked for "recorded
+    ticks since now - 3 s" with ``now`` from the box, so the window opened three
+    hours before the present and was answered with 20000 rows of history, every
+    one of them older than the live tick -- older than the scan's own watermark,
+    so every pass found nothing fresh, forever. A guard that is blind to 98% of
+    ticks and a guard whose scan silently reads the wrong hours look identical
+    from the outside: both say nothing.
+
+    This pins the two clocks apart by exactly that measured skew and asserts the
+    window is expressed in the tick's hours, and that the crossing is still named
+    and still aged against the tick.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock(start=1_700_000_000.0 - 10_799.0)  # the box, ~3 h behind
+    mt5 = _FakeMT5(
+        bid=1.14190, ask=1.14210,
+        tick_after_polls=(1, 1.15030, 1.15050),
+        ticks=[{"time_msc": 1_700_000_000_150, "bid": 1.15, "ask": 1.15}],
+    )
+
+    _run, events, _after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, [_rule(price=1.15)], max_seconds=2
+    )
+
+    assert mt5.tick_windows, "the scan must actually ask the recorded stream"
+    assert clock.now < 1_700_000_000.0, "the box clock really is behind the tick"
+    for since in mt5.tick_windows:
+        # In the tick's hours: inside the lookback of the live tick ...
+        assert since > 1_700_000_000.0 - 60.0, since
+        # ... and not in the box's, which is the bug that was measured live.
+        assert since > clock.now, since
+
+    fired = [e for e in events if e["event"] == "fired"]
+    assert len(fired) == 1, events
+    event = fired[0]
+    assert event["crossing_msc"] == 1_700_000_000_150
+    assert event["ticks_scanned"] >= 1
+    # 50 ms between the crossing and the live tick that noticed it. Read against
+    # the box clock this difference is NEGATIVE (the crossing is stamped in the
+    # future), which is how the age silently became a constant 0.0.
+    assert event["crossing_age_ms"] == pytest.approx(50.0, abs=1.0)
+
+
+def test_a_skewed_tick_clock_still_ages_a_near_miss_correctly(monkeypatch, tmp_path):
+    """The near-miss age is read in the tick clock too, not clamped to zero.
+
+    Same measured skew as the fire above, on the other path that ages a tick: a
+    level touched and already back inside. Aged against the box clock the touch
+    is always "in the future", so the reported age would always be 0 ms -- the
+    line would look right and be worthless. The touch here is 50 ms old and must
+    be reported as 50 ms old.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock(start=1_700_000_000.0 - 10_799.0)
+    mt5 = _FakeMT5(
+        # Below the level throughout: the only tick at the level is RECORDED, and
+        # the live poll that notices it is already back inside.
+        bid=1.14190, ask=1.14210,
+        tick_after_polls=(1, 1.14200, 1.14220),
+        ticks=[{"time_msc": 1_700_000_000_150, "bid": 1.15, "ask": 1.15}],
+    )
+
+    _run, events, _after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, [_rule(price=1.15)], max_seconds=2
+    )
+
+    near = [e for e in events if e["event"] == "level_touched_then_reverted"]
+    assert len(near) == 1, events
+    assert near[0]["touch_price"] == 1.15
+    assert near[0]["touch_age_ms"] == pytest.approx(50.0, abs=1.0)
+    assert not [e for e in events if e["event"] == "fired"], events
 
 
 def test_guard_watch_returns_the_moment_something_happens(monkeypatch, tmp_path):

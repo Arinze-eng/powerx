@@ -2565,6 +2565,13 @@ CLOSE_RETRY_FAST_COOLDOWN_SECONDS = 0.25
 #: it is to read the ticks that were RECORDED since the last poll and stop
 #: discarding them. The interval stays where it is; the blindness goes.
 TICK_SCAN_LOOKBACK_SECONDS = 3.0
+#: How far back the scan is ever willing to reach, in the TICK clock. The normal
+#: window is ``TICK_SCAN_LOOKBACK_SECONDS`` back from the live tick, but when a
+#: pass left its watermark further behind than that (a stalled box, a close-retry
+#: burst, a paused sandbox resuming) the window starts from the watermark instead,
+#: so the ticks recorded in the gap are walked rather than skipped. This bound is
+#: what keeps that catch-up finite.
+TICK_SCAN_MAX_LOOKBACK_SECONDS = 60.0
 #: A touch that reverted between two polls is REPORTED but does NOT fire: the
 #: price is already back inside the level, so acting on it would close at a price
 #: the user never asked to be out at. It is throttled so a level being grazed
@@ -2705,12 +2712,20 @@ def triggered(price, op, level):
 
 
 def recorded_ticks(symbol, since, limit=20000):
-    """Ticks RECORDED since ``since``, or ``[]`` when the read is unavailable.
+    """Ticks RECORDED at or after ``since``, or ``[]`` when the read fails.
 
     ``symbol_info_tick`` answers "what is the price now" with ONE tick, so a loop
     that calls it every 100 ms never sees the ticks it skipped -- MEASURED
     2026-09-23, ~98% of a 618.85 tick/s feed. This reads the recorded stream
     instead, so the loop can name the tick that actually crossed a level.
+
+    CALL ``since`` IN THE TICK CLOCK, NOT IN THIS PROCESS'S. MEASURED 2026-09-23
+    on a live box: the terminal stamps ticks in the SERVER's time, which ran
+    10799 s (~3 h) ahead of the box, so a window derived from ``time.time()``
+    missed the present entirely -- it returned 20000 rows of history, none of
+    them newer than three hours ago, and every one of them looked stale against
+    the live tick. The scan was silently empty. Callers therefore pass a time
+    taken from a tick, and the two sides of the comparison share one clock.
 
     Degrades to an empty list rather than raising: an older terminal, a symbol
     without tick history, or a transient IPC error must cost the rule its
@@ -2926,11 +2941,26 @@ def main():
             live_hit = triggered(price, op, level)
             scan_msc = None
             scan_price = None
+            # THE SCAN RUNS ON THE TICK CLOCK, NOT THIS PROCESS'S. MEASURED
+            # 2026-09-23 on a live box: the terminal stamps ticks in the SERVER's
+            # time, which ran 10799 s (~3 h) AHEAD of the box. A window built from
+            # ``time.time()`` therefore never reached the present -- the first
+            # live run of this scan asked for "the last 3 s" and was answered with
+            # 20000 rows, none of them newer than three hours ago, so every one of
+            # them read as stale against the live tick and ``fresh`` was ALWAYS
+            # empty. The scan ran, counted nothing, and looked exactly like a
+            # quiet market. Anchoring both the window and the ages on
+            # ``tick_msc`` -- the live tick's OWN stamp -- puts the two sides of
+            # the comparison in one clock, with nothing to calibrate. Whether the
+            # terminal's clock is right is not this code's business; only that it
+            # is the SAME clock.
+            #
             # ``or int(now * 1000)`` matters: a tick without a millisecond stamp
             # (an older terminal, a stub) would otherwise floor the scan at 0 and
             # the very next pass would treat the whole lookback window as ticks
             # this rule had just seen -- inventing a crossing that happened before
-            # the rule existed. Absent a stamp, "now" is the honest floor.
+            # the rule existed. Absent a stamp, this process's clock is the only
+            # one in evidence and "now" is the honest floor.
             tick_msc = int(getattr(tick, "time_msc", 0) or 0) or int(now * 1000)
             if symbol not in scanned_to_msc:
                 # Arm the scan at the tick already visible: ticks recorded BEFORE
@@ -2938,9 +2968,20 @@ def main():
                 # them would invent a touch that never happened while armed.
                 scanned_to_msc[symbol] = tick_msc
             else:
-                rows = recorded_ticks(symbol, now - TICK_SCAN_LOOKBACK_SECONDS)
-                fresh = []
                 floor = int(scanned_to_msc.get(symbol) or 0)
+                # Look back FROM THE LIVE TICK, and fall back to the watermark
+                # when the previous pass left it further behind than the lookback:
+                # the ticks in that gap are precisely the ones a stalled loop
+                # missed, which is the case this scan exists for. Bounded, so a
+                # long stall cannot ask for an unbounded window.
+                scan_since = tick_msc / 1000.0 - TICK_SCAN_LOOKBACK_SECONDS
+                if floor:
+                    scan_since = min(scan_since, floor / 1000.0)
+                scan_since = max(
+                    scan_since, tick_msc / 1000.0 - TICK_SCAN_MAX_LOOKBACK_SECONDS
+                )
+                rows = recorded_ticks(symbol, scan_since)
+                fresh = []
                 for row in rows:
                     try:
                         row_msc = int(row["time_msc"])
@@ -2978,7 +3019,10 @@ def main():
                     if now - float(near_miss_reported.get(rule_id) or 0.0) >= \
                             NEAR_MISS_COOLDOWN_SECONDS:
                         near_miss_reported[rule_id] = now
-                        age_ms = round(max(0.0, now * 1000.0 - scan_msc), 1)
+                        # Measured against the LIVE TICK, in the tick clock, for
+                        # the same reason the scan window is: ``now`` is this
+                        # process's clock and can sit hours from the tick's.
+                        age_ms = round(max(0.0, float(tick_msc - scan_msc)), 1)
                         near_miss_last[rule_id] = {
                             "symbol": symbol, "op": op, "level": level,
                             "side": used_side, "touch_price": scan_price,
@@ -3054,7 +3098,7 @@ def main():
                 {
                     "crossing_msc": scan_msc,
                     "crossing_price": scan_price,
-                    "crossing_age_ms": round(max(0.0, now * 1000.0 - scan_msc), 1),
+                    "crossing_age_ms": round(max(0.0, float(tick_msc - scan_msc)), 1),
                 }
                 if scan_msc is not None
                 else {}
