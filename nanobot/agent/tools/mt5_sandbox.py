@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-23.7"
+_CLI_VERSION = "2026-09-23.8"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -792,7 +792,7 @@ class MT5SandboxTool(Tool):
                 "trigger_price": {"type": "number", "description": "action=guard (arm): the price level to act on, e.g. 1.1650 in \"close when EURUSD hits 1.1650\"."},
                 "trigger_op": {"type": "string", "enum": [">=", "<="], "description": "action=guard (arm): \">=\" fires at or above the level, \"<=\" at or below. Omit it and the direction is inferred from the live price."},
                 "trigger_side": {"type": "string", "enum": ["mid", "bid", "ask"], "description": "action=guard (arm): which price is compared to the level (default mid = (bid+ask)/2, which is what \"the price\" usually means)."},
-                "interval_ms": {"type": "integer", "description": "action=guard (arm): how often the watcher reads the tick stream, in milliseconds (default 100). Lowering it does NOT make the guard see more of the market: MEASURED 2026-09-23, one symbol_info_tick call inside Wine costs 334.7 us (~2988/s is the absolute ceiling for a Python poll) and each call returns ONE tick, while the feed records ~619 tick/s -- so the watcher already reads every tick that was RECORDED since the last loop and reports the one that truly crossed. The interval is how often it decides, not how much it sees."},
+                "interval_ms": {"type": "integer", "description": "action=guard (arm): how often the watcher reads the tick stream, in milliseconds (default 100). Lowering it does NOT make the guard see more of the market: MEASURED 2026-09-23, one symbol_info_tick call inside Wine costs 334.7 us (~2988/s is the absolute ceiling for a Python poll) and each call returns ONE tick, while the recorded feed carries several a second at its quietest (MEASURED, same day: 282 rows over 60.5 s; another reading counted 618.85 tick/s -- the rate is bursty). The watcher already reads every tick that was RECORDED since the last loop and reports the one that truly crossed, so the interval is how often it decides, not how much it sees."},
                 "wait_seconds": {"type": "number", "description": "action=guard, guard_action=status: instead of returning a snapshot instantly, WATCH the guard for this many seconds and return the moment something happens (a fire, a refused close, a resumed retry, a level touched and reverted, the watcher stopping). Capped at 120 s. Use this to actually observe an exit instead of reporting that the guard is 'monitoring' -- the answer carries watched.timed_out, so 'nothing happened yet' is never read as 'something happened'."},
                 "poll_seconds": {"type": "number", "description": "action=guard, guard_action=status with wait_seconds: how often to sample the guard (default 1 s)."},
                 "max_seconds": {"type": "integer", "description": "action=guard (arm/ensure): how long the guard may keep watching before it stops itself. Omit it (the default) and it holds the level for as long as it takes -- there is no time limit. Only set it for a deliberately bounded run; a guard that stops is reported by guard status as alert=guard_not_running, never as protection."},

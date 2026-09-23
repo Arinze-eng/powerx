@@ -313,9 +313,12 @@ else — that list is the exact shape of the original complaint.
   is honoured only when it is positive, and `ensure` inherits the budget the
   guard was armed with when the call does not restate one.
 * **The guard reads every tick that was RECORDED, not one sample per loop.**
-  MEASURED 2026-09-23, live: EURUSD recorded 37131 ticks in 60 s (618.85 tick/s)
-  while the watcher looked 10 times a second, so ~98% of the ticks were never
-  examined and a level touched inside a 100 ms gap was invisible. The watcher now
+  MEASURED 2026-09-23, live: the watcher reads ONE tick per poll while the feed
+  records as many as it likes — 37131 EURUSD ticks in 60 s (618.85 tick/s) in one
+  reading that day, 282 rows over 60.5 s (~4.7 tick/s) in another 30 minutes
+  later — so the ticks in between were never examined and a level touched inside
+  a 100 ms gap was invisible. Do not quote a fixed percentage of "missed ticks":
+  the rate is bursty and unexplainable from inside the box. The watcher now
   reads the recorded stream (`copy_ticks_from`) on each pass. `status` carries
   `ticks_scanned` per symbol; every event carries it too, and a fire names the
   tick that actually crossed (`crossing_msc`, `crossing_price`,

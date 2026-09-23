@@ -2934,11 +2934,19 @@ class _FakeMT5:
         tick_after_sends: int = 1,
         ticks: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
         tick_after_polls: tuple[int, float, float] | None = None,
+        ticks_after_polls: tuple[int, list[dict[str, Any]]] | None = None,
     ) -> None:
         self.script = list(retcodes) or [10009]
         self.poll_count = 0
         self.swapped = False
         self.tick_after_polls = tick_after_polls
+        #: Recorded ticks that reach the terminal only after a later poll, as
+        #: (after_polls, rows). A stream that is static cannot show a crossing
+        #: arriving BETWEEN two passes, which is the only way a crossing tick can
+        #: be newer than a watermark that has already been armed -- and the case
+        #: the scan exists for.
+        self.ticks_after_polls = ticks_after_polls
+        self.ticks_appended = False
         self.positions = [
             types.SimpleNamespace(
                 ticket=ticket, symbol=symbol, type=self.POSITION_TYPE_BUY,
@@ -2996,6 +3004,13 @@ class _FakeMT5:
                 time=1_700_000_200, last=float(self.tick_after_polls[1]), volume=1,
                 time_msc=self.tick.time_msc + 200,
             )
+        if (
+            self.ticks_after_polls is not None
+            and not self.ticks_appended
+            and self.poll_count > int(self.ticks_after_polls[0])
+        ):
+            self.ticks_appended = True
+            self.ticks.extend(self.ticks_after_polls[1])
         return self.tick
 
     def copy_ticks_from(self, _symbol: str, since: Any, _limit: int = 20000,
@@ -3004,7 +3019,7 @@ class _FakeMT5:
 
         Returns every fake tick at or after ``since`` (seconds), so a test can
         put ticks in the gap between two polls -- exactly what a 10 Hz sample of
-        a ~619 tick/s feed throws away -- and assert what the watcher did with
+        several ticks per second throws away -- and assert what the watcher did with
         them. An empty ``ticks`` list is the default, so every older test keeps
         exercising the degradation path where the read is simply unavailable.
         """
@@ -3408,9 +3423,9 @@ def test_a_level_touched_and_reverted_between_polls_is_reported_and_not_closed(
 ):
     """The tick the 10 Hz sample could not see is REPORTED, and NOT acted on.
 
-    MEASURED 2026-09-23 on a live box: EURUSD records ~619 tick/s and the watcher
-    looked 10 times a second, so ~98% of ticks were never examined and a level
-    touched and reverted inside a 100 ms gap was invisible. This is that tick --
+    MEASURED 2026-09-23 on a live box: the watcher reads ONE tick per poll while
+    EURUSD records several a second, so the ticks in between were never examined
+    and a level touched and reverted inside a 100 ms gap was invisible. This is that tick --
     and the decision it must produce is the OPPOSITE of a fire: the price is back
     inside the level, so closing now would fill at a price the caller never asked
     to be out at. Seeing the tick must not become acting on the tick.
@@ -3517,6 +3532,50 @@ def test_a_fire_names_the_tick_that_actually_crossed(monkeypatch, tmp_path):
     assert mt5.sends and mt5.sends[0]["price"] == pytest.approx(1.15030)
 
 
+def test_a_second_rule_on_the_same_symbol_still_sees_the_crossing(monkeypatch, tmp_path):
+    """The ticks of a pass belong to the SYMBOL, not to whichever rule read first.
+
+    MEASURED live 2026-09-23, and the bug this pins: two rules armed on EURUSD --
+    a far level that never fires, listed FIRST, and the level that actually fired,
+    listed second. The first rule's read advanced the per-symbol watermark to the
+    crossing tick, so the firing rule's own read found nothing newer than its own
+    watermark and its fire carried NO crossing. It closed the position correctly
+    (retcode 10009, 139.6 ms) and named no tick -- losing exactly the evidence the
+    scan was added for, while looking healthy. Every rule on a symbol now measures
+    its level against the ticks that symbol produced in that pass.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock()
+    mt5 = _FakeMT5(
+        bid=1.14190, ask=1.14210,
+        # Two rules, so a poll is two visits: the swap has to land on the SECOND
+        # pass, which is the pass the bug is on (pass 1 arms and reads nothing).
+        tick_after_polls=(2, 1.15030, 1.15050),
+        # The crossing tick reaches the terminal only on the second pass, so it is
+        # genuinely newer than the watermark either rule reads against -- and the
+        # rule listed FIRST consumes it.
+        ticks=[{"time_msc": 1_700_000_000_000, "bid": 1.14200, "ask": 1.14220}],
+        ticks_after_polls=(2, [{"time_msc": 1_700_000_000_150, "bid": 1.15,
+                               "ask": 1.15}]),
+    )
+
+    _run, events, _after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock,
+        [_rule(id="first-far", price=1.5), _rule(id="second-near", price=1.15)],
+        max_seconds=2,
+    )
+
+    fired = [e for e in events if e["event"] == "fired"]
+    assert len(fired) == 1, events
+    assert fired[0]["rule_id"] == "second-near"
+    assert fired[0]["crossing_msc"] == 1_700_000_000_150
+    assert fired[0]["crossing_price"] == 1.15
+    assert fired[0]["crossing_age_ms"] == pytest.approx(50.0, abs=1.0)
+    assert fired[0]["ticks_scanned"] >= 1
+    assert mt5.sends and mt5.sends[0]["price"] == pytest.approx(1.15030)
+    assert not [e for e in events if e["event"] == "level_touched_then_reverted"]
+
+
 def test_the_tick_scan_asks_in_the_tick_clock_not_this_processs(monkeypatch, tmp_path):
     """The scan is expressed in the TICK clock, because that is the one the rows use.
 
@@ -3526,8 +3585,9 @@ def test_the_tick_scan_asks_in_the_tick_clock_not_this_processs(monkeypatch, tmp
     ticks since now - 3 s" with ``now`` from the box, so the window opened three
     hours before the present and was answered with 20000 rows of history, every
     one of them older than the live tick -- older than the scan's own watermark,
-    so every pass found nothing fresh, forever. A guard that is blind to 98% of
-    ticks and a guard whose scan silently reads the wrong hours look identical
+    so every pass found nothing fresh, forever. A guard that misses the ticks
+    between two polls and a guard whose scan silently reads the wrong hours look
+    identical
     from the outside: both say nothing.
 
     This pins the two clocks apart by exactly that measured skew and asserts the

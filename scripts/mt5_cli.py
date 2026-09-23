@@ -64,7 +64,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-23.7"
+CLI_VERSION = "2026-09-23.8"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -2552,11 +2552,14 @@ CLOSE_RETRY_FAST_COOLDOWN_SECONDS = 0.25
 #: How far back each loop rereads RECORDED ticks.
 #:
 #: WHY THIS EXISTS, MEASURED 2026-09-23 on a live box: ``symbol_info_tick``
-#: returns ONE tick, and the loop reached it 10 times a second, while EURUSD was
-#: recording 37131 ticks in 60 s (618.85 tick/s). The guard therefore never
-#: looked at ~98% of the ticks that arrived, and a level touched and reverted
-#: inside a 100 ms gap was invisible. (A 2 s probe saw 7 ticks arrive where
-#: ``symbol_info_tick`` would have shown 1.)
+#: returns ONE tick, and the loop reached it 10 times a second -- so the guard
+#: examined at most 10 of however many ticks arrived, and a level touched and
+#: reverted inside a 100 ms gap was invisible. HOW MANY it was blind to is not a
+#: fixed number: one reading taken that day counted 37131 EURUSD ticks in 60 s
+#: (618.85 tick/s) and another, on the same box 30 min later, counted 282 rows
+#: over 60.5 s (~4.7 tick/s, with the stream's head level with the live tick).
+#: The rate is bursty and CANNOT be assumed. What is constant is the shape of the
+#: hole: one price per poll, whatever the feed is doing.
 #:
 #: NOTE the ceiling this cannot fix, measured the same day: ``symbol_info_tick``
 #: inside Wine costs 334.7 us, i.e. ~2988 polls/s is the absolute limit for a
@@ -2716,8 +2719,10 @@ def recorded_ticks(symbol, since, limit=20000):
 
     ``symbol_info_tick`` answers "what is the price now" with ONE tick, so a loop
     that calls it every 100 ms never sees the ticks it skipped -- MEASURED
-    2026-09-23, ~98% of a 618.85 tick/s feed. This reads the recorded stream
-    instead, so the loop can name the tick that actually crossed a level.
+    2026-09-23 on a live box, 10 ticks a second against a feed that carried
+    several a second at its quietest and hundreds at its busiest. This reads the
+    recorded stream instead, so the loop can name the tick that actually crossed
+    a level.
 
     CALL ``since`` IN THE TICK CLOCK, NOT IN THIS PROCESS'S. MEASURED 2026-09-23
     on a live box: the terminal stamps ticks in the SERVER's time, which ran
@@ -2887,6 +2892,11 @@ def main():
             break
 
         changed = False
+        #: Symbol -> the recorded ticks this PASS read, so several rules on one
+        #: symbol all measure their level against the same ticks instead of each
+        #: consuming them in turn. Cleared every pass; the watermark that bounds
+        #: the read lives on in ``scanned_to_msc``.
+        scan_fresh = {}
         for rule in list(rules):
             symbol = str(rule.get("symbol") or "")
             if not symbol:
@@ -2926,11 +2936,11 @@ def main():
             rule["last_price_ts"] = now
 
             # ---- every tick, not just the one we happened to poll ---------------
-            # ``price`` above is ONE tick. MEASURED 2026-09-23: this feed records
-            # 618.85 tick/s and the loop reaches it 10 times a second, so ~98% of
-            # the ticks were never looked at. Read what was recorded since the
-            # last look so the guard can (a) name the tick that actually crossed
-            # when it fires, and (b) say out loud when a level was TOUCHED and is
+            # ``price`` above is ONE tick: the feed records several a second and
+            # this loop reaches it 10 times a second, so whatever arrived in
+            # between was never looked at. Read what was recorded since the last
+            # look so the guard can (a) name the tick that actually crossed when
+            # it fires, and (b) say out loud when a level was TOUCHED and is
             # already back inside.
             #
             # DELIBERATELY NOT A NEW TRIGGER. A touch that reverted is reported,
@@ -2967,6 +2977,20 @@ def main():
                 # the rule existed are not this rule's crossing, and backfilling
                 # them would invent a touch that never happened while armed.
                 scanned_to_msc[symbol] = tick_msc
+                fresh = []
+            elif symbol in scan_fresh:
+                # WHAT THIS PASS ALREADY READ, for every other rule on the same
+                # symbol. MEASURED live 2026-09-23, and the bug it fixes: two
+                # rules on EURUSD, the first (a far level that never fires) read
+                # the recorded stream and advanced the per-symbol watermark to the
+                # crossing tick, so by the time the SECOND rule was evaluated --
+                # the one that actually fired -- its own read returned nothing
+                # newer than the watermark. It closed the position correctly and
+                # named no crossing, which is precisely the evidence this scan
+                # exists to produce. The ticks belong to the SYMBOL for this pass,
+                # not to whichever rule happened to be listed first, so they are
+                # read once and every rule measures its own level against them.
+                fresh = scan_fresh[symbol]
             else:
                 floor = int(scanned_to_msc.get(symbol) or 0)
                 # Look back FROM THE LIVE TICK, and fall back to the watermark
@@ -2994,7 +3018,8 @@ def main():
                         int(r["time_msc"]) for r in fresh
                     )
                     ticks_seen[symbol] = ticks_seen.get(symbol, 0) + len(fresh)
-                scan_msc, scan_price = first_crossing(fresh, op, level, used_side)
+                scan_fresh[symbol] = fresh
+            scan_msc, scan_price = first_crossing(fresh, op, level, used_side)
 
             #: A rule can be in one of two states:
             #:   * armed and waiting -- it acts only while the level is touched;
