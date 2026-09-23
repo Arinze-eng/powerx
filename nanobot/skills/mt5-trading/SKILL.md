@@ -250,10 +250,35 @@ else — that list is the exact shape of the original complaint.
   minimum distance, staying on its own side. Only the legs you actually pass are
   touched, so `--tp` never rewrites a stop that was already there. Two different
   instructions — do not treat a refusal as a failure to retry blindly.
-* A guard fires in **97–110 ms** measured (trigger tick → fill acknowledgement),
-  across three samples (97.3, 109.1, 100.5 ms). `guard_action='events'` carries
-  `latency_ms` per fire; when a "close at X" instruction was late, that number is
-  the answer to why.
+* **An exit AT the market closes the position now, by design.** `--exit-at` with
+  a level equal to the current price (measured: `inside = bid`) routes to the leg
+  on that side, is clamped just outside the minimum stop distance, and the server
+  fills it immediately — `after: count=0`. So do not follow a level-at-the-market
+  call with more work on that ticket: it is gone, and a second call answers
+  `no open position with ticket(s) … it may have already closed`. If the caller
+  wanted a level to *wait* at, give one that is not already through the market.
+* A guard fires in **92–191 ms** measured (trigger tick → fill acknowledgement),
+  across nine live MetaQuotes-demo samples: 92.5, 96.6, 97.3, 100.5, 102.3,
+  102.4, 109.1 ms with one position, and **190.5 / 187.6 ms** closing a
+  two-position basket in a single call (both retcode 10009).
+  `guard_action='events'` carries `latency_ms` per fire; when a "close at X"
+  instruction was late, that number is the answer to why. Nothing here is a
+  *guaranteed* bound — it is what the barrier is worth on a live account with a
+  fixed 100 ms poll, and a sub-100 ms spike through the level and back can still
+  be missed.
+* **An `arm` whose level is already satisfied is a completed exit, not a failed
+  guard.** The rule fires on the first tick and the watcher is gone before the
+  heartbeat wait ends, so `arm` answers `ok: true, guard: "fired_immediately"`
+  with `fired[]` (level, trigger price, `latency_ms`, positions matched). Read
+  `fired` and `positions` instead of arming again — the exit has already
+  happened.
+* If that first-tick fire is **refused by the broker**, `arm` answers `ok: false,
+  guard: "close_failed"` with `close_failed[]` carrying the retcodes: the
+  position is **still open** at a level you were asked to be out at. That is a
+  different problem from a dead watcher and is named differently on purpose.
+* A failed `arm` tails only what **that** watcher wrote, so `log_tail` is not a
+  previous run's `max 600 s` line; if the new watcher wrote nothing at all,
+  `log_note` says so.
 * **A stopped guard with rules still armed is an ALARM, not a status.** `status`
   answers `ok: false` with `alert: "guard_not_running"`, the `exit_reason`, the
   `heartbeat_age_s`, and `recovery: "guard action='ensure'"`. Never report the
@@ -261,7 +286,16 @@ else — that list is the exact shape of the original complaint.
 * `guard_action='ensure'` restarts a watcher that stopped with rules still armed,
   and reports `unprotected_seconds` — the window in which a level could have been
   touched and nothing acted on it. Say that window out loud; the rules stayed
-  armed through it and nothing fired.
+  armed through it and nothing fired. `ensure` answers `action: "rearmed"`,
+  `"rearmed_and_fired"` (the level was reached while nothing was watching, so the
+  restarted guard fired on its first tick and stopped again) or `"rearm_failed"`
+  — a fired re-arm is a completed exit, not a broken guard.
+* Guard-death detection is **passive**: a watcher that dies is noticed by the
+  next tool call that looks (`status`, `positions`, `ensure`), never by a
+  background watchdog — a Wine process cannot be supervised from outside Wine.
+  So do not tell anyone a level is protected indefinitely on the strength of one
+  `arm`: re-check `positions.protection` or `guard status` on the next turn, and
+  treat any `alert` as unprotected until `ensure` says otherwise.
 * **`arm` refuses a symbol it cannot price.** A rule on a symbol with no tick can
   never fire, and a watcher polling in silence is indistinguishable from
   protection. The refusal names the symbols (`unpriceable`) and points at
