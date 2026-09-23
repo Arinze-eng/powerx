@@ -272,10 +272,37 @@ else — that list is the exact shape of the original complaint.
   with `fired[]` (level, trigger price, `latency_ms`, positions matched). Read
   `fired` and `positions` instead of arming again — the exit has already
   happened.
-* If that first-tick fire is **refused by the broker**, `arm` answers `ok: false,
-  guard: "close_failed"` with `close_failed[]` carrying the retcodes: the
-  position is **still open** at a level you were asked to be out at. That is a
-  different problem from a dead watcher and is named differently on purpose.
+* If that first-tick fire is **refused by the broker**, `arm` answers `ok: false`
+  with the retcodes and `alert: "close_retrying"`: the position is **still open**
+  at a level you were asked to be out at. That is a different problem from a dead
+  watcher and is named differently on purpose. The rule is NOT consumed and the
+  watcher keeps retrying — see the retry loop below before reporting it as lost.
+* **A refused close is retried until the broker accepts or a deadline passes.**
+  MEASURED 2026-09-23, live: a rule armed with an impossible volume (1000 lots on
+  a 0.01 position) was refused with retcode **10014 "Invalid volume"**, retried
+  every **1.5 s** (measured gaps 1.548 / 1.548 / 1.547 s), and after **20
+  attempts / 29.4 s** logged a single `close_gave_up` naming the retcodes and the
+  ticket that is still open. In one sentence: a decided exit is honoured even
+  after the price has moved back inside the level, because the decision was
+  already made when the level was touched. The details:
+  - `status` (and `positions.protection`, and `arm`) carry the retry state:
+    `retrying[]` with `attempts`, `trying_for_s`, `retry_in_s`, `deadline_in_s`,
+    or `gave_up[]` with `attempts`, `retcodes`, `gave_up_s_ago` and
+    `next_window_in_s`. Both set `ok: false` — a caller who asked to be out is
+    still in, and must not be told the level is covered.
+  - `alert: "close_retrying"` means *exit in progress*: recovery is "nothing to
+    do yet", and polling `guard_action='events'` for `fired` or `close_gave_up`
+    is the whole follow-up. `alert: "close_gave_up"` means the watcher could not
+    get out: close by hand (`action='close'`) or fix what the broker refused.
+  - After giving up it is **parked for 60 s**, then a fresh window opens — a
+    closed market is minutes from being closable, not never, so the rule is not
+    abandoned. One loud line per window instead of a refusal storm at 10 Hz.
+  - A watcher that restarts with a retry in flight resumes it and says so:
+    `close_retry_resumed` in the event log (`{"rule_id", "symbol", "attempts"}`),
+    continuing from the inherited attempt count — verified live across
+    `guard stop` → `guard ensure` (attempts 1,2 before, `attempts: 3` inherited).
+  - The rule is consumed only by a **confirmed** close, so a retry never has to
+    be reconstructed from memory: it lives on the rule in `rules.json`.
 * A failed `arm` tails only what **that** watcher wrote, so `log_tail` is not a
   previous run's `max 600 s` line; if the new watcher wrote nothing at all,
   `log_note` says so.
@@ -314,8 +341,16 @@ else — that list is the exact shape of the original complaint.
   off, so a live guard can always be inspected or disarmed. `ensure`, like `arm`,
   **starts a process that can place orders and is gated the same way**.
 * `positions` answers "is anything watching a price?" alongside the positions:
-  `protection.guard_live`, `protection.guard_alert`, and a `warning` when rules
-  are armed with nothing running.
+  `protection.guard_live`, `protection.guard_alert`,
+  `protection.guard_retrying_close` / `protection.guard_gave_up_close`, and a
+  `warning` when rules are armed with nothing running. **Fixed 2026-09-23:** the
+  bridge re-exec'd into Wine without passing `MT5_ROOT`, so it resolved
+  `Path.home()` as Wine's `C:\users\user` and read the guard's files from a
+  different, empty directory — `positions` answered `guard: {live: false,
+  rules_armed: 0}` while a guard was live and retrying a refused close, i.e. the
+  one call that reads open risk said nothing was watching. If a build answers
+  `guard_live: false` while `guard status` says `running: true`, that is this bug
+  and the CLI needs re-fetching, not re-arming.
 * End a guard with `guard_action='stop'` (a stop **file**), never by killing a
   process: `pkill -f` matches the shell that launched it.
 
