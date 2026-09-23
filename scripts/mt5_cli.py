@@ -4760,6 +4760,21 @@ def _reexec_under_wine(argv: list[str]) -> int | None:
     bat = tmp_dir / "run.bat"
     bat.write_text(
         "@echo off\r\n"
+        # THE ROOTS ARE PASSED THROUGH, and they must be. MEASURED 2026-09-23 on
+        # a live box: this child resolved ``Path.home()`` as ``C:\users\user``
+        # (Wine's USERPROFILE, not the Linux home), so ``MT5_ROOT`` came out as
+        # ``C:\users\user\.mt5`` -- a DIFFERENT, empty directory. Every bridge
+        # action therefore read the guard's state and rules from nowhere:
+        # ``positions`` answered ``guard: {live: false, rules_armed: 0}`` while a
+        # guard was running, armed, and retrying a refused close. The tool turned
+        # that into "No tick-level guard is running right now, so a guard rule is
+        # NOT currently protecting anything" -- the exact class of lie this guard
+        # work exists to remove, told by the one call that reads open risk.
+        #
+        # The Wine ``Z:`` form is used because it does not depend on the child's
+        # current drive; it is the same directory either way.
+        f'set "MT5_ROOT={_to_wine_path(MT5_ROOT)}"\r\n'
+        f'set "WINE_PREFIX={_to_wine_path(WINE_PREFIX)}"\r\n'
         f'"{_to_wine_path(winpy)}" "{_to_wine_path(Path(__file__).resolve())}" '
         f"{win_args} > \"C:\\mt5tmp\\stdout.txt\" 2>&1\r\n",
         encoding="utf-8",

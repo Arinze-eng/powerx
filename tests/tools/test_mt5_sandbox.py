@@ -2823,6 +2823,55 @@ def test_the_watcher_reports_a_symbol_it_cannot_price(monkeypatch, tmp_path):
     assert "UNPRICEABLE_STALE" in source
 
 
+def test_the_wine_reexec_passes_the_roots_through(monkeypatch, tmp_path):
+    """The re-exec'd child must read the SAME ``.mt5`` the parent does.
+
+    MEASURED 2026-09-23 on a live MetaQuotes box: the child resolved
+    ``Path.home()`` as ``C:\\users\\user`` -- Wine's USERPROFILE, not the Linux
+    home -- so its ``MT5_ROOT`` was a different, empty directory. ``positions``
+    then answered ``guard: {live: false, rules_armed: 0}`` while a guard was
+    running with a rule armed and a refused close being retried, and the tool
+    told the model that no guard was protecting anything. The roots are now
+    written into the batch file the bridge is launched from.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    (cli.WINE_PREFIX / "drive_c" / "Python311").mkdir(parents=True, exist_ok=True)
+    winpy = cli.WINE_PREFIX / "drive_c" / "Python311" / "python.exe"
+    winpy.write_bytes(b"MZ")
+    monkeypatch.setattr(cli, "win_python", lambda: winpy)
+    monkeypatch.setattr(cli, "wine_bin", lambda: "wine")
+    captured: dict[str, Any] = {}
+
+    def _run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs.get("env") or {}
+        bat = cli.WINE_PREFIX / "drive_c" / "mt5tmp" / "run.bat"
+        captured["bat"] = bat.read_text(encoding="utf-8")
+        (cli.WINE_PREFIX / "drive_c" / "mt5tmp" / "stdout.txt").write_text(
+            '{"ok": true}\n', encoding="utf-8"
+        )
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", _run)
+
+    code = cli._reexec_under_wine(["positions"])
+
+    assert code == 0
+    bat = captured["bat"]
+    # The Wine Z: form, so the child does not care which drive is current, and
+    # it points at the parent's real root rather than a guessed one.
+    def _wine_form(path: Any) -> str:
+        return "Z:" + str(path).replace("/", chr(92))
+
+    assert f'set "MT5_ROOT={_wine_form(cli.MT5_ROOT)}"' in bat
+    assert f'set "WINE_PREFIX={_wine_form(cli.WINE_PREFIX)}"' in bat
+    # The guard's own files are under the root the child is told about: this is
+    # the link that was broken, and it is what positions reads to answer "is a
+    # guard watching a price".
+    assert cli.GUARD_STATE_FILE == cli.MT5_ROOT / "guard" / "state.json"
+    assert captured["env"].get("MT5_UNDER_WINE") == "1"
+
+
 # ---------------------------------------------------------------------------
 # The close-retry loop: driven by running the REAL watcher source.
 #
