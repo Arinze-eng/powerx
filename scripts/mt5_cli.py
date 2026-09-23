@@ -2956,6 +2956,10 @@ def _guard_spawn(interval_ms: int, max_seconds: int, deviation: int) -> dict[str
         GUARD_STOP_FILE.unlink()
     except OSError:
         pass
+    # Where this run's output starts in the append-only logs. Counted BEFORE the
+    # spawn so the caller can tail only what THIS watcher wrote -- see _tail_new.
+    log_mark = _log_line_count(GUARD_LOG_FILE)
+    err_mark = _log_line_count(GUARD_ERR_FILE)
     inner = (
         f"{wine} {shlex.quote(_to_wine_path(winpy))} "
         f"{shlex.quote(_to_wine_path(GUARD_WATCH_SCRIPT))} "

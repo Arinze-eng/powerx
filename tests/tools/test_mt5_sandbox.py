@@ -2878,3 +2878,34 @@ async def test_positions_says_when_a_guard_is_not_actually_watching():
     rendered = str(await tool.execute(action="positions"))
     assert "GUARD NOT WATCHING" not in rendered
     assert "a tick-level guard IS running" in rendered
+
+
+def test_spawn_reports_the_log_marks_its_callers_tail_from(monkeypatch, tmp_path):
+    """A REAL spawn must carry the offsets the arm/ensure tails read.
+
+    This is the test that was missing when it mattered: every arm test stubbed
+    ``_guard_spawn``, so a ``NameError`` inside the real one was invisible to the
+    suite and shipped -- on a live MetaQuotes box ``guard arm`` answered
+    ``ok=false, error="NameError: name 'log_mark' is not defined"`` and a caller
+    reading that cannot tell a broken guard from a refused one.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cli, "_guard_python", lambda: ("wine", tmp_path / "py.exe"))
+    cli.GUARD_LOG_FILE.write_text("old run 1\nold run 2\n", encoding="utf-8")
+
+    class _Proc:
+        returncode = 0
+        stdout = "4242\n"
+        stderr = ""
+
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _Proc())
+
+    spawn = cli._guard_spawn(100, 60, 30)
+
+    for key in ("state", "launcher_pid", "waited_s", "log_mark", "err_mark"):
+        assert key in spawn, f"_guard_spawn must report {key!r}"
+    # Counted BEFORE the spawn, so a tail skips the previous run's lines.
+    assert spawn["log_mark"] == 2
+    assert spawn["err_mark"] == 0
+    assert spawn["launcher_pid"] == "4242"
