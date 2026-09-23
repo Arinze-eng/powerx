@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-22.12"
+_CLI_VERSION = "2026-09-23.2"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -91,7 +91,18 @@ _MAX_SANDBOX_COMMAND_TIMEOUT = 900
 _INSTALL_COMMAND_TIMEOUT = 120
 
 #: Actions that move money. Blocked unless explicitly enabled.
-_TRADING_ACTIONS = frozenset({"order", "close", "close_all"})
+#:
+#: ``modify`` belongs here because it changes where a LIVE position exits, and
+#: ``guard`` because arming a guard is arming a close. Their safe halves --
+#: reading the guard, reading its event log, stopping it -- are exempted in
+#: execute() (see _GUARD_SAFE_SUBACTIONS), so an operator can always inspect or
+#: disarm protection even with trading disabled.
+_TRADING_ACTIONS = frozenset({"order", "close", "close_all", "modify", "guard"})
+
+#: ``guard`` sub-actions that place no order. These stay available without
+#: MT5_ALLOW_TRADING: refusing to report the state of a live guard would leave
+#: protection running with no way to look at it.
+_GUARD_SAFE_SUBACTIONS = frozenset({"status", "stop", "events", "clear"})
 
 #: Actions that only read state. These never require the trading opt-in.
 _READ_ONLY_ACTIONS = frozenset(
@@ -128,6 +139,11 @@ _TIMEOUTS: dict[str, int] = {
     "symbols": 120,
     "history": 120,
     "run": 120,
+    # `modify` is one TRADE_ACTION_SLTP per position through the Wine bridge;
+    # `guard` only writes files and spawns the watcher (which keeps running
+    # after this call returns), so both fit well inside the ceiling.
+    "modify": 120,
+    "guard": 120,
 }
 _DEFAULT_TIMEOUT = 120
 
@@ -371,6 +387,57 @@ def _server_is_known(server: str | None) -> bool:
     return bool(name) and any(name.startswith(prefix) for prefix in _KNOWN_SERVER_PREFIXES)
 
 
+def build_guard_rule(kwargs: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Turn tool kwargs into ONE guard rule, or explain what is missing.
+
+    Kept apart from the command builder so the mapping is unit-testable without a
+    sandbox, and so the model only ever passes plain fields -- a caller that has
+    to hand-write JSON is a caller that will produce JSON the watcher cannot read.
+    """
+    symbol = str(kwargs.get("symbol") or "").strip()
+    if not symbol:
+        return None, "guard action='arm' requires 'symbol'."
+    if kwargs.get("trigger_price") is None:
+        return None, (
+            "guard action='arm' requires 'trigger_price' -- the level to act on. "
+            "For 'close when EURUSD hits 1.1650' that is 1.1650."
+        )
+    try:
+        level = float(kwargs["trigger_price"])
+    except (TypeError, ValueError):
+        return None, "trigger_price must be a number."
+
+    op = str(kwargs.get("trigger_op") or "").strip()
+    if op and op not in (">=", "<="):
+        return None, (
+            f"trigger_op must be '>=' (at or above the level) or '<=' (at or below "
+            f"it); got {op!r}. Omit it and the direction is inferred from the live "
+            "price."
+        )
+
+    side = str(kwargs.get("trigger_side") or "mid").strip().lower() or "mid"
+    if side not in ("bid", "ask", "mid"):
+        return None, f"trigger_side must be bid, ask or mid; got {side!r}."
+
+    rule: dict[str, Any] = {
+        "symbol": symbol,
+        "price": level,
+        "side": side,
+        "action": "close",
+    }
+    if op:
+        rule["op"] = op
+    if kwargs.get("ticket"):
+        rule["ticket"] = int(kwargs["ticket"])
+    elif kwargs.get("all_positions"):
+        rule["scope"] = {"all": True}
+    if kwargs.get("volume") is not None:
+        rule["volume"] = float(kwargs["volume"])
+    if kwargs.get("max_seconds") is not None:
+        rule["max_seconds"] = int(kwargs["max_seconds"])
+    return rule, None
+
+
 def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
     """Translate tool kwargs into an ``mt5_cli.py`` invocation."""
     parts = ["python3", _CLI_PATH, action]
@@ -466,6 +533,42 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
             parts += ["--volume", str(float(kwargs["volume"]))]
         if kwargs.get("deviation") is not None:
             parts += ["--deviation", str(int(kwargs["deviation"]))]
+    elif action == "modify":
+        # `--ticket` is repeatable, so both the single and list spellings are
+        # accepted; a caller that has one position should not have to wrap it.
+        for ticket in list(kwargs.get("tickets") or []):
+            parts += ["--ticket", str(int(ticket))]
+        if kwargs.get("ticket"):
+            parts += ["--ticket", str(int(kwargs["ticket"]))]
+        if kwargs.get("symbol"):
+            parts += ["--symbol", _sh(kwargs["symbol"])]
+        if kwargs.get("all_positions"):
+            parts += ["--all"]
+        if kwargs.get("exit_at") is not None:
+            parts += ["--exit-at", str(float(kwargs["exit_at"]))]
+        for flag in ("sl", "tp"):
+            if kwargs.get(flag) is not None:
+                parts += [f"--{flag}", str(float(kwargs[flag]))]
+    elif action == "guard":
+        sub_action = str(kwargs.get("guard_action") or "status").strip().lower()
+        parts += [_sh(sub_action)]
+        if sub_action == "arm":
+            rule, rule_error = build_guard_rule(kwargs)
+            if rule is not None:
+                # Serialised here (not by the caller) so a quoted level can never
+                # be mangled by shell splitting on the way into the sandbox.
+                parts += [
+                    "--rule",
+                    _sh(json.dumps(rule)),
+                    "--interval-ms",
+                    str(int(kwargs.get("interval_ms") or 100)),
+                    "--max-seconds",
+                    str(int(kwargs.get("max_seconds") or 3600)),
+                ]
+            elif rule_error:  # pragma: no cover - validated in execute()
+                raise ValueError(rule_error)
+        elif sub_action == "events":
+            parts += ["--lines", str(int(kwargs.get("lines") or 20))]
     elif action == "compile":
         parts += ["--file", _sh(kwargs.get("file") or "")]
         if kwargs.get("include"):
@@ -594,7 +697,26 @@ class MT5SandboxTool(Tool):
             "market_open is true; if none is, every instrument on that server is closed "
             "right now and an order will come back as retcode 10018 'Market closed'. "
             f"Actions: {', '.join(_ALL_ACTIONS)}. "
-            "Trading actions (order, close, close_all) require MT5_ALLOW_TRADING to be "
+            "INSTANT EXITS AT A PRICE -- read before promising anything: a position "
+            "only closes when SOMETHING sends the close. Polling quote in a loop is "
+            "not that something: each poll costs a sandbox round trip plus an agent "
+            "turn, so a level touched between polls is missed entirely, and the "
+            "position stays open while the user is told it is being watched. So when "
+            "the user wants an exit at a price (\"close when it hits X\", \"take "
+            "profit at X\", \"get me out if it drops to X\"), arm it in ONE call "
+            "instead of watching: action=\"modify\" with exit_at=X puts the level "
+            "on the broker server (instant, and it survives this sandbox being "
+            "paused or killed) -- use it for an open position. Use action=\"guard\" "
+            "when the broker cannot hold the condition: close every position on a "
+            "symbol at a level, exit a basket, partial closes at a price. guard "
+            "action=\"arm\" returns as soon as the watcher is alive and the watcher "
+            "keeps running on its own -- do NOT poll it in a loop; read "
+            "guard_action=\"events\" later for the measured trigger->fill latency "
+            "(latency_ms), and use guard_action=\"status\" only when asked whether "
+            "the exit is still armed. A position you leave with no SL/TP has no "
+            "server-side exit at all, so offer to arm one. "
+            "Trading actions (order, close, close_all, modify, guard) require "
+            "MT5_ALLOW_TRADING to be "
             "enabled and return the broker retcode; a rejected order is reported with "
             "code 3 and its reason rather than raising. "
             "After an order, verify it: retcode 10009 means the broker executed it, "
@@ -627,7 +749,17 @@ class MT5SandboxTool(Tool):
                 "sl": {"type": "number", "description": "Stop loss price (action=order)."},
                 "tp": {"type": "number", "description": "Take profit price (action=order)."},
                 "deviation": {"type": "integer", "description": "Max slippage in points."},
-                "ticket": {"type": "integer", "description": "Position ticket (action=close)."},
+                "ticket": {"type": "integer", "description": "Position ticket (action=close, or the single target of action=modify/guard)."},
+                "tickets": {"type": "array", "items": {"type": "integer"}, "description": "action=modify: several position tickets at once."},
+                "all_positions": {"type": "boolean", "description": "action=modify: every open position."},
+                "exit_at": {"type": "number", "description": "action=modify: the price to exit this position at. The SL/TP side is chosen from the position direction and the level is nudged outside the broker's minimum stop distance. This is the instant, broker-held exit -- prefer it over watching the price yourself."},
+                "guard_action": {"type": "string", "enum": ["arm", "status", "stop", "clear", "events"], "description": "action=guard: \"arm\" starts the detached tick-level watcher that closes at trigger_price; \"status\" reports whether it is alive, the rules armed and the price it is seeing; \"events\" returns its log including the measured trigger->fill latency_ms; \"stop\" ends it; \"clear\" drops the rules. Defaults to status."},
+                "trigger_price": {"type": "number", "description": "action=guard (arm): the price level to act on, e.g. 1.1650 in \"close when EURUSD hits 1.1650\"."},
+                "trigger_op": {"type": "string", "enum": [">=", "<="], "description": "action=guard (arm): \">=\" fires at or above the level, \"<=\" at or below. Omit it and the direction is inferred from the live price."},
+                "trigger_side": {"type": "string", "enum": ["mid", "bid", "ask"], "description": "action=guard (arm): which price is compared to the level (default mid = (bid+ask)/2, which is what \"the price\" usually means)."},
+                "interval_ms": {"type": "integer", "description": "action=guard (arm): how often the watcher reads the tick stream, in milliseconds (default 100). This is the exit's worst-case delay."},
+                "max_seconds": {"type": "integer", "description": "action=guard (arm): how long the guard may keep watching before it stops itself (default 3600)."},
+                "rule": {"type": "object", "description": "action=guard (arm): advanced -- an explicit rule object instead of trigger_* fields. Normally omit it and pass symbol/trigger_price/trigger_op."},
                 "comment": {"type": "string", "description": "Order comment."},
                 "file": {"type": "string", "description": "Absolute .mq5/.mqh path inside the sandbox (action=compile)."},
                 "include": {"type": "string", "description": "MetaEditor include dir (action=compile)."},
@@ -665,12 +797,30 @@ class MT5SandboxTool(Tool):
                 }
             )
 
-        if action in _TRADING_ACTIONS and not _trading_enabled():
+        guard_sub = str(kwargs.get("guard_action") or "status").strip().lower()
+        if action == "guard" and guard_sub not in (
+            "arm",
+            "status",
+            "stop",
+            "events",
+            "clear",
+        ):
             return ToolResult.error(
-                f"action='{action}' moves real money and is disabled. Set "
-                "MT5_ALLOW_TRADING=1 in the deployment environment to enable live "
-                "trading, then retry."
+                f"Unknown guard_action '{guard_sub}'. Use arm, status, stop, clear "
+                "or events."
             )
+
+        if action in _TRADING_ACTIONS and not _trading_enabled():
+            # Reading, stopping or clearing a guard places no order, and refusing
+            # it would strand a live guard with no way to inspect or disarm it.
+            if not (
+                action == "guard" and guard_sub in _GUARD_SAFE_SUBACTIONS
+            ):
+                return ToolResult.error(
+                    f"action='{action}' moves real money and is disabled. Set "
+                    "MT5_ALLOW_TRADING=1 in the deployment environment to enable live "
+                    "trading, then retry."
+                )
 
         if action == "order":
             if not kwargs.get("symbol") or not kwargs.get("side"):
@@ -679,6 +829,25 @@ class MT5SandboxTool(Tool):
                 return ToolResult.error("action=order requires a positive 'volume'.")
         if action == "close" and not kwargs.get("ticket"):
             return ToolResult.error("action=close requires 'ticket'.")
+        if action == "modify":
+            if not any(
+                kwargs.get(key) for key in ("ticket", "tickets", "symbol", "all_positions")
+            ):
+                return ToolResult.error(
+                    "action=modify needs a target: 'ticket', 'tickets', 'symbol' (all "
+                    "positions on it), or all_positions=true."
+                )
+            if not any(
+                kwargs.get(key) is not None for key in ("exit_at", "sl", "tp")
+            ):
+                return ToolResult.error(
+                    "action=modify needs the new exit: 'exit_at' (a price to exit at -- "
+                    "the side is chosen for you), or explicit 'sl'/'tp'."
+                )
+        if action == "guard" and guard_sub == "arm":
+            _, rule_error = build_guard_rule(kwargs)
+            if rule_error:
+                return ToolResult.error(rule_error)
         if action == "compile" and not kwargs.get("file"):
             return ToolResult.error("action=compile requires 'file' (absolute path in the sandbox).")
         if action in ("quote", "candles", "symbol") and not (
@@ -781,6 +950,27 @@ class MT5SandboxTool(Tool):
         # Never echo a password back, even if a broker/library logged it.
         if "password" in payload:
             payload["password"] = "***"
+
+        # A position with no SL and no TP has no server-side exit at all: the only
+        # way it can ever close is a model turn calling `close`, which is the exact
+        # reason a "close at 1.1650" instruction was not honoured instantly. The
+        # hint is attached where the model is already looking at its position.
+        if action == "positions" and isinstance(payload.get("positions"), list):
+            unprotected = [
+                int(p.get("ticket") or 0)
+                for p in payload["positions"]
+                if not float(p.get("sl") or 0.0) and not float(p.get("tp") or 0.0)
+            ]
+            payload["positions_without_a_server_side_exit"] = unprotected
+            if unprotected:
+                payload["hint"] = (
+                    "These positions have no SL/TP, so nothing but an agent turn can "
+                    "close them -- the broker will NOT exit them at a price while you "
+                    "are not calling tools. To honour 'close when it hits X', arm a "
+                    "server-side exit now: action='modify' with exit_at=X (the broker "
+                    "then holds the level and fires it instantly), or action='guard' "
+                    "for a condition the broker cannot hold."
+                )
 
         # action='install' is detached and reports "installing" immediately. Rather
         # than handing that back and hoping the model comes back to poll (the stall

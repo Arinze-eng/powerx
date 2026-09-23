@@ -1795,3 +1795,580 @@ def test_a_failed_install_always_lands_its_log_in_install_log():
         'status failed "terminal64.exe was not produced after ${_attempt} attempt(s) '
         '(installer log: ${_last_attempt_log})"' in script
     )
+
+
+# --------------------------------------------------------------------------- #
+# instant exits at a price: `modify` and `guard`
+# --------------------------------------------------------------------------- #
+# THE BUG THESE PIN: an exit at a price had only two routes and both put the
+# model in the loop. ``order --tp`` is broker-side and instant, but it was
+# attachable at ORDER TIME only -- an open position could not be given a stop
+# afterwards. So "close when it reaches X" had to be polled: quote, compare,
+# close. Every poll is a sandbox round trip plus an agent turn, and a level
+# touched between two polls is missed entirely. MEASURED in a Runloop devbox
+# (2026-09-23): one ``quote`` call costs ~1.0-1.5 s inside the box, before the
+# model's own latency is added. MEASURED with the fix: the tick-level watcher's
+# own trigger->fill latency was 97.3 ms and 109.1 ms on two live fires.
+
+
+def test_modify_and_guard_are_advertised_actions():
+    """The model cannot use a primitive it cannot see in the schema."""
+    params = MT5SandboxTool().parameters
+    assert {"modify", "guard"} <= set(params["properties"]["action"]["enum"])
+    assert params["required"] == ["action"]
+    # The fields exist so the model never hand-writes the watcher's rule JSON: a
+    # caller that has to build JSON is a caller that produces JSON the watcher
+    # cannot read, and the failure arrives as silence rather than an error.
+    assert {
+        "tickets",
+        "all_positions",
+        "exit_at",
+        "guard_action",
+        "trigger_price",
+        "trigger_op",
+        "trigger_side",
+        "interval_ms",
+        "max_seconds",
+    } <= set(params["properties"])
+
+
+def test_modify_command_attaches_an_exit_to_an_open_position():
+    cmd = build_cli_command("modify", {"ticket": 123, "exit_at": 1.1650})
+    assert cmd.endswith("mt5_cli.py modify --ticket 123 --exit-at 1.165")
+
+
+def test_modify_command_can_target_many_positions():
+    cmd = build_cli_command(
+        "modify", {"tickets": [11, 22], "all_positions": True, "exit_at": 1.165}
+    )
+    assert "--ticket 11 --ticket 22" in cmd
+    assert " --all " in cmd
+    assert "--exit-at 1.165" in cmd
+
+
+def test_a_guard_rule_is_built_from_flat_fields_never_hand_written_json():
+    from nanobot.agent.tools.mt5_sandbox import build_guard_rule
+
+    rule, error = build_guard_rule(
+        {
+            "symbol": "EURUSD",
+            "trigger_price": 1.1650,
+            "trigger_side": "mid",
+            "ticket": 123,
+        }
+    )
+    assert error is None
+    assert rule == {
+        "symbol": "EURUSD",
+        "price": 1.165,
+        "side": "mid",
+        "action": "close",
+        "ticket": 123,
+    }
+    # 'op' is ABSENT when the caller gave none: the CLI infers the direction from
+    # the live price, because "close when it hits X" does not say which side of
+    # the market X is on -- and that is the one input a caller gets backwards.
+    assert "op" not in rule
+
+    # An explicit op survives, and `all_positions` becomes the basket scope.
+    rule, error = build_guard_rule(
+        {
+            "symbol": "EURUSD",
+            "trigger_price": 1.1650,
+            "trigger_op": "<=",
+            "all_positions": True,
+        }
+    )
+    assert error is None
+    assert rule["op"] == "<=" and rule["scope"] == {"all": True}
+    assert "ticket" not in rule
+
+
+def test_a_guard_rule_without_a_level_is_refused_with_the_reason():
+    from nanobot.agent.tools.mt5_sandbox import build_guard_rule
+
+    rule, error = build_guard_rule({"symbol": "EURUSD"})
+    assert rule is None and "trigger_price" in error
+
+    rule, error = build_guard_rule({"trigger_price": 1.165})
+    assert rule is None and "symbol" in error
+
+    # '>' and '<' are refused rather than accepted: the watcher would have to
+    # decide what a strict comparison means at tick granularity, and every caller
+    # who means "at or through the level" writes '>='.
+    rule, error = build_guard_rule(
+        {"symbol": "EURUSD", "trigger_price": 1.165, "trigger_op": ">"}
+    )
+    assert rule is None and "trigger_op" in error
+
+    rule, error = build_guard_rule(
+        {"symbol": "EURUSD", "trigger_price": 1.165, "trigger_side": "last"}
+    )
+    assert rule is None and "trigger_side" in error
+
+
+def test_guard_arm_command_serialises_the_rule_itself():
+    cmd = build_cli_command(
+        "guard",
+        {
+            "guard_action": "arm",
+            "symbol": "EURUSD",
+            "trigger_price": 1.165,
+            "ticket": 123,
+            "interval_ms": 100,
+            "max_seconds": 900,
+        },
+    )
+    assert "mt5_cli.py guard arm " in cmd
+    assert "--rule" in cmd and '"price": 1.165' in cmd
+    assert "--interval-ms 100" in cmd
+    assert "--max-seconds 900" in cmd
+
+
+def test_guard_events_asks_for_a_bounded_number_of_lines():
+    cmd = build_cli_command("guard", {"guard_action": "events", "lines": 5})
+    assert "mt5_cli.py guard events --lines 5" in cmd
+
+
+def test_modify_and_guard_fit_the_sandbox_command_ceiling():
+    from nanobot.agent.tools.mt5_sandbox import _MAX_SANDBOX_COMMAND_TIMEOUT
+
+    for action in ("modify", "guard"):
+        assert _TIMEOUTS[action] <= _MAX_SANDBOX_COMMAND_TIMEOUT
+
+
+async def test_modify_needs_a_target_and_a_level(monkeypatch):
+    monkeypatch.setenv("MT5_ALLOW_TRADING", "1")
+    sandbox = _FakeSandbox()
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+
+    result = await tool.execute(action="modify", exit_at=1.165)
+    assert result.is_error and "target" in str(result)
+
+    result = await tool.execute(action="modify", ticket=123)
+    assert result.is_error and "exit_at" in str(result)
+
+    assert sandbox.calls == [], "a refused modify must never reach the sandbox"
+
+
+async def test_guard_arm_is_gated_but_a_live_guard_is_always_disarmable(monkeypatch):
+    """Refusing `guard status` with trading off would strand a live guard.
+
+    The watcher places orders, so arming it needs the same opt-in as `order`. But
+    an operator who has turned trading off must still be able to SEE the guard
+    that is running and STOP it -- otherwise the only way to disarm a watcher is
+    to enable trading again.
+    """
+    monkeypatch.delenv("MT5_ALLOW_TRADING", raising=False)
+    sandbox = _FakeSandbox('{"ok": true, "running": false}\n[exit_code=0]')
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+
+    for sub in ("status", "stop", "events", "clear"):
+        result = await tool.execute(action="guard", guard_action=sub)
+        assert not getattr(result, "is_error", False), sub
+    assert len(sandbox.calls) == 4
+
+    result = await tool.execute(
+        action="guard", guard_action="arm", symbol="EURUSD", trigger_price=1.165
+    )
+    assert result.is_error and "MT5_ALLOW_TRADING" in str(result)
+
+    result = await tool.execute(action="modify", ticket=123, exit_at=1.165)
+    assert result.is_error and "MT5_ALLOW_TRADING" in str(result)
+
+    assert len(sandbox.calls) == 4, "neither arm nor modify may reach the sandbox"
+
+
+async def test_an_unknown_guard_subaction_is_refused_by_name(monkeypatch):
+    monkeypatch.setenv("MT5_ALLOW_TRADING", "1")
+    sandbox = _FakeSandbox()
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+
+    result = await tool.execute(action="guard", guard_action="watch")
+
+    assert result.is_error
+    assert "watch" in str(result) and "arm" in str(result)
+    assert sandbox.calls == []
+
+
+async def test_positions_names_the_positions_nothing_will_ever_close_on_its_own():
+    """A position with no SL and no TP has NO server-side exit.
+
+    This is the live-trading shape that produced the original complaint: the
+    first position placed in a real box came back ``sl 0.0 tp 0.0``, so nothing
+    but an agent turn could ever close it. Naming those tickets where the model
+    is already reading its positions is what turns the instruction back into a
+    server-held exit.
+    """
+    payload = {
+        "ok": True,
+        "count": 2,
+        "positions": [
+            {"ticket": 1, "symbol": "EURUSD", "sl": 0.0, "tp": 0.0},
+            {"ticket": 2, "symbol": "EURUSD", "sl": 1.14, "tp": 0.0},
+        ],
+    }
+    sandbox = _FakeSandbox(json.dumps(payload) + "\n[exit_code=0]")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+
+    result = await tool.execute(action="positions")
+
+    rendered = str(result)
+    assert "positions_without_a_server_side_exit" in rendered
+    assert "modify" in rendered and "exit_at" in rendered
+
+    # A position that already holds a stop is not called out: the hint is for the
+    # ones at risk, and a hint that fires on everything is a hint the model learns
+    # to ignore.
+    payload["positions"] = [{"ticket": 2, "symbol": "EURUSD", "sl": 1.14, "tp": 0.0}]
+    sandbox.response = json.dumps(payload) + "\n[exit_code=0]"
+    result = await tool.execute(action="positions")
+    assert "positions_without_a_server_side_exit" in str(result)
+    assert "hint" not in str(result)
+
+
+# --------------------------------------------------------------------------- #
+# the CLI side of the same fix
+# --------------------------------------------------------------------------- #
+def _fake_mt5(*, bid=1.14240, ask=1.14242, point=0.00001, stops_level=0, digits=5,
+              position_type=0, sl=0.0, tp=0.0, ticket=777):
+    """A stand-in for the MetaTrader5 module, wired for one open position."""
+    import types
+
+    mt5 = types.SimpleNamespace()
+    mt5.POSITION_TYPE_BUY = 0
+    mt5.POSITION_TYPE_SELL = 1
+    mt5.TRADE_ACTION_SLTP = 5
+    mt5.TRADE_RETCODE_DONE = 10009
+    mt5.symbol_info = lambda symbol: types.SimpleNamespace(
+        point=point, trade_stops_level=stops_level, trade_freeze_level=0, digits=digits
+    )
+    mt5.symbol_info_tick = lambda symbol: types.SimpleNamespace(bid=bid, ask=ask)
+    mt5.positions_get = lambda *a, **k: [
+        types.SimpleNamespace(
+            ticket=ticket, symbol="EURUSD", type=position_type, sl=sl, tp=tp,
+            volume=0.01,
+        )
+    ]
+    def _order_send(request):
+        mt5.sent = request
+        return types.SimpleNamespace(retcode=10009, comment="Request executed")
+
+    mt5.order_send = _order_send
+    mt5.sent = None
+    mt5.last_error = lambda: (-1, "no error")
+    return mt5
+
+
+def _run_modify(monkeypatch, cli, mt5, **kwargs):
+    """Call cmd_modify against the fake bridge and return the emitted payload."""
+    import argparse
+
+    monkeypatch.setattr(cli, "require_bridge", lambda: (mt5, None))
+    captured: dict[str, Any] = {}
+
+    def _capture(payload, **_kw):
+        captured.clear()
+        captured.update(payload)
+        return 0
+
+    monkeypatch.setattr(cli, "emit", _capture)
+    args = argparse.Namespace(
+        ticket=[kwargs.get("ticket")], symbol=None, all=False,
+        exit_at=kwargs.get("exit_at"), sl=kwargs.get("sl"), tp=kwargs.get("tp"),
+    )
+    cli.cmd_modify(args)
+    return captured
+
+
+def test_modify_routes_the_level_to_the_stop_the_broker_can_hold(monkeypatch, tmp_path):
+    """The side is inferred from the position's direction, never guessed.
+
+    A level above the market protects a LONG in profit (a take-profit) and a
+    SHORT from loss (a stop-loss). Attaching a take-profit where a stop was meant
+    is the one mistake here that costs money instead of returning an error, so
+    both directions are pinned.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+
+    # Long, level above the market -> TP.
+    long_mt5 = _fake_mt5(position_type=0)
+    payload = _run_modify(monkeypatch, cli, long_mt5, ticket=777, exit_at=1.14500)
+    row = payload["results"][0]
+    assert row["routed_to"] == "tp" and row["tp"] == 1.145 and row["sl"] == 0.0
+    # The request the bridge actually sent, not just what was reported back.
+    assert long_mt5.sent["action"] == long_mt5.TRADE_ACTION_SLTP
+    assert long_mt5.sent["position"] == 777
+    assert long_mt5.sent["sl"] == 0.0 and long_mt5.sent["tp"] == 1.145
+
+    # Long, level below the market -> SL.
+    payload = _run_modify(monkeypatch, cli, _fake_mt5(position_type=0), ticket=777,
+                          exit_at=1.14000)
+    assert payload["results"][0]["routed_to"] == "sl"
+    assert payload["results"][0]["sl"] == 1.14
+
+    # SHORT inverts both: above the market is the stop, below it the target.
+    short_high = _run_modify(monkeypatch, cli, _fake_mt5(position_type=1, sl=0.0),
+                             ticket=777, exit_at=1.14500)
+    assert short_high["results"][0]["routed_to"] == "sl"
+    short_low = _run_modify(monkeypatch, cli, _fake_mt5(position_type=1, sl=0.0),
+                            ticket=777, exit_at=1.14000)
+    assert short_low["results"][0]["routed_to"] == "tp"
+
+
+def test_modify_keeps_a_level_inside_the_spread_out_of_the_brokers_rejection(
+    monkeypatch, tmp_path
+):
+    """A level inside the minimum stop distance is moved out, and SAID SO.
+
+    The server answers retcode 10016 "invalid stops" for a stop that is too close
+    to the market, which reads like a bad price rather than a too-tight one. The
+    level is nudged just far enough for the server to hold it, and the answer
+    reports both the original level and the reason.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _fake_mt5(position_type=0, bid=1.14240, ask=1.14242, point=0.00001)
+
+    # A level between the two legal bounds, above the BID the position is valued
+    # at: the caller means "exit when the market comes up to me", so it is clamped
+    # up to the nearest legal TARGET -- not down to a stop, which is the opposite
+    # instruction about the money.
+    payload = _run_modify(monkeypatch, cli, mt5, ticket=777, exit_at=1.14241)
+    row = payload["results"][0]
+
+    assert row["ok"] is True
+    assert row["min_distance"] == pytest.approx(0.00001)
+    assert row["routed_to"] == "tp"
+    assert row["tp"] == pytest.approx(1.14243)
+    assert row["adjusted_from"] == pytest.approx(1.14241)
+    assert "minimum stop distance" in row["adjust_reason"]
+    assert mt5.sent["tp"] == pytest.approx(1.14243)
+    assert mt5.sent["sl"] == 0.0
+
+    # ...and a level BELOW the bid clamps down to a stop, in the same 5-digit
+    # granularity where the two bounds are only a point apart.
+    tight = _fake_mt5(position_type=0, bid=1.14240, ask=1.14242, point=0.00001,
+                      stops_level=5)
+    payload = _run_modify(monkeypatch, cli, tight, ticket=777, exit_at=1.14237)
+    row = payload["results"][0]
+    assert row["routed_to"] == "sl"
+    assert row["sl"] == pytest.approx(1.14235)
+    assert row["tp"] == 0.0
+    assert tight.sent["sl"] == pytest.approx(1.14235)
+
+    # A level the broker will take is passed through untouched.
+    clean = _run_modify(monkeypatch, cli, _fake_mt5(position_type=0), ticket=777,
+                        exit_at=1.15000)
+    assert "adjusted_from" not in clean["results"][0]
+
+
+def test_modify_snaps_the_level_to_the_symbols_precision(monkeypatch, tmp_path):
+    """A 6-decimal level on a 5-digit symbol is an invalid stop, not a rounded one."""
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _fake_mt5(position_type=0, digits=5)
+
+    payload = _run_modify(monkeypatch, cli, mt5, ticket=777, exit_at=1.1450049)
+
+    assert payload["results"][0]["tp"] == 1.145
+    assert mt5.sent["tp"] == 1.145
+
+
+def test_modify_reports_a_missing_ticket_as_closed_rather_than_silently_passing(
+    monkeypatch, tmp_path
+):
+    cli = _broker_cli(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "require_bridge", lambda: (_fake_mt5(), None))
+    code = cli.cmd_modify(
+        __import__("argparse").Namespace(
+            ticket=[999], symbol=None, all=False, exit_at=1.145, sl=None, tp=None
+        )
+    )
+    assert code == 2
+
+
+def test_the_watcher_is_embedded_valid_python(monkeypatch, tmp_path):
+    """The watcher ships as a string in the CLI, so nothing else compiles it.
+
+    A syntax error in it would only ever surface as "guard failed to start" in a
+    sandbox, with the traceback buried in a Wine log -- so it is compiled here.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    compile(cli._GUARD_WATCH_SOURCE, "<guard_watch>", "exec")
+    assert "MetaTrader5" in cli._GUARD_WATCH_SOURCE
+    # It writes measured latency, which is the number that says the exit was
+    # instant rather than merely fast enough.
+    assert "latency_ms" in cli._GUARD_WATCH_SOURCE
+
+
+def test_the_guard_log_holds_readable_lines_not_wine_chatter(monkeypatch, tmp_path):
+    """``log_file`` is what a caller is pointed at when a guard fails to start.
+
+    Wine writes fixme/err chatter to stderr for every process it starts, so
+    merging stderr into that log buried the watcher's own lines under hundreds of
+    them (MEASURED 2026-09-23: the log was 100% Wine noise). The two streams are
+    kept in separate files.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    assert cli.GUARD_ERR_FILE.name == "watcher.err"
+    assert cli.GUARD_ERR_FILE != cli.GUARD_LOG_FILE
+
+    source = (Path(__file__).resolve().parents[2] / "scripts" / "mt5_cli.py").read_text()
+    assert "2>> {shlex.quote(str(GUARD_ERR_FILE))}" in source
+    # The watcher says what it is doing on stdout, which is the stream the
+    # readable log captures.
+    assert "def note(message):" in cli._GUARD_WATCH_SOURCE
+    assert 'note(f"finished: {exit_reason} after {polls} polls, "' in cli._GUARD_WATCH_SOURCE
+
+
+def test_the_guard_rule_direction_is_inferred_from_the_live_price(
+    monkeypatch, tmp_path
+):
+    """ "Close when it hits X" does not say which side X is on, so it is inferred.
+
+    Both directions, and the inference is REPORTED (``op_inferred``) so a caller
+    can see that the CLI chose the side rather than being told it.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+
+    above = cli._validate_rule({"symbol": "EURUSD", "price": 1.165}, 0, price_hint=1.142)
+    assert above["op"] == ">=" and above["op_inferred"] is True
+    assert above["price_at_arm"] == 1.142
+
+    below = cli._validate_rule({"symbol": "EURUSD", "price": 1.100}, 0, price_hint=1.142)
+    assert below["op"] == "<="
+
+    given = cli._validate_rule({"symbol": "EURUSD", "price": 1.165, "op": "<="}, 0, 1.142)
+    assert given["op"] == "<=" and given["op_inferred"] is False
+
+    # With no price to infer from, guessing would be the only alternative to
+    # asking -- and a wrong direction is a stop where a target was meant.
+    with pytest.raises(ValueError) as excinfo:
+        cli._validate_rule({"symbol": "EURUSD", "price": 1.165}, 0, price_hint=None)
+    assert "op" in str(excinfo.value)
+
+
+def test_the_guard_refuses_a_rule_it_cannot_watch(monkeypatch, tmp_path):
+    cli = _broker_cli(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError, match="symbol"):
+        cli._validate_rule({"price": 1.165}, 0, 1.142)
+    with pytest.raises(ValueError, match="price"):
+        cli._validate_rule({"symbol": "EURUSD"}, 0, 1.142)
+    with pytest.raises(ValueError, match="number"):
+        cli._validate_rule({"symbol": "EURUSD", "price": "soon"}, 0, 1.142)
+    with pytest.raises(ValueError, match="op"):
+        cli._validate_rule({"symbol": "EURUSD", "price": 1.165, "op": "~="}, 0, 1.142)
+    with pytest.raises(ValueError, match="side"):
+        cli._validate_rule(
+            {"symbol": "EURUSD", "price": 1.165, "side": "close"}, 0, 1.142
+        )
+    # volume=0 is "no partial close", not an error; a NEGATIVE size is.
+    with pytest.raises(ValueError, match="volume"):
+        cli._validate_rule(
+            {"symbol": "EURUSD", "price": 1.165, "volume": -0.5}, 0, 1.142
+        )
+    assert cli._validate_rule(
+        {"symbol": "EURUSD", "price": 1.165, "volume": 0}, 0, 1.142
+    )["volume"] is None
+
+
+def test_a_guard_rule_scope_prefers_a_ticket_then_the_basket_then_the_symbol(
+    monkeypatch, tmp_path
+):
+    """Three scopes, in the order of how specific the caller was."""
+    cli = _broker_cli(monkeypatch, tmp_path)
+
+    by_ticket = cli._validate_rule({"symbol": "EURUSD", "price": 1.165, "ticket": 42},
+                                   0, 1.142)
+    assert by_ticket["scope"] == {"ticket": 42}
+
+    basket = cli._validate_rule(
+        {"symbol": "EURUSD", "price": 1.165, "scope": {"all": True}}, 0, 1.142
+    )
+    assert basket["scope"] == {"all": True}
+
+    # Default: every position on the rule's own symbol -- so a second position
+    # opened later on that symbol is still protected by the rule.
+    whole_symbol = cli._validate_rule({"symbol": "EURUSD", "price": 1.165}, 0, 1.142)
+    assert whole_symbol["scope"] == {"symbol": "EURUSD"}
+
+
+def test_a_generic_install_records_the_url_it_will_actually_land(monkeypatch, tmp_path):
+    """The recorded target and the installer's own default must be the same build.
+
+    MEASURED FAILURE (2026-09-23, Runloop devbox): ``install --server
+    MetaQuotes-Demo`` wrote the EXNESS url into ``.install.target`` while the
+    installer downloaded the generic build into ``.installed.url``. The two
+    markers can never converge, so ``status`` reported
+    ``stage="installing", in_progress=true`` -- "a different build is being
+    installed" -- for the life of the box, even though the installer's own
+    ``install.status`` already read ``done``. The host tool's install wait then
+    polls until its whole budget expires and reports a timeout, which reads as a
+    permanent hang instead of a finished install.
+    """
+    import argparse
+    import subprocess as _subprocess
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    script = tmp_path / "install_mt5_sandbox.sh"
+    script.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+
+    # The installer is detached; the test only inspects what was recorded.
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *a, **k: _subprocess.CompletedProcess(a, 0, "4242\n", ""),
+    )
+    cli.cmd_install(
+        argparse.Namespace(
+            script=str(script),
+            server="MetaQuotes-Demo",
+            broker_installer_url="",
+            broker_dir_name="",
+            timeout=60,
+            detach=True,
+            foreground=False,
+        )
+    )
+
+    recorded = cli.INSTALL_TARGET_FILE.read_text(encoding="utf-8").strip()
+    assert recorded == cli.GENERIC_INSTALLER_URL
+    assert recorded != cli.DEFAULT_INSTALLER_URL
+
+    # The property that matters: once the installer has landed that same URL, the
+    # install stops reading as "a different build is being installed" and the
+    # poll loop can terminate.
+    assert cli._pending_install_target() == recorded
+    cli.INSTALLED_URL_FILE.write_text(recorded, encoding="utf-8")
+    assert cli._pending_install_target() == ""
+
+
+def test_a_broker_install_still_records_the_broker_url(monkeypatch, tmp_path):
+    """The generic fix must not swallow the broker path it sits next to."""
+    import argparse
+    import subprocess as _subprocess
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    script = tmp_path / "install_mt5_sandbox.sh"
+    script.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *a, **k: _subprocess.CompletedProcess(a, 0, "4242\n", ""),
+    )
+
+    cli.cmd_install(
+        argparse.Namespace(
+            script=str(script),
+            server="Exness-MT5Trial9",
+            broker_installer_url="",
+            broker_dir_name="",
+            timeout=60,
+            detach=True,
+            foreground=False,
+        )
+    )
+
+    recorded = cli.INSTALL_TARGET_FILE.read_text(encoding="utf-8").strip()
+    assert recorded != cli.GENERIC_INSTALLER_URL
+    assert "exness" in recorded.lower()

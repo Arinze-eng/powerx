@@ -216,6 +216,41 @@ A rejected order is a normal result, not an exception: the payload carries the
 broker `retcode` and `comment`. Common retcodes: `10009` done, `10016` invalid
 stops, `10019` no money, `10030` unsupported filling mode.
 
+## Exits at a price — never poll for them
+
+When the user says *"close when it hits X"* — a stop, a target, "get me out at
+1.1650" — the exit has to be held by something that is **not you**:
+
+| What they want | Use | Why |
+|---|---|---|
+| Exit an **open** position at a level | `action='modify'` with `ticket` + `exit_at=X` | The **broker's server** holds the level. It fires in milliseconds, with no process and no model turn, and it survives the sandbox being paused or killed. |
+| A condition the broker cannot hold (part of a position, a basket, a level that is not the stop) | `action='guard'` + `guard_action='arm'` | A detached tick-level watcher inside the sandbox, reading the tick stream every `interval_ms` (default 100 ms). |
+| Out *now*, at whatever the market is | `action='close'` | |
+
+**Polling `quote` and comparing is not an exit — do not do it.** MEASURED inside
+a real box (2026-09-23): one `quote` round trip costs **1.0–1.5 s**, before your
+own turn latency is added. A level touched and recovered inside one poll is
+missed entirely, and the position stays open. A position reporting `sl 0.0
+tp 0.0` has **no** server-side exit at all: nothing but an agent turn can ever
+close it. When `positions` comes back with
+`positions_without_a_server_side_exit`, arm a real exit before doing anything
+else — that list is the exact shape of the original complaint.
+
+* `modify --exit-at X` infers the side from the position: for a long, a level
+  above the market is the target and below it is the stop; for a short, the
+  reverse. It nudges the level outside the broker's minimum stop distance and
+  reports `adjusted_from` + `adjust_reason` when it had to — **read them**: they
+  mean the level that is now set is not the level that was asked for.
+* A guard fires in **97–109 ms** measured (trigger tick → fill acknowledgement).
+  `guard_action='events'` carries `latency_ms` per fire; when a "close at X"
+  instruction was late, that number is the answer to why.
+* A stopped guard protects nothing. `guard_action='status'` reports `running`
+  and the tick it is seeing — re-arm if it is not running. `status` / `stop` /
+  `events` / `clear` stay available with `MT5_ALLOW_TRADING` off, so a live
+  guard can always be inspected or disarmed.
+* End a guard with `guard_action='stop'` (a stop **file**), never by killing a
+  process: `pkill -f` matches the shell that launched it.
+
 ## Sizing
 
 Wine + MT5 does not fit in the stock ~486 MB sandbox and gets OOM-killed
@@ -239,10 +274,22 @@ with `NOVITA_SANDBOX_MEMORY_MB=4096`) and the installer refuses to start below
 | `order` fails with `AttributeError: ... 'SYMBOL_FILLING_FOK'` | Old bug, now fixed: the package exports only `ORDER_FILLING_*`. `filling_mode` is a bitmask (1=FOK, 2=IOC, 4=RETURN); `order`/`close` retry each supported mode. |
 | `retcode: 10018, "Market closed"` | **Not a code bug.** The request reached the broker and was answered correctly. FX/metals are shut on weekends — find a live symbol before concluding trading is broken. |
 | `stop` reports success but the terminal is still up | Old bug, now fixed: Wine runs the terminal with comm `main`, so `pkill -x terminal64.exe` matched nothing. PIDs now come from `/proc/*/cmdline`. Never use `pkill -f terminal64` — it matches the calling shell and `wineserver`. |
+| A "close when it hits X" instruction was late, or never acted on | The level was **polled** instead of held. MEASURED: a `quote` costs 1.0-1.5 s in the box, so a touch between polls is missed. Use `modify --exit-at X` (broker-held, instant) or `guard` (tick-level, 100 ms) — see "Exits at a price". |
+| `modify` returns `retcode 10016` (invalid stops) | The level is inside the broker's minimum stop distance or on the wrong side of the market. Read `min_distance` from `action='symbol'`; on a live position `modify --exit-at` clamps and reports `adjusted_from` instead of failing. |
+| a guard reports `running: false` when a fill was expected | It stopped: read `guard_action='events'` for the `watcher_stop` reason and `max_seconds`. A guard with no rules (`rules_armed: 0`) also exits immediately. |
+| the guard log is nothing but Wine `fixme:` lines | Old bug, now fixed: Wine's stderr is kept in `watcher.err` and `log_file` holds the watcher's own lines (`[guard HH:MM:SS] ... FIRED ... N ms to fill`). |
 | `bridge_imports_in_wine=false` in `doctor` | Windows python or the `MetaTrader5` wheel failed to install; check `log_tail`. |
 | `mt5_cli.py must run inside Wine` | Do not invoke the CLI's bridge actions directly on Linux python — always go through `mt5_sandbox`. |
 
 ## Verified facts (measured in a Novita sandbox)
+- **Exits at a price are instant with `modify`/`guard`** (Runloop devbox,
+  MetaQuotes-Demo, 2026-09-23): a long with `sl 0.0 tp 0.0` was given
+  `modify --exit-at <bid-2 points>` and the **server** closed it at exactly
+  the level (deal `reason 4`, comment `[sl 1.14232]`) with no `close` call
+  and no model turn. The tick-level guard fired twice at **97.3 ms** and
+  **109.1 ms** trigger→fill, retcode `10009`, position count 0 both times.
+  For comparison, one `quote` CLI round trip in the same box cost
+  **1014-1480 ms** — which is why polling a price can never be an exit.
 
 - Wine **10.0** is required. Wine 11.0 fails MetaTrader's anti-debug check.
 - `WINEDEBUG` must be **absent** from the environment of every MT5 process.

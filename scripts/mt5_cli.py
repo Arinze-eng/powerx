@@ -22,6 +22,8 @@ Subcommands
   order             send an order (--symbol --side --volume [--sl --tp])
   close             close a position (--ticket N [--volume V])
   close_all         flatten every open position
+  modify            set/move SL or TP on an OPEN position (--exit-at X routes it)
+  guard             detached tick-level watcher that closes at a price (arm/status/stop/events)
   symbol            symbol metadata (digits, spread, min/max lot, trade mode)
   compile           compile an .mq5/.mqh file with MetaEditor's CLI
   logs              read the MT5 terminal log tail (--lines N)
@@ -62,7 +64,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-22.12"
+CLI_VERSION = "2026-09-23.2"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -1086,11 +1088,27 @@ def cmd_install(args: argparse.Namespace) -> int:
         # makes an agent stop waiting for a terminal that is not there yet.
         # Precedence mirrors the installer's own: a broker URL first, then an
         # explicit generic URL, then the default the script would use.
-        install_target = str(
-            env.get("MT5_BROKER_INSTALLER_URL")
-            or env.get("MT5_INSTALLER_URL")
-            or DEFAULT_INSTALLER_URL
-        )
+        # The GENERIC flag has to be checked FIRST. When it is set the installer
+        # downloads its own default (GENERIC_INSTALLER_URL) and never looks at
+        # MT5_BROKER_INSTALLER_URL, so recording the broker URL here puts a URL on
+        # disk that this install cannot possibly produce. `status` then compares it
+        # against .installed.url forever, and answers "a different build is being
+        # installed" -- a poll loop that can never terminate.
+        #
+        # MEASURED 2026-09-23 (Runloop devbox): `install --server MetaQuotes-Demo`
+        # recorded the Exness URL, installed the generic terminal, and stayed at
+        # stage="installing" for the life of the box while the installer's own
+        # status file already read "done|install complete". Every generic-build
+        # install -- which is what naming a MetaQuotes server selects -- reported a
+        # hang that had not happened.
+        if env.get("MT5_GENERIC_INSTALLER") == "1":
+            install_target = str(env.get("MT5_INSTALLER_URL") or GENERIC_INSTALLER_URL)
+        else:
+            install_target = str(
+                env.get("MT5_BROKER_INSTALLER_URL")
+                or env.get("MT5_INSTALLER_URL")
+                or DEFAULT_INSTALLER_URL
+            )
         try:
             (MT5_ROOT / INSTALL_TARGET_FILE.name).write_text(
                 install_target, encoding="utf-8"
@@ -2274,6 +2292,964 @@ def cmd_close_all(args: argparse.Namespace) -> int:
                 text=f"closed {len(results)} position(s)", code=0 if ok else 3)
 
 
+# --------------------------------------------------------------------------- #
+# instant exits at a price
+# --------------------------------------------------------------------------- #
+# THE BUG THIS FIXES (reported 2026-09-23: "when something hits a certain price
+# it doesn't close trade instantly").
+#
+# An exit at a price had exactly two possible routes before this code existed,
+# and BOTH of them put the model in the loop:
+#
+#   1. ``order`` with ``--tp``/``--sl``. Broker-side and instant -- but only
+#      available at order time. There was no way to attach or move a stop after
+#      the position existed, so "buy now, exit at 1.1650" could not be expressed
+#      as a broker-side instruction at all.
+#   2. poll ``quote`` in a loop, compare, then ``close``. Every poll costs a
+#      sandbox round trip (the CLI re-execs the Windows python under Wine for
+#      bridge actions, ~1-2 s) and then an LLM turn on top. The level is only
+#      observed on the turns the model chooses to poll, and the market does not
+#      stop ticking while it thinks. A level touched between two polls is simply
+#      missed -- the position stays open and the user is told it "did not close".
+#
+# So there are now two primitives, and they answer different questions:
+#
+#   * ``modify``  attaches/moves SL and TP on an EXISTING position (and
+#     ``--exit-at`` routes a bare "exit at X" to the correct side for the
+#     position's direction). The terminal's server holds the level, so the exit
+#     is executed by MetaQuotes itself -- the lowest possible latency, and it
+#     survives this sandbox being paused or killed.
+#   * ``guard``   runs a detached tick-level watcher INSIDE the sandbox for the
+#     conditions a broker cannot hold: close every position on a symbol when the
+#     symbol touches a level, exit a basket, exit at a level on the wrong side of
+#     the spread, partial closes. It polls the tick stream every 100 ms and sends
+#     the deal itself, with no model turn anywhere in the path.
+#
+# Both record MEASURED latency so a claim of "instant" is evidence, not a hope.
+GUARD_DIR = MT5_ROOT / "guard"
+GUARD_RULES_FILE = GUARD_DIR / "rules.json"
+GUARD_EVENTS_FILE = GUARD_DIR / "events.jsonl"
+GUARD_STATE_FILE = GUARD_DIR / "state.json"
+GUARD_STOP_FILE = GUARD_DIR / "stop"
+GUARD_WATCH_SCRIPT = GUARD_DIR / "guard_watch.py"
+GUARD_LOG_FILE = GUARD_DIR / "watcher.log"
+#: Wine writes its own debug chatter (``fixme:``/``err:`` lines) to stderr for
+#: every process it starts, the watcher included. That chatter is kept out of
+#: the log a reader is pointed at, and parked here instead -- otherwise the
+#: guard log is nothing but Wine noise and a real traceback is unfindable.
+GUARD_ERR_FILE = GUARD_DIR / "watcher.err"
+
+#: Seconds after which a silent heartbeat means the watcher is dead. The watcher
+#: beats every ``--interval-ms`` loop, so this is ~50 missed loops: long enough
+#: that a slow tick or a busy box is not mistaken for a crash, short enough that
+#: a user is never told a dead guard is protecting them.
+GUARD_HEARTBEAT_STALE = 5.0
+
+#: The watcher itself. It is written into the sandbox by ``guard start`` and run
+#: by the WINDOWS python under Wine -- the only interpreter that can import
+#: MetaTrader5 -- as a detached process with its output redirected to a file
+#: (a Wine python cannot inherit Linux pipes; see ``_reexec_under_wine``).
+#: It is armed by ``guard arm`` and shipped to the box with the CLI.
+#:
+#: It is embedded here rather than shipped as a second file because the sandbox
+#: bootstraps exactly two files from the repo; a third one that the bootstrap
+#: does not fetch would be missing in every sandbox that has not been rebuilt.
+_GUARD_WATCH_SOURCE = r'''#!/usr/bin/env python3
+"""Tick-level price guard: closes positions the instant a level is touched.
+
+WHY THIS IS A DEDICATED PROCESS
+    The agent only observes the market when it calls a tool. Measured in the
+    sandbox (2026-09-23): one ``quote`` costs a Wine re-exec plus IPC, and an
+    agent turn sits on top of that, so a price-triggered exit handled by the
+    model lands seconds late -- and only on the turns the model happens to poll.
+    A level touched between two polls is missed entirely.
+
+    This process removes the model from the path: it polls the tick stream every
+    ``--interval-ms`` (default 100 ms), evaluates the armed rules, and sends the
+    closing deal itself. It writes an append-only event log with the trigger
+    timestamp, the fill timestamp and the measured latency, so "instant" is a
+    number rather than a claim.
+
+STATE AND CONTROL (all files, so no process is ever killed by pattern)
+    --rules     JSON list of armed rules; rules are removed as they fire
+    --events    JSONL append-only log (watcher_start, fired, watcher_stop, ...)
+    --state     heartbeat + last seen prices, rewritten every loop
+    --stop-file presence asks the watcher to exit cleanly after this loop
+"""
+import argparse
+import json
+import os
+import time
+
+import MetaTrader5 as mt5
+
+FILLING_IOC_FLAG = 2
+FILLING_FOK_FLAG = 1
+FILLING_RETURN_FLAG = 4
+RETCODE_DONE = 10009
+RETCODE_UNSUPPORTED_FILLING = 10030
+#: A rejected close (no money, market closed, requote) keeps the rule ARMED --
+#: silently disarming protection is worse than a retry -- but it is retried on a
+#: cooldown so a persistent rejection cannot spam the broker 10x a second.
+RETRY_COOLDOWN_SECONDS = 1.5
+
+
+def append_jsonl(path, payload):
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, default=str) + "\n")
+    except OSError:
+        pass
+
+
+def write_json(path, payload):
+    try:
+        with open(path + ".tmp", "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, default=str)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
+def read_rules(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def filling_candidates(info):
+    mask = int(getattr(info, "filling_mode", 0) or 0)
+    out = []
+    if mask & FILLING_IOC_FLAG:
+        out.append(mt5.ORDER_FILLING_IOC)
+    if mask & FILLING_FOK_FLAG:
+        out.append(mt5.ORDER_FILLING_FOK)
+    if mask & FILLING_RETURN_FLAG:
+        out.append(mt5.ORDER_FILLING_RETURN)
+    if not out:
+        out = [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
+    return out
+
+
+def send_with_fillings(request, fillings):
+    last = None
+    for filling in fillings:
+        attempt = dict(request)
+        attempt["type_filling"] = filling
+        result = mt5.order_send(attempt)
+        if result is None:
+            last = {"ok": False, "error": str(mt5.last_error()), "filling_used": filling}
+            continue
+        payload = {
+            "ok": result.retcode == RETCODE_DONE,
+            "retcode": result.retcode,
+            "comment": result.comment,
+            "deal": getattr(result, "deal", None),
+            "filling_used": filling,
+        }
+        if payload["ok"]:
+            return payload
+        last = payload
+        if result.retcode != RETCODE_UNSUPPORTED_FILLING:
+            return payload
+    return last or {"ok": False, "error": "no filling mode was attempted"}
+
+
+def matching_positions(rule):
+    scope = rule.get("scope") or {}
+    if scope.get("ticket"):
+        return list(mt5.positions_get(ticket=int(scope["ticket"])) or [])
+    positions = list(mt5.positions_get() or [])
+    if scope.get("all"):
+        return positions
+    if scope.get("symbol"):
+        return [p for p in positions if p.symbol == scope["symbol"]]
+    return [p for p in positions if p.symbol == rule.get("symbol")]
+
+
+def close_positions(rule, positions, deviation, magic):
+    results = []
+    for position in positions:
+        info = mt5.symbol_info(position.symbol)
+        tick = mt5.symbol_info_tick(position.symbol)
+        if tick is None:
+            results.append({"ticket": position.ticket, "ok": False, "error": "no tick"})
+            continue
+        is_long = position.type == mt5.POSITION_TYPE_BUY
+        fillings = filling_candidates(info) if info is not None else None
+        full = fillings or [mt5.ORDER_FILLING_RETURN]
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": position.symbol,
+            "volume": float(rule.get("volume") or position.volume),
+            "type": mt5.ORDER_TYPE_SELL if is_long else mt5.ORDER_TYPE_BUY,
+            "position": position.ticket,
+            "price": float(tick.bid if is_long else tick.ask),
+            "deviation": int(deviation),
+            "magic": int(magic),
+            "comment": "powerx-guard",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": full[0],
+        }
+        payload = send_with_fillings(request, full)
+        payload["ticket"] = position.ticket
+        results.append(payload)
+    return results
+
+
+def price_for_rule(rule, tick):
+    side = str(rule.get("side") or "mid").lower()
+    if side == "bid":
+        return float(tick.bid), "bid"
+    if side == "ask":
+        return float(tick.ask), "ask"
+    return (float(tick.bid) + float(tick.ask)) / 2.0, "mid"
+
+
+def triggered(price, op, level):
+    if op == ">=":
+        return price >= level
+    if op == "<=":
+        return price <= level
+    if op == ">":
+        return price > level
+    if op == "<":
+        return price < level
+    return False
+
+
+def note(message):
+    """One human-readable line on stdout, which is redirected to the log.
+
+    The event log is the machine channel; this is what a person tails while
+    a rule waits for its level, and it is the only thing written to the log
+    once Wine's own chatter is kept out of it.
+    """
+    try:
+        print(f"[guard {time.strftime('%H:%M:%S')}] {message}", flush=True)
+    except Exception:
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rules", required=True)
+    parser.add_argument("--events", required=True)
+    parser.add_argument("--state", required=True)
+    parser.add_argument("--stop-file", required=True)
+    parser.add_argument("--interval-ms", type=int, default=100)
+    parser.add_argument("--max-seconds", type=int, default=3600)
+    parser.add_argument("--deviation", type=int, default=30)
+    parser.add_argument("--magic", type=int, default=20240919)
+    args = parser.parse_args()
+
+    started = time.time()
+    write_json(args.state, {"pid": os.getpid(), "started_at": started, "status": "starting"})
+    note(
+        f"watching {len(read_rules(args.rules))} rule(s) every {args.interval_ms} ms; "
+        f"max {args.max_seconds} s"
+    )
+    append_jsonl(args.events, {
+        "event": "watcher_start", "ts": started, "pid": os.getpid(),
+        "interval_ms": args.interval_ms, "rules": len(read_rules(args.rules)),
+    })
+
+    if not mt5.initialize():
+        error = str(mt5.last_error())
+        note(f"cannot initialise MetaTrader5: {error}")
+        append_jsonl(args.events, {"event": "watcher_failed", "ts": time.time(), "error": error})
+        write_json(args.state, {
+            "pid": os.getpid(), "started_at": started, "status": "failed", "error": error,
+        })
+        return 2
+
+    for rule in read_rules(args.rules):
+        try:
+            mt5.symbol_select(str(rule.get("symbol")), True)
+        except Exception:
+            pass
+
+    polls = 0
+    exit_reason = "rules_satisfied"
+    prices = {}
+    while True:
+        now = time.time()
+        if now - started > args.max_seconds:
+            exit_reason = "max_seconds"
+            break
+        if os.path.exists(args.stop_file):
+            exit_reason = "stop_requested"
+            break
+
+        rules = read_rules(args.rules)
+        if not rules:
+            break
+
+        changed = False
+        for rule in list(rules):
+            symbol = str(rule.get("symbol") or "")
+            if not symbol:
+                continue
+            tick = mt5.symbol_info_tick(symbol)
+            polls += 1
+            if tick is None:
+                mt5.symbol_select(symbol, True)
+                continue
+            price, used_side = price_for_rule(rule, tick)
+            prices[symbol] = price
+            op = str(rule.get("op") or ">=")
+            level = float(rule.get("price"))
+            rule["last_price"] = price
+            rule["last_price_ts"] = now
+            if not triggered(price, op, level):
+                continue
+            if now - float(rule.get("last_attempt") or 0.0) < RETRY_COOLDOWN_SECONDS:
+                continue
+            rule["last_attempt"] = now
+            trigger_ts = time.time()
+            positions = matching_positions(rule)
+            results = close_positions(rule, positions, args.deviation, args.magic)
+            close_ts = time.time()
+            ok = all(r.get("ok") for r in results) if results else True
+            append_jsonl(args.events, {
+                "event": "fired" if ok else "close_failed",
+                "rule_id": rule.get("id"), "symbol": symbol, "op": op, "level": level,
+                "side": used_side, "trigger_price": price,
+                "bid": float(tick.bid), "ask": float(tick.ask),
+                "tick_time": int(getattr(tick, "time", 0) or 0),
+                "trigger_ts": trigger_ts, "close_ts": close_ts,
+                "latency_ms": round((close_ts - trigger_ts) * 1000.0, 1),
+                "positions_matched": len(positions), "results": results, "polls": polls,
+            })
+            if ok:
+                note(
+                    f"{rule.get('id')} FIRED {symbol} {op} {level} at {price} "
+                    f"({used_side}) -- {len(positions)} position(s), "
+                    f"{round((close_ts - trigger_ts) * 1000.0, 1)} ms to fill"
+                )
+            else:
+                note(f"{rule.get('id')} close FAILED at {price}: {results}")
+            if ok and rule.get("once", True):
+                rules = [r for r in rules if r.get("id") != rule.get("id")]
+                changed = True
+
+        if changed:
+            write_json(args.rules, rules)
+        write_json(args.state, {
+            "pid": os.getpid(), "started_at": started, "status": "running",
+            "heartbeat": time.time(), "polls": polls, "interval_ms": args.interval_ms,
+            "prices": prices, "rules": len(read_rules(args.rules)),
+        })
+        time.sleep(max(0.01, args.interval_ms / 1000.0))
+
+    write_json(args.state, {
+        "pid": os.getpid(), "started_at": started, "status": "finished",
+        "exit_reason": exit_reason, "finished_at": time.time(),
+        "heartbeat": time.time(), "polls": polls,
+        "rules": len(read_rules(args.rules)),
+    })
+    append_jsonl(args.events, {
+        "event": "watcher_stop", "ts": time.time(), "exit_reason": exit_reason,
+        "polls": polls, "ran_seconds": round(time.time() - started, 1),
+    })
+    note(f"finished: {exit_reason} after {polls} polls, "
+         f"{round(time.time() - started, 1)} s")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def _guard_python() -> tuple[str, Path] | None:
+    """The (wine launcher, windows python) pair the watcher must run under."""
+    winpy = win_python()
+    if winpy is None:
+        return None
+    return wine_bin(), winpy
+
+
+def _guard_is_live(state: dict[str, Any] | None) -> bool:
+    if not state:
+        return False
+    if str(state.get("status")) != "running":
+        return False
+    try:
+        heartbeat = float(state.get("heartbeat") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return (time.time() - heartbeat) <= GUARD_HEARTBEAT_STALE
+
+
+def _read_guard_state() -> dict[str, Any] | None:
+    try:
+        return json.loads(GUARD_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _read_guard_rules() -> list[dict[str, Any]]:
+    try:
+        data = json.loads(GUARD_RULES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _guard_events(limit: int) -> list[dict[str, Any]]:
+    try:
+        lines = GUARD_EVENTS_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for line in lines[-max(1, limit):]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def _guard_current_price(symbol: str) -> float | None:
+    """Mid price for a symbol, read through the bridge, or None if unavailable.
+
+    Used only to INFER a trigger direction -- "close when it hits X" does not say
+    which side of the market X is on. This costs one bridge round trip (~1-2 s),
+    so it is only paid for rules that actually omit ``op``.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "quote", symbol],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        payload = json.loads((proc.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+    tick = ((payload.get("quotes") or {}).get(symbol) or {}).get("tick") or {}
+    bid, ask = tick.get("bid"), tick.get("ask")
+    if bid is None or ask is None:
+        return None
+    return (float(bid) + float(ask)) / 2.0
+
+
+def _validate_rule(
+    raw: dict[str, Any], index: int, price_hint: float | None = None
+) -> dict[str, Any]:
+    """Normalise one rule, or raise ValueError with the reason it cannot arm."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"rule {index} is not an object")
+    symbol = str(raw.get("symbol") or "").strip()
+    if not symbol:
+        raise ValueError(f"rule {index} needs a 'symbol'")
+    if raw.get("price") is None:
+        raise ValueError(f"rule {index} needs a 'price' (the level to act on)")
+    try:
+        level = float(raw["price"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"rule {index}: 'price' is not a number ({exc})") from exc
+    op = str(raw.get("op") or "").strip()
+    inferred = False
+    if not op:
+        if price_hint is None:
+            raise ValueError(
+                f"rule {index}: give an 'op' (>= or <=), or arm a rule whose symbol "
+                "price can be read so the direction can be inferred"
+            )
+        # "close when it hits X" does not say which side X is on. Inferring it
+        # from the live price is what the person asking actually means, and it
+        # removes the one input a caller most often gets backwards.
+        op = ">=" if level >= price_hint else "<="
+        inferred = True
+    if op not in (">=", "<=", ">", "<"):
+        raise ValueError(f"rule {index}: 'op' must be one of >= <= > < (got {op!r})")
+    side = str(raw.get("side") or "mid").strip().lower() or "mid"
+    if side not in ("bid", "ask", "mid"):
+        raise ValueError(f"rule {index}: 'side' must be bid, ask or mid (got {side!r})")
+
+    scope: dict[str, Any] = {}
+    ticket = raw.get("ticket")
+    scope_raw = raw.get("scope") if isinstance(raw.get("scope"), dict) else {}
+    if ticket is None:
+        ticket = scope_raw.get("ticket")
+    if ticket not in (None, "", 0):
+        try:
+            scope = {"ticket": int(ticket)}
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"rule {index}: 'ticket' is not an integer") from exc
+    elif scope_raw.get("all") or raw.get("all"):
+        scope = {"all": True}
+    else:
+        scope = {"symbol": str(scope_raw.get("symbol") or symbol)}
+
+    volume = raw.get("volume")
+    if volume not in (None, "", 0):
+        try:
+            volume = float(volume)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"rule {index}: 'volume' is not a number") from exc
+        if volume <= 0:
+            raise ValueError(f"rule {index}: 'volume' must be positive")
+    else:
+        volume = None
+
+    return {
+        "id": str(raw.get("id") or f"g{int(time.time())}-{index}"),
+        "symbol": symbol,
+        "op": op,
+        "price": level,
+        "side": side,
+        "scope": scope,
+        "action": str(raw.get("action") or "close"),
+        "volume": volume,
+        "once": bool(raw.get("once", True)),
+        "created_at": time.time(),
+        "armed_by": "mt5_cli",
+        "op_inferred": inferred,
+        "price_at_arm": price_hint,
+    }
+
+
+def cmd_guard(args: argparse.Namespace) -> int:
+    """Arm/inspect/stop the detached tick-level price guard."""
+    subcommand = str(getattr(args, "guard_action", "status") or "status").lower()
+    GUARD_DIR.mkdir(parents=True, exist_ok=True)
+
+    if subcommand == "arm":
+        raw_rules: list[dict[str, Any]] = []
+        for blob in list(getattr(args, "rule", None) or []):
+            try:
+                parsed = json.loads(blob)
+            except ValueError as exc:
+                return fail(f"--rule is not valid JSON: {exc}", code=1)
+            if isinstance(parsed, list):
+                raw_rules.extend(parsed)
+            else:
+                raw_rules.append(parsed)
+        if not raw_rules:
+            return fail("guard arm needs at least one --rule '<json>'", code=1)
+
+        # One bridge quote per distinct symbol, and only for rules that omit
+        # 'op'. The round trip is ~1-2 s, so it is not paid when every rule
+        # already states its direction.
+        price_hints: dict[str, float] = {}
+        for raw in raw_rules:
+            if not isinstance(raw, dict) or str(raw.get("op") or "").strip():
+                continue
+            symbol = str(raw.get("symbol") or "").strip()
+            if symbol and symbol not in price_hints:
+                found = _guard_current_price(symbol)
+                if found is not None:
+                    price_hints[symbol] = found
+
+        rules: list[dict[str, Any]] = []
+        for index, raw in enumerate(raw_rules):
+            try:
+                hint = (
+                    price_hints.get(str(raw.get("symbol") or "").strip())
+                    if isinstance(raw, dict)
+                    else None
+                )
+                rules.append(_validate_rule(raw, index, price_hint=hint))
+            except ValueError as exc:
+                return fail(str(exc), code=1)
+
+        # Rules are validated BEFORE anything is armed, and merged by id so a
+        # re-arm replaces its own rule instead of stacking duplicates that would
+        # each fire a close.
+        existing = {str(r.get("id")): r for r in _read_guard_rules()}
+        for rule in rules:
+            existing[rule["id"]] = rule
+        merged = list(existing.values())
+        try:
+            GUARD_RULES_FILE.write_text(json.dumps(merged, default=str), encoding="utf-8")
+        except OSError as exc:
+            return fail(f"could not write {GUARD_RULES_FILE}: {exc}", code=2)
+
+        pair = _guard_python()
+        if pair is None:
+            return fail(
+                "the Windows python is not installed in the Wine prefix, so the "
+                "tick-level guard cannot start. Run install first (the guard uses "
+                "the MetaTrader5 module, which only publishes win_amd64 wheels).",
+                code=2,
+            )
+        wine, winpy = pair
+        try:
+            GUARD_WATCH_SCRIPT.write_text(_GUARD_WATCH_SOURCE, encoding="utf-8")
+        except OSError as exc:
+            return fail(f"could not write the watcher script: {exc}", code=2)
+        # A stop file left from a previous run would kill this watcher on its
+        # first loop, so it is removed as part of arming.
+        try:
+            GUARD_STOP_FILE.unlink()
+        except OSError:
+            pass
+
+        state = _read_guard_state()
+        live = _guard_is_live(state)
+        if not live:
+            inner = (
+                f"{wine} {shlex.quote(_to_wine_path(winpy))} "
+                f"{shlex.quote(_to_wine_path(GUARD_WATCH_SCRIPT))} "
+                f"--rules {shlex.quote(_to_wine_path(GUARD_RULES_FILE))} "
+                f"--events {shlex.quote(_to_wine_path(GUARD_EVENTS_FILE))} "
+                f"--state {shlex.quote(_to_wine_path(GUARD_STATE_FILE))} "
+                f"--stop-file {shlex.quote(_to_wine_path(GUARD_STOP_FILE))} "
+                f"--interval-ms {int(getattr(args, 'interval_ms', 100) or 100)} "
+                f"--max-seconds {int(getattr(args, 'max_seconds', 3600) or 3600)} "
+                f"--deviation {int(getattr(args, 'deviation', 30) or 30)}"
+                f" >> {shlex.quote(str(GUARD_LOG_FILE))} "
+                f"2>> {shlex.quote(str(GUARD_ERR_FILE))}"
+            )
+            proc = subprocess.run(
+                ["sh", "-c", f"nohup setsid sh -c {shlex.quote(inner)} >/dev/null 2>&1 & echo $!"],
+                env=wine_env(),
+                capture_output=True,
+                text=True,
+            )
+            pid = (proc.stdout or "").strip()
+            # The watcher writes its heartbeat on its first loop, so a short wait
+            # turns "started" into "verified alive" -- otherwise the answer is a
+            # pid that may already be gone.
+            deadline = time.time() + float(os.environ.get("MT5_GUARD_ARM_WAIT", "12"))
+            while time.time() < deadline:
+                state = _read_guard_state()
+                if _guard_is_live(state) or (state or {}).get("status") == "failed":
+                    break
+                time.sleep(0.5)
+        else:
+            pid = str((state or {}).get("pid") or "")
+
+        state = _read_guard_state()
+        live = _guard_is_live(state)
+        payload: dict[str, Any] = {
+            "ok": live,
+            "guard": "armed" if live else "not_running",
+            # The state file carries the watcher's OWN pid; ``pid`` is the
+            # subshell that spawned it and is useless for anything.
+            "pid": (state or {}).get("pid") or pid,
+            "interval_ms": int(getattr(args, "interval_ms", 100) or 100),
+            "max_seconds": int(getattr(args, "max_seconds", 3600) or 3600),
+            "rules": _read_guard_rules(),
+            "events_file": str(GUARD_EVENTS_FILE),
+            "state_file": str(GUARD_STATE_FILE),
+            "log_file": str(GUARD_LOG_FILE),
+            "err_file": str(GUARD_ERR_FILE),
+            "heartbeat": (state or {}).get("heartbeat"),
+            "message": (
+                "Guard is live: it polls the tick stream inside the sandbox and "
+                "closes the instant the level is touched -- no model turn is "
+                "involved. Poll action='guard' with guard_action='events' for the "
+                "measured trigger->fill latency."
+            ),
+        }
+        if not live:
+            payload["error"] = (
+                "the guard watcher did not report a heartbeat. Read log_file: a "
+                "watcher that cannot import MetaTrader5 or reach the terminal "
+                "writes 'watcher_failed' to the event log."
+            )
+            payload["log_tail"] = _tail(GUARD_LOG_FILE, 15)
+            payload["err_tail"] = _tail(GUARD_ERR_FILE, 15)
+            return emit(payload, text="guard failed to start", code=2)
+        return emit(payload, text=f"guard armed ({len(payload['rules'])} rule(s))")
+
+    if subcommand == "status":
+        state = _read_guard_state()
+        live = _guard_is_live(state)
+        rules = _read_guard_rules()
+        payload = {
+            "ok": True,
+            "running": live,
+            "state": state,
+            "rules_armed": len(rules),
+            "rules": rules,
+            "interval_ms": (state or {}).get("interval_ms"),
+            "polls": (state or {}).get("polls"),
+            "prices": (state or {}).get("prices") or {},
+            "events_file": str(GUARD_EVENTS_FILE),
+            "hint": (
+                "A guard that is not running protects nothing: re-arm it with "
+                "guard action='arm'. Read the event log for why it stopped."
+                if not live
+                else "Live. 'prices' is the tick the watcher is seeing right now."
+            ),
+        }
+        if not live:
+            payload["last_events"] = _guard_events(5)
+        return emit(payload)
+
+    if subcommand == "stop":
+        try:
+            GUARD_STOP_FILE.write_text(str(time.time()), encoding="utf-8")
+        except OSError as exc:
+            return fail(f"could not write the stop file: {exc}", code=2)
+        deadline = time.time() + 5.0
+        state = _read_guard_state()
+        while time.time() < deadline and _guard_is_live(state):
+            time.sleep(0.25)
+            state = _read_guard_state()
+        return emit(
+            {
+                "ok": True,
+                "running": _guard_is_live(state),
+                "note": (
+                    "The watcher exits after its current loop (a stop FILE is used "
+                    "on purpose -- killing by process name would match the shell "
+                    "that launches it)."
+                ),
+                "rules_armed": len(_read_guard_rules()),
+                "state": state,
+            },
+            text="guard stopped",
+        )
+
+    if subcommand == "clear":
+        try:
+            GUARD_RULES_FILE.write_text("[]", encoding="utf-8")
+        except OSError as exc:
+            return fail(f"could not clear the rules: {exc}", code=2)
+        return emit({"ok": True, "rules_armed": 0, "state": _read_guard_state()})
+
+    if subcommand == "events":
+        events = _guard_events(int(getattr(args, "lines", 20) or 20))
+        fired = [e for e in events if e.get("event") == "fired"]
+        return emit(
+            {
+                "ok": True,
+                "count": len(events),
+                "events": events,
+                "last_latency_ms": fired[-1].get("latency_ms") if fired else None,
+                "note": (
+                    "latency_ms is measured inside the watcher: the tick that "
+                    "crossed the level to the broker's fill acknowledgement."
+                ),
+            }
+        )
+
+    return fail(
+        f"unknown guard action {subcommand!r}; use arm, status, stop, clear or events",
+        code=1,
+    )
+
+
+def _position_targets(mt5: Any, args: argparse.Namespace) -> tuple[list[Any], int | None]:
+    """Resolve which positions ``modify`` should act on."""
+    tickets = list(getattr(args, "ticket", None) or [])
+    positions = list(mt5.positions_get() or [])
+    if tickets:
+        wanted = {int(t) for t in tickets}
+        selected = [p for p in positions if int(p.ticket) in wanted]
+        missing = wanted - {int(p.ticket) for p in selected}
+        if missing:
+            return selected, fail(
+                "no open position with ticket(s) "
+                + ", ".join(str(t) for t in sorted(missing))
+                + " -- it may have already closed. Read action='positions'.",
+                code=2,
+            )
+        return selected, None
+    symbol = str(getattr(args, "symbol", "") or "").strip()
+    if symbol:
+        selected = [p for p in positions if p.symbol == symbol]
+        if not selected:
+            return [], fail(f"no open position on {symbol}", code=2)
+        return selected, None
+    if getattr(args, "all", False):
+        if not positions:
+            return [], fail("no open positions", code=2)
+        return positions, None
+    return [], fail(
+        "modify needs a target: --ticket N, --symbol <SYMBOL>, or --all", code=1
+    )
+
+
+def cmd_modify(args: argparse.Namespace) -> int:
+    """Attach or move SL/TP on positions that are ALREADY open.
+
+    THE GAP THIS FILLS: ``order --tp`` was the only way to get a broker-side
+    exit, and only at order time. A position opened without a stop could not be
+    given one afterwards, so "exit when it reaches X" had to be polled by the
+    model -- which is exactly why the exit was late.
+    """
+    mt5, err = require_bridge()
+    if err is not None:
+        return err
+
+    exit_at = getattr(args, "exit_at", None)
+    sl = getattr(args, "sl", None)
+    tp = getattr(args, "tp", None)
+    if exit_at is None and sl is None and tp is None:
+        return fail("modify needs --exit-at PRICE, or --sl/--tp", code=1)
+
+    positions, target_error = _position_targets(mt5, args)
+    if target_error is not None:
+        return target_error
+
+    results = []
+    for position in positions:
+        info = mt5.symbol_info(position.symbol)
+        tick = mt5.symbol_info_tick(position.symbol)
+        if tick is None:
+            results.append({"ticket": position.ticket, "ok": False, "error": "no tick"})
+            continue
+        is_long = position.type == mt5.POSITION_TYPE_BUY
+        point = float(getattr(info, "point", 0.0) or 0.0)
+        # Stops must clear the broker's minimum distance or the server rejects
+        # them with retcode 10016 "invalid stops" -- which reads like a bad price
+        # rather than a too-tight one.
+        min_points = max(
+            int(getattr(info, "trade_stops_level", 0) or 0),
+            int(getattr(info, "trade_freeze_level", 0) or 0),
+            1,
+        )
+        min_distance = min_points * point if point else 0.0
+
+        new_sl = float(sl) if sl is not None else float(position.sl or 0.0)
+        new_tp = float(tp) if tp is not None else float(position.tp or 0.0)
+        routed = None
+        adjusted_from = None
+
+        if exit_at is not None:
+            level = float(exit_at)
+            # An "exit at X" says nothing about side, so it is routed to the stop
+            # that can actually be held by the server. A long exits at the BID and
+            # a short at the ASK (the price the closing deal is filled at), and
+            # the level must clear that side by the broker's minimum distance --
+            # a level inside the spread would otherwise come back 10016.
+            upper = float(tick.ask) + min_distance
+            lower = float(tick.bid) - min_distance
+            # A level ABOVE the market protects a LONG in profit and a SHORT from
+            # loss; below the market it is the other way round. Getting this
+            # backwards would attach a take-profit where a stop was meant, which
+            # is the one mistake that costs money instead of an error message.
+            if is_long:
+                if level >= upper:
+                    routed, new_tp, new_sl = "tp", level, 0.0
+                elif level <= lower:
+                    routed, new_sl, new_tp = "sl", level, 0.0
+                else:
+                    routed = None
+            else:
+                if level >= upper:
+                    routed, new_sl, new_tp = "sl", level, 0.0
+                elif level <= lower:
+                    routed, new_tp, new_sl = "tp", level, 0.0
+                else:
+                    routed = None
+            if routed is None:
+                # Too close to trade: clamp to the side the caller MEANT and say
+                # so. Which side that is comes from the price the position is
+                # VALUED at (the bid for a long, the ask for a short): a level
+                # above it is "exit when the market comes up to me", below it is
+                # the opposite. Deciding this by distance to the two legal bounds
+                # instead made it a coin flip -- at a level between them the
+                # comparison came down to binary float noise, so the SAME level
+                # could attach a take-profit or a stop-loss on different ticks,
+                # and those two mean opposite things about the money.
+                meant_high = level >= (float(tick.bid) if is_long else float(tick.ask))
+                adjusted_from = level
+                if is_long:
+                    if meant_high:
+                        routed, new_tp, new_sl = "tp", upper, 0.0
+                    else:
+                        routed, new_sl, new_tp = "sl", lower, 0.0
+                else:
+                    if meant_high:
+                        routed, new_sl, new_tp = "sl", upper, 0.0
+                    else:
+                        routed, new_tp, new_sl = "tp", lower, 0.0
+        else:
+            if new_tp:
+                if is_long and new_tp < float(tick.ask) + min_distance:
+                    adjusted_from = new_tp
+                    new_tp = float(tick.ask) + min_distance
+                elif not is_long and new_tp > float(tick.bid) - min_distance:
+                    adjusted_from = new_tp
+                    new_tp = float(tick.bid) - min_distance
+            if new_sl:
+                if is_long and new_sl > float(tick.bid) - min_distance:
+                    adjusted_from = new_sl
+                    new_sl = float(tick.bid) - min_distance
+                elif not is_long and new_sl < float(tick.ask) + min_distance:
+                    adjusted_from = new_sl
+                    new_sl = float(tick.ask) + min_distance
+
+        digits = int(getattr(info, "digits", 5) or 5)
+        # Snap to the symbol's precision: the server compares prices digit by
+        # digit and a 6-decimal level on a 5-digit symbol is an invalid stop.
+        new_sl = round(new_sl, digits) if new_sl else 0.0
+        new_tp = round(new_tp, digits) if new_tp else 0.0
+
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": position.symbol,
+            "position": int(position.ticket),
+            "sl": new_sl,
+            "tp": new_tp,
+        }
+        result = mt5.order_send(request)
+        if result is None:
+            results.append({
+                "ticket": position.ticket, "ok": False,
+                "error": str(mt5.last_error()), "request": request,
+            })
+            continue
+        payload: dict[str, Any] = {
+            "ticket": position.ticket,
+            "symbol": position.symbol,
+            "ok": result.retcode == mt5.TRADE_RETCODE_DONE,
+            "retcode": result.retcode,
+            "comment": result.comment,
+            "sl": new_sl,
+            "tp": new_tp,
+            "routed_to": routed,
+            "min_distance": min_distance,
+        }
+        if adjusted_from is not None:
+            payload["adjusted_from"] = adjusted_from
+            payload["adjust_reason"] = (
+                "the requested level was inside the broker's minimum stop "
+                f"distance ({min_distance}); it was moved just far enough for the "
+                "server to hold it"
+            )
+        if not payload["ok"] and result.retcode == 10016:
+            payload["hint"] = (
+                "retcode 10016 means the stop is too close to the market for this "
+                "symbol (or on the wrong side of it). Read min_distance/point from "
+                "action='symbol' and move the level further out."
+            )
+        results.append(payload)
+
+    ok = all(r.get("ok") for r in results) if results else False
+    return emit(
+        {
+            "ok": ok,
+            "modified": sum(1 for r in results if r.get("ok")),
+            "results": results,
+            "note": (
+                "The broker's server now holds this level: the exit is executed "
+                "by MetaQuotes with no process and no model turn involved, and it "
+                "survives this sandbox being paused or killed."
+            ),
+        },
+        text=f"modified {sum(1 for r in results if r.get('ok'))} position(s)",
+        code=0 if ok else 3,
+    )
+
+
 def installed_chain() -> dict[str, Any]:
     """Report whether the FULL Wine + MT5 chain is installed.
 
@@ -2770,6 +3746,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--magic", type=int, default=20240919)
     p.set_defaults(func=cmd_close_all)
 
+    p = sub.add_parser(
+        "modify",
+        help="attach/move SL or TP on an OPEN position (the broker then holds the exit)",
+    )
+    p.add_argument("--ticket", type=int, action="append", default=[], help="position ticket (repeatable)")
+    p.add_argument("--symbol", default=None, help="every open position on this symbol")
+    p.add_argument("--all", action="store_true", help="every open position")
+    p.add_argument("--exit-at", type=float, default=None, help="price to exit at; routed to SL or TP by direction")
+    p.add_argument("--sl", type=float, default=None, help="explicit stop loss (0 clears it)")
+    p.add_argument("--tp", type=float, default=None, help="explicit take profit (0 clears it)")
+    p.set_defaults(func=cmd_modify)
+
+    p = sub.add_parser(
+        "guard",
+        help="detached tick-level watcher: closes the instant a price is touched",
+    )
+    p.add_argument(
+        "guard_action",
+        nargs="?",
+        default="status",
+        choices=["arm", "status", "stop", "clear", "events"],
+        help="arm rules, read status, stop the watcher, clear rules, or read events",
+    )
+    p.add_argument("--rule", action="append", default=[], help="rule JSON (repeatable)")
+    p.add_argument("--interval-ms", type=int, default=100, help="tick poll interval (default 100 ms)")
+    p.add_argument("--max-seconds", type=int, default=3600, help="how long the guard may watch")
+    p.add_argument("--deviation", type=int, default=30)
+    p.add_argument("--lines", type=int, default=20, help="events to return")
+    p.set_defaults(func=cmd_guard)
+
     p = sub.add_parser("compile", help="compile .mq5 via MetaEditor")
     p.add_argument("--file", required=True)
     p.add_argument("--include", default=None)
@@ -2803,6 +3809,11 @@ _BRIDGE_ACTIONS = frozenset(
     {
         "login", "account", "quote", "candles", "positions", "orders",
         "history", "symbol", "symbols", "order", "close", "close_all", "run",
+        # `modify` talks to the terminal (TRADE_ACTION_SLTP), so it must run
+        # under Wine. `guard` deliberately does NOT appear here: arming the
+        # watcher spawns wine FROM the Linux python, which the re-exec'd
+        # Windows process could not do.
+        "modify",
     }
 )
 
