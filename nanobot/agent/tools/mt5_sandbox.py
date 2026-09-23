@@ -562,9 +562,13 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
                     _sh(json.dumps(rule)),
                     "--interval-ms",
                     str(int(kwargs.get("interval_ms") or 100)),
-                    "--max-seconds",
-                    str(int(kwargs.get("max_seconds") or 3600)),
                 ]
+                # Only restate the budget when the caller set one: the CLI's own
+                # default is NO limit, because an exit at a price has to be held
+                # for however long the price takes. Forcing 3600 here is what used
+                # to stop a guard after an hour with the level still untouched.
+                if kwargs.get("max_seconds"):
+                    parts += ["--max-seconds", str(int(kwargs["max_seconds"]))]
                 # Arming on a symbol the CLI cannot price is refused by default:
                 # the guard would poll in silence and look exactly like
                 # protection. This is the caller's explicit way to say "the
@@ -577,12 +581,12 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
             # Restarting the watcher inherits how it was armed, so the wait and
             # the tick interval can be restated; the rules themselves come from
             # the rules file the stopped watcher left behind.
-            parts += [
-                "--max-seconds",
-                str(int(kwargs.get("max_seconds") or 3600)),
-                "--interval-ms",
-                str(int(kwargs.get("interval_ms") or 100)),
-            ]
+            parts += ["--interval-ms", str(int(kwargs.get("interval_ms") or 100))]
+            # Same rule as arm: an omitted budget means "inherit what it was
+            # armed with", so a re-arm never downgrades an unlimited guard to an
+            # hour or silently extends a deliberately bounded one.
+            if kwargs.get("max_seconds"):
+                parts += ["--max-seconds", str(int(kwargs["max_seconds"]))]
         elif sub_action == "events":
             parts += ["--lines", str(int(kwargs.get("lines") or 20))]
     elif action == "compile":
@@ -775,7 +779,7 @@ class MT5SandboxTool(Tool):
                 "trigger_op": {"type": "string", "enum": [">=", "<="], "description": "action=guard (arm): \">=\" fires at or above the level, \"<=\" at or below. Omit it and the direction is inferred from the live price."},
                 "trigger_side": {"type": "string", "enum": ["mid", "bid", "ask"], "description": "action=guard (arm): which price is compared to the level (default mid = (bid+ask)/2, which is what \"the price\" usually means)."},
                 "interval_ms": {"type": "integer", "description": "action=guard (arm): how often the watcher reads the tick stream, in milliseconds (default 100). This is the exit's worst-case delay."},
-                "max_seconds": {"type": "integer", "description": "action=guard (arm): how long the guard may keep watching before it stops itself (default 3600)."},
+                "max_seconds": {"type": "integer", "description": "action=guard (arm/ensure): how long the guard may keep watching before it stops itself. Omit it (the default) and it holds the level for as long as it takes -- there is no time limit. Only set it for a deliberately bounded run; a guard that stops is reported by guard status as alert=guard_not_running, never as protection."},
                 "rule": {"type": "object", "description": "action=guard (arm): advanced -- an explicit rule object instead of trigger_* fields. Normally omit it and pass symbol/trigger_price/trigger_op."},
                 "comment": {"type": "string", "description": "Order comment."},
                 "file": {"type": "string", "description": "Absolute .mq5/.mqh path inside the sandbox (action=compile)."},

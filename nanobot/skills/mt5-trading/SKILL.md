@@ -279,6 +279,12 @@ else — that list is the exact shape of the original complaint.
 * A failed `arm` tails only what **that** watcher wrote, so `log_tail` is not a
   previous run's `max 600 s` line; if the new watcher wrote nothing at all,
   `log_note` says so.
+* **A guard has no time limit unless you set one.** `guard arm` with no
+  `max_seconds` holds the level for as long as it takes to be touched — "close
+  when it hits X" is a standing instruction, not a one-hour one. The old default
+  of 3600 s is what stopped guards whose level had not arrived yet. `max_seconds`
+  is honoured only when it is positive, and `ensure` inherits the budget the
+  guard was armed with when the call does not restate one.
 * **A stopped guard with rules still armed is an ALARM, not a status.** `status`
   answers `ok: false` with `alert: "guard_not_running"`, the `exit_reason`, the
   `heartbeat_age_s`, and `recovery: "guard action='ensure'"`. Never report the

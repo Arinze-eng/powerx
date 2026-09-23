@@ -2580,7 +2580,7 @@ def main():
     parser.add_argument("--state", required=True)
     parser.add_argument("--stop-file", required=True)
     parser.add_argument("--interval-ms", type=int, default=100)
-    parser.add_argument("--max-seconds", type=int, default=3600)
+    parser.add_argument("--max-seconds", type=int, default=0)
     parser.add_argument("--deviation", type=int, default=30)
     parser.add_argument("--magic", type=int, default=20240919)
     args = parser.parse_args()
@@ -2589,7 +2589,7 @@ def main():
     write_json(args.state, {"pid": os.getpid(), "started_at": started, "status": "starting"})
     note(
         f"watching {len(read_rules(args.rules))} rule(s) every {args.interval_ms} ms; "
-        f"max {args.max_seconds} s"
+        f"max {int(args.max_seconds) if int(args.max_seconds) > 0 else 'none'} s"
     )
     append_jsonl(args.events, {
         "event": "watcher_start", "ts": started, "pid": os.getpid(),
@@ -2622,7 +2622,11 @@ def main():
     ever_priced = set()
     while True:
         now = time.time()
-        if now - started > args.max_seconds:
+        # ``--max-seconds 0`` (the default) means NO limit: an exit at a price has
+        # to be held for as long as the price takes to arrive, and a guard that
+        # quietly stops after an hour leaves the level watched by nobody. A
+        # positive value is still honoured for bounded runs and tests.
+        if int(args.max_seconds) > 0 and now - started > int(args.max_seconds):
             exit_reason = "max_seconds"
             break
         if os.path.exists(args.stop_file):
@@ -2719,6 +2723,7 @@ def main():
         write_json(args.state, {
             "pid": os.getpid(), "started_at": started, "status": "running",
             "heartbeat": time.time(), "polls": polls, "interval_ms": args.interval_ms,
+            "max_seconds": int(args.max_seconds),
             "prices": prices, "rules": len(read_rules(args.rules)),
             "unpriceable": {s: round(t, 1) for s, t in unpriced_since.items()},
         })
@@ -2803,6 +2808,23 @@ def _last_exit_reason() -> str | None:
             reason = event.get("exit_reason")
             return str(reason) if reason else None
     return None
+
+
+def _guard_max_seconds(value: Any, default: int = 0) -> int:
+    """Normalise a guard time budget; ``0`` (or anything falsy) means NO limit.
+
+    ``int(value or 3600)`` was the bug this replaces: an explicit ``0`` -- "watch
+    until the level is reached, however long that takes" -- folded back to one
+    hour, so the guard stopped exactly when the caller had said not to. A limit is
+    a positive number of seconds; everything else means unlimited.
+    """
+    if value in (None, ""):
+        return int(default)
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return seconds if seconds > 0 else 0
 
 
 def _guard_fires_since(rule_ids: set[str], since: float) -> list[dict[str, Any]]:
@@ -3092,7 +3114,7 @@ def cmd_guard(args: argparse.Namespace) -> int:
         if not live:
             spawn = _guard_spawn(
                 int(getattr(args, "interval_ms", 100) or 100),
-                int(getattr(args, "max_seconds", 3600) or 3600),
+                _guard_max_seconds(getattr(args, "max_seconds", None)),
                 int(getattr(args, "deviation", 30) or 30),
             )
             state = spawn["state"]
@@ -3109,7 +3131,7 @@ def cmd_guard(args: argparse.Namespace) -> int:
             # subshell that spawned it and is useless for anything.
             "pid": (state or {}).get("pid") or pid,
             "interval_ms": int(getattr(args, "interval_ms", 100) or 100),
-            "max_seconds": int(getattr(args, "max_seconds", 3600) or 3600),
+            "max_seconds": _guard_max_seconds(getattr(args, "max_seconds", None)),
             "rules": _read_guard_rules(),
             "events_file": str(GUARD_EVENTS_FILE),
             "state_file": str(GUARD_STATE_FILE),
@@ -3236,7 +3258,13 @@ def cmd_guard(args: argparse.Namespace) -> int:
             rearmed_at = time.time()
             spawn = _guard_spawn(
                 int((state or {}).get("interval_ms") or 100),
-                int(getattr(args, "max_seconds", 3600) or 3600),
+                # Reuse the budget the guard was ARMED with when this call does
+                # not restate one: a re-arm must not silently downgrade an
+                # unlimited guard to an hour, or extend a deliberately bounded one.
+                _guard_max_seconds(
+                    getattr(args, "max_seconds", None),
+                    default=_guard_max_seconds((state or {}).get("max_seconds")),
+                ),
                 int(getattr(args, "deviation", 30) or 30),
             )
             state = spawn["state"]
@@ -4284,7 +4312,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--rule", action="append", default=[], help="rule JSON (repeatable)")
     p.add_argument("--interval-ms", type=int, default=100, help="tick poll interval (default 100 ms)")
-    p.add_argument("--max-seconds", type=int, default=3600, help="how long the guard may watch")
+    p.add_argument(
+        "--max-seconds",
+        type=int,
+        default=None,
+        help=(
+            "how long the guard may watch; omit (or 0) to hold the level for as "
+            "long as it takes. A positive limit is a bounded run, and an expired "
+            "guard is reported as an alert, never as protection."
+        ),
+    )
     p.add_argument("--deviation", type=int, default=30)
     p.add_argument(
         "--allow-unpriceable",

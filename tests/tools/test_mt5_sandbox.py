@@ -2909,3 +2909,55 @@ def test_spawn_reports_the_log_marks_its_callers_tail_from(monkeypatch, tmp_path
     assert spawn["log_mark"] == 2
     assert spawn["err_mark"] == 0
     assert spawn["launcher_pid"] == "4242"
+
+
+def test_a_guard_is_not_killed_by_an_hour_it_was_never_given(monkeypatch, tmp_path):
+    """No budget means NO limit; only a positive number bounds the watch.
+
+    The guard used to be armed with ``--max-seconds 3600`` whether or not anyone
+    asked for it, so an exit level that took longer than an hour to be touched
+    was watched by nobody and had to be noticed by a later status call. "Close
+    when it hits X" is a standing instruction, not a one-hour one.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+
+    assert cli._guard_max_seconds(None) == 0
+    assert cli._guard_max_seconds("") == 0
+    assert cli._guard_max_seconds(0) == 0
+    assert cli._guard_max_seconds(-5) == 0
+    assert cli._guard_max_seconds("nonsense") == 0
+    assert cli._guard_max_seconds(600) == 600
+    assert cli._guard_max_seconds("90") == 90
+    # A re-arm that does not restate a budget inherits the one it was armed with.
+    assert cli._guard_max_seconds(None, default=cli._guard_max_seconds(1800)) == 1800
+    assert cli._guard_max_seconds(None, default=cli._guard_max_seconds(0)) == 0
+
+    # The watcher must actually honour it: a zero budget is not "expire at once".
+    source = cli._GUARD_WATCH_SOURCE
+    assert "int(args.max_seconds) > 0 and now - started > int(args.max_seconds)" in source
+    assert '"max_seconds": int(args.max_seconds)' in source
+
+
+def test_the_tools_guard_omits_the_budget_so_the_cli_default_applies():
+    """An unset budget must reach the CLI as absent, not as 3600.
+
+    ``int(kwargs.get("max_seconds") or 3600)`` meant the tool could never ask for
+    an unlimited guard: whatever the caller sent, an hour was forced on top of it.
+    """
+    cmd = build_cli_command("guard", {
+        "guard_action": "arm", "symbol": "EURUSD", "trigger_price": 1.1,
+        "trigger_op": "<=",
+    })
+    assert "--max-seconds" not in cmd
+
+    cmd = build_cli_command("guard", {
+        "guard_action": "arm", "symbol": "EURUSD", "trigger_price": 1.1,
+        "trigger_op": "<=", "max_seconds": 600,
+    })
+    assert "--max-seconds 600" in cmd
+
+    cmd = build_cli_command("guard", {"guard_action": "ensure"})
+    assert "--max-seconds" not in cmd
+
+    cmd = build_cli_command("guard", {"guard_action": "ensure", "max_seconds": 120})
+    assert "--max-seconds 120" in cmd
