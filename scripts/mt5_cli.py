@@ -64,7 +64,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-23.2"
+CLI_VERSION = "2026-09-23.3"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -1858,6 +1858,36 @@ def cmd_candles(args: argparse.Namespace) -> int:
     return emit({"ok": True, "symbol": args.symbol, "timeframe": args.timeframe.upper(), "bars": rows})
 
 
+def _guard_summary() -> dict[str, Any]:
+    """One-line answer to "is anything watching a price right now?".
+
+    Attached to ``positions`` so a caller looking at open risk is told, in the
+    same payload, whether the levels are held by the broker, watched by the
+    guard, or by nobody at all -- the third case being the one that used to be
+    indistinguishable from the first two.
+    """
+    state = _read_guard_state()
+    rules = _read_guard_rules()
+    live = _guard_is_live(state)
+    alert = None
+    if rules and not live:
+        alert = "guard_not_running"
+    elif live and (state or {}).get("unpriceable"):
+        alert = "rule_unpriceable"
+    return {
+        "live": live,
+        "rules_armed": len(rules),
+        "alert": alert,
+        "exit_reason": None if live else (state or {}).get("exit_reason"),
+        "heartbeat_age_s": (
+            round(time.time() - float((state or {}).get("heartbeat") or 0.0), 1)
+            if (state or {}).get("heartbeat")
+            else None
+        ),
+        "recovery": "guard ensure" if alert == "guard_not_running" else None,
+    }
+
+
 def cmd_positions(_: argparse.Namespace) -> int:
     mt5, err = require_bridge()
     if err is not None:
@@ -1865,7 +1895,12 @@ def cmd_positions(_: argparse.Namespace) -> int:
     positions = mt5.positions_get()
     if positions is None:
         return fail(f"positions_get failed: {mt5.last_error()}", code=2)
-    return emit({"ok": True, "count": len(positions), "positions": [p._asdict() for p in positions]})
+    return emit({
+        "ok": True,
+        "count": len(positions),
+        "positions": [p._asdict() for p in positions],
+        "guard": _guard_summary(),
+    })
 
 
 def cmd_orders(_: argparse.Namespace) -> int:
@@ -2392,6 +2427,10 @@ RETCODE_UNSUPPORTED_FILLING = 10030
 #: silently disarming protection is worse than a retry -- but it is retried on a
 #: cooldown so a persistent rejection cannot spam the broker 10x a second.
 RETRY_COOLDOWN_SECONDS = 1.5
+#: Seconds a rule's symbol may go unpriced before the watcher says so out loud.
+#: A symbol with no tick is a rule that can never be evaluated, and a watcher
+#: that is silent about it is indistinguishable from protection.
+UNPRICEABLE_STALE = 10.0
 
 
 def append_jsonl(path, payload):
@@ -2575,6 +2614,12 @@ def main():
     polls = 0
     exit_reason = "rules_satisfied"
     prices = {}
+    #: Symbol -> the moment it stopped pricing; report_pending tracks the ones
+    #: already reported, so the event log gets one line per outage, not one per
+    #: 100 ms poll.
+    unpriced_since = {}
+    unpriced_reported = set()
+    ever_priced = set()
     while True:
         now = time.time()
         if now - started > args.max_seconds:
@@ -2597,7 +2642,29 @@ def main():
             polls += 1
             if tick is None:
                 mt5.symbol_select(symbol, True)
+                since = unpriced_since.setdefault(symbol, now)
+                if symbol not in unpriced_reported and now - since >= UNPRICEABLE_STALE:
+                    unpriced_reported.add(symbol)
+                    note(
+                        f"{symbol} has had NO tick for {round(now - since, 1)} s -- "
+                        f"{rule.get('id')} cannot be evaluated while that lasts"
+                    )
+                    append_jsonl(args.events, {
+                        "event": "rule_unpriceable", "ts": now, "rule_id": rule.get("id"),
+                        "symbol": symbol, "unpriced_seconds": round(now - since, 1),
+                        "detail": "no tick from symbol_info_tick; the rule cannot fire "
+                                  "until the symbol prices again",
+                    })
                 continue
+            ever_priced.add(symbol)
+            if symbol in unpriced_reported:
+                unpriced_reported.discard(symbol)
+                append_jsonl(args.events, {
+                    "event": "rule_priceable", "ts": now, "symbol": symbol,
+                    "outage_seconds": round(now - unpriced_since.get(symbol, now), 1),
+                })
+                note(f"{symbol} is pricing again after an outage")
+            unpriced_since.pop(symbol, None)
             price, used_side = price_for_rule(rule, tick)
             prices[symbol] = price
             op = str(rule.get("op") or ">=")
@@ -2638,10 +2705,22 @@ def main():
 
         if changed:
             write_json(args.rules, rules)
+        # Nothing has EVER been priced and every armed symbol is dark: this is
+        # the misspelled-symbol case, not a market that has gone quiet. It stops
+        # now, loudly, instead of polling an hour and looking like protection.
+        if not ever_priced and prices == {} and unpriced_since:
+            armed_symbols = {str(r.get("symbol") or "") for r in read_rules(args.rules)}
+            if (
+                armed_symbols <= set(unpriced_since)
+                and now - min(unpriced_since.values()) >= UNPRICEABLE_STALE
+            ):
+                exit_reason = "unpriceable_symbol"
+                break
         write_json(args.state, {
             "pid": os.getpid(), "started_at": started, "status": "running",
             "heartbeat": time.time(), "polls": polls, "interval_ms": args.interval_ms,
             "prices": prices, "rules": len(read_rules(args.rules)),
+            "unpriceable": {s: round(t, 1) for s, t in unpriced_since.items()},
         })
         time.sleep(max(0.01, args.interval_ms / 1000.0))
 
@@ -2714,6 +2793,44 @@ def _guard_events(limit: int) -> list[dict[str, Any]]:
             out.append(json.loads(line))
         except ValueError:
             continue
+    return out
+
+
+def _last_exit_reason() -> str | None:
+    """Why the watcher stopped, from the event log (the state file is rewritten)."""
+    for event in reversed(_guard_events(40)):
+        if event.get("event") == "watcher_stop":
+            reason = event.get("exit_reason")
+            return str(reason) if reason else None
+    return None
+
+
+def _guard_fires_since(rule_ids: set[str], since: float) -> list[dict[str, Any]]:
+    """Fired events for these rules that happened AT OR AFTER ``since``.
+
+    The timestamp is the whole point. A rule id defaults to ``g<arm-time>-<index>``
+    so a fresh arm gets a fresh id, but a caller may reuse an explicit id -- and
+    re-arming one that already fired once would then find its own OLD fired event
+    and be told "fired immediately" while the new watcher was in fact dead. That
+    is the same lie in the opposite direction: a dead guard reported as a
+    completed exit. ``since`` is the wall clock taken immediately before the
+    watcher was started, and both sides run on the one container clock.
+    """
+    if not rule_ids:
+        return []
+    out: list[dict[str, Any]] = []
+    for event in _guard_events(60):
+        if event.get("event") not in ("fired", "close_failed"):
+            continue
+        if str(event.get("rule_id")) not in rule_ids:
+            continue
+        stamp = event.get("close_ts") or event.get("trigger_ts")
+        try:
+            when = float(stamp)
+        except (TypeError, ValueError):
+            continue
+        if when >= float(since):
+            out.append(event)
     return out
 
 
@@ -2821,6 +2938,57 @@ def _validate_rule(
     }
 
 
+def _guard_spawn(interval_ms: int, max_seconds: int, deviation: int) -> dict[str, Any]:
+    """Write the watcher out and start it detached, then WAIT for a heartbeat.
+
+    A pid is not evidence: the launcher subshell is gone the moment it returns,
+    so the only thing that says the watcher is alive is the heartbeat it writes
+    on its first loop. Every caller of this gets "started" or "failed", never
+    "probably started" -- a guard that is assumed rather than confirmed is the
+    whole failure mode this file exists to close.
+
+    A stop file left behind by a previous run would kill the new watcher on its
+    first loop, so it is removed here rather than trusted to be absent.
+    """
+    wine, winpy = _guard_python()
+    GUARD_WATCH_SCRIPT.write_text(_GUARD_WATCH_SOURCE, encoding="utf-8")
+    try:
+        GUARD_STOP_FILE.unlink()
+    except OSError:
+        pass
+    inner = (
+        f"{wine} {shlex.quote(_to_wine_path(winpy))} "
+        f"{shlex.quote(_to_wine_path(GUARD_WATCH_SCRIPT))} "
+        f"--rules {shlex.quote(_to_wine_path(GUARD_RULES_FILE))} "
+        f"--events {shlex.quote(_to_wine_path(GUARD_EVENTS_FILE))} "
+        f"--state {shlex.quote(_to_wine_path(GUARD_STATE_FILE))} "
+        f"--stop-file {shlex.quote(_to_wine_path(GUARD_STOP_FILE))} "
+        f"--interval-ms {int(interval_ms)} "
+        f"--max-seconds {int(max_seconds)} "
+        f"--deviation {int(deviation)}"
+        f" >> {shlex.quote(str(GUARD_LOG_FILE))} "
+        f"2>> {shlex.quote(str(GUARD_ERR_FILE))}"
+    )
+    proc = subprocess.run(
+        ["sh", "-c", f"nohup setsid sh -c {shlex.quote(inner)} >/dev/null 2>&1 & echo $!"],
+        env=wine_env(),
+        capture_output=True,
+        text=True,
+    )
+    launcher_pid = (proc.stdout or "").strip()
+    started_wait = time.time()
+    deadline = started_wait + float(os.environ.get("MT5_GUARD_ARM_WAIT", "12"))
+    state: dict[str, Any] | None = None
+    while time.time() < deadline:
+        state = _read_guard_state()
+        if _guard_is_live(state) or (state or {}).get("status") == "failed":
+            break
+        time.sleep(0.5)
+    return {"state": state, "launcher_pid": launcher_pid,
+            "log_mark": log_mark, "err_mark": err_mark,
+            "waited_s": round(time.time() - started_wait, 1)}
+
+
 def cmd_guard(args: argparse.Namespace) -> int:
     """Arm/inspect/stop the detached tick-level price guard."""
     subcommand = str(getattr(args, "guard_action", "status") or "status").lower()
@@ -2840,18 +3008,43 @@ def cmd_guard(args: argparse.Namespace) -> int:
         if not raw_rules:
             return fail("guard arm needs at least one --rule '<json>'", code=1)
 
-        # One bridge quote per distinct symbol, and only for rules that omit
-        # 'op'. The round trip is ~1-2 s, so it is not paid when every rule
-        # already states its direction.
+        # One bridge price read per distinct symbol, and it is paid for EVERY
+        # rule -- not only the ones that omit 'op'. The read answers two
+        # questions at once:
+        #   * a rule without an 'op' needs a live price to infer its direction;
+        #   * a symbol the CLI cannot price is a symbol the watcher will poll
+        #     forever without ever evaluating a rule.
+        # The second one is the point. MEASURED 2026-09-23 (MetaQuotes demo): a
+        # rule on a misspelled symbol armed cleanly, answered guard="armed" with
+        # a live heartbeat, polled 47 times, priced NOTHING, and was
+        # indistinguishable from protection. A caller told "armed" about a guard
+        # that cannot see the market is worse off than one told nothing.
         price_hints: dict[str, float] = {}
+        unpriceable: list[str] = []
         for raw in raw_rules:
-            if not isinstance(raw, dict) or str(raw.get("op") or "").strip():
+            if not isinstance(raw, dict):
                 continue
             symbol = str(raw.get("symbol") or "").strip()
-            if symbol and symbol not in price_hints:
-                found = _guard_current_price(symbol)
-                if found is not None:
-                    price_hints[symbol] = found
+            if not symbol or symbol in price_hints or symbol in unpriceable:
+                continue
+            found = _guard_current_price(symbol)
+            if found is None:
+                unpriceable.append(symbol)
+            else:
+                price_hints[symbol] = found
+        if unpriceable and not getattr(args, "allow_unpriceable", False):
+            return fail(
+                "refusing to arm: the CLI cannot read a price for "
+                + ", ".join(repr(s) for s in unpriceable)
+                + ". A guard on a symbol with no tick can never fire -- it would "
+                "poll in silence and look exactly like protection. Check the "
+                "symbol spelling with action='symbol' (or wait for the market to "
+                "open), then arm again. Pass allow_unpriceable=true only if you "
+                "know the symbol prices later and want the watcher to wait for it.",
+                code=4,
+                unpriceable=unpriceable,
+                priced_symbols=sorted(price_hints),
+            )
 
         rules: list[dict[str, Any]] = []
         for index, raw in enumerate(raw_rules):
@@ -2877,60 +3070,31 @@ def cmd_guard(args: argparse.Namespace) -> int:
         except OSError as exc:
             return fail(f"could not write {GUARD_RULES_FILE}: {exc}", code=2)
 
-        pair = _guard_python()
-        if pair is None:
+        # The moment the merged ruleset became the live one: the earliest time a
+        # fire reported below can have been caused by THIS arm.
+        armed_at = time.time()
+        if _guard_python() is None:
             return fail(
                 "the Windows python is not installed in the Wine prefix, so the "
                 "tick-level guard cannot start. Run install first (the guard uses "
                 "the MetaTrader5 module, which only publishes win_amd64 wheels).",
                 code=2,
             )
-        wine, winpy = pair
-        try:
-            GUARD_WATCH_SCRIPT.write_text(_GUARD_WATCH_SOURCE, encoding="utf-8")
-        except OSError as exc:
-            return fail(f"could not write the watcher script: {exc}", code=2)
-        # A stop file left from a previous run would kill this watcher on its
-        # first loop, so it is removed as part of arming.
-        try:
-            GUARD_STOP_FILE.unlink()
-        except OSError:
-            pass
-
         state = _read_guard_state()
         live = _guard_is_live(state)
+        pid = str((state or {}).get("pid") or "")
+        log_mark = 0
+        err_mark = 0
         if not live:
-            inner = (
-                f"{wine} {shlex.quote(_to_wine_path(winpy))} "
-                f"{shlex.quote(_to_wine_path(GUARD_WATCH_SCRIPT))} "
-                f"--rules {shlex.quote(_to_wine_path(GUARD_RULES_FILE))} "
-                f"--events {shlex.quote(_to_wine_path(GUARD_EVENTS_FILE))} "
-                f"--state {shlex.quote(_to_wine_path(GUARD_STATE_FILE))} "
-                f"--stop-file {shlex.quote(_to_wine_path(GUARD_STOP_FILE))} "
-                f"--interval-ms {int(getattr(args, 'interval_ms', 100) or 100)} "
-                f"--max-seconds {int(getattr(args, 'max_seconds', 3600) or 3600)} "
-                f"--deviation {int(getattr(args, 'deviation', 30) or 30)}"
-                f" >> {shlex.quote(str(GUARD_LOG_FILE))} "
-                f"2>> {shlex.quote(str(GUARD_ERR_FILE))}"
+            spawn = _guard_spawn(
+                int(getattr(args, "interval_ms", 100) or 100),
+                int(getattr(args, "max_seconds", 3600) or 3600),
+                int(getattr(args, "deviation", 30) or 30),
             )
-            proc = subprocess.run(
-                ["sh", "-c", f"nohup setsid sh -c {shlex.quote(inner)} >/dev/null 2>&1 & echo $!"],
-                env=wine_env(),
-                capture_output=True,
-                text=True,
-            )
-            pid = (proc.stdout or "").strip()
-            # The watcher writes its heartbeat on its first loop, so a short wait
-            # turns "started" into "verified alive" -- otherwise the answer is a
-            # pid that may already be gone.
-            deadline = time.time() + float(os.environ.get("MT5_GUARD_ARM_WAIT", "12"))
-            while time.time() < deadline:
-                state = _read_guard_state()
-                if _guard_is_live(state) or (state or {}).get("status") == "failed":
-                    break
-                time.sleep(0.5)
-        else:
-            pid = str((state or {}).get("pid") or "")
+            state = spawn["state"]
+            pid = spawn["launcher_pid"]
+            log_mark = int(spawn.get("log_mark") or 0)
+            err_mark = int(spawn.get("err_mark") or 0)
 
         state = _read_guard_state()
         live = _guard_is_live(state)
@@ -2956,22 +3120,205 @@ def cmd_guard(args: argparse.Namespace) -> int:
             ),
         }
         if not live:
+            # A rule whose level is ALREADY satisfied fires on the first tick, so
+            # the watcher can have done its entire job and exited before this call
+            # finishes waiting for a heartbeat. MEASURED 2026-09-23 (MetaQuotes
+            # demo, live): that came back guard="not_running" with ok=false -- a
+            # complete, correct exit reported as a failed arm, which invites the
+            # caller to arm a second guard over a position that is already closed.
+            # The event log is what tells the two apart.
+            armed_ids = {str(r.get("id")) for r in rules}
+            strikes = _guard_fires_since(armed_ids, armed_at)
+            fired_now = [e for e in strikes if e.get("event") == "fired"]
+            failed_now = [e for e in strikes if e.get("event") == "close_failed"]
+            if failed_now:
+                # The level WAS touched and the close was REJECTED. That is not a
+                # dead watcher and it is not a success: the position is still open
+                # at a level the caller asked to be out at, and it has to be said
+                # in those words or it reads as a broken arm.
+                payload["ok"] = False
+                payload["guard"] = "close_failed"
+                payload["close_failed"] = [
+                    {
+                        "rule_id": e.get("rule_id"), "symbol": e.get("symbol"),
+                        "level": e.get("level"),
+                        "trigger_price": e.get("trigger_price"),
+                        "results": e.get("results"),
+                    }
+                    for e in failed_now
+                ]
+                payload.pop("error", None)
+                payload["message"] = (
+                    "The level was already satisfied, the guard fired on the first "
+                    "tick, and the CLOSE WAS REJECTED -- the position is still "
+                    "open. Read 'close_failed' for the broker's answer."
+                )
+                return emit(
+                    payload,
+                    text="guard fired and the close failed",
+                    code=2,
+                )
+            if fired_now:
+                payload["ok"] = True
+                payload["guard"] = "fired_immediately"
+                payload["fired"] = [
+                    {
+                        "rule_id": e.get("rule_id"), "symbol": e.get("symbol"),
+                        "op": e.get("op"), "level": e.get("level"),
+                        "trigger_price": e.get("trigger_price"),
+                        "latency_ms": e.get("latency_ms"),
+                        "positions_matched": e.get("positions_matched"),
+                    }
+                    for e in fired_now
+                ]
+                payload["rules"] = _read_guard_rules()
+                payload["message"] = (
+                    "The level was already satisfied when the guard armed, so it "
+                    "fired on the first tick and has stopped -- the exit has "
+                    "already happened. Read 'fired' for the measured latency, and "
+                    "action='positions' to confirm what is left open."
+                )
+                payload.pop("error", None)
+                return emit(
+                    payload,
+                    text=f"guard fired immediately ({fired_now[-1].get('latency_ms')} ms)",
+                )
             payload["error"] = (
                 "the guard watcher did not report a heartbeat. Read log_file: a "
                 "watcher that cannot import MetaTrader5 or reach the terminal "
                 "writes 'watcher_failed' to the event log."
             )
-            payload["log_tail"] = _tail(GUARD_LOG_FILE, 15)
-            payload["err_tail"] = _tail(GUARD_ERR_FILE, 15)
+            payload["log_tail"] = _tail_new(GUARD_LOG_FILE, 15, log_mark)
+            payload["err_tail"] = _tail_new(GUARD_ERR_FILE, 15, err_mark)
+            if not payload["log_tail"] and not payload["err_tail"]:
+                payload["log_note"] = (
+                    "this watcher wrote nothing at all to the log, so it died "
+                    "before its first loop -- check that the shared directory is "
+                    "mounted and that Wine can start the Windows python."
+                )
             return emit(payload, text="guard failed to start", code=2)
         return emit(payload, text=f"guard armed ({len(payload['rules'])} rule(s))")
 
-    if subcommand == "status":
+    if subcommand in ("status", "ensure"):
         state = _read_guard_state()
         live = _guard_is_live(state)
         rules = _read_guard_rules()
+        if subcommand == "ensure" and rules and not live and _guard_python() is None:
+            return fail(
+                "the Windows python is not in the Wine prefix, so the guard cannot "
+                "be restarted. The armed rules are UNPROTECTED: run install first, "
+                "then call guard action='ensure' again.",
+                code=2,
+                rules_armed=len(rules),
+                alert="guard_not_running",
+            )
+        if subcommand == "ensure" and rules and not live:
+            # THE HOLE THIS CLOSES: a guard can stop for reasons that have nothing
+            # to do with the market -- the watcher's own --max-seconds runs out,
+            # the sandbox is suspended, the Wine prefix is restarted. Nothing then
+            # tells the caller, and the level that used to be watched is watched
+            # by nobody. Re-arming is one call, and the gap is REPORTED rather
+            # than papered over, because anything that touched the level while the
+            # watcher was down was missed.
+            previous_hb = (state or {}).get("heartbeat")
+            # Captured BEFORE the spawn overwrites the state file, or the reason
+            # the guard had stopped is lost by the very call that recovers it.
+            previous_exit = (state or {}).get("exit_reason") or _last_exit_reason()
+            # A re-armed guard faces a market that has moved on. A rule whose level
+            # is satisfied NOW fires on the first tick and the watcher is gone by
+            # the time the heartbeat wait ends -- the exact case the arm path had
+            # to be taught, and re-arming is where it is most likely: the level was
+            # very often reached while nothing was watching.
+            rearmed_at = time.time()
+            spawn = _guard_spawn(
+                int((state or {}).get("interval_ms") or 100),
+                int(getattr(args, "max_seconds", 3600) or 3600),
+                int(getattr(args, "deviation", 30) or 30),
+            )
+            state = spawn["state"]
+            live = _guard_is_live(state)
+            strikes = [] if live else _guard_fires_since(
+                {str(r.get("id")) for r in rules}, rearmed_at
+            )
+            fired_now = [e for e in strikes if e.get("event") == "fired"]
+            # "rearmed" and "rearmed then fired" are different outcomes and only
+            # one of them leaves a watcher running. Saying just "rearmed" for the
+            # second leaves the caller believing a guard is live over a position
+            # that is already closed; saying "rearm_failed" reports a completed
+            # exit as a broken guard. Both are wrong, so they are separate.
+            if live:
+                action = "rearmed"
+            elif fired_now:
+                action = "rearmed_and_fired"
+            else:
+                action = "rearm_failed"
+            payload: dict[str, Any] = {
+                "ok": bool(live or fired_now),
+                "action": action,
+                "running": live,
+                "previous_exit_reason": previous_exit,
+                "unprotected_seconds": (
+                    round(time.time() - float(previous_hb), 1)
+                    if previous_hb not in (None, "")
+                    else None
+                ),
+                "rules_armed": len(rules),
+                "warning": (
+                    "The guard had stopped and has been restarted. Anything that "
+                    "touched an armed level while it was down was NOT acted on -- "
+                    "check action='positions' before trusting the rules again."
+                    if live
+                    else "The guard could not be restarted; the armed rules are "
+                         "still unprotected. Read log_file/err_file."
+                ),
+                "log_tail": _tail_new(GUARD_LOG_FILE, 10, int(spawn.get("log_mark") or 0))
+                if not live else None,
+                "err_tail": _tail_new(GUARD_ERR_FILE, 10, int(spawn.get("err_mark") or 0))
+                if not live else None,
+            }
+            if fired_now:
+                # The level that was reached while nothing was watching has been
+                # acted on by the restarted guard, on its first tick.
+                payload["fired"] = [
+                    {
+                        "rule_id": e.get("rule_id"), "symbol": e.get("symbol"),
+                        "op": e.get("op"), "level": e.get("level"),
+                        "trigger_price": e.get("trigger_price"),
+                        "latency_ms": e.get("latency_ms"),
+                        "positions_matched": e.get("positions_matched"),
+                    }
+                    for e in fired_now
+                ]
+                payload["warning"] = (
+                    "The guard had stopped and was restarted; the level was "
+                    "already reached, so it fired on its first tick and has "
+                    "stopped again -- that exit has now happened. Anything that "
+                    "touched the level BEFORE the restart was NOT acted on by this "
+                    "fire; check action='positions'."
+                )
+                payload.pop("log_tail", None)
+                payload.pop("err_tail", None)
+            return emit(
+                payload,
+                text={
+                    "rearmed": "guard re-armed",
+                    "rearmed_and_fired": "guard re-armed and fired immediately",
+                }.get(action, "guard re-arm failed"),
+                code=0 if payload["ok"] else 2,
+            )
+
+        unpriceable = (state or {}).get("unpriceable") or {}
+        # A stopped watcher with rules still armed is an ALARM, not a status. It
+        # used to come back ok=True, which reads as "everything is fine" while
+        # the level is being watched by nobody -- the one answer this action must
+        # never give.
+        alarm = None
+        if rules and not live:
+            alarm = "guard_not_running"
+        elif live and unpriceable:
+            alarm = "rule_unpriceable"
         payload = {
-            "ok": True,
+            "ok": alarm is None,
             "running": live,
             "state": state,
             "rules_armed": len(rules),
@@ -2979,6 +3326,12 @@ def cmd_guard(args: argparse.Namespace) -> int:
             "interval_ms": (state or {}).get("interval_ms"),
             "polls": (state or {}).get("polls"),
             "prices": (state or {}).get("prices") or {},
+            "unpriceable": unpriceable,
+            "heartbeat_age_s": (
+                round(time.time() - float((state or {}).get("heartbeat") or 0.0), 1)
+                if (state or {}).get("heartbeat")
+                else None
+            ),
             "events_file": str(GUARD_EVENTS_FILE),
             "hint": (
                 "A guard that is not running protects nothing: re-arm it with "
@@ -2987,6 +3340,28 @@ def cmd_guard(args: argparse.Namespace) -> int:
                 else "Live. 'prices' is the tick the watcher is seeing right now."
             ),
         }
+        if alarm:
+            payload["alert"] = alarm
+            payload["recovery"] = "guard action='ensure' (or arm again)"
+            if alarm == "guard_not_running":
+                payload["exit_reason"] = (state or {}).get("exit_reason")
+                payload["warning"] = (
+                    f"{len(rules)} rule(s) are armed and NOTHING is watching them: "
+                    "the watcher stopped"
+                    + (
+                        f" ({state.get('exit_reason')})"
+                        if (state or {}).get("exit_reason")
+                        else ""
+                    )
+                    + ". Nothing will close on these levels until it runs again."
+                )
+            else:
+                payload["warning"] = (
+                    "the watcher is running but cannot price "
+                    + ", ".join(sorted(unpriceable))
+                    + f" (dark for {max(unpriceable.values())} s at last beat). A "
+                    "rule on an unpriced symbol can never fire."
+                )
         if not live:
             payload["last_events"] = _guard_events(5)
         return emit(payload)
@@ -3040,7 +3415,7 @@ def cmd_guard(args: argparse.Namespace) -> int:
         )
 
     return fail(
-        f"unknown guard action {subcommand!r}; use arm, status, stop, clear or events",
+        f"unknown guard action {subcommand!r}; use arm, status, stop, clear, events or ensure",
         code=1,
     )
 
@@ -3074,6 +3449,50 @@ def _position_targets(mt5: Any, args: argparse.Namespace) -> tuple[list[Any], in
     return [], fail(
         "modify needs a target: --ticket N, --symbol <SYMBOL>, or --all", code=1
     )
+
+
+#: How a requested stop/target relates to the market it has to sit in.
+LEG_EXACT = "exact"          # the server will hold it exactly as asked
+LEG_ADJUSTED = "adjusted"    # too tight: moved to the nearest legal distance
+LEG_WRONG_SIDE = "wrong_side"  # the market is already through it -- refused
+
+
+def _place_leg(
+    is_long: bool, leg: str, level: float, bid: float, ask: float, min_distance: float
+) -> tuple[str, float]:
+    """Where a requested SL/TP can legally sit, or why it cannot sit at all.
+
+    ``leg`` is ``"sl"`` or ``"tp"``. A long's stop sits BELOW the bid and its
+    target ABOVE the ask; a short is the mirror. Two things can be wrong with a
+    level, and they are NOT the same thing:
+
+    * TOO TIGHT -- it is on the correct side of the market but inside the
+      broker's minimum stop distance, so the server answers retcode 10016
+      "invalid stops". Moving it out to that distance keeps the caller's
+      instruction and is reported.
+    * WRONG SIDE -- the market has already gone through it. There is no honest
+      clamp for that: moving it to the other side of the market turns "take
+      profit at 1.1400" into a take profit ABOVE a long, which is the opposite
+      instruction about the money. MEASURED 2026-09-23: the previous code did
+      exactly that, silently reporting ``adjusted_from``. It is refused instead,
+      and ``--exit-at`` is offered for a caller who really does mean "exit at
+      this level" (a bare level carries no side, so routing it is right).
+
+    Returns ``(status, placed_level)`` for the exact and adjusted cases.
+    """
+    if leg == "tp":
+        bound = ask + min_distance if is_long else bid - min_distance
+        wrong_side = level <= bid if is_long else level >= ask
+        too_tight = level < bound if is_long else level > bound
+    else:
+        bound = bid - min_distance if is_long else ask + min_distance
+        wrong_side = level >= bid if is_long else level <= ask
+        too_tight = level > bound if is_long else level < bound
+    if wrong_side:
+        return LEG_WRONG_SIDE, level
+    if too_tight:
+        return LEG_ADJUSTED, bound
+    return LEG_EXACT, level
 
 
 def cmd_modify(args: argparse.Namespace) -> int:
@@ -3120,7 +3539,10 @@ def cmd_modify(args: argparse.Namespace) -> int:
         new_sl = float(sl) if sl is not None else float(position.sl or 0.0)
         new_tp = float(tp) if tp is not None else float(position.tp or 0.0)
         routed = None
-        adjusted_from = None
+        #: Every leg this call actually moved, with the level that was asked for.
+        #: A LIST, not one field: clamping both legs used to report only the last
+        #: one, so half of what was changed about the caller's money was silent.
+        adjustments: list[dict[str, Any]] = []
 
         if exit_at is not None:
             level = float(exit_at)
@@ -3160,32 +3582,75 @@ def cmd_modify(args: argparse.Namespace) -> int:
                 # could attach a take-profit or a stop-loss on different ticks,
                 # and those two mean opposite things about the money.
                 meant_high = level >= (float(tick.bid) if is_long else float(tick.ask))
-                adjusted_from = level
-                if is_long:
-                    if meant_high:
-                        routed, new_tp, new_sl = "tp", upper, 0.0
-                    else:
-                        routed, new_sl, new_tp = "sl", lower, 0.0
+                # "Above the market" protects a long in profit (a target) and a
+                # short from loss (a stop); below it is the mirror. Same routing
+                # table as the two branches above, applied to the bound the caller
+                # meant rather than the one their level happened to land nearest.
+                if meant_high:
+                    routed, new_tp, new_sl = ("tp", upper, 0.0) if is_long else ("sl", upper, 0.0)
                 else:
-                    if meant_high:
-                        routed, new_sl, new_tp = "sl", upper, 0.0
-                    else:
-                        routed, new_tp, new_sl = "tp", lower, 0.0
+                    routed, new_sl, new_tp = ("sl", lower, 0.0) if is_long else ("tp", lower, 0.0)
+                adjustments.append({
+                    "leg": routed, "requested": level,
+                    "placed": new_tp if routed == "tp" else new_sl,
+                })
         else:
-            if new_tp:
-                if is_long and new_tp < float(tick.ask) + min_distance:
-                    adjusted_from = new_tp
-                    new_tp = float(tick.ask) + min_distance
-                elif not is_long and new_tp > float(tick.bid) - min_distance:
-                    adjusted_from = new_tp
-                    new_tp = float(tick.bid) - min_distance
-            if new_sl:
-                if is_long and new_sl > float(tick.bid) - min_distance:
-                    adjusted_from = new_sl
-                    new_sl = float(tick.bid) - min_distance
-                elif not is_long and new_sl < float(tick.ask) + min_distance:
-                    adjusted_from = new_sl
-                    new_sl = float(tick.ask) + min_distance
+            # An explicit --sl/--tp states the side, so each leg is checked
+            # against the side it claims to be on. Only the legs the caller
+            # PASSED are touched: re-clamping a stop that was already on the
+            # position would let "modify --tp" quietly rewrite the caller's
+            # protection, which is not what they asked for.
+            refused: list[str] = []
+            for leg, requested in (("tp", tp), ("sl", sl)):
+                if requested is None:
+                    continue
+                level = float(requested)
+                if not level:
+                    # An explicit 0 REMOVES that leg rather than placing one at
+                    # price zero, so there is nothing to check it against.
+                    if leg == "tp":
+                        new_tp = 0.0
+                    else:
+                        new_sl = 0.0
+                    continue
+                status, placed = _place_leg(
+                    is_long, leg, level, float(tick.bid), float(tick.ask), min_distance
+                )
+                if status == LEG_WRONG_SIDE:
+                    refused.append(leg)
+                    continue
+                if leg == "tp":
+                    new_tp = placed
+                else:
+                    new_sl = placed
+                if status == LEG_ADJUSTED:
+                    adjustments.append({"leg": leg, "requested": level, "placed": placed})
+            if refused:
+                # The required side depends on the LEG as well as the direction:
+                # a long's stop is below the market and its target is above it, so
+                # naming one side for both would tell half the callers the exact
+                # opposite of what they need to do.
+                leg = sorted(refused)[0]
+                must_be_below = (leg == "sl") == bool(is_long)
+                side = "below" if must_be_below else "above"
+                results.append({
+                    "ticket": position.ticket,
+                    "symbol": position.symbol,
+                    "ok": False,
+                    "error": "the level is on the wrong side of the market",
+                    "wrong_side": sorted(refused),
+                    "bid": float(tick.bid),
+                    "ask": float(tick.ask),
+                    "hint": (
+                        f"a --{leg} on a "
+                        f"{'long' if is_long else 'short'} has to be {side} the "
+                        f"market (bid {tick.bid} / ask {tick.ask}), and the market "
+                        "is already through the level you gave. Nothing was sent. "
+                        "If you meant 'exit at this price' rather than a stop or a "
+                        "target, use --exit-at and the side will be chosen for you."
+                    ),
+                })
+                continue
 
         digits = int(getattr(info, "digits", 5) or 5)
         # Snap to the symbol's precision: the server compares prices digit by
@@ -3218,8 +3683,11 @@ def cmd_modify(args: argparse.Namespace) -> int:
             "routed_to": routed,
             "min_distance": min_distance,
         }
-        if adjusted_from is not None:
-            payload["adjusted_from"] = adjusted_from
+        if adjustments:
+            payload["adjustments"] = adjustments
+            # One scalar too, for the common single-leg case: "did my level
+            # survive?" is the first thing read off a modify result.
+            payload["adjusted_from"] = adjustments[0]["requested"]
             payload["adjust_reason"] = (
                 "the requested level was inside the broker's minimum stop "
                 f"distance ({min_distance}); it was moved just far enough for the "
@@ -3234,17 +3702,27 @@ def cmd_modify(args: argparse.Namespace) -> int:
         results.append(payload)
 
     ok = all(r.get("ok") for r in results) if results else False
+    payload: dict[str, Any] = {
+        "ok": ok,
+        "modified": sum(1 for r in results if r.get("ok")),
+        "results": results,
+    }
+    if ok:
+        payload["note"] = (
+            "The broker's server now holds this level: the exit is executed "
+            "by MetaQuotes with no process and no model turn involved, and it "
+            "survives this sandbox being paused or killed."
+        )
+    else:
+        # A refusal must not be wrapped in a sentence that says the level is held:
+        # that note was attached to every result, including the ones where
+        # nothing was sent and the level is held by nobody.
+        payload["note"] = (
+            "NOTHING was changed: every result above with ok=false was refused, so "
+            "that position still has whatever protection it had before."
+        )
     return emit(
-        {
-            "ok": ok,
-            "modified": sum(1 for r in results if r.get("ok")),
-            "results": results,
-            "note": (
-                "The broker's server now holds this level: the exit is executed "
-                "by MetaQuotes with no process and no model turn involved, and it "
-                "survives this sandbox being paused or killed."
-            ),
-        },
+        payload,
         text=f"modified {sum(1 for r in results if r.get('ok'))} position(s)",
         code=0 if ok else 3,
     )
@@ -3527,6 +4005,36 @@ def _tail(path: Path, lines: int, max_chars: int = _LOG_TAIL_MAX_CHARS) -> str:
     return tail
 
 
+def _log_line_count(path: Path) -> int:
+    """How many lines a log already holds, for tailing only what comes next."""
+    text = _read_log_text(path)
+    return len(text.replace("\x00", "").splitlines()) if text else 0
+
+
+def _tail_new(
+    path: Path, lines: int, skip: int, max_chars: int = _LOG_TAIL_MAX_CHARS
+) -> str:
+    """Last ``lines`` lines written AFTER the first ``skip`` lines of the file.
+
+    A watcher log is appended to across runs, so the last lines of the file at a
+    moment when the CURRENT watcher just died are easily the PREVIOUS watcher's.
+    MEASURED 2026-09-23 (MetaQuotes demo, live): a failed arm reported "watching
+    2 rule(s) every 100 ms; max 600 s" -- a guard that had finished four minutes
+    earlier -- against the 120 s this one had actually been given. A diagnostic
+    that describes a different run is worse than none, because it is read as
+    this one and sends the caller looking for a bug that is not there.
+
+    Counting lines rather than bytes is deliberate: the log is UTF-16LE from
+    Wine, where a byte offset can land mid-character and decode to garbage.
+    """
+    text = _read_log_text(path)
+    content = text.replace("\x00", "").splitlines() if text else []
+    tail = "\n".join(content[max(0, int(skip)):][-max(1, int(lines)):])
+    if len(tail) > max_chars:
+        tail = "...\n" + tail[-max_chars:]
+    return tail
+
+
 def _fit_payload(payload: dict[str, Any], budget: int = _LOG_PAYLOAD_BUDGET) -> dict[str, Any]:
     """Trim a payload until its serialized JSON fits the sandbox's output cap.
 
@@ -3766,13 +4274,20 @@ def build_parser() -> argparse.ArgumentParser:
         "guard_action",
         nargs="?",
         default="status",
-        choices=["arm", "status", "stop", "clear", "events"],
-        help="arm rules, read status, stop the watcher, clear rules, or read events",
+        choices=["arm", "status", "stop", "clear", "events", "ensure"],
+        help="arm rules, read status, stop, clear, read events, or restart a "
+             "stopped watcher that still has rules armed",
     )
     p.add_argument("--rule", action="append", default=[], help="rule JSON (repeatable)")
     p.add_argument("--interval-ms", type=int, default=100, help="tick poll interval (default 100 ms)")
     p.add_argument("--max-seconds", type=int, default=3600, help="how long the guard may watch")
     p.add_argument("--deviation", type=int, default=30)
+    p.add_argument(
+        "--allow-unpriceable",
+        action="store_true",
+        help="arm even if a rule's symbol has no tick right now (the watcher then "
+             "waits for it, and says so in the event log)",
+    )
     p.add_argument("--lines", type=int, default=20, help="events to return")
     p.set_defaults(func=cmd_guard)
 

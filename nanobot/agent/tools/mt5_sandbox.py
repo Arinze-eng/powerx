@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-23.2"
+_CLI_VERSION = "2026-09-23.3"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -565,8 +565,24 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
                     "--max-seconds",
                     str(int(kwargs.get("max_seconds") or 3600)),
                 ]
+                # Arming on a symbol the CLI cannot price is refused by default:
+                # the guard would poll in silence and look exactly like
+                # protection. This is the caller's explicit way to say "the
+                # symbol prices later, watch for it".
+                if kwargs.get("guard_allow_unpriceable"):
+                    parts += ["--allow-unpriceable"]
             elif rule_error:  # pragma: no cover - validated in execute()
                 raise ValueError(rule_error)
+        elif sub_action == "ensure":
+            # Restarting the watcher inherits how it was armed, so the wait and
+            # the tick interval can be restated; the rules themselves come from
+            # the rules file the stopped watcher left behind.
+            parts += [
+                "--max-seconds",
+                str(int(kwargs.get("max_seconds") or 3600)),
+                "--interval-ms",
+                str(int(kwargs.get("interval_ms") or 100)),
+            ]
         elif sub_action == "events":
             parts += ["--lines", str(int(kwargs.get("lines") or 20))]
     elif action == "compile":
@@ -753,7 +769,8 @@ class MT5SandboxTool(Tool):
                 "tickets": {"type": "array", "items": {"type": "integer"}, "description": "action=modify: several position tickets at once."},
                 "all_positions": {"type": "boolean", "description": "action=modify: every open position."},
                 "exit_at": {"type": "number", "description": "action=modify: the price to exit this position at. The SL/TP side is chosen from the position direction and the level is nudged outside the broker's minimum stop distance. This is the instant, broker-held exit -- prefer it over watching the price yourself."},
-                "guard_action": {"type": "string", "enum": ["arm", "status", "stop", "clear", "events"], "description": "action=guard: \"arm\" starts the detached tick-level watcher that closes at trigger_price; \"status\" reports whether it is alive, the rules armed and the price it is seeing; \"events\" returns its log including the measured trigger->fill latency_ms; \"stop\" ends it; \"clear\" drops the rules. Defaults to status."},
+                "guard_action": {"type": "string", "enum": ["arm", "status", "stop", "clear", "events", "ensure"], "description": "action=guard: \"arm\" starts the detached tick-level watcher that closes at trigger_price; \"status\" reports whether it is alive, the rules armed, the price it is seeing and whether any rule cannot be priced; \"events\" returns its log including the measured trigger->fill latency_ms; \"stop\" ends it; \"clear\" drops the rules; \"ensure\" restarts the watcher when rules are still armed but nothing is running, and reports how long the levels went unwatched. Defaults to status. A stopped guard with rules still armed is reported as an ALERT, not a healthy status."},
+                "guard_allow_unpriceable": {"type": "boolean", "description": "action=guard (arm): arm even if a rule's symbol has no tick right now. Off by default: a guard on a symbol the CLI cannot price polls in silence and looks exactly like protection, so it is refused unless you know the symbol prices later (e.g. a market that has not opened yet)."},
                 "trigger_price": {"type": "number", "description": "action=guard (arm): the price level to act on, e.g. 1.1650 in \"close when EURUSD hits 1.1650\"."},
                 "trigger_op": {"type": "string", "enum": [">=", "<="], "description": "action=guard (arm): \">=\" fires at or above the level, \"<=\" at or below. Omit it and the direction is inferred from the live price."},
                 "trigger_side": {"type": "string", "enum": ["mid", "bid", "ask"], "description": "action=guard (arm): which price is compared to the level (default mid = (bid+ask)/2, which is what \"the price\" usually means)."},
@@ -804,10 +821,11 @@ class MT5SandboxTool(Tool):
             "stop",
             "events",
             "clear",
+            "ensure",
         ):
             return ToolResult.error(
-                f"Unknown guard_action '{guard_sub}'. Use arm, status, stop, clear "
-                "or events."
+                f"Unknown guard_action '{guard_sub}'. Use arm, status, stop, clear, "
+                "events or ensure."
             )
 
         if action in _TRADING_ACTIONS and not _trading_enabled():
@@ -962,14 +980,57 @@ class MT5SandboxTool(Tool):
                 if not float(p.get("sl") or 0.0) and not float(p.get("tp") or 0.0)
             ]
             payload["positions_without_a_server_side_exit"] = unprotected
+            # Whether ANYTHING is watching a price is part of reading open risk,
+            # so it is answered in the same payload rather than left to a second
+            # call the model may never make. `guard` comes from the CLI (read from
+            # the watcher's own state file); "none" is a fact, not an absence.
+            guard = payload.get("guard") if isinstance(payload.get("guard"), dict) else {}
+            watched = bool(guard.get("live")) and int(guard.get("rules_armed") or 0) > 0
+            payload["protection"] = {
+                "server_side_exit": [
+                    int(p.get("ticket") or 0)
+                    for p in payload["positions"]
+                    if float(p.get("sl") or 0.0) or float(p.get("tp") or 0.0)
+                ],
+                "guard_live": bool(guard.get("live")),
+                "guard_rules_armed": int(guard.get("rules_armed") or 0),
+                "guard_alert": guard.get("alert"),
+                "unprotected_tickets": unprotected,
+            }
             if unprotected:
                 payload["hint"] = (
                     "These positions have no SL/TP, so nothing but an agent turn can "
                     "close them -- the broker will NOT exit them at a price while you "
                     "are not calling tools. To honour 'close when it hits X', arm a "
                     "server-side exit now: action='modify' with exit_at=X (the broker "
-                    "then holds the level and fires it instantly), or action='guard' "
-                    "for a condition the broker cannot hold."
+                    "then holds the level and fires it instantly)"
+                    + (
+                        "; a tick-level guard IS running and covers the levels armed "
+                        "in it."
+                        if watched
+                        else ", or action='guard' for a condition the broker cannot "
+                        "hold. No tick-level guard is running right now, so a guard "
+                        "rule is NOT currently protecting anything."
+                    )
+                )
+            if guard.get("alert") == "guard_not_running":
+                payload["warning"] = (
+                    f"GUARD NOT WATCHING: {guard.get('rules_armed')} guard rule(s) are "
+                    "armed but the watcher is not running"
+                    + (
+                        f" (it stopped: {guard.get('exit_reason')})"
+                        if guard.get("exit_reason")
+                        else ""
+                    )
+                    + ". Nothing will close at those levels until it is restarted. "
+                    "Restart it with action='guard', guard_action='ensure', then "
+                    "re-read positions before trusting those levels."
+                )
+            elif guard.get("alert") == "rule_unpriceable":
+                payload["warning"] = (
+                    "GUARD BLIND: the watcher is running but cannot price one of its "
+                    "symbols, so that rule can never fire. Re-read action='guard' "
+                    "guard_action='events' for which symbol went dark."
                 )
 
         # action='install' is detached and reports "installing" immediately. Rather

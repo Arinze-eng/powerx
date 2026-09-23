@@ -239,15 +239,43 @@ else — that list is the exact shape of the original complaint.
 * `modify --exit-at X` infers the side from the position: for a long, a level
   above the market is the target and below it is the stop; for a short, the
   reverse. It nudges the level outside the broker's minimum stop distance and
-  reports `adjusted_from` + `adjust_reason` when it had to — **read them**: they
-  mean the level that is now set is not the level that was asked for.
-* A guard fires in **97–109 ms** measured (trigger tick → fill acknowledgement).
-  `guard_action='events'` carries `latency_ms` per fire; when a "close at X"
-  instruction was late, that number is the answer to why.
-* A stopped guard protects nothing. `guard_action='status'` reports `running`
-  and the tick it is seeing — re-arm if it is not running. `status` / `stop` /
-  `events` / `clear` stay available with `MT5_ALLOW_TRADING` off, so a live
-  guard can always be inspected or disarmed.
+  reports `adjustments` (every leg it moved, with the level asked for) plus
+  `adjusted_from` / `adjust_reason` — **read them**: they mean the level that is
+  now set is not the level that was asked for.
+* `modify --sl/--tp` is **checked against the side the leg has to be on**, and a
+  level the market has already gone through is **refused** (`ok: false`,
+  `wrong_side: ["sl"]`), not moved: nothing is sent, and the hint names the side
+  that leg needs and offers `--exit-at` for a caller who meant "exit at X". A
+  level that is merely **too tight** is still clamped out to the broker's
+  minimum distance, staying on its own side. Only the legs you actually pass are
+  touched, so `--tp` never rewrites a stop that was already there. Two different
+  instructions — do not treat a refusal as a failure to retry blindly.
+* A guard fires in **97–110 ms** measured (trigger tick → fill acknowledgement),
+  across three samples (97.3, 109.1, 100.5 ms). `guard_action='events'` carries
+  `latency_ms` per fire; when a "close at X" instruction was late, that number is
+  the answer to why.
+* **A stopped guard with rules still armed is an ALARM, not a status.** `status`
+  answers `ok: false` with `alert: "guard_not_running"`, the `exit_reason`, the
+  `heartbeat_age_s`, and `recovery: "guard action='ensure'"`. Never report the
+  levels as protected while `alert` is set.
+* `guard_action='ensure'` restarts a watcher that stopped with rules still armed,
+  and reports `unprotected_seconds` — the window in which a level could have been
+  touched and nothing acted on it. Say that window out loud; the rules stayed
+  armed through it and nothing fired.
+* **`arm` refuses a symbol it cannot price.** A rule on a symbol with no tick can
+  never fire, and a watcher polling in silence is indistinguishable from
+  protection. The refusal names the symbols (`unpriceable`) and points at
+  `action='symbol'`. Pass `guard_allow_unpriceable=true` only for a symbol you
+  expect to price later. A symbol that goes dark **mid-watch** is logged as
+  `rule_unpriceable` and surfaced by `status` as `alert: "rule_unpriceable"`;
+  if nothing was ever priced the watcher exits with
+  `exit_reason: "unpriceable_symbol"`.
+* `status` / `stop` / `events` / `clear` stay available with `MT5_ALLOW_TRADING`
+  off, so a live guard can always be inspected or disarmed. `ensure`, like `arm`,
+  **starts a process that can place orders and is gated the same way**.
+* `positions` answers "is anything watching a price?" alongside the positions:
+  `protection.guard_live`, `protection.guard_alert`, and a `warning` when rules
+  are armed with nothing running.
 * End a guard with `guard_action='stop'` (a stop **file**), never by killing a
   process: `pkill -f` matches the shell that launched it.
 

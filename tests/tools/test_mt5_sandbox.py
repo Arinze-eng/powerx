@@ -21,6 +21,7 @@ import importlib.util
 import inspect
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -2372,3 +2373,508 @@ def test_a_broker_install_still_records_the_broker_url(monkeypatch, tmp_path):
     recorded = cli.INSTALL_TARGET_FILE.read_text(encoding="utf-8").strip()
     assert recorded != cli.GENERIC_INSTALLER_URL
     assert "exness" in recorded.lower()
+
+
+# --------------------------------------------------------------------------- #
+# a level on the wrong side of the market, and a guard that cannot see
+# --------------------------------------------------------------------------- #
+def test_a_long_stop_above_the_market_is_refused_not_relocated(
+    monkeypatch, tmp_path
+):
+    """The clamp may move a level OUT, never to the other side of the market.
+
+    MEASURED 2026-09-23 (MetaQuotes demo, live): ``modify --sl <above the bid>``
+    on a long came back ok=true with ``adjusted_from`` set, and what had been
+    sent was a stop BELOW the market -- a level the caller never asked for, on
+    the other side of their position, reported as a success. A level the market
+    has already gone through is refused instead, and ``--exit-at`` is named for
+    the caller who really did mean "exit at this price".
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _fake_mt5(position_type=0, bid=1.14240, ask=1.14242, point=0.00001)
+
+    payload = _run_modify(monkeypatch, cli, mt5, ticket=777, sl=1.14300)
+
+    row = payload["results"][0]
+    assert row["ok"] is False
+    assert row["wrong_side"] == ["sl"]
+    assert "exit-at" in row["hint"]
+    assert payload["ok"] is False
+    assert mt5.sent is None, "a refused leg must never reach the broker"
+
+    # A long's TAKE PROFIT below the market is the same mistake the other way.
+    below = _fake_mt5(position_type=0, bid=1.14240, ask=1.14242, point=0.00001)
+    payload = _run_modify(monkeypatch, cli, below, ticket=777, tp=1.14000)
+    assert payload["results"][0]["wrong_side"] == ["tp"]
+    assert below.sent is None
+
+    # A SHORT is the mirror: its stop is above the market, its target below.
+    short_below = _fake_mt5(position_type=1, bid=1.14240, ask=1.14242, point=0.00001)
+    assert _run_modify(monkeypatch, cli, short_below, ticket=777, sl=1.14100)[
+        "results"
+    ][0]["wrong_side"] == ["sl"]
+    assert short_below.sent is None
+    short_above = _fake_mt5(position_type=1, bid=1.14240, ask=1.14242, point=0.00001)
+    assert _run_modify(monkeypatch, cli, short_above, ticket=777, tp=1.14500)[
+        "results"
+    ][0]["wrong_side"] == ["tp"]
+    assert short_above.sent is None
+
+    # The guidance names the side THAT LEG needs: a long's stop is below the
+    # market and its target is above it. MEASURED 2026-09-23 (live): the first
+    # version told a caller their long's --tp had to be "below the market", the
+    # exact opposite of the truth.
+    long_tp = _run_modify(
+        monkeypatch, cli,
+        _fake_mt5(position_type=0, bid=1.14240, ask=1.14242, point=0.00001),
+        ticket=777, tp=1.14000,
+    )["results"][0]
+    assert "has to be above the market" in long_tp["hint"]
+    long_sl = _run_modify(
+        monkeypatch, cli,
+        _fake_mt5(position_type=0, bid=1.14240, ask=1.14242, point=0.00001),
+        ticket=777, sl=1.14300,
+    )["results"][0]
+    assert "has to be below the market" in long_sl["hint"]
+    short_tp = _run_modify(
+        monkeypatch, cli,
+        _fake_mt5(position_type=1, bid=1.14240, ask=1.14242, point=0.00001),
+        ticket=777, tp=1.14500,
+    )["results"][0]
+    assert "has to be below the market" in short_tp["hint"]
+
+
+def test_a_tight_leg_is_clamped_on_its_own_side_and_both_legs_are_reported(
+    monkeypatch, tmp_path
+):
+    """Too tight is not wrong side: that one is moved out, and every move is named.
+
+    A single ``adjusted_from`` field could only ever carry one leg, so clamping
+    both of them reported half of what had been changed about the caller's money.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    # stops_level 5 -> the broker wants 5 points; both legs are asked 1 point out.
+    mt5 = _fake_mt5(position_type=0, bid=1.14240, ask=1.14242, point=0.00001,
+                    stops_level=5)
+
+    payload = _run_modify(monkeypatch, cli, mt5, ticket=777,
+                          sl=1.14239, tp=1.14243)
+
+    row = payload["results"][0]
+    assert row["ok"] is True
+    assert row["sl"] == pytest.approx(1.14235)   # bid - 5 points, still BELOW
+    assert row["tp"] == pytest.approx(1.14247)   # ask + 5 points, still ABOVE
+    # adjusted_from is the first leg moved; the list is what carries every one.
+    assert row["adjusted_from"] == pytest.approx(1.14243)
+    assert [a["leg"] for a in row["adjustments"]] == ["tp", "sl"]
+    assert {a["leg"]: a["placed"] for a in row["adjustments"]} == {
+        "tp": pytest.approx(1.14247),
+        "sl": pytest.approx(1.14235),
+    }
+    assert mt5.sent["sl"] == pytest.approx(1.14235)
+    assert mt5.sent["tp"] == pytest.approx(1.14247)
+
+
+def test_modify_leaves_alone_the_leg_the_caller_did_not_pass(monkeypatch, tmp_path):
+    """``modify --tp`` must not quietly re-place the stop that is already there.
+
+    Only the legs the caller passed are checked and clamped, so a stop the server
+    accepted earlier is carried through exactly as it stands.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _fake_mt5(position_type=0, bid=1.14240, ask=1.14242, point=0.00001,
+                    stops_level=5, sl=1.14200, tp=0.0)
+
+    payload = _run_modify(monkeypatch, cli, mt5, ticket=777, tp=1.14500)
+
+    assert mt5.sent["sl"] == pytest.approx(1.14200), "the existing stop was rewritten"
+    assert mt5.sent["tp"] == pytest.approx(1.14500)
+
+    # An explicit zero REMOVES that leg rather than placing one at price zero.
+    mt5 = _fake_mt5(position_type=0, bid=1.14240, ask=1.14242, sl=1.14200, tp=1.14500)
+    _run_modify(monkeypatch, cli, mt5, ticket=777, tp=0)
+    assert mt5.sent["tp"] == 0.0
+    assert mt5.sent["sl"] == pytest.approx(1.14200)
+
+
+def test_arming_a_guard_on_an_unpriceable_symbol_is_refused(monkeypatch, tmp_path):
+    """A guard that cannot read a price protects nothing, and says nothing.
+
+    MEASURED 2026-09-23 (Runloop box, MetaQuotes demo): a rule on a misspelled
+    symbol answered ``ok=true, guard="armed"`` with a live heartbeat, polled 47
+    times and priced NOTHING. It was indistinguishable from protection. The arm
+    now reads one price per rule symbol up front and refuses the ones it cannot
+    see, naming them.
+    """
+    import argparse
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_guard_current_price", lambda symbol: None)
+    spawned: list[Any] = []
+    monkeypatch.setattr(cli, "_guard_spawn", lambda *a, **k: spawned.append(a))
+
+    args = argparse.Namespace(
+        guard_action="arm",
+        rule=[json.dumps({"symbol": "NOTASYMBOL", "price": 1.0, "op": ">=",
+                          "action": "close", "ticket": 1})],
+        interval_ms=100,
+        max_seconds=60,
+        deviation=30,
+    )
+    code = cli.cmd_guard(args)
+    assert code == 4
+    # Nothing was armed and nothing was started.
+    assert spawned == []
+    assert cli._read_guard_rules() == []
+
+    # The escape hatch exists for a symbol that prices later, and only then.
+    monkeypatch.setattr(cli, "_guard_current_price", lambda symbol: 1.15)
+    monkeypatch.setattr(cli, "_read_guard_state",
+                        lambda: {"status": "running", "pid": 1, "heartbeat": 1e18})
+    args.allow_unpriceable = True
+    assert cli.cmd_guard(
+        argparse.Namespace(**{**vars(args), "rule": [json.dumps(
+            {"symbol": "EURUSD", "price": 1.16, "op": ">=", "ticket": 1})]})
+    ) in (0, 2)
+
+
+def test_an_arm_that_fired_immediately_is_not_reported_as_a_failed_arm(
+    monkeypatch, tmp_path
+):
+    """A rule that is already satisfied fires on tick one and the watcher exits.
+
+    MEASURED 2026-09-23 (MetaQuotes demo, live): the position was closed with
+    ``latency_ms: 92.5, polls: 1`` and the arm still answered ``ok=false,
+    guard="not_running"`` -- a completed exit reported as a failure, which invites
+    arming a second guard over a position that is already closed.
+    """
+    import argparse
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cli, "_guard_current_price", lambda symbol: 1.14212)
+    monkeypatch.setattr(
+        cli, "_guard_python", lambda: ("wine", tmp_path / "python.exe")
+    )
+    rule = cli._validate_rule(
+        {"symbol": "EURUSD", "price": 1.14222, "op": "<=", "side": "bid",
+         "ticket": 152670647138},
+        0, 1.14212,
+    )
+
+    # The spawn stub writes the fire exactly as the real watcher does -- during
+    # the arm, after the ruleset went live. Writing it BEFORE the arm instead
+    # would be testing the false positive the timestamp filter exists to stop.
+    def _spawn_writes_the_fire(*_a, **_k):
+        with open(cli.GUARD_EVENTS_FILE, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "event": "fired", "rule_id": rule["id"], "symbol": "EURUSD",
+                "op": "<=", "level": 1.14222, "trigger_price": 1.14212,
+                "side": "bid", "trigger_ts": time.time(),
+                "close_ts": time.time(), "latency_ms": 92.5,
+                "positions_matched": 1, "polls": 1,
+            }) + "\n")
+        return {"state": {"status": "finished", "exit_reason": "rules_satisfied"},
+                "launcher_pid": "7", "waited_s": 1.0,
+                "log_mark": 0, "err_mark": 0}
+
+    monkeypatch.setattr(cli, "_guard_spawn", _spawn_writes_the_fire)
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "emit",
+                        lambda payload, **_k: captured.update(payload) or 0)
+
+    cli.cmd_guard(argparse.Namespace(
+        guard_action="arm", rule=[json.dumps(
+            {"id": rule["id"], "symbol": "EURUSD", "price": 1.14222, "op": "<=",
+             "side": "bid", "ticket": 152670647138})],
+        interval_ms=100, max_seconds=60, deviation=30,
+    ))
+
+    assert captured["ok"] is True
+    assert captured["guard"] == "fired_immediately"
+    assert captured["fired"][0]["latency_ms"] == 92.5
+    assert "already happened" in captured["message"]
+    assert "error" not in captured
+
+
+def test_an_old_fire_for_the_same_rule_id_is_not_read_as_this_arms_fire(
+    monkeypatch, tmp_path
+):
+    """A re-arm of an explicit rule id must not inherit that rule's old fire.
+
+    Rule ids default to ``g<arm-time>-<index>``, but a caller may pass its own id
+    and re-arm it. Without a timestamp filter, the fire from the FIRST arm is
+    still the newest event for that id, so a watcher that died for a real reason
+    (Wine could not import MetaTrader5, the terminal logged out) would be reported
+    as a completed exit -- the same lie as before, pointing the other way.
+    """
+    import argparse
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cli, "_guard_current_price", lambda symbol: 1.14212)
+    monkeypatch.setattr(cli, "_guard_python", lambda: ("wine", tmp_path / "p.exe"))
+    old_fire = {
+        "event": "fired", "rule_id": "g1700000000-0", "symbol": "EURUSD",
+        "op": "<=", "level": 1.14222, "trigger_price": 1.14212, "side": "bid",
+        "trigger_ts": time.time() - 600.0, "close_ts": time.time() - 600.0,
+        "latency_ms": 92.5, "positions_matched": 1, "polls": 1,
+    }
+    cli.GUARD_EVENTS_FILE.write_text(json.dumps(old_fire) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cli, "_guard_spawn",
+        lambda *a, **k: {"state": {"status": "failed", "error": "no MetaTrader5"},
+                         "launcher_pid": "7", "waited_s": 1.0,
+                         "log_mark": 0, "err_mark": 0},
+    )
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "emit",
+                        lambda payload, **_k: captured.update(payload) or 0)
+
+    cli.cmd_guard(argparse.Namespace(
+        guard_action="arm", rule=[json.dumps(
+            {"id": "g1700000000-0", "symbol": "EURUSD", "price": 1.14222,
+             "op": "<=", "side": "bid", "ticket": 152670647138})],
+        interval_ms=100, max_seconds=60, deviation=30,
+    ))
+
+    assert captured["ok"] is False
+    assert captured["guard"] == "not_running"
+    assert "fired" not in captured
+
+
+def test_a_fire_whose_close_was_rejected_is_not_reported_as_a_dead_watcher(
+    monkeypatch, tmp_path
+):
+    """Level touched, close refused: the position is still open and must be said.
+
+    A ``close_failed`` event means the watcher DID its job and the broker said no
+    ("market closed", "no prices", an invalid deviation). Reading that as a failed
+    arm sends the caller to diagnose Wine while a position sits open at a level
+    they asked to be out at.
+    """
+    import argparse
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cli, "_guard_current_price", lambda symbol: 1.14212)
+    monkeypatch.setattr(cli, "_guard_python", lambda: ("wine", tmp_path / "p.exe"))
+    rule = cli._validate_rule(
+        {"symbol": "EURUSD", "price": 1.14222, "op": "<=", "side": "bid",
+         "ticket": 152670647138},
+        0, 1.14212,
+    )
+
+    def _spawn_writes_the_rejection(*_a, **_k):
+        with open(cli.GUARD_EVENTS_FILE, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "event": "close_failed", "rule_id": rule["id"],
+                "symbol": "EURUSD", "op": "<=", "level": 1.14222,
+                "trigger_price": 1.14212, "trigger_ts": time.time(),
+                "close_ts": time.time(), "latency_ms": 88.0,
+                "positions_matched": 1, "polls": 1,
+                "results": [{"ok": False, "retcode": 10018,
+                             "comment": "market closed"}],
+            }) + "\n")
+        return {"state": {"status": "finished", "exit_reason": "rules_satisfied"},
+                "launcher_pid": "7", "waited_s": 1.0,
+                "log_mark": 0, "err_mark": 0}
+
+    monkeypatch.setattr(cli, "_guard_spawn", _spawn_writes_the_rejection)
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "emit",
+                        lambda payload, **_k: captured.update(payload) or 0)
+
+    cli.cmd_guard(argparse.Namespace(
+        guard_action="arm", rule=[json.dumps(
+            {"id": rule["id"], "symbol": "EURUSD", "price": 1.14222, "op": "<=",
+             "side": "bid", "ticket": 152670647138})],
+        interval_ms=100, max_seconds=60, deviation=30,
+    ))
+
+    assert captured["ok"] is False
+    assert captured["guard"] == "close_failed"
+    assert captured["close_failed"][0]["results"][0]["retcode"] == 10018
+    assert "still open" in captured["message"]
+    assert "error" not in captured
+
+
+def test_a_guard_that_stopped_is_an_alert_not_a_healthy_status(monkeypatch, tmp_path):
+    """Armed rules plus a stopped watcher is the failure that must never read OK.
+
+    MEASURED 2026-09-23: after a guard hit its own --max-seconds, ``status``
+    answered ``ok=true, running=false`` with the rules still armed and a hint --
+    which reads as "everything is fine" while the level is watched by nobody.
+    """
+    import argparse
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    cli.GUARD_RULES_FILE.write_text(
+        json.dumps([{"id": "g1", "symbol": "EURUSD", "op": ">=", "price": 1.2}]),
+        encoding="utf-8",
+    )
+    cli.GUARD_STATE_FILE.write_text(
+        json.dumps({"status": "finished", "exit_reason": "max_seconds",
+                    "heartbeat": 1.0, "polls": 78}),
+        encoding="utf-8",
+    )
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "emit",
+                        lambda payload, **_k: captured.update(payload) or 0)
+
+    code = cli.cmd_guard(argparse.Namespace(guard_action="status"))
+    assert code == 0
+    assert captured["ok"] is False
+    assert captured["alert"] == "guard_not_running"
+    assert captured["exit_reason"] == "max_seconds"
+    assert "ensure" in captured["recovery"]
+    assert "NOTHING is watching them" in captured["warning"]
+
+    # The same rules with nothing running are also what `positions` reports, so a
+    # caller reading open risk is told in the same breath.
+    summary = cli._guard_summary()
+    assert summary["live"] is False
+    assert summary["rules_armed"] == 1
+    assert summary["alert"] == "guard_not_running"
+
+
+def test_ensure_restarts_a_stopped_guard_and_names_the_unwatched_window(
+    monkeypatch, tmp_path
+):
+    """Recovery is one call, and the gap is reported rather than papered over.
+
+    Anything that touched an armed level while the watcher was down was missed, so
+    the caller is told how long that window was instead of being handed a fresh
+    "armed" and left to assume it was never open.
+    """
+    import argparse
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    cli.GUARD_RULES_FILE.write_text(
+        json.dumps([{"id": "g1", "symbol": "EURUSD", "op": ">=", "price": 1.2}]),
+        encoding="utf-8",
+    )
+    stopped_at = cli.time.time() - 42.0
+    cli.GUARD_STATE_FILE.write_text(
+        json.dumps({"status": "finished", "exit_reason": "max_seconds",
+                    "interval_ms": 100, "heartbeat": stopped_at}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_guard_python", lambda: ("wine", tmp_path / "py.exe"))
+    monkeypatch.setattr(
+        cli, "_guard_spawn",
+        lambda *a, **k: {"state": {"status": "running", "pid": 9,
+                                   "heartbeat": cli.time.time()},
+                         "launcher_pid": "9", "waited_s": 1.0},
+    )
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "emit",
+                        lambda payload, **_k: captured.update(payload) or 0)
+
+    code = cli.cmd_guard(argparse.Namespace(guard_action="ensure", max_seconds=600))
+    assert code == 0
+    assert captured["action"] == "rearmed"
+    assert captured["ok"] is True
+    assert captured["previous_exit_reason"] == "max_seconds"
+    assert captured["unprotected_seconds"] == pytest.approx(42.0, abs=1.0)
+    assert "NOT acted on" in captured["warning"]
+
+    # Nothing armed and nothing to restart -> no watcher is spawned for nothing.
+    cli.GUARD_RULES_FILE.write_text("[]", encoding="utf-8")
+    spawned: list[Any] = []
+    monkeypatch.setattr(cli, "_guard_spawn", lambda *a, **k: spawned.append(a))
+    cli.cmd_guard(argparse.Namespace(guard_action="ensure", max_seconds=600))
+    assert spawned == []
+    assert captured["running"] is False and captured["rules_armed"] == 0
+
+    # Rules armed, watcher dead, and no Windows python to restart it: the armed
+    # rules are UNPROTECTED and that is what the refusal says.
+    cli.GUARD_RULES_FILE.write_text(
+        json.dumps([{"id": "g1", "symbol": "EURUSD", "op": ">=", "price": 1.2}]),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_guard_python", lambda: None)
+    captured.clear()
+    cli.cmd_guard(argparse.Namespace(guard_action="ensure", max_seconds=600))
+    assert captured["ok"] is False
+    assert captured["alert"] == "guard_not_running"
+    assert captured["rules_armed"] == 1
+    assert "UNPROTECTED" in str(captured)
+
+
+def test_the_watcher_reports_a_symbol_it_cannot_price(monkeypatch, tmp_path):
+    """A symbol that goes dark mid-watch is an event, and a stop is a stop.
+
+    The watcher must not poll forever in silence on a symbol with no tick: it
+    writes ``rule_unpriceable`` (and ``rule_priceable`` when the feed returns),
+    keeps the outage in its state file, and -- if NOTHING has ever been priced --
+    exits with ``unpriceable_symbol`` instead of pretending to watch.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    source = cli._GUARD_WATCH_SOURCE
+    assert "rule_unpriceable" in source
+    assert "rule_priceable" in source
+    assert "unpriceable_symbol" in source
+    assert '"unpriceable": {s: round(t, 1) for s, t in unpriced_since.items()}' in source
+    assert "UNPRICEABLE_STALE" in source
+
+
+def test_guard_ensure_and_the_unpriceable_override_reach_the_cli():
+    ensure = build_cli_command(
+        "guard", {"guard_action": "ensure", "max_seconds": 600, "interval_ms": 50}
+    )
+    assert "mt5_cli.py guard ensure" in ensure
+    assert "--max-seconds 600" in ensure and "--interval-ms 50" in ensure
+
+    armed = build_cli_command(
+        "guard",
+        {"guard_action": "arm", "symbol": "EURUSD", "trigger_price": 1.165,
+         "guard_allow_unpriceable": True},
+    )
+    assert "--allow-unpriceable" in armed
+    # Off unless asked for: refusing is the default.
+    plain = build_cli_command(
+        "guard", {"guard_action": "arm", "symbol": "EURUSD", "trigger_price": 1.165}
+    )
+    assert "--allow-unpriceable" not in plain
+
+
+async def test_guard_ensure_is_gated_like_arming(monkeypatch):
+    """ensure SPAWNS the watcher, so trading-off must not start one silently."""
+    monkeypatch.delenv("MT5_ALLOW_TRADING", raising=False)
+    sandbox = _FakeSandbox('{"ok": true}\n[exit_code=0]')
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+
+    result = await tool.execute(action="guard", guard_action="ensure")
+
+    assert result.is_error and "MT5_ALLOW_TRADING" in str(result)
+    assert sandbox.calls == []
+
+
+async def test_positions_says_when_a_guard_is_not_actually_watching():
+    """Open risk and the answer to "is anything watching a price" travel together."""
+    payload = {
+        "ok": True,
+        "count": 1,
+        "positions": [{"ticket": 1, "symbol": "EURUSD", "sl": 0.0, "tp": 0.0}],
+        "guard": {"live": False, "rules_armed": 2,
+                  "alert": "guard_not_running", "exit_reason": "max_seconds"},
+    }
+    sandbox = _FakeSandbox(json.dumps(payload) + "\n[exit_code=0]")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+
+    rendered = str(await tool.execute(action="positions"))
+
+    assert '"guard_alert": "guard_not_running"' in rendered
+    assert "GUARD NOT WATCHING" in rendered
+    assert "ensure" in rendered
+    assert "NOT currently protecting anything" in rendered
+
+    # And with a live guard the hint says so instead of implying the rule is idle.
+    payload["guard"] = {"live": True, "rules_armed": 2, "alert": None}
+    sandbox.response = json.dumps(payload) + "\n[exit_code=0]"
+    rendered = str(await tool.execute(action="positions"))
+    assert "GUARD NOT WATCHING" not in rendered
+    assert "a tick-level guard IS running" in rendered
