@@ -2961,3 +2961,35 @@ def test_the_tools_guard_omits_the_budget_so_the_cli_default_applies():
 
     cmd = build_cli_command("guard", {"guard_action": "ensure", "max_seconds": 120})
     assert "--max-seconds 120" in cmd
+
+
+def test_the_reported_latency_survives_a_narrow_events_window(monkeypatch, tmp_path):
+    """``last_latency_ms`` is the last FIRE's, not the last line's.
+
+    MEASURED 2026-09-23 (live, MetaQuotes): a guard fired and closed its position
+    in 145.1 ms; ``guard events --lines 1`` then answered ``last_latency_ms:
+    null``, because the one newest line was the ``watcher_stop`` that followed the
+    fire. The latency is what the caller asks for when a close was late, so it has
+    to survive the window they happened to ask for.
+    """
+    import argparse
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"event": "fired", "rule_id": "g1", "latency_ms": 145.1,
+         "positions_matched": 1, "close_ts": 1.0},
+        {"event": "watcher_stop", "exit_reason": "rules_satisfied", "ts": 1.1},
+    ]
+    cli.GUARD_EVENTS_FILE.write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+    )
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "emit",
+                        lambda payload, **_k: captured.update(payload) or 0)
+
+    cli.cmd_guard(argparse.Namespace(guard_action="events", lines=1))
+
+    assert captured["count"] == 1
+    assert captured["events"][0]["event"] == "watcher_stop"
+    assert captured["last_latency_ms"] == 145.1

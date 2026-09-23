@@ -3433,12 +3433,22 @@ def cmd_guard(args: argparse.Namespace) -> int:
     if subcommand == "events":
         events = _guard_events(int(getattr(args, "lines", 20) or 20))
         fired = [e for e in events if e.get("event") == "fired"]
+        # The last fire is read from the WHOLE log, not from the returned window.
+        # MEASURED 2026-09-23 (live): after a guard fired and closed its position,
+        # ``guard events --lines 1`` answered ``last_latency_ms: null`` because the
+        # single newest line was the watcher_stop that followed the fire. That
+        # number is the headline answer to "why was the close late", so it is the
+        # last fire's, never the window's.
+        all_fired = [e for e in _guard_events(500) if e.get("event") == "fired"]
         return emit(
             {
                 "ok": True,
                 "count": len(events),
                 "events": events,
-                "last_latency_ms": fired[-1].get("latency_ms") if fired else None,
+                "last_latency_ms": (
+                    all_fired[-1].get("latency_ms") if all_fired
+                    else (fired[-1].get("latency_ms") if fired else None)
+                ),
                 "note": (
                     "latency_ms is measured inside the watcher: the tick that "
                     "crossed the level to the broker's fill acknowledgement."
