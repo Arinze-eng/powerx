@@ -205,7 +205,79 @@ def test_derived_search_can_succeed_without_a_page():
     result = bd.discover_installer("Deriv-Server", probe=_probe_returning({target}))
     assert result["found"] is True
     assert result["source"] == "derived"
-    assert result["dir_name"] == "MetaTrader 5 DERIV"
+    # NOT "MetaTrader 5 DERIV": Deriv is the measured exception, and the known
+    # table must beat the inferred pattern -- a wrong dir name breaks coexistence.
+    assert result["dir_name"] == "MetaTrader 5 Terminal"
+
+
+def test_unlisted_broker_falls_back_to_the_brand_pattern():
+    target = "https://download.mql5.com/cdn/web/nonexistent/mt5/nonexistent5setup.exe"
+    result = bd.discover_installer("Nonexistent-Server", probe=_probe_returning({target}))
+    assert result["found"] is True
+    assert result["dir_name"] == "MetaTrader 5 NONEXISTENT"
+
+
+# --------------------------------------------------------------------------- #
+# the known-broker table
+# --------------------------------------------------------------------------- #
+def test_known_broker_candidates_are_tried_before_generic_guesses():
+    """The table carries real entity domains that brand_tokens cannot derive.
+
+    MEASURED: AXI's slug is ``axicorp.financial.services``; no amount of token
+    splitting gets from "axicorp" to that.
+    """
+    urls = bd.candidate_installer_urls("AXICorp-Live01")
+    assert urls, "expected candidates"
+    assert "axicorp.financial.services" in urls[0]
+
+
+def test_known_brokers_use_their_real_entity_domains():
+    """The mined slugs must appear, not just the bare brand."""
+    exness = bd.candidate_installer_urls("Exness-Real")
+    assert any("exness.technologies.ltd" in u for u in exness)
+    deriv = bd.candidate_installer_urls("Deriv-Server")
+    assert any("deriv.com.limited" in u for u in deriv)
+
+
+def test_known_dir_name_is_reported_for_deriv_only_where_measured():
+    assert bd.known_broker_dir_name("Deriv-Server") == "MetaTrader 5 Terminal"
+    # Unlisted and ordinary brokers have no recorded override.
+    assert bd.known_broker_dir_name("ICMarketsSC-Live01") == ""
+    assert bd.known_broker_dir_name("NoSuchBroker-1") == ""
+
+
+def test_env_override_beats_the_builtin_table(monkeypatch):
+    """The escape hatch for a slug we got wrong or that has since changed."""
+    monkeypatch.setenv("MT5_BROKER_INSTALLERS", "xm|real.xm.domain|xm")
+    assert bd.known_broker_candidates("XMGlobal-Live")[0] == ("real.xm.domain", "xm")
+
+
+def test_malformed_env_entries_are_skipped_not_fatal(monkeypatch):
+    """A typo in an ops variable must not break discovery for every broker."""
+    monkeypatch.setenv("MT5_BROKER_INSTALLERS", "garbage;;x|y|z|w;ok|slug.here|ok")
+    assert bd._env_broker_installers() == {"ok": [("slug.here", "ok")]}
+    # And discovery still works with the bad variable set.
+    assert bd.candidate_installer_urls("OK-Live")
+
+
+def test_env_absent_means_no_overrides(monkeypatch):
+    monkeypatch.delenv("MT5_BROKER_INSTALLERS", raising=False)
+    assert bd._env_broker_installers() == {}
+
+
+def test_table_candidates_are_still_validated():
+    """Safety property: a table entry is a CANDIDATE, never trusted blindly.
+
+    A wrong slug must cost one probe and fail, not reach an installer.
+    """
+    result = bd.discover_installer("ICMarketsSC-Live01", probe=_probe_returning(set()))
+    assert result["found"] is False
+    assert result["blocked"] is False
+
+
+def test_table_does_not_break_brand_token_lookups():
+    assert bd.brand_tokens("ICMarketsSC-Live01")[0] == "icmarketssc"
+    assert bd.brand_tokens("XMGlobal-Demo")[0] == "xmglobal"
 
 
 def test_a_rate_limit_stops_the_sweep_immediately():

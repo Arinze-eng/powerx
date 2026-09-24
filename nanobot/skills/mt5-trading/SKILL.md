@@ -72,14 +72,19 @@ rejected with a clear message instead of burning a two-minute Wine install and
 then dying as `could not download the MT5 installer`. If you see a rejection, fix
 the slug from the broker's own "Download MT5" page — do not retry the same URL.
 
-### An unknown broker: `discover_broker`, then search
+### An unknown broker: `list_brokers`, then `discover_broker`
 
 The registry (`BROKER_BUILDS`) only knows a handful of brokers. Handed
 credentials for ANY other one, MT5 does not report a wrong build — it **skips the
 connection silently**, writes zero `Network` lines, and the bridge blocks on its
 IPC timeout. The login reads as a frozen terminal and the real cause is invisible.
 
-The path forward is `action='discover_broker'`, and **you do the search half of it**:
+**Step 1 — ask what is already known.** `action='list_brokers'` returns every
+broker whose installer the tool already knows, and marks the install-dir names
+that differ from the usual `MetaTrader 5 <BRAND>` pattern. Do this FIRST: it tells
+you whether this broker is handled before you spend a single probe.
+
+**Step 2 — search, then discover.** You do the search half:
 
 ```
 1. web-search "<broker> download MT5" and fetch the broker's OWN download page.
@@ -92,11 +97,21 @@ then status -> done, start, account.
 ```
 
 **Pass `page_urls` whenever you have it.** A link mined from the broker's own page
-is *authoritative*; a slug you or the tool invents is nearly always a 404 —
+is *authoritative*; a slug invented from the brand is nearly always a 404. The
+slug is a legal ENTITY domain, not the brand — seen in the wild:
+`axicorp.financial.services` (AXI), `exness.technologies.ltd`, `deriv.com.limited`.
 MEASURED 2026-09-24: 210 blind slug permutations across 21 well-known brokers
-produced **2** live URLs. The slug is genuinely unguessable: Deriv needs
-`deriv.com.limited` (not `deriv`, `deriv.ltd`, `deriv.markets`), Exness needs
-`exness.technologies.ltd`. So search first, then pass what you found.
+produced **2** live URLs. So search first, then pass what you found.
+
+If the broker IS in `list_brokers`, discovery tries its known entity domain
+first — you may not need to search at all. Either way, **never hand-build an
+installer URL and never retry a login against a terminal that cannot resolve the
+server.**
+
+**Adding a broker permanently** — worth telling the user, since it helps every
+later run: set `MT5_BROKER_INSTALLERS='brand|slug|name;brand2|slug2|name2'` in the
+deployment. Operator entries win over the built-in table, so this also corrects a
+slug that has gone stale.
 
 Two things the answer can say that are NOT "the broker does not exist":
 

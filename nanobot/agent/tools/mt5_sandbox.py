@@ -144,7 +144,7 @@ _READ_ONLY_ACTIONS = frozenset(
 #: an HTTP search for an installer URL. Both must work when the sandbox is gone
 #: or has never been created -- discovering where to download MT5 from is most
 #: needed precisely before anything is installed.
-_HOST_ONLY_ACTIONS = frozenset({"plan", "discover_broker"})
+_HOST_ONLY_ACTIONS = frozenset({"plan", "discover_broker", "list_brokers"})
 
 _ALL_ACTIONS = sorted(
     _READ_ONLY_ACTIONS
@@ -651,6 +651,85 @@ def _host_discover_broker(kwargs: dict[str, Any]) -> str:
             "No installer validated from the server's brand tokens. Fetch the "
             "broker's own 'Download MT5' page and pass its text as page_urls (the "
             "link there is authoritative), or ask the user to paste the link."
+        )
+    return json.dumps(payload)
+
+
+def _host_list_brokers(kwargs: dict[str, Any]) -> str:
+    """``action='list_brokers'``: the brokers whose installer is already known.
+
+    This is the agent's own memory of brokers. WITHOUT it the model meets an
+    unknown server, has no idea whether the tool can handle it, and either guesses
+    a URL (which almost always 404s) or gives up and asks the user to find their
+    own download link.
+
+    WITH it, the sequence for any broker is decidable before a single probe: if the
+    broker is here, discovery will try its real, mined installer domain first; if
+    it is not, the model knows to web-search the broker's "Download MT5" page and
+    pass the link as ``page_urls``. Either way it does not have to guess.
+
+    Reports the built-in table plus any operator additions from
+    ``MT5_BROKER_INSTALLERS``, and -- importantly -- marks which install directory
+    names are KNOWN to differ from the usual "MetaTrader 5 <BRAND>" pattern, since
+    a wrong directory name silently breaks coexistence with other builds.
+    """
+    from nanobot.trading import broker_discovery as bd
+
+    wanted = str(kwargs.get("query") or "").strip().lower()
+
+    entries: list[dict[str, Any]] = []
+    for brand, entry in sorted(bd._KNOWN_BROKERS.items()):
+        if wanted and wanted not in brand:
+            continue
+        candidates = [
+            bd.INSTALLER_URL_TEMPLATE.format(slug=slug, name=name)
+            for slug, name in entry.get("candidates", ())
+        ]
+        item: dict[str, Any] = {
+            "brand": brand,
+            "candidate_installer_urls": candidates,
+        }
+        if entry.get("dir_name"):
+            item["install_dir_name"] = entry["dir_name"]
+            item["dir_name_note"] = (
+                "Known to differ from the usual 'MetaTrader 5 <BRAND>' pattern -- "
+                "pass this as broker_dir_name, or coexistence with other builds "
+                "silently fails."
+            )
+        entries.append(item)
+
+    env_added = bd._env_broker_installers()
+    payload: dict[str, Any] = {
+        "known_broker_count": len(bd._KNOWN_BROKERS),
+        "brokers": entries,
+        "operator_additions": {k: [f"{s}|{n}" for s, n in v] for k, v in sorted(env_added.items())},
+        "how_to_use": (
+            "For a server whose brand appears above: call action='discover_broker' "
+            "with server=<their server>; the known installer domains are tried "
+            "FIRST, and each candidate is validated (200 + executable + real size) "
+            "before it can be installed. Pass page_urls too when you have the "
+            "broker's own download page -- that always beats a table entry."
+        ),
+        "if_the_broker_is_missing": (
+            "Web-search '<broker> download MT5', fetch the broker's own download "
+            "page, and pass it as page_urls to action='discover_broker'. The link "
+            "there is authoritative. Do NOT hand-build an installer URL: the CDN "
+            "slug is a legal entity domain (AXI is axicorp.financial.services, "
+            "Exness exness.technologies.ltd, Deriv deriv.com.limited) and cannot be "
+            "guessed from the brand -- 210 blind guesses across 21 brokers produced "
+            "2 hits."
+        ),
+        "add_a_broker_permanently": (
+            "Set MT5_BROKER_INSTALLERS='brand|slug|name;brand2|slug2|name2' in the "
+            "deployment. Operator entries win over the built-in table, so this also "
+            "corrects a slug that has gone stale."
+        ),
+    }
+    if wanted and not entries:
+        payload["matches"] = []
+        payload["note"] = (
+            f"No built-in entry matches {wanted!r}. Use "
+            "'if_the_broker_is_missing' above -- search, then pass page_urls."
         )
     return json.dumps(payload)
 
@@ -1204,11 +1283,14 @@ class MT5SandboxTool(Tool):
             "MT5_ALLOW_TRADING to be "
             "enabled and return the broker retcode; a rejected order is reported with "
             "code 3 and its reason rather than raising. "
-            "UNKNOWN BROKER? action='discover_broker'. The registry only knows a few "
-            "brokers; given credentials for any other, MT5 does not say the build is "
-            "wrong -- it skips the connection SILENTLY and the login reads as a frozen "
-            "terminal. So when a login hangs, or the user names a broker you do not "
-            "recognise, call action='discover_broker' with server=<their server>. "
+            "UNKNOWN BROKER? action='list_brokers' first, then action='discover_broker'. The "
+            "registry only knows a few brokers; given credentials for any other, MT5 "
+            "does not say the build is wrong -- it skips the connection SILENTLY and "
+            "the login reads as a frozen terminal. action='list_brokers' shows which "
+            "brokers' installer domains are already known (and which install-dir "
+            "names differ from the usual pattern), so you can tell immediately "
+            "whether discovery will handle this broker. action='discover_broker' then "
+            "returns a VALIDATED installer URL for any server. "
             "ALSO SEARCH FIRST AND PASS WHAT YOU FIND as page_urls: fetch the broker's "
             "own 'Download MT5' page and pass it, because a link mined from there is "
             "authoritative while a guessed CDN slug almost always 404s (the slug is "
@@ -1300,6 +1382,7 @@ class MT5SandboxTool(Tool):
                 "max_total_risk_pct": {"type": "number", "description": "action=limits: as max_total_risk_money, but as a percentage of account EQUITY. Needs the account to be readable: with no equity the percentage cannot be checked and is reported as such rather than assumed to pass."},
                 "watch_session": {"type": "string", "description": "action=watch: continue ONE observation across calls. Every watch carrying the same name folds its samples into a ledger on the box and returns session.price_path_total (the WHOLE session's high/low/drift, not this call's) plus session.since_last_call (the move since you last looked) and session.elapsed_s. USE THIS WHENEVER YOU FOLLOW A LIVE TRADE: without it each 90-second call reports a different trade's first price and drift, so 'is it working?' cannot be answered across calls. With it the calls are one timeline and you can think between them."},
                 "page_urls": {"type": "array", "items": {"type": "string"}, "description": "action=discover_broker: the broker's own 'Download MT5' page -- either the URL (fetched for you) or already-fetched page text. A link mined from that page is AUTHORITATIVE and beats any derived guess, so ALWAYS pass it when you have it. Search for '<broker> download MT5', fetch the broker's own download page, and pass what you find. Without it the tool can only probe a few derived candidates, which usually fails: the CDN slug is unguessable (Deriv needs 'deriv.com.limited', Exness 'exness.technologies.ltd')."},
+                "query": {"type": "string", "description": "action=list_brokers: optional brand filter, e.g. 'icmarkets' or 'xm'. Omit to list every broker whose installer is already known."},
             },
             "required": ["action"],
         }
@@ -1318,6 +1401,8 @@ class MT5SandboxTool(Tool):
         if action in _HOST_ONLY_ACTIONS:
             if action == "discover_broker":
                 return _host_discover_broker(kwargs)
+            if action == "list_brokers":
+                return _host_list_brokers(kwargs)
             return _host_plan(kwargs)
 
         # --- trading gate -------------------------------------------------- #

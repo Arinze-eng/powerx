@@ -34,6 +34,7 @@ the CLI *inside* the Wine sandbox, where adding a dependency is not an option.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 import urllib.error
@@ -44,6 +45,8 @@ __all__ = [
     "brand_tokens",
     "candidate_slugs",
     "candidate_installer_urls",
+    "known_broker_candidates",
+    "known_broker_dir_name",
     "extract_installer_urls",
     "probe_url",
     "validate_installer_url",
@@ -246,14 +249,131 @@ def candidate_slugs(server: str | None) -> list[str]:
     return slugs
 
 
-def candidate_installer_urls(server: str | None) -> list[str]:
-    """Installer URLs to probe for a server, derived from its brand tokens.
+#: Known brokers: brand token -> known-good installer candidates + install dir.
+#:
+#: HOW TO READ THIS TABLE. Each entry lists the (slug, filename) pairs that are
+#: PLAUSIBLE for that broker, most likely first. They are CANDIDATES, not claims:
+#: every one is still validated by ``discover_installer`` before it can reach an
+#: installer, so a wrong entry costs exactly one HTTP probe (or a 404) and can
+#: never burn a two-minute Wine install. That is what makes this table safe to
+#: ship while the CDN slugs remain genuinely hard to guess.
+#:
+#: WHY IT EXISTS AT ALL: the CDN slug is a legal entity domain, not the brand, and
+#: the mapping is unguessable from a server name. MINED from live broker pages:
+#: AXI -> ``axicorp.financial.services``, Exness -> ``exness.technologies.ltd``,
+#: Deriv -> ``deriv.com.limited``. ``brand_tokens`` cannot derive any of those, so
+#: without this table a correctly-named server still fails discovery.
+#:
+#: ``dir_name`` is only recorded where it is KNOWN to differ from the usual
+#: "MetaTrader 5 <BRAND>" (Deriv creates "MetaTrader 5 Terminal"). Leaving it unset
+#: is correct for the common case and avoids asserting a name nobody verified.
+#:
+#: Operators can extend or correct this WITHOUT a code change via
+#: ``MT5_BROKER_INSTALLERS='brand|slug|name;brand2|slug2|name2'`` -- the right
+#: escape hatch for a broker whose slug we got wrong or has since changed.
+_KNOWN_BROKERS: dict[str, dict[str, Any]] = {
+    "exness": {"candidates": [("exness.technologies.ltd", "exness")]},
+    "deriv": {
+        "candidates": [("deriv.com.limited", "deriv")],
+        # MEASURED live: Deriv's installer creates "MetaTrader 5 Terminal", not
+        # "MetaTrader 5 DERIV". Load-bearing on both sides (the installer waits for
+        # terminal64.exe there; find_terminal separates builds by that name).
+        "dir_name": "MetaTrader 5 Terminal",
+    },
+    "axi": {"candidates": [("axicorp.financial.services", "axi")]},
+    "icmarkets": {"candidates": [("icmarkets.limited", "icmarkets"), ("icmarkets.com", "icmarkets")]},
+    "pepperstone": {"candidates": [("pepperstone.limited", "pepperstone"), ("pepperstone.com", "pepperstone")]},
+    "xm": {"candidates": [("xm.com", "xm"), ("xmglobal.com", "xm")]},
+    "fxtm": {"candidates": [("forextime.com", "fxtm"), ("fxtm.limited", "fxtm")]},
+    "hotforex": {"candidates": [("hfmarkets.limited", "hotforex"), ("hotforex.com", "hotforex")]},
+    "hfm": {"candidates": [("hfmarkets.limited", "hfm")]},
+    "fbs": {"candidates": [("fbs.trade", "fbs"), ("fbs.com", "fbs")]},
+    "vantage": {"candidates": [("vantagemarkets.com", "vantage"), ("vantagefx.limited", "vantage")]},
+    "eightcap": {"candidates": [("eightcap.com", "eightcap"), ("eightcap.limited", "eightcap")]},
+    "tickmill": {"candidates": [("tickmill.limited", "tickmill"), ("tickmill.com", "tickmill")]},
+    "avatrade": {"candidates": [("avatrade.com", "avatrade")]},
+    "admiralmarkets": {"candidates": [("admiralmarkets.com", "admiralmarkets")]},
+    "fxpro": {"candidates": [("fxpro.com", "fxpro")]},
+    "thinkmarkets": {"candidates": [("thinkmarkets.com", "thinkmarkets")]},
+    "fpmarkets": {"candidates": [("fpmarkets.com", "fpmarkets")]},
+    "oanda": {"candidates": [("oanda.com", "oanda")]},
+    "justmarkets": {"candidates": [("justmarkets.com", "justmarkets")]},
+    "fxopen": {"candidates": [("fxopen.com", "fxopen")]},
+    "instaforex": {"candidates": [("instaforex.com", "instaforex")]},
+    "litefinance": {"candidates": [("litefinance.org", "litefinance")]},
+    "robofx": {"candidates": [("roboforex.com", "robofx"), ("roboforex.com", "roboforex")]},
+    "windsorbrokers": {"candidates": [("windsorbrokers.com", "windsor")]},
+    "alpari": {"candidates": [("alpari", "alpari"), ("alpari.com", "alpari")]},
+    "nordfx": {"candidates": [("nordfx.ltd", "nordfx"), ("nordfx.com", "nordfx")]},
+    "axicorp": {"candidates": [("axicorp.financial.services", "axi")]},
+}
 
-    The ``{name}`` half is the bare token (no suffix); MEASURED 2026-09-24:
-    ``deriv`` uses ``deriv5setup.exe`` and ``exness`` uses ``exness5setup.exe``,
-    so the filename is the brand even when the slug is a domain.
+
+def known_broker_candidates(server: str | None) -> list[tuple[str, str]]:
+    """Known (slug, filename) candidate pairs for a server's brand, if any.
+
+    Returned ahead of the generic guesses so the specific knowledge is spent
+    first. An entry here is still only a CANDIDATE -- the caller validates it.
+    """
+    pairs: list[tuple[str, str]] = []
+    for token in brand_tokens(server):
+        entry = _KNOWN_BROKERS.get(token)
+        if not entry:
+            continue
+        for slug, name in entry.get("candidates", ()):
+            pair = (str(slug), str(name))
+            if pair not in pairs:
+                pairs.append(pair)
+    # Operator-supplied additions/corrections win over the built-in table.
+    for token in brand_tokens(server):
+        for slug, name in _env_broker_installers().get(token, ()):
+            pair = (slug, name)
+            if pair not in pairs:
+                pairs.insert(0, pair)
+    return pairs
+
+
+def known_broker_dir_name(server: str | None) -> str:
+    """The known install directory for a server's broker, or "" if not recorded."""
+    for token in brand_tokens(server):
+        entry = _KNOWN_BROKERS.get(token)
+        if entry and entry.get("dir_name"):
+            return str(entry["dir_name"])
+    return ""
+
+
+def _env_broker_installers() -> dict[str, list[tuple[str, str]]]:
+    """Parse ``MT5_BROKER_INSTALLERS`` ('brand|slug|name;brand|slug|name').
+
+    The escape hatch for a broker whose slug is wrong or has changed: fix it in
+    the environment rather than waiting for a code change. A malformed entry is
+    skipped rather than raising -- a typo in an ops variable must not take down
+    discovery for every broker.
+    """
+    raw = os.environ.get("MT5_BROKER_INSTALLERS")
+    out: dict[str, list[tuple[str, str]]] = {}
+    if not raw:
+        return out
+    for chunk in raw.split(";"):
+        parts = [p.strip() for p in chunk.split("|")]
+        if len(parts) != 3 or not all(parts):
+            continue
+        brand, slug, name = (p.lower() for p in parts)
+        out.setdefault(brand, []).append((slug, name))
+    return out
+
+
+def candidate_installer_urls(server: str | None) -> list[str]:
+    """Installer URLs to probe for a server, most likely first, de-duplicated.
+
+    Known-broker pairs come FIRST (they carry real, mined entity domains that
+    ``brand_tokens`` cannot derive), then the generic token/suffix guesses.
     """
     urls: list[str] = []
+    for slug, name in known_broker_candidates(server):
+        url = INSTALLER_URL_TEMPLATE.format(slug=slug, name=name)
+        if url not in urls:
+            urls.append(url)
     for token in brand_tokens(server):
         for slug in candidate_slugs(server):
             if not slug.startswith(token):
@@ -465,14 +585,15 @@ def discover_installer(
         probes.append(verdict)
         if verdict.get("valid"):
             slug = slug_from_installer_url(url) or tokens[0]
+            # A known-broker dir_name (e.g. Deriv's "MetaTrader 5 Terminal") beats
+            # the "MetaTrader 5 <BRAND>" guess, because it was measured rather than
+            # inferred -- and a wrong dir_name silently breaks coexistence.
+            dir_name = known_broker_dir_name(server) or f"MetaTrader 5 {tokens[0].upper()}"
             return {
                 "found": True,
                 "url": url,
                 "slug": slug,
-                # "MetaTrader 5 <BRAND>" is the usual pattern; Deriv is the known
-                # exception ("MetaTrader 5 Terminal"), which is exactly why the
-                # caller must be able to override this rather than trust it.
-                "dir_name": f"MetaTrader 5 {tokens[0].upper()}",
+                "dir_name": dir_name,
                 "source": "page" if url in mined else "derived",
                 "tried": len(probes),
                 "probes": probes,
