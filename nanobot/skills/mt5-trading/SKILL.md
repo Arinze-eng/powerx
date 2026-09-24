@@ -10,7 +10,35 @@ The `mt5_sandbox` tool drives a headless MetaTrader 5 terminal **inside the
 user's execution sandbox**. Wine, the MT5 terminal, and the Python bridge never
 touch the application host — that is deliberate, because the Wine prefix alone
 is ~800 MB and the terminal is an amd64 GUI app.
-#One Super Important Role that make you resolve installation faster: when user gives you gives you a broker that it not metaqoutes demo or exness, automatically search online and get the brokers installer and use it normally,stop getting stuck and think,once you see thr credentials and you don't have the installer search online and get it
+## Resolving an unfamiliar broker (do this, do not stall)
+
+When the credentials name a broker the terminal cannot resolve, **keep going**:
+`mt5_sandbox` now consults its broker table and validates candidate installer
+URLs over HTTP before installing, so an unrecognised server is a discovery step,
+not a dead end and not a question for the user.
+
+Order of effort, cheapest first:
+
+1. `action="start"` / `action="login"` as normal. If the build is wrong the tool
+   resolves and installs it **and replays your action** — usually you never see it.
+2. If it still refuses: `action="list_brokers"` (what it knows), then
+   `action="discover_broker"`, `server="<their server>"`.
+3. If discovery fails, **web-search `<broker> download MT5`**, fetch that page, and
+   pass it: `action="discover_broker", server=..., page_urls=["<the page url>"]`.
+   The link on the broker's own page is authoritative; a derived guess usually is not.
+
+Two things that keep you from going in circles:
+
+* **Only some table entries are confirmed.** `list_brokers` marks each brand
+  `verified: true|false`. A `false` brand carries a *guessed* domain and often 404s
+  — that means "our guess was wrong", **never** "this broker is unsupported". Go to
+  step 3 instead of retrying guesses.
+* **Never invent an installer URL.** Unverified slugs on `download.mql5.com` 404,
+  and a bad guess costs a two-minute Wine install to discover it. Every URL you act
+  on must come back `valid` from `discover_broker`.
+* **Do not ask the user for their download link before step 3.** Asking early is
+  the old behaviour and it is what this section replaces.
+
 ## The one rule that matters
 
 **`install` waits for you now — never hand the wait back to the user.**

@@ -47,6 +47,7 @@ __all__ = [
     "candidate_installer_urls",
     "known_broker_candidates",
     "known_broker_dir_name",
+    "broker_is_verified",
     "extract_installer_urls",
     "probe_url",
     "validate_installer_url",
@@ -309,21 +310,69 @@ _KNOWN_BROKERS: dict[str, dict[str, Any]] = {
 }
 
 
+#: Brands whose installer URL has been CONFIRMED LIVE against the CDN, with the
+#: date it was last confirmed. Everything else in the table is a PLAUSIBLE guess.
+#:
+#: WHY THIS EXISTS. The table used to read as if all of it were knowledge. It is
+#: not: audited live on 2026-09-24, **6 of 28** entries resolved and the other 22
+#: returned 404. The mined three (Exness, Deriv, AXI) work; the rest were inferred
+#: from a broker's marketing domain, which is not the same string as the CDN slug
+#: (``icmarkets.com`` is not ``icmarkets.limited``, which is not what MQL5 hosts).
+#:
+#: That distinction is load-bearing because of what it feeds:
+#:
+#: * ``list_brokers`` told the model it "knows" 28 brokers. Confident in that, the
+#:   model spends its small probe budget (``DEFAULT_MAX_CANDIDATES``) on dead
+#:   slugs, gets nothing, and concludes the broker is unsupported -- the exact
+#:   "cannot resolve my broker" report.
+#: * Ordering. A verified candidate should be tried before an unverified guess, so
+#:   the budget is spent on what has ever worked.
+#:
+#: Adding a brand here means: a probe of that URL returned HTTP 200, an executable
+#: content type, and a real installer size. Not "the domain looked right".
+_VERIFIED_BRANDS: frozenset[str] = frozenset(
+    {
+        "exness",  # exness.technologies.ltd  -- confirmed 2026-09-24
+        "deriv",  # deriv.com.limited         -- confirmed 2026-09-24
+        "axi",  # axicorp.financial.services  -- confirmed 2026-09-24
+        "axicorp",  # same URL as `axi`        -- confirmed 2026-09-24
+        "alpari",  # alpari                    -- confirmed 2026-09-24
+        "nordfx",  # nordfx.ltd                -- confirmed 2026-09-24
+    }
+)
+
+
+def broker_is_verified(server: str | None) -> bool:
+    """True when *server*'s brand has an installer confirmed live against the CDN.
+
+    Used to separate "we can install this" from "we have a guess for this", which
+    the model must not conflate -- see :data:`_VERIFIED_BRANDS`.
+    """
+    return any(token in _VERIFIED_BRANDS for token in brand_tokens(server))
+
+
 def known_broker_candidates(server: str | None) -> list[tuple[str, str]]:
     """Known (slug, filename) candidate pairs for a server's brand, if any.
 
     Returned ahead of the generic guesses so the specific knowledge is spent
     first. An entry here is still only a CANDIDATE -- the caller validates it.
+
+    Within the known pairs, candidates from a VERIFIED brand come before those
+    from an unverified one: the probe budget is small on purpose, so the URL that
+    has actually been seen live should be the first one spent on it.
     """
-    pairs: list[tuple[str, str]] = []
+    verified: list[tuple[str, str]] = []
+    inferred: list[tuple[str, str]] = []
     for token in brand_tokens(server):
         entry = _KNOWN_BROKERS.get(token)
         if not entry:
             continue
+        bucket = verified if token in _VERIFIED_BRANDS else inferred
         for slug, name in entry.get("candidates", ()):
             pair = (str(slug), str(name))
-            if pair not in pairs:
-                pairs.append(pair)
+            if pair not in bucket and pair not in verified:
+                bucket.append(pair)
+    pairs = verified + inferred
     # Operator-supplied additions/corrections win over the built-in table.
     for token in brand_tokens(server):
         for slug, name in _env_broker_installers().get(token, ()):
@@ -582,7 +631,6 @@ def discover_installer(
                     "directly.".format(len(probes))
                 ),
             }
-        probes.append(verdict)
         if verdict.get("valid"):
             slug = slug_from_installer_url(url) or tokens[0]
             # A known-broker dir_name (e.g. Deriv's "MetaTrader 5 Terminal") beats

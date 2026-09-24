@@ -358,3 +358,110 @@ def test_throttle_spaces_requests_to_one_host(monkeypatch):
     slept.clear()
     bd._throttle("https://other.example/x.exe")
     assert slept == []
+
+# --------------------------------------------------------------------------- #
+# probe accounting (the `tried` / `probes` the agent actually reads)
+# --------------------------------------------------------------------------- #
+def test_each_candidate_is_recorded_exactly_once():
+    """One candidate in, one probe record out. No more, no less.
+
+    WHY THIS IS TESTED: the loop that appends verdicts appended TWICE per
+    candidate -- once before the rate-limit check, once after. Every number the
+    agent was shown about the search was therefore wrong: a clean single-hit
+    discovery on Deriv reported `tried: 2` with the same URL listed twice, and a
+    4-candidate miss reported `tried: 8`. Doubled diagnostics are how a model is
+    talked into believing the sweep was wider, and therefore more conclusive,
+    than it was.
+    """
+    calls: list[str] = []
+
+    def probe(url: str, timeout: float = 20.0) -> dict[str, Any]:
+        calls.append(url)
+        return _404()
+
+    result = bd.discover_installer("Nope-Broker", probe=probe, max_candidates=4)
+    assert result["found"] is False
+    assert len(calls) == len(result["probes"]) == result["tried"], (
+        "every probed URL must appear in `probes` exactly once"
+    )
+
+
+def test_tried_counts_the_real_search_when_a_later_candidate_hits():
+    """`tried` is the number of probes actually spent, including the winner."""
+    winner = bd.candidate_installer_urls("Deriv-Demo")[0]
+    result = bd.discover_installer("Deriv-Demo", probe=_probe_returning({winner}))
+    assert result["found"] is True
+    assert result["tried"] == len(result["probes"]) == 1
+
+
+def test_a_hit_is_not_listed_twice_in_its_own_evidence():
+    """The winning URL appears exactly once in `probes`."""
+    winner = bd.candidate_installer_urls("Exness-MT5Real8")[0]
+    result = bd.discover_installer("Exness-MT5Real8", probe=_probe_returning({winner}))
+    urls = [p.get("url") for p in result["probes"]]
+    assert urls.count(winner) == 1
+
+
+def test_rate_limit_stop_reports_one_record_per_probe():
+    """The early-return path shares the accounting with the normal path."""
+    blocked = {
+        "ok": False, "status": None, "size": None, "content_type": "",
+        "error": "Connection reset by peer", "blocked": True,
+    }
+    result = bd.discover_installer(
+        "Pepperstone-Demo", probe=_probe_returning(set(), default=blocked)
+    )
+    assert result["blocked"] is True
+    assert result["found"] is False
+    assert len(result["probes"]) == result["tried"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# verification provenance: a mined domain vs a guessed one
+# --------------------------------------------------------------------------- #
+def test_a_verified_brand_is_reported_as_verified():
+    # Deriv was measured live; its slug is not derivable from the server name,
+    # which is the only reason the table exists.
+    assert bd.broker_is_verified("Deriv-Demo") is True
+    assert bd.broker_is_verified("Exness-MT5Real8") is True
+
+
+def test_an_inferred_brand_is_not_reported_as_verified():
+    """The table is bigger than the knowledge in it, and must say so.
+
+    Audited 2026-09-24: 6 of 28 entries resolve against the CDN. The other 22
+    carry a domain inferred from the broker's website. Treating those as known is
+    what produced "the agent cannot resolve my broker": the model burns its whole
+    probe budget on a guaranteed 404, then concludes the broker is unsupported.
+    """
+    assert bd.broker_is_verified("Pepperstone-Demo") is False
+    assert bd.broker_is_verified("TotallyUnknown-Live") is False
+    assert len(bd._VERIFIED_BRANDS) < len(bd._KNOWN_BROKERS)
+
+
+def test_verified_candidates_are_probed_before_inferred_ones():
+    """Order = budget. The URL known to work is spent first."""
+    pairs = bd.known_broker_candidates("Deriv-Demo")
+    assert pairs[0] == ("deriv.com.limited", "deriv")
+
+
+def test_every_verified_brand_resolves_without_a_page_hint():
+    """A verified brand must resolve from the server name alone.
+
+    This is the contract the rest of the tool is written against: `list_brokers`
+    advertises these brands as handled, so discovery has to deliver on the first
+    probe with no broker page supplied. If this ever fails, the brand is a guess
+    wearing a checkmark.
+    """
+    winners = {
+        "Exness-MT5Real8": "exness.technologies.ltd",
+        "Deriv-Demo": "deriv.com.limited",
+        "AXI-Live": "axicorp.financial.services",
+    }
+    for server, slug in winners.items():
+        urls = bd.candidate_installer_urls(server)
+        assert urls, server
+        assert slug in urls[0], f"{server}: verified slug must be probed first, got {urls[0]}"
+        assert bd.discover_installer(
+            server, probe=_probe_returning({bd.candidate_installer_urls(server)[0]})
+        )["found"] is True

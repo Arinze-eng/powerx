@@ -427,12 +427,62 @@ def validate_broker_installer_url(url: str) -> str | None:
 #: (the CLI is authoritative about what it installs; this only decides whether the
 #: tool can finish an install on its own). MetaQuotes' own demo servers resolve on
 #: the generic build, which needs no broker URL at all.
+#:
+#: This is a FAST PATH, not the gate it used to be. Falling through it no longer
+#: means "give up and ask the user": the caller tries ``_discover_for_server``,
+#: which consults ``broker_discovery`` (a far larger, HTTP-validated table) first.
+#: Keeping the list short is still correct -- a hit here skips a network probe.
 _KNOWN_SERVER_PREFIXES = ("metaquotes", "exness", "deriv")
 
 
 def _server_is_known(server: str | None) -> bool:
     name = (server or "").strip().lower()
     return bool(name) and any(name.startswith(prefix) for prefix in _KNOWN_SERVER_PREFIXES)
+
+
+async def _discover_for_server(server: str | None) -> dict[str, Any] | None:
+    """Resolve + VALIDATE an installer URL for *server* using the discovery table.
+
+    WHY THIS EXISTS. The gate it sits in front of used to compare the server name
+    against ``_KNOWN_SERVER_PREFIXES`` -- three brokers mirrored from the CLI's
+    ``BROKER_BUILDS``. Meanwhile ``broker_discovery._KNOWN_BROKERS`` learned 28
+    brokers with mined, validated entity domains. The two lists were never joined,
+    so a server the agent COULD resolve (``Pepperstone-Demo``, ``AXI-Live``,
+    ``ICMarkets-Demo``...) fell straight through to "ask the user for their
+    broker's download link". That gap is the reported "the LLM cannot resolve
+    brokers": the knowledge was in the repo, just not on the path that decides.
+
+    So the rule here is: the table is only consulted when the CLI's own registry
+    cannot resolve the server. ``discover_installer`` validates every candidate
+    (HTTP 200 + executable content-type + real installer size) before returning it,
+    which is what makes it safe to hand the result to a two-minute Wine install.
+
+    Runs on a worker thread because ``discover_installer`` does blocking urllib
+    probes with per-host spacing; calling it inline would stall the event loop for
+    every other session on this process.
+
+    Returns ``{"url", "dir_name"}`` on success, ``None`` when nothing validated --
+    including when the CDN is rate-limiting us, which the caller must NOT report as
+    "this broker does not exist".
+    """
+    if not server or not str(server).strip():
+        return None
+    try:
+        from nanobot.trading.broker_discovery import discover_installer
+
+        result = await asyncio.to_thread(discover_installer, str(server))
+    except Exception as exc:  # noqa: BLE001 - discovery must never crash the tool
+        logger.warning("mt5_sandbox: broker discovery for {!r} failed ({})", server, exc)
+        return None
+    if not result.get("found") or not result.get("url"):
+        logger.info(
+            "mt5_sandbox: no validated installer for {!r} (blocked={}, {})",
+            server,
+            bool(result.get("blocked")),
+            str(result.get("reason", ""))[:160],
+        )
+        return None
+    return {"url": str(result["url"]), "dir_name": str(result.get("dir_name") or "")}
 
 
 def build_guard_rule(kwargs: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -688,7 +738,25 @@ def _host_list_brokers(kwargs: dict[str, Any]) -> str:
         item: dict[str, Any] = {
             "brand": brand,
             "candidate_installer_urls": candidates,
+            # HONESTY OVER COVERAGE. Most of this table is an inferred guess, not
+            # mined knowledge (audited 2026-09-24: 6 of 28 resolve). Without this
+            # flag the list reads as "these 28 are handled", and the model spends
+            # its whole probe budget on a dead slug instead of searching for the
+            # broker's real download page -- then reports the broker as unresolvable.
+            "verified": brand in bd._VERIFIED_BRANDS,
         }
+        if item["verified"]:
+            item["verified_note"] = (
+                "Installer confirmed live against the CDN. Discovery should resolve "
+                "this brand on the first probe."
+            )
+        else:
+            item["inferred_note"] = (
+                "Domain GUESSED from the broker's website; NOT confirmed against the "
+                "CDN, and most guesses like this 404. Try discover_broker, but if it "
+                "fails do not conclude the broker is unsupported -- fetch their own "
+                "'Download MT5' page and pass it as page_urls."
+            )
         if entry.get("dir_name"):
             item["install_dir_name"] = entry["dir_name"]
             item["dir_name_note"] = (
@@ -699,8 +767,19 @@ def _host_list_brokers(kwargs: dict[str, Any]) -> str:
         entries.append(item)
 
     env_added = bd._env_broker_installers()
+    verified_count = sum(1 for b in bd._KNOWN_BROKERS if b in bd._VERIFIED_BRANDS)
     payload: dict[str, Any] = {
         "known_broker_count": len(bd._KNOWN_BROKERS),
+        # The number that matters is NOT the table size. Reporting only 28 is what
+        # makes a model confident enough to stop at a failed probe.
+        "verified_broker_count": verified_count,
+        "inferred_broker_count": len(bd._KNOWN_BROKERS) - verified_count,
+        "coverage_note": (
+            f"{verified_count} of {len(bd._KNOWN_BROKERS)} brands have an installer "
+            "CONFIRMED live against the CDN; the rest carry an inferred domain that "
+            "may 404. A failed probe on an unverified brand means 'we guessed wrong', "
+            "never 'this broker is unsupported' -- go fetch their download page."
+        ),
         "brokers": entries,
         "operator_additions": {k: [f"{s}|{n}" for s, n in v] for k, v in sorted(env_added.items())},
         "how_to_use": (
@@ -1975,20 +2054,39 @@ class MT5SandboxTool(Tool):
                 install_kwargs[key] = value
 
         if not install_kwargs.get("broker_installer_url") and not _server_is_known(server):
+            # The CLI's registry cannot resolve this server. Before giving up, ask the
+            # DISCOVERY table -- it knows far more brokers than `_KNOWN_SERVER_PREFIXES`
+            # and validates each candidate over HTTP. This is the fix for "the agent
+            # cannot resolve my broker": it used to bounce straight to the user.
+            discovered = await _discover_for_server(server)
+            if discovered:
+                install_kwargs["broker_installer_url"] = discovered["url"]
+                if discovered.get("dir_name") and not install_kwargs.get("broker_dir_name"):
+                    install_kwargs["broker_dir_name"] = discovered["dir_name"]
+                logger.info(
+                    "mt5_sandbox: resolved server {!r} via discovery -> {}",
+                    server,
+                    discovered["url"],
+                )
+
+        if not install_kwargs.get("broker_installer_url"):
             return ToolResult.error(
                 json.dumps(
                     {
                         **refusal,
                         "message": (
                             f"The sandbox terminal cannot resolve server {server!r} and "
-                            "this broker is not in the agent's built-in registry, so the "
+                            "no MT5 installer validated for it, so the "
                             "installer URL has to come from the broker's own "
                             "'Download MT5' page (it is in the link to their MT5 "
                             "download), or the deployment can register it once with "
                             "MT5_BROKER_BUILDS='<server-prefix>|<url>|<install dir>'."
                         ),
                         "next": (
-                            "Ask the user for their broker's MT5 download link, then "
+                            "Try action='discover_broker' with server=<their server>, "
+                            "passing page_urls=<the broker's own 'Download MT5' page> "
+                            "if you have fetched it; that validates candidates over "
+                            "HTTP. Otherwise ask the user for the download link and "
                             f"retry action='install' with server={server!r} and "
                             "broker_installer_url=<that link>."
                         ),
