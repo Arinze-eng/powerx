@@ -4986,6 +4986,7 @@ class _StopMT5:
     def __init__(
         self, bid: float, ask: float | None = None, *,
         stops_level_points: int = 0, point: float = 0.01, retcode: int = 10009,
+        orders: tuple[float, ...] | None = None,
     ) -> None:
         self.tick = types.SimpleNamespace(
             bid=float(bid), ask=float(bid if ask is None else ask)
@@ -4995,6 +4996,14 @@ class _StopMT5:
         )
         self.retcode = int(retcode)
         self.sl_sends: list[dict[str, Any]] = []
+        #: The stops the position's ORDER HISTORY reports, earliest first. Only
+        #: installed when the test wants one, so every other test still exercises
+        #: the terminal that cannot answer -- which is the honest fallback.
+        if orders is not None:
+            self.history_orders_get = lambda **_kw: [
+                types.SimpleNamespace(sl=float(s), time_msc=1_700_000_000 + i)
+                for i, s in enumerate(orders)
+            ]
 
     def move_to(self, bid: float, ask: float | None = None) -> "_StopMT5":
         self.tick = types.SimpleNamespace(
@@ -5116,6 +5125,9 @@ def test_the_r_a_breakeven_uses_is_the_one_it_measured_at_first_sight(
     again = defs["move_stops"](rule, [position], 30, 0)
 
     assert "1R" in again[0]["skipped"], again[0]
+    # ...and the answer names what the R came from, because a trigger measured off
+    # a moved stop is a trigger for a reason that does not exist.
+    assert again[0]["risk_source"] == "the stop as it is now"
     assert again[0]["sl"] == 4285.0
     assert rule["move_ref"]["9001"]["risk"] == 20.0
     assert mt5.sl_sends == []
@@ -5526,3 +5538,85 @@ def test_a_waiting_moving_stop_says_so_instead_of_looking_absent(
     # ...and "waiting" is never a move.
     assert [e for e in events if e["event"] == "stop_moved"] == []
     assert mt5.sltp_sends == []
+
+
+def test_the_r_a_breakeven_uses_is_the_stop_the_position_was_opened_with(
+    monkeypatch, tmp_path
+):
+    """The stop NOW is not the risk once anything has moved it.
+
+    MEASURED LIVE 2026-09-24: a trail moved a Gold stop from 4293.09 to 4294.82,
+    and a breakeven rule armed afterwards measured R as 0.44 instead of 2.17 --
+    so its "1R" sat 0.44 above the entry and it would have announced a breakeven
+    move at a level that was never 1R. The order that OPENED the position still
+    says 4280, and that is the only honest source.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _StopMT5(4315.0, 4315.2, orders=(4280.0,))
+    defs = _watcher_defs(cli, monkeypatch, mt5)
+    rule = _breakeven_rule()
+    # entry 4300, and a stop that has already been trailed up to 4294.82.
+    position = _position(entry=4300.0, sl=4294.82)
+
+    rows = defs["move_stops"](rule, [position], 30, 0)
+
+    assert rule["move_ref"]["9001"]["risk"] == 20.0
+    assert rule["move_ref"]["9001"]["risk_source"] == "the stop it was opened with"
+    # 1R is 4320 -- not the 4300.44 the current stop would have produced.
+    assert "4320.0" in rows[0]["skipped"]
+    assert mt5.sl_sends == []
+
+
+def test_the_opening_stop_is_the_earliest_order_that_carried_one(
+    monkeypatch, tmp_path
+):
+    cli = _broker_cli(monkeypatch, tmp_path)
+    # A modify appends a later order row carrying the trailed stop. The OPENER is
+    # the one that says what the trade was sized on.
+    mt5 = _StopMT5(4300.0, 4300.2, orders=(4280.0, 4294.0))
+    defs = _watcher_defs(cli, monkeypatch, mt5)
+
+    assert defs["initial_risk_price"](_position(entry=4300.0, sl=4294.0)) == 4280.0
+
+
+def test_the_r_falls_back_to_the_current_stop_and_says_which_it_used(
+    monkeypatch, tmp_path
+):
+    """A terminal that cannot answer must not silently look like one that did."""
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _StopMT5(4315.0, 4315.2)  # no order history at all
+    defs = _watcher_defs(cli, monkeypatch, mt5)
+
+    rows = defs["move_stops"](
+        _breakeven_rule(), [_position(entry=4300.0, sl=4280.0)], 30, 0
+    )
+
+    assert rows[0]["risk_source"] == "the stop as it is now"
+    assert "the stop as it is now" in rows[0]["skipped"]
+    # No history is not a stop to invent.
+    assert defs["initial_risk_price"](_position(entry=4300.0, sl=4280.0)) is None
+    # ...and neither is history with no stop on any of its orders.
+    bare = _StopMT5(4315.0, 4315.2, orders=(0.0, 0.0))
+    bare_defs = _watcher_defs(cli, monkeypatch, bare)
+    assert bare_defs["initial_risk_price"](_position(entry=4300.0, sl=4280.0)) is None
+
+
+def test_a_breakeven_rule_will_not_measure_r_off_an_already_protected_stop(
+    monkeypatch, tmp_path
+):
+    """Nothing to take off, and no honest R to measure -- so it does nothing.
+
+    The alternative is a trigger computed from the distance to a stop that has
+    already moved, i.e. a stop move justified by a number that means nothing.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _StopMT5(4310.0, 4310.2)  # no history available
+    defs = _watcher_defs(cli, monkeypatch, mt5)
+    # The stop is already past the entry: the trade is protected.
+    position = _position(entry=4300.0, sl=4302.0)
+
+    rows = defs["move_stops"](_breakeven_rule(), [position], 30, 0)
+
+    assert rows[0]["ok"] is False
+    assert "already at or past the entry" in rows[0]["skipped"]
+    assert mt5.sl_sends == []

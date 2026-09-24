@@ -5112,6 +5112,38 @@ def stop_room(info):
     return points * point
 
 
+def initial_risk_price(position):
+    """The stop the position was OPENED with, or None if history will not say.
+
+    ``position.sl`` is the stop as it is NOW, and a moving stop moves it -- so by
+    the time a breakeven rule is armed, the distance to the current stop is no
+    longer the risk the trade was sized on. MT5 keeps no 'initial sl' on the
+    position itself, but the ORDER that opened it carries the stop as it was
+    then, and that is the only honest source for R.
+
+    MEASURED LIVE 2026-09-24: a trail moved a Gold stop from 4293.09 to 4294.82,
+    and a breakeven rule armed afterwards recorded R as 0.44 instead of 2.17. Its
+    "1R" trigger then sat 0.44 above the entry, so it would have announced a
+    breakeven move at a level that was never 1R -- a stop moved for a reason that
+    did not exist.
+    """
+    try:
+        orders = mt5.history_orders_get(position=int(position.ticket)) or []
+    except Exception:
+        return None
+    stopped = [o for o in orders if float(getattr(o, "sl", 0.0) or 0.0)]
+    if not stopped:
+        return None
+    try:
+        stopped.sort(key=lambda o: float(getattr(o, "time_msc", 0) or 0))
+    except Exception:
+        pass
+    try:
+        return float(stopped[0].sl) or None
+    except (TypeError, ValueError):
+        return None
+
+
 def move_stops(rule, positions, deviation, magic):
     """Push each position's stop further into profit. THREE RULES, all safety:
 
@@ -5158,12 +5190,27 @@ def move_stops(rule, positions, deviation, magic):
 
         ref = refs.get(ticket)
         if not isinstance(ref, dict):
-            refs[ticket] = ref = {
-                "entry": entry,
-                "risk": abs(entry - current) if current else 0.0,
-            }
+            opened = initial_risk_price(position)
+            if opened:
+                refs[ticket] = ref = {
+                    "entry": entry, "risk": abs(entry - opened),
+                    "opened_sl": opened,
+                    "risk_source": "the stop it was opened with",
+                }
+            elif current:
+                # Not the same thing, and said so: this is the stop NOW, which is
+                # the risk only as long as nothing has moved it yet.
+                refs[ticket] = ref = {
+                    "entry": entry, "risk": abs(entry - current),
+                    "risk_source": "the stop as it is now",
+                }
+            else:
+                refs[ticket] = ref = {
+                    "entry": entry, "risk": 0.0, "risk_source": None,
+                }
             row["recorded"] = True
         risk = float(ref.get("risk") or 0.0)
+        row["risk_source"] = ref.get("risk_source")
 
         if mode == "breakeven":
             if not current:
@@ -5180,13 +5227,38 @@ def move_stops(rule, positions, deviation, magic):
                 })
                 results.append(row)
                 continue
+            if (
+                ref.get("risk_source") == "the stop as it is now"
+                and (current >= entry if is_long else current <= entry)
+            ):
+                # The trade is already protected and the only R available is the
+                # distance to a stop that has already moved -- which is not the
+                # trade's risk. Better nothing than a trigger measured off the
+                # wrong stop.
+                row.update({
+                    "ok": False,
+                    "skipped": (
+                        "the stop is already at or past the entry, so there is no "
+                        "risk left to take off; and this rule could not read the "
+                        "stop the position was OPENED with, so it will not measure "
+                        "R off the stop it has now and guess"
+                    ),
+                })
+                results.append(row)
+                continue
             multiple = float(rule.get("when_r") or 1.0)
             trigger = entry + multiple * risk if is_long else entry - multiple * risk
             reached = price >= trigger if is_long else price <= trigger
             if not reached:
                 row.update({
                     "ok": True,
-                    "skipped": f"not yet {multiple:g}R ({round(trigger, 5)})",
+                    # The trigger AND what it was measured from, because "not yet
+                    # 1R" is only a useful answer if the R behind it is the
+                    # trade's own risk and not the distance to a moved stop.
+                    "skipped": (
+                        f"not yet {multiple:g}R ({round(trigger, 5)}) -- 1R is "
+                        f"{round(risk, 5)} from {ref.get('risk_source')}"
+                    ),
                     "sl": current,
                 })
                 results.append(row)

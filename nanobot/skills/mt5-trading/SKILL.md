@@ -293,10 +293,25 @@ Three things make it safe to leave alone:
   carries **both** levels; the target is passed back unchanged, because this rule
   owns the stop and nothing else.
 
-`R` is measured **once**, from the position as it was when the rule first saw it,
-and remembered on the rule. Measured off the current stop instead, R would shrink
-every time the stop moved, the trigger would walk down with it, and the stop would
-crawl into the price for no reason.
+`R` is measured **once**, from the **stop the position was opened with** — read
+from the order that opened it, because `position.sl` is the stop *now* and a
+moving stop has already moved it. Measured off the current stop instead, R shrinks
+every time the stop moves, the trigger walks down with it, and the stop crawls
+into the price for no reason.
+
+**Where the R came from is in every answer**, so the trigger is auditable rather
+than asserted: a waiting row reads
+`not yet 1R (4297.43) -- 1R is 2.17 from the stop it was opened with`.
+
+MEASURED LIVE 2026-09-24: a trail moved a Gold stop 4293.09 → 4294.82, and a
+`breakeven` rule armed *afterwards* recorded R as **0.44** instead of 2.17, so its
+`1R` sat 0.44 above the entry. That is the bug this ordering exists to prevent,
+and why you arm `breakeven` **when the trade opens**, not once it is running.
+
+If the order history cannot be read, the fallback is the stop as it is now and the
+answer says *that* instead — and if the fallback is in use on a position whose
+stop has already reached the entry, the rule does **nothing** and says so, rather
+than measuring R off a stop that has already moved.
 
 A `guard_mode` rule needs **no `trigger_price`** — there is no level to cross — so
 it is never "satisfied" and never fires itself out. It stays armed and keeps
