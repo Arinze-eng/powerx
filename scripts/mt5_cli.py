@@ -53,6 +53,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +65,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.1"
+CLI_VERSION = "2026-09-24.2"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -5817,11 +5818,23 @@ def _reexec_under_wine(argv: list[str]) -> int | None:
         return None
 
     drive_c = WINE_PREFIX / "drive_c"
-    tmp_dir = drive_c / "mt5tmp"
+    # ONE SANDBOX PER INVOCATION. These paths used to be fixed
+    # (``C:\mt5tmp\run.bat`` + ``C:\mt5tmp\stdout.txt``), so two bridge actions
+    # running at the same time clobbered each other. MEASURED 2026-09-24 on a
+    # live box: an ``order`` issued while a ``watch`` was sampling made the watch
+    # report the ORDER's JSON as its own result -- the order deleted the file the
+    # watch was about to read, and the watch's answer was lost with it.
+    #
+    # That is not a corner case any more. The whole point of ``watch`` is to sit
+    # on a live trade while the caller acts on it, so ``watch`` + ``order`` /
+    # ``close`` / ``positions`` overlapping is the intended usage, not an
+    # accident. A private directory per invocation makes the overlap harmless.
+    tmp_dir = drive_c / "mt5tmp" / f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     try:
         tmp_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
+    win_tmp = f"C:\\mt5tmp\\{tmp_dir.name}"
 
     out_linux = tmp_dir / "stdout.txt"
     if out_linux.exists():
@@ -5848,7 +5861,7 @@ def _reexec_under_wine(argv: list[str]) -> int | None:
         f'set "MT5_ROOT={_to_wine_path(MT5_ROOT)}"\r\n'
         f'set "WINE_PREFIX={_to_wine_path(WINE_PREFIX)}"\r\n'
         f'"{_to_wine_path(winpy)}" "{_to_wine_path(Path(__file__).resolve())}" '
-        f"{win_args} > \"C:\\mt5tmp\\stdout.txt\" 2>&1\r\n",
+        f"{win_args} > \"{win_tmp}\\stdout.txt\" 2>&1\r\n",
         encoding="utf-8",
     )
 
@@ -5856,7 +5869,7 @@ def _reexec_under_wine(argv: list[str]) -> int | None:
     env["MT5_UNDER_WINE"] = "1"
     try:
         subprocess.run(
-            [wine_bin(), "cmd", "/c", "C:\\mt5tmp\\run.bat"],
+            [wine_bin(), "cmd", "/c", f"{win_tmp}\\run.bat"],
             env=env,
             capture_output=True,
             text=True,
@@ -5865,15 +5878,21 @@ def _reexec_under_wine(argv: list[str]) -> int | None:
     except subprocess.TimeoutExpired:
         return fail("timed out waiting for the MT5 bridge inside Wine", code=2)
 
-    if out_linux.exists():
-        # CP1252 is the default console codepage Wine uses; fall back safely.
-        raw = out_linux.read_bytes()
-        for enc in ("utf-8", "cp1252", "latin-1"):
-            try:
-                sys.stdout.write(raw.decode(enc))
-                break
-            except UnicodeDecodeError:
-                continue
+    try:
+        if out_linux.exists():
+            # CP1252 is the default console codepage Wine uses; fall back safely.
+            raw = out_linux.read_bytes()
+            for enc in ("utf-8", "cp1252", "latin-1"):
+                try:
+                    sys.stdout.write(raw.decode(enc))
+                    break
+                except UnicodeDecodeError:
+                    continue
+    finally:
+        # The directory is private to this invocation, so it is dead the moment
+        # the answer has been read. Left behind, one per bridge call, it would
+        # grow the prefix without bound.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     return 0
 
 

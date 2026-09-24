@@ -2845,11 +2845,10 @@ def test_the_wine_reexec_passes_the_roots_through(monkeypatch, tmp_path):
     def _run(argv, **kwargs):
         captured["argv"] = argv
         captured["env"] = kwargs.get("env") or {}
-        bat = cli.WINE_PREFIX / "drive_c" / "mt5tmp" / "run.bat"
-        captured["bat"] = bat.read_text(encoding="utf-8")
-        (cli.WINE_PREFIX / "drive_c" / "mt5tmp" / "stdout.txt").write_text(
-            '{"ok": true}\n', encoding="utf-8"
-        )
+        bats = list((cli.WINE_PREFIX / "drive_c" / "mt5tmp").glob("*/run.bat"))
+        assert len(bats) == 1, bats
+        captured["bat"] = bats[0].read_text(encoding="utf-8")
+        (bats[0].parent / "stdout.txt").write_text('{"ok": true}\n', encoding="utf-8")
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(cli.subprocess, "run", _run)
@@ -2870,6 +2869,53 @@ def test_the_wine_reexec_passes_the_roots_through(monkeypatch, tmp_path):
     # guard watching a price".
     assert cli.GUARD_STATE_FILE == cli.MT5_ROOT / "guard" / "state.json"
     assert captured["env"].get("MT5_UNDER_WINE") == "1"
+
+
+def test_two_bridge_invocations_never_share_a_temp_file(monkeypatch, tmp_path):
+    """Two bridge actions at once must not write over each other's output.
+
+    MEASURED 2026-09-24, live: an ``order`` sent while a ``watch`` was sampling
+    made the watch report the ORDER's JSON as its own result. The paths were
+    fixed (``C:\\mt5tmp\\run.bat`` and ``stdout.txt``), so the second invocation
+    deleted the file the first was about to read and left its own answer there.
+
+    That overlap is the INTENDED usage now rather than an accident: watching a
+    live trade and acting on it in the same breath is what ``watch`` is for. A
+    private directory per invocation is what makes it harmless.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    (cli.WINE_PREFIX / "drive_c" / "Python311").mkdir(parents=True, exist_ok=True)
+    winpy = cli.WINE_PREFIX / "drive_c" / "Python311" / "python.exe"
+    winpy.write_bytes(b"MZ")
+    monkeypatch.setattr(cli, "win_python", lambda: winpy)
+    monkeypatch.setattr(cli, "wine_bin", lambda: "wine")
+
+    bats: list[str] = []
+    outs: list[str] = []
+
+    def _run(argv, **kwargs):
+        bats.append(str(argv[-1]))
+        # The batch redirect target, read from the batch file itself: the test
+        # must not assume where the CLI decided to put it.
+        bat = list((cli.WINE_PREFIX / "drive_c" / "mt5tmp").glob("*/run.bat"))
+        assert len(bat) == 1, bat
+        text = bat[0].read_text(encoding="utf-8")
+        out = bat[0].parent / "stdout.txt"
+        outs.append(str(out))
+        assert str(out.name) in text
+        out.write_text('{"ok": true}\n', encoding="utf-8")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", _run)
+
+    cli._reexec_under_wine(["positions"])
+    cli._reexec_under_wine(["quote", "EURUSD"])
+
+    assert len(set(bats)) == 2, bats
+    assert len(set(outs)) == 2, outs
+    # And the scratch space is cleaned up, so a long session of bridge calls
+    # does not grow the prefix one directory at a time.
+    assert list((cli.WINE_PREFIX / "drive_c" / "mt5tmp").glob("*/run.bat")) == []
 
 
 # ---------------------------------------------------------------------------
