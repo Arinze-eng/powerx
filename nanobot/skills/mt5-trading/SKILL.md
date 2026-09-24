@@ -69,6 +69,48 @@ rejected with a clear message instead of burning a two-minute Wine install and
 then dying as `could not download the MT5 installer`. If you see a rejection, fix
 the slug from the broker's own "Download MT5" page — do not retry the same URL.
 
+### An unknown broker: `discover_broker`, then search
+
+The registry (`BROKER_BUILDS`) only knows a handful of brokers. Handed
+credentials for ANY other one, MT5 does not report a wrong build — it **skips the
+connection silently**, writes zero `Network` lines, and the bridge blocks on its
+IPC timeout. The login reads as a frozen terminal and the real cause is invisible.
+
+The path forward is `action='discover_broker'`, and **you do the search half of it**:
+
+```
+1. web-search "<broker> download MT5" and fetch the broker's OWN download page.
+2. mt5_sandbox(action="discover_broker", server="<their server>",
+               page_urls=["<the page URL, or its fetched text>"])
+     -> {"found": true, "url": "<validated installer>", "source": "page", "next": ...}
+3. mt5_sandbox(action="install", server="<their server>",
+               broker_installer_url="<that url>", broker_dir_name="<if it differs>")
+then status -> done, start, account.
+```
+
+**Pass `page_urls` whenever you have it.** A link mined from the broker's own page
+is *authoritative*; a slug you or the tool invents is nearly always a 404 —
+MEASURED 2026-09-24: 210 blind slug permutations across 21 well-known brokers
+produced **2** live URLs. The slug is genuinely unguessable: Deriv needs
+`deriv.com.limited` (not `deriv`, `deriv.ltd`, `deriv.markets`), Exness needs
+`exness.technologies.ltd`. So search first, then pass what you found.
+
+Two things the answer can say that are NOT "the broker does not exist":
+
+* `blocked: true` — the MT5 CDN is rate-limiting this box. Continuing to sweep is
+  what *causes* it, and a blocked CDN then refuses the **real** download the
+  install needs next. So the search stops itself at the first refusal. Wait a
+  minute and retry, or pass `page_urls`.
+* `derived` source — the URL was constructed from the brand tokens, not mined.
+  It IS validated (right content type, real size), but verify `broker_dir_name`:
+  the usual pattern is `MetaTrader 5 <BRAND>`, and Deriv is the known exception
+  (`MetaTrader 5 Terminal`). A wrong directory name silently reintroduces the
+  coexistence failure.
+
+When nothing validates and the CDN is not blocked, the answer names the brand
+tokens it tried. Do not then invent a URL — ask the user to paste their broker's
+download link, which is one honest question instead of a failed install.
+
 ## The installation rule (this is what you were getting wrong)
 
 Being handed an `.mq5` is **not** permission to compile it casually. An `.mq5`

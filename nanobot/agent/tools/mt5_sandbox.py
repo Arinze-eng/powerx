@@ -41,6 +41,7 @@ import os
 import re
 import shlex
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -134,15 +135,21 @@ _READ_ONLY_ACTIONS = frozenset(
     }
 )
 
-#: Actions answered entirely on the host, with no bridge call and no sandbox.
+#: Actions answered on the HOST, with no bridge call and no sandbox.
 #: They are dispatched before the sandbox is looked for, so they still work in a
 #: deployment whose sandbox is unreachable -- which is exactly when a caller is
 #: most likely to be asking "what is my stop supposed to be?".
-_HOST_ONLY_ACTIONS = frozenset({"plan"})
+#:
+#: ``plan`` is arithmetic over the caller's own numbers; ``discover_broker`` is
+#: an HTTP search for an installer URL. Both must work when the sandbox is gone
+#: or has never been created -- discovering where to download MT5 from is most
+#: needed precisely before anything is installed.
+_HOST_ONLY_ACTIONS = frozenset({"plan", "discover_broker"})
 
 _ALL_ACTIONS = sorted(
     _READ_ONLY_ACTIONS
     | _TRADING_ACTIONS
+    | _HOST_ONLY_ACTIONS
     | {"install", "start", "stop", "login", "compile"}
 )
 
@@ -557,6 +564,108 @@ def _host_plan(kwargs: dict[str, Any]) -> str:
     except (TypeError, ValueError) as exc:
         return ToolResult.error(f"action=plan could not build the setup: {exc}")
     return json.dumps(result)
+
+
+def _host_discover_broker(kwargs: dict[str, Any]) -> str:
+    """``action='discover_broker'``: find an unknown broker's MT5 installer URL.
+
+    THE GAP THIS CLOSES: the CLI's broker registry is hand-maintained, and the
+    only broker it knows beyond MetaQuotes are the ones someone added. Handed
+    credentials for anything else, the resolver returns None, MT5 tries anyway,
+    and -- because an unresolvable server is skipped SILENTLY -- the login reads
+    as a frozen terminal rather than "wrong build". The caller is stuck with no
+    path forward except "go find your broker's download link yourself".
+
+    So this searches, validates, and hands back an installer URL that is proven
+    to download (right content type, real size), ready to pass to
+    ``action='install'`` as ``broker_installer_url``. It installs NOTHING itself.
+
+    Searching is validate-first and rate-limited on purpose: this box's egress IP
+    was rate-limited by ``download.mql5.com`` by a naive sweep, which then
+    refused the REAL download the install needed (see broker_discovery). Few
+    candidates, spaced, and it stops the moment the CDN starts refusing.
+
+    ``page_urls`` is where an LLM should put what it already found: fetch the
+    broker's own "Download MT5" page, paste it here, and the extracted link wins
+    over any guess -- that is the only kind of slug ever verified to work.
+    """
+    from nanobot.trading.broker_discovery import discover_installer
+
+    server = str(kwargs.get("server") or "").strip()
+    if not server:
+        return ToolResult.error(
+            "action=discover_broker requires 'server' -- the broker server the "
+            "account lives on, e.g. 'ICMarketsSC-Live01'. The brand is taken "
+            "from it."
+        )
+
+    pages: list[str] = []
+    raw_pages = kwargs.get("page_urls")
+    if isinstance(raw_pages, str):
+        pages.append(raw_pages)
+    elif isinstance(raw_pages, (list, tuple)):
+        pages.extend(str(p) for p in raw_pages if p)
+
+    # A single caller-supplied page may be a URL to FETCH or already-fetched text.
+    # Fetching is best-effort: a page that 404s must not sink the derived search.
+    fetched: list[str] = []
+    for page in pages:
+        text = page
+        if page.lower().startswith(("http://", "https://")):
+            text = _fetch_page_text(page)
+        fetched.append(text)
+        fetched.append(page)
+
+    try:
+        result = discover_installer(server, page_urls=fetched)
+    except Exception as exc:  # noqa: BLE001 - discovery must never crash the tool
+        return ToolResult.error(
+            f"Broker discovery for server {server!r} failed: {type(exc).__name__}: {exc}"
+        )
+
+    payload = dict(result)
+    # Never dump every probe into the caller's context: the verdicts that matter
+    # are "which URL won" and "was the CDN refusing us". Keep the tail for the
+    # failure case only, where it is the diagnostic.
+    payload["probes"] = payload.get("probes", [])[:3] if not result.get("found") else []
+    if result.get("found"):
+        payload["next"] = (
+            f"action='install' with server={server!r} and "
+            f"broker_installer_url={result['url']!r}"
+            + (
+                f", optionally broker_dir_name={result['dir_name']!r} "
+                "(verify it: Deriv's installer creates 'MetaTrader 5 Terminal', "
+                "not the usual 'MetaTrader 5 <BRAND>')."
+                if result.get("source") == "derived"
+                else ", broker_dir_name from the broker's install if it differs."
+            )
+        )
+    elif result.get("blocked"):
+        payload["next"] = (
+            "The MT5 CDN is rate-limiting this box, so nothing could be validated. "
+            "This is NOT 'the broker does not exist'. Wait a minute and retry, or "
+            "fetch the broker's own 'Download MT5' page and pass it as page_urls."
+        )
+    else:
+        payload["next"] = (
+            "No installer validated from the server's brand tokens. Fetch the "
+            "broker's own 'Download MT5' page and pass its text as page_urls (the "
+            "link there is authoritative), or ask the user to paste the link."
+        )
+    return json.dumps(payload)
+
+
+def _fetch_page_text(url: str, timeout: float = 25.0) -> str:
+    """Best-effort fetch of a page, for mining an installer link. Never raises."""
+    try:
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) MT5-Discovery"}
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read(2_000_000)
+        return raw.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - a page that will not load is not fatal
+        return ""
 
 
 def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
@@ -1095,6 +1204,18 @@ class MT5SandboxTool(Tool):
             "MT5_ALLOW_TRADING to be "
             "enabled and return the broker retcode; a rejected order is reported with "
             "code 3 and its reason rather than raising. "
+            "UNKNOWN BROKER? action='discover_broker'. The registry only knows a few "
+            "brokers; given credentials for any other, MT5 does not say the build is "
+            "wrong -- it skips the connection SILENTLY and the login reads as a frozen "
+            "terminal. So when a login hangs, or the user names a broker you do not "
+            "recognise, call action='discover_broker' with server=<their server>. "
+            "ALSO SEARCH FIRST AND PASS WHAT YOU FIND as page_urls: fetch the broker's "
+            "own 'Download MT5' page and pass it, because a link mined from there is "
+            "authoritative while a guessed CDN slug almost always 404s (the slug is "
+            "unguessable). It returns a VALIDATED installer URL -- then call "
+            "action='install' with server= and broker_installer_url= that URL. Never "
+            "invent a broker_installer_url yourself, and never retry a login against a "
+            "terminal the tool has told you cannot resolve the server. "
             "After an order, verify it: retcode 10009 means the broker executed it, "
             "'positions' then lists the open position and 'history' the closed deals "
             "(newest first, window anchored to the BROKER's clock — tick time is "
@@ -1178,6 +1299,7 @@ class MT5SandboxTool(Tool):
                 "max_total_risk_money": {"type": "number", "description": "action=limits: the most the WHOLE BOOK may lose if every stop is hit at once, in account currency. This is the number that decides whether a bad day is survivable, and it is not any single position's risk. It is measured from the stops themselves (|entry - stop| x contract x lots), and an order with no stop cannot be counted against it, so such an order is refused while this limit is in force."},
                 "max_total_risk_pct": {"type": "number", "description": "action=limits: as max_total_risk_money, but as a percentage of account EQUITY. Needs the account to be readable: with no equity the percentage cannot be checked and is reported as such rather than assumed to pass."},
                 "watch_session": {"type": "string", "description": "action=watch: continue ONE observation across calls. Every watch carrying the same name folds its samples into a ledger on the box and returns session.price_path_total (the WHOLE session's high/low/drift, not this call's) plus session.since_last_call (the move since you last looked) and session.elapsed_s. USE THIS WHENEVER YOU FOLLOW A LIVE TRADE: without it each 90-second call reports a different trade's first price and drift, so 'is it working?' cannot be answered across calls. With it the calls are one timeline and you can think between them."},
+                "page_urls": {"type": "array", "items": {"type": "string"}, "description": "action=discover_broker: the broker's own 'Download MT5' page -- either the URL (fetched for you) or already-fetched page text. A link mined from that page is AUTHORITATIVE and beats any derived guess, so ALWAYS pass it when you have it. Search for '<broker> download MT5', fetch the broker's own download page, and pass what you find. Without it the tool can only probe a few derived candidates, which usually fails: the CDN slug is unguessable (Deriv needs 'deriv.com.limited', Exness 'exness.technologies.ltd')."},
             },
             "required": ["action"],
         }
@@ -1194,6 +1316,8 @@ class MT5SandboxTool(Tool):
         # over the caller's own numbers, so requiring a live terminal to tell
         # someone what their stop should be would be a worse tool for no gain.
         if action in _HOST_ONLY_ACTIONS:
+            if action == "discover_broker":
+                return _host_discover_broker(kwargs)
             return _host_plan(kwargs)
 
         # --- trading gate -------------------------------------------------- #
