@@ -4645,3 +4645,121 @@ def test_the_description_tells_the_model_to_loop_the_watch_and_says_what_split_i
     assert "timed_out" in desc
     assert "SPLIT TRADING" in desc
     assert "grid" in desc
+
+
+# --------------------------------------------------------------------------- #
+# ENTERING AT A PRICE, AND SIZING BY MONEY AT RISK
+# --------------------------------------------------------------------------- #
+# The two instructions the tool could not serve: "buy the dip at X"/"buy the
+# breakout above X" (not a market order), and "risk $100 on this" (not a lot
+# size). Both are now arguments, and both must reach the CLI verbatim.
+
+
+def test_order_can_rest_at_a_price_instead_of_filling_now():
+    cmd = build_cli_command(
+        "order", {"symbol": "XAUUSD", "side": "buy", "volume": 0.1,
+                  "entry_type": "limit", "price": 4270.0, "sl": 4268.0}
+    )
+    assert "--entry-type limit" in cmd
+    assert "--price 4270.0" in cmd
+    # A market entry is the default and must stay byte-identical to before, so a
+    # plain order does not start carrying a flag the CLI has to ignore.
+    plain = build_cli_command("order", {"symbol": "XAUUSD", "side": "buy", "volume": 0.1})
+    assert "--entry-type" not in plain
+    assert "--price" not in plain
+
+
+def test_order_can_be_sized_by_money_at_risk_and_omits_the_zero_volume():
+    """`--volume 0.0` next to `--risk-money` is a second, zero answer to one
+    question, and the CLI refuses two sizes for one order."""
+    cmd = build_cli_command(
+        "order", {"symbol": "XAUUSD", "side": "buy", "sl": 4283.18, "risk_money": 100}
+    )
+    assert "--volume" not in cmd
+    assert "--risk-money 100.0" in cmd
+    assert "--sl 4283.18" in cmd
+    assert "--risk-pct 1.0" in build_cli_command(
+        "order", {"symbol": "XAUUSD", "side": "buy", "sl": 4283.18, "risk_pct": 1.0}
+    )
+
+
+def test_cancel_is_a_trading_action_with_a_ticket_or_a_sweep():
+    from nanobot.agent.tools.mt5_sandbox import _TRADING_ACTIONS
+
+    # Removing a resting order changes what will happen to real money, so it sits
+    # behind the same opt-in as every other action that reaches the broker.
+    assert "cancel" in _TRADING_ACTIONS
+    assert "cancel" in _TIMEOUTS
+    assert "--ticket 12" in build_cli_command("cancel", {"ticket": 12})
+    assert "--all" in build_cli_command("cancel", {"cancel_all": True})
+
+
+@pytest.mark.asyncio
+async def test_order_accepts_money_at_risk_instead_of_lots(monkeypatch):
+    monkeypatch.setenv("MT5_ALLOW_TRADING", "1")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox()}))
+
+    # No size at all is still an error...
+    assert (await tool.execute(action="order", symbol="XAUUSD", side="buy")).is_error
+    # ...but money-at-risk IS a size, provided it comes with the stop that defines it.
+    no_stop = await tool.execute(
+        action="order", symbol="XAUUSD", side="buy", risk_money=100
+    )
+    assert no_stop.is_error
+    assert "sl" in str(no_stop)
+    with_stop = await tool.execute(
+        action="order", symbol="XAUUSD", side="buy", risk_money=100, sl=4283.18
+    )
+    assert not getattr(with_stop, "is_error", False)
+    # And two sizes for one order is refused rather than resolved silently.
+    both = await tool.execute(
+        action="order", symbol="XAUUSD", side="buy", volume=0.1,
+        risk_money=100, sl=4283.18,
+    )
+    assert both.is_error
+    assert "not both" in str(both)
+
+
+@pytest.mark.asyncio
+async def test_a_pending_entry_needs_the_price_it_rests_at(monkeypatch):
+    monkeypatch.setenv("MT5_ALLOW_TRADING", "1")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox()}))
+
+    missing = await tool.execute(
+        action="order", symbol="XAUUSD", side="buy", volume=0.1, entry_type="limit"
+    )
+    assert missing.is_error
+    assert "price" in str(missing)
+
+    # And a market order must not pretend to honour a price it cannot.
+    contradictory = await tool.execute(
+        action="order", symbol="XAUUSD", side="buy", volume=0.1,
+        entry_type="market", price=4270.0,
+    )
+    assert contradictory.is_error
+    assert "market" in str(contradictory)
+
+    nonsense = await tool.execute(
+        action="order", symbol="XAUUSD", side="buy", volume=0.1, entry_type="wish"
+    )
+    assert nonsense.is_error
+
+
+@pytest.mark.asyncio
+async def test_cancel_needs_a_target(monkeypatch):
+    monkeypatch.setenv("MT5_ALLOW_TRADING", "1")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox()}))
+
+    assert (await tool.execute(action="cancel")).is_error
+    swept = await tool.execute(action="cancel", cancel_all=True)
+    assert not getattr(swept, "is_error", False)
+
+
+def test_the_description_explains_entering_at_a_price_and_sizing_by_risk():
+    desc = MT5SandboxTool().description
+    assert "ENTERING AT A PRICE" in desc
+    assert "entry_type" in desc
+    # The confusion worth naming out loud: a resting order is not an open trade.
+    assert "resting order is" in desc
+    assert "SIZING BY MONEY AT RISK" in desc
+    assert "risk_money" in desc

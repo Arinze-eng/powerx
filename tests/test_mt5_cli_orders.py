@@ -1143,3 +1143,432 @@ def test_margin_mode_is_reported_rather_than_left_as_a_number(cli):
     assert unknown["margin_mode"] is None
     assert unknown["multiple_positions_ok"] is False
     assert unknown["hedging"] is False
+
+
+# --------------------------------------------------------------------------- #
+# ENTERING AT A PRICE, AND SIZING BY MONEY AT RISK
+# --------------------------------------------------------------------------- #
+# Two instructions a trader gives all the time and the tool could not serve:
+#
+#   * "buy the dip at 4270" / "buy the breakout above 4300" -- a price that is
+#     NOT the market, so a market order fills at a price the caller never asked
+#     for and the difference is the whole trade.
+#   * "risk $100 on this" -- money, not lots. The lots are arithmetic over the
+#     stop distance, the pip and the contract size, and doing it by hand is the
+#     error that costs money.
+#
+# Everything here is a pure function or a faked terminal, so no Wine is needed.
+
+
+class _SymMT5:
+    """A terminal that knows one symbol's contract and no more."""
+
+    def __init__(self, info):
+        self._info = info
+
+    def symbol_info(self, symbol):
+        return self._info
+
+
+def _sym(digits, contract, step=0.01, minimum=0.01, maximum=100.0):
+    return types.SimpleNamespace(
+        digits=digits, trade_contract_size=contract, volume_step=step,
+        volume_min=minimum, volume_max=maximum, filling_mode=1,
+    )
+
+
+def test_risk_sizing_turns_money_into_lots_on_gold(cli):
+    """Gold's pip is 0.10 and its contract is 100 oz, so a 20-pip stop is $2.
+
+    $20 of risk over a 20-pip stop is therefore 0.10 lots, not 0.02 and not 1.00.
+    The published pip (0.10) is the whole reason this cannot be derived from the
+    two-digit quote.
+    """
+    info = _sym(2, 100.0)
+    volume, detail, err = cli._volume_for_risk(
+        _SymMT5(info), "XAUUSD", info, 4285.18, 4283.18, 20.0
+    )
+    assert err is None
+    assert volume == 0.10
+    assert detail["pip"] == 0.10
+    assert detail["stop_pips"] == 20.0
+    assert detail["money_per_pip_per_lot"] == 10.0
+    assert detail["requested_risk_money"] == 20.0
+
+
+def test_risk_sizing_works_on_a_five_digit_fx_pair(cli):
+    """The same arithmetic on a different pip and contract must agree in money."""
+    info = _sym(5, 100000.0)
+    volume, detail, err = cli._volume_for_risk(
+        _SymMT5(info), "EURUSD", info, 1.10000, 1.09980, 20.0
+    )
+    assert err is None
+    assert volume == 1.0
+    assert detail["stop_pips"] == 20.0
+    # 1.00 lot of EURUSD is $100,000, so 0.0002 of movement IS the $20 asked for.
+    assert round(detail["stop_pips"] * detail["money_per_pip_per_lot"] * volume, 2) == 20.0
+
+
+def test_risk_sizing_rounds_down_so_it_never_risks_more_than_asked(cli):
+    """$25 over a 20-pip Gold stop is 0.125 lots, which is not expressible.
+
+    0.13 would risk $26 -- more than the caller asked for, on the one number the
+    caller actually chose. It must round DOWN and say so.
+    """
+    info = _sym(2, 100.0)
+    volume, detail, err = cli._volume_for_risk(
+        _SymMT5(info), "XAUUSD", info, 4285.18, 4283.18, 25.0
+    )
+    assert err is None
+    assert detail["volume_unrounded"] == 0.125
+    assert volume == 0.12
+    assert volume * 20.0 * 10.0 <= 25.0
+
+
+def test_risk_sizing_below_the_broker_minimum_says_what_would_fit(cli):
+    """A risk the symbol cannot express is a refusal that names the floor.
+
+    "$0.10 on a 20-pip Gold stop" needs 0.0005 lots, and the smallest Gold trade
+    is 0.01 -- which risks $2.00. Telling the caller that number is the only
+    useful answer; sending the minimum instead would risk 20x the ask.
+    """
+    info = _sym(2, 100.0)
+    volume, detail, err = cli._volume_for_risk(
+        _SymMT5(info), "XAUUSD", info, 4285.18, 4283.18, 0.10
+    )
+    assert volume is None
+    assert err is not None
+    assert "below this symbol's minimum" in err
+    assert "2.0" in err
+    assert detail["volume"] == 0.0
+
+
+def test_risk_sizing_refuses_a_stop_that_is_not_a_stop(cli):
+    """Without a stop, or with a zero-distance one, the risk is undefined."""
+    info = _sym(2, 100.0)
+    volume, _detail, err = cli._volume_for_risk(
+        _SymMT5(info), "XAUUSD", info, 4285.18, 4285.18, 20.0
+    )
+    assert volume is None and err is not None
+
+
+@pytest.mark.parametrize(
+    "side,entry_type,price,ok",
+    [
+        ("buy", "limit", 4270.0, True),    # below the ask: a dip
+        ("buy", "limit", 4290.0, False),   # above the ask: that is a buy STOP
+        ("sell", "limit", 4300.0, True),   # above the bid: a fade
+        ("sell", "limit", 4280.0, False),  # below the bid: that is a sell STOP
+        ("buy", "stop", 4300.0, True),     # through the ask: a breakout
+        ("buy", "stop", 4280.0, False),    # below the ask: that is a buy LIMIT
+        ("sell", "stop", 4270.0, True),    # through the bid
+        ("sell", "stop", 4290.0, False),   # above the bid: that is a sell LIMIT
+    ],
+)
+def test_a_pending_price_on_the_wrong_side_is_caught_before_the_round_trip(
+    cli, side, entry_type, price, ok
+):
+    """retcode 10015 reads like a bad number. It is a limit on the wrong side.
+
+    The server rejects both wrong-side cases with "invalid price", which names
+    neither the side nor the fix, so the order looks like a formatting bug
+    instead of an order that cannot work.
+    """
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    error = cli._validate_pending_price(side, entry_type, price, tick)
+    assert (error is None) is ok
+    if error:
+        # The refusal must NAME the correct style, not just refuse.
+        assert "LIMIT" in error or "STOP" in error
+
+
+def test_a_market_entry_is_never_validated_as_a_pending_one(cli):
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    assert cli._validate_pending_price("buy", "market", 4290.0, tick) is None
+
+
+class _OrderMT5:
+    """A terminal with the order constants and one symbol, for cmd_order."""
+
+    ORDER_TYPE_BUY = 0
+    ORDER_TYPE_SELL = 1
+    ORDER_TYPE_BUY_LIMIT = 2
+    ORDER_TYPE_SELL_LIMIT = 3
+    ORDER_TYPE_BUY_STOP = 4
+    ORDER_TYPE_SELL_STOP = 5
+    TRADE_ACTION_DEAL = 1
+    TRADE_ACTION_PENDING = 5
+    TRADE_ACTION_REMOVE = 8
+    ORDER_TIME_GTC = 0
+    ORDER_FILLING_RETURN = 2
+    TRADE_RETCODE_DONE = 10009
+
+    def __init__(self, info, tick, equity=10000.0, orders=()):
+        self._info, self._tick, self._equity = info, tick, equity
+        self._orders = list(orders)
+
+    def symbol_select(self, symbol, enable):
+        return True
+
+    def symbol_info(self, symbol):
+        return self._info
+
+    def symbol_info_tick(self, symbol):
+        return self._tick
+
+    def account_info(self):
+        return types.SimpleNamespace(equity=self._equity, balance=self._equity)
+
+    def orders_get(self):
+        return list(self._orders)
+
+
+def _order_args(**over):
+    base = dict(
+        symbol="XAUUSD", side="buy", volume=None, sl=None, tp=None, entry_type="market",
+        price=None, risk_money=None, risk_pct=None, deviation=20, magic=1, comment="c",
+    )
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+def _wire_order(cli, monkeypatch, mt5):
+    sent = []
+
+    def _send(m, req, fillings):
+        sent.append(dict(req))
+        return {
+            "ok": True, "retcode": 10009, "comment": "Request executed",
+            "order": 77, "deal": 88, "price": req["price"],
+        }
+
+    out: dict = {}
+    monkeypatch.setattr(cli, "require_bridge", lambda: (mt5, None))
+    monkeypatch.setattr(cli, "filling_candidates", lambda m, info: [2])
+    monkeypatch.setattr(cli, "_order_send", _send)
+    monkeypatch.setattr(
+        cli, "emit", lambda payload, text=None, code=0: (out.update(payload), code)[1]
+    )
+    return sent, out
+
+
+def test_order_sized_in_money_sends_the_lots_that_money_implies(cli, monkeypatch):
+    """"Risk $100 on this" must reach the broker as a lot size, not as a wish.
+
+    Live Gold tick: ask 4285.18, stop 4283.18 -- 20 pips. $20 of risk is 0.10
+    lots, and the order that reaches the terminal must already carry it.
+    """
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+    args = _order_args(sl=4283.18, risk_money=20.0)
+
+    assert cli.cmd_order(args) == 0
+    assert len(sent) == 1
+    assert sent[0]["action"] == _OrderMT5.TRADE_ACTION_DEAL
+    assert sent[0]["type"] == _OrderMT5.ORDER_TYPE_BUY
+    assert sent[0]["volume"] == 0.10
+    assert sent[0]["price"] == 4285.18
+    assert sent[0]["sl"] == 4283.18
+    assert out["volume"] == 0.10
+    assert out["sizing"]["stop_pips"] == 20.0
+    # $20 of a $10,000 account, reported so the caller can see the size it chose.
+    assert out["risk_pct_of_equity"] == 0.2
+    assert out["filled"] is True
+
+
+def test_a_limit_order_rests_at_the_price_instead_of_filling_now(cli, monkeypatch):
+    """The whole point: an order at a price that is not the market."""
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+    args = _order_args(volume=0.10, entry_type="limit", price=4270.0, sl=4268.0)
+
+    assert cli.cmd_order(args) == 0
+    assert sent[0]["action"] == _OrderMT5.TRADE_ACTION_PENDING
+    assert sent[0]["type"] == _OrderMT5.ORDER_TYPE_BUY_LIMIT
+    assert sent[0]["price"] == 4270.0
+    assert sent[0]["sl"] == 4268.0
+    assert out["pending"] is True
+    assert out["order_ticket"] == 77
+    # It holds NO position, and the report must not read as though it did.
+    assert "filled" not in out
+    assert "NO position" in out["note"]
+
+
+def test_a_sell_stop_rests_below_the_bid_as_a_sell_stop(cli, monkeypatch):
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+    args = _order_args(side="sell", volume=0.10, entry_type="stop", price=4270.0)
+
+    assert cli.cmd_order(args) == 0
+    assert sent[0]["type"] == _OrderMT5.ORDER_TYPE_SELL_STOP
+    assert sent[0]["action"] == _OrderMT5.TRADE_ACTION_PENDING
+    assert out["pending"] is True
+
+
+def test_a_wrong_side_pending_order_never_reaches_the_broker(cli, monkeypatch):
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+    args = _order_args(volume=0.10, entry_type="limit", price=4290.0)
+
+    code = cli.cmd_order(args)
+    assert sent == [], "an order that cannot work must not be sent"
+    errs = out
+    assert code, "a refused order is a failure, not a silent no-op"
+    assert "BUY STOP" in str(errs.get("error", ""))
+
+
+def test_a_market_order_refuses_a_price_it_cannot_honour(cli, monkeypatch):
+    """Silently ignoring 'price' would fill at a price the caller did not ask for."""
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+    assert cli.cmd_order(_order_args(volume=0.1, price=4290.0)) == 1
+    assert sent == []
+    assert "market" in str(out.get("error", ""))
+
+
+def test_risk_sizing_needs_a_stop_and_only_one_size(cli, monkeypatch):
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+
+    assert cli.cmd_order(_order_args(risk_money=20.0)) == 1
+    assert "sl" in str(out.get("error", ""))
+    assert sent == []
+
+    out.clear()
+    assert cli.cmd_order(_order_args(volume=0.1, risk_money=20.0, sl=4283.18)) == 1
+    assert "not both" in str(out.get("error", ""))
+    assert sent == []
+
+    out.clear()
+    assert cli.cmd_order(_order_args(risk_money=20.0, risk_pct=1.0, sl=4283.18)) == 1
+    assert "not both" in str(out.get("error", ""))
+    assert sent == []
+
+
+def test_a_stop_on_the_winning_side_is_refused_rather_than_priced(cli, monkeypatch):
+    """A buy whose 'stop' is above the entry is a target, and |entry-sl| would
+    give a plausible lot size for a trade that cannot exist."""
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+    assert cli.cmd_order(_order_args(sl=4290.0, risk_money=20.0)) == 1
+    assert "target, not a stop" in str(out.get("error", ""))
+    assert sent == []
+
+
+def test_order_without_any_size_is_refused(cli, monkeypatch):
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+    assert cli.cmd_order(_order_args()) == 1
+    assert "size" in str(out.get("error", ""))
+    assert sent == []
+
+
+def test_risk_pct_sizes_against_equity_not_balance(cli, monkeypatch):
+    """Equity is what the account is worth right now, which is what risk is a
+    percentage OF. Sizing off balance would over-risk a losing account."""
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick, equity=10000.0))
+    assert cli.cmd_order(_order_args(sl=4283.18, risk_pct=0.2)) == 0
+    # 0.2% of 10,000 is $20, which is 0.10 lots over a 20-pip Gold stop.
+    assert sent[0]["volume"] == 0.10
+    assert out["risk_pct_of_equity"] == 0.2
+
+
+# --------------------------------------------------------------------------- #
+# CANCEL -- removing a resting order, which holds no position
+# --------------------------------------------------------------------------- #
+def _wire_cancel(cli, monkeypatch, mt5, ok_for=()):
+    sent = []
+
+    def _send(m, req, fillings):
+        sent.append(dict(req))
+        ok = (not ok_for) or req["order"] in ok_for
+        return {"ok": ok, "retcode": 10009 if ok else 10013,
+                "comment": "Done" if ok else "Invalid request"}
+
+    out: dict = {}
+    monkeypatch.setattr(cli, "require_bridge", lambda: (mt5, None))
+    monkeypatch.setattr(cli, "_order_send", _send)
+    monkeypatch.setattr(
+        cli, "emit", lambda payload, text=None, code=0: (out.update(payload), code)[1]
+    )
+    return sent, out
+
+
+def test_cancel_removes_one_named_pending_order(cli, monkeypatch):
+    class _O:
+        def __init__(self, t):
+            self.ticket = t
+
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    mt5 = _OrderMT5(info, tick, orders=[_O(11), _O(12)])
+    sent, out = _wire_cancel(cli, monkeypatch, mt5)
+
+    assert cli.cmd_cancel(types.SimpleNamespace(ticket=12, all=False)) == 0
+    assert sent == [{"action": _OrderMT5.TRADE_ACTION_REMOVE, "order": 12}]
+    assert out["cancelled"] == 1 and out["requested"] == 1
+    assert "Nothing was closed" in out["note"]
+
+
+def test_cancel_all_sweeps_every_resting_order(cli, monkeypatch):
+    class _O:
+        def __init__(self, t):
+            self.ticket = t
+
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    mt5 = _OrderMT5(info, tick, orders=[_O(11), _O(12)])
+    sent, out = _wire_cancel(cli, monkeypatch, mt5)
+
+    assert cli.cmd_cancel(types.SimpleNamespace(ticket=None, all=True)) == 0
+    assert [r["order"] for r in sent] == [11, 12]
+    assert out["cancelled"] == 2
+
+
+def test_cancel_all_with_nothing_resting_is_a_success_not_an_error(cli, monkeypatch):
+    """"There was nothing to cancel" is the desired end state, not a failure."""
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    mt5 = _OrderMT5(info, tick, orders=[])
+    sent, out = _wire_cancel(cli, monkeypatch, mt5)
+
+    assert cli.cmd_cancel(types.SimpleNamespace(ticket=None, all=True)) == 0
+    assert sent == []
+    assert out["cancelled"] == 0
+    assert "no pending orders" in out["note"]
+
+
+def test_cancel_without_a_target_is_refused(cli, monkeypatch):
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_cancel(cli, monkeypatch, _OrderMT5(info, tick))
+    assert cli.cmd_cancel(types.SimpleNamespace(ticket=None, all=False)) == 1
+    assert sent == []
+    assert "all=true" in str(out.get("error", ""))
+
+
+def test_a_partial_cancel_is_an_alert_never_a_success(cli, monkeypatch):
+    """An order still resting in the market must never be reported as removed."""
+    class _O:
+        def __init__(self, t):
+            self.ticket = t
+
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    mt5 = _OrderMT5(info, tick, orders=[_O(11), _O(12)])
+    sent, out = _wire_cancel(cli, monkeypatch, mt5, ok_for={11})
+
+    code = cli.cmd_cancel(types.SimpleNamespace(ticket=None, all=True))
+    assert out["cancelled"] == 1 and out["requested"] == 2
+    assert out["alert"] == "cancel_incomplete"
+    assert code, "an incomplete sweep is not a clean result"

@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-24.7"
+_CLI_VERSION = "2026-09-24.8"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -98,7 +98,7 @@ _INSTALL_COMMAND_TIMEOUT = 120
 #: execute() (see _GUARD_SAFE_SUBACTIONS), so an operator can always inspect or
 #: disarm protection even with trading disabled.
 _TRADING_ACTIONS = frozenset(
-    {"order", "split", "close", "close_all", "modify", "guard"}
+    {"order", "split", "close", "close_all", "cancel", "modify", "guard"}
 )
 
 #: ``guard`` sub-actions that place no order. These stay available without
@@ -170,6 +170,8 @@ _TIMEOUTS: dict[str, int] = {
     # paid once rather than N times, which is the whole reason `--splits 10` is
     # not ten calls. Still bounded well inside the ceiling.
     "split": 120,
+    # `cancel` is one TRADE_ACTION_REMOVE per pending order through the bridge.
+    "cancel": 120,
 }
 _DEFAULT_TIMEOUT = 120
 
@@ -599,8 +601,23 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
         parts += [
             "--symbol", _sh(kwargs.get("symbol") or ""),
             "--side", _sh(kwargs.get("side") or ""),
-            "--volume", str(float(kwargs.get("volume") or 0)),
         ]
+        # `--volume` is emitted ONLY when the caller gave one: sending
+        # `--volume 0.0` alongside `--risk-money` would be a second, zero answer
+        # to the same question and the CLI refuses two sizes for one order.
+        if kwargs.get("volume") is not None:
+            parts += ["--volume", str(float(kwargs["volume"]))]
+        # The entry style. Passed through explicitly rather than defaulted here so
+        # the CLI, which validates the price against the live tick, is the one
+        # place that decides whether a limit/stop is on the correct side.
+        entry_type = str(kwargs.get("entry_type") or "market").strip().lower()
+        if entry_type != "market":
+            parts += ["--entry-type", _sh(entry_type)]
+        if kwargs.get("price") is not None:
+            parts += ["--price", str(float(kwargs["price"]))]
+        for flag in ("risk_money", "risk_pct"):
+            if kwargs.get(flag) is not None:
+                parts += [f"--{flag.replace('_', '-')}", str(float(kwargs[flag]))]
         for flag in ("sl", "tp"):
             if kwargs.get(flag) is not None:
                 parts += [f"--{flag}", str(float(kwargs[flag]))]
@@ -608,6 +625,13 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
             parts += ["--deviation", str(int(kwargs["deviation"]))]
         if kwargs.get("comment"):
             parts += ["--comment", _sh(kwargs["comment"])]
+    elif action == "cancel":
+        # One ticket, or every pending order. `--all` is the sweep; the CLI has no
+        # "cancel the order I just placed" heuristic, so it takes the ticket.
+        if kwargs.get("cancel_all"):
+            parts += ["--all"]
+        elif kwargs.get("ticket") is not None:
+            parts += ["--ticket", str(int(kwargs["ticket"]))]
     elif action == "split":
         parts += [
             "--symbol", _sh(kwargs.get("symbol") or ""),
@@ -886,6 +910,24 @@ class MT5SandboxTool(Tool):
             "the 0.01 point a 2-digit quote advertises -- so a 20-pip stop is $2.00. "
             "Never state a stop or target from memory: action='plan' computes it, and "
             "action='order' should be given the sl/tp it returned. "
+            "ENTERING AT A PRICE (action='order' with entry_type) -- the two most common "
+            "instructions a trader gives are 'buy the dip at X' and 'buy the breakout "
+            "above X', and neither is a market order. entry_type='limit' RESTS at "
+            "'price' and fills only BETTER than the market (buy below the ask, sell "
+            "above the bid); entry_type='stop' rests at 'price' and fills only when the "
+            "market BREAKS THROUGH it (buy above the ask, sell below the bid). Both "
+            "hold NO position and risk nothing until they fill -- a resting order is "
+            "not an open trade, so do not go on to manage or watch it as one. A "
+            "limit/stop on the wrong side of the market is refused here with the "
+            "corrected wording (the server would only answer retcode 10015). Read "
+            "resting orders with action='orders' and remove one with action='cancel' "
+            "(ticket=, or cancel_all=true). "
+            "SIZING BY MONEY AT RISK (risk_money / risk_pct) -- pass these instead of "
+            "'volume' and the lots are derived from the stop distance, the pip and the "
+            "contract size, rounded DOWN so the order never risks more than asked. "
+            "'Risk $100 on Gold with a 20-pip stop' is a size the caller should not "
+            "have to compute: give risk_money=100 and sl=<price>. risk_pct is the same "
+            "against account equity. Both need 'sl'. "
             "POLLING A LIVE TRADE -- do it, and keep doing it: while a position is "
             "open you watch it in REAL TIME instead of setting a cron and walking "
             "away, and you think between calls. Loop action='watch' with "
@@ -956,11 +998,16 @@ class MT5SandboxTool(Tool):
                 "count": {"type": "integer", "description": "action=candles: number of bars. action=close with group: close only this many of the group, oldest comment first. This is 'take 3 of the 10 off, leave 7 running'. 0 or omitted closes the whole group."},
                 "days": {"type": "integer", "description": "History window in days (action=history)."},
                 "side": {"type": "string", "enum": ["buy", "sell"], "description": "Order direction (action=order)."},
-                "volume": {"type": "number", "description": "Lots (action=order/close)."},
+                "volume": {"type": "number", "description": "Lots (action=order/close). action=order: OMIT it when passing risk_money/risk_pct, which derive the lots from the stop instead."},
+                "entry_type": {"type": "string", "enum": ["market", "limit", "stop"], "description": "action=order: where the order enters. 'market' (default) fills now at the current price. 'limit' rests at 'price' and fills only BETTER than the market (buy below, sell above) -- 'buy the dip at X'. 'stop' rests at 'price' and fills only when the market BREAKS THROUGH it (buy above, sell below) -- 'buy the breakout above X'. Both rest server-side holding no position until they fill. A limit/stop on the wrong side of the market is refused with the corrected wording."},
+                "price": {"type": "number", "description": "action=order: the entry price when entry_type is 'limit' or 'stop'. That price IS the entry. Not allowed with entry_type='market', which fills at the current market price."},
+                "risk_money": {"type": "number", "description": "action=order: size the order so a stop-out costs this much in account currency, instead of naming lots. Needs 'sl' (the entry-to-stop distance IS the risk) and is mutually exclusive with 'volume' and with risk_pct. The lots are rounded DOWN to the symbol's step, so the real risk is never above the number passed."},
+                "risk_pct": {"type": "number", "description": "action=order: as risk_money, but as a percentage of account EQUITY. Needs 'sl'. Mutually exclusive with 'volume' and with risk_money."},
                 "sl": {"type": "number", "description": "Stop loss price (action=order)."},
                 "tp": {"type": "number", "description": "Take profit price (action=order)."},
                 "deviation": {"type": "integer", "description": "Max slippage in points."},
-                "ticket": {"type": "integer", "description": "Position ticket (action=close, or the single target of action=modify/guard)."},
+                "ticket": {"type": "integer", "description": "Position ticket (action=close, or the single target of action=modify/guard). action=cancel: the PENDING ORDER ticket to remove -- read the tickets from action=orders first."},
+                "cancel_all": {"type": "boolean", "description": "action=cancel: remove every pending order this terminal has. Use it to clear resting orders before the session ends; it cancels nothing that has already filled."},
                 "tickets": {"type": "array", "items": {"type": "integer"}, "description": "action=modify: several position tickets at once."},
                 "all_positions": {"type": "boolean", "description": "action=modify: every open position."},
                 "exit_at": {"type": "number", "description": "action=modify: the price to exit this position at. The SL/TP side is chosen from the position direction and the level is nudged outside the broker's minimum stop distance. This is the instant, broker-held exit -- prefer it over watching the price yourself."},
@@ -1059,8 +1106,55 @@ class MT5SandboxTool(Tool):
         if action == "order":
             if not kwargs.get("symbol") or not kwargs.get("side"):
                 return ToolResult.error("action=order requires 'symbol' and 'side'.")
-            if not kwargs.get("volume"):
-                return ToolResult.error("action=order requires a positive 'volume'.")
+            # A size is required, but it can be lots OR money-at-risk. Sizing by
+            # risk is the point of `risk_money`/`risk_pct`: "risk $100 on this"
+            # is what a trader says, and the lots are derived from the stop.
+            risk_money = kwargs.get("risk_money")
+            risk_pct = kwargs.get("risk_pct")
+            if kwargs.get("volume") is None and risk_money is None and risk_pct is None:
+                return ToolResult.error(
+                    "action=order needs a size: 'volume' in lots, or 'risk_money' / "
+                    "'risk_pct' together with 'sl'."
+                )
+            if kwargs.get("volume") is not None and (
+                risk_money is not None or risk_pct is not None
+            ):
+                return ToolResult.error(
+                    "action=order: pass 'volume' OR 'risk_money'/'risk_pct', not both "
+                    "-- two sizes for one order is two answers to one question."
+                )
+            if risk_money is not None and risk_pct is not None:
+                return ToolResult.error(
+                    "action=order: pass 'risk_money' OR 'risk_pct', not both."
+                )
+            if (risk_money is not None or risk_pct is not None) and kwargs.get("sl") is None:
+                return ToolResult.error(
+                    "action=order sized by risk needs 'sl': the distance from the "
+                    "entry to the stop IS the money at risk."
+                )
+            entry_type = str(kwargs.get("entry_type") or "market").strip().lower()
+            if entry_type not in ("market", "limit", "stop"):
+                return ToolResult.error(
+                    "action=order: entry_type must be 'market', 'limit' or 'stop'."
+                )
+            if entry_type != "market" and kwargs.get("price") is None:
+                return ToolResult.error(
+                    f"action=order with entry_type='{entry_type}' needs 'price' -- "
+                    "that price IS the entry."
+                )
+            if entry_type == "market" and kwargs.get("price") is not None:
+                return ToolResult.error(
+                    "action=order: entry_type='market' fills at the market and cannot "
+                    "honour 'price'. Use entry_type='limit' to enter better than the "
+                    "market, or entry_type='stop' to enter on a break through it."
+                )
+        if action == "cancel":
+            if not kwargs.get("cancel_all") and kwargs.get("ticket") is None:
+                return ToolResult.error(
+                    "action=cancel needs 'ticket' (the pending order to remove), or "
+                    "cancel_all=true to remove every pending order. Read them with "
+                    "action=orders first."
+                )
         if action == "close" and not (kwargs.get("ticket") or kwargs.get("group")):
             return ToolResult.error(
                 "action=close requires 'ticket', or 'group' to close part of a split "

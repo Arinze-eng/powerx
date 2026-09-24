@@ -66,7 +66,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.7"
+CLI_VERSION = "2026-09-24.8"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -3581,7 +3581,227 @@ def cmd_split(args: argparse.Namespace) -> int:
     return emit(out, text=out["note"] if ok else out.get("warning", out["note"]), code=code)
 
 
+def _symbol_pip_and_contract(
+    mt5: Any, symbol: str, info: Any = None
+) -> tuple[float, float]:
+    """``(pip, contract_size)`` for a symbol. The two numbers risk math needs.
+
+    Kept together so every caller that converts a stop distance into money uses
+    the SAME pair -- Gold's 0.10 pip with a 100-oz contract and EURUSD's 0.00001
+    with 100000 are the reason a money figure cannot be derived from a price
+    distance alone.
+    """
+    pip = _watch_symbol_pips(mt5, symbol)[1]
+    if info is None:
+        info = mt5.symbol_info(symbol)
+    contract = float(getattr(info, "trade_contract_size", 0.0) or 0.0)
+    return pip, contract
+
+
+def _volume_for_risk(
+    mt5: Any,
+    symbol: str,
+    info: Any,
+    entry: float,
+    sl: float,
+    risk_money: float,
+) -> tuple[float | None, dict[str, Any], str | None]:
+    """The lot size that risks ``risk_money`` at this entry and stop.
+
+    THE POINT: "risk $100 on this idea" is what a trader says, and turning that
+    into lots is arithmetic over the stop distance, the pip and the contract size
+    -- three places to be wrong, in the one calculation where being wrong costs
+    money. Rounded DOWN to the broker's step, because rounding up would risk more
+    than the caller asked for.
+    """
+    pip, contract = _symbol_pip_and_contract(mt5, symbol, info)
+    step = float(getattr(info, "volume_step", 0.01) or 0.01)
+    minimum = float(getattr(info, "volume_min", 0.01) or 0.01)
+    maximum = float(getattr(info, "volume_max", 100.0) or 100.0)
+    stop_distance = abs(float(entry) - float(sl))
+    detail: dict[str, Any] = {
+        "requested_risk_money": round(float(risk_money), 2),
+        "stop_distance_price": round(stop_distance, 8),
+        "pip": pip,
+        "contract_size": contract,
+    }
+    if not pip or not contract or stop_distance <= 0:
+        return None, detail, (
+            "cannot size by risk: the pip, the contract size, or the distance "
+            "between entry and stop is zero or unknown."
+        )
+    stop_pips = stop_distance / pip
+    per_pip_per_lot = contract * pip
+    raw = float(risk_money) / (stop_pips * per_pip_per_lot)
+    volume = round(math.floor(raw / step + 1e-9) * step, 8)
+    detail.update(
+        {
+            "stop_pips": round(stop_pips, 1),
+            "money_per_pip_per_lot": round(per_pip_per_lot, 6),
+            "volume_unrounded": round(raw, 8),
+            "volume": volume,
+        }
+    )
+    if volume < minimum:
+        return None, detail, (
+            f"risking {round(float(risk_money), 2)} with a {round(stop_pips, 1)}-pip "
+            f"stop needs {round(raw, 4)} lots at {round(per_pip_per_lot, 4)} per pip "
+            f"per lot, below this symbol's minimum of {minimum}. Raise the risk to at "
+            f"least {round(minimum * stop_pips * per_pip_per_lot, 2)}, tighten the "
+            "stop, or use a symbol where that risk is expressible."
+        )
+    if volume > maximum:
+        return None, detail, (
+            f"risking {round(float(risk_money), 2)} with a {round(stop_pips, 1)}-pip "
+            f"stop needs {round(raw, 4)} lots, above this symbol's maximum of "
+            f"{maximum}. Lower the risk or widen the stop."
+        )
+    return volume, detail, None
+
+
+def _entry_type_constant(mt5: Any, side: str, entry_type: str) -> int:
+    """The MT5 ``ORDER_TYPE_*`` for a side and an entry style."""
+    is_buy = side in ("buy", "long")
+    if entry_type == "limit":
+        return mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
+    if entry_type == "stop":
+        return mt5.ORDER_TYPE_BUY_STOP if is_buy else mt5.ORDER_TYPE_SELL_STOP
+    return mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
+
+
+def _validate_pending_price(
+    side: str, entry_type: str, price: float, tick: Any
+) -> str | None:
+    """Whether a pending price is on the correct side of the market, or why not.
+
+    THE ERROR THIS PREVENTS: a buy limit ABOVE the ask, or a buy stop BELOW it, is
+    rejected by the server as retcode 10015 "invalid price" -- which reads like a
+    bad number rather than a limit on the wrong side of the market. It is an order
+    that CANNOT work, and it is worth catching here instead of on a round trip.
+    """
+    ask = float(getattr(tick, "ask", 0.0) or 0.0)
+    bid = float(getattr(tick, "bid", 0.0) or 0.0)
+    is_buy = side in ("buy", "long")
+    if entry_type == "limit":
+        if is_buy and price >= ask:
+            return (
+                f"a BUY LIMIT must sit BELOW the market: {price} is at or above the "
+                f"ask {ask}. To buy ABOVE the market that is a BUY STOP -- pass "
+                "entry_type='stop'."
+            )
+        if not is_buy and price <= bid:
+            return (
+                f"a SELL LIMIT must sit ABOVE the market: {price} is at or below the "
+                f"bid {bid}. To sell BELOW the market that is a SELL STOP -- pass "
+                "entry_type='stop'."
+            )
+    if entry_type == "stop":
+        if is_buy and price <= ask:
+            return (
+                f"a BUY STOP must sit ABOVE the market: {price} is at or below the "
+                f"ask {ask}. To buy BELOW the market that is a BUY LIMIT -- pass "
+                "entry_type='limit'."
+            )
+        if not is_buy and price >= bid:
+            return (
+                f"a SELL STOP must sit BELOW the market: {price} is at or above the "
+                f"bid {bid}. To sell ABOVE the market that is a SELL LIMIT -- pass "
+                "entry_type='limit'."
+            )
+    return None
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    """Remove a pending order that has not triggered yet."""
+    mt5, err = require_bridge()
+    if err is not None:
+        return err
+
+    tickets: list[int] = []
+    if getattr(args, "all", False):
+        tickets = [int(getattr(o, "ticket", 0)) for o in (mt5.orders_get() or [])]
+        if not tickets:
+            return emit(
+                {
+                    "ok": True,
+                    "action": "cancel",
+                    "cancelled": 0,
+                    "note": "there were no pending orders to cancel.",
+                }
+            )
+    else:
+        if getattr(args, "ticket", None) is None:
+            return fail(
+                "cancel needs 'ticket', or all=true to remove every pending order.",
+                code=1,
+            )
+        tickets = [int(args.ticket)]
+
+    results = []
+    for ticket in tickets:
+        request = {"action": mt5.TRADE_ACTION_REMOVE, "order": ticket}
+        payload = _order_send(mt5, request, [mt5.ORDER_FILLING_RETURN])
+        results.append({"ticket": ticket, **payload})
+    cancelled = [r for r in results if r.get("ok")]
+    out: dict[str, Any] = {
+        "ok": len(cancelled) == len(tickets),
+        "action": "cancel",
+        "requested": len(tickets),
+        "cancelled": len(cancelled),
+        "results": results,
+        "note": (
+            f"cancelled {len(cancelled)} of {len(tickets)} pending order(s). "
+            "Nothing was closed -- a pending order that has not triggered holds no "
+            "position."
+        ),
+    }
+    if len(cancelled) != len(tickets):
+        out["alert"] = "cancel_incomplete"
+    return emit(out, text=out["note"], code=0 if out["ok"] else 3)
+
+
+def _validate_stop_side(side: str, entry: float, sl: float | None) -> str | None:
+    """Whether a stop sits on the losing side of the entry, or why it does not.
+
+    A stop on the WINNING side is not a stop: the server rejects it, and if it
+    did not, it would be a target that closes the trade the moment it is open.
+    Caught here because the risk arithmetic divides by ``|entry - sl|``, so a
+    wrong-side stop silently produces a plausible and meaningless lot size.
+    """
+    if sl is None:
+        return None
+    is_buy = side in ("buy", "long")
+    if is_buy and float(sl) >= float(entry):
+        return (
+            f"a BUY stops OUT below the entry: sl {sl} is at or above entry "
+            f"{entry}. That is a target, not a stop."
+        )
+    if not is_buy and float(sl) <= float(entry):
+        return (
+            f"a SELL stops OUT above the entry: sl {sl} is at or below entry "
+            f"{entry}. That is a target, not a stop."
+        )
+    return None
+
+
 def cmd_order(args: argparse.Namespace) -> int:
+    """One order, at the market or resting at a price, sized in lots or in money.
+
+    THREE THINGS THIS DOES THAT A MARKET ORDER ALONE CANNOT:
+
+      * It can REST at a price (``entry_type=limit`` or ``stop``). "Buy the
+        breakout above 4300" and "buy the dip at 4270" are the two most common
+        instructions a trader gives, and neither is servable at the market --
+        sending a market order instead fills at a price the caller did not ask
+        for, and the difference is the whole trade.
+      * It can be sized by the MONEY at risk (``risk_money`` / ``risk_pct``)
+        instead of in lots. "Risk $100 on this" is what a person says; the lot
+        size is arithmetic over the stop distance, and doing that arithmetic by
+        hand is the error that costs money.
+      * It refuses an entry that CANNOT work -- a limit on the wrong side of the
+        market, a stop on the winning side of the entry -- before spending a
+        round trip on a server rejection.
+    """
     mt5, err = require_bridge()
     if err is not None:
         return err
@@ -3593,23 +3813,99 @@ def cmd_order(args: argparse.Namespace) -> int:
         return fail(f"symbol {symbol} unavailable", code=2)
 
     side = args.side.lower()
-    if side in ("buy", "long"):
-        order_type = mt5.ORDER_TYPE_BUY
-        price = tick.ask
-    elif side in ("sell", "short"):
-        order_type = mt5.ORDER_TYPE_SELL
-        price = tick.bid
-    else:
+    if side not in ("buy", "sell", "long", "short"):
         return fail("side must be buy or sell", code=1)
+    is_buy = side in ("buy", "long")
+    entry_type = (getattr(args, "entry_type", None) or "market").lower()
+    if entry_type not in ("market", "limit", "stop"):
+        return fail("entry_type must be market, limit or stop", code=1)
 
-    # Filling has to be one the symbol actually supports, and the choice is a
-    # bitmask lookup, not a constant comparison — see filling_candidates().
+    # ---- WHERE the order enters -------------------------------------------
+    requested_price = getattr(args, "price", None)
+    if entry_type == "market":
+        if requested_price is not None:
+            return fail(
+                "entry_type=market fills at the market, so 'price' cannot be "
+                "honoured. Use entry_type=limit (to enter better than the market) "
+                "or entry_type=stop (to enter on a break through price).",
+                code=1,
+            )
+        price = float(tick.ask if is_buy else tick.bid)
+    else:
+        if requested_price is None:
+            return fail(
+                f"entry_type={entry_type} needs 'price' -- that price IS the entry.",
+                code=1,
+            )
+        bad = _validate_pending_price(side, entry_type, float(requested_price), tick)
+        if bad:
+            return fail(bad, code=1)
+        price = float(requested_price)
+
+    # ---- HOW BIG, in lots or in money -------------------------------------
+    risk_money = getattr(args, "risk_money", None)
+    risk_pct = getattr(args, "risk_pct", None)
+    sizing: dict[str, Any] | None = None
+    if args.volume is not None:
+        if risk_money is not None or risk_pct is not None:
+            return fail(
+                "pass volume OR risk_money/risk_pct, not both: two sizes for one "
+                "order is two answers to one question.",
+                code=1,
+            )
+        volume = float(args.volume)
+    else:
+        if risk_money is None and risk_pct is None:
+            return fail(
+                "order needs a size: 'volume' in lots, or 'risk_money'/'risk_pct' "
+                "together with 'sl'.",
+                code=1,
+            )
+        if risk_money is not None and risk_pct is not None:
+            return fail("pass risk_money OR risk_pct, not both.", code=1)
+        if args.sl is None:
+            return fail(
+                "sizing by risk needs 'sl': the distance from the entry to the stop "
+                "IS the risk. Without a stop the risk is the whole account.",
+                code=1,
+            )
+        stop_bad = _validate_stop_side(side, price, args.sl)
+        if stop_bad:
+            return fail(stop_bad, code=1)
+        if risk_pct is not None:
+            account = mt5.account_info()
+            equity = float(getattr(account, "equity", 0.0) or 0.0)
+            if equity <= 0:
+                return fail(
+                    "cannot size by percentage: the account equity is unreadable.",
+                    code=2,
+                )
+            risk_money = equity * float(risk_pct) / 100.0
+        volume, sizing, sizing_error = _volume_for_risk(
+            mt5, symbol, info, price, float(args.sl), float(risk_money)
+        )
+        if volume is None:
+            return fail(
+                sizing_error or "cannot size this risk on this symbol",
+                code=1,
+                sizing=sizing,
+            )
+        sizing["risk_pct_of_equity"] = None
+
+    # ---- the request ------------------------------------------------------
+    pending = entry_type != "market"
+    if pending:
+        action = mt5.TRADE_ACTION_PENDING
+        order_type = _entry_type_constant(mt5, side, entry_type)
+    else:
+        action = mt5.TRADE_ACTION_DEAL
+        order_type = _entry_type_constant(mt5, side, "market")
+
     fillings = filling_candidates(mt5, info)
-
     request = {
-        "action": mt5.TRADE_ACTION_DEAL,
+        "action": action,
         "symbol": symbol,
-        "volume": float(args.volume),
+        "volume": float(volume),
         "type": order_type,
         "price": float(price),
         "deviation": int(args.deviation),
@@ -3624,10 +3920,39 @@ def cmd_order(args: argparse.Namespace) -> int:
         request["tp"] = float(args.tp)
 
     payload = _order_send(mt5, request, fillings)
+    payload["entry_type"] = entry_type
+    payload["side"] = side
+    payload["symbol"] = symbol
+    payload["volume"] = float(volume)
+    payload["request_price"] = float(price)
+    if sizing is not None:
+        # The arithmetic that produced the lot size is reported WITH the order:
+        # a size the caller cannot check is a size the caller has to trust.
+        payload["sizing"] = sizing
+        account = mt5.account_info()
+        equity = float(getattr(account, "equity", 0.0) or 0.0)
+        if equity > 0:
+            sizing["risk_pct_of_equity"] = round(
+                sizing["requested_risk_money"] / equity * 100.0, 2
+            )
+            payload["risk_pct_of_equity"] = sizing["risk_pct_of_equity"]
+    if payload["ok"] and pending:
+        payload["pending"] = True
+        payload["order_ticket"] = payload.get("order")
+        payload["note"] = (
+            f"{entry_type} order resting at {price}: it holds NO position and risks "
+            "nothing until the market reaches it. Cancel it with cancel --ticket."
+        )
+    elif payload["ok"]:
+        payload["filled"] = True
+        if payload.get("price") is not None:
+            payload["fill_price"] = payload["price"]
     code = 0 if payload["ok"] else 3
-    note = "order filled" if payload["ok"] else f"order rejected: {payload.get('comment')}"
+    if payload["ok"]:
+        note = payload.get("note") or "order filled"
+    else:
+        note = f"order rejected: {payload.get('comment')}"
     return emit(payload, text=note, code=code)
-
 
 def _close_one(mt5: Any, pos: Any, args: argparse.Namespace) -> dict[str, Any]:
     """Close one position (or part of it), resolving the symbol's filling mode.
@@ -6524,16 +6849,71 @@ def build_parser() -> argparse.ArgumentParser:
                    help="a tick younger than this means the market is open")
     p.set_defaults(func=cmd_symbols)
 
-    p = sub.add_parser("order", help="send a market order")
+    p = sub.add_parser(
+        "order",
+        help="send an order: at the market, or RESTING at a price, sized in lots or in money",
+    )
     p.add_argument("--symbol", required=True)
     p.add_argument("--side", required=True, choices=["buy", "sell", "long", "short"])
-    p.add_argument("--volume", type=float, required=True)
+    p.add_argument(
+        "--volume",
+        type=float,
+        default=None,
+        help=(
+            "lots to trade. Omit it when passing --risk-money/--risk-pct, which "
+            "derive the lots from the stop distance instead"
+        ),
+    )
+    p.add_argument(
+        "--entry-type",
+        default="market",
+        choices=["market", "limit", "stop"],
+        help=(
+            "market = fill now at the current price. limit = rest at --price and "
+            "fill only BETTER than the market (buy below, sell above). stop = rest "
+            "at --price and fill only when the market BREAKS THROUGH it (buy above, "
+            "sell below). A limit/stop order holds no position until it fills"
+        ),
+    )
+    p.add_argument(
+        "--price",
+        type=float,
+        default=None,
+        help=(
+            "the entry price for --entry-type limit/stop. Not allowed with "
+            "market, which fills at the current price"
+        ),
+    )
+    p.add_argument(
+        "--risk-money",
+        type=float,
+        default=None,
+        help=(
+            "size the order so that a stop-out costs this much in account "
+            "currency. Needs --sl. Prefer this over --volume when the instruction "
+            "is 'risk $100 on this'"
+        ),
+    )
+    p.add_argument(
+        "--risk-pct",
+        type=float,
+        default=None,
+        help="as --risk-money, but as a percentage of account equity. Needs --sl",
+    )
     p.add_argument("--sl", type=float, default=None)
     p.add_argument("--tp", type=float, default=None)
     p.add_argument("--deviation", type=int, default=20)
     p.add_argument("--magic", type=int, default=20240919)
     p.add_argument("--comment", default="powerx-mt5")
     p.set_defaults(func=cmd_order)
+
+    p = sub.add_parser(
+        "cancel",
+        help="remove a pending order that has not triggered yet",
+    )
+    p.add_argument("--ticket", type=int, default=None, help="the pending order ticket")
+    p.add_argument("--all", action="store_true", help="remove every pending order")
+    p.set_defaults(func=cmd_cancel)
 
     p = sub.add_parser(
         "split",
@@ -6709,6 +7089,9 @@ _BRIDGE_ACTIONS = frozenset(
     {
         "login", "account", "quote", "candles", "positions", "orders",
         "history", "symbol", "symbols", "order", "split", "close", "close_all",
+        # `cancel` sends TRADE_ACTION_REMOVE to the terminal, so it is a Wine
+        # action like the rest of the trade path.
+        "cancel",
         "run",
         # `watch` samples ticks and positions every poll, so it MUST run under
         # Wine: on the Linux python each sample would be a fresh re-exec into
