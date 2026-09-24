@@ -774,9 +774,21 @@ def test_installed_chain_reports_everything_missing_on_a_bare_box(monkeypatch, t
     ``installed_chain`` is what the gate reads. It checks the WHOLE chain, not
     just terminal64.exe: MetaEditor actually compiles, and the Windows python
     bridge is what makes the terminal usable, so a partial prefix must not pass.
+
+    WINE IS STUBBED OUT, and it has to be: the wine arm of the chain is probed
+    with ``which <wine_bin>`` against the REAL PATH, so on the developer host
+    (where Wine is installed -- it is required to run this project's own tests
+    against a live terminal) the assertion below failed with
+    ``'wine' not in ['wine_prefix', 'terminal64.exe', ...]``. That failure said
+    nothing about ``installed_chain`` and everything about the machine the suite
+    ran on. ``_isolate_prefix`` already walls off HOME and the prefix; pointing
+    ``wine_bin`` at a name nothing can resolve does the same for the launcher, so
+    the test states its own precondition ("a bare box") instead of inheriting one.
     """
     _isolate_prefix(monkeypatch, tmp_path)
-    info = _load_cli_module().installed_chain()
+    module = _load_cli_module()
+    monkeypatch.setattr(module, "wine_bin", lambda: "wine-not-installed-in-this-fixture")
+    info = module.installed_chain()
 
     assert info["installed"] is False
     assert "wine" in info["missing"]
@@ -1043,13 +1055,26 @@ def test_find_terminal_prefers_the_broker_branded_build(tmp_path, monkeypatch):
     assert cli.find_terminal() == branded / "terminal64.exe"
 
 
-def test_broker_server_probe_flags_the_generic_terminal(tmp_path):
+def test_broker_server_probe_flags_the_generic_terminal(monkeypatch, tmp_path):
     """The probe that turns a silent failure into a loud one.
 
-    Size is the only readable signal: servers.dat is not plain text (a string
-    scan finds just the copyright), so the generic 50 KB build and the branded
-    234 KB build are told apart by size.
+    Size is the FAST PATH, not the whole test: servers.dat is not plain text (a
+    string scan finds just the copyright), so 234 KB is enough to call a build
+    branded without asking anything else. It is NOT enough to call one generic --
+    MEASURED 2026-09-22: Deriv's branded servers.dat is 43,804 B, i.e. SMALLER
+    than the generic ~50 KB, so a bare size comparison reported "no broker
+    servers" about a terminal that was streaming 722 Deriv symbols. A small file
+    therefore falls through to the registry, which names the build from its own
+    install record / directory.
+
+    THE PREFIX IS ISOLATED, and it has to be: without that, the ARM of
+    ``installed_broker_key`` that reads ``~/.mt5/.broker_key`` sees the
+    developer's own REAL install. On a host with a live Deriv terminal this test
+    failed with ``assert True is False`` for the generic fixture -- the probe was
+    correctly reading ``.broker_key=deriv`` and answering about that, not about
+    the temp directory the test built.
     """
+    _isolate_prefix(monkeypatch, tmp_path)
     cli = _load_cli_module()
 
     generic = tmp_path / "MetaTrader 5"
