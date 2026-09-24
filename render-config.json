@@ -4,11 +4,11 @@
       "model": "custom/${LLM_MODEL}",
       "provider": "custom",
       "maxToolIterations": 120,
-      "reasoningEffort": "max",
+      "reasoningEffort": "medium",
       "maxConcurrentSubagents": 1,
       "contextWindowTokens": 1048576,
       "maxTokens": 32768,
-      "maxToolResultChars": 524288,
+      "maxToolResultChars": 131072,
       "workspace": "~/.nanobot/workspace",
       "botName": "Novita Super Agent"
     }

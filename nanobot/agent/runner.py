@@ -162,6 +162,56 @@ def _model_heartbeat_seconds() -> float:
     return _resolve_heartbeat_seconds("NANOBOT_MODEL_HEARTBEAT_S", MODEL_HEARTBEAT_SECONDS)
 
 
+def _tool_concurrency_limit() -> int:
+    """Maximum tool calls allowed to run at once inside a parallel batch.
+
+    [PERF 2026-09-24] The batched path below used a bare ``asyncio.gather`` with
+    no ceiling. That was harmless while nothing ever emitted more than one tool
+    call per turn, but once ``parallel_tool_calls`` is advertised the model can
+    legitimately return a dozen calls in one response -- and an unbounded gather
+    runs all of them simultaneously. A burst of heavy tools (several browser
+    sessions, big reads, model-backed sub-tools) then contends for the same CPU
+    and sockets and finishes SLOWER than a bounded pool, while also spiking
+    memory. Capping keeps the parallelism that matters (a handful of genuinely
+    independent I/O-bound calls) without letting one turn stampede the host.
+
+    Default 6: high enough that ordinary batched reads are never throttled,
+    low enough to stay polite on a small container. Override with
+    NANOBOT_MAX_PARALLEL_TOOLS. A non-positive or invalid value falls back to
+    the default rather than silently serialising everything.
+    """
+    raw = os.environ.get("NANOBOT_MAX_PARALLEL_TOOLS")
+    if raw is None or not raw.strip():
+        return 6
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid NANOBOT_MAX_PARALLEL_TOOLS={!r}; using 6", raw)
+        return 6
+    return value if value > 0 else 6
+
+
+async def _bounded_gather(awaitables: list[Any], limit: int) -> list[Any]:
+    """``asyncio.gather`` with at most *limit* awaitables in flight at a time.
+
+    Results keep the input order, matching ``asyncio.gather``, so callers do not
+    need to know whether the batch was throttled. Exceptions propagate the same
+    way they would from a plain gather.
+    """
+    if limit <= 1 or len(awaitables) <= 1:
+        # Nothing to bound: a single awaitable, or an explicit request to
+        # serialise. Await them in order.
+        return [await item for item in awaitables]
+
+    semaphore = asyncio.Semaphore(limit)
+
+    async def _guarded(item: Any) -> Any:
+        async with semaphore:
+            return await item
+
+    return list(await asyncio.gather(*(_guarded(item) for item in awaitables)))
+
+
 TOOL_HEARTBEAT_SECONDS = DEFAULT_TOOL_HEARTBEAT_SECONDS
 
 #: How long a model request may produce NOTHING before the turn says so.
@@ -2089,18 +2139,25 @@ class AgentRunner:
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
             if spec.concurrent_tools and len(batch) > 1:
-                batch_results = await asyncio.gather(*(
-                    self._run_tool(
-                        spec,
-                        tool_call,
-                        external_lookup_counts,
-                        workspace_violation_counts,
-                        hook,
-                        context,
-                        repeat_tool_state=repeat_tool_state,
-                    )
-                    for tool_call in batch
-                ))
+                # Bounded, not a bare gather: the model may now emit many
+                # parallel calls in one turn, and running all of them at once
+                # contends for CPU/sockets and can finish slower than a capped
+                # pool. See _tool_concurrency_limit.
+                batch_results = await _bounded_gather(
+                    [
+                        self._run_tool(
+                            spec,
+                            tool_call,
+                            external_lookup_counts,
+                            workspace_violation_counts,
+                            hook,
+                            context,
+                            repeat_tool_state=repeat_tool_state,
+                        )
+                        for tool_call in batch
+                    ],
+                    _tool_concurrency_limit(),
+                )
                 tool_results.extend(batch_results)
             else:
                 batch_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
