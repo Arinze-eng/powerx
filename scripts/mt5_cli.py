@@ -5597,7 +5597,21 @@ def main():
                     # Nothing left to protect. Not an error and not an exit: the
                     # rule stays armed for the next position on the symbol, which
                     # is what makes a trailing policy usable across a session
-                    # rather than only on the trade it was armed for.
+                    # rather than only on the trade it was armed for. Said out
+                    # loud, because an armed rule with nothing under it and an
+                    # armed rule whose answer nobody can read look identical --
+                    # MEASURED LIVE 2026-09-24: the position closed on its own
+                    # trail and the rule went silent in the status, which reads
+                    # as "not armed" to whoever armed it.
+                    stop_move_last[str(rule.get("id"))] = {
+                        "ts": now, "mode": str(rule.get("mode") or "breakeven"),
+                        "price": price, "outcome": "no_position",
+                        "detail": [
+                            "armed and waiting: no open position matches this "
+                            f"rule ({rule.get('scope') or rule.get('symbol')}) -- "
+                            "it stays armed for the next one"
+                        ],
+                    }
                     continue
                 moved = move_stops(rule, targets, args.deviation, args.magic)
                 sent = [r for r in moved if r.get("retcode") is not None]

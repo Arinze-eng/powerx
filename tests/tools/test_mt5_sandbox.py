@@ -5620,3 +5620,37 @@ def test_a_breakeven_rule_will_not_measure_r_off_an_already_protected_stop(
     assert rows[0]["ok"] is False
     assert "already at or past the entry" in rows[0]["skipped"]
     assert mt5.sl_sends == []
+
+
+def test_a_moving_stop_with_nothing_to_protect_says_so_rather_than_going_silent(
+    monkeypatch, tmp_path
+):
+    """An armed rule with nothing under it must not read as "not armed".
+
+    MEASURED LIVE 2026-09-24: the position closed on its own trail and the rule
+    vanished from the published state, because the "no matching position" exit
+    happened before anything was recorded. To whoever armed it, that is the same
+    answer as a rule that was never written.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock()
+    # The rule scopes a ticket that is NOT open: the position it was armed for is
+    # already gone.
+    mt5 = _FakeMT5(symbol="XAUUSD", bid=4300.0, ask=4300.2, tickets=(9002,))
+
+    rule = cli._validate_rule(
+        {"symbol": "XAUUSD", "action": "move_stop", "mode": "trail",
+         "ticket": 9001, "distance": 2.0, "id": "g-trail"}, 0, 4300.0,
+    )
+    run, events, rules_after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, [rule],
+        interval_ms=100, max_seconds=2,
+    )
+
+    idle = run["state"]["stop_move"]["g-trail"]
+    assert idle["outcome"] == "no_position"
+    assert "no open position matches this rule" in idle["detail"][0]
+    # Nothing was sent, and the rule is still armed for the next position.
+    assert mt5.sltp_sends == []
+    assert [r["id"] for r in rules_after] == ["g-trail"]
+    assert [e for e in events if e["event"].startswith("stop_move")] == []

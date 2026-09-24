@@ -331,8 +331,9 @@ Two limits worth knowing before you arm one:
 
 **A moving stop is usually WAITING, and waiting is what you will see.** `not yet
 1R` writes no event — it would write one per tick — so `guard_action='status'`
-publishes `stop_move`: one row per armed rule with `outcome` (`moved`, `refused`
-or `waiting`), the `mode`, the price, and the `detail` — *"#4735550381 not yet 1R
+publishes `stop_move`: one row per armed rule with `outcome` (`moved`, `refused`,
+`waiting`, or `no_position` — armed and nothing matches it yet), the `mode`, the
+price, and the `detail` — *"#4735550381 not yet 1R
 (4302.18)"* or *"#4735550381 4284.92 -> 4286.69"*. That is the only way to tell a
 rule doing its job quietly from a rule that was never armed, so read it before
 telling anyone their stop is protected.
