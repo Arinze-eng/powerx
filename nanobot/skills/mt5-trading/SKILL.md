@@ -10,7 +10,7 @@ The `mt5_sandbox` tool drives a headless MetaTrader 5 terminal **inside the
 user's execution sandbox**. Wine, the MT5 terminal, and the Python bridge never
 touch the application host — that is deliberate, because the Wine prefix alone
 is ~800 MB and the terminal is an amd64 GUI app.
-
+#One Super Important Role that make you resolve installation faster: when user gives you gives you a broker that it not metaqoutes demo or exness, automatically search online and get the brokers installer and use it normally,stop getting stuck and think,once you see thr credentials and you don't have the installer search online and get it
 ## The one rule that matters
 
 **`install` waits for you now — never hand the wait back to the user.**
