@@ -17,6 +17,7 @@ The sandbox is faked, so the tests are fast and need no network or Wine.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import inspect
 import json
@@ -32,10 +33,14 @@ import pytest
 
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.mt5_sandbox import (
-    MT5SandboxTool,
     _ALL_ACTIONS,
+    _FLOAT_FIELDS,
     _INSTALL_COMMAND_TIMEOUT,
+    _INT_FIELDS,
     _TIMEOUTS,
+    BadNumberError,
+    MT5SandboxTool,
+    _normalize_numeric,
     _parse_payload,
     _server_is_known,
     bootstrap_command,
@@ -5679,3 +5684,123 @@ def test_a_moving_stop_with_nothing_to_protect_says_so_rather_than_going_silent(
     assert mt5.sltp_sends == []
     assert [r["id"] for r in rules_after] == ["g-trail"]
     assert [e for e in events if e["event"].startswith("stop_move")] == []
+
+
+# --------------------------------------------------------------------------- #
+# numeric arguments as a model actually emits them
+#
+# Reported failure, verbatim from an agent: "Due to platform-specific limitations
+# ... the system requires numeric parameters but substitutes them as strings
+# during variable expansion ... you can manually place the above stop order."
+# There was no platform limitation. `sl=""` reached `float("")`, which raised a
+# fieldless ValueError inside build_cli_command -- OUTSIDE the try/except that
+# guards the transport -- so the model received a bare traceback, could not
+# attribute it, and told a human to click the buttons instead. The bug class is
+# "optional field arrives empty", which is what JSON-emitting models do constantly.
+# --------------------------------------------------------------------------- #
+def test_blank_optional_number_means_not_provided():
+    """The crash case: an empty `sl`/`tp` must not reach float()."""
+    cmd = build_cli_command(
+        "order",
+        {"symbol": "EURUSD", "side": "buy", "volume": 0.01, "sl": "", "tp": "",
+         "allow_no_stop": True},
+    )
+    assert "--sl" not in cmd and "--tp" not in cmd
+    assert "--volume 0.01" in cmd
+
+
+def test_blank_required_number_is_dropped_not_zeroed():
+    """`volume: ""` disappears rather than becoming a 0-lot order."""
+    cmd = build_cli_command("order", {"symbol": "EURUSD", "side": "buy", "volume": ""})
+    assert "--volume" not in cmd
+    assert " 0" not in cmd.split("--side")[1]
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("0.01", "0.01"),        # number shipped as a string
+        ("0,01", "0.01"),        # European decimal comma
+        ("0.01 lots", "0.01"),   # unit pasted from a broker page
+        (0.01, "0.01"),
+    ],
+)
+def test_volume_is_read_whichever_way_it_arrives(raw, expected):
+    cmd = build_cli_command(
+        "order", {"symbol": "EURUSD", "side": "buy", "volume": raw, "allow_no_stop": True}
+    )
+    assert f"--volume {expected}" in cmd
+
+
+def test_money_shaped_risk_is_read_as_money():
+    """`risk_money` is a currency field, so models hand it back with the symbol on."""
+    out = _normalize_numeric({"risk_money": "$50", "risk_pct": "1.5%"})
+    assert out["risk_money"] == 50.0
+    assert out["risk_pct"] == 1.5
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("sl", "soon"),          # not a number in any notation
+        ("volume", "0.01,0.02"), # two numbers glued together is one bad number
+        ("volume", True),        # bool is an int subclass; True is not a lot size
+    ],
+)
+def test_unparseable_number_names_its_field(field, value):
+    """The message must be attributable, or the model can only guess and stall."""
+    with pytest.raises(BadNumberError) as raised:
+        _normalize_numeric({"symbol": "EURUSD", field: value})
+    assert raised.value.field == field
+    assert field in str(raised.value)
+
+
+def test_fractional_ticket_is_refused_not_rounded():
+    """A ticket that silently rounds would close the WRONG position."""
+    assert _normalize_numeric({"ticket": 4736608160.0})["ticket"] == 4736608160
+    with pytest.raises(BadNumberError):
+        _normalize_numeric({"ticket": 4736608160.5})
+
+
+def test_execute_reports_bad_number_instead_of_traceback():
+    """The tool must answer with JSON naming the field and confirming nothing fired."""
+    tool = MT5SandboxTool()
+    result = asyncio.run(
+        tool.execute(action="order", symbol="EURUSD", side="buy", volume=0.01, sl="soon")
+    )
+    payload = json.loads(result.content) if hasattr(result, "content") else json.loads(result)
+    assert payload["error"] == "bad_numeric_argument"
+    assert payload["field"] == "sl"
+    assert "no position changed" in payload["next"]
+
+
+def test_numeric_fields_match_the_schema():
+    """The schema is the contract; the coercion sets must not drift from it.
+
+    Checks BOTH directions:
+      * a numeric field in `parameters` that is in neither set keeps the old
+        crash-on-blank behaviour, silently, until an agent tells a user to place
+        the trade by hand;
+      * a field put in the wrong set is worse than missing -- `limit` and
+        `deviation` are integers, and an integer read as a float lets `2.7`
+        through to a flag that then truncates it.
+    """
+    declared = MT5SandboxTool().parameters["properties"]
+    schema_floats = {
+        n for n, s in declared.items()
+        if isinstance(s, dict) and s.get("type") == "number"
+    }
+    schema_ints = {
+        n for n, s in declared.items()
+        if isinstance(s, dict) and s.get("type") == "integer"
+    }
+    assert schema_floats == _FLOAT_FIELDS, (
+        f"number fields out of sync: missing={sorted(schema_floats - _FLOAT_FIELDS)} "
+        f"extra={sorted(_FLOAT_FIELDS - schema_floats)}"
+    )
+    assert schema_ints == _INT_FIELDS, (
+        f"integer fields out of sync: missing={sorted(schema_ints - _INT_FIELDS)} "
+        f"extra={sorted(_INT_FIELDS - schema_ints)}"
+    )
+    # A field in both sets would be parsed as an integer by accident of iteration.
+    assert not (_FLOAT_FIELDS & _INT_FIELDS)

@@ -334,6 +334,112 @@ def _sh(value: Any) -> str:
     return shlex.quote(str(value))
 
 
+#: Every field the tool's own JSON schema declares number/integer. Kept as one
+#: list so argument coercion is a single decision, not 20 call sites that each
+#: remember to call float(). Kept honest by
+#: tests/tools/test_mt5_sandbox.py::test_numeric_fields_match_the_schema, which
+#: fails if `parameters` gains a numeric field that is missing from, or sorted
+#: into the wrong one of, these two sets.
+_FLOAT_FIELDS: frozenset[str] = frozenset(
+    {
+        "activate_at", "entry", "equity", "exit_at", "max_daily_loss_money",
+        "max_total_risk_money", "max_total_risk_pct", "poll_seconds", "price",
+        "range_high", "range_low", "risk_money", "risk_pct", "rr", "sl",
+        "sl_pips", "spread", "tp", "trail_distance", "trigger_price",
+        "volume", "wait_seconds", "when_r",
+    }
+)
+_INT_FIELDS: frozenset[str] = frozenset(
+    {
+        # NOT "items": `"tickets": {"type": "array", "items": {...}}` is the
+        # JSON-Schema keyword, not a parameter. `test_numeric_fields_match_the_schema`
+        # compares these sets against `properties`, which is what keeps a nested
+        # keyword from sneaking in again.
+        "count", "days", "deviation", "interval_ms", "limit", "lines",
+        "login", "max_positions", "max_seconds", "splits", "ticket", "timeout",
+        "wait",
+    }
+)
+_NUMERIC_FIELDS: frozenset[str] = _FLOAT_FIELDS | _INT_FIELDS
+
+#: Groupings, thresholds and levels an LLM pastes out of a broker's own docs,
+#: where the number is rarely alone. Stripped before parsing so "$50", "50%",
+#: "0,01" (European decimal) and "0.01 lots" are the same argument as 0.01.
+_NUM_NOISE = re.compile(r"[^\d.,\-+eE]")
+
+
+class BadNumberError(ValueError):
+    """A numeric argument arrived that cannot be read as a number.
+
+    Carries enough to let the model fix its OWN call. The alternative -- letting
+    `float('')` raise on the way to building the command -- hands the agent a
+    bare `ValueError: could not convert string to float: ''` with no field name,
+    which it then explains to the user as a "platform-specific limitation" and
+    gives up. Measured: an empty `sl`/`tp` (the single most common way an optional
+    field arrives from a JSON-emitting model) killed order placement outright.
+    """
+
+    def __init__(self, field: str, value: Any, kind: str) -> None:
+        self.field = field
+        self.value = value
+        super().__init__(
+            f"{field!r} must be a {kind}, but was {value!r}. Send a plain number "
+            f"(e.g. 0.01), or omit the field entirely to mean 'not provided'."
+        )
+
+
+def _coerce_number(field: str, value: Any, integer: bool) -> float | int:
+    """Parse one numeric argument. Raises :class:`BadNumberError` rather than ValueError."""
+    if isinstance(value, bool):  # bool is an int subclass; True is not a volume.
+        raise BadNumberError(field, value, "number")
+    if isinstance(value, (int, float)):
+        out = float(value)
+    elif isinstance(value, str):
+        cleaned = _NUM_NOISE.sub("", value.strip())
+        if "," in cleaned and "." not in cleaned:
+            cleaned = cleaned.replace(",", ".")  # European decimal comma
+        else:
+            cleaned = cleaned.replace(",", "")  # thousands separator
+        try:
+            out = float(cleaned)
+        except (ValueError, TypeError):
+            raise BadNumberError(field, value, "integer" if integer else "number") from None
+    else:
+        raise BadNumberError(field, value, "integer" if integer else "number")
+    if integer:
+        # int("0.5") would raise; int(0.5) silently becomes 0. A ticket or a
+        # count that quietly rounds is a wrong trade, so refuse it out loud.
+        if out != int(out):
+            raise BadNumberError(field, value, "a whole number")
+        return int(out)
+    return out
+
+
+def _normalize_numeric(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return *kwargs* with every declared numeric field coerced to a real number.
+
+    Two rules do the work:
+
+    * **Blank means absent.** `""`, `"  "`, `None` are removed, so the existing
+      `kwargs.get(x) or default` fallbacks see a plain "caller did not pass this".
+      This is the crash fix: an empty optional field must never reach `float()`.
+    * **Anything else must parse, or the call is rejected with the field named.**
+      Silently treating garbage as 0 on a trading tool is not an option -- 0 lots
+      and 0 price are real, wrong, spendable answers.
+    """
+    out: dict[str, Any] = dict(kwargs)
+    for field in _NUMERIC_FIELDS:
+        if field not in out:
+            continue
+        value = out[field]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            del out[field]
+            continue
+        out[field] = _coerce_number(field, value, field in _INT_FIELDS)
+    return out
+
+
+
 #: A broker-branded MT5 installer URL, as published on the broker's own
 #: "Download MT5" page. Exness is ``exness.technologies.ltd``.
 #:
@@ -828,6 +934,9 @@ def _fetch_page_text(url: str, timeout: float = 25.0) -> str:
 
 def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
     """Translate tool kwargs into an ``mt5_cli.py`` invocation."""
+    # Coerce once, here, so no branch below has to remember that a model may send
+    # "0.01", 0.01, "0,01", "$50", or "" for the same field.
+    kwargs = _normalize_numeric(kwargs)
     parts = ["python3", _CLI_PATH, action]
 
     if action == "install":
@@ -1471,6 +1580,35 @@ class MT5SandboxTool(Tool):
         if action not in _ALL_ACTIONS:
             return ToolResult.error(
                 f"Unknown action '{action}'. Valid actions: {', '.join(_ALL_ACTIONS)}"
+            )
+
+        # Coerce the model's numbers BEFORE anything reads them -- the guard-rule
+        # builder, the plan preview and the command builder all take numeric input.
+        #
+        # WHY THIS IS HERE AND NOT ONLY IN THE BUILDER: when `float('')` raised on
+        # the way to building an order, the agent received a fieldless traceback and
+        # reported it to the user as a "platform-specific limitation" that needed the
+        # order placed BY HAND. An empty optional field is the single most common
+        # shape a JSON-emitting model sends, so that failure was routine. Naming the
+        # offending field turns an unexplainable crash into a self-correctable retry.
+        try:
+            kwargs = _normalize_numeric(kwargs)
+        except BadNumberError as bad:
+            return ToolResult.error(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "bad_numeric_argument",
+                        "field": bad.field,
+                        "received": repr(bad.value),
+                        "message": str(bad),
+                        "next": (
+                            f"Call action={action!r} again with {bad.field} as a plain "
+                            "number, or leave it out. Nothing was sent to the broker; no "
+                            "position changed."
+                        ),
+                    }
+                )
             )
 
         # --- host-only actions --------------------------------------------- #
