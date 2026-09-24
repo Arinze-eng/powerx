@@ -66,7 +66,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.4"
+CLI_VERSION = "2026-09-24.5"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -2084,6 +2084,10 @@ def _watch_quote(mt5: Any, symbol: str) -> dict[str, Any] | None:
 #: ``nanobot/trading/gold_strategy.py``; a test pins both to 0.10.
 GOLD_PIP = 0.10
 
+#: Troy ounces in one Gold lot, so a pip is worth ``volume * contract * pip``.
+#: Kept in step with ``GOLD_CONTRACT`` in ``nanobot/trading/gold_strategy.py``.
+GOLD_CONTRACT = 100.0
+
 
 def _is_gold_symbol(symbol: str) -> bool:
     """Whether ``symbol`` is Gold, by the broker's own spelling.
@@ -2990,6 +2994,15 @@ def _order_send(mt5, request: dict[str, Any],
             "deal": result.deal,
             "filling_used": filling,
         }
+        # The price the DEAL executed at. This is not the price the request asked
+        # for, and on a market order they are not the same number: MEASURED
+        # 2026-09-24 on a live Deriv-Demo terminal, a 10-way split of XAUUSD
+        # requested at one price filled across 4284.06..4284.25. The request price
+        # is what was ASKED; this is what the account got, and a report that gives
+        # only the first is wrong about a dividend of the money.
+        executed = getattr(result, "price", None)
+        if executed:
+            payload["price"] = float(executed)
         if payload["ok"]:
             return payload
         payload["request"] = req
@@ -3141,20 +3154,46 @@ def cmd_split(args: argparse.Namespace) -> int:
         for key in ("order", "deal", "price"):
             if result.get(key) is not None:
                 entry[key] = result.get(key)
+        # The executed price lives at the TOP level of an `_order_send` payload
+        # (`price`), while a wrapper's nested `result` carries the ids. Read both,
+        # so the actual fill is reported whichever shape the bridge returns.
+        if entry.get("price") is None and payload.get("price") is not None:
+            entry["price"] = payload["price"]
         results.append(entry)
         if payload.get("ok"):
             filled += 1
         elif args.stop_on_failure:
             break
 
-    # The stop is the thing that makes the total risk what it is, so its absence
-    # is reported in terms of risk rather than as a style note.
+    # --- what the account actually got --------------------------------------- #
+    # "The same price" is the promise of this method, so it is MEASURED rather
+    # than asserted. A market order fills at whatever the other side is when it
+    # lands, and N of them land at N moments: MEASURED 2026-09-24 on a live
+    # Deriv-Demo terminal, ten XAUUSD tickets requested at 4284.15 filled across
+    # 4284.06..4284.25 -- 0.19 of price, which is 1.9 pips on a 20-pip stop, from
+    # nothing but the market moving between tickets. A split is *near* one price,
+    # never exactly one, and saying otherwise would make a backtest of this method
+    # silently better than the method.
+    fills = sorted(
+        e["price"] for e in results if e.get("ok") and e.get("price") is not None
+    )
+    pip = _watch_symbol_pips(mt5, symbol)[1]
+    fill_spread_pips = None
+    if len(fills) > 1 and pip > 0:
+        fill_spread_pips = round((fills[-1] - fills[0]) / pip, 1)
+
+    # Risk is summed PER TICKET off each ticket's own fill, not off the one price
+    # the request asked for: those differ by exactly the dispersion above, and on
+    # the tickets that filled worst the stop is closer than planned.
     risk_money = None
-    if args.sl is not None:
-        pip = _watch_symbol_pips(mt5, symbol)[1]
-        per_pip = per * 100.0 * pip if _is_gold_symbol(symbol) else None
+    if args.sl is not None and fills:
+        # Money per pip at this ticket size -- same arithmetic as
+        # gold_strategy.money_per_pip (volume * contract * pip).
+        per_pip = per * GOLD_CONTRACT * pip if _is_gold_symbol(symbol) else None
         if per_pip is not None:
-            risk_money = round(abs(price - float(args.sl)) / pip * per_pip * filled, 2)
+            risk_money = round(
+                sum(abs(f - float(args.sl)) / pip * per_pip for f in fills), 2
+            )
 
     # `ok` is about TICKETS, not lots. A shortfall opens slightly less volume than
     # asked for, which is safe on purpose -- it carries a warning, and it is not a
@@ -3177,6 +3216,10 @@ def cmd_split(args: argparse.Namespace) -> int:
         "sl": args.sl,
         "tp": args.tp,
         "total_risk_money": risk_money,
+        # What the account actually got, versus the price that was asked for.
+        "fill_price_first": fills[0] if fills else None,
+        "fill_price_last": fills[-1] if fills else None,
+        "fill_dispersion_pips": fill_spread_pips,
         "results": results,
         "note": (
             f"{filled}/{count} tickets of {per} lots on {symbol} at {price}. "
@@ -3185,6 +3228,12 @@ def cmd_split(args: argparse.Namespace) -> int:
             "Close any subset by ticket, or by group with close --group."
         ),
     }
+    if fill_spread_pips is not None and fill_spread_pips > 0:
+        out["note"] += (
+            f" Filled {fills[0]}..{fills[-1]} ({fill_spread_pips} pips of dispersion): "
+            "a split is NEAR one price, not exactly one -- the market moved between "
+            "tickets. Report the fills, not the requested price."
+        )
     if shortfall:
         out["warning"] = (
             f"{total} lots does not divide into {count} x {per}: {left_over} lots "

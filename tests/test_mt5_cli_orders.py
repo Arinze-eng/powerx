@@ -865,3 +865,59 @@ def test_the_ledger_keeps_the_events_that_happened_between_calls(cli, tmp_path, 
     assert result["event_count"] == 2
     stored = json.loads(path.read_text(encoding="utf-8"))
     assert [e["event"] for e in stored["events"]] == ["rule_fired", "position_closed"]
+
+
+def test_split_reports_what_the_account_actually_got_not_what_it_asked_for(cli, monkeypatch):
+    """A split is NEAR one price, never exactly one.
+
+    MEASURED 2026-09-24 on a live Deriv-Demo terminal: ten XAUUSD tickets
+    requested at one price filled across 4284.06..4284.25, because a market order
+    fills at whatever the other side is when it lands and ten of them land at ten
+    moments. Reporting only the requested price makes the method look better than
+    it is, and understates the risk on the tickets that filled worst.
+    """
+    sent = []
+
+    class _Info:
+        volume_min, volume_max, volume_step, digits = 0.01, 100.0, 0.01, 2
+        filling_mode = 1
+
+    class _Tick:
+        bid, ask = 4284.15, 4284.33
+
+    fills = [4284.06, 4284.11, 4284.15, 4284.22, 4284.25] * 2
+
+    def _fake_send(mt5, req, fillings):
+        sent.append(dict(req))
+        executed = fills[len(sent) - 1]
+        return {"ok": True, "retcode": 10009, "comment": "Request executed",
+                "order": len(sent), "deal": len(sent), "price": executed}
+
+    monkeypatch.setattr(cli, "require_bridge", lambda: (_FakeMT5(sent, _Info(), _Tick()), None))
+    monkeypatch.setattr(cli, "filling_candidates", lambda mt5, info: [1])
+    monkeypatch.setattr(cli, "_order_send", _fake_send)
+
+    args = types.SimpleNamespace(
+        symbol="XAUUSD", side="sell", volume=0.10, splits=10, group="probe1",
+        sl=4330.00, tp=4240.00, deviation=20, magic=20240919,
+        comment="probe", stop_on_failure=False, check_cost=False,
+    )
+    out = {}
+    monkeypatch.setattr(cli, "emit", lambda payload, text=None, code=0: (out.update(payload), 0)[1])
+    assert cli.cmd_split(args) == 0
+
+    assert out["price"] == 4284.15, "the requested price is still reported"
+    assert out["fill_price_first"] == 4284.06 and out["fill_price_last"] == 4284.25
+    # 0.19 of price at a 0.10 pip is 1.9 pips -- on a 20-pip stop that is a tenth
+    # of the trade's risk, purely from the tickets not being simultaneous.
+    assert out["fill_dispersion_pips"] == 1.9
+    assert "dispersion" in out["note"]
+    # Risk is summed off each ticket's OWN fill -- the distance to the stop differs
+    # per ticket by exactly the dispersion, so the request-price figure is a
+    # different number and the wrong one.
+    per_pip = 0.01 * 100.0 * 0.10
+    assert out["total_risk_money"] == round(
+        sum(abs(f - 4330.00) / 0.10 * per_pip for f in fills), 2
+    )
+    from_request_price = abs(4284.15 - 4330.00) / 0.10 * per_pip * 10
+    assert out["total_risk_money"] != round(from_request_price, 2)

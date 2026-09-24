@@ -624,6 +624,15 @@ mt5_sandbox(action="close", group="xau-leg2", count=3)
 
 ### What makes it work — and the trap
 
+* **"The same price" means *near* one price.** The tick is read once, before the
+  loop, so every ticket is *requested* at the same price — but a market order
+  fills at whatever the other side is when it lands, and N tickets land at N
+  moments. MEASURED on a live account: ten XAUUSD tickets requested at 4284.15
+  filled across **4284.06–4284.25** (1.9 pips on a 20-pip stop) from nothing but
+  the market moving. `fill_price_first` / `fill_price_last` /
+  `fill_dispersion_pips` report it, and `total_risk_money` is summed off each
+  ticket's own fill rather than the requested price. Quote the fills; "all at one
+  price" is not true and the entry rate is on the ticket list.
 * **Every ticket must carry the same stop.** Ten 0.10 lots with a 20-pip stop risk
   exactly what one 1.00 lot with a 20-pip stop risks. The split multiplies
   *exits*, not risk. A split with stops on only some of the tickets multiplies
