@@ -337,6 +337,66 @@ def _assert_ephemeral(root: Path) -> bool:
     return not (candidate == persistent or persistent in candidate.parents)
 
 
+def _build_backend(
+    backend_name: str,
+    backend_config: object | None,
+    key: str,
+) -> object | None:
+    """Instantiate the execution backend for *backend_name*, or ``None``.
+
+    Kept as one function because the constructor signature differs per backend
+    (Upstash/Daytona/Runloop/Vercel each need a session-derived resource name,
+    VPS does not) and two callers now need the same instance semantics: the
+    project stager and the live-screen byte mover.
+    """
+    if backend_name == "vps":
+        from nanobot.agent.tools.vps_backend import VPSExecutionBackend
+
+        return VPSExecutionBackend(backend_config)
+    if backend_name == "upstash" and backend_config is not None:
+        from nanobot.agent.tools.upstash_backend import (
+            UpstashExecutionBackend,
+            upstash_box_name,
+        )
+
+        return UpstashExecutionBackend(backend_config, box_name=upstash_box_name(key))
+    if backend_name == "daytona" and backend_config is not None:
+        from nanobot.agent.tools.daytona_backend import (
+            DaytonaExecutionBackend,
+            daytona_sandbox_name,
+        )
+
+        return DaytonaExecutionBackend(backend_config, sandbox_name=daytona_sandbox_name(key))
+    if backend_name == "runloop" and backend_config is not None:
+        from nanobot.agent.tools.runloop_backend import (
+            RunloopExecutionBackend,
+            runloop_devbox_name,
+        )
+
+        return RunloopExecutionBackend(backend_config, devbox_name=runloop_devbox_name(key))
+    if backend_name == "vercel" and backend_config is not None:
+        from nanobot.agent.tools.vercel_backend import (
+            VercelExecutionBackend,
+            vercel_sandbox_name,
+        )
+
+        return VercelExecutionBackend(backend_config, sandbox_name=vercel_sandbox_name(key))
+    return None
+
+
+def _backend_root(backend_name: str, backend: object, backend_config: object | None) -> str:
+    """Return the workspace root the backend resolves paths against."""
+    root = str(getattr(backend, "workspace", "") or "/workspace")
+    if backend_name == "vps":
+        resolver = getattr(backend, "_configured_workspace", None)
+        if callable(resolver):
+            try:
+                root = str(resolver(backend_config) or root)
+            except Exception:  # noqa: BLE001
+                pass
+    return root
+
+
 async def _stage_remote_backend(
     backend_name: str,
     backend_config: object | None,
@@ -350,53 +410,12 @@ async def _stage_remote_backend(
     from nanobot.agent.tools.novita_sandbox import _session_key  # noqa: PLC2701
 
     key = _session_key()
-    backend: object | None = None
-
-    if backend_name == "vps":
-        from nanobot.agent.tools.vps_backend import VPSExecutionBackend
-
-        backend = VPSExecutionBackend(backend_config)
-    elif backend_name == "upstash" and backend_config is not None:
-        from nanobot.agent.tools.upstash_backend import (
-            UpstashExecutionBackend,
-            upstash_box_name,
-        )
-
-        backend = UpstashExecutionBackend(backend_config, box_name=upstash_box_name(key))
-    elif backend_name == "daytona" and backend_config is not None:
-        from nanobot.agent.tools.daytona_backend import (
-            DaytonaExecutionBackend,
-            daytona_sandbox_name,
-        )
-
-        backend = DaytonaExecutionBackend(backend_config, sandbox_name=daytona_sandbox_name(key))
-    elif backend_name == "runloop" and backend_config is not None:
-        from nanobot.agent.tools.runloop_backend import (
-            RunloopExecutionBackend,
-            runloop_devbox_name,
-        )
-
-        backend = RunloopExecutionBackend(backend_config, devbox_name=runloop_devbox_name(key))
-    elif backend_name == "vercel" and backend_config is not None:
-        from nanobot.agent.tools.vercel_backend import (
-            VercelExecutionBackend,
-            vercel_sandbox_name,
-        )
-
-        backend = VercelExecutionBackend(backend_config, sandbox_name=vercel_sandbox_name(key))
-
+    backend = _build_backend(backend_name, backend_config, key)
     if backend is None:
         logger.debug("workspace_bridge: no backend instance for {}", backend_name)
         return None
 
-    root = str(getattr(backend, "workspace", "") or "/workspace")
-    if backend_name == "vps":
-        resolver = getattr(backend, "_configured_workspace", None)
-        if callable(resolver):
-            try:
-                root = str(resolver(backend_config) or root)
-            except Exception:  # noqa: BLE001
-                pass
+    root = _backend_root(backend_name, backend, backend_config)
 
     remote_dir = _normalise_remote_dir(source_dir, root)
     tar_cmd = (
@@ -523,10 +542,170 @@ async def sandbox_workspace_root() -> str | None:
     return mapping.get(backend_name)
 
 
+#: Ceiling for a single file-pull out of the sandbox. A GUI frame is tens of
+#: kilobytes; this bound exists so a runaway capture cannot pull an unbounded
+#: payload into the gateway process, and so a caller can tell "too big" from
+#: "transfer failed" instead of hanging on a multi-hundred-megabyte read.
+DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024
+
+#: Every backend's ``run`` renders its status as a trailing ``[exit_code=N]``
+#: marker (see ``vps_backend._output`` and its siblings). Parse the last one so
+#: a command that echoes the marker itself cannot spoof the result.
+_EXIT_CODE_RE = re.compile(r"\[exit_code=(-?\d+)\]")
+
+
+def _exit_code(output: str) -> int | None:
+    """Return the trailing exit code a backend's ``run`` reports, or ``None``."""
+    matches = _EXIT_CODE_RE.findall(output or "")
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class RemoteExecutor:
+    """A resolved way to run a command and pull a file from the active sandbox.
+
+    Two shapes exist because Novita's native SDK handle is not a
+    :class:`~nanobot.agent.tools.vps_backend.VPSExecutionBackend` — it exposes
+    ``commands``/``files`` directly and moves bytes as chunked base64. Callers
+    that only need "run this, fetch that" should not have to know which.
+    """
+
+    name: str
+    backend: object | None = None
+    native: object | None = None
+
+    @property
+    def available(self) -> bool:
+        return self.backend is not None or self.native is not None
+
+
+async def resolve_remote_executor(session_key: str | None = None) -> RemoteExecutor:
+    """Resolve the configured sandbox into a run/fetch handle.
+
+    Never raises: an unconfigured or unreachable backend returns an
+    unavailable executor so callers degrade instead of failing a request.
+
+    *session_key* names the sandbox to attach to. Callers outside an agent turn
+    — the live-screen pump is the one that exists — have no request context, so
+    the implicit :func:`_session_key` lookup would silently answer ``"unknown"``
+    and attach to the wrong (or no) sandbox. Such callers must pass the key.
+    """
+    try:
+        backend_name, backend_config = await _selected_backend()
+        from nanobot.agent.tools.novita_sandbox import _STORE, _session_key  # noqa: PLC2701
+
+        key = session_key or _session_key()
+        if backend_name == "novita" and backend_config is None:
+            return RemoteExecutor(name="novita", native=_STORE.get(key))
+        return RemoteExecutor(
+            name=backend_name, backend=_build_backend(backend_name, backend_config, key)
+        )
+    except Exception as exc:  # noqa: BLE001 - absence of a backend is not fatal
+        logger.debug("workspace_bridge: executor resolution failed: {}", exc)
+        return RemoteExecutor(name="unavailable")
+
+
+async def run_remote(
+    command: str,
+    *,
+    timeout: int = 120,
+    executor: RemoteExecutor | None = None,
+) -> tuple[bool, str]:
+    """Run *command* in the sandbox. Returns ``(ok, output)``; never raises."""
+    ex = executor or await resolve_remote_executor()
+    try:
+        if ex.native is not None:
+            result = await asyncio.to_thread(
+                ex.native.commands.run, command, cwd="/", timeout=timeout
+            )
+            code = getattr(result, "exit_code", None)
+            text = (
+                f"{getattr(result, 'stdout', '') or ''}"
+                f"\n{getattr(result, 'stderr', '') or ''}"
+            ).strip()
+            return (code in (0, None)), text
+        if ex.backend is None:
+            return False, "no execution backend is configured"
+        output = await ex.backend.run(command, timeout=timeout)  # type: ignore[attr-defined]
+        return (_exit_code(output) == 0), output
+    except Exception as exc:  # noqa: BLE001 - callers degrade, never crash
+        logger.debug("workspace_bridge: remote command failed: {}", exc)
+        return False, str(exc)[:400]
+
+
+async def fetch_remote_file(
+    remote_path: str,
+    *,
+    max_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    executor: RemoteExecutor | None = None,
+) -> bytes | None:
+    """Fetch one file out of the sandbox as bytes, or ``None``.
+
+    Reuses the archive fetch paths rather than adding a third byte-mover, so
+    backend knowledge (Novita's text-only ``files.read``, Runloop's base64
+    fallback, per-backend ``download``) stays in one place.
+
+    Note the path must be one the backend is willing to read — Runloop's
+    ``download`` runs ``_safe_path`` and refuses anything outside its workspace,
+    so callers should target the workspace rather than ``/tmp``.
+    """
+    ex = executor or await resolve_remote_executor()
+    if not ex.available:
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix="powerx-file-") as tmp:
+            local = Path(tmp) / "payload.bin"
+            if ex.native is not None:
+                ok = await _fetch_via_novita_sdk(
+                    ex.native, remote_path, local, max_bytes=max_bytes
+                )
+            else:
+                ok = await _fetch_via_backend_download(
+                    ex.backend, remote_path, local, timeout=120
+                )
+            if not ok or not local.is_file():
+                return None
+            if local.stat().st_size > max_bytes:
+                logger.debug(
+                    "workspace_bridge: {} exceeds {} bytes; refusing to fetch",
+                    remote_path,
+                    max_bytes,
+                )
+                return None
+            return local.read_bytes()
+    except Exception as exc:  # noqa: BLE001 - a missing frame is not fatal
+        logger.debug("workspace_bridge: fetch of {} failed: {}", remote_path, exc)
+        return None
+
+
+async def remote_workspace_root(session_key: str | None = None) -> str | None:
+    """Return the workspace root of the *resolved* backend instance.
+
+    Differs from :func:`sandbox_workspace_root` only for VPS, where the root is
+    configuration-derived and therefore needs a live instance to resolve.
+    """
+    ex = await resolve_remote_executor(session_key=session_key)
+    if ex.backend is not None:
+        _, backend_config = await _selected_backend()
+        return _backend_root(ex.name, ex.backend, backend_config)
+    return await sandbox_workspace_root()
+
+
 __all__ = [
     "stage_from_sandbox",
     "sandbox_workspace_root",
+    "remote_workspace_root",
+    "resolve_remote_executor",
+    "run_remote",
+    "fetch_remote_file",
+    "RemoteExecutor",
     "StagedProject",
     "DEFAULT_EXCLUDES",
     "DEFAULT_MAX_BYTES",
+    "DEFAULT_MAX_FILE_BYTES",
 ]

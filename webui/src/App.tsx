@@ -169,7 +169,7 @@ const TOKEN_REFRESH_MIN_DELAY_MS = 5_000;
 const PAIRING_POLL_INTERVAL_MS = 5_000;
 const PAIRING_IDLE_POLL_INTERVAL_MS = 15_000;
 const PAIRING_DISMISS_SNOOZE_MS = 30_000;
-type ShellView = "chat" | "settings" | "apps" | "automations" | "skills";
+type ShellView = "chat" | "settings" | "apps" | "automations" | "skills" | "screen";
 type ShellRoute = {
   view: ShellView;
   activeKey: string | null;
@@ -177,6 +177,10 @@ type ShellRoute = {
   temporary?: boolean;
 };
 const loadSettingsView = () => import("@/components/settings/SettingsView");
+const ScreenView = lazy(async () => {
+  const module = await import("@/components/screen/ScreenView");
+  return { default: module.ScreenView };
+});
 const SettingsView = lazy(async () => {
   const module = await loadSettingsView();
   return { default: module.SettingsView };
@@ -304,6 +308,9 @@ function readShellRoute(): ShellRoute {
   }
   if (path === "/skills") {
     return { view: "skills", activeKey, settingsSection: "skills" };
+  }
+  if (path === "/screen") {
+    return { view: "screen", activeKey, settingsSection: "overview" };
   }
   if (path.startsWith("/temporary/")) {
     const encoded = path.slice("/temporary/".length);
@@ -2507,6 +2514,12 @@ function Shell({
     setMobileSidebarOpen(false);
   }, [activeKey, navigate]);
 
+  const onOpenScreen = useCallback(() => {
+    setSessionSearchOpen(false);
+    navigate({ view: "screen", activeKey, settingsSection: "overview" });
+    setMobileSidebarOpen(false);
+  }, [activeKey, navigate]);
+
   const onSettingsSectionChange = useCallback(
     (section: SettingsSectionKey) => {
       navigate({
@@ -2986,6 +2999,12 @@ function Shell({
       });
       return;
     }
+    if (view === "screen") {
+      document.title = t("app.documentTitle.chat", {
+        title: t("sidebar.screen", { defaultValue: "Live screen" }),
+      });
+      return;
+    }
     document.title = activeSession
       ? t("app.documentTitle.chat", { title: headerTitle })
       : t("app.documentTitle.base");
@@ -3043,7 +3062,11 @@ function Shell({
     onOpenSkills,
     onSettingsIntent,
     onOpenSearch: onOpenSessionSearch,
-    activeUtility: view === "apps" || view === "automations" || view === "skills" ? view : null,
+    onOpenScreen,
+    activeUtility:
+      view === "apps" || view === "automations" || view === "skills" || view === "screen"
+        ? view
+        : null,
     onToggleArchived,
     pinnedKeys: sidebarPinnedTabKeys,
     archivedKeys: sidebarArchivedTabKeys,
@@ -3347,7 +3370,21 @@ function Shell({
                 }}
               />
             </div>
-            {view !== "chat" && (
+            {view === "screen" && (
+              <div className="absolute inset-0 flex flex-col">
+                <Suspense fallback={<SurfaceLoadingFallback />}>
+                  <ScreenView
+                    chatId={activeChatId}
+                    sessions={topicSessions}
+                    title={headerTitle}
+                    onSelectChat={onSelectSidebarItem}
+                    onBackToChat={onBackToChat}
+                    hostChromeInset={showHostChrome}
+                  />
+                </Suspense>
+              </div>
+            )}
+            {view !== "chat" && view !== "screen" && (
               <div className="absolute inset-0 flex flex-col">
                 <Suspense fallback={<SurfaceLoadingFallback />}>
                   <SettingsView

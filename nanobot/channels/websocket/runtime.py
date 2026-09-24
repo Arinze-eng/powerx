@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Self, TypeGuard, cast
 from urllib.parse import urlsplit, urlunsplit
 
+from loguru import logger as module_logger
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 from websockets.asyncio.server import ServerConnection, serve, unix_serve
 from websockets.exceptions import ConnectionClosed
@@ -90,6 +91,11 @@ from nanobot.webui.metadata import (
     WEBSOCKET_TURN_OWNER_METADATA_KEY,
     WEBUI_SYSTEM_COMMAND_TURN_PREFIX,
     WEBUI_TURN_METADATA_KEY,
+)
+from nanobot.webui.screen_stream import (
+    DEFAULT_INTERVAL_S as SCREEN_DEFAULT_INTERVAL_S,
+    FrameSink,
+    ScreenStreamManager,
 )
 from nanobot.webui.session_access import (
     SessionMention,
@@ -350,6 +356,26 @@ def _parse_envelope(raw: str) -> dict[str, Any] | None:
     return envelope
 
 
+#: Only an X display spec may cross from the client into a shell command. The
+#: value ends up in ``DISPLAY=<value>``, so anything outside this charset is
+#: refused rather than escaped — a display name is never a legitimate place for
+#: shell metacharacters, and rejecting is clearer than quoting.
+_DISPLAY_RE = re.compile(r"^:[0-9]{1,3}(\.[0-9]{1,2})?$")
+
+
+def _clean_display(value: Any) -> str | None:
+    """Return a validated X display spec from an envelope, or ``None`` to default."""
+    raw = str(value).strip() if isinstance(value, str) else ""
+    if not raw:
+        return None
+    if not _DISPLAY_RE.match(raw):
+        # Worth a line: this is the only client-supplied value that reaches a
+        # shell as ``DISPLAY=<value>``, so a rejected spec is a signal.
+        module_logger.warning("ignoring invalid screen display spec")
+        return None
+    return raw
+
+
 def _is_websocket_upgrade(request: WsRequest) -> bool:
     """Detect an actual WS upgrade; plain HTTP GETs to the same path should fall through."""
     upgrade = request.headers.get("Upgrade") or request.headers.get("upgrade")
@@ -439,6 +465,114 @@ class WebSocketChannel(BaseChannel):
         )
 
         self._stream_text_buffers: dict[tuple[str, str], list[str]] = {}
+        # Live GUI frames. One capture pump per chat, running while at least one
+        # client has the panel open, independent of whether an agent turn is
+        # running — see ``nanobot/webui/screen_stream.py`` for why. The per-
+        # connection map exists so a dropped socket releases its sinks instead of
+        # leaving a pump writing frames into a dead transport.
+        self._screens = ScreenStreamManager()
+        self._conn_screens: dict[ServerConnection, dict[str, FrameSink]] = {}
+
+    # -- Live screen --------------------------------------------------------
+
+    async def _handle_screen_subscribe(
+        self, connection: ServerConnection, envelope: dict[str, Any]
+    ) -> None:
+        """Start (or join) the live screen stream for a chat.
+
+        Driven by the client opening the panel rather than by an agent action:
+        the view is useful precisely when no turn is running, so requiring a tool
+        call to start it would put the refresh loop behind the agent's own turn.
+        """
+        chat_id = self._screen_chat_id(connection, envelope)
+        if chat_id is None:
+            await self._send_event(connection, "screen_error", detail="no chat to attach the screen to")
+            return
+
+        sinks = self._conn_screens.setdefault(connection, {})
+        sink = sinks.get(chat_id)
+        if sink is None:
+            sink = self._make_screen_sink(connection, chat_id)
+            sinks[chat_id] = sink
+
+        interval = envelope.get("interval_s")
+        try:
+            interval_s = float(interval) if interval is not None else SCREEN_DEFAULT_INTERVAL_S
+        except (TypeError, ValueError):
+            interval_s = SCREEN_DEFAULT_INTERVAL_S
+
+        stream = await self._screens.subscribe(
+            chat_id,
+            sink,
+            display=_clean_display(envelope.get("display")),
+            interval_s=interval_s,
+            session_key=self._screen_session_key(chat_id),
+        )
+        await self._send_event(
+            connection,
+            "screen_subscribed",
+            chat_id=chat_id,
+            display=stream.source.display,
+            # "sandbox" or "host". A local / self-hosted box captures on the
+            # gateway itself, and the panel should say so rather than imply the
+            # frame came out of a sandbox that does not exist.
+            location=getattr(stream.source, "location", "sandbox"),
+            interval_s=stream.interval_s,
+        )
+
+    async def _handle_screen_unsubscribe(
+        self, connection: ServerConnection, envelope: dict[str, Any]
+    ) -> None:
+        """Stop watching a chat's screen when the panel closes."""
+        chat_id = self._screen_chat_id(connection, envelope)
+        if chat_id is None:
+            return
+        sink = self._conn_screens.get(connection, {}).pop(chat_id, None)
+        if sink is not None:
+            await self._screens.unsubscribe(chat_id, sink)
+        await self._send_event(connection, "screen_unsubscribed", chat_id=chat_id)
+
+    def _screen_chat_id(
+        self, connection: ServerConnection, envelope: dict[str, Any]
+    ) -> str | None:
+        """Resolve which chat a screen request belongs to, or ``None``."""
+        raw = envelope.get("chat_id")
+        chat_id = str(raw).strip() if isinstance(raw, str) and raw.strip() else ""
+        if not chat_id:
+            chat_id = self._conn_default.get(connection, "")
+        return chat_id or None
+
+    def _screen_session_key(self, chat_id: str) -> str:
+        """Session key the chat's sandbox is filed under.
+
+        The capture pump runs outside any agent turn, so there is no request
+        context to read this from and it has to be reconstructed. It is
+        deliberately the same expression the rest of this channel already uses
+        (``exclude_session_key`` below, and ``TemporaryChats._session_key``), so
+        the screen attaches to the sandbox the chat's own tools attach to.
+
+        Known miss: ``unified_session`` mode files every channel's work under one
+        key, which this expression does not reproduce. That mode is off by
+        default; under it the panel reports no sandbox rather than showing
+        another chat's desktop, which is the safe failure.
+        """
+        return f"{self.name}:{chat_id}"
+
+    def _make_screen_sink(self, connection: ServerConnection, chat_id: str) -> FrameSink:
+        """Build the callable the stream uses to hand this connection a frame."""
+
+        async def sink(frame: Any, *, replay: bool = False) -> None:
+            await self._send_event(
+                connection, "screen_frame", chat_id=chat_id, **frame.payload(replay=replay)
+            )
+
+        return sink
+
+    async def _release_screen_sinks(self, connection: ServerConnection) -> None:
+        """Detach every screen sink owned by a connection."""
+        sinks = self._conn_screens.pop(connection, {})
+        for chat_id, sink in sinks.items():
+            await self._screens.unsubscribe(chat_id, sink)
 
     # -- Subscription bookkeeping -------------------------------------------
 
@@ -614,6 +748,13 @@ class WebSocketChannel(BaseChannel):
                 self._detach(connection, cid)
         for cid in self._temporary_chats.chat_ids_for_owner(connection):
             await self._discard_connection_owned_chat(connection, cid)
+        # Release screen sinks before discarding the connection maps, so a
+        # stream with no remaining viewers actually stops instead of pumping
+        # frames into a closed socket. Best-effort: a cleanup path must not raise.
+        try:
+            await self._release_screen_sinks(connection)
+        except Exception as exc:  # noqa: BLE001 - teardown must not raise
+            self.logger.debug("screen sink release failed: {}", exc)
         self._conn_default.pop(connection, None)
         self._webui_connections.discard(connection)
         self._admin_connections.discard(connection)
@@ -1062,6 +1203,12 @@ class WebSocketChannel(BaseChannel):
         t = envelope.get("type")
         if t == "webui_request":
             await self._start_webui_request(connection, envelope)
+            return
+        if t == "screen_subscribe":
+            await self._handle_screen_subscribe(connection, envelope)
+            return
+        if t == "screen_unsubscribe":
+            await self._handle_screen_unsubscribe(connection, envelope)
             return
         if t == "new_chat":
             new_id = str(uuid.uuid4())
@@ -1878,6 +2025,13 @@ class WebSocketChannel(BaseChannel):
         self._subs.clear()
         self._conn_chats.clear()
         self._conn_default.clear()
+        # Stop every capture pump. Without this a live-screen stream keeps
+        # capturing on its own timer after the channel is down.
+        try:
+            await self._screens.shutdown()
+            self._conn_screens.clear()
+        except Exception as e:  # noqa: BLE001 - shutdown must not raise
+            self.logger.warning("screen stream shutdown failed: {}", e)
         self._webui_connections.clear()
         self._admin_connections.clear()
         self._conn_supabase_user.clear()

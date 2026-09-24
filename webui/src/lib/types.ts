@@ -1407,6 +1407,42 @@ export type InboundEvent =
       error: { status: number; message: string };
     }
   | {
+      event: "screen_subscribed";
+      chat_id: string;
+      display: string;
+      /** Where the frame is captured: inside the sandbox, or on the gateway host
+       * (a local / self-hosted box with no execution sandbox provisioned). */
+      location?: "sandbox" | "host";
+      interval_s: number;
+    }
+  | {
+      event: "screen_unsubscribed";
+      chat_id: string;
+    }
+  | {
+      event: "screen_error";
+      chat_id?: string;
+      detail?: string;
+    }
+  | {
+      event: "screen_frame";
+      chat_id: string;
+      /** Monotonic per-stream counter, so a dropped frame is detectable. */
+      seq: number;
+      content_type: string;
+      width: number | null;
+      height: number | null;
+      /** False on a keepalive re-send of a frame the client already has. */
+      changed: boolean;
+      display: string;
+      captured_at: number;
+      bytes: number;
+      /** Base64 image bytes. */
+      image: string;
+      /** True when this frame was replayed to hydrate a new subscriber. */
+      replay?: boolean;
+    }
+  | {
       event: "error";
       chat_id?: string;
       detail?: string;
@@ -1504,6 +1540,15 @@ export type Outbound =
   | { type: "set_sidebar_state"; state: SidebarStatePayload }
   | { type: "discard_temporary_chat"; chat_id: string }
   | { type: "set_workspace_scope"; chat_id: string; workspace_scope: WorkspaceScopePayload }
+  | {
+      type: "screen_subscribe";
+      chat_id: string;
+      /** X display to capture, e.g. ":99". The server validates it. */
+      display?: string;
+      /** Seconds between captures; clamped server-side to 0.25-10. */
+      interval_s?: number;
+    }
+  | { type: "screen_unsubscribe"; chat_id: string }
   | { type: "transcribe_audio"; request_id: string; data_url: string; duration_ms?: number }
   | {
       type: "message";

@@ -75,6 +75,7 @@
     },
     "apps": "Applications",
     "automations": "Automatisations",
+    "screen": "Écran en direct",
     "skills": {
       "title": "Compétences"
     }

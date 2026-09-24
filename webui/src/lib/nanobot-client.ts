@@ -193,6 +193,12 @@ export class NanobotClient {
   private static readonly PENDING_INBOUND_MAX = 2000;
   // chat_ids we've attached to since connect; re-attached after reconnects
   private knownChats = new Set<string>();
+  /**
+   * chat_ids whose live screen panel is open. Kept separate from ``knownChats``
+   * because a screen pump must stop when the panel closes: attaching is
+   * permanent per chat, but watching a screen is not.
+   */
+  private screenChats = new Set<string>();
   /** Temporary chats are connection-owned and intentionally not reattached. */
   private temporaryChatIds = new Set<string>();
   /** Wall-clock run strip: updated from ``goal_status`` even with no ``onChat`` subscriber. */
@@ -1033,6 +1039,33 @@ export class NanobotClient {
     });
   }
 
+  /**
+   * Ask the gateway to start pushing live frames of the chat's sandbox desktop.
+   *
+   * Safe to repeat: the gateway joins the running pump when one already exists
+   * for the chat, so a reconnect can re-issue this without side effects.
+   */
+  screenSubscribe(chatId: string, options?: { display?: string; intervalS?: number }): void {
+    this.screenChats.add(chatId);
+    this.queueSend({
+      type: "screen_subscribe",
+      chat_id: chatId,
+      ...(options?.display ? { display: options.display } : {}),
+      ...(options?.intervalS ? { interval_s: options.intervalS } : {}),
+    });
+  }
+
+  /** Stop the chat's capture pump. Called when the panel closes. */
+  screenUnsubscribe(chatId: string): void {
+    if (!this.screenChats.delete(chatId)) return;
+    this.queueSend({ type: "screen_unsubscribe", chat_id: chatId });
+  }
+
+  /** True while a screen panel is open for the chat. */
+  isScreenSubscribed(chatId: string): boolean {
+    return this.screenChats.has(chatId);
+  }
+
   setSidebarState(state: SidebarStatePayload): Promise<SidebarStatePayload> {
     return this.requestMutation<SidebarStatePayload>("sidebar.update", { state });
   }
@@ -1059,6 +1092,11 @@ export class NanobotClient {
     // Re-attach every known chat_id so deliveries continue routing after a drop.
     for (const chatId of this.knownChats) {
       this.rawSend({ type: "attach", chat_id: chatId });
+    }
+    // An open screen panel has no way of noticing the socket dropped, so the
+    // resume has to happen here or it would sit frozen on its last frame.
+    for (const chatId of this.screenChats) {
+      this.rawSend({ type: "screen_subscribe", chat_id: chatId });
     }
     for (const pending of this.pendingWebUIRequests.values()) {
       this.rawSendSerialized(pending.serializedFrame);
@@ -1463,6 +1501,12 @@ export class NanobotClient {
   private forgetTemporaryChat(chatId: string): void {
     this.temporaryChatIds.delete(chatId);
     this.knownChats.delete(chatId);
+    // A discarded chat's pump is owned by the connection that opened it, and the
+    // gateway drops it on disconnect — but an explicit unsubscribe stops the
+    // capture immediately instead of on the next reconnect.
+    if (this.screenChats.delete(chatId)) {
+      this.rawSend({ type: "screen_unsubscribe", chat_id: chatId });
+    }
     this.chatHandlers.delete(chatId);
     this.pendingInboundByChat.delete(chatId);
     const wasRunning = this.runStartedAtByChatId.delete(chatId);
