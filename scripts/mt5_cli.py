@@ -66,7 +66,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.11"
+CLI_VERSION = "2026-09-24.12"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -4237,6 +4237,23 @@ def _risk_gate(
     }
 
 
+def _standing_breaches(gate: dict[str, Any]) -> list[dict[str, Any]]:
+    """The gate's breaches that are true of the BOOK, not of a hypothetical order.
+
+    ``_risk_gate`` is asked about the book by passing ``new_risk_money=None``,
+    which is by definition the STOPLESS case -- so its total-risk complaint is
+    about an order that does not exist, and reporting it as a standing violation
+    says the account is breaking a limit it is not. The UNDERSTATEMENT breach is
+    the exception: that one IS about the book, because a naked position makes the
+    total too small to enforce anything against.
+    """
+    return [
+        b
+        for b in gate["breaches"]
+        if b["limit"] != "max_total_risk_money" or "UNDERSTATEMENT" in b["reason"]
+    ]
+
+
 def cmd_risk(_: argparse.Namespace) -> int:
     """ONE call: what is open, what it can lose, what today has cost, and the room left.
 
@@ -4267,11 +4284,7 @@ def cmd_risk(_: argparse.Namespace) -> int:
     realised = gate["today"].get("realised_pnl_money")
     if daily is not None and realised is not None:
         headroom["daily_loss_money"] = round(-abs(float(daily)) - float(realised), 2)
-    # The gate is called with new_risk_money=None, which is the STOPLESS case, so
-    # its total-risk complaint is about the book rather than about an order. Keep
-    # only the ones that are true of the book as it stands.
-    standing = [b for b in gate["breaches"] if b["limit"] != "max_total_risk_money"
-                or "UNDERSTATEMENT" in b["reason"]]
+    standing = _standing_breaches(gate)
     payload = {
         "ok": True,
         "note": (
@@ -4372,7 +4385,7 @@ def cmd_limits(args: argparse.Namespace) -> int:
         "limits": limits,
         "file": str(RISK_LIMITS_FILE),
         "set": sorted(wanted),
-        "standing": gate["breaches"] if gate else [],
+        "standing": _standing_breaches(gate) if gate else [],
         "exposure": gate["exposure"]["totals"] if gate else None,
         "today": gate["today"] if gate else None,
         "note": (
@@ -4614,7 +4627,14 @@ def cmd_order(args: argparse.Namespace) -> int:
         payload["warning"] = NO_STOP_REFUSAL
     code = 0 if payload["ok"] else 3
     if payload["ok"]:
-        note = payload.get("note") or "warning: " + NO_STOP_REFUSAL
+        # The fallback must be NEUTRAL. It used to fall back to NO_STOP_REFUSAL,
+        # so every successful market order printed "warning: this order carries no
+        # stop" as its text while the payload, correctly, carried no such alert.
+        # A stopped order described as stopless is worse than no sentence at all.
+        note = payload.get("note") or (
+            f"{payload.get('side')} {payload.get('volume')} {symbol} accepted by "
+            f"the broker (retcode {payload.get('retcode')})."
+        )
     else:
         note = f"order rejected: {payload.get('comment')}"
     return emit(payload, text=note, code=code)

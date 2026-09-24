@@ -2123,3 +2123,74 @@ def test_a_terminal_that_cannot_report_the_account_does_not_crash_the_gate(cli, 
     # The risk total is still measured, and is not silently zero.
     assert exposure["totals"]["risk_money"] == 20.0
     assert exposure["totals"]["risk_pct_of_equity"] is None
+
+
+# --------------------------------------------------------------------------- #
+# TWO THINGS THE LIVE ACCOUNT SAID THAT THE TESTS DID NOT
+# --------------------------------------------------------------------------- #
+# Both were found on 2026-09-24 by reading the box's actual output rather than
+# the payload it came with. The JSON was right in both cases and the words were
+# wrong, which is the harder failure to catch: the JSON is what the tests looked
+# at, and the words are what a person reads.
+
+
+def test_a_stopped_orders_text_line_is_not_the_no_stop_warning(cli, monkeypatch):
+    """MEASURED LIVE: `order --risk-money 20 --sl 4284.92` filled at 4286.69 with
+    the stop at 4284.92 on the position, and the payload carried no `alert` and
+    no `warning` -- but the line printed above it said "warning: this order
+    carries no stop". Every successful market order said that."""
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+
+    texts: list[str] = []
+    monkeypatch.setattr(
+        cli, "emit", lambda payload, text=None, code=0: (out.update(payload), texts.append(text), code)[2]
+    )
+
+    assert cli.cmd_order(_order_args(sl=4283.18, risk_money=20.0)) == 0
+    assert out["filled"] is True
+    assert "alert" not in out and "warning" not in out
+    assert texts and texts[0] is not None
+    assert "warning" not in texts[0].lower()
+    assert "no stop" not in texts[0].lower()
+    # It says what actually happened instead.
+    assert "accepted" in texts[0]
+
+    # ...and a genuinely stopless order still says so, in both places.
+    texts.clear()
+    out.clear()
+    assert cli.cmd_order(_order_args(volume=0.10, allow_no_stop=True)) == 0
+    assert out["alert"] == "opened_without_a_stop"
+
+
+def test_limits_set_does_not_report_a_breach_about_an_order_that_does_not_exist(cli, monkeypatch, tmp_path):
+    """MEASURED LIVE: `limits set --max-total-risk-money 30` on a FLAT account
+    answered with a standing breach saying "this order carries no stop, so what it
+    risks cannot be counted" -- there was no order. The gate is asked about the
+    book by passing new_risk_money=None, which is by definition the stopless case,
+    so that complaint had to be filtered out of the standing report."""
+    _limits_file(cli, monkeypatch, tmp_path, limits=None)
+    out: dict = {}
+    monkeypatch.setattr(cli, "emit", lambda payload, text=None, code=0: (out.update(payload), code)[1])
+    monkeypatch.setattr(cli, "require_bridge", lambda: (_RiskMT5(), None))
+
+    assert cli.cmd_limits(types.SimpleNamespace(
+        limits_action="set", max_daily_loss_money=None, max_positions=None,
+        max_total_risk_money=30.0, max_total_risk_pct=None,
+    )) == 0
+    assert out["standing"] == []
+    assert out["limits"] == {"max_total_risk_money": 30.0}
+
+    # A breach that IS about the book still shows: a naked position makes the
+    # total too small to enforce anything against.
+    out.clear()
+    monkeypatch.setattr(
+        cli, "require_bridge", lambda: (_RiskMT5([_Pos(1, 4287.0, 0.0)]), None)
+    )
+    assert cli.cmd_limits(types.SimpleNamespace(
+        limits_action="set", max_daily_loss_money=None, max_positions=None,
+        max_total_risk_money=None, max_total_risk_pct=5.0,
+    )) == 0
+    assert len(out["standing"]) == 1
+    assert "UNDERSTATEMENT" in out["standing"][0]["reason"]
