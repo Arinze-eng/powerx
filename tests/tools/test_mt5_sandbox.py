@@ -416,6 +416,72 @@ async def test_unknown_action_is_rejected():
 
 
 @pytest.mark.asyncio
+async def test_plan_gives_the_playbook_stop_and_target_with_no_sandbox_at_all(monkeypatch):
+    """`plan` is arithmetic on the caller's numbers, so it needs no terminal.
+
+    This is the property that matters: the question "what is my stop supposed to
+    be?" is asked when the sandbox is unreachable or the terminal is down, and
+    answering it with "no sandbox is configured" would be a worse tool for no
+    gain. The stop and target must also be the playbook's, not the caller's.
+    """
+    monkeypatch.delenv("MT5_ALLOW_TRADING", raising=False)
+    tool = MT5SandboxTool.create(_ctx({}))  # deliberately NO sandbox
+    result = await tool.execute(
+        action="plan", symbol="XAUUSD", side="buy", entry=4285.0,
+        volume=0.1, equity=10302.92,
+    )
+    assert isinstance(result, str), result
+    payload = json.loads(result)
+    # 20 pips of 0.10 is $2.00; 1:7 is $14.00.
+    assert payload["setup"]["sl"] == 4283.0
+    assert payload["setup"]["tp"] == 4299.0
+    assert payload["risk_money"] == 20.0
+    assert payload["reward_money"] == 140.0
+    assert payload["violations"] == []
+
+
+@pytest.mark.asyncio
+async def test_plan_does_not_place_anything_and_is_not_a_trading_action():
+    """It must run with trading OFF and must reach no sandbox."""
+    sandbox = _FakeSandbox()
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+    result = await tool.execute(
+        action="plan", side="sell", entry=4285.0, volume=0.1,
+    )
+    assert isinstance(result, str), result
+    assert sandbox.calls == [], "plan must not contact the sandbox"
+    payload = json.loads(result)
+    assert payload["setup"]["sl"] == 4287.0
+    assert payload["setup"]["tp"] == 4271.0
+
+
+@pytest.mark.asyncio
+async def test_plan_refuses_without_an_entry_rather_than_inventing_one():
+    """A stop derived from a price nobody gave is a fabricated level."""
+    tool = MT5SandboxTool.create(_ctx({}))
+    result = await tool.execute(action="plan", side="buy", volume=0.1)
+    assert result.is_error
+    assert "entry" in str(result)
+    missing_side = await tool.execute(action="plan", entry=4285.0, volume=0.1)
+    assert missing_side.is_error
+    assert "side" in str(missing_side)
+
+
+def test_plan_is_advertised_and_the_description_states_the_playbook():
+    """The model reads the schema, not the module docstring."""
+    params = MT5SandboxTool().parameters["properties"]
+    assert "plan" in MT5SandboxTool().parameters["properties"]["action"]["enum"]
+    for field in ("entry", "equity", "sl_pips", "rr", "range_low", "range_high"):
+        assert field in params, field
+    assert params["sl_pips"]["description"].startswith("action=plan: stop distance")
+    desc = MT5SandboxTool().description
+    assert "DEFAULT PLAYBOOK" in desc
+    assert "action='plan'" in desc
+    # The 10x trap has to be in the text the model actually reads.
+    assert "a pip is 0.10" in desc
+
+
+@pytest.mark.asyncio
 async def test_order_requires_symbol_side_and_volume(monkeypatch):
     monkeypatch.setenv("MT5_ALLOW_TRADING", "1")
     tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox()}))

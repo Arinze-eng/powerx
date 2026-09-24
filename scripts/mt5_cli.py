@@ -65,7 +65,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.2"
+CLI_VERSION = "2026-09-24.3"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -2064,10 +2064,44 @@ def _watch_quote(mt5: Any, symbol: str) -> dict[str, Any] | None:
     }
 
 
+#: ONE GOLD PIP, in price. Every gold stop, target and guard level in this file
+#: is expressed in pips, so this single number decides whether "a 20-pip stop"
+#: is a $2.00 stop or a $0.20 one.
+#:
+#: The convention comes from the trading guide this bridge trades by, whose own
+#: worked example is ``entry 4162.50 / SL 4160.50 / TP 4176.50`` -- "20 pips"
+#: and "140 pips". ``4162.50 - 4160.50 = 2.00``, so a pip is 0.10: ten points on
+#: a two-decimal quote.
+#:
+#: This is NOT ``10 ** -digits``. MEASURED 2026-09-24 on a live Deriv-Demo
+#: terminal: ``quote XAUUSD`` returns ``digits: 2, point: 0.01``, so the naive
+#: rule gives 0.01 -- the point, not the pip -- and every gold distance in pips
+#: is inflated 10x. A "20-pip" stop then sits $0.20 away, inside the spread of
+#: the quote itself, and the position is stopped out on the next tick.
+#:
+#: Kept in step with ``GOLD_PIP`` in
+#: ``nanobot/trading/gold_strategy.py``; a test pins both to 0.10.
+GOLD_PIP = 0.10
+
+
+def _is_gold_symbol(symbol: str) -> bool:
+    """Whether ``symbol`` is Gold, by the broker's own spelling.
+
+    Brokers label it ``XAUUSD``, ``GOLD``, ``frxXAUUSD``, ``XAUUSD.raw``,
+    ``XAUUSDm`` … A substring test rather than a fixed list, because a symbol
+    this fails to recognise silently falls back to the point-as-pip rule and
+    gets a 10x-wrong stop.
+    """
+    name = (symbol or "").upper()
+    return "XAU" in name or "GOLD" in name
+
+
 def _watch_symbol_pips(mt5: Any, symbol: str) -> tuple[int, float]:
     """``(digits, pip)`` for a symbol; a sane default when it cannot be read."""
     info = mt5.symbol_info(symbol)
     digits = int(getattr(info, "digits", 5) or 5) if info is not None else 5
+    if _is_gold_symbol(symbol):
+        return digits, GOLD_PIP
     return digits, float(10 ** -digits)
 
 

@@ -465,6 +465,82 @@ mt5_sandbox(action="watch", symbols="EURUSD XAUUSD", wait_seconds=60)
 * `watch` is **read-only** and works with `MT5_ALLOW_TRADING` off — observing is
   never the thing that moves money.
 
+## The default playbook — Gold, 20-pip stop, 1:7
+
+This is the strategy to trade unless the user names another one. It is encoded in
+`nanobot/trading/gold_strategy.py`, and `action='plan'` runs it for you. **Do not
+state a stop or a target from memory — compute it.**
+
+```
+mt5_sandbox(action="plan", symbol="XAUUSD", side="buy", entry=<ask for a buy,
+            the bid for a sell>, volume=0.1, equity=<action='account' equity>,
+            range_low=<session low>, range_high=<session high>, spread=<from quote>)
+```
+
+It returns `setup.sl` / `setup.tp` — pass those straight to `action="order"`, and
+`action="guard"`/`modify` the same levels. It also returns the range sub-levels,
+the risk in dollars **and** percent, and `violations`: every way the setup breaks
+the playbook. **A non-empty `violations` means it is not this strategy** — say so
+rather than placing it.
+
+### The numbers
+
+| | |
+|---|---|
+| Stop loss | **20 pips** — a strict, fixed stop |
+| Reward-to-risk | **1:7** = **140 pips** of target |
+| Entry | **at a range level**, not between levels |
+| Bias filter | price beyond the MA Ribbon **and** beyond the 50% level, agreeing |
+
+### A Gold pip is 0.10 — not the 0.01 the quote advertises
+
+**This is the trap, and it is a factor of ten.** The broker quotes XAUUSD with
+`digits=2`, so `point` is 0.01 and `10**-digits` is 0.01 — the *point*, not the
+pip. MEASURED 2026-09-24 on a live Deriv-Demo terminal:
+`quote XAUUSD → digits: 2, point: 0.01, spread: 18`.
+
+Treat 0.01 as the pip and a 20-pip stop is **$0.20** — inside the spread of the
+quote it was just read from, so the position is stopped out on the next tick, and
+every level you ever express on Gold is 10x wrong. **A Gold pip is 0.10, so 20
+pips is $2.00 and 140 pips is $14.00.**
+
+The convention comes from the source guide's own worked example — `entry 4162.50,
+SL 4160.50, TP 4176.50`, called "20 pips" and "140 pips". `4162.50 − 4160.50 =
+2.00`. It is pinned in `gold_strategy.GOLD_PIP` and again in `scripts/mt5_cli.py`
+(where `watch`/`guard` compute their own pips on the box), and a test holds the
+two equal.
+
+### The levels and the entry signals
+
+Range sub-levels, from the session range: **25% / 50% / 62.5% / 75% / 87.5% /
+100%**, plus the **150%** (1.5x) structure extension. The **62.5% "Golden
+Retracement"** is the headline entry. The range indicator's divisor is **4.68**
+for Gold; the guide states the number without its arithmetic, so `plan` returns
+it in `range.divisor` rather than pretending to know the formula.
+
+Enter only on a level, on one of three candles: **pin bar** (tail ≥ 2/3 of the
+candle, rejection), **engulfing bar** (body swallows the previous body,
+momentum), **inside bar** (break of the mother bar; the direction is unknown
+until it breaks). Never chase a breakout — wait for the retracement to the level.
+
+### The 20% risk parameter is a warning, not an instruction
+
+The guide's Gold parameters also say **risk 20% of capital per trade**. `plan`
+reports what that means and does not apply it: on a $10,302.92 account it is
+**10.3 lots** at this stop, and the guide itself notes it "can lead to rapid
+account depletion (ruin)". At **0.1 lot the same stop risks $20 — 0.19%**. Trade
+the lot the user asked for, and if the arithmetic says the request is 103x
+hotter than the playbook, say so in one line before placing it.
+
+### What the strategy is not
+
+A 1:7 target means the strategy loses most of the time by construction — seven
+losses in eight still breaks even. So never present a setup as a likely win, and
+never report a `plan` as a done trade: `plan` places nothing. The edge is in the
+fixed stop and the level-based entry, not in the target being reached. If the
+user asks for a different RR or stop, pass `rr=`/`sl_pips=`, and mention that
+`violations` will then flag it as off-playbook.
+
 ## Sizing
 
 Wine + MT5 does not fit in the stock ~486 MB sandbox and gets OOM-killed

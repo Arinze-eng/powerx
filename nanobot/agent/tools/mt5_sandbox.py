@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-24.2"
+_CLI_VERSION = "2026-09-24.3"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -114,8 +114,20 @@ _READ_ONLY_ACTIONS = frozenset(
         # caller most in need of watching a live trade is the one who has just
         # been told trading is off.
         "watch",
+        # `plan` is pure arithmetic over numbers the caller supplied -- it
+        # reaches no terminal, places no order and needs no sandbox at all. It
+        # is also the one action that must keep working when the sandbox is
+        # gone, because it is what tells the caller what the stop and target
+        # *would* have been.
+        "plan",
     }
 )
+
+#: Actions answered entirely on the host, with no bridge call and no sandbox.
+#: They are dispatched before the sandbox is looked for, so they still work in a
+#: deployment whose sandbox is unreachable -- which is exactly when a caller is
+#: most likely to be asking "what is my stop supposed to be?".
+_HOST_ONLY_ACTIONS = frozenset({"plan"})
 
 _ALL_ACTIONS = sorted(
     _READ_ONLY_ACTIONS
@@ -444,6 +456,49 @@ def build_guard_rule(kwargs: dict[str, Any]) -> tuple[dict[str, Any] | None, str
     if kwargs.get("max_seconds") is not None:
         rule["max_seconds"] = int(kwargs["max_seconds"])
     return rule, None
+
+
+def _host_plan(kwargs: dict[str, Any]) -> str:
+    """``action='plan'``: the playbook's order for the numbers given.
+
+    Pure arithmetic, no bridge. The caller supplies the entry (or a live price
+    it already fetched) and gets back the stop, the target, the lots, the
+    document's range sub-levels, and every way the setup breaks the playbook's
+    own rules -- a 20-pip stop at 1:7, entered at a level.
+
+    It deliberately does NOT place the order, and it deliberately does NOT
+    pretend the setup is good. A 1:7 target is a claim about the market; all
+    this can be sure of is the arithmetic and the rule compliance, and the
+    result says which is which.
+    """
+    from nanobot.trading.gold_strategy import plan as build_plan
+
+    entry = kwargs.get("entry")
+    side = str(kwargs.get("side") or "").strip().lower()
+    if entry is None:
+        return ToolResult.error(
+            "action=plan requires 'entry' (the price to build the stop and target "
+            "from). Get one from action=quote -- pass the ask for a buy and the bid "
+            "for a sell -- or pass the level you intend to enter at."
+        )
+    if side not in ("buy", "sell"):
+        return ToolResult.error("action=plan requires 'side' ('buy' or 'sell').")
+    try:
+        result = build_plan(
+            side=side,
+            entry=float(entry),
+            volume=float(kwargs.get("volume") or 0.1),
+            symbol=str(kwargs.get("symbol") or "XAUUSD"),
+            equity=float(kwargs["equity"]) if kwargs.get("equity") else None,
+            sl_pips=float(kwargs.get("sl_pips") or 20.0),
+            rr=float(kwargs.get("rr") or 7.0),
+            low=float(kwargs["range_low"]) if kwargs.get("range_low") is not None else None,
+            high=float(kwargs["range_high"]) if kwargs.get("range_high") is not None else None,
+            spread=float(kwargs["spread"]) if kwargs.get("spread") is not None else None,
+        )
+    except (TypeError, ValueError) as exc:
+        return ToolResult.error(f"action=plan could not build the setup: {exc}")
+    return json.dumps(result)
 
 
 def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
@@ -786,6 +841,14 @@ class MT5SandboxTool(Tool):
             "(latency_ms), and use guard_action=\"status\" only when asked whether "
             "the exit is still armed. A position you leave with no SL/TP has no "
             "server-side exit at all, so offer to arm one. "
+            "DEFAULT PLAYBOOK (Gold, and the default for every trade until told "
+            "otherwise): 20-pip stop, 1:7 reward-to-risk, entered AT a range level. "
+            "Call action='plan' with entry/side/volume/equity BEFORE order: it returns "
+            "the exact sl and tp, the lots, the range sub-levels (25/50/62.5/75/87.5/"
+            "100/150%), and every rule the setup breaks. On Gold a pip is 0.10 -- NOT "
+            "the 0.01 point a 2-digit quote advertises -- so a 20-pip stop is $2.00. "
+            "Never state a stop or target from memory: action='plan' computes it, and "
+            "action='order' should be given the sl/tp it returned. "
             "Trading actions (order, close, close_all, modify, guard) require "
             "MT5_ALLOW_TRADING to be "
             "enabled and return the broker retcode; a rejected order is reported with "
@@ -846,6 +909,13 @@ class MT5SandboxTool(Tool):
                 "broker_installer_url": {"type": "string", "description": "action=install: URL of the BROKER's branded MT5 installer (e.g. https://download.mql5.com/cdn/web/<broker-slug>/mt5/<name>setup.exe). Use it for a broker that 'server' does not already resolve. MetaQuotes' generic terminal ships no broker server list, so broker logins silently never happen (zero 'Network' log lines, then '-10005 IPC timeout' from the bridge)."},
                 "broker_dir_name": {"type": "string", "description": "action=install: install directory name the branded installer creates, e.g. 'MetaTrader 5 EXNESS'. Pair with broker_installer_url."},
                 "dry_run": {"type": "boolean", "description": "For order/close: validate inputs and report the planned request without sending."},
+                "entry": {"type": "number", "description": "action=plan: the entry price to build the stop and target from. The playbook's stop and target are derived from it -- 20 pips below a buy, 140 above -- so the same entry always gives the same plan."},
+                "equity": {"type": "number", "description": "action=plan: account equity, so the plan can report the risk in percent of the account instead of only in dollars. Read it from action=account (equity, not balance)."},
+                "sl_pips": {"type": "number", "description": "action=plan: stop distance in pips. Default 20, which is the playbook's Gold stop and should not be changed without saying why."},
+                "rr": {"type": "number", "description": "action=plan: reward-to-risk target. Default 7 (the playbook's 20-pip stop / 140-pip target). Lower it only deliberately: it is the whole source of the edge in a 20-pip-stop strategy, which loses most of the time by construction."},
+                "range_low": {"type": "number", "description": "action=plan: the low of the session range. With range_high it adds the playbook's range sub-levels (25/50/62.5/75/87.5/100/150%) and says which level the entry sits on -- the strategy enters AT a level, so an entry between levels is reported as a violation."},
+                "range_high": {"type": "number", "description": "action=plan: the high of the session range. See range_low."},
+                "spread": {"type": "number", "description": "action=plan: live spread in price, from action=quote. A 20-pip Gold stop is only ~10x a typical spread, so the plan flags a spread that eats more than a quarter of the stop."},
             },
             "required": ["action"],
         }
@@ -856,6 +926,13 @@ class MT5SandboxTool(Tool):
             return ToolResult.error(
                 f"Unknown action '{action}'. Valid actions: {', '.join(_ALL_ACTIONS)}"
             )
+
+        # --- host-only actions --------------------------------------------- #
+        # Answered before the sandbox is even looked for: `plan` is arithmetic
+        # over the caller's own numbers, so requiring a live terminal to tell
+        # someone what their stop should be would be a worse tool for no gain.
+        if action in _HOST_ONLY_ACTIONS:
+            return _host_plan(kwargs)
 
         # --- trading gate -------------------------------------------------- #
         # dry_run is evaluated BEFORE the gate on purpose: previewing the exact
