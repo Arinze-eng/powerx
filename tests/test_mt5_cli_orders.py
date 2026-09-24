@@ -723,6 +723,7 @@ def test_split_divides_the_total_volume_and_gives_every_ticket_the_same_stop(cli
         symbol="XAUUSD", side="sell", volume=1.0, splits=10, group="xau-leg2",
         sl=4294.18, tp=4278.18, deviation=20, magic=20240919,
         comment="powerx-split", stop_on_failure=False, check_cost=False,
+        allow_no_stop=False,
     )
     code = cli.cmd_split(args)
     assert code == 0
@@ -760,8 +761,9 @@ def test_split_rounds_down_rather_than_risking_more_than_asked(cli, monkeypatch)
 
     args = types.SimpleNamespace(
         symbol="XAUUSD", side="buy", volume=0.25, splits=10, group="g",
-        sl=None, tp=None, deviation=20, magic=20240919,
+        sl=4284.00, tp=None, deviation=20, magic=20240919,
         comment="powerx-split", stop_on_failure=False, check_cost=False,
+        allow_no_stop=False,
     )
     assert cli.cmd_split(args) == 0
     assert all(r["volume"] == 0.02 for r in sent)
@@ -780,8 +782,9 @@ def test_split_refuses_when_the_per_ticket_volume_is_below_the_broker_minimum(cl
     monkeypatch.setattr(cli, "require_bridge", lambda: (_FakeMT5([], _Info(), _Tick()), None))
     args = types.SimpleNamespace(
         symbol="XAUUSD", side="buy", volume=0.5, splits=10, group="g",
-        sl=None, tp=None, deviation=20, magic=20240919,
+        sl=4284.00, tp=None, deviation=20, magic=20240919,
         comment="c", stop_on_failure=False, check_cost=False,
+        allow_no_stop=False,
     )
     assert cli.cmd_split(args) == 1
 
@@ -1032,8 +1035,9 @@ def test_a_netting_account_refuses_a_split_instead_of_netting_it(cli, monkeypatc
                         lambda mt5, req, fillings: {"ok": True, "retcode": 10009})
     args = types.SimpleNamespace(
         symbol="XAUUSD", side="buy", volume=0.10, splits=10, group="g",
-        sl=None, tp=None, deviation=20, magic=1, comment="c",
+        sl=4284.00, tp=None, deviation=20, magic=1, comment="c",
         stop_on_failure=False, check_cost=False,
+        allow_no_stop=False,
     )
     err = {}
     monkeypatch.setattr(cli, "emit", lambda payload, text=None, code=0: (err.update(payload, _code=code), code)[1])
@@ -1069,8 +1073,9 @@ def test_a_hedging_account_is_told_it_is_hedging(cli, monkeypatch):
     monkeypatch.setattr(cli, "emit", lambda payload, text=None, code=0: (out.update(payload), 0)[1])
     args = types.SimpleNamespace(
         symbol="XAUUSD", side="buy", volume=0.10, splits=10, group="g",
-        sl=None, tp=None, deviation=20, magic=1, comment="c",
+        sl=4284.00, tp=None, deviation=20, magic=1, comment="c",
         stop_on_failure=False, check_cost=False,
+        allow_no_stop=False,
     )
     assert cli.cmd_split(args) == 0
     assert out["account_margin_mode"]["hedging"] is True
@@ -1108,8 +1113,9 @@ def test_a_split_that_cannot_be_margined_is_refused_before_anything_is_sent(cli,
     monkeypatch.setattr(cli, "require_bridge", lambda: (_Tight(sent, _Info(), _Tick()), None))
     args = types.SimpleNamespace(
         symbol="XAUUSD", side="buy", volume=0.10, splits=10, group="g",
-        sl=None, tp=None, deviation=20, magic=1, comment="c",
+        sl=4284.00, tp=None, deviation=20, magic=1, comment="c",
         stop_on_failure=False, check_cost=False,
+        allow_no_stop=False,
     )
     err = {}
     monkeypatch.setattr(cli, "emit", lambda payload, text=None, code=0: (err.update(payload), code)[1])
@@ -1327,6 +1333,7 @@ def _order_args(**over):
     base = dict(
         symbol="XAUUSD", side="buy", volume=None, sl=None, tp=None, entry_type="market",
         price=None, risk_money=None, risk_pct=None, deviation=20, magic=1, comment="c",
+        allow_no_stop=False,
     )
     base.update(over)
     return types.SimpleNamespace(**base)
@@ -1400,7 +1407,8 @@ def test_a_sell_stop_rests_below_the_bid_as_a_sell_stop(cli, monkeypatch):
     info = _sym(2, 100.0)
     tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
     sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
-    args = _order_args(side="sell", volume=0.10, entry_type="stop", price=4270.0)
+    args = _order_args(side="sell", volume=0.10, entry_type="stop", price=4270.0,
+                       sl=4272.0)
 
     assert cli.cmd_order(args) == 0
     assert sent[0]["type"] == _OrderMT5.ORDER_TYPE_SELL_STOP
@@ -1412,7 +1420,7 @@ def test_a_wrong_side_pending_order_never_reaches_the_broker(cli, monkeypatch):
     info = _sym(2, 100.0)
     tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
     sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
-    args = _order_args(volume=0.10, entry_type="limit", price=4290.0)
+    args = _order_args(volume=0.10, entry_type="limit", price=4290.0, sl=4288.0)
 
     code = cli.cmd_order(args)
     assert sent == [], "an order that cannot work must not be sent"
@@ -1426,7 +1434,7 @@ def test_a_market_order_refuses_a_price_it_cannot_honour(cli, monkeypatch):
     info = _sym(2, 100.0)
     tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
     sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
-    assert cli.cmd_order(_order_args(volume=0.1, price=4290.0)) == 1
+    assert cli.cmd_order(_order_args(volume=0.1, price=4290.0, sl=4283.18)) == 1
     assert sent == []
     assert "market" in str(out.get("error", ""))
 
@@ -1466,7 +1474,7 @@ def test_order_without_any_size_is_refused(cli, monkeypatch):
     info = _sym(2, 100.0)
     tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
     sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
-    assert cli.cmd_order(_order_args()) == 1
+    assert cli.cmd_order(_order_args(sl=4283.18)) == 1
     assert "size" in str(out.get("error", ""))
     assert sent == []
 
@@ -1614,11 +1622,11 @@ def test_a_target_on_the_wrong_side_is_refused_too(cli, monkeypatch):
     tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
     sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
 
-    assert cli.cmd_order(_order_args(volume=0.01, tp=4280.0)) == 1
+    assert cli.cmd_order(_order_args(volume=0.01, tp=4280.0, sl=4283.18)) == 1
     assert "target" in str(out.get("error", ""))
     assert sent == []
 
-    assert cli.cmd_order(_order_args(volume=0.01, tp=4302.18)) == 0
+    assert cli.cmd_order(_order_args(volume=0.01, tp=4302.18, sl=4283.18)) == 0
     assert sent[0]["tp"] == 4302.18
 
 
@@ -1654,3 +1662,129 @@ def test_the_report_names_the_money_at_risk_at_the_price_paid(cli, monkeypatch):
     # 0.10 lots of Gold is $1 a pip, so 21.8 pips is $21.80 of real risk.
     assert out["sizing"]["actual_risk_money"] == 21.8
     assert out["risk_pct_of_equity"] == 0.22
+
+
+# --------------------------------------------------------------------------- #
+# NOTHING OPENS WITHOUT A SERVER-SIDE EXIT
+# --------------------------------------------------------------------------- #
+# A position with no stop has NO exit on the broker: MetaQuotes holds nothing,
+# so the only thing that can close it is something looking at the price -- and
+# nothing looks between calls. "I will watch it" expires; a stop does not. So an
+# unprotected trade is allowed, but only when it is ASKED for.
+
+
+def test_nothing_opens_without_a_stop_unless_that_was_asked_for(cli, monkeypatch):
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+
+    assert cli.cmd_order(_order_args(volume=0.10)) == 1
+    assert sent == [], "an order with no stop must not reach the broker by default"
+    assert "no stop" in str(out.get("error", ""))
+    assert "allow_no_stop" in str(out.get("error", ""))
+
+    # Asked for explicitly, it goes through -- and says what it is.
+    out.clear()
+    assert cli.cmd_order(_order_args(volume=0.10, allow_no_stop=True)) == 0
+    assert len(sent) == 1
+    assert "sl" not in sent[0]
+    assert out["alert"] == "opened_without_a_stop"
+    assert "no stop" in out["warning"]
+
+
+def test_a_pending_order_without_a_stop_is_refused_too(cli, monkeypatch):
+    """A resting order is not "safe because it has not filled": when it does
+    fill it opens the same naked position."""
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+    assert cli.cmd_order(
+        _order_args(volume=0.01, entry_type="limit", price=4270.0)
+    ) == 1
+    assert sent == []
+    assert "no stop" in str(out.get("error", ""))
+
+
+def test_a_split_without_a_stop_is_refused_the_same_way(cli, monkeypatch):
+    """A split shares ONE stop across every ticket, so a split with no stop is
+    the naked-position problem multiplied by the split count."""
+    class _Info:
+        volume_min, volume_max, volume_step, digits = 0.01, 100.0, 0.01, 2
+        filling_mode = 1
+
+    class _Tick:
+        bid, ask = 4285.00, 4285.18
+
+    class _Hedging(_FakeMT5):
+        def account_info(self):
+            return types.SimpleNamespace(equity=10000.0, margin_free=9000.0, margin_mode=2)
+
+        def order_calc_margin(self, action, symbol, volume, price):
+            return volume * 100.0 * price / 1000.0
+
+    sent = []
+    monkeypatch.setattr(cli, "require_bridge", lambda: (_Hedging(sent, _Info(), _Tick()), None))
+    out = {}
+    monkeypatch.setattr(cli, "emit", lambda payload, text=None, code=0: (out.update(payload), code)[1])
+    args = types.SimpleNamespace(
+        symbol="XAUUSD", side="buy", volume=0.10, splits=10, group="g",
+        sl=None, tp=None, deviation=20, magic=1, comment="c",
+        stop_on_failure=False, check_cost=False, allow_no_stop=False,
+    )
+    assert cli.cmd_split(args) == 1
+    assert sent == []
+    assert "no stop" in str(out.get("error", ""))
+
+
+def test_modify_reports_when_it_leaves_a_position_with_nothing_holding_it(cli, monkeypatch):
+    """A modify can REMOVE protection (--sl 0), and a position with neither leg
+    has no server-side exit at all. Whoever reads the next result has to be able
+    to see that nothing is holding it but the model."""
+    class _Pos:
+        ticket, symbol, type, sl, tp, volume = 500, "XAUUSD", 0, 4283.18, 4300.0, 0.10
+
+    class _Info:
+        digits, point = 2, 0.01
+        trade_stops_level, trade_freeze_level = 0, 0
+
+    class _Tick:
+        bid, ask = 4285.00, 4285.18
+
+    class _M:
+        POSITION_TYPE_BUY = 0
+        TRADE_RETCODE_DONE = 10009
+        TRADE_ACTION_SLTP = 6
+
+        def positions_get(self, ticket=None):
+            return [_Pos()]
+
+        def symbol_info(self, symbol):
+            return _Info()
+
+        def symbol_info_tick(self, symbol):
+            return _Tick()
+
+        def order_send(self, request):
+            return types.SimpleNamespace(
+                retcode=10009, comment="Request executed", order=1, deal=1, price=None
+            )
+
+        def last_error(self):
+            return "fake"
+
+    out: dict = {}
+    monkeypatch.setattr(cli, "require_bridge", lambda: (_M(), None))
+    monkeypatch.setattr(cli, "emit", lambda payload, text=None, code=0: (out.update(payload), code)[1])
+
+    assert cli.cmd_modify(types.SimpleNamespace(
+        ticket=[500], tickets=[], symbol=None, all=False, exit_at=None, sl=0.0, tp=0.0,
+    )) == 0
+    assert out["alert"] == "position_left_without_a_stop"
+    assert out["positions_without_a_stop"] == [500]
+
+    # A modify that LEAVES a stop in place is not an alert.
+    out.clear()
+    assert cli.cmd_modify(types.SimpleNamespace(
+        ticket=[500], tickets=[], symbol=None, all=False, exit_at=None, sl=0.0, tp=4300.0,
+    )) == 0
+    assert "alert" not in out

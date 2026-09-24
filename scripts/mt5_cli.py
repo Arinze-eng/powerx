@@ -66,7 +66,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.9"
+CLI_VERSION = "2026-09-24.10"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -3354,6 +3354,12 @@ def cmd_split(args: argparse.Namespace) -> int:
     else:
         mode_note = None
 
+    # Every ticket of a split shares ONE stop. A split with no stop has no exit
+    # on the server for ANY of its tickets, which is the naked-position problem
+    # multiplied by the split count.
+    if getattr(args, "sl", None) is None and not bool(getattr(args, "allow_no_stop", False)):
+        return fail(NO_STOP_REFUSAL, code=1)
+
     side = args.side.lower()
     if side in ("buy", "long"):
         order_type = mt5.ORDER_TYPE_BUY
@@ -3760,6 +3766,25 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     return emit(out, text=out["note"], code=0 if out["ok"] else 3)
 
 
+#: The one thing a position can be left without that nothing else can fix.
+#:
+#: A position with no stop has NO server-side exit: MetaQuotes holds nothing, so
+#: the only thing that can close it is something that looks at the price. A
+#: polling model does look -- until the run ends, the sandbox is paused, or the
+#: next call is spent on something else. "I will watch it" is a promise that
+#: expires; a stop is a promise the broker keeps. So opening without one is
+#: allowed, but never by accident: it has to be asked for, and it comes back as
+#: an alert rather than a quiet success.
+NO_STOP_REFUSAL = (
+    "this order carries no stop, so NOTHING on the broker's server would close "
+    "it -- only something looking at the price could, and nothing is looking "
+    "between calls. Pass sl=<price>, or pass allow_no_stop=true to open it "
+    "deliberately."
+)
+
+NO_STOP_ALERT = "opened_without_a_stop"
+
+
 def _validate_stop_side(side: str, entry: float, sl: float | None) -> str | None:
     """Whether a stop sits on the losing side of the entry, or why it does not.
 
@@ -3922,6 +3947,11 @@ def cmd_order(args: argparse.Namespace) -> int:
             )
         sizing["risk_pct_of_equity"] = None
 
+    # Nothing opens without a server-side exit unless that was asked for.
+    allow_no_stop = bool(getattr(args, "allow_no_stop", False))
+    if args.sl is None and not allow_no_stop:
+        return fail(NO_STOP_REFUSAL, code=1)
+
     # ---- the request ------------------------------------------------------
     pending = entry_type != "market"
     if pending:
@@ -4001,9 +4031,13 @@ def cmd_order(args: argparse.Namespace) -> int:
         payload["filled"] = True
         if payload.get("price") is not None:
             payload["fill_price"] = payload["price"]
+    if payload["ok"] and args.sl is None:
+        # Said out loud, in the result, every time it happens.
+        payload["alert"] = NO_STOP_ALERT
+        payload["warning"] = NO_STOP_REFUSAL
     code = 0 if payload["ok"] else 3
     if payload["ok"]:
-        note = payload.get("note") or "order filled"
+        note = payload.get("note") or "warning: " + NO_STOP_REFUSAL
     else:
         note = f"order rejected: {payload.get('comment')}"
     return emit(payload, text=note, code=code)
@@ -6316,6 +6350,17 @@ def cmd_modify(args: argparse.Namespace) -> int:
         "modified": sum(1 for r in results if r.get("ok")),
         "results": results,
     }
+    # A modify can also REMOVE protection (--sl 0), and a position left with
+    # neither leg has no server-side exit at all. Whether the caller meant it or
+    # not, that is the state worth an alert -- the next reader of this result
+    # needs to know that nothing is holding the position but the model.
+    naked = [
+        int(r["ticket"]) for r in results
+        if r.get("ok") and not r.get("sl") and not r.get("tp")
+    ]
+    if naked:
+        payload["alert"] = "position_left_without_a_stop"
+        payload["positions_without_a_stop"] = naked
     if ok:
         payload["note"] = (
             "The broker's server now holds this level: the exit is executed "
@@ -6956,6 +7001,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--sl", type=float, default=None)
     p.add_argument("--tp", type=float, default=None)
+    p.add_argument(
+        "--allow-no-stop",
+        action="store_true",
+        help=(
+            "open the order with NO stop at all. Refused by default: without a "
+            "stop the broker holds no exit, so the only thing that could close "
+            "the position is something looking at the price, and nothing looks "
+            "between calls. Only for a deliberately unprotected trade"
+        ),
+    )
     p.add_argument("--deviation", type=int, default=20)
     p.add_argument("--magic", type=int, default=20240919)
     p.add_argument("--comment", default="powerx-mt5")
@@ -7001,6 +7056,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--sl", type=float, default=None)
     p.add_argument("--tp", type=float, default=None)
+    p.add_argument(
+        "--allow-no-stop",
+        action="store_true",
+        help="open the split with NO stop (see `order --allow-no-stop`); refused by default",
+    )
     p.add_argument("--deviation", type=int, default=20)
     p.add_argument("--magic", type=int, default=20240919)
     p.add_argument("--comment", default="powerx-split")

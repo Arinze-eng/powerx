@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-24.9"
+_CLI_VERSION = "2026-09-24.10"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -621,6 +621,8 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
         for flag in ("sl", "tp"):
             if kwargs.get(flag) is not None:
                 parts += [f"--{flag}", str(float(kwargs[flag]))]
+        if kwargs.get("allow_no_stop"):
+            parts += ["--allow-no-stop"]
         if kwargs.get("deviation") is not None:
             parts += ["--deviation", str(int(kwargs["deviation"]))]
         if kwargs.get("comment"):
@@ -646,7 +648,7 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
             parts += ["--deviation", str(int(kwargs["deviation"]))]
         if kwargs.get("comment"):
             parts += ["--comment", _sh(kwargs["comment"])]
-        for flag in ("stop_on_failure", "check_cost"):
+        for flag in ("stop_on_failure", "check_cost", "allow_no_stop"):
             if kwargs.get(flag):
                 parts += [f"--{flag.replace('_', '-')}"]
     elif action == "close":
@@ -922,6 +924,15 @@ class MT5SandboxTool(Tool):
             "corrected wording (the server would only answer retcode 10015). Read "
             "resting orders with action='orders' and remove one with action='cancel' "
             "(ticket=, or cancel_all=true). "
+            "EVERY ORDER CARRIES A STOP (sl) unless allow_no_stop=true says otherwise, "
+            "and the refusal is not a formality: without a stop the BROKER holds no "
+            "exit at all, so the only thing that could close the position is "
+            "something looking at the price -- and you are not looking between "
+            "calls. A stop is also what lets the position survive this sandbox "
+            "being paused or the run ending. If a trade genuinely should not have "
+            "one, say so out loud when you report it. A modify that leaves a "
+            "position with neither sl nor tp comes back as "
+            "alert=position_left_without_a_stop. "
             "SIZING BY MONEY AT RISK (risk_money / risk_pct) -- pass these instead of "
             "'volume' and the lots are derived from the stop distance, the pip and the "
             "contract size, rounded DOWN so the order never risks more than asked. "
@@ -1001,6 +1012,7 @@ class MT5SandboxTool(Tool):
                 "volume": {"type": "number", "description": "Lots (action=order/close). action=order: OMIT it when passing risk_money/risk_pct, which derive the lots from the stop instead."},
                 "entry_type": {"type": "string", "enum": ["market", "limit", "stop"], "description": "action=order: where the order enters. 'market' (default) fills now at the current price. 'limit' rests at 'price' and fills only BETTER than the market (buy below, sell above) -- 'buy the dip at X'. 'stop' rests at 'price' and fills only when the market BREAKS THROUGH it (buy above, sell below) -- 'buy the breakout above X'. Both rest server-side holding no position until they fill. A limit/stop on the wrong side of the market is refused with the corrected wording."},
                 "price": {"type": "number", "description": "action=order: the entry price when entry_type is 'limit' or 'stop'. That price IS the entry. Not allowed with entry_type='market', which fills at the current market price."},
+                "allow_no_stop": {"type": "boolean", "description": "action=order/split: open with NO stop at all. Refused by default. Without a stop the broker holds no exit, so nothing but something actively looking at the price can close the position -- and nothing looks between your calls. Only pass it for a deliberately unprotected trade, and never because a stop was inconvenient."},
                 "risk_money": {"type": "number", "description": "action=order: size the order so a stop-out costs this much in account currency, instead of naming lots. Needs 'sl' (the entry-to-stop distance IS the risk) and is mutually exclusive with 'volume' and with risk_pct. The lots are rounded DOWN to the symbol's step, so the real risk is never above the number passed."},
                 "risk_pct": {"type": "number", "description": "action=order: as risk_money, but as a percentage of account EQUITY. Needs 'sl'. Mutually exclusive with 'volume' and with risk_money."},
                 "sl": {"type": "number", "description": "Stop loss price (action=order)."},
@@ -1148,6 +1160,14 @@ class MT5SandboxTool(Tool):
                     "honour 'price'. Use entry_type='limit' to enter better than the "
                     "market, or entry_type='stop' to enter on a break through it."
                 )
+            if not kwargs.get("allow_no_stop") and kwargs.get("sl") is None:
+                return ToolResult.error(
+                    "action=order with no 'sl' opens a position the BROKER cannot "
+                    "close: no server-side exit would exist, so the only thing that "
+                    "could close it is something looking at the price -- and nothing "
+                    "looks between your calls. Pass sl=<price>, or "
+                    "allow_no_stop=true to open it deliberately."
+                )
         if action == "cancel":
             if not kwargs.get("cancel_all") and kwargs.get("ticket") is None:
                 return ToolResult.error(
@@ -1173,6 +1193,14 @@ class MT5SandboxTool(Tool):
                 return ToolResult.error(
                     "action=split with splits < 2 is just action=order. Use splits=2 "
                     "or more, or use order."
+                )
+            if not kwargs.get("allow_no_stop") and kwargs.get("sl") is None:
+                return ToolResult.error(
+                    "action=split with no 'sl' opens a position the BROKER cannot "
+                    "close: no server-side exit would exist, so the only thing that "
+                    "could close it is something looking at the price -- and nothing "
+                    "looks between your calls. Pass sl=<price>, or "
+                    "allow_no_stop=true to open it deliberately."
                 )
         if action == "modify":
             if not any(

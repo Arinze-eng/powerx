@@ -220,15 +220,91 @@ it**: the fixed version above builds with `0 errors, 0 warnings, 478 ms`.
 
 ## Trading
 
-`order`, `close`, and `close_all` move real money and are **disabled unless the
-deployment sets `MT5_ALLOW_TRADING=1`**. When disabled they return an error and
-never reach the sandbox.
+`order`, `split`, `close`, `close_all`, `cancel` and `modify` move real money and
+are **disabled unless the deployment sets `MT5_ALLOW_TRADING=1`**. When disabled
+they return an error and never reach the sandbox.
 
-* `order` needs `symbol`, `side` (`buy`/`sell`), and `volume`; optional `sl`,
-  `tp`, `deviation`, `comment`.
-* `close` needs `ticket`; optional `volume` for a partial close.
+* `order` needs `symbol` and `side` (`buy`/`sell`), plus **a size** — either
+  `volume` in lots, or `risk_money` / `risk_pct` with the `sl` that defines it.
+* `close` needs `ticket`, or `group` for a split; optional `volume` for a partial.
+* `cancel` needs `ticket` (a resting order), or `cancel_all=true`.
 * `dry_run=true` prints the exact command that *would* run, without sending —
   use it to show the user what you are about to do.
+
+### Every position gets a stop — and that is not a formality
+
+`order` and `split` **refuse to open without `sl`** unless you pass
+`allow_no_stop=true`. This is not the tool being fussy:
+
+* Without a stop the **broker's server holds no exit at all**. Nothing on
+  MetaQuotes' side can close the position.
+* The only thing left that can close it is **something looking at the price** —
+  and nothing is looking between your calls. Your next turn may be minutes away,
+  the box may pause, the run may end.
+* "I will watch it" is a promise that expires. A stop is one the broker keeps.
+
+If a trade genuinely should not carry a stop, say so out loud when you report it;
+the result comes back with `alert=opened_without_a_stop` either way. A `modify`
+that leaves a position with neither `sl` nor `tp` returns
+`alert=position_left_without_a_stop`.
+
+### Entering at a price — `entry_type`
+
+*"Buy the dip at 4270"* and *"buy the breakout above 4300"* are **not market
+orders**. Sending a market order instead fills at a price the user never asked
+for, and the difference between the price named and the price paid is the whole
+trade.
+
+```
+# rests at 4270 and fills only if the market comes down to it
+mt5_sandbox(action="order", symbol="XAUUSD", side="buy", volume=0.10,
+            entry_type="limit", price=4270.0, sl=4268.0)
+
+# rests at 4300 and fills only if the market breaks through it
+mt5_sandbox(action="order", symbol="XAUUSD", side="buy", volume=0.10,
+            entry_type="stop", price=4300.0, sl=4298.0)
+```
+
+* `limit` fills **better** than the market (buy below the ask, sell above the
+  bid). `stop` fills **through** it (buy above the ask, sell below the bid).
+* A pending order **holds no position** and risks nothing until it fills. It is
+  not an open trade: do not watch it, do not "manage" it, and do not report it as
+  a position. Read it with `orders`, remove it with `cancel`.
+* A pending order carries its own `sl`/`tp`, so the exit is already on the server
+  the moment it fills.
+* The wrong side is caught **before** the round trip. A buy limit above the ask
+  comes back with the corrected wording instead of the broker's
+  `retcode 10015 "invalid price"`, which names neither the side nor the fix.
+* Same for the legs: a stop on the winning side of the entry, or a target on the
+  losing side, is refused here rather than surfacing as `retcode 10016 "Invalid
+  stops"` — measured live: a buy limit at 4282.05 carrying `sl 4285.05` came back
+  as exactly that.
+
+### Sizing by money at risk — `risk_money` / `risk_pct`
+
+*"Risk $100 on this"* is what a person says. The lot size is arithmetic over the
+stop distance, the pip and the contract size — three places to be wrong, in the
+one calculation where being wrong costs money. Let the tool do it:
+
+```
+mt5_sandbox(action="order", symbol="XAUUSD", side="buy", risk_money=100,
+            sl=4283.18)
+```
+
+* The result carries `sizing`: the stop in pips, the money per pip per lot, the
+  unrounded lots, the lots used, and `risk_pct_of_equity`. **Read it out loud**
+  when the number matters — it is what makes the size checkable.
+* It rounds **down** to the broker's lot step, so the order never risks more than
+  asked. On Gold a pip is 0.10 and the contract is 100 oz, so a 20-pip stop is
+  $2 a lot: $20 of risk is 0.10 lots.
+* Below the broker's minimum it **refuses and names the smallest risk the symbol
+  can express**, instead of quietly sending the minimum — which would risk
+  several times what was asked.
+* A market order fills at whatever the other side is when it lands, so the risk
+  that was *sized* is not exactly the risk that was *taken*. MEASURED: the
+  XAUUSD ask moved 0.18 between the quote and the fill, turning a 20.0-pip stop
+  into 21.8 pips and a $20 risk into $21.80. `sizing.fill_stop_pips` and
+  `sizing.actual_risk_money` report what the price paid actually implies.
 
 A rejected order is a normal result, not an exception: the payload carries the
 broker `retcode` and `comment`. Common retcodes: `10009` done, `10016` invalid
@@ -691,6 +767,10 @@ mt5_sandbox(action="close", group="xau-leg2", count=3)
   `fill_dispersion_pips` report it, and `total_risk_money` is summed off each
   ticket's own fill rather than the requested price. Quote the fills; "all at one
   price" is not true and the entry rate is on the ticket list.
+* **A split needs `sl` too**, for the same reason an order does — and here the
+  reason is multiplied by the split count: without one, N tickets open with no
+  server-side exit between them. `split` refuses without `sl` unless you pass
+  `allow_no_stop=true`.
 * **Every ticket must carry the same stop.** Ten 0.10 lots with a 20-pip stop risk
   exactly what one 1.00 lot with a 20-pip stop risks. The split multiplies
   *exits*, not risk. A split with stops on only some of the tickets multiplies

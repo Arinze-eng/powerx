@@ -385,7 +385,9 @@ async def test_trading_forwards_when_explicitly_enabled(monkeypatch):
     sandbox = _FakeSandbox('{"ok": true, "retcode": 10009}\n[exit_code=0]')
     tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
 
-    result = await tool.execute(action="order", symbol="EURUSD", side="buy", volume=0.1)
+    result = await tool.execute(
+        action="order", symbol="EURUSD", side="buy", volume=0.1, sl=1.05
+    )
 
     assert not getattr(result, "is_error", False)
     assert "mt5_cli.py order" in sandbox.calls[0]["command"]
@@ -4763,3 +4765,63 @@ def test_the_description_explains_entering_at_a_price_and_sizing_by_risk():
     assert "resting order is" in desc
     assert "SIZING BY MONEY AT RISK" in desc
     assert "risk_money" in desc
+
+
+# --------------------------------------------------------------------------- #
+# NOTHING OPENS WITHOUT A SERVER-SIDE EXIT
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_an_order_without_a_stop_is_refused_at_the_tool(monkeypatch):
+    """The CLI is the enforcement point; this is the same refusal without the
+    cost of a sandbox round trip to learn it."""
+    monkeypatch.setenv("MT5_ALLOW_TRADING", "1")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox()}))
+
+    naked = await tool.execute(action="order", symbol="XAUUSD", side="buy", volume=0.1)
+    assert naked.is_error
+    assert "sl" in str(naked)
+    assert "allow_no_stop" in str(naked)
+
+    stopped = await tool.execute(
+        action="order", symbol="XAUUSD", side="buy", volume=0.1, sl=4283.18
+    )
+    assert not getattr(stopped, "is_error", False)
+
+    # And the opt-out is a real opt-out, passed through to the CLI.
+    deliberate = await tool.execute(
+        action="order", symbol="XAUUSD", side="buy", volume=0.1, allow_no_stop=True
+    )
+    assert not getattr(deliberate, "is_error", False)
+
+
+@pytest.mark.asyncio
+async def test_a_split_without_a_stop_is_refused_at_the_tool(monkeypatch):
+    monkeypatch.setenv("MT5_ALLOW_TRADING", "1")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox()}))
+    naked = await tool.execute(
+        action="split", symbol="XAUUSD", side="buy", volume=1.0, splits=10
+    )
+    assert naked.is_error
+    assert "sl" in str(naked)
+
+
+def test_the_opt_out_reaches_the_command_line():
+    cmd = build_cli_command(
+        "order", {"symbol": "XAUUSD", "side": "buy", "volume": 0.1, "allow_no_stop": True}
+    )
+    assert "--allow-no-stop" in cmd
+    # ...and is absent unless asked for, so the default stays protective.
+    assert "--allow-no-stop" not in build_cli_command(
+        "order", {"symbol": "XAUUSD", "side": "buy", "volume": 0.1, "sl": 1.05}
+    )
+    assert "--allow-no-stop" in build_cli_command(
+        "split", {"symbol": "XAUUSD", "side": "buy", "volume": 1.0, "allow_no_stop": True}
+    )
+
+
+def test_the_description_says_a_position_gets_a_stop_by_default():
+    desc = MT5SandboxTool().description
+    assert "EVERY ORDER CARRIES A STOP" in desc
+    assert "allow_no_stop" in desc
+    # The reason, not just the rule: the broker holds nothing without one.
+    assert "BROKER holds no" in desc
