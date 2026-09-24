@@ -4548,3 +4548,100 @@ def test_the_reported_latency_survives_a_narrow_events_window(monkeypatch, tmp_p
     assert captured["count"] == 1
     assert captured["events"][0]["event"] == "watcher_stop"
     assert captured["last_latency_ms"] == 145.1
+
+
+# --------------------------------------------------------------------------- #
+# split trading, and polling that carries across calls
+# --------------------------------------------------------------------------- #
+def test_split_sends_one_virtual_command_for_many_tickets():
+    """N tickets must be ONE bridge invocation.
+
+    `--splits 10` as ten separate CLI calls would be ten Wine re-execs AND ten
+    windows for the price to move between the first ticket and the last -- which
+    is the opposite of "the same price". The CLI reads the tick once and prices
+    every ticket off it, and that only holds if the command is built once.
+    """
+    cmd = build_cli_command(
+        "split",
+        {"symbol": "XAUUSD", "side": "sell", "volume": 1.0, "splits": 10,
+         "sl": 4294.18, "tp": 4278.18, "group": "xau-leg2"},
+    )
+    assert "split" in cmd
+    assert "--splits 10" in cmd
+    assert "--volume 1.0" in cmd
+    assert "--group xau-leg2" in cmd
+    assert "--sl 4294.18" in cmd and "--tp 4278.18" in cmd
+
+
+def test_split_defaults_to_ten_and_says_so_in_the_schema():
+    cmd = build_cli_command(
+        "split", {"symbol": "XAUUSD", "side": "buy", "volume": 1.0}
+    )
+    assert "--splits 10" in cmd
+    desc = MT5SandboxTool().parameters["properties"]["splits"]["description"]
+    assert "2..50" in desc
+    # The property the method depends on has to be in the text the model reads.
+    assert "SAME TOTAL RISK" in desc
+    assert "grid" in desc
+
+
+@pytest.mark.asyncio
+async def test_split_requires_a_total_volume_and_a_real_split(monkeypatch):
+    monkeypatch.setenv("MT5_ALLOW_TRADING", "1")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox()}))
+    missing = await tool.execute(action="split", symbol="XAUUSD", side="sell")
+    assert missing.is_error
+    assert "TOTAL lots" in str(missing)
+    # splits=1 is not a split, and allowing it would let "split" mean "order".
+    degenerate = await tool.execute(
+        action="split", symbol="XAUUSD", side="sell", volume=1.0, splits=1
+    )
+    assert degenerate.is_error
+    assert "order" in str(degenerate)
+
+
+def test_close_by_group_targets_the_group_and_never_a_ticket_zero():
+    """`--ticket 0` would be read as a real ticket and close the wrong thing."""
+    cmd = build_cli_command("close", {"group": "xau-leg2", "count": 3})
+    assert "--group xau-leg2" in cmd
+    assert "--count 3" in cmd
+    assert "--ticket" not in cmd
+    # A plain ticket close still builds exactly as it did.
+    plain = build_cli_command("close", {"ticket": 123})
+    assert "--ticket 123" in plain and "--group" not in plain
+
+
+@pytest.mark.asyncio
+async def test_close_accepts_a_group_instead_of_a_ticket(monkeypatch):
+    monkeypatch.setenv("MT5_ALLOW_TRADING", "1")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox()}))
+    neither = await tool.execute(action="close")
+    assert neither.is_error
+    assert "group" in str(neither)
+    # execute() returns the raw sandbox string on success and a ToolResult only on
+    # error, so success is asserted the way the rest of this file does it.
+    by_group = await tool.execute(action="close", group="xau-leg2", count=3)
+    assert not getattr(by_group, "is_error", False)
+
+
+def test_watch_session_is_passed_through_to_the_cli():
+    """Continuity is the whole point, so the name must reach the command."""
+    cmd = build_cli_command(
+        "watch", {"watch_session": "xau-leg-2", "wait_seconds": 90, "symbols": "XAUUSD"}
+    )
+    assert "--session xau-leg-2" in cmd
+    assert "--wait-seconds 90.0" in cmd
+    # And omitting it must not invent one: a session nobody asked for would
+    # silently merge two unrelated trades into one timeline.
+    assert "--session" not in build_cli_command("watch", {"wait_seconds": 5})
+
+
+def test_the_description_tells_the_model_to_loop_the_watch_and_says_what_split_is():
+    desc = MT5SandboxTool().description
+    assert "watch_session" in desc
+    assert "POLLING A LIVE TRADE" in desc
+    # The instruction that fixes "it says it is watching but nobody is watching".
+    assert "watch again" in desc
+    assert "timed_out" in desc
+    assert "SPLIT TRADING" in desc
+    assert "grid" in desc

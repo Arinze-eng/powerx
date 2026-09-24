@@ -650,3 +650,218 @@ def test_mq5_fixtures_are_present():
     assert "IndicatorRelease" in complex_src
     # The broken one proves MetaEditor errors reach the model.
     assert "undefinedVariable" in broken_src
+
+
+class _FakeMT5:
+    """Just enough MT5 for cmd_split and the group close: select, info, tick, send.
+
+    The constants are the real ones, because the request the CLI builds is part of
+    what these tests assert -- a fake with invented values would let the CLI send
+    a request no terminal would accept and still pass.
+    """
+
+    ORDER_TYPE_BUY = 0
+    ORDER_TYPE_SELL = 1
+    POSITION_TYPE_BUY = 0
+    POSITION_TYPE_SELL = 1
+    TRADE_ACTION_DEAL = 1
+    ORDER_TIME_GTC = 0
+    ORDER_FILLING_FOK = 0
+    ORDER_FILLING_IOC = 1
+    ORDER_FILLING_RETURN = 2
+    TRADE_RETCODE_DONE = 10009
+
+    def __init__(self, sent, info, tick, positions=()):
+        self.sent = sent
+        self._info, self._tick = info, tick
+        self._positions = list(positions)
+
+    def symbol_select(self, symbol, enable):
+        return True
+
+    def symbol_info(self, symbol):
+        return self._info
+
+    def symbol_info_tick(self, symbol):
+        return self._tick
+
+    def positions_get(self, ticket=None):
+        if ticket is None:
+            return list(self._positions)
+        return [p for p in self._positions if int(p.ticket) == int(ticket)]
+
+
+# --------------------------------------------------------------------------- #
+# SPLIT TRADING -- one idea, N positions
+# --------------------------------------------------------------------------- #
+def test_split_divides_the_total_volume_and_gives_every_ticket_the_same_stop(cli, monkeypatch):
+    """The property the method depends on: the split risks what one did.
+
+    Ten 0.10-lot tickets with a 20-pip stop risk exactly what one 1.00-lot ticket
+    with a 20-pip stop risks. The split multiplies EXITS, not risk -- so every
+    ticket must carry the same sl, and the total volume must be the volume asked
+    for, or the position is not the one that was planned.
+    """
+    sent = []
+
+    class _Info:
+        volume_min, volume_max, volume_step, digits = 0.01, 100.0, 0.01, 2
+        filling_mode = 1
+
+    class _Tick:
+        bid, ask = 4285.00, 4285.18
+
+    monkeypatch.setattr(cli, "require_bridge", lambda: (_FakeMT5(sent, _Info(), _Tick()), None))
+    monkeypatch.setattr(cli, "filling_candidates", lambda mt5, info: [1])
+    monkeypatch.setattr(cli, "_order_send", lambda mt5, req, fillings: (
+        sent.append(dict(req)),
+        {"ok": True, "retcode": 10009, "comment": "Done",
+         "result": {"order": len(sent), "deal": len(sent), "price": req["price"]}},
+    )[1])
+
+    args = types.SimpleNamespace(
+        symbol="XAUUSD", side="sell", volume=1.0, splits=10, group="xau-leg2",
+        sl=4294.18, tp=4278.18, deviation=20, magic=20240919,
+        comment="powerx-split", stop_on_failure=False, check_cost=False,
+    )
+    code = cli.cmd_split(args)
+    assert code == 0
+    assert len(sent) == 10, "one request per ticket, inside ONE bridge invocation"
+    assert all(r["volume"] == 0.1 for r in sent)
+    assert all(r["sl"] == 4294.18 and r["tp"] == 4278.18 for r in sent)
+    # Every ticket prices off the ONE tick read before the loop, so they are the
+    # same price rather than merely near each other.
+    assert {r["price"] for r in sent} == {4285.00}
+    assert all("xau-leg2" in r["comment"] for r in sent)
+
+
+def test_split_rounds_down_rather_than_risking_more_than_asked(cli, monkeypatch):
+    """0.25 over 10 is 0.025, which the broker's 0.01 step cannot take.
+
+    Rounding UP the last ticket would make the split risk more than the caller
+    asked for, which is the one error this method cannot survive. It reports the
+    leftover instead.
+    """
+    sent = []
+
+    class _Info:
+        volume_min, volume_max, volume_step, digits = 0.01, 100.0, 0.01, 2
+        filling_mode = 1
+
+    class _Tick:
+        bid, ask = 4285.00, 4285.18
+
+    monkeypatch.setattr(cli, "require_bridge", lambda: (_FakeMT5(sent, _Info(), _Tick()), None))
+    monkeypatch.setattr(cli, "filling_candidates", lambda mt5, info: [1])
+    monkeypatch.setattr(cli, "_order_send", lambda mt5, req, fillings: (
+        sent.append(dict(req)),
+        {"ok": True, "retcode": 10009, "comment": "Done", "result": {"order": 1}},
+    )[1])
+
+    args = types.SimpleNamespace(
+        symbol="XAUUSD", side="buy", volume=0.25, splits=10, group="g",
+        sl=None, tp=None, deviation=20, magic=20240919,
+        comment="powerx-split", stop_on_failure=False, check_cost=False,
+    )
+    assert cli.cmd_split(args) == 0
+    assert all(r["volume"] == 0.02 for r in sent)
+    assert sum(r["volume"] for r in sent) == 0.20
+
+
+def test_split_refuses_when_the_per_ticket_volume_is_below_the_broker_minimum(cli, monkeypatch):
+    """A split that cannot be filled must say so, not quietly send nothing."""
+    class _Info:
+        volume_min, volume_max, volume_step, digits = 0.10, 100.0, 0.01, 2
+        filling_mode = 1
+
+    class _Tick:
+        bid, ask = 4285.00, 4285.18
+
+    monkeypatch.setattr(cli, "require_bridge", lambda: (_FakeMT5([], _Info(), _Tick()), None))
+    args = types.SimpleNamespace(
+        symbol="XAUUSD", side="buy", volume=0.5, splits=10, group="g",
+        sl=None, tp=None, deviation=20, magic=20240919,
+        comment="c", stop_on_failure=False, check_cost=False,
+    )
+    assert cli.cmd_split(args) == 1
+
+
+def test_a_group_tag_matches_its_own_group_and_not_a_longer_name(cli):
+    """`a` must not select the tickets of `abc`; the colons make it a field."""
+
+    class _Pos:
+        def __init__(self, ticket, comment):
+            self.ticket, self.comment, self.volume = ticket, comment, 0.1
+
+    class _MT5:
+        @staticmethod
+        def positions_get():
+            return [
+                _Pos(1, "powerx-split:abc:1of10"),
+                _Pos(2, "powerx-split:a:1of10"),
+                _Pos(3, "powerx-split:a:2of10"),
+                _Pos(4, "powerx-split:a:1of10"),
+                _Pos(5, "unrelated"),
+            ]
+
+    matched = cli._positions_in_group(_MT5(), "a")
+    assert [p.ticket for p in matched] == [2, 3, 4]
+
+
+def test_the_ledger_makes_consecutive_watches_one_observation(cli, tmp_path, monkeypatch):
+    """The whole point of --session: the second call knows what the first saw."""
+    monkeypatch.setattr(cli, "MT5_ROOT", tmp_path)
+    path = cli._watch_session_path("xau-leg-2")
+    assert path is not None
+
+    def _fold(track, observed=(), samples=3, seconds=10.0):
+        return cli._watch_session_fold(
+            path, "xau-leg-2", ["XAUUSD"], track, {"XAUUSD": 0.10},
+            list(observed), seconds, samples, {11},
+        )
+
+    first = _fold({"XAUUSD": {"samples": 3, "first_mid": 4285.0, "last_mid": 4286.0,
+                              "min_mid": 4285.0, "max_mid": 4286.0}})
+    assert first["calls"] == 1
+    assert first["price_path_total"]["XAUUSD"]["first_mid"] == 4285.0
+
+    # A second call that only saw the high end of the move must still report the
+    # TRUE high and low of the whole session, not just its own window.
+    second = _fold({"XAUUSD": {"samples": 2, "first_mid": 4290.0, "last_mid": 4284.0,
+                               "min_mid": 4284.0, "max_mid": 4290.0}}, samples=2)
+    total = second["price_path_total"]["XAUUSD"]
+    assert second["calls"] == 2
+    assert total["first_mid"] == 4285.0, "the session's first price, not this call's"
+    assert total["last_mid"] == 4284.0
+    assert total["min_mid"] == 4284.0 and total["max_mid"] == 4290.0
+    assert total["samples"] == 5, "samples accumulate across calls"
+    assert second["watch_seconds_total"] == 20.0
+    assert second["tickets_at_start"] == [11]
+    # "moved since you last looked" is a different question from "moved in this
+    # call", and only the ledger can answer it.
+    assert second["since_last_call"]["XAUUSD"]["was"] == 4286.0
+    assert second["since_last_call"]["XAUUSD"]["now"] == 4284.0
+    assert second["since_last_call"]["XAUUSD"]["moved_pips"] == -20.0
+
+
+def test_a_session_name_that_cannot_be_a_filename_is_refused_not_sanitised_away(cli, tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "MT5_ROOT", tmp_path)
+    assert cli._watch_session_path("xau/leg:2") == tmp_path / "watch_sessions" / "xauleg2.json"
+    assert cli._watch_session_path("////") is None
+    assert cli._watch_session_path("") is None
+
+
+def test_the_ledger_keeps_the_events_that_happened_between_calls(cli, tmp_path, monkeypatch):
+    """Events are the reason to keep a session: one call's fire is the next
+    call's context, and dropping it would make each call start from nothing."""
+    monkeypatch.setattr(cli, "MT5_ROOT", tmp_path)
+    path = cli._watch_session_path("s")
+    track = {"XAUUSD": {"samples": 1, "first_mid": 1.0, "last_mid": 1.0,
+                        "min_mid": 1.0, "max_mid": 1.0}}
+    cli._watch_session_fold(path, "s", ["XAUUSD"], track, {"XAUUSD": 0.1},
+                            [{"event": "rule_fired"}], 5.0, 1, set())
+    result = cli._watch_session_fold(path, "s", ["XAUUSD"], track, {"XAUUSD": 0.1},
+                                     [{"event": "position_closed"}], 5.0, 1, set())
+    assert result["event_count"] == 2
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert [e["event"] for e in stored["events"]] == ["rule_fired", "position_closed"]

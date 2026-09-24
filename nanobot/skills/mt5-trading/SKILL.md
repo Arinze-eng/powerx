@@ -541,6 +541,116 @@ fixed stop and the level-based entry, not in the target being reached. If the
 user asks for a different RR or stop, pass `rr=`/`sl_pips=`, and mention that
 `violations` will then flag it as off-playbook.
 
+## Polling a live trade in real time — not a cron
+
+While a position is open, **watch it for real**. A scheduled task that checks the
+price every five minutes is not watching, and it cannot see anything happen — it
+samples a market that ticks continuously, and the model is told about it long
+after the fact. Cron is for work that must happen with nobody watching. A trade
+you are following is the opposite: you are there, so observe it.
+
+```
+# call this in a LOOP until the position is closed or the user says stop
+mt5_sandbox(action="watch", watch_session="xau-leg-2", wait_seconds=90)
+```
+
+**Always pass `watch_session`.** Without it every call starts from zero: each one
+reports its own first price, its own drift, its own range, and none of them can
+answer "how has this trade gone?" — you are watching a different trade every
+90 seconds. With it, the calls fold into one ledger on the box and each answer
+carries:
+
+| Field | Meaning |
+|---|---|
+| `session.price_path_total` | the **whole session's** first/last/min/max, drift and range in pips |
+| `session.since_last_call` | `was` / `now` / `moved_pips` — the move since you last looked |
+| `session.elapsed_s` | wall-clock time since the trade's first watch, across all calls |
+| `session.samples_total` | samples taken across all calls |
+| `session.calls` | how many times you have looked |
+
+### How the loop works
+
+1. `watch` blocks up to **90 s** and returns the moment something happens.
+2. If `watched.timed_out` is `true`, **nothing happened** — that is a normal
+   result, not a failure and not an error. Read the price path, think, call
+   `watch` again with the same session.
+3. If `watched.observed_event` is set, something happened (a fire, a refused
+   close, a near miss, a dead watcher, a position opened/closed). Read it, decide,
+   act.
+4. Stop the loop when: the position set is empty (the trade is done), the user
+   tells you to stop, or you have something to say to the user.
+
+**Keep the thinking in the loop.** Each call gives you the cumulative path, the
+delta since last time, the guard's tick counts and any near miss. That is enough
+to say whether the trade is working, whether the level is being respected, and
+whether the stop should move — say it, don't just keep polling in silence.
+
+**The 90 s cap is not a limit on how long you watch.** It is the ceiling on one
+sandbox command. Watching for an hour is ~40 calls, and they are one
+observation because they share a session name. There is no daemon behind this and
+there does not need to be one: the loop is you, and you are the part that thinks.
+
+### Never poll with `quote`
+
+`quote` in a loop costs a sandbox round trip per poll and returns a price with no
+history, no guard state and no event log — and it is exactly the pattern that
+misses a level touched between two polls. `watch` samples inside the box at 1 Hz
+and hands you the path, for one round trip. Use `quote` once, when you want a
+price; use `watch` when you want to know what the price is doing.
+
+## Split trading — one idea, N positions
+
+Instead of risking $100 as one 1.00-lot position, open **ten 0.10-lot positions
+at the same price**. Same symbol, same direction, same stop, **same total risk** —
+but the exits stop being all-or-nothing.
+
+```
+mt5_sandbox(action="split", symbol="XAUUSD", side="sell", volume=1.0,
+            splits=10, sl=4294.18, tp=4278.18, group="xau-leg2")
+
+# later: take three off into a run, leave seven working
+mt5_sandbox(action="close", group="xau-leg2", count=3)
+```
+
+### Why it helps
+
+* **Tiered exits.** Three off at the first target, seven left to run to the
+  extension — you cannot do that with one ticket, you can only be all in or all out.
+* **Free runners.** Close enough to cover the risk, then the remainder is a
+  risk-free position with the original target still on it. That is where the
+  extra profit actually comes from, not from the extra tickets.
+* **Smaller decisions.** Each close is a small, reversible-feeling choice, which
+  is easier to make by a rule than "close it all now".
+
+### What makes it work — and the trap
+
+* **Every ticket must carry the same stop.** Ten 0.10 lots with a 20-pip stop risk
+  exactly what one 1.00 lot with a 20-pip stop risks. The split multiplies
+  *exits*, not risk. A split with stops on only some of the tickets multiplies
+  the risk instead, and `split` reports the total risk it actually created.
+* **It is not a grid.** `split` fires **once**, at one price, with one stop. Adding
+  tickets as the price goes *against* you is the martingale the guide warns "can
+  lead to rapid account depletion (ruin)". If the user asks for that, say what it
+  is; do not quietly translate it into a split.
+* **Cost is not always proportional.** Commission charged **per deal** is paid ten
+  times where one 1.00-lot deal pays it once, and so are slippage and requotes.
+  Spread cost is proportional to volume and is unaffected. On a 20-pip stop that
+  difference matters — pass `check_cost=true` and read it before sending.
+* **The volume must divide.** `split` rounds **down** to the broker's lot step and
+  reports the leftover in `volume_left_over` rather than rounding up, because
+  rounding up would risk more than the user asked for. A leftover that is not
+  small is reported as a `warning`, and the split is smaller than requested on
+  purpose.
+* **A partial fill is not a position.** If only 6 of 10 tickets fill, the result
+  is `alert=split_incomplete` with the volume actually open. Say that; never
+  report a 10-ticket split that is 6 tickets.
+
+### Reporting a split honestly
+
+Ten tickets at $10 each is $100 of profit, exactly like one ticket at $100. If the
+screenshot angle is the reason, that is the user's call — but when you report
+P&L, add it up and give the real number.
+
 ## Sizing
 
 Wine + MT5 does not fit in the stock ~486 MB sandbox and gets OOM-killed

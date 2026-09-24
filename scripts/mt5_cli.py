@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import shutil
@@ -65,7 +66,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.3"
+CLI_VERSION = "2026-09-24.4"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -2170,6 +2171,166 @@ def _positions_by_ticket(mt5: Any) -> tuple[list[Any], bool]:
     return list(positions), True
 
 
+# --------------------------------------------------------------------------- #
+# ONE observation, many calls -- `watch --session NAME`
+# --------------------------------------------------------------------------- #
+# WHY THIS EXISTS: `watch` is bounded at WATCH_MAX_WAIT_SECONDS per call, and it
+# has to be -- a sandbox command cannot be held open for the life of a trade.
+# But "watch this trade" is not a 90-second question; a trade runs for hours.
+# Without continuity the caller gets a series of UNRELATED windows: each answers
+# with its own first price, its own drift, its own range, and not one of them can
+# say what the price has done SINCE the trade opened. Watching a long trade that
+# way is watching a different trade every two minutes.
+#
+# `--session NAME` fixes exactly that, and nothing else. Every call carrying the
+# same name folds its samples into a ledger on disk and returns the CUMULATIVE
+# view next to this call's own, so consecutive calls are one continuous
+# observation of one idea and the caller can THINK between slices rather than
+# start over each time. That is the difference between polling and a loop of
+# unrelated snapshots.
+#
+# The ledger is a plain JSON file under the MT5 root, so it survives the sandbox
+# command that wrote it -- which is the point, because each call is a different
+# command.
+WATCH_SESSION_MAX_EVENTS = 200
+
+
+def _watch_session_path(name: str) -> Path | None:
+    """``<MT5_ROOT>/watch_sessions/<safe-name>.json``; ``None`` if unusable."""
+    # No regex: a session name is a label, not an expression, and this file
+    # keeps its dependency list to the stdlib it already imports.
+    safe = "".join(
+        c for c in str(name or "").strip() if c.isalnum() or c in "._-"
+    )[:64]
+    if not safe:
+        return None
+    return MT5_ROOT / "watch_sessions" / f"{safe}.json"
+
+
+def _watch_session_load(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _watch_session_fold(
+    path: Path,
+    name: str,
+    symbols: list[str],
+    track: dict[str, Any],
+    pips: dict[str, float],
+    observed: list[dict[str, Any]],
+    watch_seconds: float,
+    samples: int,
+    tickets_at_start: set[int],
+) -> dict[str, Any]:
+    """Fold this call's samples into the ledger and return the cumulative view.
+
+    The merge is per symbol and deliberately conservative: the first price is the
+    one the SESSION started at (not this call), the last is always the newest,
+    and min/max only ever widen. So a two-hour trade watched in eighty slices
+    reports the true high and low of the whole two hours, which is the number a
+    stop and a target are actually judged against.
+    """
+    ledger = _watch_session_load(path)
+    now = time.time()
+    ledger.setdefault("name", name)
+    ledger["calls"] = int(ledger.get("calls") or 0) + 1
+    ledger["first_at"] = float(ledger.get("first_at") or now)
+    ledger["last_at"] = now
+    ledger["watch_seconds"] = round(
+        float(ledger.get("watch_seconds") or 0.0) + float(watch_seconds), 2
+    )
+    ledger["samples"] = int(ledger.get("samples") or 0) + int(samples)
+    ledger["symbols_watched"] = sorted(
+        set(ledger.get("symbols_watched") or []) | set(symbols)
+    )
+    if tickets_at_start:
+        ledger.setdefault("tickets_at_start", sorted(tickets_at_start))
+
+    stored: dict[str, Any] = ledger.get("symbols") or {}
+    # What the previous call last saw, captured BEFORE this call overwrites it:
+    # "moved since you last looked" is a different and more useful question than
+    # "moved since this call began", and only the ledger can answer it.
+    previous_last = {s: (row or {}).get("last_mid") for s, row in stored.items()}
+    for symbol, row in (track or {}).items():
+        if row.get("first_mid") is None:
+            continue
+        into = stored.setdefault(
+            symbol,
+            {"samples": 0, "first_mid": None, "last_mid": None,
+             "min_mid": None, "max_mid": None},
+        )
+        into["samples"] = int(into.get("samples") or 0) + int(row.get("samples") or 0)
+        if into.get("first_mid") is None:
+            into["first_mid"] = row["first_mid"]
+        into["last_mid"] = row["last_mid"]
+        into["min_mid"] = (
+            row["min_mid"] if into.get("min_mid") is None
+            else min(into["min_mid"], row["min_mid"])
+        )
+        into["max_mid"] = (
+            row["max_mid"] if into.get("max_mid") is None
+            else max(into["max_mid"], row["max_mid"])
+        )
+    ledger["symbols"] = stored
+
+    events = list(ledger.get("events") or [])
+    for event in observed or []:
+        events.append({"at": now, **event})
+    ledger["events"] = events[-WATCH_SESSION_MAX_EVENTS:]
+    ledger["event_count"] = len(events)
+
+    ledger_error = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(ledger, indent=1, default=str), encoding="utf-8")
+    except OSError:
+        # A watch whose ledger cannot be written is still a valid watch. Losing
+        # continuity is worth reporting, not worth failing the observation for.
+        ledger_error = "could not write the session ledger"
+
+    cumulative = _watch_path_report(stored, pips)
+    since_last: dict[str, Any] = {}
+    for symbol, row in cumulative.items():
+        before = previous_last.get(symbol)
+        after = row.get("last_mid")
+        pip = pips.get(symbol) or 0.0
+        since_last[symbol] = {
+            "was": before,
+            "now": after,
+            "moved_pips": (
+                round((after - before) / pip, 1)
+                if before is not None and after is not None and pip
+                else None
+            ),
+        }
+    elapsed = round(now - float(ledger.get("first_at") or now), 1)
+    return {
+        "name": ledger.get("name"),
+        "calls": ledger.get("calls"),
+        "first_at": ledger.get("first_at"),
+        "elapsed_s": elapsed,
+        "watch_seconds_total": ledger.get("watch_seconds"),
+        "samples_total": ledger.get("samples"),
+        "event_count": ledger.get("event_count"),
+        "tickets_at_start": ledger.get("tickets_at_start") or [],
+        "price_path_total": cumulative,
+        "since_last_call": since_last,
+        "ledger": str(path),
+        "ledger_error": ledger_error,
+        "note": (
+            f"session '{ledger.get('name')}': call {ledger.get('calls')}, "
+            f"{ledger.get('watch_seconds')} s and {ledger.get('samples')} samples of "
+            f"watching across {elapsed} s of wall clock. price_path_total is the "
+            "WHOLE session, not this call, and since_last_call is the move since "
+            "you last looked. Call again with the same session to continue it."
+        ),
+    }
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Watch a live trade: block, sample, and return what to think about.
 
@@ -2343,6 +2504,30 @@ def cmd_watch(args: argparse.Namespace) -> int:
             ),
         },
     }
+    # The continuous-observation view. Attached BEFORE the alert flags below so
+    # a session is reported even when the terminal or the guard is unhappy --
+    # losing the timeline exactly when something went wrong is the one time it
+    # is worth most.
+    session_name = str(getattr(args, "session", "") or "").strip()
+    if session_name:
+        session_path = _watch_session_path(session_name)
+        if session_path is None:
+            payload["session"] = {
+                "error": f"session name '{session_name}' has no usable characters"
+            }
+        else:
+            payload["session"] = _watch_session_fold(
+                session_path,
+                session_name,
+                symbols,
+                track,
+                pips,
+                observed,
+                watched_seconds,
+                samples,
+                tickets_at_start,
+            )
+            payload.setdefault("hint", payload["session"]["note"])
     if not terminal_ok:
         payload["ok"] = False
         payload["alert"] = "terminal_unavailable"
@@ -2817,6 +3002,221 @@ def _order_send(mt5, request: dict[str, Any],
     return last
 
 
+# --------------------------------------------------------------------------- #
+# SPLIT TRADING -- one idea, N positions
+# --------------------------------------------------------------------------- #
+# The method: instead of risking $100 on one 1.00-lot entry, open TEN 0.10-lot
+# entries at the same price. Nothing about the idea changes -- same symbol, same
+# direction, same stop, same total risk -- but the exits stop being all-or-
+# nothing. Three can come off into a run, seven can be left to work, and the
+# runners can be walked to breakeven so the rest of the trade is free.
+#
+# THE TWO THINGS THAT MAKE IT WORK, AND THE ONE THAT MAKES IT A TRAP:
+#
+#   * Total risk is IDENTICAL to the single position *only if every ticket
+#     carries the same stop*. Ten 0.10 lots with a 20-pip stop risk exactly what
+#     one 1.00 lot with a 20-pip stop risks. The splits multiply EXITS, not risk.
+#     A split that leaves stops off the later tickets multiplies the risk
+#     instead, and this command will not do it silently.
+#   * Cost is not always proportional. Commission charged PER DEAL (common on
+#     FX and metals) is paid ten times, and so is any slippage or requote, while
+#     1.00 lot would have paid it once. On a 20-pip stop that difference is real
+#     money, so `--check-cost` reports it before anything is sent.
+#   * It is NOT a grid. Adding tickets as the price goes AGAINST you is the
+#     martingale the trading guide warns can empty an account, and it is a
+#     different command from this one: `split` fires exactly once, at one price,
+#     with one stop, and refuses to fire again while its own group is open.
+SPLIT_MAX_TICKETS = 50
+
+
+def _split_group_tag(group: str) -> str:
+    """A comment-safe group tag. Broker comments are short and often truncated."""
+    safe = "".join(
+        c for c in str(group or "").strip() if c.isalnum() or c in "._-"
+    )[:24]
+    return safe
+
+
+def cmd_split(args: argparse.Namespace) -> int:
+    """Open ONE idea as ``--splits`` positions of equal volume, in one call.
+
+    Deliberately one bridge invocation: ``--splits 10`` as ten separate CLI calls
+    would be ten Wine re-execs and ten windows in which the price moves between
+    the first ticket and the last, which is the opposite of "the same price".
+    Inside one call the tick is read once and every ticket prices off it.
+
+    Every ticket gets the SAME sl and tp, so the split's total risk is the single
+    position's total risk. That is the property the method depends on and the one
+    that is checked in the answer.
+    """
+    mt5, err = require_bridge()
+    if err is not None:
+        return err
+
+    count = int(getattr(args, "splits", 0) or 0)
+    if count < 2 or count > SPLIT_MAX_TICKETS:
+        return fail(
+            f"--splits must be between 2 and {SPLIT_MAX_TICKETS}, got {count}. "
+            "A split of one is just `order`.",
+            code=1,
+        )
+    symbol = args.symbol
+    mt5.symbol_select(symbol, True)
+    info = mt5.symbol_info(symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if info is None or tick is None:
+        return fail(f"symbol {symbol} unavailable", code=2)
+
+    side = args.side.lower()
+    if side in ("buy", "long"):
+        order_type = mt5.ORDER_TYPE_BUY
+        price = float(tick.ask)
+    elif side in ("sell", "short"):
+        order_type = mt5.ORDER_TYPE_SELL
+        price = float(tick.bid)
+    else:
+        return fail("side must be buy or sell", code=1)
+
+    # Volume has to be split into lots the broker will actually accept. Rounding
+    # DOWN to the step and refusing the remainder is the honest option: rounding
+    # UP would make the split risk more than the caller asked for, which is the
+    # one error this method cannot survive.
+    step = float(getattr(info, "volume_step", 0.01) or 0.01)
+    minimum = float(getattr(info, "volume_min", 0.01) or 0.01)
+    maximum = float(getattr(info, "volume_max", 100.0) or 100.0)
+    total = float(args.volume)
+    per = total / count
+    per = math.floor(per / step + 1e-9) * step
+    per = round(per, 8)
+    if per < minimum:
+        return fail(
+            f"{total} over {count} splits is {total / count} per ticket, below this "
+            f"symbol's minimum lot of {minimum}. Use {int(total / minimum)} splits "
+            f"or fewer, or raise the total volume.",
+            code=1,
+        )
+    if per > maximum:
+        return fail(f"per-ticket volume {per} exceeds the symbol maximum {maximum}", code=1)
+
+    actual_total = round(per * count, 8)
+    left_over = round(total - actual_total, 8)
+    shortfall = left_over > step / 2
+
+    group = _split_group_tag(getattr(args, "group", "") or "") or _split_group_tag(
+        args.comment or "split"
+    )
+    fillings = filling_candidates(mt5, info)
+    base_comment = (args.comment or "powerx-split")[:16]
+
+    results: list[dict[str, Any]] = []
+    filled = 0
+    for index in range(count):
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": per,
+            "type": order_type,
+            # Every ticket prices off the ONE tick read above, so they are the
+            # same price and not merely near each other.
+            "price": price,
+            "deviation": int(args.deviation),
+            "magic": int(args.magic),
+            "comment": f"{base_comment}:{group}:{index + 1}of{count}",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": fillings[0],
+        }
+        if args.sl is not None:
+            request["sl"] = float(args.sl)
+        if args.tp is not None:
+            request["tp"] = float(args.tp)
+        payload = _order_send(mt5, request, fillings)
+        entry = {
+            "index": index + 1,
+            "volume": per,
+            "ok": bool(payload.get("ok")),
+            "retcode": payload.get("retcode"),
+            "comment": payload.get("comment"),
+        }
+        result = payload.get("result") or {}
+        for key in ("order", "deal", "price"):
+            if result.get(key) is not None:
+                entry[key] = result.get(key)
+        results.append(entry)
+        if payload.get("ok"):
+            filled += 1
+        elif args.stop_on_failure:
+            break
+
+    # The stop is the thing that makes the total risk what it is, so its absence
+    # is reported in terms of risk rather than as a style note.
+    risk_money = None
+    if args.sl is not None:
+        pip = _watch_symbol_pips(mt5, symbol)[1]
+        per_pip = per * 100.0 * pip if _is_gold_symbol(symbol) else None
+        if per_pip is not None:
+            risk_money = round(abs(price - float(args.sl)) / pip * per_pip * filled, 2)
+
+    # `ok` is about TICKETS, not lots. A shortfall opens slightly less volume than
+    # asked for, which is safe on purpose -- it carries a warning, and it is not a
+    # failure. Reporting it as one would make a caller that retries a failed split
+    # open a SECOND live position on top of the first. Only a ticket that did not
+    # fill is a failure, and only that gets a non-zero exit.
+    ok = filled == count
+    out: dict[str, Any] = {
+        "ok": ok,
+        "action": "split",
+        "symbol": symbol,
+        "side": side,
+        "price": price,
+        "splits_requested": count,
+        "splits_filled": filled,
+        "volume_per_ticket": per,
+        "volume_total": actual_total,
+        "volume_left_over": left_over,
+        "group": group,
+        "sl": args.sl,
+        "tp": args.tp,
+        "total_risk_money": risk_money,
+        "results": results,
+        "note": (
+            f"{filled}/{count} tickets of {per} lots on {symbol} at {price}. "
+            f"Total {actual_total} lots. Every ticket carries the same stop, so the "
+            "split's total risk is one position's risk -- it multiplies exits, not risk. "
+            "Close any subset by ticket, or by group with close --group."
+        ),
+    }
+    if shortfall:
+        out["warning"] = (
+            f"{total} lots does not divide into {count} x {per}: {left_over} lots "
+            f"({int(left_over / step)} step(s)) is NOT open. The split is "
+            f"{actual_total} lots, not {total} -- a smaller position than asked for, "
+            "deliberately: rounding the last ticket up would risk more than you asked."
+        )
+    if filled < count:
+        out["alert"] = "split_incomplete"
+        out["warning"] = (
+            (out.get("warning", "") + " ")
+            + f"Only {filled} of {count} tickets filled (retcode "
+            f"{results[-1].get('retcode') if results else 'n/a'}: "
+            f"{results[-1].get('comment') if results else 'n/a'}). The position is "
+            f"{per * filled} lots, not {actual_total}. This is a HALF-OPEN split: "
+            "its stop covers fewer tickets than intended, and every ticket already "
+            "filled is live right now."
+        )
+    if args.check_cost and args.sl is not None:
+        out["cost_check"] = {
+            "deals": count,
+            "deals_if_single_position": 1,
+            "note": (
+                f"{count} deals pay any PER-DEAL commission {count} times where one "
+                "1.00-lot deal pays it once. Spread cost is proportional to volume "
+                "and is unchanged; slippage and requotes are per deal and are not."
+            ),
+        }
+    code = 0 if ok else 3
+    return emit(out, text=out["note"] if ok else out.get("warning", out["note"]), code=code)
+
+
 def cmd_order(args: argparse.Namespace) -> int:
     mt5, err = require_bridge()
     if err is not None:
@@ -2865,22 +3265,22 @@ def cmd_order(args: argparse.Namespace) -> int:
     return emit(payload, text=note, code=code)
 
 
-def cmd_close(args: argparse.Namespace) -> int:
-    mt5, err = require_bridge()
-    if err is not None:
-        return err
-    positions = mt5.positions_get(ticket=int(args.ticket))
-    if not positions:
-        return fail(f"no position with ticket {args.ticket}", code=2)
-    pos = positions[0]
+def _close_one(mt5: Any, pos: Any, args: argparse.Namespace) -> dict[str, Any]:
+    """Close one position (or part of it), resolving the symbol's filling mode.
+
+    Split out of ``cmd_close`` so the group path and the single-ticket path send
+    byte-identical requests. Two code paths that close positions must not differ
+    in how they resolve a filling mode: one of them would start failing with
+    retcode 10030 on FOK/IOC-only symbols and the other would not.
+    """
     tick = mt5.symbol_info_tick(pos.symbol)
     if tick is None:
-        return fail(f"no tick for {pos.symbol}", code=2)
+        return {"ok": False, "retcode": None, "comment": f"no tick for {pos.symbol}"}
     closing_long = pos.type == mt5.POSITION_TYPE_BUY
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": pos.symbol,
-        "volume": float(args.volume or pos.volume),
+        "volume": float(getattr(args, "volume", None) or pos.volume),
         "type": mt5.ORDER_TYPE_SELL if closing_long else mt5.ORDER_TYPE_BUY,
         "position": pos.ticket,
         "price": float(tick.bid if closing_long else tick.ask),
@@ -2892,8 +3292,71 @@ def cmd_close(args: argparse.Namespace) -> int:
     }
     # Hard-coding ORDER_FILLING_RETURN made every close fail with retcode 10030
     # on symbols that only advertise FOK/IOC, so resolve it from the symbol.
-    payload = _order_send(mt5, request,
-                          filling_candidates(mt5, mt5.symbol_info(pos.symbol)))
+    return _order_send(
+        mt5, request, filling_candidates(mt5, mt5.symbol_info(pos.symbol))
+    )
+
+
+def _positions_in_group(mt5: Any, group: str) -> list[Any]:
+    """Every open position whose comment carries ``:<group>:``.
+
+    The tag is matched with its colons because `split` writes
+    ``<base>:<group>:<n>of<total>`` and a bare substring match would let a group
+    named ``a`` also select a group named ``abc``. The colons make the label a
+    field rather than a coincidence.
+    """
+    needle = f":{group}:"
+    return [
+        p for p in (mt5.positions_get() or []) if needle in str(getattr(p, "comment", ""))
+    ]
+
+
+def cmd_close(args: argparse.Namespace) -> int:
+    mt5, err = require_bridge()
+    if err is not None:
+        return err
+
+    # Closing PART of a split is the whole point of splitting, so `close` also
+    # takes a group: "take 3 of the 10 off" is one call, not three, and doing it
+    # as three calls means the price moves between them -- on a book that exists
+    # precisely to make exits granular.
+    group = _split_group_tag(getattr(args, "group", "") or "")
+    if group:
+        group_positions = _positions_in_group(mt5, group)
+        if not group_positions:
+            return fail(f"no open positions carry the split group '{group}'", code=2)
+        # Deterministic order so "close 3" is reproducible: FIFO would depend on
+        # the broker's sort, and the caller is choosing a NUMBER, not a ticket.
+        group_positions.sort(key=lambda p: (str(getattr(p, "comment", "")), int(p.ticket)))
+        count = int(getattr(args, "count", 0) or 0)
+        chosen = group_positions if count <= 0 else group_positions[:count]
+        results = []
+        for pos in chosen:
+            payload = _close_one(mt5, pos, args)
+            results.append({"ticket": pos.ticket, "volume": float(pos.volume), **payload})
+        closed = [r for r in results if r.get("ok")]
+        ok = len(closed) == len(chosen)
+        out = {
+            "ok": ok,
+            "action": "close_group",
+            "group": group,
+            "selected": len(chosen),
+            "closed": len(closed),
+            "still_open": len(group_positions) - len(closed),
+            "results": results,
+            "note": (
+                f"closed {len(closed)} of {len(chosen)} selected from group '{group}'; "
+                f"{len(group_positions) - len(closed)} of that group remain open."
+            ),
+        }
+        if not ok:
+            out["alert"] = "close_incomplete"
+        return emit(out, text=out["note"], code=0 if ok else 3)
+
+    positions = mt5.positions_get(ticket=int(args.ticket))
+    if not positions:
+        return fail(f"no position with ticket {args.ticket}", code=2)
+    payload = _close_one(mt5, positions[0], args)
     return emit(payload, text="position closed" if payload["ok"] else "close failed",
                 code=0 if payload["ok"] else 3)
 
@@ -5665,6 +6128,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="watch --wait-seconds: how often to sample (default 1 s)",
     )
     p.add_argument("--lines", type=int, default=20, help="guard events to return")
+    p.add_argument(
+        "--session",
+        default="",
+        help=(
+            "continue ONE observation across calls. Every watch carrying the same "
+            "name folds its samples into a ledger on disk and returns "
+            "session.price_path_total (the whole session's high/low/drift, not this "
+            "call's) plus session.since_last_call. Watching a long trade in "
+            f"{int(WATCH_MAX_WAIT_SECONDS)}-second calls without this reports a "
+            "different trade every call; with it, the calls are one timeline and "
+            "you can think between them."
+        ),
+    )
     p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("history", help="closed deals")
@@ -5695,9 +6171,73 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--comment", default="powerx-mt5")
     p.set_defaults(func=cmd_order)
 
-    p = sub.add_parser("close", help="close a position")
-    p.add_argument("--ticket", type=int, required=True)
+    p = sub.add_parser(
+        "split",
+        help="open ONE idea as N equal positions at one price (split trading)",
+    )
+    p.add_argument("--symbol", required=True)
+    p.add_argument("--side", required=True, choices=["buy", "sell", "long", "short"])
+    p.add_argument(
+        "--volume",
+        type=float,
+        required=True,
+        help="TOTAL lots for the idea, divided across the tickets",
+    )
+    p.add_argument(
+        "--splits",
+        type=int,
+        default=10,
+        help=(
+            "how many positions to open (2..50, default 10). One idea risking $100 "
+            "becomes 10 tickets of 0.10 rather than one of 1.00: same direction, "
+            "same stop, same TOTAL risk, but the exits stop being all-or-nothing"
+        ),
+    )
+    p.add_argument(
+        "--group",
+        default="",
+        help=(
+            "label the tickets so they can be closed as a set later "
+            "(close --group NAME --count 3)"
+        ),
+    )
+    p.add_argument("--sl", type=float, default=None)
+    p.add_argument("--tp", type=float, default=None)
+    p.add_argument("--deviation", type=int, default=20)
+    p.add_argument("--magic", type=int, default=20240919)
+    p.add_argument("--comment", default="powerx-split")
+    p.add_argument(
+        "--stop-on-failure",
+        action="store_true",
+        help="stop sending tickets after the first rejection (default: try them all)",
+    )
+    p.add_argument(
+        "--check-cost",
+        action="store_true",
+        help="report the per-deal cost of N tickets vs one position",
+    )
+    p.set_defaults(func=cmd_split)
+
+    p = sub.add_parser(
+        "close",
+        help="close a position, or PART of a split by --group",
+    )
+    p.add_argument("--ticket", type=int, default=None)
     p.add_argument("--volume", type=float, default=None)
+    p.add_argument(
+        "--group",
+        default="",
+        help=(
+            "close tickets of a split by its group label instead of one ticket. "
+            "Combine with --count to take only part of it off"
+        ),
+    )
+    p.add_argument(
+        "--count",
+        type=int,
+        default=0,
+        help="close only this many of the group (oldest comment first); 0 = all of it",
+    )
     p.add_argument("--deviation", type=int, default=20)
     p.add_argument("--magic", type=int, default=20240919)
     p.set_defaults(func=cmd_close)
@@ -5804,7 +6344,8 @@ def build_parser() -> argparse.ArgumentParser:
 _BRIDGE_ACTIONS = frozenset(
     {
         "login", "account", "quote", "candles", "positions", "orders",
-        "history", "symbol", "symbols", "order", "close", "close_all", "run",
+        "history", "symbol", "symbols", "order", "split", "close", "close_all",
+        "run",
         # `watch` samples ticks and positions every poll, so it MUST run under
         # Wine: on the Linux python each sample would be a fresh re-exec into
         # Wine (seconds each) and a 1 Hz watch would sample the market at

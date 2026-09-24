@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-24.3"
+_CLI_VERSION = "2026-09-24.4"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -97,7 +97,9 @@ _INSTALL_COMMAND_TIMEOUT = 120
 #: reading the guard, reading its event log, stopping it -- are exempted in
 #: execute() (see _GUARD_SAFE_SUBACTIONS), so an operator can always inspect or
 #: disarm protection even with trading disabled.
-_TRADING_ACTIONS = frozenset({"order", "close", "close_all", "modify", "guard"})
+_TRADING_ACTIONS = frozenset(
+    {"order", "split", "close", "close_all", "modify", "guard"}
+)
 
 #: ``guard`` sub-actions that place no order. These stay available without
 #: MT5_ALLOW_TRADING: refusing to report the state of a live guard would leave
@@ -164,6 +166,10 @@ _TIMEOUTS: dict[str, int] = {
     # `watch` measures the market while it waits, so like `guard` its ceiling is
     # raised to cover the wait (see execute()).
     "watch": 120,
+    # `split` is N order sends inside ONE bridge invocation: the Wine re-exec is
+    # paid once rather than N times, which is the whole reason `--splits 10` is
+    # not ten calls. Still bounded well inside the ceiling.
+    "split": 120,
 }
 _DEFAULT_TIMEOUT = 120
 
@@ -602,8 +608,34 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
             parts += ["--deviation", str(int(kwargs["deviation"]))]
         if kwargs.get("comment"):
             parts += ["--comment", _sh(kwargs["comment"])]
+    elif action == "split":
+        parts += [
+            "--symbol", _sh(kwargs.get("symbol") or ""),
+            "--side", _sh(kwargs.get("side") or ""),
+            "--volume", str(float(kwargs.get("volume") or 0)),
+            "--splits", str(int(kwargs.get("splits") or 10)),
+        ]
+        for flag in ("sl", "tp", "group"):
+            if kwargs.get(flag) not in (None, ""):
+                parts += [f"--{flag}", _sh(kwargs[flag])]
+        if kwargs.get("deviation") is not None:
+            parts += ["--deviation", str(int(kwargs["deviation"]))]
+        if kwargs.get("comment"):
+            parts += ["--comment", _sh(kwargs["comment"])]
+        for flag in ("stop_on_failure", "check_cost"):
+            if kwargs.get(flag):
+                parts += [f"--{flag.replace('_', '-')}"]
     elif action == "close":
-        parts += ["--ticket", str(int(kwargs.get("ticket") or 0))]
+        # Closing PART of a split: `--group` targets the tickets the split
+        # labelled, and `--count` is what makes it partial (three off, seven
+        # left). A group close must NOT also emit `--ticket 0`, which the CLI
+        # would read as a ticket, so the two are mutually exclusive here.
+        if kwargs.get("group"):
+            parts += ["--group", _sh(kwargs["group"])]
+            if kwargs.get("count") is not None:
+                parts += ["--count", str(int(kwargs["count"]))]
+        else:
+            parts += ["--ticket", str(int(kwargs.get("ticket") or 0))]
         if kwargs.get("volume") is not None:
             parts += ["--volume", str(float(kwargs["volume"]))]
         if kwargs.get("deviation") is not None:
@@ -695,6 +727,11 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
                 "--poll-seconds", str(float(kwargs.get("poll_seconds") or 1.0)),
             ]
         parts += ["--lines", str(int(kwargs.get("lines") or 20))]
+        # One observation, many calls. Passed through unchanged so consecutive
+        # watches fold into a single timeline instead of reporting a fresh
+        # "first price" every time.
+        if kwargs.get("watch_session"):
+            parts += ["--session", _sh(kwargs["watch_session"])]
     elif action == "compile":
         parts += ["--file", _sh(kwargs.get("file") or "")]
         if kwargs.get("include"):
@@ -849,6 +886,30 @@ class MT5SandboxTool(Tool):
             "the 0.01 point a 2-digit quote advertises -- so a 20-pip stop is $2.00. "
             "Never state a stop or target from memory: action='plan' computes it, and "
             "action='order' should be given the sl/tp it returned. "
+            "POLLING A LIVE TRADE -- do it, and keep doing it: while a position is "
+            "open you watch it in REAL TIME instead of setting a cron and walking "
+            "away, and you think between calls. Loop action='watch' with "
+            "wait_seconds=90 and ALWAYS pass watch_session=<one name for this "
+            "trade>. Each call returns the moment something happens (a rule fires, a "
+            "close is refused, a level is touched and reverted, the watcher dies, the "
+            "position set changes), and session.price_path_total plus "
+            "session.since_last_call carry the WHOLE trade across calls -- so call "
+            "after call is one continuous observation, not unrelated snapshots. A "
+            "watch that returns watched.timed_out=true is a normal result: nothing "
+            "happened in that 90 s, the trade is still open, and the right next move "
+            "is to watch again. Stop looping only when the position is closed, the "
+            "user says stop, or you have something to report to the user. Cron and "
+            "scheduled tasks are for things that must happen with nobody watching; "
+            "a trade you are following is not one of them. "
+            "SPLIT TRADING (action='split') -- one idea as N equal tickets at one "
+            "price instead of one position: same direction, same stop, and the SAME "
+            "TOTAL RISK, but the exits become granular. Take 3 off into a run and "
+            "leave 7 working with action='close', group=<label>, count=3. Give every "
+            "ticket the same sl, or the split multiplies risk instead of exits. It "
+            "fires once at one price and never adds tickets as the price moves "
+            "against you. Adding tickets as the price falls is a grid/martingale, "
+            "which empties accounts, and it is not this action: if the price goes "
+            "against a split, the answer is the stop, never more tickets. "
             "Trading actions (order, close, close_all, modify, guard) require "
             "MT5_ALLOW_TRADING to be "
             "enabled and return the broker retcode; a rejected order is reported with "
@@ -876,7 +937,7 @@ class MT5SandboxTool(Tool):
                 "limit": {"type": "integer", "description": "action=symbols: max rows to return (default 60)."},
                 "symbols": {"type": "string", "description": "Space/comma separated symbols for action=quote, and for action=watch (where it is optional -- omit it and the symbols of the OPEN POSITIONS are watched)."},
                 "timeframe": {"type": "string", "description": "M1..MN1 (action=candles)."},
-                "count": {"type": "integer", "description": "Number of bars (action=candles)."},
+                "count": {"type": "integer", "description": "action=candles: number of bars. action=close with group: close only this many of the group, oldest comment first. This is 'take 3 of the 10 off, leave 7 running'. 0 or omitted closes the whole group."},
                 "days": {"type": "integer", "description": "History window in days (action=history)."},
                 "side": {"type": "string", "enum": ["buy", "sell"], "description": "Order direction (action=order)."},
                 "volume": {"type": "number", "description": "Lots (action=order/close)."},
@@ -916,6 +977,11 @@ class MT5SandboxTool(Tool):
                 "range_low": {"type": "number", "description": "action=plan: the low of the session range. With range_high it adds the playbook's range sub-levels (25/50/62.5/75/87.5/100/150%) and says which level the entry sits on -- the strategy enters AT a level, so an entry between levels is reported as a violation."},
                 "range_high": {"type": "number", "description": "action=plan: the high of the session range. See range_low."},
                 "spread": {"type": "number", "description": "action=plan: live spread in price, from action=quote. A 20-pip Gold stop is only ~10x a typical spread, so the plan flags a spread that eats more than a quarter of the stop."},
+                "splits": {"type": "integer", "description": "action=split: how many positions to open (2..50, default 10). SPLIT TRADING -- one idea as N equal tickets at one price instead of one big position: same direction, same stop, and the SAME TOTAL RISK, but the exits stop being all-or-nothing. It is how you take 3 off into a run and leave 7 working. It is NOT a grid: it fires once, at one price, with one stop, and never adds tickets as the price goes against you."},
+                "group": {"type": "string", "description": "action=split: a label for the tickets so the set can be addressed later (action=close with group/count). action=close: close the tickets of this split group instead of one ticket."},
+                "stop_on_failure": {"type": "boolean", "description": "action=split: stop sending tickets after the first rejection (default: try them all and report which filled). Either way a partial split is reported as alert=split_incomplete, never as a filled position."},
+                "check_cost": {"type": "boolean", "description": "action=split: report the per-deal cost of N tickets against one position. Commission charged per deal is paid N times, and so are slippage and requotes; spread cost is proportional to volume and is not affected."},
+                "watch_session": {"type": "string", "description": "action=watch: continue ONE observation across calls. Every watch carrying the same name folds its samples into a ledger on the box and returns session.price_path_total (the WHOLE session's high/low/drift, not this call's) plus session.since_last_call (the move since you last looked) and session.elapsed_s. USE THIS WHENEVER YOU FOLLOW A LIVE TRADE: without it each 90-second call reports a different trade's first price and drift, so 'is it working?' cannot be answered across calls. With it the calls are one timeline and you can think between them."},
             },
             "required": ["action"],
         }
@@ -979,8 +1045,25 @@ class MT5SandboxTool(Tool):
                 return ToolResult.error("action=order requires 'symbol' and 'side'.")
             if not kwargs.get("volume"):
                 return ToolResult.error("action=order requires a positive 'volume'.")
-        if action == "close" and not kwargs.get("ticket"):
-            return ToolResult.error("action=close requires 'ticket'.")
+        if action == "close" and not (kwargs.get("ticket") or kwargs.get("group")):
+            return ToolResult.error(
+                "action=close requires 'ticket', or 'group' to close part of a split "
+                "(with 'count' for a partial)."
+            )
+        if action == "split":
+            if not kwargs.get("symbol") or not kwargs.get("side"):
+                return ToolResult.error("action=split requires 'symbol' and 'side'.")
+            if not kwargs.get("volume"):
+                return ToolResult.error(
+                    "action=split requires 'volume' -- the TOTAL lots for the idea, "
+                    "which is divided across the tickets."
+                )
+            splits = int(kwargs.get("splits") or 10)
+            if splits < 2:
+                return ToolResult.error(
+                    "action=split with splits < 2 is just action=order. Use splits=2 "
+                    "or more, or use order."
+                )
         if action == "modify":
             if not any(
                 kwargs.get(key) for key in ("ticket", "tickets", "symbol", "all_positions")
