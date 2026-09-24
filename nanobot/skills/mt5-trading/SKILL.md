@@ -568,6 +568,40 @@ carries:
 | `session.samples_total` | samples taken across all calls |
 | `session.calls` | how many times you have looked |
 
+### You manage the trade — there is nobody else in the loop
+
+The polling loop is not a status read-out. **You are the trade management.** No
+cron, no EA, no automation runs between your calls, and nothing will close the
+position, move a stop or take a partial profit unless you decide it and call for
+it. That is the design: a program cannot read *why* the price is where it is, and
+you can.
+
+Every call hands you the arithmetic you need so you are deciding, not
+calculating:
+
+| Field (`trade_state`) | Meaning |
+|---|---|
+| `totals.total_r` / `best_r` / `worst_r` | how many R the open trade has made, per position and summed |
+| `totals.risk_money`, `risk_pct_of_equity` | what is at risk right now, and as a share of the account |
+| `positions[].r_multiple` | `(price − entry) / (entry − sl)` — a ratio, so it is right on Gold and FX alike |
+| `positions[].pips_to_sl` / `pips_to_tp` | distance to each edge, in that symbol's own pip |
+| `positions[].breakeven_price` | the entry — where the stop goes once the trade has paid for its risk |
+| `positions[].breakeven_due` | set when the trade is at **≥1R and still carrying its risk** |
+| `positions[].alert` | `no_stop` — a position with no stop at all |
+| `session.trade_path` | `best_r` / `worst_r` / best and worst profit **across every call** |
+| `notes` | the plain-language version of the above, when something needs saying |
+
+`trade_state.notes` is not decoration. If it says a ticket is at 2R with its stop
+still 40 pips away, **that is your cue to act on it** — `modify` the stop to
+`breakeven_price`, or take part of the position off with `close`. If it says a
+position has `no_stop`, stop watching and fix that first: you are one gap away
+from an unbounded loss.
+
+**Leave no position unwatched and no stop unset.** A trade you are polling has a
+human's money on it; `timed_out: true` means nothing happened *yet*, not that you
+are done. Watch until the position set is empty, or until you have told the user
+something they need to answer.
+
 ### How the loop works
 
 1. `watch` blocks up to **90 s** and returns the moment something happens.

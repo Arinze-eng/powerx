@@ -66,7 +66,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.5"
+CLI_VERSION = "2026-09-24.6"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -2110,6 +2110,145 @@ def _watch_symbol_pips(mt5: Any, symbol: str) -> tuple[int, float]:
     return digits, float(10 ** -digits)
 
 
+def _analyse_trade(
+    positions: list[Any],
+    pips: dict[str, float],
+    prices: dict[str, Any],
+    contracts: dict[str, float] | None = None,
+    equity: float | None = None,
+) -> dict[str, Any]:
+    """The decision material for the trade that is open RIGHT NOW.
+
+    WHY THIS EXISTS: a polling loop that only reports prices and positions makes
+    the caller re-derive the same arithmetic every 90 seconds -- how far to the
+    stop, how much is at risk, how many R the trade has made, where breakeven is.
+    That arithmetic is the part a model gets subtly wrong at 3 a.m. on call
+    forty, and it is the part that decides whether money is taken or lost.
+
+    So it is computed once, in one place, from the position itself:
+
+    * ``r_multiple`` is ``(price_now - entry) / (entry - sl)`` -- a RATIO, so it
+      needs no contract size and is right on Gold, EURUSD and anything else.
+    * ``pips_to_sl`` / ``pips_to_tp`` use the symbol's own pip, so Gold's 0.10
+      and EURUSD's 0.00001 are not conflated.
+    * ``breakeven_price`` is the entry: the level to move the stop to once the
+      trade has paid for its own risk.
+
+    It deliberately does NOT act. It reports, and the caller decides -- a program
+    that closes positions on its own arithmetic is an EA, and an EA cannot read
+    the reason the price is where it is.
+    """
+    contracts = contracts or {}
+    rows: list[dict[str, Any]] = []
+    notes: list[str] = []
+
+    for pos in positions:
+        symbol = str(getattr(pos, "symbol", "") or "")
+        pip = pips.get(symbol) or 0.0
+        is_buy = int(getattr(pos, "type", 0) or 0) == 0
+        entry = float(getattr(pos, "price_open", 0.0) or 0.0)
+        sl = float(getattr(pos, "sl", 0.0) or 0.0)
+        tp = float(getattr(pos, "tp", 0.0) or 0.0)
+        volume = float(getattr(pos, "volume", 0.0) or 0.0)
+        quote = prices.get(symbol) or {}
+        now = quote.get("mid")
+        now = float(now) if now is not None else None
+        profit = float(getattr(pos, "profit", 0.0) or 0.0)
+
+        # R is a ratio of PRICE distances, so it is currency- and
+        # contract-size-agnostic -- the same formula is correct on Gold and on FX.
+        # A stop of 0 is NO STOP, not a stop at zero: without this guard a naked
+        # position divides by its whole entry price and reports a plausible,
+        # meaningless R that hides the fact that its risk is unbounded.
+        risk_price = (entry - sl) if is_buy else (sl - entry) if sl else 0.0
+        r_multiple = None
+        if now is not None and sl and risk_price > 0:
+            moved = (now - entry) if is_buy else (entry - now)
+            r_multiple = round(moved / risk_price, 2)
+
+        per_pip = volume * (contracts.get(symbol) or 0.0) * pip if pip else 0.0
+        risk_money = (
+            round(risk_price / pip * per_pip, 2)
+            if sl and risk_price > 0 and per_pip
+            else None
+        )
+
+        row: dict[str, Any] = {
+            "ticket": getattr(pos, "ticket", None),
+            "symbol": symbol,
+            "side": "buy" if is_buy else "sell",
+            "volume": volume,
+            "entry": entry,
+            "price": now,
+            "sl": sl or None,
+            "tp": tp or None,
+            "profit_money": round(profit, 2),
+            "profit_pips": (
+                round(((now - entry) if is_buy else (entry - now)) / pip, 1)
+                if now is not None and pip
+                else None
+            ),
+            "r_multiple": r_multiple,
+            "risk_money": risk_money,
+            "pips_to_sl": round(abs(now - sl) / pip, 1) if now is not None and sl and pip else None,
+            "pips_to_tp": round(abs(tp - now) / pip, 1) if now is not None and tp and pip else None,
+            "breakeven_price": entry,
+            "comment": getattr(pos, "comment", ""),
+        }
+
+        # The two states that decide the next action, named rather than left for
+        # the caller to notice: a position with no stop, and one that has earned
+        # its risk but is still carrying it.
+        if not sl:
+            row["alert"] = "no_stop"
+            notes.append(
+                f"ticket {row['ticket']} on {symbol} has NO STOP: its risk is "
+                "whatever the market decides. Set one with action=modify."
+            )
+        if r_multiple is not None and r_multiple >= 1.0 and sl:
+            at_be = (sl >= entry) if is_buy else (sl <= entry)
+            if not at_be:
+                row["breakeven_due"] = True
+                notes.append(
+                    f"ticket {row['ticket']} is at {r_multiple}R and its stop is "
+                    f"still {row['pips_to_sl']} pips away -- it has paid for its own "
+                    f"risk. Moving sl to {entry} makes it free; a runner can then be "
+                    "left with the target intact."
+                )
+        rows.append(row)
+
+    open_profit = round(sum(r["profit_money"] for r in rows), 2)
+    known_risk = [r["risk_money"] for r in rows if r["risk_money"] is not None]
+    total_risk = round(sum(known_risk), 2) if known_risk else None
+    rs = [r["r_multiple"] for r in rows if r["r_multiple"] is not None]
+
+    totals: dict[str, Any] = {
+        "positions": len(rows),
+        "volume": round(sum(r["volume"] for r in rows), 8),
+        "profit_money": open_profit,
+        "risk_money": total_risk,
+        "risk_pct_of_equity": (
+            round(total_risk / equity * 100.0, 2)
+            if total_risk is not None and equity
+            else None
+        ),
+        "total_r": round(sum(rs), 2) if rs else None,
+        "worst_r": min(rs) if rs else None,
+        "best_r": max(rs) if rs else None,
+    }
+    #: A risk figure that is a large share of the account is the fact a
+    #: risk-conscious caller is asking for, and it is not visible from any one
+    #: position.
+    pct = totals["risk_pct_of_equity"]
+    if pct is not None and pct >= 5.0:
+        notes.append(
+            f"{total_risk} is {pct}% of equity in open risk across "
+            f"{len(rows)} positions. The playbook's own limit is 20% on ONE "
+            "idea, so this is worth saying out loud before adding another."
+        )
+    return {"positions": rows, "totals": totals, "notes": notes}
+
+
 def _watch_track(store: dict[str, Any], prices: dict[str, Any]) -> None:
     """Fold one sample into the per-symbol price path.
 
@@ -2229,6 +2368,7 @@ def _watch_session_fold(
     watch_seconds: float,
     samples: int,
     tickets_at_start: set[int],
+    trade_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fold this call's samples into the ledger and return the cumulative view.
 
@@ -2281,6 +2421,27 @@ def _watch_session_fold(
         )
     ledger["symbols"] = stored
 
+    # The trade's own history, not just its price history: the best and worst this
+    # position has been while this session watched it. A trade that was +3R an
+    # hour ago and is -0.4R now is a different decision from one that has never
+    # been in profit, and only the ledger saw the first one.
+    totals = (trade_state or {}).get("totals") or {}
+    if totals.get("positions"):
+        path_state = ledger.setdefault("trade_path", {})
+        for key, value, pick in (
+            ("best_r", totals.get("best_r"), max),
+            ("worst_r", totals.get("worst_r"), min),
+            ("best_profit_money", totals.get("profit_money"), max),
+            ("worst_profit_money", totals.get("profit_money"), min),
+        ):
+            if value is None:
+                continue
+            prior = path_state.get(key)
+            path_state[key] = value if prior is None else pick(float(prior), float(value))
+        path_state["last_profit_money"] = totals.get("profit_money")
+        path_state["risk_money"] = totals.get("risk_money")
+        path_state["risk_pct_of_equity"] = totals.get("risk_pct_of_equity")
+
     events = list(ledger.get("events") or [])
     for event in observed or []:
         events.append({"at": now, **event})
@@ -2323,6 +2484,9 @@ def _watch_session_fold(
         "tickets_at_start": ledger.get("tickets_at_start") or [],
         "price_path_total": cumulative,
         "since_last_call": since_last,
+        # MFE/MAE across every call: the best and worst this trade has been since
+        # the session opened, which is not recoverable from the current frame.
+        "trade_path": ledger.get("trade_path") or None,
         "ledger": str(path),
         "ledger_error": ledger_error,
         "note": (
@@ -2453,9 +2617,34 @@ def cmd_watch(args: argparse.Namespace) -> int:
     steps = _watch_path_report(track, pips)
     guard = _guard_summary()
 
+    # The trade's own numbers, so the caller decides on arithmetic it did not
+    # have to redo. Contract size comes from the symbol (Gold and FX differ by
+    # 100x); equity is what makes "risk" a share of the account rather than a
+    # number with no scale.
+    contracts: dict[str, float] = {}
+    for symbol in {str(getattr(p, "symbol", "") or "") for p in positions}:
+        if not symbol:
+            continue
+        info = mt5.symbol_info(symbol)
+        if info is not None:
+            contracts[symbol] = float(getattr(info, "trade_contract_size", 0.0) or 0.0)
+    equity = None
+    try:
+        account = mt5.account_info()
+        if account is not None:
+            equity = float(getattr(account, "equity", 0.0) or 0.0) or None
+    except Exception:  # noqa: BLE001 - a watch is still valid without equity
+        equity = None
+    trade_state = _analyse_trade(positions, pips, prices, contracts, equity)
+
     payload: dict[str, Any] = {
         "ok": True,
         "position_count": len(positions),
+        # The trade's own arithmetic: R multiple, pips to the stop and the
+        # target, breakeven price, open risk in money and as a share of equity.
+        # This is what a 90-second call is FOR -- without it the caller redoes
+        # the same sums on call forty, at 3 a.m., and that is where money goes.
+        "trade_state": trade_state,
         "positions": [p._asdict() for p in positions],
         "symbols_watched": symbols,
         "prices": prices,
@@ -2530,6 +2719,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 watched_seconds,
                 samples,
                 tickets_at_start,
+                trade_state,
             )
             payload.setdefault("hint", payload["session"]["note"])
     if not terminal_ok:

@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-24.5"
+_CLI_VERSION = "2026-09-24.6"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -900,7 +900,17 @@ class MT5SandboxTool(Tool):
             "is to watch again. Stop looping only when the position is closed, the "
             "user says stop, or you have something to report to the user. Cron and "
             "scheduled tasks are for things that must happen with nobody watching; "
-            "a trade you are following is not one of them. "
+            "a trade you are following is not one of them. YOU ARE THE MANAGEMENT: "
+            "no EA and no cron runs between your calls, so nothing moves a stop or "
+            "takes a profit unless you call for it. Each call returns trade_state -- "
+            "r_multiple, pips_to_sl, pips_to_tp, breakeven_price, risk_money, "
+            "risk_pct_of_equity, and trade_state.notes in plain words -- so you are "
+            "deciding, not calculating. Act on it: when a ticket is at 1R or more "
+            "and breakeven_due is set, move its stop to breakeven_price or take part "
+            "of it off; when a position reports alert=no_stop, set a stop before "
+            "watching anything else. session.trade_path carries best_r/worst_r "
+            "across every call, so a trade that was +3R an hour ago and is flat now "
+            "is a decision you can see. "
             "SPLIT TRADING (action='split') -- one idea as N equal tickets at one "
             "price instead of one position: same direction, same stop, and the SAME "
             "TOTAL RISK, but the exits become granular. Take 3 off into a run and "

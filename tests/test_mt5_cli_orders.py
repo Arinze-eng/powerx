@@ -921,3 +921,86 @@ def test_split_reports_what_the_account_actually_got_not_what_it_asked_for(cli, 
     )
     from_request_price = abs(4284.15 - 4330.00) / 0.10 * per_pip * 10
     assert out["total_risk_money"] != round(from_request_price, 2)
+
+
+def test_trade_state_gives_the_loop_the_arithmetic_to_decide_on(cli):
+    """The polling loop must be able to reason without redoing the sums.
+
+    R is a ratio of PRICE distances, so one formula has to be right for Gold
+    (pip 0.10, contract 100) and for EURUSD (pip 0.00001, contract 100000) at
+    once. Getting this wrong at 3 a.m. on call forty is how money is lost.
+    """
+    import collections
+
+    Pos = collections.namedtuple(
+        "Pos", "ticket symbol type volume price_open sl tp profit comment"
+    )
+    # A Gold buy at +2R: entry 4200, stop 4180 (20 pips), now 4240.
+    gold = Pos(1, "XAUUSD", 0, 0.10, 4200.0, 4180.0, 4400.0, 200.0, "g")
+    # A EURUSD sell at -0.5R: entry 1.10000, stop 1.10200 (20 pips), now 1.10100.
+    fx = Pos(2, "EURUSD", 1, 0.50, 1.10000, 1.10200, 1.09600, -50.0, "f")
+    pips = {"XAUUSD": 0.10, "EURUSD": 0.00001}
+    prices = {"XAUUSD": {"mid": 4240.0}, "EURUSD": {"mid": 1.10100}}
+    contracts = {"XAUUSD": 100.0, "EURUSD": 100000.0}
+
+    out = cli._analyse_trade([gold, fx], pips, prices, contracts, 10000.0)
+    rows = {r["ticket"]: r for r in out["positions"]}
+
+    assert rows[1]["r_multiple"] == 2.0
+    assert rows[2]["r_multiple"] == -0.5
+    # Distances use each symbol's OWN pip, so a 60-dollar Gold move and a
+    # 10-pip FX move are measured against the right unit on each.
+    assert rows[1]["pips_to_sl"] == 600.0   # 4240 -> 4180 at pip 0.10
+    assert rows[2]["pips_to_sl"] == 100.0   # 1.10100 -> 1.10200 at pip 0.00001
+    # Risk is measured at ENTRY, from the stop, not from the current price:
+    # 0.10 lots of Gold, 20 dollars offside = 10 oz x $20 = $200.
+    assert rows[1]["risk_money"] == 200.0
+    # 0.50 lots of EURUSD, 200 pips offside = 50,000 x 0.00200 = $100.
+    assert rows[2]["risk_money"] == 100.0
+    assert rows[1]["breakeven_price"] == 4200.0
+
+    # Gold at +2R has paid for its risk and is still carrying it -- the single
+    # most actionable state in the whole payload.
+    assert rows[1]["breakeven_due"] is True
+    assert not rows[2].get("breakeven_due")
+    assert out["totals"]["profit_money"] == 150.0
+    assert out["totals"]["risk_money"] == 300.0
+    assert out["totals"]["risk_pct_of_equity"] == 3.0
+    assert out["totals"]["best_r"] == 2.0 and out["totals"]["worst_r"] == -0.5
+    assert any("breakeven" in n or "free" in n for n in out["notes"])
+
+
+def test_a_position_with_no_stop_is_an_alert_not_a_silent_zero(cli):
+    """No stop is unbounded risk, and it must be impossible to miss."""
+    import collections
+
+    Pos = collections.namedtuple(
+        "Pos", "ticket symbol type volume price_open sl tp profit comment"
+    )
+    naked = Pos(9, "XAUUSD", 0, 1.0, 4200.0, 0.0, 0.0, -30.0, "")
+    out = cli._analyse_trade(
+        [naked], {"XAUUSD": 0.10}, {"XAUUSD": {"mid": 4190.0}}, {"XAUUSD": 100.0}, 10000.0
+    )
+    assert out["positions"][0]["alert"] == "no_stop"
+    assert out["positions"][0]["r_multiple"] is None
+    assert any("NO STOP" in n for n in out["notes"])
+
+
+def test_the_ledger_remembers_the_best_and_worst_the_trade_ever_was(cli, tmp_path, monkeypatch):
+    """A trade that was +3R an hour ago and is flat now is a different decision
+    from one that has never been in profit, and only the ledger saw the first."""
+    monkeypatch.setattr(cli, "MT5_ROOT", tmp_path)
+    path = cli._watch_session_path("t")
+    track = {"XAUUSD": {"samples": 1, "first_mid": 1.0, "last_mid": 1.0,
+                        "min_mid": 1.0, "max_mid": 1.0}}
+    cli._watch_session_fold(path, "t", ["XAUUSD"], track, {"XAUUSD": 0.1}, [], 5.0, 1, set(),
+                            {"totals": {"positions": 1, "profit_money": 300.0,
+                                        "best_r": 3.0, "worst_r": 0.5}})
+    cli._watch_session_fold(path, "t", ["XAUUSD"], track, {"XAUUSD": 0.1}, [], 5.0, 1, set(),
+                            {"totals": {"positions": 1, "profit_money": 0.0,
+                                        "best_r": -0.4, "worst_r": -0.4}})
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["trade_path"]["best_profit_money"] == 300.0
+    assert stored["trade_path"]["worst_profit_money"] == 0.0
+    assert stored["trade_path"]["best_r"] == 3.0
+    assert stored["trade_path"]["worst_r"] == -0.4
