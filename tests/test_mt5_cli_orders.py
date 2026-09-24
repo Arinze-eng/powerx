@@ -47,7 +47,12 @@ def cli():
 
 
 class FakeMT5:
-    """Just the constants the real 5.0.6180 module exposes for filling."""
+    """Just the constants the real 5.0.6180 module exposes for filling.
+
+    Plus enough of a terminal to be asked what is open: every order passes
+    through the account's risk gate, which reads the book before it agrees to
+    send anything.
+    """
 
     ORDER_FILLING_FOK = 0
     ORDER_FILLING_IOC = 1
@@ -70,6 +75,20 @@ class FakeMT5:
 
     def last_error(self):
         return "fake-last-error"
+
+    def positions_get(self, ticket=None):
+        return []
+
+    def account_info(self):
+        return types.SimpleNamespace(
+            equity=10000.0, balance=10000.0, margin_free=10000.0, currency="USD",
+        )
+
+    def symbols_get(self):
+        return []
+
+    def history_deals_get(self, start, end):
+        return []
 
 
 def _info(mask):
@@ -1294,7 +1313,13 @@ def test_a_market_entry_is_never_validated_as_a_pending_one(cli):
 
 
 class _OrderMT5:
-    """A terminal with the order constants and one symbol, for cmd_order."""
+    """A terminal with the order constants and one symbol, for cmd_order.
+
+    It also answers ``positions_get``: every order now passes through the
+    account's risk gate, which reads the open book before it agrees to send
+    anything, so a terminal that cannot be asked what is open cannot place an
+    order.
+    """
 
     ORDER_TYPE_BUY = 0
     ORDER_TYPE_SELL = 1
@@ -1309,9 +1334,10 @@ class _OrderMT5:
     ORDER_FILLING_RETURN = 2
     TRADE_RETCODE_DONE = 10009
 
-    def __init__(self, info, tick, equity=10000.0, orders=()):
+    def __init__(self, info, tick, equity=10000.0, orders=(), positions=()):
         self._info, self._tick, self._equity = info, tick, equity
         self._orders = list(orders)
+        self._positions = list(positions)
 
     def symbol_select(self, symbol, enable):
         return True
@@ -1327,6 +1353,15 @@ class _OrderMT5:
 
     def orders_get(self):
         return list(self._orders)
+
+    def positions_get(self, ticket=None):
+        return list(self._positions)
+
+    def symbols_get(self):
+        return []
+
+    def history_deals_get(self, start, end):
+        return []
 
 
 def _order_args(**over):
@@ -1788,3 +1823,303 @@ def test_modify_reports_when_it_leaves_a_position_with_nothing_holding_it(cli, m
         ticket=[500], tickets=[], symbol=None, all=False, exit_at=None, sl=0.0, tp=4300.0,
     )) == 0
     assert "alert" not in out
+
+
+# --------------------------------------------------------------------------- #
+# THE ACCOUNT CIRCUIT BREAKER, AND ONE CALL FOR TOTAL EXPOSURE
+# --------------------------------------------------------------------------- #
+# A stop limits what ONE trade can lose. Nothing limited what the ACCOUNT could
+# lose, and the account is the thing that runs out. Five "small" positions each
+# risking 2% is 10% on the table, and no single ticket's stop stops that -- it
+# takes a rule that looks at the whole book, at the moment the next order is
+# about to be sent. A rule only the model remembers to apply is not a rule, so
+# it is enforced at the one point every order passes through.
+
+
+class _Pos:
+    def __init__(self, ticket, entry, sl, volume=0.10, profit=0.0, symbol="XAUUSD"):
+        self.ticket, self.price_open, self.sl = ticket, entry, sl
+        self.volume, self.profit, self.symbol = volume, profit, symbol
+        self.tp, self.price_current, self.type = 0.0, entry, 0
+
+
+class _RiskMT5:
+    """A terminal with positions, an account, and a day's worth of deals."""
+
+    DEAL_TYPE_BALANCE = 2
+
+    def __init__(self, positions=(), equity=10000.0, deals=(), contract=100.0):
+        self._positions, self._equity = list(positions), equity
+        self._deals, self._contract = list(deals), contract
+
+    def positions_get(self, ticket=None):
+        return list(self._positions)
+
+    def account_info(self):
+        return types.SimpleNamespace(
+            equity=self._equity, balance=self._equity, margin_free=self._equity,
+            currency="USD",
+        )
+
+    def symbol_info(self, symbol):
+        return types.SimpleNamespace(trade_contract_size=self._contract, digits=2, point=0.01)
+
+    def symbol_info_tick(self, symbol):
+        return None
+
+    def symbols_get(self):
+        return []
+
+    def history_deals_get(self, start, end):
+        return list(self._deals)
+
+
+def _deal(profit, swap=0.0, commission=0.0, kind=0):
+    return types.SimpleNamespace(profit=profit, swap=swap, commission=commission, type=kind)
+
+
+def _limits_file(cli, monkeypatch, tmp_path, limits=None):
+    path = tmp_path / "risk_limits.json"
+    monkeypatch.setattr(cli, "RISK_LIMITS_FILE", path)
+    if limits is not None:
+        path.write_text(json.dumps(limits), encoding="utf-8")
+    return path
+
+
+def test_a_position_risk_is_measured_from_its_stop_in_money(cli):
+    """|entry - stop| x contract x lots. Gold, 0.10 lots, $2 of stop = $20."""
+    mt5 = _RiskMT5()
+    pos = _Pos(1, entry=4287.23, sl=4285.05, volume=0.09)
+    assert cli._position_risk_money(mt5, pos) == 19.62
+
+
+def test_a_position_with_no_stop_has_unknown_risk_rather_than_zero(cli):
+    """Zero would let a naked position pass every total-risk check as though it
+    were free, which is the opposite of what it is."""
+    mt5 = _RiskMT5()
+    assert cli._position_risk_money(mt5, _Pos(1, entry=4287.23, sl=0.0)) is None
+
+
+def test_total_exposure_says_how_many_positions_it_does_not_cover(cli):
+    mt5 = _RiskMT5([
+        _Pos(1, 4287.23, 4285.05, volume=0.09, profit=1.44),
+        _Pos(2, 4287.00, 4285.00, volume=0.10, profit=-2.00),
+        _Pos(3, 4287.00, 0.0, volume=0.10),          # naked
+    ])
+    out = cli._open_exposure(mt5)
+    assert out["totals"]["positions"] == 3
+    assert out["totals"]["positions_counted"] == 2
+    assert out["totals"]["risk_unknown_positions"] == 1
+    assert out["positions_without_a_stop"] == [3]
+    # 0.09 x 100 x 2.18 = 19.62, and 0.10 x 100 x 2.00 = 20.00
+    assert out["totals"]["risk_money"] == 39.62
+    assert out["totals"]["risk_pct_of_equity"] == 0.4
+    assert out["totals"]["unrealised_pnl_money"] == -0.56
+
+
+def test_no_limits_means_no_breach_and_no_limit_read_is_an_error_not_a_pass(cli, monkeypatch, tmp_path):
+    """The dangerous case is an unreadable limits file: treating it as "no
+    limits" would drop the protection at exactly the moment something is wrong."""
+    _limits_file(cli, monkeypatch, tmp_path, limits=None)
+    gate = cli._risk_gate(_RiskMT5(), new_risk_money=20.0)
+    assert gate["limits"] == {} and gate["limits_error"] is None
+    assert gate["breaches"] == []
+
+    path = _limits_file(cli, monkeypatch, tmp_path, limits={"max_positions": 3})
+    path.write_text("{not json", encoding="utf-8")
+    gate = cli._risk_gate(_RiskMT5(), new_risk_money=20.0)
+    assert gate["limits_error"] is not None
+    assert "not valid JSON" in gate["limits_error"]
+
+
+def test_max_positions_refuses_the_order_that_would_cross_it(cli, monkeypatch, tmp_path):
+    _limits_file(cli, monkeypatch, tmp_path, limits={"max_positions": 2})
+    mt5 = _RiskMT5([_Pos(1, 4287.0, 4285.0), _Pos(2, 4287.0, 4285.0)])
+    gate = cli._risk_gate(mt5, new_risk_money=20.0, new_positions=1)
+    assert [b["limit"] for b in gate["breaches"]] == ["max_positions"]
+    assert gate["breaches"][0]["actual"] == 2 and gate["breaches"][0]["allowed"] == 2
+
+
+def test_max_total_risk_refuses_when_the_book_would_carry_too_much(cli, monkeypatch, tmp_path):
+    _limits_file(cli, monkeypatch, tmp_path, limits={"max_total_risk_money": 50.0})
+    mt5 = _RiskMT5([_Pos(1, 4287.0, 4285.0, volume=0.10)])   # $20 of open risk
+    # $20 open + $40 new = $60, past the $50 limit.
+    gate = cli._risk_gate(mt5, new_risk_money=40.0, new_positions=1)
+    assert [b["limit"] for b in gate["breaches"]] == ["max_total_risk_money"]
+    assert gate["breaches"][0]["actual"] == 60.0
+    # ...and it fits when it does fit.
+    assert cli._risk_gate(mt5, new_risk_money=25.0, new_positions=1)["breaches"] == []
+
+
+def test_a_stopless_order_cannot_be_counted_against_a_total_risk_limit(cli, monkeypatch, tmp_path):
+    """An uncountable position is exactly the one that makes the limit
+    meaningless, so it is refused rather than waved through as free."""
+    _limits_file(cli, monkeypatch, tmp_path, limits={"max_total_risk_money": 50.0})
+    gate = cli._risk_gate(_RiskMT5(), new_risk_money=None, new_positions=1)
+    assert [b["limit"] for b in gate["breaches"]] == ["max_total_risk_money"]
+    assert "no stop" in gate["breaches"][0]["reason"]
+
+
+def test_a_total_risk_limit_says_when_the_total_is_an_understatement(cli, monkeypatch, tmp_path):
+    """A naked OPEN position makes the total too small, and a limit enforced
+    against a number known to be too small reads as protection while being none."""
+    _limits_file(cli, monkeypatch, tmp_path, limits={"max_total_risk_money": 500.0})
+    mt5 = _RiskMT5([_Pos(1, 4287.0, 0.0)])
+    gate = cli._risk_gate(mt5, new_risk_money=20.0, new_positions=1)
+    assert len(gate["breaches"]) == 1
+    assert "UNDERSTATEMENT" in gate["breaches"][0]["reason"]
+
+
+def test_the_daily_loss_limit_ends_the_day(cli, monkeypatch, tmp_path):
+    _limits_file(cli, monkeypatch, tmp_path, limits={"max_daily_loss_money": 200.0})
+    # A deposit is DEAL_TYPE_BALANCE: counting one would let a funding transfer
+    # read as a winning day, or a withdrawal as a loss that trips the breaker.
+    losing = _RiskMT5(deals=[_deal(-150.0), _deal(-60.0, commission=-5.0), _deal(9999.0, kind=2)])
+    gate = cli._risk_gate(losing, new_risk_money=20.0, new_positions=1)
+    assert [b["limit"] for b in gate["breaches"]] == ["max_daily_loss_money"]
+    assert gate["today"]["realised_pnl_money"] == -215.0
+    assert gate["today"]["losing_deals"] == 2
+
+    # Down but not out: the day continues.
+    mild = _RiskMT5(deals=[_deal(-30.0)])
+    assert cli._risk_gate(mild, new_risk_money=20.0, new_positions=1)["breaches"] == []
+
+
+def test_the_history_query_is_only_paid_for_when_a_daily_limit_exists(cli, monkeypatch, tmp_path):
+    """This gate runs on EVERY order, so it must not add a deals query to the
+    path where no daily limit is set."""
+    _limits_file(cli, monkeypatch, tmp_path, limits={"max_positions": 5})
+    gate = cli._risk_gate(_RiskMT5(), new_risk_money=20.0, new_positions=1)
+    assert gate["today"] == {"skipped": "no max_daily_loss_money limit is set"}
+
+    _limits_file(cli, monkeypatch, tmp_path, limits={"max_daily_loss_money": 100.0})
+    gate = cli._risk_gate(_RiskMT5(), new_risk_money=20.0, new_positions=1)
+    assert "realised_pnl_money" in gate["today"]
+
+
+def test_limits_set_show_and_clear_round_trip(cli, monkeypatch, tmp_path):
+    path = _limits_file(cli, monkeypatch, tmp_path, limits=None)
+    out: dict = {}
+    monkeypatch.setattr(cli, "emit", lambda payload, text=None, code=0: (out.update(payload), code)[1])
+    monkeypatch.setattr(cli, "require_bridge", lambda: (_RiskMT5(), None))
+    setargs = types.SimpleNamespace(
+        limits_action="set", max_daily_loss_money=200.0, max_positions=3,
+        max_total_risk_money=500.0, max_total_risk_pct=None,
+    )
+    assert cli.cmd_limits(setargs) == 0
+    assert out["limits"] == {
+        "max_daily_loss_money": 200.0, "max_positions": 3, "max_total_risk_money": 500.0,
+    }
+    assert json.loads(path.read_text(encoding="utf-8"))["max_positions"] == 3
+
+    # set MERGES: a second call adds rather than replacing the first.
+    out.clear()
+    assert cli.cmd_limits(types.SimpleNamespace(
+        limits_action="set", max_daily_loss_money=None, max_positions=None,
+        max_total_risk_money=None, max_total_risk_pct=5.0,
+    )) == 0
+    assert out["limits"]["max_positions"] == 3
+    assert out["limits"]["max_total_risk_pct"] == 5.0
+
+    out.clear()
+    assert cli.cmd_limits(types.SimpleNamespace(limits_action="clear")) == 0
+    assert out["cleared"] is True and not path.exists()
+
+
+def test_limits_set_with_nothing_to_set_is_refused(cli, monkeypatch, tmp_path):
+    _limits_file(cli, monkeypatch, tmp_path, limits=None)
+    out: dict = {}
+    monkeypatch.setattr(cli, "emit", lambda payload, text=None, code=0: (out.update(payload), code)[1])
+    code = cli.cmd_limits(types.SimpleNamespace(
+        limits_action="set", max_daily_loss_money=None, max_positions=None,
+        max_total_risk_money=None, max_total_risk_pct=None,
+    ))
+    assert code == 1
+    assert "at least one" in str(out.get("error", ""))
+    # A non-positive limit is not a limit.
+    assert cli.cmd_limits(types.SimpleNamespace(
+        limits_action="set", max_daily_loss_money=0.0, max_positions=None,
+        max_total_risk_money=None, max_total_risk_pct=None,
+    )) == 1
+
+
+def test_risk_reports_the_room_left_before_the_next_order(cli, monkeypatch, tmp_path):
+    _limits_file(cli, monkeypatch, tmp_path, limits={
+        "max_positions": 3, "max_total_risk_money": 200.0, "max_daily_loss_money": 100.0,
+    })
+    mt5 = _RiskMT5([_Pos(1, 4287.0, 4285.0, volume=0.10)], deals=[_deal(-25.0)])
+    out: dict = {}
+    monkeypatch.setattr(cli, "emit", lambda payload, text=None, code=0: (out.update(payload), code)[1])
+    monkeypatch.setattr(cli, "require_bridge", lambda: (mt5, None))
+    assert cli.cmd_risk(types.SimpleNamespace()) == 0
+    assert out["totals"]["risk_money"] == 20.0
+    assert out["headroom"]["positions"] == 2
+    assert out["headroom"]["risk_money"] == 180.0
+    assert out["headroom"]["daily_loss_money"] == -75.0
+    assert out["today"]["realised_pnl_money"] == -25.0
+    assert "alert" not in out
+
+
+def test_an_order_that_breaks_a_limit_is_refused_before_it_is_sent(cli, monkeypatch, tmp_path):
+    """The limit has to be enforced at the point of sending, or it is only a
+    suggestion that depends on the caller remembering it."""
+    _limits_file(cli, monkeypatch, tmp_path, limits={"max_positions": 1})
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    mt5 = _OrderMT5(info, tick, orders=[])
+    mt5.positions_get = lambda ticket=None: [_Pos(1, 4287.0, 4285.0)]
+    sent, out = _wire_order(cli, monkeypatch, mt5)
+
+    assert cli.cmd_order(_order_args(volume=0.01, sl=4283.18)) == 1
+    assert sent == [], "an order that breaks the account's limits must not be sent"
+    assert "max_positions" in json.dumps(out["breaches"])
+    assert "risk limits refuse" in str(out.get("error", ""))
+
+    # ...and the same order goes through once the limit allows it.
+    _limits_file(cli, monkeypatch, tmp_path, limits={"max_positions": 2})
+    out.clear()
+    assert cli.cmd_order(_order_args(volume=0.01, sl=4283.18)) == 0
+    assert len(sent) == 1
+    assert out["book_after"]["limits_in_force"] == ["max_positions"]
+    assert out["risk_money"] == 2.0   # 0.01 lots x 100 oz x $2.00 of stop
+
+
+def test_a_gate_that_cannot_read_the_book_refuses_rather_than_guesses(cli, monkeypatch, tmp_path):
+    """An unreadable book returns nothing, and "nothing open" is exactly what a
+    total of zero looks like -- so the failure is carried as an error and the
+    gate stops sending, instead of trading against a number it knows is wrong."""
+    _limits_file(cli, monkeypatch, tmp_path, limits={"max_total_risk_money": 50.0})
+
+    class _Blind(_RiskMT5):
+        def positions_get(self, ticket=None):
+            raise RuntimeError("terminal not answering")
+
+    gate = cli._risk_gate(_Blind(), new_risk_money=20.0, new_positions=1)
+    assert gate["exposure"]["error"] is not None
+    assert [b["limit"] for b in gate["breaches"]] == ["open_book_unreadable"]
+    assert "known to be wrong" in gate["breaches"][0]["reason"]
+
+    # With no limits in force there is nothing to enforce, so the order is not
+    # refused -- but the report still says the total is not to be trusted.
+    path = _limits_file(cli, monkeypatch, tmp_path, limits=None)
+    path.unlink()
+    gate = cli._risk_gate(_Blind(), new_risk_money=20.0, new_positions=1)
+    assert gate["breaches"] == []
+    assert gate["exposure"]["error"] is not None
+
+
+def test_a_terminal_that_cannot_report_the_account_does_not_crash_the_gate(cli, monkeypatch, tmp_path):
+    _limits_file(cli, monkeypatch, tmp_path, limits=None)
+
+    class _Anonymous(_RiskMT5):
+        def account_info(self):
+            raise RuntimeError("no account info")
+
+    mt5 = _Anonymous([_Pos(1, 4287.0, 4285.0)])
+    exposure = cli._open_exposure(mt5)
+    assert exposure["account"]["equity"] is None
+    assert exposure["account"]["error"] is not None
+    assert exposure["error"] is not None
+    # The risk total is still measured, and is not silently zero.
+    assert exposure["totals"]["risk_money"] == 20.0
+    assert exposure["totals"]["risk_pct_of_equity"] is None

@@ -33,6 +33,7 @@ import pytest
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.mt5_sandbox import (
     MT5SandboxTool,
+    _ALL_ACTIONS,
     _INSTALL_COMMAND_TIMEOUT,
     _TIMEOUTS,
     _parse_payload,
@@ -4825,3 +4826,116 @@ def test_the_description_says_a_position_gets_a_stop_by_default():
     assert "allow_no_stop" in desc
     # The reason, not just the rule: the broker holds nothing without one.
     assert "BROKER holds no" in desc
+
+
+# --------------------------------------------------------------------------- #
+# THE ACCOUNT CIRCUIT BREAKER
+# --------------------------------------------------------------------------- #
+# A stop caps what ONE trade can lose. Nothing capped what the ACCOUNT could
+# lose, and the account is the thing that runs out. The limits are enforced by
+# the CLI at the point an order is sent, so the tool's job here is the smaller
+# one: make them reachable, refuse the nonsense before a round trip, and say
+# what they are.
+
+
+def test_the_risk_report_is_readable_without_live_trading():
+    """Refusing to report the account's exposure because trading is switched off
+    hides it from exactly the caller who needs to see it."""
+    cmd = build_cli_command("risk", {})
+    assert cmd.endswith("mt5_cli.py risk")
+    assert "risk" in _ALL_ACTIONS
+
+
+@pytest.mark.asyncio
+async def test_risk_reads_the_account_book_without_the_trading_opt_in(monkeypatch):
+    monkeypatch.delenv("MT5_ALLOW_TRADING", raising=False)
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox()}))
+    result = await tool.execute(action="risk")
+    assert not getattr(result, "is_error", False)
+
+
+def test_limits_set_passes_only_what_was_asked_for_so_it_merges():
+    """A `set` that emitted every field would clear the ones it did not mention."""
+    cmd = build_cli_command(
+        "limits", {"limits_action": "set", "max_total_risk_money": 30, "max_positions": 2}
+    )
+    assert cmd.endswith("limits set --max-positions 2 --max-total-risk-money 30.0")
+    assert "--max-daily-loss-money" not in cmd
+    # A count is an int on the CLI: "2.0" would be rejected as a bad argument.
+    assert "--max-positions 2 " in cmd + " "
+
+
+def test_limits_defaults_to_show_and_clear_carries_no_values():
+    assert build_cli_command("limits", {}).endswith("limits show")
+    assert build_cli_command("limits", {"limits_action": "clear"}).endswith("limits clear")
+
+
+@pytest.mark.asyncio
+async def test_limits_show_is_available_without_the_trading_opt_in(monkeypatch):
+    """Asking what protection is in force is the one call most worth having when
+    trading is switched off."""
+    monkeypatch.delenv("MT5_ALLOW_TRADING", raising=False)
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox()}))
+    result = await tool.execute(action="limits", limits_action="show")
+    assert not getattr(result, "is_error", False)
+
+
+@pytest.mark.asyncio
+async def test_setting_a_limit_needs_the_trading_opt_in(monkeypatch):
+    """It changes what the system will do with money, so it is gated like an order."""
+    monkeypatch.delenv("MT5_ALLOW_TRADING", raising=False)
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox()}))
+    blocked = await tool.execute(
+        action="limits", limits_action="set", max_total_risk_money=100
+    )
+    assert blocked.is_error
+    # ...but asking what is in force is always allowed.
+    assert not getattr(await tool.execute(action="limits", limits_action="show"), "is_error", False)
+
+    monkeypatch.setenv("MT5_ALLOW_TRADING", "1")
+    allowed = await tool.execute(
+        action="limits", limits_action="set", max_total_risk_money=100
+    )
+    assert not getattr(allowed, "is_error", False)
+
+
+@pytest.mark.asyncio
+async def test_limits_set_with_nothing_to_set_is_refused_here(monkeypatch):
+    monkeypatch.setenv("MT5_ALLOW_TRADING", "1")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox()}))
+    empty = await tool.execute(action="limits", limits_action="set")
+    assert empty.is_error
+    assert "at least one" in str(empty)
+
+    # A limit of zero is not a limit.
+    zero = await tool.execute(action="limits", limits_action="set", max_positions=0)
+    assert zero.is_error
+    assert "positive" in str(zero)
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_limits_action_is_refused(monkeypatch):
+    monkeypatch.setenv("MT5_ALLOW_TRADING", "1")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _FakeSandbox()}))
+    bad = await tool.execute(action="limits", limits_action="wipe")
+    assert bad.is_error
+    assert "show, set or clear" in str(bad)
+
+
+def test_the_description_says_what_the_circuit_breaker_caps_and_where_to_read_it():
+    desc = MT5SandboxTool().description
+    assert "ACCOUNT CIRCUIT BREAKER" in desc
+    assert "max_total_risk_money" in desc
+    # The failure it exists to stop, named: many small positions nobody adds up.
+    assert "10% on the table" in desc
+    # And the one call to read before sizing.
+    assert "action='risk'" in desc
+
+
+def test_the_limits_limits_are_documented_as_money_and_counts():
+    props = MT5SandboxTool().parameters["properties"]
+    assert props["limits_action"]["enum"] == ["show", "set", "clear"]
+    assert props["max_positions"]["type"] == "integer"
+    assert props["max_total_risk_money"]["type"] == "number"
+    # A stopless order cannot be counted, and says so.
+    assert "no stop" in props["max_total_risk_money"]["description"]

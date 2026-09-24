@@ -66,7 +66,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.10"
+CLI_VERSION = "2026-09-24.11"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -3395,6 +3395,29 @@ def cmd_split(args: argparse.Namespace) -> int:
     left_over = round(total - actual_total, 8)
     shortfall = left_over > step / 2
 
+    # ---- the ACCOUNT's own limits, checked on the way in ------------------- #
+    # A split is N positions, so it is counted as N against max_positions and its
+    # risk is the SUM over the tickets that will actually be sent -- not one
+    # ticket's, and not the total that was asked for when the lot step rounded
+    # some of it away.
+    split_risk = _risk_money_of(
+        mt5, symbol, info, price, getattr(args, "sl", None), actual_total
+    )
+    gate = _risk_gate(
+        mt5, new_risk_money=split_risk, new_positions=count, symbol=symbol
+    )
+    if gate["breaches"]:
+        return fail(
+            "the account's own risk limits refuse this split. "
+            + " ".join(b["reason"] for b in gate["breaches"]),
+            code=1,
+            breaches=gate["breaches"],
+            limits=gate["limits"],
+            limits_error=gate["limits_error"],
+            exposure=gate["exposure"]["totals"],
+            today=gate["today"],
+        )
+
     # --- can the account actually carry this? -------------------------------- #
     # Ten tickets are ten separate margin reservations, and the failure mode is
     # not a clean refusal: the first few fill and the rest come back 10019 "no
@@ -3832,6 +3855,534 @@ def _validate_target_side(side: str, entry: float, tp: float | None) -> str | No
     return None
 
 
+# --------------------------------------------------------------------------- #
+# THE ACCOUNT CIRCUIT BREAKER -- and one call that says what is actually at risk
+# --------------------------------------------------------------------------- #
+# WHY THIS EXISTS: a stop limits what ONE trade can lose. Nothing limited what
+# the ACCOUNT could lose, and the account is the thing that runs out. Five
+# "small" positions each risking 2% is 10% on the table, and a bad day is not
+# stopped by any single ticket's stop -- it is stopped by a rule that looks at
+# the whole book, at the moment the next order is about to be sent.
+#
+# THE RULE THIS FOLLOWS: a limit that only the model remembers to apply is not a
+# limit. So these are enforced HERE, at the one point every order passes through,
+# and they are reported in the same answer -- `risk` is one call that says what
+# is open, what it can lose, what today has already cost, and how much room is
+# left before the next order is refused.
+RISK_LIMITS_FILE = MT5_ROOT / "risk_limits.json"
+
+#: Every limit the breaker understands. Money limits are in the ACCOUNT's
+#: currency, because that is the currency the losses arrive in.
+RISK_LIMIT_KEYS = (
+    "max_daily_loss_money",
+    "max_positions",
+    "max_total_risk_money",
+    "max_total_risk_pct",
+)
+
+
+def _read_risk_limits() -> dict[str, Any]:
+    """The limits in force, or ``{}``. A corrupt file is reported, not obeyed.
+
+    An unreadable limits file is the dangerous case: silently treating it as "no
+    limits" would remove the protection at exactly the moment something is
+    wrong, so the failure is reported as ``limits_error`` alongside the empty
+    set.
+    """
+    try:
+        raw = RISK_LIMITS_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        return {"_error": f"could not read {RISK_LIMITS_FILE}: {exc}"}
+    try:
+        loaded = json.loads(raw)
+    except ValueError as exc:
+        return {"_error": f"{RISK_LIMITS_FILE} is not valid JSON: {exc}"}
+    if not isinstance(loaded, dict):
+        return {"_error": f"{RISK_LIMITS_FILE} must hold a JSON object"}
+    out = {k: loaded[k] for k in RISK_LIMIT_KEYS if loaded.get(k) is not None}
+    if not out:
+        return {"_error": f"{RISK_LIMITS_FILE} holds none of {', '.join(RISK_LIMIT_KEYS)}"}
+    return out
+
+
+def _write_risk_limits(limits: dict[str, Any]) -> None:
+    RISK_LIMITS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    RISK_LIMITS_FILE.write_text(json.dumps(limits, indent=2) + "\n", encoding="utf-8")
+
+
+def _position_risk_money(mt5: Any, position: Any) -> float | None:
+    """What this position loses if its stop is hit, or ``None`` if it has none.
+
+    ``|entry - stop| x contract x lots`` -- no pip involved, which is why this
+    one is safe to write by hand: a pip is a convention, but a price difference
+    times a contract size is money. A position with ``sl 0`` has no stop, so the
+    honest answer is NOT zero -- zero would let it pass every total-risk check as
+    though it were free.
+    """
+    stop = float(getattr(position, "sl", 0.0) or 0.0)
+    if not stop:
+        return None
+    info = mt5.symbol_info(getattr(position, "symbol", ""))
+    contract = float(getattr(info, "trade_contract_size", 0.0) or 0.0)
+    if not contract:
+        return None
+    entry = float(getattr(position, "price_open", 0.0) or 0.0)
+    volume = float(getattr(position, "volume", 0.0) or 0.0)
+    return round(abs(entry - stop) * contract * volume, 2)
+
+
+def _account_figures(mt5: Any) -> dict[str, Any]:
+    # A terminal that cannot answer is a fact to report, not a crash: this runs
+    # inside the gate that every order passes through, and a gate that raises is
+    # a gate that stops being consulted. Equity stays None rather than 0, so a
+    # percentage-limit check can tell "no equity" from "no money".
+    try:
+        account = mt5.account_info()
+    except Exception as exc:  # noqa: BLE001 - an unreadable account is reportable
+        return {
+            "equity": None, "balance": None, "margin_free": None, "currency": None,
+            "error": f"account_info failed: {exc}",
+        }
+    if account is None:
+        return {"equity": None, "balance": None, "margin_free": None, "currency": None}
+    return {
+        "equity": float(getattr(account, "equity", 0.0) or 0.0),
+        "balance": float(getattr(account, "balance", 0.0) or 0.0),
+        "margin_free": float(getattr(account, "margin_free", 0.0) or 0.0),
+        "currency": getattr(account, "currency", None),
+    }
+
+
+def _open_exposure(mt5: Any) -> dict[str, Any]:
+    """Every open position, what each can lose, and the total.
+
+    THE ONE THING THIS MUST NOT DO IS COUNT A STOPLESS POSITION AS FREE. It has
+    no KNOWN risk, which is a different fact from no risk, so those tickets are
+    listed separately as ``positions_without_a_stop`` and the total says how many
+    of the open positions it does NOT cover.
+    """
+    # An unreadable book is NOT an empty book. The failure is carried on the
+    # report as ``error`` -- and by the gate below that refuses to send anything
+    # while a limit is in force -- because a total of nothing reads exactly like
+    # a book with nothing in it, which is the one thing it is not.
+    error: str | None = None
+    try:
+        open_positions = list(mt5.positions_get() or [])
+    except Exception as exc:  # noqa: BLE001 - an unreadable book is reportable
+        error = f"positions_get failed, so the open book could NOT be read: {exc}"
+        open_positions = []
+    rows: list[dict[str, Any]] = []
+    total_risk = 0.0
+    unrealised = 0.0
+    without_stop: list[int] = []
+    for position in sorted(open_positions, key=lambda p: int(getattr(p, "ticket", 0))):
+        risk = _position_risk_money(mt5, position)
+        if risk is None:
+            without_stop.append(int(position.ticket))
+        else:
+            total_risk += risk
+        profit = float(getattr(position, "profit", 0.0) or 0.0)
+        unrealised += profit
+        rows.append({
+            "ticket": int(position.ticket),
+            "symbol": getattr(position, "symbol", None),
+            "side": "buy" if int(getattr(position, "type", 0)) == 0 else "sell",
+            "volume": float(getattr(position, "volume", 0.0) or 0.0),
+            "price_open": float(getattr(position, "price_open", 0.0) or 0.0),
+            "price_current": float(getattr(position, "price_current", 0.0) or 0.0),
+            "sl": float(getattr(position, "sl", 0.0) or 0.0),
+            "tp": float(getattr(position, "tp", 0.0) or 0.0),
+            "profit_money": round(profit, 2),
+            "risk_money": risk,
+        })
+    figures = _account_figures(mt5)
+    if figures.get("error") and not error:
+        error = figures["error"]
+    equity = figures["equity"]
+    return {
+        "error": error,
+        "positions": rows,
+        "totals": {
+            "positions": len(rows),
+            "volume": round(sum(r["volume"] for r in rows), 8),
+            "risk_money": round(total_risk, 2),
+            "risk_pct_of_equity": (
+                round(total_risk / equity * 100.0, 2) if equity else None
+            ),
+            "unrealised_pnl_money": round(unrealised, 2),
+            "positions_counted": len(rows) - len(without_stop),
+            "risk_unknown_positions": len(without_stop),
+        },
+        "positions_without_a_stop": without_stop,
+        "account": figures,
+    }
+
+
+def _realised_since(mt5: Any, *, hours: float | None = None) -> dict[str, Any]:
+    """Closed-deal P&L for today (server time), or the last ``hours``.
+
+    Anchored to the BROKER's clock, for the same reason ``history`` is: the
+    MetaTrader5 wrapper forwards naive datetimes as SERVER time, so a window
+    built from the box clock can end hours in the broker's past and see none of
+    today's deals at all.
+    """
+    import datetime as _dt
+
+    offset = _server_clock_offset(mt5)
+    box_now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    server_now = box_now + _dt.timedelta(seconds=offset)
+    if hours is None:
+        start = server_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        label = "since midnight, broker server time"
+    else:
+        start = server_now - _dt.timedelta(hours=hours)
+        label = f"the last {hours:g} hours"
+    end = server_now + _dt.timedelta(hours=6)
+    try:
+        deals = mt5.history_deals_get(start, end) or []
+    except Exception as exc:  # noqa: BLE001 - no history is a reportable fact
+        return {"error": f"history_deals_get failed: {exc}", "window": label}
+    # DEAL_TYPE_BALANCE (2) is a deposit or withdrawal, not trading: counting one
+    # would let a funding transfer read as a winning day, or a withdrawal as a
+    # loss that trips the breaker.
+    balance_types = {int(getattr(mt5, "DEAL_TYPE_BALANCE", 2))}
+    closed = [d for d in deals if int(getattr(d, "type", -1)) not in balance_types]
+    realised = 0.0
+    wins = losses = 0
+    worst = 0.0
+    best = 0.0
+    for deal in closed:
+        net = (
+            float(getattr(deal, "profit", 0.0) or 0.0)
+            + float(getattr(deal, "swap", 0.0) or 0.0)
+            + float(getattr(deal, "commission", 0.0) or 0.0)
+        )
+        realised += net
+        if net > 0:
+            wins += 1
+        elif net < 0:
+            losses += 1
+            worst = min(worst, net)
+        best = max(best, net)
+    return {
+        "window": label,
+        "from": start.isoformat(sep=" ", timespec="seconds"),
+        "to": end.isoformat(sep=" ", timespec="seconds"),
+        "server_clock_offset_s": offset,
+        "deals": len(closed),
+        "realised_pnl_money": round(realised, 2),
+        "winning_deals": wins,
+        "losing_deals": losses,
+        "best_deal_money": round(best, 2),
+        "worst_deal_money": round(worst, 2),
+    }
+
+
+def _risk_money_of(
+    mt5: Any, symbol: str, info: Any, entry: float, sl: float | None, volume: float
+) -> float | None:
+    """What ONE planned order would lose at its stop, or ``None`` without one."""
+    if sl is None:
+        return None
+    _pip, contract = _symbol_pip_and_contract(mt5, symbol, info)
+    if not contract:
+        return None
+    return round(abs(float(entry) - float(sl)) * contract * float(volume), 2)
+
+
+def _risk_gate(
+    mt5: Any,
+    *,
+    new_risk_money: float | None,
+    new_positions: int = 1,
+    symbol: str | None = None,
+    always_today: bool = False,
+) -> dict[str, Any]:
+    """Whether the next order may be sent, and what it would do to the book.
+
+    Called on the way INTO every order, which is the only way a limit can be a
+    limit rather than a suggestion: the model does not have to remember, and a
+    caller using the raw CLI cannot skip it.
+
+    ``new_risk_money=None`` means the order has no stop, so its risk is UNKNOWN.
+    With a total-risk limit in force that is refused rather than waved through --
+    an uncountable position is exactly the one that makes the limit meaningless.
+    """
+    limits = _read_risk_limits()
+    exposure = _open_exposure(mt5)
+    # The history window is the expensive part of this call, so it is only paid
+    # when something is going to be done with it: a gate that runs on EVERY
+    # order must not add a deals query to the path where no daily limit exists.
+    if always_today or limits.get("max_daily_loss_money") is not None:
+        today = _realised_since(mt5)
+    else:
+        today = {"skipped": "no max_daily_loss_money limit is set"}
+    breaches: list[dict[str, Any]] = []
+    error = limits.pop("_error", None)
+
+    if exposure.get("error") and limits:
+        # A limit enforced against a total that is known to be wrong is worse
+        # than no limit, because it reads as protection. So the order is refused
+        # rather than sent against an unmeasured book.
+        breaches.append({
+            "limit": "open_book_unreadable",
+            "allowed": sorted(limits),
+            "actual": None,
+            "reason": (
+                f"{exposure['error']}. A limit is in force and the book it "
+                "applies to could not be measured, so nothing is sent against a "
+                "total that is known to be wrong. Fix the terminal, or clear the "
+                "limits deliberately."
+            ),
+        })
+
+    daily_limit = limits.get("max_daily_loss_money")
+    realised = today.get("realised_pnl_money")
+    if daily_limit is not None and realised is not None:
+        if float(realised) <= -abs(float(daily_limit)):
+            breaches.append({
+                "limit": "max_daily_loss_money",
+                "allowed": float(daily_limit),
+                "actual": round(float(realised), 2),
+                "reason": (
+                    f"today is already down {abs(round(float(realised), 2))} "
+                    f"({today.get('window')}), at or past the daily loss limit of "
+                    f"{abs(float(daily_limit))}. The day is over: no new position "
+                    "may be opened here, whatever the setup looks like. Close what "
+                    "is open, or clear the limit deliberately."
+                ),
+            })
+
+    max_positions = limits.get("max_positions")
+    if max_positions is not None:
+        would_be = int(exposure["totals"]["positions"]) + int(new_positions)
+        if would_be > int(max_positions):
+            breaches.append({
+                "limit": "max_positions",
+                "allowed": int(max_positions),
+                "actual": int(exposure["totals"]["positions"]),
+                "reason": (
+                    f"there are already {exposure['totals']['positions']} open "
+                    f"positions and this would make {would_be}; the limit is "
+                    f"{int(max_positions)}."
+                ),
+            })
+
+    money_limit = limits.get("max_total_risk_money")
+    pct_limit = limits.get("max_total_risk_pct")
+    equity = exposure["account"].get("equity")
+    if money_limit is not None or pct_limit is not None:
+        if new_risk_money is None:
+            breaches.append({
+                "limit": "max_total_risk_money" if money_limit is not None else "max_total_risk_pct",
+                "allowed": money_limit if money_limit is not None else pct_limit,
+                "actual": None,
+                "reason": (
+                    "this order carries no stop, so what it risks cannot be "
+                    "counted against the total-risk limit in force. Add sl, or "
+                    "clear the limit deliberately."
+                ),
+            })
+        else:
+            total = float(exposure["totals"]["risk_money"]) + float(new_risk_money)
+            if money_limit is not None and total > float(money_limit):
+                breaches.append({
+                    "limit": "max_total_risk_money",
+                    "allowed": float(money_limit),
+                    "actual": round(total, 2),
+                    "reason": (
+                        f"open risk is {exposure['totals']['risk_money']} and this "
+                        f"order adds {round(float(new_risk_money), 2)}, taking the "
+                        f"book to {round(total, 2)} -- past the limit of "
+                        f"{float(money_limit)}."
+                    ),
+                })
+            if pct_limit is not None and equity:
+                pct = total / equity * 100.0
+                if pct > float(pct_limit):
+                    breaches.append({
+                        "limit": "max_total_risk_pct",
+                        "allowed": float(pct_limit),
+                        "actual": round(pct, 2),
+                        "reason": (
+                            f"open risk would be {round(total, 2)} of an equity of "
+                            f"{round(equity, 2)} -- {round(pct, 2)}% against a limit "
+                            f"of {float(pct_limit)}%."
+                        ),
+                    })
+
+    if exposure["positions_without_a_stop"] and (money_limit is not None or pct_limit is not None):
+        # Not a breach by itself, but the total cannot be trusted while it is
+        # true, and a limit enforced against a number known to be too small is
+        # worse than no limit: it reads as protection.
+        breaches.append({
+            "limit": "max_total_risk_money",
+            "allowed": money_limit if money_limit is not None else pct_limit,
+            "actual": None,
+            "reason": (
+                f"{len(exposure['positions_without_a_stop'])} open position(s) have "
+                "NO stop, so the total above does not include them and is an "
+                "UNDERSTATEMENT. Put a stop on them (modify) before trusting the "
+                "total-risk limit."
+            ),
+        })
+    return {
+        "limits": limits,
+        "limits_error": error,
+        "exposure": exposure,
+        "today": today,
+        "breaches": breaches,
+    }
+
+
+def cmd_risk(_: argparse.Namespace) -> int:
+    """ONE call: what is open, what it can lose, what today has cost, and the room left.
+
+    The question a trader actually asks before the next order is not "what is my
+    position" but "what am I carrying, and how much more can I take" -- and
+    answering it from separate calls means adding up stop distances in a model
+    turn, which is the arithmetic this exists to remove.
+    """
+    mt5, err = require_bridge()
+    if err is not None:
+        return err
+    gate = _risk_gate(mt5, new_risk_money=None, new_positions=0, always_today=True)
+    limits = gate["limits"]
+    equity = gate["exposure"]["account"].get("equity")
+    total_risk = float(gate["exposure"]["totals"]["risk_money"])
+    headroom: dict[str, Any] = {}
+    if limits.get("max_total_risk_money") is not None:
+        headroom["risk_money"] = round(float(limits["max_total_risk_money"]) - total_risk, 2)
+    if limits.get("max_total_risk_pct") is not None and equity:
+        headroom["risk_pct"] = round(
+            float(limits["max_total_risk_pct"]) - total_risk / equity * 100.0, 2
+        )
+    if limits.get("max_positions") is not None:
+        headroom["positions"] = int(limits["max_positions"]) - int(
+            gate["exposure"]["totals"]["positions"]
+        )
+    daily = limits.get("max_daily_loss_money")
+    realised = gate["today"].get("realised_pnl_money")
+    if daily is not None and realised is not None:
+        headroom["daily_loss_money"] = round(-abs(float(daily)) - float(realised), 2)
+    # The gate is called with new_risk_money=None, which is the STOPLESS case, so
+    # its total-risk complaint is about the book rather than about an order. Keep
+    # only the ones that are true of the book as it stands.
+    standing = [b for b in gate["breaches"] if b["limit"] != "max_total_risk_money"
+                or "UNDERSTATEMENT" in b["reason"]]
+    payload = {
+        "ok": True,
+        "note": (
+            "risk_money is what each position LOSES IF ITS STOP IS HIT, summed "
+            "from |entry - stop| x contract x lots. Unrealised P&L is what it is "
+            "worth right now. They are different numbers and both are here."
+        ),
+        **gate["exposure"],
+        "today": gate["today"],
+        "limits": limits,
+        "limits_error": gate["limits_error"],
+        "headroom": headroom,
+        "breaches": standing,
+    }
+    if gate["limits_error"]:
+        payload["alert"] = "risk_limits_unreadable"
+    elif standing:
+        payload["alert"] = "risk_limits_breached"
+    code = 0
+    return emit(payload, text=payload.get("alert") or "risk report", code=code)
+
+
+def cmd_limits(args: argparse.Namespace) -> int:
+    """Set, show or clear the account circuit breaker.
+
+    THE VALUES ARE MONEY, NOT PERCENTAGES OF NOTHING: ``max_total_risk_money`` is
+    the most the whole book may lose if every stop is hit at once, which is a
+    different number from any single position's risk and the one that decides
+    whether the account survives a bad day.
+    """
+    subcommand = str(getattr(args, "limits_action", "show") or "show").lower()
+    if subcommand == "show":
+        limits = _read_risk_limits()
+        error = limits.pop("_error", None)
+        return emit({
+            "ok": True,
+            "action": "limits",
+            "limits": limits,
+            "limits_error": error,
+            "file": str(RISK_LIMITS_FILE),
+            "keys": list(RISK_LIMIT_KEYS),
+            "note": (
+                "No limits set means nothing refuses an order on account grounds. "
+                "Use action=risk to see the book these limits would apply to."
+            ),
+        })
+    if subcommand == "clear":
+        try:
+            RISK_LIMITS_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            return fail(f"could not remove {RISK_LIMITS_FILE}: {exc}", code=2)
+        return emit({
+            "ok": True,
+            "action": "limits",
+            "cleared": True,
+            "limits": {},
+            "note": (
+                "No account limits are in force: nothing refuses an order on "
+                "account grounds until they are set again."
+            ),
+        })
+
+    wanted = {
+        key: getattr(args, key)
+        for key in RISK_LIMIT_KEYS
+        if getattr(args, key, None) is not None
+    }
+    if not wanted:
+        return fail(
+            "limits set needs at least one of: "
+            + ", ".join(f"--{k.replace('_', '-')}" for k in RISK_LIMIT_KEYS)
+            + ". Use `limits clear` to remove them.",
+            code=1,
+        )
+    negative = {k: v for k, v in wanted.items() if float(v) <= 0}
+    if negative:
+        return fail(
+            "a limit must be positive: "
+            + ", ".join(f"{k}={v}" for k, v in negative.items())
+            + ". A limit of zero or less is not a limit -- it would refuse every "
+            "order for a reason that looks like a rule. To stop trading, close "
+            "what is open.",
+            code=1,
+        )
+    limits = _read_risk_limits()
+    limits.pop("_error", None)
+    limits.update(wanted)
+    _write_risk_limits(limits)
+    mt5, err = require_bridge()
+    gate = None
+    if err is None:
+        gate = _risk_gate(mt5, new_risk_money=None, new_positions=0)
+    return emit({
+        "ok": True,
+        "action": "limits",
+        "limits": limits,
+        "file": str(RISK_LIMITS_FILE),
+        "set": sorted(wanted),
+        "standing": gate["breaches"] if gate else [],
+        "exposure": gate["exposure"]["totals"] if gate else None,
+        "today": gate["today"] if gate else None,
+        "note": (
+            "These are enforced at the point an order is sent, so they apply to "
+            "every caller, not only to one that remembers them. `action=risk` "
+            "shows the book they apply to."
+        ),
+    })
+
+
 def cmd_order(args: argparse.Namespace) -> int:
     """One order, at the market or resting at a price, sized in lots or in money.
 
@@ -3952,6 +4503,24 @@ def cmd_order(args: argparse.Namespace) -> int:
     if args.sl is None and not allow_no_stop:
         return fail(NO_STOP_REFUSAL, code=1)
 
+    # ---- the ACCOUNT's own limits, checked on the way in ------------------- #
+    # The one point every order passes through, so a limit does not depend on
+    # anyone remembering it. A stopless order reports its risk as UNKNOWN, which
+    # a total-risk limit refuses rather than counting as free.
+    order_risk = _risk_money_of(mt5, symbol, info, price, args.sl, volume)
+    gate = _risk_gate(mt5, new_risk_money=order_risk, new_positions=1, symbol=symbol)
+    if gate["breaches"]:
+        return fail(
+            "the account's own risk limits refuse this order. "
+            + " ".join(b["reason"] for b in gate["breaches"]),
+            code=1,
+            breaches=gate["breaches"],
+            limits=gate["limits"],
+            limits_error=gate["limits_error"],
+            exposure=gate["exposure"]["totals"],
+            today=gate["today"],
+        )
+
     # ---- the request ------------------------------------------------------
     pending = entry_type != "market"
     if pending:
@@ -3980,6 +4549,14 @@ def cmd_order(args: argparse.Namespace) -> int:
         request["tp"] = float(args.tp)
 
     payload = _order_send(mt5, request, fillings)
+    payload["risk_money"] = order_risk
+    payload["book_after"] = {
+        "open_risk_money": gate["exposure"]["totals"]["risk_money"],
+        "open_risk_pct_of_equity": gate["exposure"]["totals"]["risk_pct_of_equity"],
+        "positions": gate["exposure"]["totals"]["positions"],
+        "limits_in_force": sorted(gate["limits"]),
+        "exposure_error": gate["exposure"].get("error"),
+    }
     payload["entry_type"] = entry_type
     payload["side"] = side
     payload["symbol"] = symbol
@@ -6948,6 +7525,43 @@ def build_parser() -> argparse.ArgumentParser:
                    help="a tick younger than this means the market is open")
     p.set_defaults(func=cmd_symbols)
 
+    sub.add_parser(
+        "risk",
+        help="ONE call: what is open, what the book can lose, what today cost, and the room left",
+    ).set_defaults(func=cmd_risk)
+
+    p = sub.add_parser(
+        "limits",
+        help="the account circuit breaker: daily loss, max positions, max total open risk",
+    )
+    p.add_argument(
+        "limits_action",
+        nargs="?",
+        default="show",
+        choices=["show", "set", "clear"],
+        help="show the limits in force, set some, or clear them all",
+    )
+    p.add_argument(
+        "--max-daily-loss-money", type=float, default=None,
+        help="refuse new positions once the realised loss TODAY reaches this",
+    )
+    p.add_argument(
+        "--max-positions", type=int, default=None,
+        help="refuse an order that would open more positions than this",
+    )
+    p.add_argument(
+        "--max-total-risk-money", type=float, default=None,
+        help=(
+            "refuse an order that would take the WHOLE book's risk past this, "
+            "counting every open position's distance to its stop"
+        ),
+    )
+    p.add_argument(
+        "--max-total-risk-pct", type=float, default=None,
+        help="as --max-total-risk-money, but as a percentage of account equity",
+    )
+    p.set_defaults(func=cmd_limits)
+
     p = sub.add_parser(
         "order",
         help="send an order: at the market, or RESTING at a price, sized in lots or in money",
@@ -7203,6 +7817,11 @@ _BRIDGE_ACTIONS = frozenset(
     {
         "login", "account", "quote", "candles", "positions", "orders",
         "history", "symbol", "symbols", "order", "split", "close", "close_all",
+        # `risk` reads positions, the account and the day's deals, all of which
+        # live in the terminal. `limits` mostly reads and writes one small file,
+        # but `limits set` reports the book the new limits apply to, so it goes
+        # through the same path rather than answering from a different python.
+        "risk", "limits",
         # `cancel` sends TRADE_ACTION_REMOVE to the terminal, so it is a Wine
         # action like the rest of the trade path.
         "cancel",

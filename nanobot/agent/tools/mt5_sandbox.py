@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-24.10"
+_CLI_VERSION = "2026-09-24.11"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -98,13 +98,18 @@ _INSTALL_COMMAND_TIMEOUT = 120
 #: execute() (see _GUARD_SAFE_SUBACTIONS), so an operator can always inspect or
 #: disarm protection even with trading disabled.
 _TRADING_ACTIONS = frozenset(
-    {"order", "split", "close", "close_all", "cancel", "modify", "guard"}
+    {"order", "split", "close", "close_all", "cancel", "modify", "guard", "limits"}
 )
 
 #: ``guard`` sub-actions that place no order. These stay available without
 #: MT5_ALLOW_TRADING: refusing to report the state of a live guard would leave
 #: protection running with no way to look at it.
 _GUARD_SAFE_SUBACTIONS = frozenset({"status", "stop", "events", "clear"})
+
+#: The same reasoning for the account's own limits: ``show`` changes nothing and
+#: is the one call most worth having when trading is switched off, because it is
+#: what says whether there is any protection at all.
+_LIMITS_SAFE_SUBACTIONS = frozenset({"show"})
 
 #: Actions that only read state. These never require the trading opt-in.
 _READ_ONLY_ACTIONS = frozenset(
@@ -122,6 +127,10 @@ _READ_ONLY_ACTIONS = frozenset(
         # gone, because it is what tells the caller what the stop and target
         # *would* have been.
         "plan",
+        # `risk` reads the book, the account and today's closed deals and
+        # changes nothing. Gating it behind the trading opt-in would hide the
+        # account's own exposure from the caller who most needs to see it.
+        "risk",
     }
 )
 
@@ -172,6 +181,10 @@ _TIMEOUTS: dict[str, int] = {
     "split": 120,
     # `cancel` is one TRADE_ACTION_REMOVE per pending order through the bridge.
     "cancel": 120,
+    # `risk` reads positions + account + today's deals; `limits` writes one JSON
+    # file, so neither is anywhere near the ceiling.
+    "risk": 120,
+    "limits": 120,
 }
 _DEFAULT_TIMEOUT = 120
 
@@ -758,6 +771,35 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
         # "first price" every time.
         if kwargs.get("watch_session"):
             parts += ["--session", _sh(kwargs["watch_session"])]
+    elif action == "risk":
+        # No arguments. The whole point of the call is that the answer is the
+        # report: what is open, what it risks, what today has cost, and the room
+        # left. Anything that had to be passed in would be arithmetic the caller
+        # was already doing by hand.
+        pass
+    elif action == "limits":
+        sub_action = str(kwargs.get("limits_action") or "show").strip().lower()
+        parts += [_sh(sub_action)]
+        # Emitted ONLY when the caller set one, so a `set` merges into what is
+        # already in force instead of silently clearing the limits it did not
+        # mention.
+        for flag in (
+            "max_daily_loss_money",
+            "max_positions",
+            "max_total_risk_money",
+            "max_total_risk_pct",
+        ):
+            if kwargs.get(flag) is None:
+                continue
+            # A count is not a money value: the CLI reads --max-positions as an
+            # int, so "2.0" would be rejected as a bad argument rather than
+            # silently rounded.
+            value = (
+                str(int(kwargs[flag]))
+                if flag == "max_positions"
+                else str(float(kwargs[flag]))
+            )
+            parts += [f"--{flag.replace('_', '-')}", value]
     elif action == "compile":
         parts += ["--file", _sh(kwargs.get("file") or "")]
         if kwargs.get("include"):
@@ -979,7 +1021,26 @@ class MT5SandboxTool(Tool):
             "free margin cannot cover every ticket, because a half-filled split "
             "leaves a stop covering fewer tickets than planned. Check "
             "action=account for margin_mode and free margin BEFORE sizing a split. "
-            "Trading actions (order, close, close_all, modify, guard) require "
+            "THE ACCOUNT CIRCUIT BREAKER (action='limits', and action='risk' to "
+            "see the book it applies to) -- set these before the next order, not "
+            "after the loss. A stop caps ONE trade; these cap the ACCOUNT, which is "
+            "the thing that runs out, and no single ticket's stop does it: five "
+            "'small' positions each risking 2% is 10% on the table. max_total_risk_"
+            "money is the most the whole book may lose if every stop is hit at once, "
+            "max_positions caps how many tickets may exist (a split counts as its "
+            "full N), and max_daily_loss_money ends the day once the REALISED loss "
+            "reaches it (deposits and withdrawals are excluded; it refuses new "
+            "entries, it does not liquidate, so close what is open yourself). They "
+            "are enforced at the point an order is sent, so they bind every caller "
+            "and not only whoever remembers them: a refused order comes back with "
+            "ok=false, the breaches and their numbers, and NOTHING was sent. Call "
+            "action='risk' BEFORE sizing anything -- it is ONE call for what is "
+            "open, what each position loses at its stop, what today has already "
+            "cost, and the headroom left. Read its totals, then size the order to "
+            "the headroom. A position with no stop has UNKNOWN risk rather than zero "
+            "and is listed separately, because it is the one that makes a total-risk "
+            "limit meaningless -- fix it before trusting the total. "
+            "Trading actions (order, close, close_all, modify, guard, limits) require "
             "MT5_ALLOW_TRADING to be "
             "enabled and return the broker retcode; a rejected order is reported with "
             "code 3 and its reason rather than raising. "
@@ -1056,6 +1117,11 @@ class MT5SandboxTool(Tool):
                 "group": {"type": "string", "description": "action=split: a label for the tickets so the set can be addressed later (action=close with group/count). action=close: close the tickets of this split group instead of one ticket."},
                 "stop_on_failure": {"type": "boolean", "description": "action=split: stop sending tickets after the first rejection (default: try them all and report which filled). Either way a partial split is reported as alert=split_incomplete, never as a filled position."},
                 "check_cost": {"type": "boolean", "description": "action=split: report the per-deal cost of N tickets against one position. Commission charged per deal is paid N times, and so are slippage and requotes; spread cost is proportional to volume and is not affected."},
+                "limits_action": {"type": "string", "enum": ["show", "set", "clear"], "description": "action=limits: 'show' (default) reports the account's limits in force; 'set' writes them (it MERGES -- limits you do not mention keep their value); 'clear' removes them all. THE ACCOUNT CIRCUIT BREAKER: a stop limits what ONE trade can lose, these limit what the ACCOUNT can lose, which is the thing that actually runs out. Five 'small' positions each risking 2% is 10% on the table and no single ticket's stop prevents it. The limits are enforced at the point an order is sent, so they apply to every caller rather than to whoever remembers them. A refused order reports 'breaches' with the reason and the numbers, and nothing is sent."},
+                "max_daily_loss_money": {"type": "number", "description": "action=limits: stop opening new positions for the rest of the day once the day's REALISED loss reaches this much (account currency). Measured from closed deals since midnight BROKER time; deposits and withdrawals are excluded, because a funding transfer is not a trading result. Close what is open by hand -- this refuses entries, it does not liquidate."},
+                "max_positions": {"type": "integer", "description": "action=limits: the most open positions the account may hold. A call that would cross it is refused before anything is sent, and a split counts as its full number of tickets, not one."},
+                "max_total_risk_money": {"type": "number", "description": "action=limits: the most the WHOLE BOOK may lose if every stop is hit at once, in account currency. This is the number that decides whether a bad day is survivable, and it is not any single position's risk. It is measured from the stops themselves (|entry - stop| x contract x lots), and an order with no stop cannot be counted against it, so such an order is refused while this limit is in force."},
+                "max_total_risk_pct": {"type": "number", "description": "action=limits: as max_total_risk_money, but as a percentage of account EQUITY. Needs the account to be readable: with no equity the percentage cannot be checked and is reported as such rather than assumed to pass."},
                 "watch_session": {"type": "string", "description": "action=watch: continue ONE observation across calls. Every watch carrying the same name folds its samples into a ledger on the box and returns session.price_path_total (the WHOLE session's high/low/drift, not this call's) plus session.since_last_call (the move since you last looked) and session.elapsed_s. USE THIS WHENEVER YOU FOLLOW A LIVE TRADE: without it each 90-second call reports a different trade's first price and drift, so 'is it working?' cannot be answered across calls. With it the calls are one timeline and you can think between them."},
             },
             "required": ["action"],
@@ -1089,6 +1155,12 @@ class MT5SandboxTool(Tool):
                 }
             )
 
+        limits_sub = str(kwargs.get("limits_action") or "show").strip().lower()
+        if action == "limits" and limits_sub not in ("show", "set", "clear"):
+            return ToolResult.error(
+                f"Unknown limits_action '{limits_sub}'. Use show, set or clear."
+            )
+
         guard_sub = str(kwargs.get("guard_action") or "status").strip().lower()
         if action == "guard" and guard_sub not in (
             "arm",
@@ -1107,12 +1179,39 @@ class MT5SandboxTool(Tool):
             # Reading, stopping or clearing a guard places no order, and refusing
             # it would strand a live guard with no way to inspect or disarm it.
             if not (
-                action == "guard" and guard_sub in _GUARD_SAFE_SUBACTIONS
+                (action == "guard" and guard_sub in _GUARD_SAFE_SUBACTIONS)
+                or (action == "limits" and limits_sub in _LIMITS_SAFE_SUBACTIONS)
             ):
                 return ToolResult.error(
                     f"action='{action}' moves real money and is disabled. Set "
                     "MT5_ALLOW_TRADING=1 in the deployment environment to enable live "
                     "trading, then retry."
+                )
+
+        if action == "limits" and limits_sub == "set":
+            wanted = [
+                flag
+                for flag in (
+                    "max_daily_loss_money",
+                    "max_positions",
+                    "max_total_risk_money",
+                    "max_total_risk_pct",
+                )
+                if kwargs.get(flag) is not None
+            ]
+            if not wanted:
+                return ToolResult.error(
+                    "action=limits with limits_action='set' needs at least one of "
+                    "max_daily_loss_money, max_positions, max_total_risk_money, "
+                    "max_total_risk_pct. Use limits_action='clear' to remove them."
+                )
+            bad = [f for f in wanted if float(kwargs[f]) <= 0]
+            if bad:
+                return ToolResult.error(
+                    "a limit must be positive: "
+                    + ", ".join(bad)
+                    + ". A limit of zero or less is not a limit. To stop trading, "
+                    "close what is open."
                 )
 
         if action == "order":

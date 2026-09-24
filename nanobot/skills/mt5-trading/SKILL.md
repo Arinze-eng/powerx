@@ -220,9 +220,12 @@ it**: the fixed version above builds with `0 errors, 0 warnings, 478 ms`.
 
 ## Trading
 
-`order`, `split`, `close`, `close_all`, `cancel` and `modify` move real money and
-are **disabled unless the deployment sets `MT5_ALLOW_TRADING=1`**. When disabled
-they return an error and never reach the sandbox.
+`order`, `split`, `close`, `close_all`, `cancel`, `modify` and `limits` move real
+money and are **disabled unless the deployment sets `MT5_ALLOW_TRADING=1`**. When
+disabled they return an error and never reach the sandbox. `risk` and
+`limits show` only read, so they keep working either way — the caller who most
+needs to see the account's exposure is the one who has just been told trading is
+off.
 
 * `order` needs `symbol` and `side` (`buy`/`sell`), plus **a size** — either
   `volume` in lots, or `risk_money` / `risk_pct` with the `sl` that defines it.
@@ -309,6 +312,71 @@ mt5_sandbox(action="order", symbol="XAUUSD", side="buy", risk_money=100,
 A rejected order is a normal result, not an exception: the payload carries the
 broker `retcode` and `comment`. Common retcodes: `10009` done, `10016` invalid
 stops, `10019` no money, `10030` unsupported filling mode.
+
+### The account circuit breaker — `limits` and `risk`
+
+**Every stop in this skill caps ONE trade. Nothing capped the ACCOUNT.** The
+account is the thing that runs out, and no single ticket's stop prevents it:
+five "small" positions each risking 2% is 10% on the table, and the day ends
+with no ticket having done anything wrong.
+
+Set the limits **before** the next order, not after the loss:
+
+```
+mt5_sandbox(action="limits", limits_action="set",
+            max_total_risk_money=300, max_positions=5,
+            max_daily_loss_money=200)
+```
+
+| Limit | Caps |
+|---|---|
+| `max_total_risk_money` | what the **whole book** loses if every stop is hit at once |
+| `max_total_risk_pct` | the same, as a percentage of account **equity** |
+| `max_positions` | how many positions may be open — a `split` counts its full N |
+| `max_daily_loss_money` | **realised** loss today (broker server midnight), after which no new position opens |
+
+`limits_action` is `show` (default), `set` or `clear`. **`set` merges**: limits
+you do not mention keep their value, so raising one does not silently drop the
+others. A limit of zero or less is refused — it would refuse every order for a
+reason that looks like a rule.
+
+**They are enforced where an order is sent, not where it is remembered.** A
+refused order comes back `ok=false` with `breaches` (each with the limit, the
+numbers and a plain reason) and **nothing was sent**. That is the point: the rule
+binds every caller, including one that never read this page.
+
+```
+mt5_sandbox(action="risk")
+```
+
+**One call, before you size anything.** It returns the open book — each position
+with what it loses at its stop — plus `totals` (`risk_money`,
+`risk_pct_of_equity`, `unrealised_pnl_money`), `today` (realised P&L since the
+broker's midnight), `limits`, `headroom`, and `breaches` if the book already
+violates something. Read `headroom`, then size the order to it.
+
+Things it will tell you that are easy to get wrong on your own:
+
+* **`risk_money` and unrealised P&L are different numbers.** One is what the
+  position loses *if the stop is hit* (`|entry - stop| × contract × lots`); the
+  other is what it is worth *right now*. Both are in the report.
+* **A position with no stop has UNKNOWN risk, not zero.** It is listed in
+  `positions_without_a_stop`, and `totals.positions_counted` says how many the
+  total actually covers. With a total-risk limit in force that is itself a
+  breach: a limit enforced against a total known to be too small reads as
+  protection while being none.
+* **Deposits and withdrawals are not P&L.** The daily-loss figure counts closed
+  deals only, so a funding transfer can never read as a winning day or a
+  withdrawal as a loss that trips the breaker.
+* **An unreadable limits file is reported, not obeyed as "no limits"**
+  (`alert=risk_limits_unreadable`), and an unreadable book stops the gate from
+  sending anything while limits are in force. Failing open is how a protection
+  quietly stops protecting.
+* `alert=risk_limits_breached` on `risk` means the **standing** book already
+  breaks a limit — fix it before adding to it.
+
+The daily-loss limit **refuses new entries; it does not liquidate**. Closing is
+yours to do deliberately.
 
 ## Exits at a price — never poll for them
 
