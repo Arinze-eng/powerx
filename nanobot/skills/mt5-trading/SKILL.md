@@ -314,10 +314,17 @@ Two limits worth knowing before you arm one:
   playbook's own 20-pip stop distance. A distance of zero would put the stop on
   the price and close the position, and is refused.
 
-Read what it did with `guard_action='events'`: `stop_moved` carries the mode, the
-price that caused it, and a `moved` row per ticket with `from_sl` and `to_sl`;
-`stop_move_failed` carries the broker's own retcode. `guard_action='status'` shows
-the moving rules still armed.
+**A moving stop is usually WAITING, and waiting is what you will see.** `not yet
+1R` writes no event — it would write one per tick — so `guard_action='status'`
+publishes `stop_move`: one row per armed rule with `outcome` (`moved`, `refused`
+or `waiting`), the `mode`, the price, and the `detail` — *"#4735550381 not yet 1R
+(4302.18)"* or *"#4735550381 4284.92 -> 4286.69"*. That is the only way to tell a
+rule doing its job quietly from a rule that was never armed, so read it before
+telling anyone their stop is protected.
+
+`guard_action='events'` has the history: `stop_moved` carries the mode, the price
+that caused the move, and a `moved` row per ticket with `from_sl` and `to_sl`;
+`stop_move_failed` carries the broker's own retcode.
 
 ### Entering at a price — `entry_type`
 

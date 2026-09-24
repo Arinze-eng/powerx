@@ -2714,6 +2714,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         # watching?" with a count instead of a claim.
         "ticks_scanned": (state or {}).get("ticks_scanned") or {},
         "near_miss": (state or {}).get("near_miss") or {},
+        "stop_move": (state or {}).get("stop_move") or {},
         "events": _guard_events(int(getattr(args, "lines", 20) or 20)),
         "terminal": {
             "available": terminal_ok,
@@ -5443,6 +5444,11 @@ def main():
     #: the touch the guard saw and chose not to act on.
     near_miss_reported = {}
     near_miss_last = {}
+    #: Rule id -> the last thing a move_stop rule DID, including "nothing".
+    #: A policy rule is usually WAITING -- "not yet 1R" -- and waiting writes no
+    #: event, so without this a rule quietly doing its job and a rule that was
+    #: never armed look identical to whoever armed it.
+    stop_move_last = {}
     while True:
         now = time.time()
         # ``--max-seconds 0`` (the default) means NO limit: an exit at a price has
@@ -5527,6 +5533,20 @@ def main():
                 refused = [r for r in sent if not r.get("ok")]
                 skipped = [r for r in moved if r.get("retcode") is None]
                 recorded = any(r.get("recorded") for r in moved)
+                stop_move_last[str(rule.get("id"))] = {
+                    "ts": now, "mode": str(rule.get("mode") or "breakeven"),
+                    "price": price,
+                    "outcome": ("moved" if acted else "refused" if refused
+                                else "waiting"),
+                    "detail": (
+                        [f"#{r['ticket']} {r.get('from_sl')} -> {r.get('to_sl')}"
+                         for r in acted]
+                        or [f"#{r['ticket']} retcode {r.get('retcode')}"
+                            for r in refused]
+                        or [f"#{r['ticket']} {r.get('skipped') or r.get('error')}"
+                            for r in skipped]
+                    ),
+                }
                 if acted or refused:
                     append_jsonl(args.events, {
                         "event": "stop_moved" if acted else "stop_move_failed",
@@ -5894,6 +5914,7 @@ def main():
             # the state so "is it watching?" is answered with a count.
             "ticks_scanned": dict(ticks_seen),
             "near_miss": dict(near_miss_last),
+            "stop_move": dict(stop_move_last),
         })
         time.sleep(max(0.01, args.interval_ms / 1000.0))
 
@@ -5913,6 +5934,7 @@ def main():
         "gave_up": [str(r.get("id")) for r in final_rules if r.get("gave_up_at")],
         "ticks_scanned": dict(ticks_seen),
         "near_miss": dict(near_miss_last),
+        "stop_move": dict(stop_move_last),
     })
     append_jsonl(args.events, {
         "event": "watcher_stop", "ts": time.time(), "exit_reason": exit_reason,
@@ -6826,6 +6848,10 @@ def cmd_guard(args: argparse.Namespace) -> int:
             # The last level that was TOUCHED and was already back inside when it
             # was looked at. Reported, never acted on -- see the watcher.
             "near_miss": (state or {}).get("near_miss") or {},
+            # What each armed moving stop last DID, including "still waiting for
+            # its trigger" -- the thing that distinguishes a rule doing its job
+            # quietly from a rule that is not there.
+            "stop_move": (state or {}).get("stop_move") or {},
             "unpriceable": unpriceable,
             "heartbeat_age_s": (
                 round(time.time() - float((state or {}).get("heartbeat") or 0.0), 1)

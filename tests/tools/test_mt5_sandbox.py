@@ -5319,6 +5319,11 @@ def test_a_moving_stop_rule_keeps_the_reference_it_measured_on_the_moving_pass(
     # ...and the reference survives into the FILE, not only in memory.
     assert rules_after[0]["move_ref"]["9001"]["risk"] == 10.0
     assert rules_after[0]["move_best"]["9001"] == 4300.0
+    # The state says what the rule DID, in the place a caller already looks for
+    # the last near miss.
+    published = _run["state"]["stop_move"]["g-trail"]
+    assert published["outcome"] == "moved" and published["mode"] == "trail"
+    assert published["detail"] == ["#9001 4290.0 -> 4298.0"]
     assert events[-1]["event"] == "watcher_stop"
 
 
@@ -5488,3 +5493,36 @@ def test_the_description_and_the_schema_offer_a_stop_that_moves_itself():
     assert "guard_mode='breakeven'" in desc and "guard_mode='trail'" in desc
     # The reason it exists, named: nothing else runs between the model's calls.
     assert "between your calls" in desc
+
+
+def test_a_waiting_moving_stop_says_so_instead_of_looking_absent(
+    monkeypatch, tmp_path
+):
+    """Armed and quietly "not yet 1R" must not look like never armed.
+
+    A policy rule that is WAITING writes no event -- correctly, since it would
+    otherwise write one per tick -- so the state file is the only place the
+    difference between "working quietly" and "not there" can be read. It is
+    published exactly where the last near miss is.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock()
+    mt5 = _FakeMT5(symbol="XAUUSD", bid=4310.0, ask=4310.2, tickets=(9001,))
+    mt5.positions[0].price_open = 4300.0
+    mt5.positions[0].sl = 4280.0
+
+    rule = cli._validate_rule(
+        {"symbol": "XAUUSD", "action": "move_stop", "mode": "breakeven",
+         "ticket": 9001, "when_r": 1.0, "id": "g-be"}, 0, price_hint=4310.0,
+    )
+    run, events, _after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, [rule],
+        interval_ms=100, max_seconds=3,
+    )
+
+    waiting = run["state"]["stop_move"]["g-be"]
+    assert waiting["outcome"] == "waiting" and waiting["mode"] == "breakeven"
+    assert "not yet 1R" in waiting["detail"][0]
+    # ...and "waiting" is never a move.
+    assert [e for e in events if e["event"] == "stop_moved"] == []
+    assert mt5.sltp_sends == []
