@@ -602,6 +602,30 @@ human's money on it; `timed_out: true` means nothing happened *yet*, not that yo
 are done. Watch until the position set is empty, or until you have told the user
 something they need to answer.
 
+### Don't narrate. Manage.
+
+While the trade is being managed, **keep the loop to yourself**. "Still watching,
+nothing yet" every 90 seconds is noise, and a user who asked you to run a trade
+does not want forty status updates — they want the trade run. Work quietly and
+speak only when one of these is true:
+
+* **The job is done** — the position set is empty. Then report the outcome with
+  the real numbers: every fill, the exit price of each part, the net P&L, and the
+  R multiple. From `history`, not from your memory of the loop.
+* **You need a decision only the user can make** — they said "close half at the
+  first target" and the target is here but the size was never specified; or the
+  setup has gone invalid and the choice is theirs.
+* **Something is wrong that they must know now** — a position with no stop, an
+  account that turns out to be netting, margin that will not cover the plan, the
+  watcher dying, a broker rejection you cannot work around. A problem is not
+  noise; silence on a problem is the failure mode.
+
+Everything else is the loop doing its job. Acting on `trade_state` — taking a
+partial off, moving a stop to breakeven — is **management, not a report**: do it
+and carry on watching. Do not stop the loop to announce what you just did; the
+numbers will be in the final summary, and stopping mid-trade to narrate is how a
+trade ends up unwatched.
+
 ### How the loop works
 
 1. `watch` blocks up to **90 s** and returns the moment something happens.
