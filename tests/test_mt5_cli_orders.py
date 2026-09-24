@@ -583,19 +583,49 @@ def test_start_restarts_a_terminal_that_lacks_credentials(cli, monkeypatch, tmp_
     stopped: list[int] = []
     launched: list[list[str]] = []
 
-    monkeypatch.setattr(cli, "find_terminal", lambda: tmp_path / "terminal64.exe")
+    # ``prefer_key`` is the broker the credentials live on: cmd_start passes it so
+    # a terminal for a DIFFERENT broker is not silently reused. The stub has to
+    # accept it, or these tests fail on the call signature instead of on the
+    # behaviour they pin.
+    terminal = tmp_path / "MetaTrader 5 Terminal" / "terminal64.exe"
+    monkeypatch.setattr(cli, "find_terminal", lambda prefer_key=None: terminal)
     monkeypatch.setattr(cli, "wine_bin", lambda: "wine")
     monkeypatch.setattr(cli, "wine_env", lambda: {})
     monkeypatch.setattr(cli, "MT5_ROOT", tmp_path / "mt5")
     monkeypatch.setattr(cli, "WINE_PREFIX", tmp_path / "wine")
     # A terminal is up, but it was launched WITHOUT /config:.
-    monkeypatch.setattr(cli, "_terminal_processes", lambda: [(4242, ["wine", "/t/terminal64.exe"])])
-    monkeypatch.setattr(cli, "_terminal_has_credentials", lambda: False)
-    def fake_stop() -> list[int]:
+    #
+    # Its argv names the SAME install directory ``find_terminal`` returns. That is
+    # what makes it the terminal this call must RECLAIM rather than another broker's
+    # interloper -- ``_stop_terminal_processes(keep_terminal=...)`` spares a process
+    # whose argv points at the terminal being kept, matched on the install
+    # directory's name (``MetaTrader 5 EXNESS`` / ``MetaTrader 5 Terminal``), the
+    # way two coexisting branded builds are told apart.
+    # ...and once the kill has happened it is GONE, which is what the stub below
+    # models: ``cmd_start`` decides whether to launch by asking whether THIS
+    # terminal is running (not merely whether a terminal is), so a stub that keeps
+    # reporting 4242 after the stop suppresses the very relaunch being tested.
+    monkeypatch.setattr(
+        cli,
+        "_terminal_processes",
+        lambda: [] if stopped else [(4242, ["wine", str(terminal)])],
+    )
+    monkeypatch.setattr(cli, "_terminal_has_credentials", lambda terminal=None: False)
+    def fake_stop(keep_terminal=None) -> list[int]:
+        # The interlopers pass (``keep_terminal`` set) must find NOTHING to stop:
+        # 4242 IS the terminal being kept, so it is spared -- exactly as
+        # ``_process_is_for_terminal`` spares it on a real box. Appending here
+        # unconditionally made the stub report two stops for one terminal.
+        if keep_terminal is not None:
+            return []
         stopped.append(4242)
         return [4242]
 
     monkeypatch.setattr(cli, "_stop_terminal_processes", fake_stop)
+    # The server preflight is a separate behaviour (find_terminal/preflight_server);
+    # stubbed here so this test fails on the credential logic it pins, not on a
+    # broker resolution the fake terminal cannot answer.
+    monkeypatch.setattr(cli, "preflight_server", lambda terminal, server=None: None)
     # After the kill no terminal is left, so the launch must actually happen.
     monkeypatch.setattr(cli, "terminal_running", lambda: not stopped)
     monkeypatch.setattr(cli, "_bridge_probe", lambda timeout=None: {"ok": True, "account": None})
@@ -628,12 +658,19 @@ def test_start_restarts_a_terminal_that_lacks_credentials(cli, monkeypatch, tmp_
 def test_start_keeps_a_terminal_that_already_has_credentials(cli, monkeypatch, tmp_path):
     """No needless restart: a credential-carrying, connected terminal is reused."""
     launched: list[list[str]] = []
-    monkeypatch.setattr(cli, "find_terminal", lambda: tmp_path / "terminal64.exe")
+    # ``prefer_key`` is the broker the credentials live on: cmd_start passes it so
+    # a terminal for a DIFFERENT broker is not silently reused. The stub has to
+    # accept it, or these tests fail on the call signature instead of on the
+    # behaviour they pin.
+    monkeypatch.setattr(
+        cli, "find_terminal", lambda prefer_key=None: tmp_path / "terminal64.exe"
+    )
     monkeypatch.setattr(cli, "wine_bin", lambda: "wine")
     monkeypatch.setattr(cli, "MT5_ROOT", tmp_path / "mt5")
     monkeypatch.setattr(cli, "WINE_PREFIX", tmp_path / "wine")
     monkeypatch.setattr(cli, "_terminal_processes", lambda: [(1, ["wine", "/t/terminal64.exe"])])
-    monkeypatch.setattr(cli, "_terminal_has_credentials", lambda: True)
+    monkeypatch.setattr(cli, "_terminal_has_credentials", lambda terminal=None: True)
+    monkeypatch.setattr(cli, "preflight_server", lambda terminal, server=None: None)
     monkeypatch.setattr(
         cli, "_bridge_probe",
         lambda timeout=None: {"ok": True, "account": {"login": 10012768157, "server": "MetaQuotes-Demo"}},
@@ -2194,3 +2231,133 @@ def test_limits_set_does_not_report_a_breach_about_an_order_that_does_not_exist(
     )) == 0
     assert len(out["standing"]) == 1
     assert "UNDERSTATEMENT" in out["standing"][0]["reason"]
+
+
+# --------------------------------------------------------------------------- #
+# The Wine command layer: multi-line code and `%` used to be lost SILENTLY
+# --------------------------------------------------------------------------- #
+def test_a_multi_line_run_code_is_spilled_to_a_file_for_the_batch_layer(cli, tmp_path):
+    """MEASURED 2026-09-24 (live Deriv-Demo box): ``run --code "<multi-line>"``
+    returned NOTHING -- no JSON, exit 0.
+
+    The re-exec writes ``<python.exe> <mt5_cli.py> "run" "--code" "<code>"`` into a
+    ``.bat``, and a batch file is line-based: the first newline ended the command,
+    the redirect never happened, and the caller got an empty stdout. Indistinguishable
+    from a hang, in the one subcommand meant to be the escape hatch.
+    """
+    script = "x = 1\ny = 2\nresult = x + y"
+    argv = cli._spill_code_to_file(["run", "--code", script], tmp_path)
+
+    assert "--code-file" in argv and "--code" not in argv
+    passed = argv[argv.index("--code-file") + 1]
+    assert passed.startswith("C:\\mt5tmp\\")
+    assert (tmp_path / "code.py").read_text(encoding="utf-8") == script
+
+    # A single-line script keeps the inline path: nothing about the common case moves.
+    assert cli._spill_code_to_file(["run", "--code", "result = 1"], tmp_path) == [
+        "run", "--code", "result = 1",
+    ]
+    # Only `run` carries free-form code; other actions are left alone.
+    assert cli._spill_code_to_file(["order", "--code", "a\nb"], tmp_path) == [
+        "order", "--code", "a\nb",
+    ]
+
+
+def test_cmd_run_reads_the_code_file_the_reexec_spilled(cli, monkeypatch, tmp_path, capsys):
+    script = tmp_path / "code.py"
+    script.write_text("x = 40\nresult = x + 2", encoding="utf-8")
+    monkeypatch.setattr(cli, "require_bridge", lambda: (types.SimpleNamespace(), None))
+
+    assert cli.cmd_run(types.SimpleNamespace(code=None, code_file=str(script))) == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload == {"ok": True, "result": 42}
+
+
+def test_a_windows_code_file_path_is_localized_into_the_prefix(cli, monkeypatch, tmp_path):
+    """The re-exec passes ``C:\\mt5tmp\\<id>\\code.py``; either interpreter may read it."""
+    monkeypatch.setattr(cli, "WINE_PREFIX", tmp_path / "wine")
+    target = tmp_path / "wine" / "drive_c" / "mt5tmp" / "9911-abcd" / "code.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("result = 'from a windows path'", encoding="utf-8")
+
+    assert cli._localize_wine_path(r"C:\mt5tmp\9911-abcd\code.py") == target
+    # A Linux path is already local and passes through untouched.
+    assert cli._localize_wine_path(str(target)) == target
+
+
+def test_a_newline_that_cannot_cross_the_batch_layer_is_refused_out_loud(
+    cli, monkeypatch, tmp_path, capsys
+):
+    """Refused rather than written into a .bat that fails quietly."""
+    monkeypatch.setattr(cli, "under_wine", lambda: False)
+    monkeypatch.setattr(cli, "win_python", lambda: tmp_path / "python.exe")
+    monkeypatch.setattr(cli, "WINE_PREFIX", tmp_path / "wine")
+    monkeypatch.setattr(cli, "wine_bin", lambda: "wine")
+    monkeypatch.setattr(cli.time, "sleep", lambda *_: None)
+
+    assert cli._reexec_under_wine(["order", "--comment", "two\nlines"]) is not None
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["ok"] is False
+    assert "newline" in payload["error"]
+    assert payload["action"] == "order"
+
+
+def test_a_child_that_wrote_nothing_is_a_reported_failure_not_silence(
+    cli, monkeypatch, tmp_path, capsys
+):
+    """Silence used to be returned as SUCCESS with an empty stdout.
+
+    The caller could then only say "the tool produced no JSON", which is the same
+    message a frozen terminal gives -- for a completely different reason. The
+    command file is kept as the evidence and named in the failure.
+    """
+    monkeypatch.setattr(cli, "under_wine", lambda: False)
+    monkeypatch.setattr(cli, "win_python", lambda: tmp_path / "python.exe")
+    monkeypatch.setattr(cli, "WINE_PREFIX", tmp_path / "wine")
+    monkeypatch.setattr(cli, "wine_bin", lambda: "wine")
+    # Wine runs, and writes nothing at all -- the silent-loss case.
+    monkeypatch.setattr(
+        cli.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0)
+    )
+
+    assert cli._reexec_under_wine(["account"]) is not None
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["ok"] is False
+    assert "produced no output" in payload["error"]
+    assert Path(payload["bat"]).exists(), "the command file must survive as evidence"
+
+
+def test_book_after_reports_the_book_the_trade_left_behind(cli, monkeypatch, tmp_path):
+    """`book_after` used to be the exposure the risk gate read BEFORE the send.
+
+    MEASURED live 2026-09-24 (Deriv-Demo): XAUUSD 0.01 with a stop filled at
+    retcode 10009 with $21.29 of risk, and the payload reported
+    ``book_after: {positions: 0, open_risk_money: 0.0}`` -- the one number a caller
+    checks to confirm the trade landed said nothing had.
+    """
+    _limits_file(cli, monkeypatch, tmp_path, limits={})
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    mt5 = _OrderMT5(info, tick, orders=[])
+    # The book is empty until the deal lands, then the position is there.
+    opened = [_Pos(777, 4285.18, 4283.18, volume=0.01)]
+    state = {"filled": False}
+    mt5.positions_get = lambda ticket=None: opened if state["filled"] else []
+
+    sent, out = _wire_order(cli, monkeypatch, mt5)
+    inner = cli._order_send
+
+    def _send(m, req, fillings):  # the fill is what puts the position on the book
+        result = inner(m, req, fillings)
+        state["filled"] = True
+        return result
+
+    monkeypatch.setattr(cli, "_order_send", _send)
+
+    assert cli.cmd_order(_order_args(volume=0.01, sl=4283.18)) == 0
+    assert len(sent) == 1
+    assert out["book_before"]["positions"] == 0
+    assert out["book_after"]["positions"] == 1
+    assert out["book_after"]["settled"] is True
+    # 0.01 lots x 100 oz x $2.00 of stop.
+    assert out["book_after"]["open_risk_money"] == 2.0

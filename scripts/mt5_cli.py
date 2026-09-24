@@ -48,6 +48,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -66,7 +67,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.13"
+CLI_VERSION = "2026-09-24.14"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -4021,6 +4022,46 @@ def _open_exposure(mt5: Any) -> dict[str, Any]:
     }
 
 
+def _book_summary(exposure: dict[str, Any], limits: dict[str, Any]) -> dict[str, Any]:
+    """The four things a caller checks about the book, from one exposure read."""
+    totals = exposure.get("totals") or {}
+    return {
+        "open_risk_money": totals.get("risk_money"),
+        "open_risk_pct_of_equity": totals.get("risk_pct_of_equity"),
+        "positions": totals.get("positions"),
+        "limits_in_force": sorted(limits),
+        "exposure_error": exposure.get("error"),
+    }
+
+
+def _book_after_send(
+    mt5: Any, before: dict[str, Any], limits: dict[str, Any]
+) -> dict[str, Any]:
+    """The book as it IS after the deal, not the one the gate measured.
+
+    A trade report whose "after" is really "before" is worse than no report: a
+    caller confirming that a fill landed reads exactly the number that says it did
+    not. This re-reads the book, and when the re-read itself fails it says so and
+    keeps the pre-trade numbers LABELLED as pre-trade instead of passing them off
+    as the outcome.
+    """
+    try:
+        after = _open_exposure(mt5)
+    except Exception as exc:  # noqa: BLE001 - an unreadable book is reportable
+        summary = dict(before)
+        summary["settled"] = False
+        summary["exposure_error"] = (
+            f"the book could not be re-read after the send: {exc}. The numbers "
+            "shown are the PRE-trade book."
+        )
+        return summary
+    summary = _book_summary(after, limits)
+    summary["settled"] = not after.get("error")
+    if after.get("error"):
+        summary["exposure_error"] = after["error"]
+    return summary
+
+
 def _realised_since(mt5: Any, *, hours: float | None = None) -> dict[str, Any]:
     """Closed-deal P&L for today (server time), or the last ``hours``.
 
@@ -4564,13 +4605,19 @@ def cmd_order(args: argparse.Namespace) -> int:
 
     payload = _order_send(mt5, request, fillings)
     payload["risk_money"] = order_risk
-    payload["book_after"] = {
-        "open_risk_money": gate["exposure"]["totals"]["risk_money"],
-        "open_risk_pct_of_equity": gate["exposure"]["totals"]["risk_pct_of_equity"],
-        "positions": gate["exposure"]["totals"]["positions"],
-        "limits_in_force": sorted(gate["limits"]),
-        "exposure_error": gate["exposure"].get("error"),
-    }
+    # BOOK BEFORE / BOOK AFTER, measured either side of the send.
+    #
+    # `book_after` used to be built from the exposure the risk gate read BEFORE
+    # the order went out, so a fill that opened a position reported the book as it
+    # was before it: MEASURED live 2026-09-24 (Deriv-Demo, XAUUSD 0.01 with a
+    # stop): retcode 10009, fill 4286.23, risk_money 21.29 -- and
+    # `book_after: {positions: 0, open_risk_money: 0.0}`. The one number a caller
+    # checks to confirm the trade landed said nothing had. Measured immediately
+    # after the same fill, `positions_get` already returned the new ticket, so the
+    # staleness was in this payload alone.
+    book_before = _book_summary(gate["exposure"], gate["limits"])
+    payload["book_before"] = book_before
+    payload["book_after"] = _book_after_send(mt5, book_before, gate["limits"])
     payload["entry_type"] = entry_type
     payload["side"] = side
     payload["symbol"] = symbol
@@ -7802,12 +7849,28 @@ def cmd_experts(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    code = str(getattr(args, "code", "") or "")
+    code_file = getattr(args, "code_file", None)
+    if code_file:
+        # WHY A FILE EXISTS AT ALL: the re-exec into Wine writes the command into
+        # a line-based ``.bat``, so a multi-line ``--code`` used to end the batch
+        # line early and lose the answer COMPLETELY (no JSON, exit 0). The code is
+        # spilled to a file and read back here instead. Measured 2026-09-24: both
+        # ``--code "<multi-line>"`` and even a single-line ``'%.0f' % x`` returned
+        # nothing at all, because ``%`` is expanded by ``cmd.exe`` too.
+        path = _localize_wine_path(str(code_file))
+        try:
+            code = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return fail(f"could not read the code file {code_file}: {exc}", code=1)
+    if not code.strip():
+        return fail("nothing to run: pass --code or --code-file", code=1)
     mt5, err = require_bridge()
     if err is not None:
         return err
-    scope = {"mt5": mt5, "MetaTrader5": mt5}
+    scope = {"mt5": mt5, "MetaTrader5": mt5, "result": None}
     try:
-        exec(args.code, scope)  # noqa: S102 - explicit agent escape hatch
+        exec(code, scope)  # noqa: S102 - explicit agent escape hatch
     except Exception as exc:  # noqa: BLE001
         return fail(f"{type(exc).__name__}: {exc}", code=2)
     result = scope.get("result")
@@ -8250,7 +8313,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_experts)
 
     p = sub.add_parser("run", help="raw python escape hatch")
-    p.add_argument("--code", required=True)
+    # Neither is required on its own: exactly one of them must arrive. A
+    # multi-line script cannot travel as an argument at all (the Wine layer is
+    # batch-based), so ``--code-file`` is the form the re-exec converts to and the
+    # one an agent should use for anything longer than a line.
+    p.add_argument("--code", required=False, default=None)
+    p.add_argument(
+        "--code-file",
+        required=False,
+        default=None,
+        help="read the script from this file instead of --code (required for "
+        "anything multi-line)",
+    )
     p.set_defaults(func=cmd_run)
 
     return parser
@@ -8296,6 +8370,62 @@ _BRIDGE_ACTIONS = frozenset(
 def _to_wine_path(p: Path | str) -> str:
     """Translate a Linux path into the Wine ``Z:`` drive form."""
     return "Z:" + str(p).replace("/", "\\")
+
+
+def _spill_code_to_file(argv: list[str], tmp_dir: Path) -> list[str]:
+    """Move a multi-line ``--code`` into a file and pass ``--code-file`` instead.
+
+    THE BUG THIS REMOVES (measured 2026-09-24, real Deriv-Demo box): the re-exec
+    writes ``<python.exe> <mt5_cli.py> "run" "--code" "<code>"`` into a ``.bat``,
+    and a batch file is LINE-BASED. Any newline inside the code therefore ended
+    the command early: the child ran a truncated line, the redirect never
+    happened, and the caller got an empty stdout with exit 0 -- no JSON, no error,
+    nothing. ``run`` is the documented escape hatch for exactly the situations
+    where the fixed subcommands fall short, so a silent no-answer there is worse
+    than an error: it reads as "the bridge is frozen" and sends the caller off to
+    debug Wine.
+
+    Only the newline case needs the file; a single-line ``--code`` keeps the
+    inline path so nothing about the common case changes.
+    """
+    if not argv or argv[0] != "run" or "--code" not in argv:
+        return argv
+    idx = argv.index("--code")
+    if idx + 1 >= len(argv):
+        return argv
+    code = argv[idx + 1]
+    if "\n" not in code and "\r" not in code:
+        return argv
+    try:
+        path = tmp_dir / "code.py"
+        path.write_text(code, encoding="utf-8")
+    except OSError:
+        return argv
+    return (
+        argv[:idx]
+        + ["--code-file", f"C:\\mt5tmp\\{tmp_dir.name}\\code.py"]
+        + argv[idx + 2 :]
+    )
+
+
+def _localize_wine_path(raw: str) -> Path:
+    """A Windows path handed back to a Linux reader, resolved inside the prefix.
+
+    The counterpart of :func:`_to_wine_path`. It exists because one argument now
+    travels in the WINE direction only: the re-exec spills a multi-line ``--code``
+    into ``C:\\mt5tmp\\<id>\\code.py`` and passes that Windows path, while the
+    process that must READ it can be either side -- the Wine child (which
+    understands it natively) or a Linux python that was handed the same argument.
+    Resolving a bare ``C:`` here means the reader never has to care which it is.
+    """
+    text = str(raw or "").strip().strip('"')
+    match = re.match(r"^([A-Za-z]):[\\/](.*)$", text)
+    if not match or Path(text).exists():
+        return Path(text)
+    drive, rest = match.group(1).lower(), match.group(2).replace("\\", "/")
+    if drive == "z":
+        return Path("/" + rest)
+    return WINE_PREFIX / f"drive_{drive}" / rest
 
 
 def _reexec_under_wine(argv: list[str]) -> int | None:
@@ -8346,8 +8476,36 @@ def _reexec_under_wine(argv: list[str]) -> int | None:
     if out_linux.exists():
         out_linux.unlink()
 
-    # Quote every argument for cmd.exe (double quotes, escape inner quotes).
-    win_args = " ".join('"' + a.replace('"', '\\"') + '"' for a in argv)
+    # An argument that carries a NEWLINE cannot survive this layer at all: the
+    # command below is written into a .bat, which is line-based, so a newline ends
+    # the line and the rest of the call becomes a second, broken command. MEASURED
+    # 2026-09-24 (Deriv-Demo box): ``run --code "<multi-line python>"`` returned
+    # NOTHING -- no JSON, exit 0 -- which is indistinguishable from a hang and is
+    # how a debugging escape hatch silently eats the thing you asked it to report.
+    # ``%`` is the same class of trap: ``cmd.exe`` expands it, so even a one-line
+    # ``'%.0f' % x`` printed nothing. Both are handled below (a code file, and
+    # ``%%``), and anything else that escapes with a newline is refused OUT LOUD
+    # rather than written into a bat that will fail quietly.
+    argv = _spill_code_to_file(argv, tmp_dir)
+    for value in argv:
+        if "\n" in value or "\r" in value:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return fail(
+                "an argument to this MT5 action contains a newline, which the "
+                "Wine command layer cannot carry. Pass the value in a file, or "
+                "split it into separate calls.",
+                code=1,
+                action=action,
+            )
+
+    # Quote every argument for cmd.exe (double quotes, escape inner quotes) and
+    # double the percent signs: in a batch file ``%%`` is a literal ``%``, and a
+    # single one is an expansion -- so ``'%.2f' % x`` reached the bridge as a
+    # mangled expression. MEASURED 2026-09-24: before this, a ``%`` in the code
+    # produced no output at all.
+    win_args = " ".join(
+        '"' + a.replace('"', '\\"').replace("%", "%%") + '"' for a in argv
+    )
     bat = tmp_dir / "run.bat"
     bat.write_text(
         "@echo off\r\n"
@@ -8384,21 +8542,42 @@ def _reexec_under_wine(argv: list[str]) -> int | None:
     except subprocess.TimeoutExpired:
         return fail("timed out waiting for the MT5 bridge inside Wine", code=2)
 
+    wrote = False
     try:
         if out_linux.exists():
             # CP1252 is the default console codepage Wine uses; fall back safely.
             raw = out_linux.read_bytes()
-            for enc in ("utf-8", "cp1252", "latin-1"):
-                try:
-                    sys.stdout.write(raw.decode(enc))
-                    break
-                except UnicodeDecodeError:
-                    continue
+            if raw.strip():
+                wrote = True
+                for enc in ("utf-8", "cp1252", "latin-1"):
+                    try:
+                        sys.stdout.write(raw.decode(enc))
+                        break
+                    except UnicodeDecodeError:
+                        continue
     finally:
         # The directory is private to this invocation, so it is dead the moment
         # the answer has been read. Left behind, one per bridge call, it would
         # grow the prefix without bound.
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        #
+        # The ONE exception is a child that wrote nothing: the directory is then
+        # the evidence, so it is kept and named in the failure below. Silence
+        # used to be returned as success with an empty stdout, which the caller
+        # could only report as "the tool produced no JSON" -- the same message a
+        # hung terminal gives, for a completely different reason.
+        if wrote:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    if not wrote:
+        return fail(
+            "the MT5 bridge inside Wine produced no output at all for this "
+            "command, so it never reached the terminal. The command file is kept "
+            f"at {bat} (and the console capture at {out_linux}) -- read the .bat "
+            "to see what was run.",
+            code=2,
+            action=action,
+            bat=str(bat),
+            stdout_file=str(out_linux),
+        )
     return 0
 
 
