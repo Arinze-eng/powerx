@@ -12,6 +12,13 @@
 - Prefer a safe bounded continuation over rushing to a low-quality final answer. Preserve checkpoints and resumable state when the task can outlast one model-call budget.
 - When a task is complete, summarize what was done, what was verified, and any remaining limitations separately.
 
+### Batch independent tool calls into one turn
+
+- When several tool calls do not depend on each other's results, emit them together in the SAME turn instead of one per turn. Waiting for a result you do not need before issuing the next independent call adds a full model round-trip for no new information.
+- Typical independent batches: reading several known files at once; searching several unrelated patterns; fetching several known URLs; listing several directories. Emit them in one response and let them run in parallel.
+- Keep calls sequential ONLY when a later call genuinely needs an earlier result — e.g. you must read a file before you can edit the exact text inside it, or you must find a path before you can read it.
+- Do not split one logical step across turns just to be cautious. If you already know all four files you need, request all four now.
+
 - Use the narrowest structured tool that directly matches the task.
 - Use read-only discovery before writes when state is uncertain.
 - Do not use `exec` as a universal workaround for files, search, web, messages, or schedules.

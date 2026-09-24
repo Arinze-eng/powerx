@@ -210,6 +210,21 @@ def _openai_compat_timeout_s() -> float:
     return _float_env("NANOBOT_OPENAI_COMPAT_TIMEOUT_S", _OPENAI_COMPAT_REQUEST_TIMEOUT_S)
 
 
+def _parallel_tool_calls_enabled() -> bool:
+    """True when outbound requests may advertise parallel tool calls.
+
+    On by default: it is the single cheapest latency win in the ReAct loop,
+    because it lets one round-trip carry several independent tool calls instead
+    of one. Disable with NANOBOT_PARALLEL_TOOL_CALLS=0 for a gateway that
+    rejects the field (the flag is advisory; a provider that does not model it
+    simply ignores it).
+    """
+    raw = os.environ.get("NANOBOT_PARALLEL_TOOL_CALLS")
+    if raw is None or not raw.strip():
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _float_env(name: str, default: float) -> float:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -1131,6 +1146,24 @@ class OpenAICompatProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
+            # --- LATENCY: allow one round-trip to carry several tool calls ----
+            # MEASURED PROBLEM: the ReAct loop bills one provider round-trip per
+            # *decision*. Without this flag a model that needs four independent
+            # reads issues them one per turn -> four sequential model calls, each
+            # paying full prompt processing + TTFT, for work that has no
+            # dependency at all. The runner is already built for the parallel
+            # case: `_partition_tool_batches` groups concurrency-safe calls and
+            # `concurrent_tools=True` (set in the agent loop) gathers them.
+            # Nothing upstream ever told the model it MAY batch, so the batching
+            # branch was dead code on the hot path.
+            #
+            # Set only when tools are present (the field is meaningless without
+            # them) and let operators disable it with
+            # NANOBOT_PARALLEL_TOOL_CALLS=0 if a strict gateway rejects the
+            # field. A provider that does not understand it ignores it; the
+            # field is already sent by the codex and xai providers in this repo.
+            if _parallel_tool_calls_enabled():
+                kwargs["parallel_tool_calls"] = True
 
         # Backfill reasoning_content="" on assistants missing it: DeepSeek
         # thinking mode rejects history otherwise (#3554, #3584); "" reads
@@ -1396,6 +1429,11 @@ class OpenAICompatProvider(LLMProvider):
         if tools:
             body["tools"] = convert_tools(tools)
             body["tool_choice"] = tool_choice or "auto"
+            # Same latency reason as the chat-completions path above: let one
+            # round-trip carry several independent tool calls so the ReAct loop
+            # does not pay a full model call per decision.
+            if _parallel_tool_calls_enabled():
+                body["parallel_tool_calls"] = True
 
         extra_body = getattr(self, "_extra_body", {})
         default_tools = getattr(self._spec, "responses_default_tools", ())

@@ -125,7 +125,44 @@ _MAX_INJECTION_CYCLES = 5
 #: 20 s is deliberately far longer than a normal call -- most finish inside it
 #: and emit nothing, so this costs nothing on a healthy turn -- and short enough
 #: that a genuinely long call ticks visibly instead of going quiet.
-TOOL_HEARTBEAT_SECONDS = 20.0
+#:
+#: [PERF 2026-09-24] Lowered 20 s -> 8 s and made env-tunable. The narration only
+#: fires on calls that are ALREADY slow (a healthy call returns inside the
+#: window), so a shorter interval costs nothing on the healthy path and makes a
+#: slow call read as slow two-and-a-half times sooner. Override with
+#: NANOBOT_TOOL_HEARTBEAT_S when a deployment wants a different cadence.
+DEFAULT_TOOL_HEARTBEAT_SECONDS = 8.0
+
+
+def _resolve_heartbeat_seconds(env_name: str, module_default: float) -> float:
+    """Return the effective heartbeat interval in seconds.
+
+    Precedence: ``NANOBOT_*_HEARTBEAT_S`` env override, else the module-level
+    constant. Falling back to the module global (rather than the DEFAULT_*
+    literal) is deliberate: the constant stays the single knob tests monkeypatch,
+    while operators get an env override -- and an env value of ``0`` keeps the
+    old explicit opt-out behaviour of a very long interval.
+    """
+    raw = os.environ.get(env_name)
+    if raw is None or not raw.strip():
+        return module_default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid {}={!r}; using {}", env_name, raw, module_default)
+        return module_default
+    return value if value > 0 else module_default
+
+
+def _tool_heartbeat_seconds() -> float:
+    return _resolve_heartbeat_seconds("NANOBOT_TOOL_HEARTBEAT_S", TOOL_HEARTBEAT_SECONDS)
+
+
+def _model_heartbeat_seconds() -> float:
+    return _resolve_heartbeat_seconds("NANOBOT_MODEL_HEARTBEAT_S", MODEL_HEARTBEAT_SECONDS)
+
+
+TOOL_HEARTBEAT_SECONDS = DEFAULT_TOOL_HEARTBEAT_SECONDS
 
 #: How long a model request may produce NOTHING before the turn says so.
 #:
@@ -133,7 +170,13 @@ TOOL_HEARTBEAT_SECONDS = 20.0
 #: critical path of every single iteration, so its silence is the one users hit
 #: most, whereas a long tool call is the exception. Still long enough that a
 #: normal request -- which answers in a couple of seconds -- never emits here.
-MODEL_HEARTBEAT_SECONDS = 15.0
+#:
+#: [PERF 2026-09-24] Lowered 15 s -> 6 s for the same reason as the tool
+#: interval: a healthy request is silent because it finished, not because it is
+#: stuck, so a tighter window only changes how a genuinely slow request reads.
+#: Override with NANOBOT_MODEL_HEARTBEAT_S.
+DEFAULT_MODEL_HEARTBEAT_SECONDS = 6.0
+MODEL_HEARTBEAT_SECONDS = DEFAULT_MODEL_HEARTBEAT_SECONDS
 
 
 def _normalize_for_drift(text: str) -> str:
@@ -1972,7 +2015,9 @@ class AgentRunner:
         started = time.perf_counter()
         try:
             while True:
-                done, _ = await asyncio.wait({task}, timeout=TOOL_HEARTBEAT_SECONDS)
+                done, _ = await asyncio.wait(
+                    {task}, timeout=_tool_heartbeat_seconds()
+                )
                 if done:
                     return task.result()
                 try:
@@ -2018,7 +2063,7 @@ class AgentRunner:
         failed model call.
         """
         while True:
-            await asyncio.sleep(MODEL_HEARTBEAT_SECONDS)
+            await asyncio.sleep(_model_heartbeat_seconds())
             if has_output():
                 return
             try:
