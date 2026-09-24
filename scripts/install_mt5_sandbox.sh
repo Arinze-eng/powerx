@@ -96,7 +96,41 @@ MT5_GECKO_VERSION="${MT5_GECKO_VERSION:-2.47.4 2.47.3}"
 # The Wine series MT5 requires. Wine 11 trips MetaTrader's anti-debug check.
 MT5_WINE_SERIES="${MT5_WINE_SERIES:-10}"
 
-log() { printf '[mt5-install] %s\n' "$*" >&2; }
+# --------------------------------------------------------------------------- #
+# 0. Self-timing
+# --------------------------------------------------------------------------- #
+# Every line this script logs carries the time elapsed since it started:
+#
+#   [mt5-install] [+0s]     installer started
+#   [mt5-install] [+3s]     sandbox memory: 3931 MB (>= 1800 MB required)
+#   [mt5-install] [+186s]   installing WineHQ stable 10 ...
+#
+# WHY THIS EXISTS, given the install already logs every step it takes: the log
+# said WHAT was happening and never HOW LONG, so "the install takes 13 minutes"
+# was not decomposable. The 13 minutes could sit in apt, in the Wine prefix boot,
+# in the 736 MB MT5 download, or in the first terminal launch that materialises
+# the MQL5 library -- and there was no way to tell which without re-running the
+# whole thing under an external stopwatch. MEASURED 2026-09-24 on the local
+# box: the Wine apt step is 34 s of a 3.5-minute install, so the Wine step is
+# NOT the bottleneck and optimizing it would have been wasted work. Two numbers
+# per line turn the log into its own profile: the difference between consecutive
+# lines is the duration of the step between them, which is what a caller needs in
+# order to attack the slow part instead of guessing at it.
+#
+# ``SECONDS`` is a bash builtin counting whole seconds since THIS shell started.
+# The script is executed, never sourced, so that is the start of the install --
+# no ``date`` fork per log line (this fires ~40 times) and no dependency on
+# ``date +%s.%N``, which busybox and older BSD ``date`` do not support.
+_elapsed() {
+  local s="${SECONDS:-0}"
+  if [ "${s}" -ge 60 ]; then
+    printf '+%dm%02ds' "$(( s / 60 ))" "$(( s % 60 ))"
+  else
+    printf '+%ds' "${s}"
+  fi
+}
+
+log() { printf '[mt5-install] [%s] %s\n' "$(_elapsed)" "$*" >&2; }
 
 # Download a URL to a file, retrying on ANY failure.
 #
@@ -231,8 +265,33 @@ MT5_WINVER="${MT5_WINVER:-win10}"
 # Any uncaught error is recorded as a terminal stage so a poller sees a definite
 # failure instead of waiting forever on a stale "in progress" marker.
 _on_error() {
-  local rc=$?
-  printf 'failed|installer exited with code %s\n' "$rc" >"${MT5_ROOT}/install.status" 2>/dev/null || true
+  # ORDER MATTERS, and only the first two lines may come first: ``$?`` is the
+  # status that tripped the trap and ``$BASH_COMMAND`` is the command that was
+  # running when it did, and BASH_COMMAND reflects whatever command is executing
+  # *now* -- so anything that runs before these reads overwrites the evidence.
+  local rc=$? cmd="${BASH_COMMAND}"
+  local line="${BASH_LINENO[0]}"
+
+  # WHERE it died, not just that it did.
+  #
+  # MEASURED 2026-09-24: a fresh install into an empty prefix failed at +2m52s
+  # with ``installer exited with code 1`` and NOTHING else -- the exit code, the
+  # status file and the log's last line ("running the silent MT5 install") all
+  # agreed that something had gone wrong and none of them could say what. A
+  # 3-minute install had to be diagnosed by re-running it under ``set -x``
+  # because the trap threw away the two things bash hands it for free. MT5's own
+  # output went to mt5setup.log, the prefix was intact, and the terminal
+  # directory held MetaEditor64.exe and metatester64.exe but no terminal64.exe --
+  # every one of those facts is consistent with a stall, a kill, and an
+  # unrelated command returning 1.
+  #
+  # The elapsed time belongs on the failure too: a box that died at +00:12s and a
+  # box that died at +12m30s have entirely different causes (a missing dependency
+  # versus a step that timed out), and the exit code alone does not tell them
+  # apart.
+  printf 'failed|installer exited with code %s after %s (line %s: %s)\n' \
+    "$rc" "$(_elapsed)" "${line}" "${cmd}" >"${MT5_ROOT}/install.status" 2>/dev/null || true
+  log "installer exited with code ${rc} after $(_elapsed) at line ${line}: ${cmd}"
   exit "$rc"
 }
 trap _on_error ERR
@@ -263,10 +322,37 @@ if ! is_root; then
   fi
 fi
 
+#: Refresh the apt indexes AT MOST ONCE per install.
+#
+# MEASURED 2026-09-24: a fresh install calls ``apt_install`` four times -- the
+# Wine stack, the base tools, the GL/Vulkan loaders and the window manager -- and
+# every call ran its own ``apt-get update``. That is four full index refreshes
+# against the same mirrors, and every one of them is requests this install then
+# has to wait for: the boxes this runs on are sandboxes, where the cost is
+# round-trip latency, not bandwidth. Downloading and parsing nothing new four
+# times is time taken straight off an install that is already minutes long.
+#
+# Once is enough. Nothing in this script needs an index fresher than the one the
+# install already fetched. ``install_winehq`` is the one deliberate exception and
+# passes ``force``: it ADDS a repository, so its index genuinely does not exist
+# yet and reusing the cached one would leave the Wine packages unfindable.
+#
+# The return value is apt-get's own, so a caller that treats a failed refresh as
+# fatal still can (``install_winehq``), while a caller that can proceed on a
+# cached index still does (``apt_install``).
+_APT_REFRESHED=0
+apt_refresh() {
+  if [ "${1:-}" != "force" ] && [ "${_APT_REFRESHED}" = "1" ]; then
+    return 0
+  fi
+  _APT_REFRESHED=1
+  $SUDO apt-get update -qq >/dev/null 2>&1
+}
+
 apt_install() {
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
-    $SUDO apt-get update -qq >/dev/null 2>&1 || true
+    apt_refresh || true
     $SUDO apt-get install -y -qq --no-install-recommends "$@" >/dev/null 2>&1
     return $?
   fi
@@ -303,7 +389,11 @@ install_winehq() {
       >/dev/null 2>&1 || return 1
 
   export DEBIAN_FRONTEND=noninteractive
-  $SUDO apt-get update -qq >/dev/null 2>&1 || return 1
+  # FORCED, not cached: the WineHQ sources file was just added, so its index does
+  # not exist yet and the cached one cannot name any wine package. This is also
+  # the refresh every later ``apt_install`` reuses, which is why the base tools,
+  # the GL/Vulkan loaders and the window manager no longer fetch their own.
+  apt_refresh force || return 1
 
   # WHY WINE 10 AND NOT THE LATEST:
   #
@@ -605,9 +695,20 @@ fi
 # version string — it raises a hard error and shows a modal dialog that nothing
 # can dismiss, which is exactly the "0% CPU, nothing produced" hang. This must
 # be corrected before ANY MT5 binary runs, i.e. only after the prefix exists.
+# GUARDED, and this is not defensive noise: MEASURED 2026-09-24 on a fresh prefix,
+# this one line killed an install outright. Under ``set -e`` a bare
+# ``var=$(command)`` assignment inherits the command's exit status, and this
+# pipeline exits non-zero whenever ``reg query`` cannot answer -- which a fresh
+# prefix does while wineboot is still settling it. The install aborted at +28s
+# with ``installer exited with code 53``, the log's last line still reading
+# "initialising wine prefix", and the prefix was perfectly usable: the ONE
+# question ``reg query`` could not answer yet was "does this prefix already
+# report Windows 10". An empty answer is not an error here -- it just means the
+# registry writes below are needed, which is exactly what the ``!=`` test does
+# with it.
 winver_current=$(timeout 60 "$WINE_BIN" reg query \
   'HKLM\Software\Microsoft\Windows NT\CurrentVersion' /v CurrentVersion 2>/dev/null \
-  | tr -d '\r' | awk '/CurrentVersion/{print $3}')
+  | tr -d '\r' | awk '/CurrentVersion/{print $3}' || true)
 if [ "${winver_current}" != "10.0" ]; then
   status winecfg "configuring the prefix to report Windows 10"
   timeout 120 "$WINE_BIN" reg add \
