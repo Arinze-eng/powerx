@@ -492,6 +492,16 @@ async def test_runner_times_out_hung_llm_request():
         max_iterations=1,
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
         llm_timeout_s=0.05,
+        # The runner's own wall-clock timeout is what this test asserts on, and
+        # in the default "rate_limit_aware" mode the runner deliberately does NOT
+        # impose one -- that mode delegates per-call timeouts to the provider so a
+        # long Retry-After window cannot be killed by the turn budget. The mock
+        # provider below ignores the timeout it is handed, so under the default
+        # mode nothing bounded the call and this test slept for the mock's full
+        # 3600 s: it did not fail, it HUNG, which took the whole tests/agent run
+        # down with it. Naming a mode where the runner owns the deadline is what
+        # makes it exercise the code path it is named for.
+        provider_retry_mode="standard",
     ))
 
     assert (time.monotonic() - started) < 1.0
@@ -542,6 +552,9 @@ async def test_runner_applies_outer_wall_timeout_to_streaming_requests():
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
             hook=StreamingHook(),
             llm_timeout_s=0.01,
+            # See test_runner_times_out_hung_llm_request: the runner applies this
+            # wall-clock timeout only outside "rate_limit_aware" mode.
+            provider_retry_mode="standard",
         ))
 
     assert result.stop_reason == "completed"
@@ -584,6 +597,10 @@ async def test_runner_times_out_never_ending_streaming_request():
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
             hook=StreamingHook(),
             llm_timeout_s=200,
+            # See test_runner_times_out_hung_llm_request: the runner imposes this
+            # timeout only outside "rate_limit_aware" mode, and without it the
+            # 3600 s mock below is unbounded -- this test hung rather than failed.
+            provider_retry_mode="standard",
         ))
 
     assert result.stop_reason == "error"
@@ -638,6 +655,10 @@ async def test_runner_closes_progress_reasoning_on_streaming_wall_timeout():
             progress_callback=AsyncMock(),
             stream_progress_deltas=True,
             llm_timeout_s=1,
+            # See test_runner_times_out_hung_llm_request: without this the runner
+            # imposes no wall-clock timeout and the 3600 s mock stream below is
+            # unbounded -- this test hung rather than failed.
+            provider_retry_mode="standard",
         ))
 
     assert result.stop_reason == "error"
