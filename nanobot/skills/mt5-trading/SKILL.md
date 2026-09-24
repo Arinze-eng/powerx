@@ -38,10 +38,13 @@ while an install is live is wasted work.
 
 ### When the wait budget runs out
 
-The internal wait is capped (`MT5_INSTALL_WAIT_SECONDS`, default 1500 s). If it
-returns `poll_timeout: true`, the install is **progressing, not broken**. Call
-`action='status'` again immediately and keep polling. Do not restart, do not
-re-run `install`, do not ask the user anything.
+The internal wait is capped (`MT5_INSTALL_WAIT_SECONDS`, default **3300 s / 55
+min** — above the 10–25 min worst case so a normal install finishes *inside* the
+call). If it returns `poll_timeout: true`, the install is **progressing, not
+broken**. Call `action='status'` again immediately, in the same turn, and keep
+polling. Do not restart, do not re-run `install`, do not ask the user anything,
+and **do not reply with a status update and no tool call** — that ends your turn
+and freezes the install, which is the exact failure this rule exists to prevent.
 
 ### Poll it as a WATCH, not as a spin
 
@@ -913,6 +916,16 @@ partial off, moving a stop to breakeven — is **management, not a report**: do 
 and carry on watching. Do not stop the loop to announce what you just did; the
 numbers will be in the final summary, and stopping mid-trade to narrate is how a
 trade ends up unwatched.
+
+**Stay inside the turn while the trade is live.** "Quiet" means "no messages to
+the user", never "end the turn and wait". If you reply with prose and no tool
+call, the turn is over, the watcher has no driver, and the trade is now unwatched
+until the human prompts you again — the opposite of autonomous. So each poll that
+comes back still-open must be followed by another poll **in the same turn**, until
+the position set is empty or one of the three report conditions above is met. If a
+long wait is needed, use the blocking form (`status` with `wait_seconds`, or
+`guard status wait_seconds=`) so the tool waits rather than you ending the turn to
+sleep. The user asked you to run a trade, not to be told that a trade is running.
 
 ### How the loop works
 

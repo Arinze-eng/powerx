@@ -1761,9 +1761,20 @@ class MT5SandboxTool(Tool):
         wait instead of delegating it back to the operator.
 
         Bounded on purpose: a full install is ~2-25 min, and this must never hang a
-        run forever. ``MT5_INSTALL_WAIT_SECONDS`` (default 1500 s / 25 min) caps it.
+        run forever. ``MT5_INSTALL_WAIT_SECONDS`` (default 3300 s / 55 min) caps it.
+
+        [FIX 2026-09-24] The cap was 1500 s (25 min), which is BELOW the tool's own
+        documented worst case for a cold install (Wine + MT5 + MetaEditor, 10-25 min),
+        so a legitimately-slow install hit the budget and returned "still running".
+        The model then did the worst possible thing with that answer: it ended its
+        turn, told the user "I'll keep monitoring", and stopped -- 0 commands, 0 API
+        calls, work frozen with the install still progressing underneath. A budget
+        that expires before the work can legitimately finish is not a safety net, it
+        is a stall generator. It is now set above the realistic worst case so the
+        normal path completes INSIDE this call, and only a genuinely stuck install
+        reaches the timeout branch at all.
         """
-        budget = int(os.getenv("MT5_INSTALL_WAIT_SECONDS", "1500") or 1500)
+        budget = int(os.getenv("MT5_INSTALL_WAIT_SECONDS", "3300") or 3300)
         interval = int(os.getenv("MT5_INSTALL_POLL_SECONDS", "30") or 30)
         deadline = time.monotonic() + budget
         last: dict[str, Any] = {}
@@ -1794,14 +1805,36 @@ class MT5SandboxTool(Tool):
 
         # Out of budget but not failed — report the last stage honestly so the model
         # knows this is "still working", not "broken".
+        #
+        # [FIX 2026-09-24] The message used to say "poll action='status' again",
+        # which a model reads as an instruction to its NEXT turn -- so it ended the
+        # turn, said "I'll keep monitoring" to the user, and stopped. The work then
+        # froze (0 commands, 0 API calls) with the install still running. The
+        # instruction now names the exact call to make and forbids the two ways the
+        # turn gets abandoned: reporting to the user, and waiting for the user.
         if last:
             last = dict(last)
             last["poll_timeout"] = True
+            last["keep_polling"] = True
             last["message"] = (
                 f"Install still running after {budget}s (last stage: "
-                f"{last.get('stage')!r}). It is progressing, not failed — poll "
-                "action='status' again rather than restarting the install."
+                f"{last.get('stage')!r}). It is progressing, not failed."
             )
+            last["next"] = (
+                "KEEP GOING IN THIS SAME TURN: call action='status' now, in this "
+                "response, and continue polling every ~30-60 s until stage='done' or "
+                "'failed'. Do NOT reply to the user in between and do NOT ask them to "
+                "wait or to tell you when to check. That ends your turn and freezes "
+                "the work -- which is exactly the stall this must avoid. Only stop to "
+                "report once the install reaches a terminal stage, or once the budget "
+                "is genuinely exhausted."
+            )
+            last["do_not"] = [
+                "tell the user you will keep monitoring and stop",
+                "ask the user to tell you when to check again",
+                "reply with only a status update and no tool call",
+                "re-run action='install' (it is already running)",
+            ]
             return last
         # No poll completed at all (a zero budget, or every attempt failing): the
         # install is still the only thing that can be true, so say "installing"
@@ -1809,10 +1842,21 @@ class MT5SandboxTool(Tool):
         return {
             "stage": "installing",
             "poll_timeout": True,
+            "keep_polling": True,
             "message": (
                 "The install was started and no status poll completed yet. It is "
-                "progressing, not failed -- poll action='status' again."
+                "progressing, not failed."
             ),
+            "next": (
+                "KEEP GOING IN THIS SAME TURN: call action='status' now and keep "
+                "polling until stage='done' or 'failed'. Do not reply to the user or "
+                "ask them to wait in between -- that ends the turn and freezes the work."
+            ),
+            "do_not": [
+                "tell the user you will keep monitoring and stop",
+                "ask the user to tell you when to check again",
+                "reply with only a status update and no tool call",
+            ],
         }
 
     async def _auto_install_for_broker(
@@ -2011,12 +2055,18 @@ class MT5SandboxTool(Tool):
                     f"It is still running after the wait budget (last stage: {stage!r})."
                 ),
                 "next": (
-                    "Poll mt5_sandbox(action='status') until stage='done', then retry "
-                    f"action='{action}'. Do NOT edit, rewrite, or hand back the .mq5 "
-                    "while provisioning is in progress, and do NOT tell the user to "
-                    "compile it locally — this sandbox compiles it."
+                    "KEEP GOING IN THIS SAME TURN: call action='status' now and keep "
+                    "polling every ~30-60 s until stage='done', then retry "
+                    f"action='{action}'. Do NOT reply to the user or ask them to wait "
+                    "in between -- that ends your turn and freezes the work. Do NOT "
+                    "edit, rewrite, or hand back the .mq5 while provisioning is in "
+                    "progress, and do NOT tell the user to compile it locally — this "
+                    "sandbox compiles it."
                 ),
                 "do_not": [
+                    "tell the user you will keep monitoring and stop",
+                    "ask the user to tell you when to check again",
+                    "reply with only a status update and no tool call",
                     "ask the user to compile in a local MetaEditor",
                     "return 'corrected' .mq5 source instead of compiling it",
                     "claim the compiler is unavailable",
