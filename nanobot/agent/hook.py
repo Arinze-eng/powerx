@@ -122,6 +122,59 @@ class AgentHook:
     ) -> None:
         pass
 
+    async def on_tool_heartbeat(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        elapsed_s: float,
+    ) -> None:
+        """A tool has been running for ``elapsed_s`` seconds without returning.
+
+        WHY THIS EXISTS: ``before_execute_tools`` announces what the agent is
+        about to do and ``after_iteration`` announces what it did, so a tool that
+        blocks in between is announced ONCE and then silent for as long as it
+        takes. MEASURED 2026-09-24: a step reading "checking ..." sat unchanged
+        for 3 minutes on a call that was working fine -- the user's only signal
+        was a frozen label, which is indistinguishable from a hung agent, and the
+        natural response was to send another message (which queues behind the
+        same blocked turn) or give up.
+
+        Emitting elapsed time turns that freeze into visible progress: the label
+        keeps moving, so "slow" reads as slow instead of as broken.
+
+        Called at most once per ``TOOL_HEARTBEAT_SECONDS``, and only for a call
+        that is still running when the interval elapses -- on a healthy turn the
+        fast majority of calls finish first and emit nothing, which is what keeps
+        this from becoming noise. Implementations must stay CHEAP and must not
+        raise: this runs while the turn is blocked, and a hook that throws here
+        would take down the tool call it is only supposed to be narrating.
+        """
+        pass
+
+    async def on_model_heartbeat(
+        self,
+        context: AgentHookContext,
+        elapsed_s: float,
+    ) -> None:
+        """A model request has been in flight for ``elapsed_s`` seconds with no
+        output yet.
+
+        WHY THIS EXISTS: this is the OTHER half of the same freeze
+        ``on_tool_heartbeat`` covers. A tool call announces itself and then goes
+        quiet, and so does a model request -- the difference is that between
+        "the model is about to answer" and the first token there is nothing at
+        all on the wire. Streaming hides this only once it has started; the wait
+        BEFORE the first token is silent at every setting, and on a queued or
+        cold model that is exactly the multi-minute "processing" step users read
+        as a hang.
+
+        Fires only while no output has arrived, so it stops the moment the model
+        starts talking and never competes with real deltas. Called at most once
+        per ``MODEL_HEARTBEAT_SECONDS`` per request. Implementations must stay
+        CHEAP and must not raise, for the same reason as ``on_tool_heartbeat``.
+        """
+        pass
+
     async def on_execute_tool_error(
         self,
         context: AgentHookContext,
@@ -237,6 +290,21 @@ class CompositeHook(AgentHook):
             params,
             result,
         )
+
+    async def on_tool_heartbeat(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        elapsed_s: float,
+    ) -> None:
+        await self._for_each_hook_safe("on_tool_heartbeat", context, tool_call, elapsed_s)
+
+    async def on_model_heartbeat(
+        self,
+        context: AgentHookContext,
+        elapsed_s: float,
+    ) -> None:
+        await self._for_each_hook_safe("on_model_heartbeat", context, elapsed_s)
 
     async def on_execute_tool_error(
         self,

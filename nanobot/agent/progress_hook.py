@@ -20,6 +20,23 @@ from nanobot.utils.progress_events import (
 from nanobot.utils.tool_hints import format_tool_hints
 
 
+def _format_elapsed(seconds: float) -> str:
+    """Seconds as the shortest honest form: ``45s``, ``2m10s``, ``1h02m``.
+
+    Whole seconds only. A tool that has been blocked for two and a bit minutes
+    reads as "2m10s" -- sub-second precision here would be noise on a number that
+    exists to say "this is still going".
+    """
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
 class AgentProgressHook(AgentHook):
     """Translate runner lifecycle events into user-visible progress signals."""
 
@@ -193,6 +210,61 @@ class AgentProgressHook(AgentHook):
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
+
+    async def on_tool_heartbeat(
+        self,
+        context: AgentHookContext,
+        tool_call: Any,
+        elapsed_s: float,
+    ) -> None:
+        """Say that a blocked tool is still running, and for how long.
+
+        Reuses the tool-hint channel rather than inventing a new event type, so
+        every surface that already renders "checking ..." renders this too and
+        nothing has to learn a new message shape. The hint is re-sent with the
+        elapsed time appended, which is the part that makes it progress: an
+        identical string repeated would be deduped by the UI and would look
+        exactly as frozen as saying nothing.
+
+        Failure here is already handled by the caller (the runner swallows it), so
+        this stays deliberately small.
+        """
+        if not self._on_progress:
+            return
+        base = self._tool_hint([tool_call])
+        name = getattr(tool_call, "name", None)
+        label = self._strip_think(base) or (name if isinstance(name, str) and name else "tool")
+        await invoke_on_progress(
+            self._on_progress,
+            f"{label} - still running ({_format_elapsed(elapsed_s)})",
+            tool_hint=True,
+            usage=self._live_usage(context),
+        )
+
+    async def on_model_heartbeat(
+        self,
+        context: AgentHookContext,
+        elapsed_s: float,
+    ) -> None:
+        """Say that the model request is still in flight, and for how long.
+
+        Published on the non-tool-hint progress lane, which is the one every
+        surface already renders as the "thinking / processing" state, so this
+        needs no new event type and no client change. Deliberately NOT a tool
+        hint: no tool is running, and reusing that lane would tell the user the
+        agent was doing something it is not.
+
+        The elapsed time is what makes it progress -- an unchanging string would
+        be deduped by the UI and would look exactly as frozen as the state it is
+        there to explain. Failure is handled by the caller.
+        """
+        if not self._on_progress:
+            return
+        await invoke_on_progress(
+            self._on_progress,
+            f"waiting for the model ({_format_elapsed(elapsed_s)})",
+            usage=self._live_usage(context),
+        )
 
     async def emit_reasoning(self, reasoning_content: str | None) -> None:
         """Publish a reasoning chunk; channel plugins decide whether to render."""

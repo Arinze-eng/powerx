@@ -9,6 +9,7 @@ import os
 import re
 import time
 from collections.abc import Awaitable, Callable, Iterable
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -106,6 +107,33 @@ _MAX_LENGTH_RECOVERIES = 3
 _LENGTH_SEGMENT_PROGRESS_CHARS = 16
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
+
+#: How long one tool call may run before the agent says it is still running.
+#:
+#: MEASURED 2026-09-24, from the loop's own event order: ``before_execute_tools``
+#: publishes the hint for what the agent is about to do ("checking ..."), and the
+#: next thing published is ``after_iteration``, once the tool has already
+#: returned. A tool that blocks in between is therefore announced EXACTLY ONCE
+#: and then silent for as long as it takes -- a step label that can sit unchanged
+#: for three minutes while the call is working perfectly.
+#:
+#: A frozen label is not a neutral state. It is indistinguishable from a hung
+#: agent, so every option the user has is a wrong one: wait and hope, send
+#: another message (which queues behind the same blocked turn), or give up.
+#: Timestamped updates make "slow" read as slow instead of as broken.
+#:
+#: 20 s is deliberately far longer than a normal call -- most finish inside it
+#: and emit nothing, so this costs nothing on a healthy turn -- and short enough
+#: that a genuinely long call ticks visibly instead of going quiet.
+TOOL_HEARTBEAT_SECONDS = 20.0
+
+#: How long a model request may produce NOTHING before the turn says so.
+#:
+#: Shorter than the tool interval on purpose: a model request is on the
+#: critical path of every single iteration, so its silence is the one users hit
+#: most, whereas a long tool call is the exception. Still long enough that a
+#: normal request -- which answers in a couple of seconds -- never emits here.
+MODEL_HEARTBEAT_SECONDS = 15.0
 
 
 def _normalize_for_drift(text: str) -> str:
@@ -1547,6 +1575,16 @@ class AgentRunner:
         # Internal provider retries are handled inside chat_with_retry and do NOT
         # bump this counter — only a real request to the configured LLM counts.
         spec.llm_calls[0] += 1
+        # Narrate the wait before the first token. Streaming cannot cover this
+        # window -- there is nothing on the wire to stream -- so without this the
+        # turn's first visible sign of life is the model's first token, however
+        # long that takes. Cancelled in ``finally`` so a returned, timed-out or
+        # cancelled request can never leave a narrator ticking behind it.
+        model_watch = asyncio.ensure_future(
+            self._watch_model_wait(
+                hook, context, request_started_at, lambda: first_output_at is not None
+            )
+        )
         try:
             response = (
                 await coro if outer_timeout_s is None
@@ -1565,6 +1603,13 @@ class AgentRunner:
                     finish_reason="error",
                     error_kind="timeout",
                 )
+        finally:
+            # Stop the narrator however the request ended -- answered, timed out,
+            # or the turn cancelled out from under it. CancelledError propagates
+            # untouched, so cancelling the turn still cancels the request.
+            model_watch.cancel()
+            with suppress(asyncio.CancelledError):
+                await model_watch
         _pause_generation()
         if first_output_at is not None:
             response.ttft_ms = max(0, round((first_output_at - request_started_at) * 1000))
@@ -1890,6 +1935,99 @@ class AgentRunner:
             merged[key] = merged.get(key, 0) + value
         return merged
 
+    async def _execute_tool_with_heartbeat(
+        self,
+        hook: AgentHook | None,
+        context: AgentHookContext | None,
+        tool_call: ToolCallRequest,
+        run: Awaitable[Any],
+    ) -> Any:
+        """Await one tool call, reporting elapsed time while it blocks.
+
+        The call is driven as a task so the wait can be sliced: every
+        ``TOOL_HEARTBEAT_SECONDS`` the hook is told how long it has been running,
+        and the moment the tool returns the result is handed straight back.
+
+        WHY A TASK AND NOT ``asyncio.wait_for``: the call is not being bounded,
+        it is being OBSERVED. ``wait_for`` would impose a deadline this has no
+        business imposing -- many tools are legitimately slow, and cutting one
+        off would turn a slow answer into no answer. ``asyncio.wait`` with a
+        timeout only ends the *wait*, never the work.
+
+        CANCELLATION MUST SURVIVE: a cancelled turn has to cancel the tool it is
+        blocked on, not leak it. ``ensure_future`` copies the current context, so
+        the tool runs in the same context as before, and the task is cancelled
+        both when the await is cancelled and in ``finally`` if the caller returned
+        early for any other reason. ``CancelledError`` is never converted -- it
+        propagates from ``task.result()`` exactly as it would from a direct await.
+
+        A hook that raises is swallowed on purpose: this runs while the turn is
+        blocked, and a progress label that throws must not take down the tool call
+        it is only narrating.
+        """
+        if hook is None or context is None:
+            return await run
+
+        task = asyncio.ensure_future(run)
+        started = time.perf_counter()
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=TOOL_HEARTBEAT_SECONDS)
+                if done:
+                    return task.result()
+                try:
+                    await hook.on_tool_heartbeat(
+                        context, tool_call, time.perf_counter() - started
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - narration must never break the tool
+                    logger.debug(
+                        "tool heartbeat hook failed for {}", tool_call.name, exc_info=True
+                    )
+        finally:
+            if not task.done():
+                task.cancel()
+
+    @staticmethod
+    async def _watch_model_wait(
+        hook: AgentHook,
+        context: AgentHookContext,
+        started: float,
+        has_output: Callable[[], bool],
+    ) -> None:
+        """Report elapsed time while a model request sits silent.
+
+        WHY A WATCHER TASK AND NOT A WRAPPER: the request path owns its own
+        timeout (``asyncio.wait_for`` on the outer wall clock) and its own
+        cancellation semantics, and it is the hottest code in the loop. Slicing
+        the await the way ``_execute_tool_with_heartbeat`` does would mean
+        restructuring that timeout to keep firing, so this observes from beside
+        the request instead of inside its await.
+
+        Stops as soon as ``has_output`` reports the model has started talking,
+        which is what keeps it from competing with real streamed deltas: once
+        output exists, the stream itself is the progress signal and a second
+        narrator would only be noise. For a non-streaming request nothing ever
+        sets output, and the watcher legitimately ticks for the whole call --
+        which is the case that most needs it, since that request is otherwise
+        completely silent end to end.
+
+        The hook is never allowed to break the turn: this runs concurrently with
+        the request, and a progress label that throws must not surface as a
+        failed model call.
+        """
+        while True:
+            await asyncio.sleep(MODEL_HEARTBEAT_SECONDS)
+            if has_output():
+                return
+            try:
+                await hook.on_model_heartbeat(context, time.perf_counter() - started)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - narration must never break the request
+                logger.debug("model heartbeat hook failed", exc_info=True)
+
     async def _execute_tools(
         self,
         spec: AgentRunSpec,
@@ -2089,9 +2227,13 @@ class AgentRunner:
         await hook.before_execute_tool(context, tool_call, tool, params)
         try:
             if tool is not None:
-                result = await tool.execute(**params)
+                result = await self._execute_tool_with_heartbeat(
+                    hook, context, tool_call, tool.execute(**params)
+                )
             else:
-                result = await spec.tools.execute(tool_call.name, params)
+                result = await self._execute_tool_with_heartbeat(
+                    hook, context, tool_call, spec.tools.execute(tool_call.name, params)
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
