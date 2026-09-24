@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-24.12"
+_CLI_VERSION = "2026-09-24.13"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -438,10 +438,47 @@ def build_guard_rule(kwargs: dict[str, Any]) -> tuple[dict[str, Any] | None, str
     symbol = str(kwargs.get("symbol") or "").strip()
     if not symbol:
         return None, "guard action='arm' requires 'symbol'."
+
+    mode = str(kwargs.get("guard_mode") or "close").strip().lower()
+    if mode not in ("close", "breakeven", "trail"):
+        return None, (
+            f"guard_mode must be 'close', 'breakeven' or 'trail'; got {mode!r}."
+        )
+
+    if mode != "close":
+        # A STOP THAT MOVES ITSELF. There is no level to cross, so 'trigger_price'
+        # has nothing to mean here -- demanding one would force every caller to
+        # invent a number for a field the rule never reads.
+        rule: dict[str, Any] = {"symbol": symbol, "action": "move_stop", "mode": mode}
+        if kwargs.get("ticket"):
+            rule["ticket"] = int(kwargs["ticket"])
+        elif kwargs.get("all_positions"):
+            rule["scope"] = {"all": True}
+        if mode == "breakeven":
+            if kwargs.get("when_r") is not None:
+                rule["when_r"] = float(kwargs["when_r"])
+        else:
+            if kwargs.get("trail_distance") is None:
+                return None, (
+                    "guard_mode='trail' requires 'trail_distance' -- how much "
+                    "PRICE to keep between the best price and the stop. On Gold "
+                    "2.0 is $2.00, which is 20 pips. A distance wider than the "
+                    "trade's own risk is a stop that cannot be reached before the "
+                    "target; a distance of zero puts the stop on the price."
+                )
+            rule["distance"] = float(kwargs["trail_distance"])
+        if kwargs.get("activate_at") is not None:
+            rule["activate_at"] = float(kwargs["activate_at"])
+        if kwargs.get("max_seconds") is not None:
+            rule["max_seconds"] = int(kwargs["max_seconds"])
+        return rule, None
+
     if kwargs.get("trigger_price") is None:
         return None, (
             "guard action='arm' requires 'trigger_price' -- the level to act on. "
-            "For 'close when EURUSD hits 1.1650' that is 1.1650."
+            "For 'close when EURUSD hits 1.1650' that is 1.1650. (For a stop that "
+            "moves itself instead of a close, pass guard_mode='breakeven' or "
+            "'trail' -- those have no level to cross.)"
         )
     try:
         level = float(kwargs["trigger_price"])
@@ -1006,6 +1043,20 @@ class MT5SandboxTool(Tool):
             "watching anything else. session.trade_path carries best_r/worst_r "
             "across every call, so a trade that was +3R an hour ago and is flat now "
             "is a decision you can see. "
+            "A STOP THAT MOVES ITSELF -- the only thing that moves a stop while you "
+            "are not looking. Action='guard' with guard_mode='breakeven' puts the "
+            "stop at the entry once the price is when_r (default 1) times the "
+            "position's own risk in front of it, and guard_mode='trail' keeps the "
+            "stop trail_distance of price behind the best price it has seen, "
+            "following it up and never down. BOTH NEED NO trigger_price: they are a "
+            "standing policy rather than a level to cross, so the detached watcher "
+            "re-evaluates them every tick and they stay armed. A stop only ever "
+            "moves towards profit, never backwards, and is never placed inside the "
+            "broker's minimum stop distance. This matters because between your "
+            "calls NOTHING runs: a trade that goes 3R in your favour and comes back "
+            "to entry while you are away gives back a win you had already earned, "
+            "and 'I will move the stop when I next look' is the same promise that "
+            "expires everywhere else. Arm the trail WITH the order, not after it. "
             "SPLIT TRADING (action='split') -- one idea as N equal tickets at one "
             "price instead of one position: same direction, same stop, and the SAME "
             "TOTAL RISK, but the exits become granular. Take 3 off into a run and "
@@ -1085,6 +1136,10 @@ class MT5SandboxTool(Tool):
                 "all_positions": {"type": "boolean", "description": "action=modify: every open position."},
                 "exit_at": {"type": "number", "description": "action=modify: the price to exit this position at. The SL/TP side is chosen from the position direction and the level is nudged outside the broker's minimum stop distance. This is the instant, broker-held exit -- prefer it over watching the price yourself."},
                 "guard_action": {"type": "string", "enum": ["arm", "status", "stop", "clear", "events", "ensure"], "description": "action=guard: \"arm\" starts the detached tick-level watcher that closes at trigger_price; \"status\" reports whether it is alive, the rules armed, the price it is seeing and whether any rule cannot be priced; \"events\" returns its log including the measured trigger->fill latency_ms; \"stop\" ends it; \"clear\" drops the rules; \"ensure\" restarts the watcher when rules are still armed but nothing is running, and reports how long the levels went unwatched. Defaults to status. A stopped guard with rules still armed is reported as an ALERT, not a healthy status."},
+                "guard_mode": {"type": "string", "enum": ["close", "breakeven", "trail"], "description": "action=guard (arm): WHAT the guard does at the level, and the one field that turns a one-shot close into a stop that moves itself. 'close' (default) closes the matched positions the instant the level is touched. 'breakeven' waits until the price is when_r times the position's OWN stop distance in front of its entry and then puts the stop AT the entry -- the trade can no longer lose, and no level has to be guessed. 'trail' keeps the stop trail_distance of price behind the best price the position has seen, following it up and never down. Both of the moving modes need no trigger_price: they are a standing policy, not a level to cross, so they are re-evaluated every tick and stay armed. A stop only ever moves towards profit, never backwards, and is never placed inside the broker's minimum stop distance (which would come back 10016 Invalid stops). THIS IS THE ONLY WAY A STOP MOVES WITHOUT YOU: nothing else runs between your calls."},
+                "when_r": {"type": "number", "description": "action=guard (guard_mode='breakeven'): how far in front of the entry the price has to be, measured in R -- the position's own initial stop distance -- before the stop moves to the entry. Default 1.0, which is 'take the risk off at 1R'. R is measured ONCE, from the position as it was when the rule first saw it, so a stop that has already moved cannot make the next trigger drift."},
+                "trail_distance": {"type": "number", "description": "action=guard (guard_mode='trail'): how much PRICE to keep between the best price and the stop. In the same units as the price and the stop, NOT pips: on Gold 2.0 is $2.00 = 20 pips, and a $2 stop behind the price is the playbook's own stop distance. A distance of zero would put the stop on the price and close the position."},
+                "activate_at": {"type": "number", "description": "action=guard (guard_mode='breakeven'/'trail'): do not start moving the stop until the price reaches this. Use it to let a trade breathe before it is protected -- 'trail once Gold is above 4300'."},
                 "guard_allow_unpriceable": {"type": "boolean", "description": "action=guard (arm): arm even if a rule's symbol has no tick right now. Off by default: a guard on a symbol the CLI cannot price polls in silence and looks exactly like protection, so it is refused unless you know the symbol prices later (e.g. a market that has not opened yet)."},
                 "trigger_price": {"type": "number", "description": "action=guard (arm): the price level to act on, e.g. 1.1650 in \"close when EURUSD hits 1.1650\"."},
                 "trigger_op": {"type": "string", "enum": [">=", "<="], "description": "action=guard (arm): \">=\" fires at or above the level, \"<=\" at or below. Omit it and the direction is inferred from the live price."},

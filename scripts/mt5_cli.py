@@ -66,7 +66,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.12"
+CLI_VERSION = "2026-09-24.13"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -5090,6 +5090,178 @@ def close_positions(rule, positions, deviation, magic):
     return results
 
 
+#: How often a move_stop rule may talk to the broker. Trailing acts on the tick
+#: that makes a new best, but a stop is only SENT when the target improves on the
+#: one already there, so this is a brake on EVALUATION rather than on the moves:
+#: it keeps a fast market from producing one order_send per 100 ms loop, and it
+#: costs nothing on a quiet one, because the answer would have been "already
+#: there" anyway.
+MOVE_COOLDOWN_SECONDS = 1.0
+
+
+def stop_room(info):
+    """The broker's minimum stop distance in PRICE, or 0 if it does not say.
+
+    ``trade_stops_level`` is in POINTS, and a point is not a pip: on Gold the
+    point is 0.01 and the pip is 0.10, so a level of 18 points is 0.18 of price.
+    Multiplying by ``point`` here is what keeps that conversion in one place.
+    """
+    points = int(getattr(info, "trade_stops_level", 0) or 0)
+    point = float(getattr(info, "point", 0.0) or 0.0)
+    return points * point
+
+
+def move_stops(rule, positions, deviation, magic):
+    """Push each position's stop further into profit. THREE RULES, all safety:
+
+      * NEVER BACKWARDS. A stop only ever moves towards the position's profit, so
+        the worst this can do is nothing. A trailing rule that could loosen a
+        stop would be a rule that gives back a protected loss.
+      * NEVER INTO THE BROKER'S FORBIDDEN ZONE. A stop inside the symbol's
+        minimum stop distance is refused by the server (retcode 10016), so it is
+        skipped with the room named rather than sent and refused.
+      * NEVER "FIX" A POSITION THAT HAS NO STOP. mode=breakeven needs a stop to
+        move; a naked position is REPORTED, not given one here, because the
+        level to set would be a guess.
+
+    ``mode=breakeven`` waits until the price is ``when_r`` times the position's
+    own stop distance in front of its entry, then puts the stop AT the entry.
+    ``mode=trail`` keeps the stop ``distance`` of price behind the best price the
+    position has seen, optionally not before ``activate_at``.
+
+    R is measured ONCE, from the position as it was when the rule first saw it,
+    and remembered on the rule. Measured off the CURRENT stop instead, breakeven
+    would re-measure against a stop it had already moved and the trigger would
+    drift every time it fired.
+    """
+    mode = str(rule.get("mode") or "breakeven").lower()
+    refs = rule.setdefault("move_ref", {})
+    best = rule.setdefault("move_best", {})
+    results = []
+    for position in positions:
+        ticket = str(int(position.ticket))
+        row = {"ticket": int(position.ticket)}
+        info = mt5.symbol_info(position.symbol)
+        tick = mt5.symbol_info_tick(position.symbol)
+        if info is None or tick is None:
+            row.update({"ok": False, "error": f"no tick for {position.symbol}"})
+            results.append(row)
+            continue
+        is_long = position.type == mt5.POSITION_TYPE_BUY
+        entry = float(position.price_open or 0.0)
+        current = float(position.sl or 0.0)
+        # The price that a stop on THIS side has to beat: a long is stopped out on
+        # the bid, a short on the ask.
+        price = float(tick.bid if is_long else tick.ask)
+        room = stop_room(info)
+
+        ref = refs.get(ticket)
+        if not isinstance(ref, dict):
+            refs[ticket] = ref = {
+                "entry": entry,
+                "risk": abs(entry - current) if current else 0.0,
+            }
+            row["recorded"] = True
+        risk = float(ref.get("risk") or 0.0)
+
+        if mode == "breakeven":
+            if not current:
+                row.update({
+                    "ok": False, "skipped": "this position has NO stop to move",
+                    "detail": "put a stop on it first (modify), then re-arm",
+                })
+                results.append(row)
+                continue
+            if not risk:
+                row.update({
+                    "ok": False,
+                    "skipped": "no stop distance to measure R against",
+                })
+                results.append(row)
+                continue
+            multiple = float(rule.get("when_r") or 1.0)
+            trigger = entry + multiple * risk if is_long else entry - multiple * risk
+            reached = price >= trigger if is_long else price <= trigger
+            if not reached:
+                row.update({
+                    "ok": True,
+                    "skipped": f"not yet {multiple:g}R ({round(trigger, 5)})",
+                    "sl": current,
+                })
+                results.append(row)
+                continue
+            target = entry
+        else:
+            activate = rule.get("activate_at")
+            if activate is not None:
+                level = float(activate)
+                if not (price >= level if is_long else price <= level):
+                    row.update({
+                        "ok": True, "skipped": f"not active until {level}", "sl": current,
+                    })
+                    results.append(row)
+                    continue
+            distance = float(rule.get("distance") or 0.0)
+            if distance <= 0:
+                row.update({"ok": False, "error": "mode=trail needs a positive 'distance'"})
+                results.append(row)
+                continue
+            seen = best.get(ticket)
+            better = seen is None or (price > float(seen) if is_long else price < float(seen))
+            if better:
+                best[ticket] = price
+                row["recorded"] = True
+            peak = float(best.get(ticket) or price)
+            target = peak - distance if is_long else peak + distance
+
+        improved = target > current if is_long else (target < current or not current)
+        if not improved:
+            row.update({
+                "ok": True, "skipped": "the stop is already at least that far",
+                "sl": current, "target": round(float(target), 5),
+            })
+            results.append(row)
+            continue
+        if room:
+            nearest = price - room if is_long else price + room
+            inside = target > nearest if is_long else target < nearest
+            if inside:
+                row.update({
+                    "ok": False,
+                    "skipped": (
+                        f"the broker needs {round(room, 5)} of room between the "
+                        f"price ({price}) and a stop, and {round(float(target), 5)} "
+                        "is inside it. Not sent -- it would only come back 10016 "
+                        "Invalid stops."
+                    ),
+                    "sl": current,
+                })
+                results.append(row)
+                continue
+
+        result = mt5.order_send({
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": position.symbol,
+            "position": position.ticket,
+            "sl": float(target),
+            # The target is NOT touched: this rule owns the stop and nothing else.
+            "tp": float(position.tp or 0.0),
+        })
+        if result is None:
+            row.update({"ok": False, "error": str(mt5.last_error())})
+        else:
+            row.update({
+                "ok": result.retcode == RETCODE_DONE,
+                "retcode": result.retcode,
+                "comment": result.comment,
+            })
+        row["from_sl"] = current
+        row["to_sl"] = round(float(target), 5)
+        row["mode"] = mode
+        results.append(row)
+    return results
+
+
 def price_for_rule(rule, tick):
     side = str(rule.get("side") or "mid").lower()
     if side == "bid":
@@ -5327,10 +5499,74 @@ def main():
             unpriced_since.pop(symbol, None)
             price, used_side = price_for_rule(rule, tick)
             prices[symbol] = price
-            op = str(rule.get("op") or ">=")
-            level = float(rule.get("price"))
             rule["last_price"] = price
             rule["last_price_ts"] = now
+
+            if str(rule.get("action") or "close").lower() == "move_stop":
+                # A stop that moves itself has NO LEVEL TO CROSS, so it is
+                # exempt from everything below: the trigger, the recorded-tick
+                # scan, the near-miss report and the close-retry machinery are
+                # all about a one-shot decision at a price. This is a standing
+                # policy whose answer changes every time the price makes a new
+                # best, so it is evaluated on every pass instead -- and it is
+                # re-evaluated from the POSITION each time, not from a cached
+                # decision, so a stop moved by anything else is respected.
+                if now - float(rule.get("last_move") or 0.0) < MOVE_COOLDOWN_SECONDS:
+                    continue
+                rule["last_move"] = now
+                targets = matching_positions(rule)
+                if not targets:
+                    # Nothing left to protect. Not an error and not an exit: the
+                    # rule stays armed for the next position on the symbol, which
+                    # is what makes a trailing policy usable across a session
+                    # rather than only on the trade it was armed for.
+                    continue
+                moved = move_stops(rule, targets, args.deviation, args.magic)
+                sent = [r for r in moved if r.get("retcode") is not None]
+                acted = [r for r in sent if r.get("ok")]
+                refused = [r for r in sent if not r.get("ok")]
+                skipped = [r for r in moved if r.get("retcode") is None]
+                recorded = any(r.get("recorded") for r in moved)
+                if acted or refused:
+                    append_jsonl(args.events, {
+                        "event": "stop_moved" if acted else "stop_move_failed",
+                        "ts": now, "rule_id": rule.get("id"), "symbol": symbol,
+                        "mode": str(rule.get("mode") or "breakeven"),
+                        "price": price, "side": used_side,
+                        "moved": acted, "refused": refused,
+                        "skipped": [r.get("skipped") for r in skipped],
+                        "polls": polls,
+                    })
+                    if acted:
+                        note(
+                            f"{rule.get('id')} STOP MOVED "
+                            + ", ".join(
+                                f"#{r['ticket']} {r.get('from_sl')}->{r.get('to_sl')}"
+                                for r in acted
+                            )
+                            + f" ({rule.get('mode')}, price {price})"
+                        )
+                    if refused:
+                        note(
+                            f"{rule.get('id')} STOP MOVE FAILED "
+                            f"{[r.get('retcode') for r in refused]}: {refused}"
+                        )
+                if recorded:
+                    # The R reference and the trailing peak were captured for the
+                    # first time and have to survive a restart of this watcher --
+                    # and note this is NOT an 'else' to the send above: the pass
+                    # that moves a stop is exactly the pass that first measures R,
+                    # so hanging the write off the quiet passes lost it in the
+                    # common case and made a restart re-measure R off the stop it
+                    # had just moved.
+                    changed = True
+                continue
+
+            # Everything below is about a LEVEL TO CROSS, which a moving stop
+            # does not have -- so 'price'/'op' are read here, past the branch
+            # above, and a policy rule never touches them.
+            op = str(rule.get("op") or ">=")
+            level = float(rule.get("price"))
 
             # ---- every tick, not just the one we happened to poll ---------------
             # ``price`` above is ONE tick: the feed records several a second and
@@ -5778,6 +6014,8 @@ def _guard_events_after(mark: int) -> list[dict[str, Any]]:
 #: caller must do next belongs here.
 _GUARD_WATCH_EVENTS = (
     "fired",
+    "stop_moved",
+    "stop_move_failed",
     "close_failed",
     "close_gave_up",
     "close_retry_resumed",
@@ -5957,6 +6195,82 @@ def _validate_rule(
     symbol = str(raw.get("symbol") or "").strip()
     if not symbol:
         raise ValueError(f"rule {index} needs a 'symbol'")
+    action = str(raw.get("action") or "close").strip().lower()
+
+    def _scope() -> dict[str, Any]:
+        """The tickets this rule owns, shared by every rule action."""
+        raw_ticket = raw.get("ticket")
+        scope_raw = raw.get("scope") if isinstance(raw.get("scope"), dict) else {}
+        if raw_ticket is None:
+            raw_ticket = scope_raw.get("ticket")
+        if raw_ticket not in (None, "", 0):
+            try:
+                return {"ticket": int(raw_ticket)}
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"rule {index}: 'ticket' is not an integer") from exc
+        if scope_raw.get("all") or raw.get("all"):
+            return {"all": True}
+        return {"symbol": str(scope_raw.get("symbol") or symbol)}
+
+    if action == "move_stop":
+        # A stop that moves itself is NOT a trigger: there is no level to cross,
+        # so 'price'/'op' have nothing to mean here and requiring them would
+        # force every caller to invent a number for a field that is unused.
+        mode = str(raw.get("mode") or "breakeven").strip().lower()
+        if mode not in ("breakeven", "trail"):
+            raise ValueError(
+                f"rule {index}: mode must be 'breakeven' (move the stop to the "
+                f"entry once the price is a multiple of R in front) or 'trail' "
+                f"(keep the stop a fixed distance behind the best price); got "
+                f"{mode!r}"
+            )
+        rule_out: dict[str, Any] = {
+            "id": str(raw.get("id") or f"g{int(time.time())}-{index}"),
+            "symbol": symbol,
+            "action": "move_stop",
+            "mode": mode,
+            "side": "mid",
+            "scope": _scope(),
+            # A policy is by definition recurring: a moving stop that stopped
+            # moving after its first move would be a stop that quietly stopped
+            # protecting. There is no 'once' here to get wrong.
+            "once": False,
+            "created_at": time.time(),
+            "armed_by": "mt5_cli",
+            "price_at_arm": price_hint,
+        }
+        if mode == "breakeven":
+            try:
+                when_r = float(raw.get("when_r", 1.0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"rule {index}: 'when_r' is not a number") from exc
+            if when_r <= 0:
+                raise ValueError(f"rule {index}: 'when_r' must be positive")
+            rule_out["when_r"] = when_r
+        else:
+            try:
+                distance = float(raw["distance"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"rule {index}: mode='trail' needs a numeric 'distance' -- how "
+                    "much PRICE to keep between the best price and the stop. On "
+                    "Gold 2.0 is $2.00, which is 20 pips."
+                ) from exc
+            if distance <= 0:
+                raise ValueError(
+                    f"rule {index}: 'distance' must be positive; a trail of zero "
+                    "would put the stop on the price and close the position."
+                )
+            rule_out["distance"] = distance
+        if raw.get("activate_at") is not None:
+            try:
+                rule_out["activate_at"] = float(raw["activate_at"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"rule {index}: 'activate_at' is not a number") from exc
+        if raw.get("max_seconds") is not None:
+            rule_out["max_seconds"] = int(raw["max_seconds"])
+        return rule_out
+
     if raw.get("price") is None:
         raise ValueError(f"rule {index} needs a 'price' (the level to act on)")
     try:
@@ -6008,6 +6322,11 @@ def _validate_rule(
     else:
         volume = None
 
+    if action != "close":
+        raise ValueError(
+            f"rule {index}: unknown action {action!r}. Use 'close' (the default) "
+            "or 'move_stop'."
+        )
     return {
         "id": str(raw.get("id") or f"g{int(time.time())}-{index}"),
         "symbol": symbol,
@@ -6015,7 +6334,7 @@ def _validate_rule(
         "price": level,
         "side": side,
         "scope": scope,
-        "action": str(raw.get("action") or "close"),
+        "action": action,
         "volume": volume,
         "once": bool(raw.get("once", True)),
         "created_at": time.time(),

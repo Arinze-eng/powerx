@@ -3033,6 +3033,7 @@ class _FakeMT5:
     ORDER_FILLING_RETURN = 3
     ORDER_TIME_GTC = 0
     TRADE_ACTION_DEAL = 1
+    TRADE_ACTION_SLTP = 6
     COPY_TICKS_ALL = 0
     COPY_TICKS_TRADE = 1
     COPY_TICKS_INFO = 2
@@ -3050,8 +3051,18 @@ class _FakeMT5:
         ticks: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None,
         tick_after_polls: tuple[int, float, float] | None = None,
         ticks_after_polls: tuple[int, list[dict[str, Any]]] | None = None,
+        stops_level_points: int = 0,
+        sltp_retcodes: tuple[int, ...] = (10009,),
     ) -> None:
         self.script = list(retcodes) or [10009]
+        #: How much room the broker demands between the price and a stop, in
+        #: points. Non-zero is how the "refused with 10016 Invalid stops" case is
+        #: reproduced without a broker.
+        self.stops_level_points = int(stops_level_points)
+        self.sltp_script = list(sltp_retcodes) or [10009]
+        #: Every TRADE_ACTION_SLTP sent, kept apart from ``sends`` so a test can
+        #: read the stop moves without filtering the deals out of them.
+        self.sltp_sends: list[dict[str, Any]] = []
         self.poll_count = 0
         self.swapped = False
         self.tick_after_polls = tick_after_polls
@@ -3099,7 +3110,11 @@ class _FakeMT5:
         return True
 
     def symbol_info(self, _symbol: str) -> Any:
-        return types.SimpleNamespace(filling_mode=self.ORDER_FILLING_FOK)
+        return types.SimpleNamespace(
+            filling_mode=self.ORDER_FILLING_FOK,
+            trade_stops_level=self.stops_level_points,
+            point=0.01,
+        )
 
     def symbol_info_tick(self, _symbol: str) -> Any:
         self.poll_count += 1
@@ -3151,6 +3166,20 @@ class _FakeMT5:
 
     def order_send(self, request: dict[str, Any]) -> Any:
         self.sends.append(dict(request))
+        if int(request.get("action") or 0) == self.TRADE_ACTION_SLTP:
+            # Moving a stop is not a deal: the position stays OPEN and the new
+            # stop is what the next pass reads back off it, which is what makes a
+            # trailing rule a loop rather than a one-shot.
+            self.sltp_sends.append(dict(request))
+            retcode = (
+                self.sltp_script.pop(0) if len(self.sltp_script) > 1
+                else self.sltp_script[0]
+            )
+            if retcode == 10009:
+                for position in self.positions:
+                    if position.ticket == int(request.get("position") or 0):
+                        position.sl = float(request.get("sl") or 0.0)
+            return types.SimpleNamespace(retcode=retcode, comment="moved", deal=0)
         if self.tick_after is not None and len(self.sends) == self.tick_after_sends:
             # The price moves back INSIDE the level while the refused close is
             # still pending -- the case that used to abandon the exit.
@@ -4939,3 +4968,523 @@ def test_the_limits_limits_are_documented_as_money_and_counts():
     assert props["max_total_risk_money"]["type"] == "number"
     # A stopless order cannot be counted, and says so.
     assert "no stop" in props["max_total_risk_money"]["description"]
+
+
+# --------------------------------------------------------------------------- #
+# A stop that moves itself: guard action ``move_stop``
+#
+# ``stop_room`` and ``move_stops`` live INSIDE the embedded watcher source -- the
+# file the sandbox actually runs -- so they are reached by running that source,
+# never by copying the arithmetic into a test that would then drift from it.
+# --------------------------------------------------------------------------- #
+class _StopMT5:
+    """A terminal that can move a stop and nothing else."""
+
+    POSITION_TYPE_BUY = 0
+    TRADE_ACTION_SLTP = 6
+
+    def __init__(
+        self, bid: float, ask: float | None = None, *,
+        stops_level_points: int = 0, point: float = 0.01, retcode: int = 10009,
+    ) -> None:
+        self.tick = types.SimpleNamespace(
+            bid=float(bid), ask=float(bid if ask is None else ask)
+        )
+        self.info = types.SimpleNamespace(
+            point=float(point), trade_stops_level=int(stops_level_points)
+        )
+        self.retcode = int(retcode)
+        self.sl_sends: list[dict[str, Any]] = []
+
+    def move_to(self, bid: float, ask: float | None = None) -> "_StopMT5":
+        self.tick = types.SimpleNamespace(
+            bid=float(bid), ask=float(bid if ask is None else ask)
+        )
+        return self
+
+    def symbol_info(self, _symbol: str) -> Any:
+        return self.info
+
+    def symbol_info_tick(self, _symbol: str) -> Any:
+        return self.tick
+
+    def order_send(self, request: dict[str, Any]) -> Any:
+        self.sl_sends.append(dict(request))
+        return types.SimpleNamespace(retcode=self.retcode, comment="moved", deal=0)
+
+    def last_error(self) -> tuple[int, str]:
+        return (0, "no error")
+
+
+def _position(
+    *, entry: float, sl: float, tp: float = 0.0, ticket: int = 9001,
+    symbol: str = "XAUUSD", side: int = 0,
+) -> Any:
+    return types.SimpleNamespace(
+        ticket=ticket, symbol=symbol, type=side, volume=0.1,
+        price_open=float(entry), sl=float(sl), tp=float(tp),
+    )
+
+
+def _watcher_defs(cli: Any, monkeypatch: Any, mt5: Any) -> dict[str, Any]:
+    """The watcher's own namespace, so one stop rule can be evaluated alone."""
+    monkeypatch.setitem(sys.modules, "MetaTrader5", mt5)
+    namespace: dict[str, Any] = {"__name__": "guard_watch_under_test"}
+    exec(compile(cli._GUARD_WATCH_SOURCE, "<guard_watch>", "exec"), namespace)
+    return namespace
+
+
+def _breakeven_rule(**overrides: Any) -> dict[str, Any]:
+    rule = {
+        "id": "g-be", "symbol": "XAUUSD", "action": "move_stop",
+        "mode": "breakeven", "when_r": 1.0,
+    }
+    rule.update(overrides)
+    return rule
+
+
+def _trail_rule(**overrides: Any) -> dict[str, Any]:
+    rule = {
+        "id": "g-tr", "symbol": "XAUUSD", "action": "move_stop",
+        "mode": "trail", "distance": 2.0,
+    }
+    rule.update(overrides)
+    return rule
+
+
+def test_the_brokers_minimum_stop_distance_is_its_points_in_price(monkeypatch, tmp_path):
+    """Points are not pips, and mixing them up is how a valid stop gets refused.
+
+    On Gold the point is 0.01 and the pip is 0.10, so a ``trade_stops_level`` of
+    18 is 0.18 of price -- 1.8 pips, not 18.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _StopMT5(4300.0)
+    defs = _watcher_defs(cli, monkeypatch, mt5)
+
+    assert defs["stop_room"](types.SimpleNamespace(trade_stops_level=18, point=0.01)) == 0.18
+    # A terminal that does not report the field cannot forbid anything.
+    assert defs["stop_room"](types.SimpleNamespace()) == 0.0
+
+
+def test_breakeven_waits_for_its_multiple_of_r_and_then_lands_on_the_entry(
+    monkeypatch, tmp_path
+):
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _StopMT5(4310.0, 4310.2)
+    defs = _watcher_defs(cli, monkeypatch, mt5)
+    rule = _breakeven_rule()
+    position = _position(entry=4300.0, sl=4280.0, tp=4360.0)
+
+    # 4310 is 10 of the 20 the stop risks, so 1R is 4320 and the stop is untouched.
+    early = defs["move_stops"](rule, [position], 30, 0)
+    assert early[0]["ok"] is True and "not yet 1R" in early[0]["skipped"]
+    assert mt5.sl_sends == [], "the stop must not be touched before the trigger"
+
+    mt5.move_to(4321.0, 4321.2)
+    reached = defs["move_stops"](rule, [position], 30, 0)
+    assert reached[0]["ok"] is True
+    assert reached[0]["from_sl"] == 4280.0 and reached[0]["to_sl"] == 4300.0
+    assert len(mt5.sl_sends) == 1
+    sent = mt5.sl_sends[0]
+    assert sent["action"] == 6 and sent["sl"] == 4300.0
+    assert sent["position"] == 9001
+    # The target belongs to whoever set it: this rule owns the stop and nothing else.
+    assert sent["tp"] == 4360.0
+
+
+def test_the_r_a_breakeven_uses_is_the_one_it_measured_at_first_sight(
+    monkeypatch, tmp_path
+):
+    """R must not be re-measured off a stop that has already been moved.
+
+    Re-measured, R collapses as the stop advances, the trigger drifts down with
+    it, and the rule fires again for no reason -- a stop that walks itself into
+    the price.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _StopMT5(4315.0, 4315.2)
+    defs = _watcher_defs(cli, monkeypatch, mt5)
+    rule = _breakeven_rule()
+    position = _position(entry=4300.0, sl=4280.0)
+
+    defs["move_stops"](rule, [position], 30, 0)
+    assert rule["move_ref"]["9001"]["risk"] == 20.0
+
+    # Something else moves the stop -- the model, or a different rule.
+    position.sl = 4285.0
+    again = defs["move_stops"](rule, [position], 30, 0)
+
+    assert "1R" in again[0]["skipped"], again[0]
+    assert again[0]["sl"] == 4285.0
+    assert rule["move_ref"]["9001"]["risk"] == 20.0
+    assert mt5.sl_sends == []
+
+
+def test_a_breakeven_rule_reports_a_naked_position_instead_of_inventing_a_stop(
+    monkeypatch, tmp_path
+):
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _StopMT5(4321.0, 4321.2)
+    defs = _watcher_defs(cli, monkeypatch, mt5)
+
+    rows = defs["move_stops"](_breakeven_rule(), [_position(entry=4300.0, sl=0.0)], 30, 0)
+
+    assert rows[0]["ok"] is False
+    assert "NO stop to move" in rows[0]["skipped"]
+    assert mt5.sl_sends == [], "the level to set would be a guess, so none is set"
+
+
+def test_a_trail_follows_the_best_price_and_never_loosens_the_stop(
+    monkeypatch, tmp_path
+):
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _StopMT5(4300.0, 4300.2)
+    defs = _watcher_defs(cli, monkeypatch, mt5)
+    rule = _trail_rule()
+    position = _position(entry=4280.0, sl=4290.0)
+
+    first = defs["move_stops"](rule, [position], 30, 0)
+    assert first[0]["to_sl"] == 4298.0 and len(mt5.sl_sends) == 1
+
+    # The market gives back 20 of price. The PEAK is what the stop hangs off, so
+    # the answer is "already there" -- never a looser stop.
+    position.sl = 4298.0
+    mt5.move_to(4280.0, 4280.2)
+    back = defs["move_stops"](rule, [position], 30, 0)
+
+    assert back[0]["ok"] is True and "already at least that far" in back[0]["skipped"]
+    assert back[0]["target"] == 4298.0
+    assert len(mt5.sl_sends) == 1, "a trailing stop only ever moves one way"
+
+
+def test_a_trail_will_not_put_the_stop_inside_the_brokers_forbidden_zone(
+    monkeypatch, tmp_path
+):
+    """Sent anyway, this is the stop that comes back 10016 Invalid stops."""
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _StopMT5(4300.0, 4300.2, stops_level_points=18)
+    defs = _watcher_defs(cli, monkeypatch, mt5)
+
+    rows = defs["move_stops"](
+        _trail_rule(distance=0.05), [_position(entry=4280.0, sl=4280.0)], 30, 0
+    )
+
+    assert rows[0]["ok"] is False
+    assert "10016" in rows[0]["skipped"]
+    assert mt5.sl_sends == [], "it would only come back refused"
+
+
+def test_a_trail_can_be_held_back_until_a_price(monkeypatch, tmp_path):
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _StopMT5(4300.0, 4300.2)
+    defs = _watcher_defs(cli, monkeypatch, mt5)
+
+    rows = defs["move_stops"](
+        _trail_rule(activate_at=4310.0), [_position(entry=4280.0, sl=4280.0)], 30, 0
+    )
+
+    assert rows[0]["skipped"] == "not active until 4310.0"
+    assert mt5.sl_sends == []
+
+
+def test_a_stop_move_the_broker_refuses_is_reported_with_its_retcode(
+    monkeypatch, tmp_path
+):
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _StopMT5(4300.0, 4300.2, retcode=10016)
+    defs = _watcher_defs(cli, monkeypatch, mt5)
+
+    rows = defs["move_stops"](_trail_rule(), [_position(entry=4280.0, sl=4290.0)], 30, 0)
+
+    assert rows[0]["ok"] is False and rows[0]["retcode"] == 10016
+    assert len(mt5.sl_sends) == 1
+
+
+def test_a_moving_stop_rule_arms_without_a_price_because_it_has_no_level(
+    monkeypatch, tmp_path
+):
+    cli = _broker_cli(monkeypatch, tmp_path)
+
+    rule = cli._validate_rule(
+        {"symbol": "XAUUSD", "action": "move_stop", "mode": "breakeven", "ticket": 9001},
+        0, price_hint=4300.0,
+    )
+
+    assert rule["action"] == "move_stop" and rule["mode"] == "breakeven"
+    assert rule["when_r"] == 1.0
+    assert rule["scope"] == {"ticket": 9001}
+    # A POLICY, not a one-shot: a moving stop that stopped moving is no protection.
+    assert rule["once"] is False
+    # Requiring a level here would force every caller to invent one for a field
+    # the rule never reads.
+    assert "price" not in rule and "op" not in rule
+
+
+def test_a_trailing_rule_carries_its_distance_and_can_wait_for_a_price(
+    monkeypatch, tmp_path
+):
+    cli = _broker_cli(monkeypatch, tmp_path)
+
+    rule = cli._validate_rule(
+        {"symbol": "XAUUSD", "action": "move_stop", "mode": "trail",
+         "distance": 2.0, "activate_at": 4310.0}, 0, 4300.0,
+    )
+
+    assert rule["mode"] == "trail" and rule["distance"] == 2.0
+    assert rule["activate_at"] == 4310.0
+    assert "when_r" not in rule
+
+
+def test_a_moving_stop_rule_refuses_a_mode_it_cannot_perform(monkeypatch, tmp_path):
+    cli = _broker_cli(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        cli._validate_rule({"symbol": "XAUUSD", "action": "move_stop", "mode": "nope"}, 0)
+
+    assert "breakeven" in str(excinfo.value) and "trail" in str(excinfo.value)
+
+
+def test_a_trail_without_a_distance_is_refused_rather_than_defaulted(
+    monkeypatch, tmp_path
+):
+    cli = _broker_cli(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        cli._validate_rule({"symbol": "XAUUSD", "action": "move_stop", "mode": "trail"}, 0)
+    assert "distance" in str(excinfo.value)
+
+    with pytest.raises(ValueError) as zero:
+        cli._validate_rule(
+            {"symbol": "XAUUSD", "action": "move_stop", "mode": "trail", "distance": 0}, 0
+        )
+    assert "positive" in str(zero.value)
+
+
+def test_a_breakeven_multiple_of_r_of_zero_is_refused(monkeypatch, tmp_path):
+    cli = _broker_cli(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        cli._validate_rule(
+            {"symbol": "XAUUSD", "action": "move_stop", "mode": "breakeven", "when_r": -1}, 0
+        )
+
+    assert "positive" in str(excinfo.value)
+
+
+def test_a_guard_action_nobody_implements_is_refused_by_name(monkeypatch, tmp_path):
+    cli = _broker_cli(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        cli._validate_rule(
+            {"symbol": "XAUUSD", "price": 4300.0, "action": "wibble"}, 0, 4300.0
+        )
+
+    assert "unknown action" in str(excinfo.value)
+
+
+def test_a_moving_stop_rule_keeps_the_reference_it_measured_on_the_moving_pass(
+    monkeypatch, tmp_path
+):
+    """The write-back must not be hung off the QUIET passes.
+
+    A pass that first measures R is usually also the pass that sends a move, so
+    an ``elif`` there leaves the rule file without its reference in the common
+    case -- and a restart then re-measures R off the stop it has just moved.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock()
+    mt5 = _FakeMT5(symbol="XAUUSD", bid=4300.0, ask=4300.2, tickets=(9001,))
+    mt5.positions[0].price_open = 4280.0
+    mt5.positions[0].sl = 4290.0
+
+    rule = cli._validate_rule(
+        {"symbol": "XAUUSD", "action": "move_stop", "mode": "trail",
+         "ticket": 9001, "distance": 2.0, "id": "g-trail"}, 0, price_hint=4300.0,
+    )
+    # ONE pass only: a 2 s sleep takes the run straight past its 1 s limit, so
+    # whatever is on the rule afterwards was written by the pass that moved it.
+    _run, events, rules_after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, [rule],
+        interval_ms=2000, max_seconds=1,
+    )
+
+    moved = [e for e in events if e["event"] == "stop_moved"]
+    assert len(moved) == 1, events
+    assert moved[0]["mode"] == "trail"
+    assert moved[0]["moved"][0]["from_sl"] == 4290.0
+    assert moved[0]["moved"][0]["to_sl"] == 4298.0
+    # Moving a stop is not a deal: the position stays open.
+    assert [s for s in mt5.sends if s["action"] == mt5.TRADE_ACTION_DEAL] == []
+    # ...and the reference survives into the FILE, not only in memory.
+    assert rules_after[0]["move_ref"]["9001"]["risk"] == 10.0
+    assert rules_after[0]["move_best"]["9001"] == 4300.0
+    assert events[-1]["event"] == "watcher_stop"
+
+
+def test_breakeven_armed_in_the_watcher_moves_the_stop_once_the_price_gets_there(
+    monkeypatch, tmp_path
+):
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock()
+    # 20 short of 1R at arm time, then the price steps past it: the trigger is
+    # the price ARRIVING, not the rule being armed.
+    mt5 = _FakeMT5(
+        symbol="XAUUSD", bid=4310.0, ask=4310.2, tickets=(9001,),
+        tick_after_polls=(3, 4321.0, 4321.2),
+    )
+    mt5.positions[0].price_open = 4300.0
+    mt5.positions[0].sl = 4280.0
+
+    rule = cli._validate_rule(
+        {"symbol": "XAUUSD", "action": "move_stop", "mode": "breakeven",
+         "ticket": 9001, "when_r": 1.0, "id": "g-be"}, 0, price_hint=4310.0,
+    )
+    _run, events, rules_after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, [rule],
+        interval_ms=100, max_seconds=5,
+    )
+
+    moved = [e for e in events if e["event"] == "stop_moved"]
+    assert len(moved) == 1, events
+    assert moved[0]["mode"] == "breakeven"
+    assert moved[0]["moved"][0]["to_sl"] == 4300.0
+    assert mt5.positions[0].sl == 4300.0
+    assert rules_after[0]["move_ref"]["9001"]["risk"] == 20.0
+    assert [s for s in mt5.sends if s["action"] == mt5.TRADE_ACTION_DEAL] == []
+    assert events[-1]["exit_reason"] == "max_seconds"
+
+
+def test_an_armed_moving_stop_rule_does_not_stop_the_watcher_from_reading_a_level(
+    monkeypatch, tmp_path
+):
+    """A policy rule and a level rule must coexist in one pass.
+
+    The level is read past the move_stop branch, so a rule with no 'price' used
+    to take the whole watcher down with it -- and with it every OTHER rule on the
+    account.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    clock = _FakeClock()
+    mt5 = _FakeMT5(symbol="XAUUSD", bid=4300.0, ask=4300.2, tickets=(9001,))
+    mt5.positions[0].price_open = 4280.0
+    mt5.positions[0].sl = 4290.0
+
+    policy = cli._validate_rule(
+        {"symbol": "XAUUSD", "action": "move_stop", "mode": "trail",
+         "ticket": 9001, "distance": 2.0, "id": "g-trail"}, 0, 4300.0,
+    )
+    level = _rule(id="g-close", symbol="XAUUSD")  # 4300 >= 1.0: fires at once
+
+    _run, events, _after, _guard = _run_the_watcher(
+        cli, monkeypatch, tmp_path, mt5, clock, [policy, level],
+        interval_ms=100, max_seconds=2,
+    )
+
+    # Both were evaluated: the policy moved a stop, the level rule closed out.
+    assert [e["event"] for e in events if e["event"] == "stop_moved"]
+    assert [e for e in events if e["event"] == "fired"]
+    assert events[-1]["exit_reason"] == "max_seconds"
+
+
+def test_a_moving_stop_guard_rule_is_built_from_the_same_flat_fields():
+    from nanobot.agent.tools.mt5_sandbox import build_guard_rule
+
+    rule, error = build_guard_rule(
+        {"symbol": "XAUUSD", "guard_mode": "breakeven", "ticket": 9001}
+    )
+    assert error is None
+    assert rule == {
+        "symbol": "XAUUSD", "action": "move_stop", "mode": "breakeven", "ticket": 9001,
+    }
+    # No level, because there is nothing to cross -- and no 'when_r' when the
+    # caller did not ask for one, so the CLI's own default is what applies.
+    assert "price" not in rule and "when_r" not in rule
+
+    rule, error = build_guard_rule(
+        {
+            "symbol": "XAUUSD", "guard_mode": "breakeven", "all_positions": True,
+            "when_r": 2, "activate_at": 4320,
+        }
+    )
+    assert error is None
+    assert rule["scope"] == {"all": True} and "ticket" not in rule
+    assert rule["when_r"] == 2.0 and rule["activate_at"] == 4320.0
+
+
+def test_a_trail_guard_mode_without_a_distance_is_refused_by_name():
+    from nanobot.agent.tools.mt5_sandbox import build_guard_rule
+
+    rule, error = build_guard_rule(
+        {"symbol": "XAUUSD", "guard_mode": "trail", "ticket": 9001}
+    )
+    assert rule is None and "trail_distance" in error
+    # The field's own units are spelled out, because "2" means different things
+    # on Gold and on EURUSD and guessing one of them is how a trail becomes a stop
+    # that sits on the price.
+    assert "Gold" in error
+
+    rule, error = build_guard_rule(
+        {"symbol": "XAUUSD", "guard_mode": "trail", "trail_distance": 2.0, "ticket": 9001}
+    )
+    assert error is None
+    assert rule["action"] == "move_stop" and rule["mode"] == "trail"
+    assert rule["distance"] == 2.0
+    assert "when_r" not in rule
+
+
+def test_a_guard_mode_nobody_implements_is_refused():
+    from nanobot.agent.tools.mt5_sandbox import build_guard_rule
+
+    rule, error = build_guard_rule({"symbol": "XAUUSD", "guard_mode": "wibble"})
+
+    assert rule is None and "wibble" in error
+    assert "breakeven" in error and "trail" in error
+
+
+def test_guard_mode_close_still_needs_a_level_and_says_where_to_go_instead():
+    from nanobot.agent.tools.mt5_sandbox import build_guard_rule
+
+    rule, error = build_guard_rule({"symbol": "XAUUSD", "guard_mode": "close"})
+
+    assert rule is None and "trigger_price" in error
+    # The refusal has to name the alternative, or a caller wanting a moving stop
+    # reads "you gave no level" and invents a level.
+    assert "breakeven" in error and "trail" in error
+
+
+def test_guard_arm_command_serialises_a_moving_stop_rule():
+    cmd = build_cli_command(
+        "guard",
+        {
+            "guard_action": "arm",
+            "symbol": "XAUUSD",
+            "guard_mode": "trail",
+            "trail_distance": 2.0,
+            "ticket": 9001,
+            "interval_ms": 100,
+        },
+    )
+
+    assert "guard arm --rule" in cmd
+    assert '"action": "move_stop"' in cmd and '"mode": "trail"' in cmd
+    assert '"distance": 2.0' in cmd
+    assert "--interval-ms 100" in cmd
+    # A moving stop has no level, so the caller is not asked for one.
+    assert "price" not in cmd
+
+
+def test_the_description_and_the_schema_offer_a_stop_that_moves_itself():
+    tool = MT5SandboxTool()
+    props = tool.parameters["properties"]
+
+    assert props["guard_mode"]["enum"] == ["close", "breakeven", "trail"]
+    # The units, in the schema: a trail distance is price, not pips.
+    assert "20 pips" in props["trail_distance"]["description"]
+    assert "R" in props["when_r"]["description"]
+
+    desc = tool.description
+    assert "MOVES ITSELF" in desc
+    assert "guard_mode='breakeven'" in desc and "guard_mode='trail'" in desc
+    # The reason it exists, named: nothing else runs between the model's calls.
+    assert "between your calls" in desc

@@ -251,6 +251,74 @@ the result comes back with `alert=opened_without_a_stop` either way. A `modify`
 that leaves a position with neither `sl` nor `tp` returns
 `alert=position_left_without_a_stop`.
 
+### A stop that moves itself — `guard_mode`
+
+A stop set when the order goes in is a stop that **never moves again**. The two
+things every trade plan asks for next — *"take the risk off at 1R"* and *"then
+let it run"* — have no broker-side equivalent: MT5's server holds one fixed `sl`,
+so a stop that follows the price has to be **something watching the price**. That
+is exactly what does not exist between your calls.
+
+`action='guard'` takes a `guard_mode` for this. Instead of waiting for a level to
+be crossed, the rule becomes a **standing policy** that the detached watcher
+re-evaluates on every tick:
+
+```
+# take the risk off once the price is 1R in front of the entry
+mt5_sandbox(action="guard", guard_action="arm", symbol="XAUUSD",
+            guard_mode="breakeven", ticket=4735550381, when_r=1)
+
+# and then let it run: hold the stop $2.00 behind the best price it has seen
+mt5_sandbox(action="guard", guard_action="arm", symbol="XAUUSD",
+            guard_mode="trail", ticket=4735550381, trail_distance=2.0)
+```
+
+| `guard_mode` | What it does | Needs |
+|---|---|---|
+| `close` (default) | closes the matched positions the instant the level is touched | `trigger_price` |
+| `breakeven` | once the price is `when_r` × the position's **own** risk in front of the entry, puts the stop **at the entry** | `when_r` (default `1`) |
+| `trail` | keeps the stop `trail_distance` of **price** behind the best price the position has seen, following it up and never down | `trail_distance` |
+
+Three things make it safe to leave alone:
+
+* **A stop only ever moves towards profit.** Every candidate is compared with the
+  stop that is already there, and one that is not an improvement is dropped. The
+  worst a moving stop can do is nothing — it can never loosen a stop that already
+  protects you.
+* **It is never placed inside the broker's minimum stop distance.** A stop closer
+  to the price than `trade_stops_level` comes back `10016 Invalid stops`, so the
+  rule names the room the broker demands and sends nothing instead of sending it
+  and being refused.
+* **It never takes the `tp` off.** Moving a stop is `TRADE_ACTION_SLTP`, which
+  carries **both** levels; the target is passed back unchanged, because this rule
+  owns the stop and nothing else.
+
+`R` is measured **once**, from the position as it was when the rule first saw it,
+and remembered on the rule. Measured off the current stop instead, R would shrink
+every time the stop moved, the trigger would walk down with it, and the stop would
+crawl into the price for no reason.
+
+A `guard_mode` rule needs **no `trigger_price`** — there is no level to cross — so
+it is never "satisfied" and never fires itself out. It stays armed and keeps
+working on whatever positions match its scope, which is what makes it usable
+across a whole session instead of on one trade. `activate_at` holds it back until
+the price gets somewhere ("trail it, but not before Gold is above 4300").
+
+Two limits worth knowing before you arm one:
+
+* **A position with no stop is reported, not fixed.** `breakeven` needs a stop to
+  move; on a naked position it answers `skipped: "this position has NO stop to
+  move"` and tells you to `modify` one on first. The level to invent would be a
+  guess, and a guessed stop is worse than an honest report.
+* **`trail_distance` is price, not pips.** On Gold `2.0` is $2.00 — the
+  playbook's own 20-pip stop distance. A distance of zero would put the stop on
+  the price and close the position, and is refused.
+
+Read what it did with `guard_action='events'`: `stop_moved` carries the mode, the
+price that caused it, and a `moved` row per ticket with `from_sl` and `to_sl`;
+`stop_move_failed` carries the broker's own retcode. `guard_action='status'` shows
+the moving rules still armed.
+
 ### Entering at a price — `entry_type`
 
 *"Buy the dip at 4270"* and *"buy the breakout above 4300"* are **not market
@@ -387,6 +455,7 @@ When the user says *"close when it hits X"* — a stop, a target, "get me out at
 |---|---|---|
 | Exit an **open** position at a level | `action='modify'` with `ticket` + `exit_at=X` | The **broker's server** holds the level. It fires in milliseconds, with no process and no model turn, and it survives the sandbox being paused or killed. |
 | A condition the broker cannot hold (part of a position, a basket, a level that is not the stop) | `action='guard'` + `guard_action='arm'` | A detached tick-level watcher inside the sandbox, reading the tick stream every `interval_ms` (default 100 ms). |
+| The stop should **move itself** — breakeven at 1R, then trail | the same `action='guard'`, with `guard_mode='breakeven'` or `'trail'` | A standing policy, not a level: the watcher re-evaluates it every tick and it never fires itself out. See **A stop that moves itself**. |
 | Out *now*, at whatever the market is | `action='close'` | |
 
 **Polling `quote` and comparing is not an exit — do not do it.** MEASURED inside
@@ -715,10 +784,17 @@ carries:
 ### You manage the trade — there is nobody else in the loop
 
 The polling loop is not a status read-out. **You are the trade management.** No
-cron, no EA, no automation runs between your calls, and nothing will close the
-position, move a stop or take a partial profit unless you decide it and call for
-it. That is the design: a program cannot read *why* the price is where it is, and
-you can.
+cron, no EA, no automation runs between your calls: nothing closes a position or
+takes a partial profit unless you decide it and call for it, and a `guard_mode`
+rule is one you armed yourself. That is the design — a program cannot read *why*
+the price is where it is, and you can.
+
+The one exception is deliberate, and it is the one thing here that has to happen
+while you are away: **the stop.** Nothing in a polling loop can move a stop on a
+tick you did not poll, so when the plan says "breakeven at 1R" or "trail it",
+arm it with `guard_mode='breakeven'`/`'trail'` and the sandbox's own watcher does
+it on every tick — instead of you waking up at 2R to find the trade never stopped
+carrying its risk. Then keep managing the rest by hand.
 
 Every call hands you the arithmetic you need so you are deciding, not
 calculating:
@@ -737,7 +813,10 @@ calculating:
 
 `trade_state.notes` is not decoration. If it says a ticket is at 2R with its stop
 still 40 pips away, **that is your cue to act on it** — `modify` the stop to
-`breakeven_price`, or take part of the position off with `close`. If it says a
+`breakeven_price`, or take part of the position off with `close`. If the plan is
+"breakeven at 1R" then the cue to arm `guard_mode='breakeven'` is **before** the
+trade reaches 1R, not `breakeven_due` appearing afterwards: a rule armed at 1R has
+already missed the tick it exists for. If it says a
 position has `no_stop`, stop watching and fix that first: you are one gap away
 from an unbounded loss.
 
