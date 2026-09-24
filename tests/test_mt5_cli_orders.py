@@ -1004,3 +1004,142 @@ def test_the_ledger_remembers_the_best_and_worst_the_trade_ever_was(cli, tmp_pat
     assert stored["trade_path"]["worst_profit_money"] == 0.0
     assert stored["trade_path"]["best_r"] == 3.0
     assert stored["trade_path"]["worst_r"] == -0.4
+
+
+def test_a_netting_account_refuses_a_split_instead_of_netting_it(cli, monkeypatch):
+    """On netting, N tickets net into ONE position at a blended price.
+
+    That is not a split: it is an oversized single trade on a stop that now
+    covers every ticket at once, which is the opposite of granular exits. It has
+    to be refused BEFORE anything is sent, not reported after.
+    """
+    sent = []
+
+    class _Info:
+        volume_min, volume_max, volume_step, digits = 0.01, 100.0, 0.01, 2
+        filling_mode = 1
+
+    class _Tick:
+        bid, ask = 4285.00, 4285.18
+
+    class _Netting(_FakeMT5):
+        def account_info(self):
+            return types.SimpleNamespace(equity=10000.0, margin_free=9000.0, margin_mode=0)
+
+    monkeypatch.setattr(cli, "require_bridge",
+                        lambda: (_Netting(sent, _Info(), _Tick()), None))
+    monkeypatch.setattr(cli, "_order_send",
+                        lambda mt5, req, fillings: {"ok": True, "retcode": 10009})
+    args = types.SimpleNamespace(
+        symbol="XAUUSD", side="buy", volume=0.10, splits=10, group="g",
+        sl=None, tp=None, deviation=20, magic=1, comment="c",
+        stop_on_failure=False, check_cost=False,
+    )
+    err = {}
+    monkeypatch.setattr(cli, "emit", lambda payload, text=None, code=0: (err.update(payload, _code=code), code)[1])
+    assert cli.cmd_split(args) == 1
+    assert sent == [], "nothing may be sent to a netting account"
+    assert "NETTING" in err.get("error", "")
+    assert "multiply size, not exits" in err.get("error", "")
+
+
+def test_a_hedging_account_is_told_it_is_hedging(cli, monkeypatch):
+    class _Info:
+        volume_min, volume_max, volume_step, digits = 0.01, 100.0, 0.01, 2
+        filling_mode = 1
+
+    class _Tick:
+        bid, ask = 4285.00, 4285.18
+
+    class _Hedging(_FakeMT5):
+        def account_info(self):
+            return types.SimpleNamespace(equity=10000.0, margin_free=9000.0, margin_mode=2)
+
+        def order_calc_margin(self, action, symbol, volume, price):
+            return volume * 100.0 * price / 1000.0
+
+    sent = []
+    monkeypatch.setattr(cli, "require_bridge",
+                        lambda: (_Hedging(sent, _Info(), _Tick()), None))
+    monkeypatch.setattr(cli, "filling_candidates", lambda mt5, info: [1])
+    monkeypatch.setattr(cli, "_order_send", lambda mt5, req, fillings: (
+        sent.append(dict(req)), {"ok": True, "retcode": 10009, "price": req["price"]},
+    )[1])
+    out = {}
+    monkeypatch.setattr(cli, "emit", lambda payload, text=None, code=0: (out.update(payload), 0)[1])
+    args = types.SimpleNamespace(
+        symbol="XAUUSD", side="buy", volume=0.10, splits=10, group="g",
+        sl=None, tp=None, deviation=20, magic=1, comment="c",
+        stop_on_failure=False, check_cost=False,
+    )
+    assert cli.cmd_split(args) == 0
+    assert out["account_margin_mode"]["hedging"] is True
+    assert out["account_margin_mode"]["netting"] is False
+    assert len(sent) == 10
+    # 0.01 lots of Gold is 0.01 x 100 x 4285 / 1000 = 4.285 a ticket, x10.
+    assert out["margin_required"] == 42.85
+
+
+def test_a_split_that_cannot_be_margined_is_refused_before_anything_is_sent(cli, monkeypatch):
+    """Half-filling on margin leaves a stop covering fewer tickets than planned.
+
+    Ten tickets are ten margin reservations, so the failure is not a clean
+    refusal -- the first few fill and the rest come back 10019. Being told in
+    advance is strictly better than that, so the broker's own margin figure is
+    consulted before the first ticket is sent.
+    """
+    sent = []
+
+    class _Info:
+        volume_min, volume_max, volume_step, digits = 0.01, 100.0, 0.01, 2
+        filling_mode = 1
+
+    class _Tick:
+        bid, ask = 4285.00, 4285.18
+
+    class _Tight(_FakeMT5):
+        def account_info(self):
+            # Enough free margin for about 5 of the 10 tickets.
+            return types.SimpleNamespace(equity=1000.0, margin_free=21.0, margin_mode=2)
+
+        def order_calc_margin(self, action, symbol, volume, price):
+            return volume * 100.0 * price / 1000.0
+
+    monkeypatch.setattr(cli, "require_bridge", lambda: (_Tight(sent, _Info(), _Tick()), None))
+    args = types.SimpleNamespace(
+        symbol="XAUUSD", side="buy", volume=0.10, splits=10, group="g",
+        sl=None, tp=None, deviation=20, magic=1, comment="c",
+        stop_on_failure=False, check_cost=False,
+    )
+    err = {}
+    monkeypatch.setattr(cli, "emit", lambda payload, text=None, code=0: (err.update(payload), code)[1])
+    assert cli.cmd_split(args) == 1
+    assert sent == [], "a split that cannot be margined must send nothing at all"
+    assert "half-fill" in err.get("error", "")
+    # And it says what WOULD fit, so the caller can adjust rather than guess.
+    assert "--splits 4" in err.get("error", "")
+
+
+def test_margin_mode_is_reported_rather_than_left_as_a_number(cli):
+    class _Acct:
+        def __init__(self, mode):
+            self.margin_mode = mode
+
+    class _MT5:
+        def __init__(self, mode):
+            self._mode = mode
+
+        def account_info(self):
+            return _Acct(self._mode)
+
+    assert cli._margin_mode_of(_MT5(2)) == {
+        "margin_mode": 2, "margin_mode_name": "hedging",
+        "hedging": True, "netting": False, "multiple_positions_ok": True,
+    }
+    net = cli._margin_mode_of(_MT5(0))
+    assert net["netting"] is True and net["multiple_positions_ok"] is False
+    # An unreadable mode is UNKNOWN and must never be treated as permissive.
+    unknown = cli._margin_mode_of(object())
+    assert unknown["margin_mode"] is None
+    assert unknown["multiple_positions_ok"] is False
+    assert unknown["hedging"] is False

@@ -66,7 +66,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.6"
+CLI_VERSION = "2026-09-24.7"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -2012,6 +2012,56 @@ def cmd_login(args: argparse.Namespace) -> int:
     return emit(payload, text=f"logged in as {getattr(acct, 'login', 'unknown')}")
 
 
+def _margin_mode_of(mt5: Any) -> dict[str, Any]:
+    """Whether this account can hold MORE THAN ONE position on a symbol.
+
+    THE BUG THIS CATCHES: under ``ACCOUNT_MARGIN_MODE_RETAIL_NETTING`` a symbol
+    can hold exactly ONE position, and a second order does not open a second
+    ticket -- it ADDS TO the first, at a blended price, with the first ticket's
+    stop. Every part of split trading assumes the opposite: that N tickets exist,
+    that "close 3 of them" is a thing, and that each carries its own entry. On a
+    netting account ``split --splits 10`` would net into one position and
+    ``close --group --count 3`` would have nothing to select, so the method would
+    silently become a single oversized trade -- the exact opposite of granular
+    exits, on a stop that now covers ten times the size.
+
+    ``margin_mode`` is absent on older builds, so an unknown mode is reported as
+    unknown and never assumed to be hedging.
+    """
+    acct = None
+    try:
+        acct = mt5.account_info()
+    except Exception:  # noqa: BLE001 - an unreadable account is "unknown", not a crash
+        acct = None
+    raw = getattr(acct, "margin_mode", None) if acct is not None else None
+    names = {0: "netting", 1: "exchange", 2: "hedging"}
+    mode = names.get(int(raw)) if raw is not None else None
+    return {
+        "margin_mode": int(raw) if raw is not None else None,
+        "margin_mode_name": mode or "unknown",
+        #: Only an explicit hedging account may be told a split is safe. Unknown
+        #: is NOT permissive: guessing wrong here multiplies a position's size.
+        "hedging": mode == "hedging",
+        "netting": mode == "netting",
+        "multiple_positions_ok": mode == "hedging",
+    }
+
+
+def _position_margin(mt5: Any, symbol: str, volume: float, price: float) -> float | None:
+    """Margin the broker says ``volume`` at ``price`` needs, or None if unknown."""
+    for action in (
+        getattr(mt5, "ORDER_TYPE_BUY", 0),
+        getattr(mt5, "ORDER_TYPE_SELL", 1),
+    ):
+        try:
+            value = mt5.order_calc_margin(action, symbol, float(volume), float(price))
+        except Exception:  # noqa: BLE001 - a missing helper means "cannot precheck"
+            return None
+        if value is not None:
+            return float(value)
+    return None
+
+
 def cmd_account(_: argparse.Namespace) -> int:
     mt5, err = require_bridge()
     if err is not None:
@@ -2019,7 +2069,13 @@ def cmd_account(_: argparse.Namespace) -> int:
     acct = mt5.account_info()
     if acct is None:
         return fail(f"account_info() returned None: {mt5.last_error()}", code=2)
-    return emit({"ok": True, "account": acct._asdict()})
+    payload: dict[str, Any] = {"ok": True, "account": acct._asdict()}
+    # Answered here rather than left in the raw struct, because the model asks
+    # "can this account hold N positions?" far more often than it asks for the
+    # numeric code, and getting it wrong turns a split into one big trade.
+    payload["margin"] = _margin_mode_of(mt5)
+    return emit(payload)
+
 
 
 def cmd_quote(args: argparse.Namespace) -> int:
@@ -3270,6 +3326,34 @@ def cmd_split(args: argparse.Namespace) -> int:
     if info is None or tick is None:
         return fail(f"symbol {symbol} unavailable", code=2)
 
+    # A netting account holds ONE position per symbol, so N tickets would net
+    # into a single trade at a blended price under the first ticket's stop. That
+    # is not a split -- it is one oversized position, the opposite of granular
+    # exits -- and it is refused BEFORE anything is sent, not reported after.
+    mode = _margin_mode_of(mt5)
+    if mode["netting"]:
+        return fail(
+            f"this account is NETTING (margin_mode={mode['margin_mode']}), so it "
+            "holds only ONE position per symbol. A split would net all "
+            f"{count} tickets into a single {args.volume}-lot trade at a blended "
+            "price under one stop -- it would multiply size, not exits, which is "
+            "the opposite of what this command is for. Use action=order for a "
+            "single position and scale out of it with close --volume, or move to "
+            "a HEDGING account, which is a change at the broker and not here.",
+            code=1,
+        )
+    if mode["margin_mode"] is None:
+        # Not refused -- a build that does not expose margin_mode must not block
+        # a legitimate trade -- but the uncertainty is stated, because guessing
+        # wrong here is the one error that multiplies the position.
+        mode_note: str | None = (
+            "margin_mode could not be read on this terminal, so it is UNKNOWN "
+            "whether this account can hold several positions per symbol. If it is "
+            "a netting account the tickets will net into one position."
+        )
+    else:
+        mode_note = None
+
     side = args.side.lower()
     if side in ("buy", "long"):
         order_type = mt5.ORDER_TYPE_BUY
@@ -3304,6 +3388,41 @@ def cmd_split(args: argparse.Namespace) -> int:
     actual_total = round(per * count, 8)
     left_over = round(total - actual_total, 8)
     shortfall = left_over > step / 2
+
+    # --- can the account actually carry this? -------------------------------- #
+    # Ten tickets are ten separate margin reservations, and the failure mode is
+    # not a clean refusal: the first few fill and the rest come back 10019 "no
+    # money", leaving a HALF-OPEN split whose stop covers fewer tickets than
+    # intended. That is much worse than being told before sending, so the
+    # broker's own margin figure is asked for first.
+    free_margin = None
+    margin_needed = None
+    try:
+        acct = mt5.account_info()
+        free_margin = float(getattr(acct, "margin_free", 0.0) or 0.0) if acct else None
+    except Exception:  # noqa: BLE001 - no account info means no precheck, not a crash
+        free_margin = None
+    if free_margin:
+        per_ticket_margin = _position_margin(mt5, symbol, per, price)
+        if per_ticket_margin is not None:
+            margin_needed = round(per_ticket_margin * count, 2)
+            if margin_needed > free_margin:
+                affordable = int(free_margin // per_ticket_margin) if per_ticket_margin else 0
+                return fail(
+                    f"{count} tickets of {per} lots need about {margin_needed} of "
+                    f"margin and only {round(free_margin, 2)} is free, so this would "
+                    f"half-fill: the first few tickets would open and the rest would "
+                    "be refused for no money, leaving a partial position whose stop "
+                    "covers fewer tickets than intended. "
+                    + (
+                        f"Use --splits {affordable} or fewer, or raise the free "
+                        "margin."
+                        if affordable >= 2
+                        else "There is not enough free margin to split this at all -- "
+                        "close something first, or trade a smaller total volume."
+                    ),
+                    code=1,
+                )
 
     group = _split_group_tag(getattr(args, "group", "") or "") or _split_group_tag(
         args.comment or "split"
@@ -3406,6 +3525,10 @@ def cmd_split(args: argparse.Namespace) -> int:
         "sl": args.sl,
         "tp": args.tp,
         "total_risk_money": risk_money,
+        # The account facts that decide whether a split is even meaningful here.
+        "account_margin_mode": mode,
+        "margin_required": margin_needed,
+        "margin_free": round(free_margin, 2) if free_margin else None,
         # What the account actually got, versus the price that was asked for.
         "fill_price_first": fills[0] if fills else None,
         "fill_price_last": fills[-1] if fills else None,
@@ -3418,6 +3541,8 @@ def cmd_split(args: argparse.Namespace) -> int:
             "Close any subset by ticket, or by group with close --group."
         ),
     }
+    if mode_note:
+        out["warning"] = ((out.get("warning", "") + " ") + mode_note).strip()
     if fill_spread_pips is not None and fill_spread_pips > 0:
         out["note"] += (
             f" Filled {fills[0]}..{fills[-1]} ({fill_spread_pips} pips of dispersion): "

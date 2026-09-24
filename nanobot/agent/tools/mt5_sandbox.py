@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-24.6"
+_CLI_VERSION = "2026-09-24.7"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -919,7 +919,13 @@ class MT5SandboxTool(Tool):
             "fires once at one price and never adds tickets as the price moves "
             "against you. Adding tickets as the price falls is a grid/martingale, "
             "which empties accounts, and it is not this action: if the price goes "
-            "against a split, the answer is the stop, never more tickets. "
+            "against a split, the answer is the stop, never more tickets. A split "
+            "needs a HEDGING account: on a NETTING account only one position per "
+            "symbol can exist, so N tickets would net into one oversized trade, "
+            "and split refuses rather than doing that. It also refuses when the "
+            "free margin cannot cover every ticket, because a half-filled split "
+            "leaves a stop covering fewer tickets than planned. Check "
+            "action=account for margin_mode and free margin BEFORE sizing a split. "
             "Trading actions (order, close, close_all, modify, guard) require "
             "MT5_ALLOW_TRADING to be "
             "enabled and return the broker retcode; a rejected order is reported with "
