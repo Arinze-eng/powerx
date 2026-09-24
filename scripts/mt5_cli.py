@@ -64,7 +64,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-23.8"
+CLI_VERSION = "2026-09-24.1"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -1177,14 +1177,216 @@ def _pending_install_target() -> str:
     return target if target != _installed_url() else ""
 
 
+def _read_install_status() -> tuple[str, str]:
+    """The raw ``stage|message`` a running installer last wrote, or unknown."""
+    status_path = MT5_ROOT / "install.status"
+    if not status_path.exists():
+        return "unknown", ""
+    raw = status_path.read_text(encoding="utf-8", errors="replace").strip()
+    stage, _, message = raw.partition("|")
+    return stage, message
+
+
+#: The stages an install can reach and never leave on its own.
+_TERMINAL_INSTALL_STAGES = frozenset({"done", "failed"})
+
+
+def _install_fingerprint() -> dict[str, Any]:
+    """The things that can MOVE during an install, as one comparable snapshot.
+
+    These are the file and process signals, not the derived status snapshot. A
+    10-25 minute install moves in exactly three ways -- the status file's stage
+    changes, the installer writes more output, and the installer process goes
+    away -- and each one is a reason for a caller to look again.
+
+    The log is measured in BYTES rather than lines on purpose: the installer's
+    own output is UTF-8, but it shells out to Wine, whose children can emit
+    UTF-16LE, so a line count depends on which codec the reader guessed. A size
+    does not.
+
+    The ALIVENESS is sampled first, and that order is deliberate. An installer's
+    last act is to write its outcome and flush its log, so the interesting poll
+    is the one where all three signals move at once. Sampling aliveness first
+    means the log and the stage are read *after* the process is known to be gone,
+    so its dying words are in the same snapshot as its death -- whatever the
+    caller then prioritises, nothing is missed for having been read a moment too
+    early.
+    """
+    alive = _installer_alive()
+    try:
+        log_bytes = int((MT5_ROOT / "install.log").stat().st_size)
+    except OSError:
+        log_bytes = 0
+    stage, message = _read_install_status()
+    return {
+        "stage": stage,
+        "message": message,
+        "log_bytes": log_bytes,
+        "installer_alive": alive,
+        "pending_target": _pending_install_target(),
+    }
+
+
+def _install_quiescent_event(fingerprint: dict[str, Any]) -> str | None:
+    """The event name for "there is nothing here to wait for", or None.
+
+    A wait against a finished install is not an observation, it is a 120 s stall
+    that then reports a timeout -- which reads as "something is wrong" when the
+    truth is "it is already over". Every state that cannot change on its own is
+    named here so the caller is told which one it is, immediately.
+    """
+    if fingerprint["installer_alive"] or fingerprint["pending_target"]:
+        return None
+    stage = fingerprint["stage"]
+    if stage == "failed":
+        return "install_already_failed"
+    if stage in _TERMINAL_INSTALL_STAGES:
+        return "install_already_done"
+    return "install_not_started"
+
+
+def _install_wait(seconds: float, poll_seconds: float) -> dict[str, Any]:
+    """Block, sampling the installer, until it moves or the budget runs out.
+
+    WHY THIS EXISTS: ``install`` is DETACHED (a full Wine + MT5 + bridge install
+    takes longer than any sandbox command ceiling), so ``status`` used to be the
+    only way to follow it -- and ``status`` answered instantly. A caller in that
+    position either hammers status in a loop it has to pace itself, or reports
+    "installing" and stops, which is exactly the silence the whole CLI exists to
+    remove: the model is told to wait, is given nothing to wait ON, and fills the
+    gap with an assertion.
+
+    This call OBSERVES. It samples every ``poll_seconds`` and returns the moment
+    the stage changes, the installer's log grows, or the installer process exits
+    -- or when the budget runs out, and it says which of the two it was. The
+    caller gets the log tail of that moment, so "thinking about the install" has
+    something new in it each time round instead of the same snapshot.
+
+    Bounded at ``WATCH_MAX_WAIT_SECONDS`` deliberately, and the bound is returned
+    in the answer, so the caller waits again rather than the wait being killed by
+    a command timeout with nothing to show.
+    """
+    budget = max(0.0, min(float(seconds or 0.0), WATCH_MAX_WAIT_SECONDS))
+    poll = max(0.2, float(poll_seconds or 1.0))
+    started = time.time()
+    before = _install_fingerprint()
+    quiescent = _install_quiescent_event(before)
+    if quiescent is not None:
+        return {
+            "observed": [{
+                "event": quiescent,
+                "ts": time.time(),
+                "stage": before["stage"],
+                "detail": (
+                    f"nothing to wait for: stage is already '{before['stage']}' and "
+                    "no installer is running"
+                ),
+            }],
+            "observed_event": quiescent,
+            "waited_s": 0.0,
+            "samples": 0,
+            "poll_seconds": poll,
+            "timed_out": False,
+            "capped_at_s": WATCH_MAX_WAIT_SECONDS,
+            "from": before,
+            "to": before,
+            "note": (
+                "no wait was needed: the install this could have watched is already "
+                f"over (stage '{before['stage']}')."
+            ),
+        }
+
+    deadline = started + budget
+    samples = 0
+    after = before
+    observed: list[dict[str, Any]] = []
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0.0:
+            break
+        time.sleep(min(poll, remaining))
+        samples += 1
+        after = _install_fingerprint()
+        # ORDER MATTERS. A stage change is the strongest signal (it is the
+        # installer saying what it is doing), then the installer disappearing,
+        # and only then "it wrote something". Checking the log first would hide
+        # the exit: an installer that ends always writes to the log as its last
+        # act, so the caller would be told "log grew" and never told that the
+        # process that was doing the work is gone.
+        if after["stage"] != before["stage"]:
+            observed = [{
+                "event": {
+                    "done": "install_done",
+                    "failed": "install_failed",
+                }.get(after["stage"], "install_stage_changed"),
+                "ts": time.time(),
+                "from_stage": before["stage"],
+                "stage": after["stage"],
+                "message": after["message"],
+                "detail": (
+                    f"the install stage went '{before['stage']}' -> "
+                    f"'{after['stage']}'"
+                ),
+            }]
+        elif before["installer_alive"] and not after["installer_alive"]:
+            observed = [{
+                "event": "installer_exited",
+                "ts": time.time(),
+                "stage": after["stage"],
+                "message": after["message"],
+                "detail": (
+                    "the installer process is gone; the stage file is whatever it "
+                    "last wrote"
+                ),
+            }]
+        elif after["log_bytes"] > before["log_bytes"]:
+            observed = [{
+                "event": "install_log_grew",
+                "ts": time.time(),
+                "grew_bytes": after["log_bytes"] - before["log_bytes"],
+                "log_bytes": after["log_bytes"],
+                "detail": "the installer wrote more output",
+            }]
+        if observed:
+            break
+
+    watched_seconds = round(time.time() - started, 2)
+    return {
+        "observed": observed,
+        "observed_event": observed[-1]["event"] if observed else None,
+        "waited_s": watched_seconds,
+        "samples": samples,
+        "poll_seconds": poll,
+        "timed_out": not observed,
+        "capped_at_s": WATCH_MAX_WAIT_SECONDS,
+        "from": before,
+        "to": after,
+        "note": (
+            f"observed '{observed[-1]['event']}' after {watched_seconds} s "
+            f"({samples} samples)."
+            if observed
+            else (
+                f"nothing moved in {watched_seconds} s of watching ({samples} "
+                f"samples): the stage is still '{after['stage']}' and the installer "
+                "is still running. This is an observation, not a claim."
+            )
+        ),
+    }
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     """Report install progress and overall stack readiness (pollable)."""
+    # A WAIT IS DONE FIRST, so the snapshot below describes what the install
+    # looked like AFTER the wait rather than before it. Watching and then
+    # reporting the pre-watch state is the failure mode this ordering avoids.
+    watched: dict[str, Any] | None = None
+    wait_seconds = float(getattr(args, "wait_seconds", 0.0) or 0.0)
+    if wait_seconds > 0:
+        watched = _install_wait(wait_seconds, float(getattr(args, "poll_seconds", 1.0) or 1.0))
+
     status_path = MT5_ROOT / "install.status"
     log_path = MT5_ROOT / "install.log"
-    stage, message = "unknown", ""
-    if status_path.exists():
-        raw = status_path.read_text(encoding="utf-8", errors="replace").strip()
-        stage, _, message = raw.partition("|")
+    stage, message = _read_install_status()
 
     # Same rule as doctor: report the terminal of the broker that is RECORDED, not
     # whichever the filesystem lists (or the marker cached) first. Live 2026-09-22:
@@ -1244,6 +1446,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             else "Run action='install'."
         ),
     }
+    if watched is not None:
+        # What the wait SAW, next to what the install looks like now. Both are
+        # needed: the observation says why this call came back, the snapshot says
+        # where the install is.
+        payload["watched"] = watched
     return emit(payload, text=f"stage={payload['stage']}: {message}"[:2000],
                 code=0 if not failed else 6)
 
@@ -1829,6 +2036,311 @@ def cmd_quote(args: argparse.Namespace) -> int:
             "point": getattr(info, "point", None),
         }
     return emit({"ok": True, "quotes": out})
+
+
+def _watch_quote(mt5: Any, symbol: str) -> dict[str, Any] | None:
+    """One symbol's live bid/ask/mid, or None when it cannot be priced.
+
+    None is returned rather than a zero-filled row on purpose: a symbol that
+    cannot be priced is the difference between "watching" and "watching nothing",
+    and a row of zeros would read as a real quote of 0.00000.
+    """
+    mt5.symbol_select(symbol, True)
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return None
+    bid = float(getattr(tick, "bid", 0.0) or 0.0)
+    ask = float(getattr(tick, "ask", 0.0) or 0.0)
+    if not bid and not ask:
+        return None
+    mid = round((bid + ask) / 2.0, 8) if (bid and ask) else (bid or ask)
+    return {
+        "bid": bid,
+        "ask": ask,
+        "mid": mid,
+        "spread": round(ask - bid, 8) if (bid and ask) else None,
+        "time_msc": int(getattr(tick, "time_msc", 0) or 0),
+    }
+
+
+def _watch_symbol_pips(mt5: Any, symbol: str) -> tuple[int, float]:
+    """``(digits, pip)`` for a symbol; a sane default when it cannot be read."""
+    info = mt5.symbol_info(symbol)
+    digits = int(getattr(info, "digits", 5) or 5) if info is not None else 5
+    return digits, float(10 ** -digits)
+
+
+def _watch_track(store: dict[str, Any], prices: dict[str, Any]) -> None:
+    """Fold one sample into the per-symbol price path.
+
+    The path is the reasoning material a single snapshot cannot give: "the price
+    moved 3 pips and came back" and "the price sat still" are the same number in
+    a snapshot and different facts about the market. Accumulated in-process so no
+    extra bridge call is paid for it.
+    """
+    for symbol, quote in prices.items():
+        row = store.setdefault(
+            symbol,
+            {"samples": 0, "first_mid": None, "last_mid": None,
+             "min_mid": None, "max_mid": None},
+        )
+        if quote is None:
+            continue
+        mid = quote["mid"]
+        row["samples"] += 1
+        if row["first_mid"] is None:
+            row["first_mid"] = mid
+        row["last_mid"] = mid
+        row["min_mid"] = mid if row["min_mid"] is None else min(row["min_mid"], mid)
+        row["max_mid"] = mid if row["max_mid"] is None else max(row["max_mid"], mid)
+
+
+def _watch_path_report(store: dict[str, Any], pips: dict[str, float]) -> dict[str, Any]:
+    """Round the accumulated path and express the movement in pips."""
+    out: dict[str, Any] = {}
+    for symbol, row in store.items():
+        pip = pips.get(symbol) or 0.0
+        span = (
+            round((row["max_mid"] - row["min_mid"]) / pip, 1)
+            if pip and row["max_mid"] is not None else None
+        )
+        drift = (
+            round((row["last_mid"] - row["first_mid"]) / pip, 1)
+            if pip and row["last_mid"] is not None else None
+        )
+        out[symbol] = {
+            "samples": row["samples"],
+            "first_mid": row["first_mid"],
+            "last_mid": row["last_mid"],
+            "min_mid": row["min_mid"],
+            "max_mid": row["max_mid"],
+            "drift_pips": drift,
+            "range_pips": span,
+            "pip": pip or None,
+        }
+    return out
+
+
+def _positions_by_ticket(mt5: Any) -> tuple[list[Any], bool]:
+    """Open positions plus whether the terminal answered at all.
+
+    ``positions_get`` returns None for a request that FAILED and an empty tuple
+    for "nothing is open", so the two are kept apart here: a watch that treated a
+    failed read as flat would report an open position as closed, which is the
+    worst thing this command could say.
+    """
+    positions = mt5.positions_get()
+    if positions is None:
+        return [], False
+    return list(positions), True
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Watch a live trade: block, sample, and return what to think about.
+
+    WHY THIS EXISTS: following a trade used to take three calls per turn --
+    ``positions`` for the risk, ``quote`` for the price, ``guard status`` for
+    whether anything is still watching the level -- each a separate trip and each
+    a snapshot of a different instant. A caller doing that is looking at three
+    photographs and guessing at the film.
+
+    This call returns one frame of the film: the open positions, the live bid/ask
+    of every symbol involved, how far each price TRAVELLED while it was watching,
+    the guard's liveness and tick counts, and any event the watcher logged in the
+    meantime. With ``wait_seconds`` it blocks first and returns the moment
+    something happens -- a rule fires, a close is refused, a level is touched and
+    reverted, the watcher stops, or the set of open positions changes -- so the
+    caller is told that something happened rather than invited to assume it.
+
+    Bounded at ``WATCH_MAX_WAIT_SECONDS``: the caller wants to watch in real time,
+    not to hold one sandbox command open until it is killed. The cap is in the
+    answer, so the next call continues the watch.
+    """
+    mt5, err = require_bridge()
+    if err is not None:
+        return err
+
+    symbols = [
+        s.strip().upper()
+        for s in (getattr(args, "symbol", None) or [])
+        if str(s).strip()
+    ]
+    budget = max(
+        0.0, min(float(getattr(args, "wait_seconds", 0.0) or 0.0), WATCH_MAX_WAIT_SECONDS)
+    )
+    poll = max(0.2, float(getattr(args, "poll_seconds", 1.0) or 1.0))
+    started = time.time()
+
+    # The rules of engagement are the set of open positions, and the levels are
+    # the guard's event log. Both are captured BEFORE the first sample so the
+    # answer can say what changed relative to the moment the caller called.
+    positions, terminal_ok = _positions_by_ticket(mt5)
+    tickets_at_start = {int(p.ticket) for p in positions}
+    if not symbols:
+        # Default to the symbols at risk: a watch with no symbol and no positions
+        # has nothing to say, and asking for one is the caller's job, not a guess.
+        symbols = sorted({str(p.symbol) for p in positions if str(p.symbol)})
+    pips = {s: _watch_symbol_pips(mt5, s)[1] for s in symbols}
+    event_mark = len(_guard_event_lines())
+    state = _read_guard_state()
+    live = _guard_is_live(state)
+
+    track: dict[str, Any] = {}
+    prices: dict[str, Any] = {}
+    samples = 0
+    observed: list[dict[str, Any]] = []
+    deadline = started + budget
+
+    while True:
+        now = time.time()
+        if terminal_ok:
+            prices = {s: _watch_quote(mt5, s) for s in symbols}
+        samples += 1
+        _watch_track(track, prices)
+
+        events = _guard_events_after(event_mark)
+        if events:
+            # A logged event is the strongest signal there is: it is the watcher
+            # saying, in its own words, that the level was reached, that the
+            # broker refused, or that it is about to stop.
+            observed = events
+            break
+
+        current, answered = _positions_by_ticket(mt5)
+        if answered and not terminal_ok:
+            terminal_ok = True
+        if answered:
+            tickets_now = {int(p.ticket) for p in current}
+            if tickets_now != tickets_at_start:
+                opened = sorted(tickets_now - tickets_at_start)
+                closed = sorted(tickets_at_start - tickets_now)
+                observed = [{
+                    "event": "position_opened" if opened else "position_closed",
+                    "ts": now,
+                    "opened": opened,
+                    "closed": closed,
+                    "open_now": sorted(tickets_now),
+                    "detail": (
+                        "the set of open positions changed while this call was "
+                        "watching"
+                    ),
+                }]
+                break
+
+        state_now = _read_guard_state()
+        if live and not _guard_is_live(state_now):
+            # The watcher died while this call was watching it. That is an
+            # OBSERVATION, not a timeout: the armed levels are now watched by
+            # nobody, and "timed out, nothing happened" would be exactly the
+            # silence this command exists to remove.
+            observed = [{
+                "event": "watcher_stop",
+                "ts": now,
+                "exit_reason": (state_now or {}).get("exit_reason"),
+                "detail": "the watcher stopped while this call was watching it",
+            }]
+            state = state_now
+            break
+        state = state_now
+
+        remaining = deadline - time.time()
+        if remaining <= 0.0:
+            break
+        time.sleep(min(poll, remaining))
+
+    watched_seconds = round(time.time() - started, 2)
+    positions, terminal_ok = _positions_by_ticket(mt5)
+    steps = _watch_path_report(track, pips)
+    guard = _guard_summary()
+
+    payload: dict[str, Any] = {
+        "ok": True,
+        "position_count": len(positions),
+        "positions": [p._asdict() for p in positions],
+        "symbols_watched": symbols,
+        "prices": prices,
+        # How each price TRAVELLED, not just where it is. A snapshot cannot tell
+        # "moved 3 pips and came back" from "sat still"; this can.
+        "price_path": steps,
+        "guard": guard,
+        "guard_state": state,
+        # Every recorded tick the watcher has examined, per symbol, and the last
+        # level touched and already back inside. Together these answer "is it
+        # watching?" with a count instead of a claim.
+        "ticks_scanned": (state or {}).get("ticks_scanned") or {},
+        "near_miss": (state or {}).get("near_miss") or {},
+        "events": _guard_events(int(getattr(args, "lines", 20) or 20)),
+        "terminal": {
+            "available": terminal_ok,
+            "last_error": None if terminal_ok else mt5.last_error(),
+        },
+        "watched": {
+            "observed": observed,
+            "observed_event": observed[-1].get("event") if observed else None,
+            "waited_s": watched_seconds,
+            "samples": samples,
+            "poll_seconds": poll,
+            "timed_out": not observed,
+            "capped_at_s": WATCH_MAX_WAIT_SECONDS,
+            "positions_at_start": sorted(tickets_at_start),
+            "note": (
+                f"observed '{observed[-1].get('event')}' after {watched_seconds} s "
+                f"({samples} samples)."
+                if observed
+                else (
+                    f"nothing happened in {watched_seconds} s of watching "
+                    f"({samples} samples): no fire, no refused close, no near miss, "
+                    "no position change, and the watcher is still up. "
+                    + (
+                        "Price moved: "
+                        + "; ".join(
+                            f"{s} {row['first_mid']} -> {row['last_mid']} "
+                            f"(range {row['range_pips']} pips)"
+                            for s, row in steps.items()
+                            if row["first_mid"] is not None
+                        )
+                        + ". "
+                        if any(r["first_mid"] is not None for r in steps.values())
+                        else ""
+                    )
+                    + "This is an observation, not a claim."
+                )
+            ),
+        },
+    }
+    if not terminal_ok:
+        payload["ok"] = False
+        payload["alert"] = "terminal_unavailable"
+        payload["warning"] = (
+            f"the terminal did not answer positions_get ({mt5.last_error()}), so the "
+            "positions above are NOT known to be the whole picture. The guard state "
+            "and event log are still read from disk and are unaffected."
+        )
+    # An observed refusal or a dead watcher is not a healthy result: the caller
+    # asked to be out and is not, or the level is protected by nobody.
+    bad = {"close_failed", "close_gave_up", "watcher_stop"}
+    if payload["watched"]["observed_event"] in bad:
+        payload["ok"] = False
+        payload.setdefault("alert", payload["watched"]["observed_event"])
+    if guard.get("alert"):
+        payload.setdefault("alert", guard["alert"])
+        payload.setdefault("warning", (
+            f"the guard reports '{guard['alert']}': the levels armed on this "
+            "account are not all being watched as they should be. Read the events "
+            "above and act on it before treating any level as covered."
+        ))
+    if not symbols and not positions:
+        payload["hint"] = (
+            "nothing to watch yet: no open positions and no --symbol given. Place "
+            "an order (or pass symbols) and call watch again."
+        )
+    elif not guard.get("live"):
+        payload["hint"] = (
+            "no guard watcher is running, so this call can see the price but "
+            "nothing will act on it. Arm one with guard action='arm' -- a watch "
+            "observes, it does not protect."
+        )
+    return emit(payload)
 
 
 def cmd_candles(args: argparse.Namespace) -> int:
@@ -2459,11 +2971,24 @@ GUARD_CLOSE_RETRY_FAST_COOLDOWN_SECONDS = 0.25
 #: touch has to have lasted before it is worth reporting as a near miss.
 GUARD_TICK_SCAN_LOOKBACK_SECONDS = 3.0
 GUARD_NEAR_MISS_COOLDOWN_SECONDS = 5.0
-#: The ceiling on one blocking ``guard status --wait-seconds`` call. A caller
-#: wants to watch in real time, not to hold a sandbox command open forever:
-#: the wait is capped here and the answer says it timed out, so the model can
-#: poll again instead of being killed by a command timeout mid-wait.
-GUARD_MAX_WAIT_SECONDS = 120.0
+#: The ceiling on ONE blocking watch, whatever it is watching: a guard's events
+#: (``guard status --wait-seconds``), a live trade (``watch``), or an install
+#: (``status --wait-seconds``). All three are one number on purpose.
+#:
+#: 90 s, not 120 s, because 120 s is the ceiling for a single SANDBOX COMMAND --
+#: the whole round trip, not the wait. A caller wants to watch in real time, not
+#: to hold a command open until the sandbox kills it, and a killed command
+#: returns NO JSON AT ALL, which reads as "the tool is broken" rather than
+#: "still waiting". Capping the wait at 90 s leaves room for the bootstrap fetch
+#: and, on the two Wine-side paths, the re-exec into Wine, and still lands under
+#: the ceiling. Every answer carries ``capped_at_s`` and ``timed_out``, so the
+#: model calls again rather than being cut off with nothing to show.
+WATCH_MAX_WAIT_SECONDS = 90.0
+
+#: The guard's wait is whichever name a reader looks for; it is the same number
+#: and must stay the same number, or one path would be holding a command open
+#: past the ceiling the others respect.
+GUARD_MAX_WAIT_SECONDS = WATCH_MAX_WAIT_SECONDS
 
 #: Seconds after which a silent heartbeat means the watcher is dead. The watcher
 #: beats every ``--interval-ms`` loop, so this is ~50 missed loops: long enough
@@ -5017,6 +5542,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("status", help="install progress / stack readiness (pollable)")
     p.add_argument("--lines", type=int, default=25)
+    p.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "instead of answering instantly, WATCH the install for this many "
+            "seconds and return the moment it moves: the stage changes, the "
+            "installer writes more output, or the installer process exits. A "
+            f"finished install returns immediately without waiting. Capped at "
+            f"{int(WATCH_MAX_WAIT_SECONDS)} s. A timeout is a normal answer and is "
+            "reported as one, in 'watched', so 'still installing' is an "
+            "observation rather than a claim."
+        ),
+    )
+    p.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=2.0,
+        help="status --wait-seconds: how often to sample the install (default 2 s)",
+    )
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("start", help="launch the terminal headless")
@@ -5056,6 +5601,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("positions", help="open positions").set_defaults(func=cmd_positions)
     sub.add_parser("orders", help="pending orders").set_defaults(func=cmd_orders)
+
+    p = sub.add_parser(
+        "watch",
+        help="watch a live trade: positions + live prices + guard, in one frame",
+    )
+    # Repeatable and optional: with no symbol the symbols of the OPEN POSITIONS
+    # are watched, which is the set that carries risk. Naming symbols is for a
+    # market the caller cares about but has not traded yet.
+    p.add_argument("--symbol", action="append", default=[])
+    p.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "block and sample for this many seconds, returning the moment "
+            "something happens (a rule fires, a close is refused, a level is "
+            "touched and reverted, the watcher stops, the set of open positions "
+            f"changes). Capped at {int(WATCH_MAX_WAIT_SECONDS)} s. Use it to "
+            "actually observe a live trade instead of reporting that it is being "
+            "'monitored'."
+        ),
+    )
+    p.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=1.0,
+        help="watch --wait-seconds: how often to sample (default 1 s)",
+    )
+    p.add_argument("--lines", type=int, default=20, help="guard events to return")
+    p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("history", help="closed deals")
     p.add_argument("--days", type=int, default=7)
@@ -5195,6 +5770,13 @@ _BRIDGE_ACTIONS = frozenset(
     {
         "login", "account", "quote", "candles", "positions", "orders",
         "history", "symbol", "symbols", "order", "close", "close_all", "run",
+        # `watch` samples ticks and positions every poll, so it MUST run under
+        # Wine: on the Linux python each sample would be a fresh re-exec into
+        # Wine (seconds each) and a 1 Hz watch would sample the market at
+        # roughly one frame per call instead of one per second. Under Wine a
+        # tick read is ~335 us, which is what makes the price PATH (not just the
+        # latest price) affordable inside one call.
+        "watch",
         # `modify` talks to the terminal (TRADE_ACTION_SLTP), so it must run
         # under Wine. `guard` deliberately does NOT appear here: arming the
         # watcher spawns wine FROM the Linux python, which the re-exec'd

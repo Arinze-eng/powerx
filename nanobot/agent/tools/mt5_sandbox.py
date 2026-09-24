@@ -73,7 +73,7 @@ _REPO = os.getenv("MT5_SCRIPT_REPO", "Arinze-eng/powerx")
 #: code that is no longer running, the caller gets a loud warning and a retry
 #: against a different source. Bump BOTH constants together whenever the CLI's
 #: contract with this tool changes.
-_CLI_VERSION = "2026-09-23.8"
+_CLI_VERSION = "2026-09-24.1"
 
 #: Where the CLI and the Wine prefix live inside the sandbox.
 _MT5_HOME = "$HOME/.mt5"
@@ -109,6 +109,11 @@ _READ_ONLY_ACTIONS = frozenset(
     {
         "status", "doctor", "account", "quote", "candles", "positions", "orders",
         "history", "symbol", "symbols", "logs", "experts", "run",
+        # `watch` reads positions, prices and the guard's files and changes
+        # nothing, so it must never be gated behind the trading opt-in: the
+        # caller most in need of watching a live trade is the one who has just
+        # been told trading is off.
+        "watch",
     }
 )
 
@@ -144,6 +149,9 @@ _TIMEOUTS: dict[str, int] = {
     # after this call returns), so both fit well inside the ceiling.
     "modify": 120,
     "guard": 120,
+    # `watch` measures the market while it waits, so like `guard` its ceiling is
+    # raised to cover the wait (see execute()).
+    "watch": 120,
 }
 _DEFAULT_TIMEOUT = 120
 
@@ -471,6 +479,18 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
             parts += ["--foreground"]
     elif action == "status":
         parts += ["--lines", str(int(kwargs.get("lines") or 25))]
+        # A WATCH, not a snapshot. With wait_seconds set this call blocks and
+        # samples the install every poll_seconds, returning the moment it moves
+        # -- stage change, more installer output, or the installer exiting -- so
+        # "still installing" is something the caller OBSERVED and has fresh log
+        # to reason about, rather than an assertion it repeats each turn.
+        # Timing out is reported as `watched.timed_out`, so "nothing moved yet"
+        # can never be read as "something moved".
+        if float(kwargs.get("wait_seconds") or 0.0) > 0:
+            parts += [
+                "--wait-seconds", str(float(kwargs["wait_seconds"])),
+                "--poll-seconds", str(float(kwargs.get("poll_seconds") or 2.0)),
+            ]
     elif action == "start":
         # The wait MUST fit inside this action's own command ceiling: a command
         # killed by the sandbox returns no JSON at all, which reads as "the tool is
@@ -603,6 +623,23 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
                 ]
         elif sub_action == "events":
             parts += ["--lines", str(int(kwargs.get("lines") or 20))]
+    elif action == "watch":
+        # Symbols are optional: with none, the CLI watches the symbols of the
+        # OPEN POSITIONS, which is the set that carries risk. `symbols` is
+        # accepted as well as `symbol` so the field that already means "the
+        # instruments I care about" on action=quote works here too.
+        raw = kwargs.get("symbol") or kwargs.get("symbols") or []
+        if isinstance(raw, str):
+            raw = [s for s in re.split(r"[,\s]+", raw) if s]
+        for sym in raw:
+            parts += ["--symbol", _sh(str(sym))]
+        wait = float(kwargs.get("wait_seconds") or 0.0)
+        if wait > 0:
+            parts += [
+                "--wait-seconds", str(wait),
+                "--poll-seconds", str(float(kwargs.get("poll_seconds") or 1.0)),
+            ]
+        parts += ["--lines", str(int(kwargs.get("lines") or 20))]
     elif action == "compile":
         parts += ["--file", _sh(kwargs.get("file") or "")]
         if kwargs.get("include"):
@@ -774,7 +811,7 @@ class MT5SandboxTool(Tool):
                 "filter": {"type": "string", "description": "action=symbols: case-insensitive substring to match symbol names."},
                 "tradable": {"type": "boolean", "description": "action=symbols: only list symbols that are enabled AND have a fresh tick (market open now)."},
                 "limit": {"type": "integer", "description": "action=symbols: max rows to return (default 60)."},
-                "symbols": {"type": "string", "description": "Space/comma separated symbols for action=quote."},
+                "symbols": {"type": "string", "description": "Space/comma separated symbols for action=quote, and for action=watch (where it is optional -- omit it and the symbols of the OPEN POSITIONS are watched)."},
                 "timeframe": {"type": "string", "description": "M1..MN1 (action=candles)."},
                 "count": {"type": "integer", "description": "Number of bars (action=candles)."},
                 "days": {"type": "integer", "description": "History window in days (action=history)."},
@@ -793,8 +830,8 @@ class MT5SandboxTool(Tool):
                 "trigger_op": {"type": "string", "enum": [">=", "<="], "description": "action=guard (arm): \">=\" fires at or above the level, \"<=\" at or below. Omit it and the direction is inferred from the live price."},
                 "trigger_side": {"type": "string", "enum": ["mid", "bid", "ask"], "description": "action=guard (arm): which price is compared to the level (default mid = (bid+ask)/2, which is what \"the price\" usually means)."},
                 "interval_ms": {"type": "integer", "description": "action=guard (arm): how often the watcher reads the tick stream, in milliseconds (default 100). Lowering it does NOT make the guard see more of the market: MEASURED 2026-09-23, one symbol_info_tick call inside Wine costs 334.7 us (~2988/s is the absolute ceiling for a Python poll) and each call returns ONE tick, while the recorded feed carries several a second at its quietest (MEASURED, same day: 282 rows over 60.5 s; another reading counted 618.85 tick/s -- the rate is bursty). The watcher already reads every tick that was RECORDED since the last loop and reports the one that truly crossed, so the interval is how often it decides, not how much it sees."},
-                "wait_seconds": {"type": "number", "description": "action=guard, guard_action=status: instead of returning a snapshot instantly, WATCH the guard for this many seconds and return the moment something happens (a fire, a refused close, a resumed retry, a level touched and reverted, the watcher stopping). Capped at 120 s. Use this to actually observe an exit instead of reporting that the guard is 'monitoring' -- the answer carries watched.timed_out, so 'nothing happened yet' is never read as 'something happened'."},
-                "poll_seconds": {"type": "number", "description": "action=guard, guard_action=status with wait_seconds: how often to sample the guard (default 1 s)."},
+                "wait_seconds": {"type": "number", "description": "BLOCKS instead of returning a snapshot, and is how a long-running thing is WATCHED rather than assumed. action=watch: watch the live trade for this many seconds and return the moment something happens (a rule fires, a close is refused, a level is touched and reverted, the watcher stops, the set of open positions changes). action=guard, guard_action=status: same, on the guard. action=status: watch the INSTALL and return the moment it moves (the stage changes, the installer writes more output, or the installer process exits); a finished install returns immediately. Capped at 90 s on every path, so the whole command still fits the 120 s ceiling for one sandbox command. Use it to actually observe an install/exit/live trade instead of reporting that it is 'monitoring' -- every answer carries watched.timed_out and watched.observed_event, so 'nothing happened yet' is never read as 'something happened'."},
+                "poll_seconds": {"type": "number", "description": "action=watch/guard/status with wait_seconds: how often to sample while waiting (default 1 s; 2 s for status)."},
                 "max_seconds": {"type": "integer", "description": "action=guard (arm/ensure): how long the guard may keep watching before it stops itself. Omit it (the default) and it holds the level for as long as it takes -- there is no time limit. Only set it for a deliberately bounded run; a guard that stops is reported by guard status as alert=guard_not_running, never as protection."},
                 "rule": {"type": "object", "description": "action=guard (arm): advanced -- an explicit rule object instead of trigger_* fields. Normally omit it and pass symbol/trigger_price/trigger_op."},
                 "comment": {"type": "string", "description": "Order comment."},
@@ -927,12 +964,16 @@ class MT5SandboxTool(Tool):
             f"{command}; tail -c 400 {_BOOTSTRAP_LOG} 1>&2"
         )
         timeout = int(kwargs.get("timeout") or _TIMEOUTS.get(action, _DEFAULT_TIMEOUT))
-        # A blocking guard status WATCHES for as long as the caller asked, so the
-        # command timeout has to cover the wait -- otherwise the wait is killed
-        # mid-flight by the sandbox and returns no JSON at all, which is the one
-        # outcome a watch exists to avoid. ``waited`` is capped CLI-side at
-        # GUARD_MAX_WAIT_SECONDS (120 s); the slack is for bootstrap + Wine.
-        if action == "guard":
+        # A WATCH runs for as long as the caller asked -- on the guard, on a live
+        # trade (``watch``), or on an install (``status``) -- so the command
+        # timeout has to cover the wait. Otherwise the wait is killed mid-flight
+        # by the sandbox and returns no JSON at all, which is the one outcome a
+        # watch exists to avoid. The wait is capped CLI-side at
+        # WATCH_MAX_WAIT_SECONDS / GUARD_MAX_WAIT_SECONDS (90 s either way), so
+        # ``wait + 30`` lands exactly on the 120 s ceiling for one sandbox
+        # command -- and the slack is for the bootstrap fetch plus, on the two
+        # Wine-side paths, the re-exec into Wine.
+        if action in ("guard", "status", "watch"):
             wait = float(kwargs.get("wait_seconds") or 0.0)
             if wait > 0:
                 timeout = max(timeout, int(wait) + 30)

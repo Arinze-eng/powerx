@@ -3729,6 +3729,494 @@ def test_guard_watch_reaches_the_cli_and_the_wait_is_bounded(monkeypatch, tmp_pa
     assert _broker_cli(monkeypatch, tmp_path).GUARD_MAX_WAIT_SECONDS <= 120.0
 
 
+# --------------------------------------------------------------------------- #
+# Following a long-running thing: the install, and a live trade
+# --------------------------------------------------------------------------- #
+def test_status_watch_returns_the_moment_the_install_advances(monkeypatch, tmp_path):
+    """Following an install must OBSERVE it advance, not assert that it is.
+
+    ``install`` is detached, so ``status`` was the only way to follow it -- and
+    ``status`` answered instantly. A caller in that position repeats "still
+    installing" each turn with nothing behind it. This waits for the stage file
+    to move and returns the moment it does, with the stage it moved TO.
+    """
+    import threading
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.MT5_ROOT.mkdir(parents=True, exist_ok=True)
+    (cli.MT5_ROOT / "install.status").write_text("downloading|wine", encoding="utf-8")
+    monkeypatch.setattr(cli, "_installer_alive", lambda: True)
+
+    def advance() -> None:
+        (cli.MT5_ROOT / "install.status").write_text(
+            "done|install complete", encoding="utf-8"
+        )
+
+    timer = threading.Timer(0.3, advance)
+    timer.start()
+    try:
+        watched = cli._install_wait(5.0, 0.2)
+    finally:
+        timer.cancel()
+
+    assert watched["timed_out"] is False
+    assert watched["observed_event"] == "install_done"
+    assert watched["observed"][-1]["from_stage"] == "downloading"
+    assert watched["observed"][-1]["stage"] == "done"
+    assert watched["samples"] >= 1
+    # It returned because of the change, not because the budget ran out.
+    assert watched["waited_s"] < 5.0
+    assert "observed 'install_done'" in watched["note"]
+
+
+def test_status_watch_reports_log_growth_as_progress(monkeypatch, tmp_path):
+    """A stage that has not changed is not the same as an install that has not.
+
+    Most of a Wine + MT5 install is one long stage with output scrolling past.
+    Without this the caller either waits for a stage change that is minutes away
+    or concludes nothing is happening while the log is being written to.
+    """
+    import threading
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.MT5_ROOT.mkdir(parents=True, exist_ok=True)
+    log = cli.MT5_ROOT / "install.log"
+    log.write_text("step 1\n", encoding="utf-8")
+    (cli.MT5_ROOT / "install.status").write_text("downloading|wine", encoding="utf-8")
+    monkeypatch.setattr(cli, "_installer_alive", lambda: True)
+
+    def grow() -> None:
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write("step 2\n")
+
+    timer = threading.Timer(0.3, grow)
+    timer.start()
+    try:
+        watched = cli._install_wait(5.0, 0.2)
+    finally:
+        timer.cancel()
+
+    assert watched["observed_event"] == "install_log_grew"
+    assert watched["observed"][-1]["grew_bytes"] == len("step 2\n")
+
+
+def test_status_watch_notices_the_installer_dying_without_a_stage_change(
+    monkeypatch, tmp_path,
+):
+    """The installer disappearing IS the news, even if the stage file never moved.
+
+    A crashed installer leaves the last stage it wrote on disk. A wait that only
+    looked at the stage would sit there until the budget ran out and then report
+    "nothing moved", while the thing doing the work had already gone.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.MT5_ROOT.mkdir(parents=True, exist_ok=True)
+    log = cli.MT5_ROOT / "install.log"
+    log.write_text("step 1\n", encoding="utf-8")
+    (cli.MT5_ROOT / "install.status").write_text("downloading|wine", encoding="utf-8")
+    alive = {"n": 0}
+
+    def flaky() -> bool:
+        alive["n"] += 1
+        if alive["n"] > 1:
+            # The exit also writes to the log, because ending IS the installer's
+            # last act. This is what makes the ORDER of the checks matter: read
+            # the log first and the caller is told "it wrote something" and never
+            # told that the process doing the work is gone.
+            with log.open("a", encoding="utf-8") as fh:
+                fh.write("bye\n")
+            return False
+        return True
+
+    monkeypatch.setattr(cli, "_installer_alive", flaky)
+
+    watched = cli._install_wait(5.0, 0.2)
+
+    assert watched["observed_event"] == "installer_exited"
+    assert watched["to"]["installer_alive"] is False
+    assert watched["timed_out"] is False
+
+
+def test_status_watch_against_a_finished_install_does_not_stall(monkeypatch, tmp_path):
+    """Nothing to wait for is answered immediately, and named.
+
+    A wait against a finished install is a 120 s stall that then reports a
+    timeout, which reads as "something is wrong" when the truth is "it is over".
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.MT5_ROOT.mkdir(parents=True, exist_ok=True)
+    (cli.MT5_ROOT / "install.status").write_text("done|install complete", encoding="utf-8")
+    monkeypatch.setattr(cli, "_installer_alive", lambda: False)
+
+    watched = cli._install_wait(30.0, 0.2)
+
+    assert watched["observed_event"] == "install_already_done"
+    assert watched["waited_s"] == 0.0 and watched["samples"] == 0
+    assert watched["timed_out"] is False
+
+
+def test_status_watch_says_when_nothing_moved(monkeypatch, tmp_path):
+    """"Still installing" must be reported as an observation, never as progress."""
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.MT5_ROOT.mkdir(parents=True, exist_ok=True)
+    (cli.MT5_ROOT / "install.status").write_text("downloading|wine", encoding="utf-8")
+    monkeypatch.setattr(cli, "_installer_alive", lambda: True)
+
+    watched = cli._install_wait(0.5, 0.2)
+
+    assert watched["timed_out"] is True
+    assert watched["observed"] == [] and watched["observed_event"] is None
+    assert watched["samples"] >= 1
+    assert "nothing moved" in watched["note"]
+    # The cap plus the tool's slack for the round trip has to land inside the
+    # 120 s ceiling for ONE sandbox command, or the wait would be killed
+    # mid-flight and return no JSON at all.
+    assert watched["capped_at_s"] == cli.WATCH_MAX_WAIT_SECONDS
+    assert cli.WATCH_MAX_WAIT_SECONDS + 30 <= 120.0
+
+
+def test_a_plain_status_is_still_a_snapshot(monkeypatch, tmp_path):
+    """No wait asked for means no wait: the existing contract is unchanged."""
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.MT5_ROOT.mkdir(parents=True, exist_ok=True)
+    (cli.MT5_ROOT / "install.status").write_text("done|install complete", encoding="utf-8")
+
+    args = types.SimpleNamespace(lines=5, wait_seconds=0.0, poll_seconds=2.0)
+    text = _capture_emit(cli, cli.cmd_status, args)
+    assert "watched" not in json.loads(text)
+
+
+def test_status_watch_reaches_the_cli_and_the_wait_is_bounded(monkeypatch, tmp_path):
+    """The tool passes the install watch through, and never past its ceiling."""
+    watching = build_cli_command(
+        "status", {"wait_seconds": 45, "poll_seconds": 3, "lines": 40}
+    )
+    assert "mt5_cli.py status" in watching
+    assert "--wait-seconds 45" in watching and "--poll-seconds 3" in watching
+    assert "--lines 40" in watching
+
+    # No wait asked for -> no flags, so a plain status stays a snapshot.
+    plain = build_cli_command("status", {"lines": 25})
+    assert "--wait-seconds" not in plain and "--poll-seconds" not in plain
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    assert cli.WATCH_MAX_WAIT_SECONDS + 30 <= 120.0
+    # One number for every watch path, or one of them would be holding a
+    # command open past the ceiling the others respect.
+    assert cli.GUARD_MAX_WAIT_SECONDS == cli.WATCH_MAX_WAIT_SECONDS
+
+
+# --------------------------------------------------------------------------- #
+# `watch`: one frame of a live trade instead of three photographs of it
+# --------------------------------------------------------------------------- #
+def _watch_position(ticket: int, symbol: str, price: float = 1.14190):
+    return types.SimpleNamespace(
+        ticket=ticket,
+        symbol=symbol,
+        _asdict=lambda: {
+            "ticket": ticket, "symbol": symbol, "volume": 0.1, "price_open": price,
+            "sl": 0.0, "tp": 0.0, "profit": 0.0,
+        },
+    )
+
+
+class _WatchMT5:
+    """Just enough of MetaTrader5 to drive ``watch``: positions and ticks."""
+
+    def __init__(self, *, positions=(), ticks=None, digits=5):
+        self._positions = list(positions)
+        self.ticks = dict(ticks or {})
+        self.digits = digits
+        self.selected: list[str] = []
+        self.unavailable = False
+
+    def initialize(self):  # noqa: ANN201
+        return True
+
+    def last_error(self):  # noqa: ANN201
+        return (0, "no error")
+
+    def symbol_select(self, name, enable=True):  # noqa: ANN001, ANN201
+        self.selected.append(name)
+        return True
+
+    def symbol_info(self, name):  # noqa: ANN001, ANN201
+        return types.SimpleNamespace(name=name, digits=self.digits)
+
+    def symbol_info_tick(self, name):  # noqa: ANN001, ANN201
+        row = self.ticks.get(name)
+        if row is None:
+            return None
+        bid, ask = row
+        return types.SimpleNamespace(
+            bid=bid, ask=ask, last=bid, volume=1, time=1_700_000_000,
+            time_msc=1_700_000_000_000,
+        )
+
+    def positions_get(self):  # noqa: ANN201
+        if self.unavailable:
+            return None
+        return tuple(self._positions)
+
+
+def _serve_watch(monkeypatch, cli, mt5) -> None:
+    monkeypatch.setattr(cli, "require_bridge", lambda: (mt5, None))
+
+
+def _live_guard_state(cli, **extra) -> None:
+    cli.GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    cli.GUARD_EVENTS_FILE.write_text("", encoding="utf-8")
+    state = {"status": "running", "heartbeat": time.time(), "rules": 1, "polls": 7}
+    state.update(extra)
+    cli.GUARD_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _capture_emit(cli, func, args) -> str:
+    """Run a CLI command and return the JSON it printed."""
+    out: list[str] = []
+    original = cli.emit
+    try:
+        cli.emit = lambda payload, **kw: (out.append(json.dumps(payload)), 0)[1]
+        func(args)
+    finally:
+        cli.emit = original
+    assert out, "the command emitted nothing"
+    return out[-1]
+
+
+def test_watch_returns_the_moment_a_rule_fires(monkeypatch, tmp_path):
+    """A live trade is OBSERVED, not assumed: the fire ends the wait.
+
+    This is the whole point of the action. "The guard is monitoring this
+    position" is a claim until a call returns having watched it do something,
+    and this returns carrying the event, the position, and the price path.
+    """
+    import threading
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    _live_guard_state(cli, ticks_scanned={"EURUSD": 35})
+    mt5 = _WatchMT5(
+        positions=[_watch_position(777, "EURUSD")],
+        ticks={"EURUSD": (1.14190, 1.14210)},
+    )
+    _serve_watch(monkeypatch, cli, mt5)
+
+    def write_fire() -> None:
+        with cli.GUARD_EVENTS_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "event": "fired", "rule_id": "g-1", "symbol": "EURUSD",
+                "latency_ms": 141.8, "positions_matched": 1,
+            }) + "\n")
+
+    timer = threading.Timer(0.3, write_fire)
+    timer.start()
+    try:
+        payload = json.loads(_capture_emit(
+            cli, cli.cmd_watch,
+            types.SimpleNamespace(symbol=[], wait_seconds=5.0, poll_seconds=0.2, lines=20),
+        ))
+    finally:
+        timer.cancel()
+
+    assert payload["watched"]["observed_event"] == "fired"
+    assert payload["watched"]["timed_out"] is False
+    assert payload["watched"]["waited_s"] < 5.0
+    # Defaults to the symbols AT RISK -- no --symbol was given.
+    assert payload["symbols_watched"] == ["EURUSD"]
+    assert payload["position_count"] == 1
+    assert payload["positions"][0]["ticket"] == 777
+    assert payload["prices"]["EURUSD"]["mid"] == pytest.approx(1.142)
+    # Proof the guard is LOOKING, carried into the same payload.
+    assert payload["ticks_scanned"] == {"EURUSD": 35}
+    assert payload["ok"] is True
+
+
+def test_watch_reports_the_price_path_when_nothing_happened(monkeypatch, tmp_path):
+    """"Nothing happened" plus how far the price travelled is the useful answer.
+
+    A snapshot cannot tell "moved 3 pips and came back" from "sat still"; those
+    are the same number in a snapshot and different facts about the market. The
+    path is what makes the timeout worth reading rather than merely honest.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    _live_guard_state(cli)
+    mt5 = _WatchMT5(
+        positions=[_watch_position(777, "EURUSD")],
+        ticks={"EURUSD": (1.14190, 1.14210)},
+    )
+    _serve_watch(monkeypatch, cli, mt5)
+
+    payload = json.loads(_capture_emit(
+        cli, cli.cmd_watch,
+        types.SimpleNamespace(symbol=[], wait_seconds=0.5, poll_seconds=0.1, lines=5),
+    ))
+
+    watched = payload["watched"]
+    assert watched["timed_out"] is True
+    assert watched["observed"] == [] and watched["observed_event"] is None
+    assert "nothing happened" in watched["note"]
+    assert "Price moved" in watched["note"]
+    path = payload["price_path"]["EURUSD"]
+    assert path["samples"] >= 1
+    assert path["first_mid"] == pytest.approx(1.142)
+    assert path["range_pips"] == 0.0
+    # The cap plus the tool's slack for the round trip has to land inside the
+    # 120 s ceiling for ONE sandbox command, or the wait would be killed
+    # mid-flight and return no JSON at all.
+    assert watched["capped_at_s"] == cli.WATCH_MAX_WAIT_SECONDS
+    assert cli.WATCH_MAX_WAIT_SECONDS + 30 <= 120.0
+
+
+def test_watch_notices_the_set_of_open_positions_changing(monkeypatch, tmp_path):
+    """The position closing under the caller's feet ends the wait, loudly.
+
+    Nothing in the market can tell the caller that their exposure changed; only
+    the position set can. A watch that waited for a price event would sit through
+    the exit it exists to report.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    _live_guard_state(cli)
+    mt5 = _WatchMT5(
+        positions=[_watch_position(777, "EURUSD")],
+        ticks={"EURUSD": (1.14190, 1.14210)},
+    )
+    _serve_watch(monkeypatch, cli, mt5)
+
+    calls = {"n": 0}
+    real = mt5.positions_get
+
+    def vanish_after_one():
+        calls["n"] += 1
+        if calls["n"] > 1:
+            mt5._positions = []
+        return real()
+
+    mt5.positions_get = vanish_after_one
+
+    payload = json.loads(_capture_emit(
+        cli, cli.cmd_watch,
+        types.SimpleNamespace(symbol=[], wait_seconds=5.0, poll_seconds=0.05, lines=5),
+    ))
+
+    assert payload["watched"]["observed_event"] == "position_closed"
+    assert payload["watched"]["observed"][-1]["closed"] == [777]
+    assert payload["position_count"] == 0
+
+
+def test_watch_notices_the_watcher_dying(monkeypatch, tmp_path):
+    """A watcher that stops mid-watch is an observation and a failure, not a timeout."""
+    cli = _broker_cli(monkeypatch, tmp_path)
+    _live_guard_state(cli)
+    mt5 = _WatchMT5(
+        positions=[_watch_position(777, "EURUSD")],
+        ticks={"EURUSD": (1.14190, 1.14210)},
+    )
+    _serve_watch(monkeypatch, cli, mt5)
+
+    live = {"n": 0}
+
+    def flaky_live(state):  # noqa: ANN001, ANN201
+        live["n"] += 1
+        return live["n"] <= 1
+
+    monkeypatch.setattr(cli, "_guard_is_live", flaky_live)
+
+    payload = json.loads(_capture_emit(
+        cli, cli.cmd_watch,
+        types.SimpleNamespace(symbol=[], wait_seconds=5.0, poll_seconds=0.05, lines=5),
+    ))
+
+    assert payload["watched"]["observed_event"] == "watcher_stop"
+    # The level is watched by nobody now, so this is not a healthy answer.
+    assert payload["ok"] is False
+    assert payload["alert"] == "watcher_stop"
+
+
+def test_watch_with_nothing_to_watch_says_so(monkeypatch, tmp_path):
+    """No positions and no symbols is an empty watch, not a silent one."""
+    cli = _broker_cli(monkeypatch, tmp_path)
+    _live_guard_state(cli)
+    mt5 = _WatchMT5(positions=[], ticks={})
+    _serve_watch(monkeypatch, cli, mt5)
+
+    payload = json.loads(_capture_emit(
+        cli, cli.cmd_watch,
+        types.SimpleNamespace(symbol=[], wait_seconds=0.0, poll_seconds=1.0, lines=5),
+    ))
+
+    assert payload["symbols_watched"] == []
+    assert payload["position_count"] == 0
+    assert "nothing to watch" in payload["hint"]
+
+
+def test_watch_reports_a_terminal_that_did_not_answer(monkeypatch, tmp_path):
+    """A failed position read must never be reported as a flat account.
+
+    ``positions_get`` returns None for a FAILED request and 0 rows for "nothing
+    is open". Collapsing the two would tell a caller their position is gone when
+    the terminal simply did not answer -- the worst thing this command could say.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    _live_guard_state(cli)
+    mt5 = _WatchMT5(positions=[], ticks={})
+    mt5.unavailable = True
+    _serve_watch(monkeypatch, cli, mt5)
+
+    payload = json.loads(_capture_emit(
+        cli, cli.cmd_watch,
+        types.SimpleNamespace(symbol=[], wait_seconds=0.0, poll_seconds=1.0, lines=5),
+    ))
+
+    assert payload["ok"] is False
+    assert payload["alert"] == "terminal_unavailable"
+    assert payload["terminal"]["available"] is False
+    assert "NOT known to be the whole picture" in payload["warning"]
+
+
+def test_watch_reaches_the_cli_and_runs_under_wine():
+    """The tool passes symbols and the wait through; the CLI runs it in Wine.
+
+    Wine matters: on the Linux python every sample is a fresh re-exec into Wine
+    (seconds each), so a 1 Hz watch would sample the market once per call instead
+    of once per second -- and the price PATH could not be built at all.
+    """
+    watching = build_cli_command(
+        "watch",
+        {"symbols": "EURUSD, XAUUSD", "wait_seconds": 60, "poll_seconds": 2, "lines": 30},
+    )
+    assert "mt5_cli.py watch" in watching
+    assert "--symbol EURUSD" in watching and "--symbol XAUUSD" in watching
+    assert "--wait-seconds 60" in watching and "--poll-seconds 2" in watching
+    assert "--lines 30" in watching
+
+    # No symbols and no wait -> a plain snapshot of the positions at risk.
+    bare = build_cli_command("watch", {})
+    assert bare.endswith("mt5_cli.py watch --lines 20")
+
+    from nanobot.agent.tools.mt5_sandbox import _READ_ONLY_ACTIONS
+
+    assert "watch" in _READ_ONLY_ACTIONS
+    assert _TIMEOUTS["watch"] <= 120
+
+
+def test_watch_survives_a_trading_disabled_deployment():
+    """Observing a live trade must not need the trading opt-in.
+
+    The caller most in need of watching is the one who has just been told live
+    trading is off; refusing to show them the position would be perverse. The
+    gate is driven by _TRADING_ACTIONS, so `watch` being absent from it (and
+    present in the read-only set) is the whole property.
+    """
+    from nanobot.agent.tools.mt5_sandbox import _READ_ONLY_ACTIONS, _TRADING_ACTIONS
+
+    assert "watch" in _READ_ONLY_ACTIONS
+    assert "watch" not in _TRADING_ACTIONS
+    # And it is offered to the model: an action the schema does not list cannot
+    # be called, which would make the whole feature unreachable.
+    schema = MT5SandboxTool.__new__(MT5SandboxTool).parameters["properties"]["action"]
+    assert "watch" in schema["enum"]
+
+
 def test_guard_ensure_and_the_unpriceable_override_reach_the_cli():
     ensure = build_cli_command(
         "guard", {"guard_action": "ensure", "max_seconds": 600, "interval_ms": 50}

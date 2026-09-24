@@ -43,6 +43,24 @@ returns `poll_timeout: true`, the install is **progressing, not broken**. Call
 `action='status'` again immediately and keep polling. Do not restart, do not
 re-run `install`, do not ask the user anything.
 
+### Poll it as a WATCH, not as a spin
+
+`status` with `wait_seconds` **blocks** until the install moves and hands you the
+thing that moved. Use it instead of calling `status` back to back:
+
+```
+mt5_sandbox(action="status", wait_seconds=60, lines=40)
+```
+
+It returns the moment the stage changes, the installer writes more output
+(`install_log_grew`), or the installer process exits (`installer_exited`), and
+the snapshot in the same payload is the state **after** that change. Read
+`watched.observed_event` and `watched.note` and say what happened; a
+`watched.timed_out: true` means *nothing moved in that window*, which is a fact
+about the install and not a failure. Capped at 90 s per call — call again to
+keep watching. A finished install answers instantly with
+`install_already_done` / `install_already_failed` rather than stalling.
+
 ### Broker installer URLs are validated
 
 `broker_installer_url` is checked **before** the sandbox is touched. A slug with a
@@ -331,13 +349,13 @@ else — that list is the exact shape of the original complaint.
   would fill at a price the caller never asked to be out at. Closes still fire on
   the LIVE tick only. When someone asks "did it touch X", this event is the
   answer — and it is not a reason to say the position was closed.
-* **`status` can OBSERVE instead of assert.** `wait_seconds` (capped at 120 s,
-  with `poll_seconds`) blocks until the event log grows, then returns the event
-  with `observed`, `observed_event`, `waited_s`, `samples`; when nothing happens
-  it returns `observed: false` with the same fields rather than a claim that all
-  is well. ANY new event ends the wait — a `close_failed`, a `close_gave_up` or a
-  `watcher_stop` matters as much as a `fired`. Use it when the caller asks you to
-  watch, instead of polling in a loop.
+* **`guard status` can OBSERVE instead of assert.** `wait_seconds` (capped at
+  90 s, with `poll_seconds`) blocks until the event log grows, then returns the
+  event with `observed`, `observed_event`, `waited_s`, `samples`; when nothing
+  happens it returns `observed: false` with the same fields rather than a claim
+  that all is well. ANY new event ends the wait — a `close_failed`, a
+  `close_gave_up` or a `watcher_stop` matters as much as a `fired`. Use it when
+  the caller asks you to watch a level, instead of polling in a loop.
 * **The tick stream is stamped in the TERMINAL's clock, not the sandbox's.**
   MEASURED 2026-09-23, live: the tick clock ran **10799 s (~3 h) ahead** of
   `time.time()` inside Wine, and comparing the two made the every-tick scan
@@ -391,6 +409,61 @@ else — that list is the exact shape of the original complaint.
   and the CLI needs re-fetching, not re-arming.
 * End a guard with `guard_action='stop'` (a stop **file**), never by killing a
   process: `pkill -f` matches the shell that launched it.
+
+## Watching a trade while it is live — `action='watch'`
+
+Once a position is open, the question stops being "what is the state" and becomes
+"what is HAPPENING". Three separate calls answer it badly: `positions` for the
+risk, `quote` for the price, `guard status` for whether anything is still
+watching — three trips, three different instants, no memory between them. A
+caller doing that is looking at three photographs and guessing at the film.
+
+```
+mt5_sandbox(action="watch", wait_seconds=60, poll_seconds=1, lines=20)
+mt5_sandbox(action="watch", symbols="EURUSD XAUUSD", wait_seconds=60)
+```
+
+`watch` returns one frame of the film, every time:
+
+| Field | What it answers |
+|---|---|
+| `positions`, `position_count` | the open risk, as you would get from `positions` |
+| `prices` | live `bid`/`ask`/`mid` per watched symbol, plus `time_msc` |
+| `price_path` | per symbol: `first_mid`, `last_mid`, `min_mid`, `max_mid`, `drift_pips`, `range_pips`, `samples` |
+| `guard`, `guard_state` | liveness, `rules_armed`, `alert`, retrying/gave-up closes, heartbeat age |
+| `ticks_scanned`, `near_miss` | proof the watcher is LOOKING, per symbol, as counts |
+| `events` | the guard's own log, including `fired` with its measured `latency_ms` |
+| `watched` | why this call came back: `observed_event`, `waited_s`, `samples`, `timed_out`, `capped_at_s`, `note` |
+
+* **Omit `symbols` and it watches the symbols of the OPEN POSITIONS** — the set
+  that actually carries risk. Name symbols only for a market you care about but
+  have not traded yet.
+* **`price_path` is the point.** A snapshot cannot tell "moved 3 pips and came
+  back" from "sat still" — the same single number, two different markets. Over a
+  60 s watch you get the travel, so "EURUSD drifted 2.1 pips over 60 s, range 3.4,
+  no rule fired" is a sentence you can honestly write.
+* **The wait ends on something that matters**, never on a price tick: a guard
+  event (`fired`, `close_failed`, `close_gave_up`, `level_touched_then_reverted`,
+  `watcher_stop`), a change in the **set of open positions**
+  (`position_opened` / `position_closed`, with the tickets), or the watcher dying
+  while you watched it. A price that merely moves does **not** end the wait — it
+  is accumulated into `price_path` instead, or the wait would return instantly
+  every time and observe nothing.
+* **`watched.timed_out: true` is not a failure** — it means nothing happened in
+  that window, and `note` says so plus how far the price travelled. Say that. Do
+  not upgrade it into "the guard is protecting the position"; `watch` observes,
+  it does not protect.
+* **`ok: false` with an `alert` is a real alarm.** `watcher_stop` observed
+  mid-watch, a `close_failed`/`close_gave_up`, a guard that is armed with nothing
+  running, or a terminal that did not answer `positions_get`
+  (`alert: "terminal_unavailable"` — the positions in that payload are **not**
+  known to be the whole picture) all mean the position is not covered the way the
+  caller thinks. Act on it or say it out loud.
+* **Capped at 90 s per call.** There is no daemon and there never will be:
+  "continuous" means a bounded blocking call, repeated. Call `watch` again to
+  continue where the last one stopped.
+* `watch` is **read-only** and works with `MT5_ALLOW_TRADING` off — observing is
+  never the thing that moves money.
 
 ## Sizing
 
