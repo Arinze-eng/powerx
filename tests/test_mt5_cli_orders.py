@@ -1572,3 +1572,85 @@ def test_a_partial_cancel_is_an_alert_never_a_success(cli, monkeypatch):
     assert out["cancelled"] == 1 and out["requested"] == 2
     assert out["alert"] == "cancel_incomplete"
     assert code, "an incomplete sweep is not a clean result"
+
+
+def test_a_stop_on_the_wrong_side_is_caught_even_with_an_explicit_volume(cli, monkeypatch):
+    """MEASURED live 2026-09-24 on Deriv-Demo: a buy limit resting at 4282.05
+    carrying an sl of 4285.05 came back as retcode 10016 "Invalid stops".
+
+    "Invalid stops" names neither the leg, the direction, nor the entry the leg
+    should have been measured against, so it reads like a broker fault. The same
+    numbers are refused here with the sentence that fixes them.
+    """
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+
+    assert cli.cmd_order(_order_args(volume=0.01, sl=4290.0)) == 1
+    assert sent == []
+    assert "target, not a stop" in str(out.get("error", ""))
+
+    # A pending entry is measured against ITS price, not the market: the same sl
+    # that is wrong for the market is also wrong for a limit resting below it.
+    out.clear()
+    assert cli.cmd_order(
+        _order_args(volume=0.01, entry_type="limit", price=4282.05, sl=4285.05)
+    ) == 1
+    assert sent == []
+    assert "target, not a stop" in str(out.get("error", ""))
+
+    # Below the pending entry is a real stop, and it must go through untouched.
+    out.clear()
+    assert cli.cmd_order(
+        _order_args(volume=0.01, entry_type="limit", price=4282.05, sl=4280.05)
+    ) == 0
+    assert sent[0]["sl"] == 4280.05
+    assert sent[0]["action"] == _OrderMT5.TRADE_ACTION_PENDING
+
+
+def test_a_target_on_the_wrong_side_is_refused_too(cli, monkeypatch):
+    """The mirror of the stop check: a buy's target belongs ABOVE the entry."""
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+
+    assert cli.cmd_order(_order_args(volume=0.01, tp=4280.0)) == 1
+    assert "target" in str(out.get("error", ""))
+    assert sent == []
+
+    assert cli.cmd_order(_order_args(volume=0.01, tp=4302.18)) == 0
+    assert sent[0]["tp"] == 4302.18
+
+
+def test_the_report_names_the_money_at_risk_at_the_price_paid(cli, monkeypatch):
+    """A market order fills at whatever the other side is when it lands.
+
+    MEASURED live 2026-09-24: the XAUUSD ask moved 0.18 between the quote and the
+    fill, which turned a 20.0-pip stop into 21.8 pips -- so the risk that was
+    sized is not exactly the risk that was taken. Reporting BOTH is what makes
+    the size checkable instead of merely plausible.
+    """
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent = []
+
+    def _send(m, req, fillings):
+        sent.append(dict(req))
+        return {"ok": True, "retcode": 10009, "comment": "Request executed",
+                "order": 77, "deal": 88, "price": 4285.36}  # 0.18 worse
+
+    out: dict = {}
+    monkeypatch.setattr(cli, "require_bridge", lambda: (_OrderMT5(info, tick), None))
+    monkeypatch.setattr(cli, "filling_candidates", lambda m, i: [2])
+    monkeypatch.setattr(cli, "_order_send", _send)
+    monkeypatch.setattr(
+        cli, "emit", lambda payload, text=None, code=0: (out.update(payload), code)[1]
+    )
+
+    assert cli.cmd_order(_order_args(sl=4283.18, risk_money=20.0)) == 0
+    assert sent[0]["volume"] == 0.10
+    assert out["sizing"]["stop_pips"] == 20.0
+    assert out["sizing"]["fill_stop_pips"] == 21.8
+    # 0.10 lots of Gold is $1 a pip, so 21.8 pips is $21.80 of real risk.
+    assert out["sizing"]["actual_risk_money"] == 21.8
+    assert out["risk_pct_of_equity"] == 0.22

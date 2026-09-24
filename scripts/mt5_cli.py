@@ -66,7 +66,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.8"
+CLI_VERSION = "2026-09-24.9"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -3784,6 +3784,29 @@ def _validate_stop_side(side: str, entry: float, sl: float | None) -> str | None
     return None
 
 
+def _validate_target_side(side: str, entry: float, tp: float | None) -> str | None:
+    """Whether a target sits on the winning side of the entry, or why it does not.
+
+    Mirror of ``_validate_stop_side``. A target on the losing side is the same
+    server error -- retcode 10016 "Invalid stops" -- which names neither the leg
+    nor the direction, so a typo'd tp reads like a broker fault.
+    """
+    if tp is None:
+        return None
+    is_buy = side in ("buy", "long")
+    if is_buy and float(tp) <= float(entry):
+        return (
+            f"a BUY takes profit ABOVE the entry: tp {tp} is at or below entry "
+            f"{entry}. That is a stop, not a target."
+        )
+    if not is_buy and float(tp) >= float(entry):
+        return (
+            f"a SELL takes profit BELOW the entry: tp {tp} is at or above entry "
+            f"{entry}. That is a stop, not a target."
+        )
+    return None
+
+
 def cmd_order(args: argparse.Namespace) -> int:
     """One order, at the market or resting at a price, sized in lots or in money.
 
@@ -3842,6 +3865,16 @@ def cmd_order(args: argparse.Namespace) -> int:
             return fail(bad, code=1)
         price = float(requested_price)
 
+    # BOTH legs are checked against the entry BEFORE anything is sent, on every
+    # path. MEASURED live 2026-09-24 on Deriv-Demo: a buy limit resting at
+    # 4282.05 carrying an sl of 4285.05 came back from the broker as retcode
+    # 10016 "Invalid stops", which names neither the leg, the direction, nor the
+    # entry it should have been measured against.
+    for bad in (_validate_stop_side(side, price, args.sl),
+                _validate_target_side(side, price, args.tp)):
+        if bad:
+            return fail(bad, code=1)
+
     # ---- HOW BIG, in lots or in money -------------------------------------
     risk_money = getattr(args, "risk_money", None)
     risk_pct = getattr(args, "risk_pct", None)
@@ -3869,9 +3902,6 @@ def cmd_order(args: argparse.Namespace) -> int:
                 "IS the risk. Without a stop the risk is the whole account.",
                 code=1,
             )
-        stop_bad = _validate_stop_side(side, price, args.sl)
-        if stop_bad:
-            return fail(stop_bad, code=1)
         if risk_pct is not None:
             account = mt5.account_info()
             equity = float(getattr(account, "equity", 0.0) or 0.0)
@@ -3936,6 +3966,30 @@ def cmd_order(args: argparse.Namespace) -> int:
                 sizing["requested_risk_money"] / equity * 100.0, 2
             )
             payload["risk_pct_of_equity"] = sizing["risk_pct_of_equity"]
+    if (
+        sizing is not None
+        and not pending
+        and payload["ok"]
+        and args.sl is not None
+        and payload.get("price") is not None
+    ):
+        # A market order fills at whatever the other side is when it lands, so
+        # the stop distance measured at fill time is not the one the size was
+        # derived from. Reporting the price PAID and the risk it implies is what
+        # makes the size checkable instead of merely plausible: MEASURED live
+        # 2026-09-24, the ask moved 0.18 between the quote and the fill, which
+        # turned a 20.0-pip stop into 21.8 pips.
+        pip, contract = _symbol_pip_and_contract(mt5, symbol, info)
+        fill_pips = abs(float(payload["price"]) - float(args.sl)) / pip
+        sizing["fill_stop_pips"] = round(fill_pips, 1)
+        sizing["actual_risk_money"] = round(
+            fill_pips * contract * pip * float(volume), 2
+        )
+        payload["risk_pct_of_equity"] = (
+            round(sizing["actual_risk_money"] / equity * 100.0, 2)
+            if equity > 0
+            else None
+        )
     if payload["ok"] and pending:
         payload["pending"] = True
         payload["order_ticket"] = payload.get("order")
