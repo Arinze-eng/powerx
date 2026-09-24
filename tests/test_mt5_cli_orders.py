@@ -2361,3 +2361,256 @@ def test_book_after_reports_the_book_the_trade_left_behind(cli, monkeypatch, tmp
     assert out["book_after"]["settled"] is True
     # 0.01 lots x 100 oz x $2.00 of stop.
     assert out["book_after"]["open_risk_money"] == 2.0
+
+
+# --------------------------------------------------------------------------- #
+# THE COMMENT CEILING -- 29 characters, enforced by the WRAPPER, not the broker
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-09-24 on a live Deriv-Demo terminal (MetaTrader5 5.0.6180), by
+# asking the terminal itself with `order_check`, which validates and prices a
+# request without sending it:
+#
+#   comment of 29 characters -> retcode 0
+#   comment of 30 characters -> order_check returns None and last_error is
+#                               '(-2, \'Invalid "comment" argument\')'
+#
+# The limit counts CHARACTERS: 29 accented characters (58 bytes) are accepted.
+# This is why `split` did nothing on a real account: its comment was
+# `<base>:<group>:<n>of<total>` with a 16-character base, so `--group verify-split`
+# built a 30-character comment and EVERY ticket came back retcode null with the
+# reason dropped -- a split that reported "0 of 3 filled" 30 seconds after a plain
+# `order` on the same symbol filled with retcode 10009.
+def test_the_comment_ceiling_is_the_measured_one(cli):
+    assert cli.ORDER_COMMENT_MAX == 29
+
+
+def test_a_comment_is_fitted_and_reported_when_it_is_cut(cli, monkeypatch):
+    """An over-long comment is REFUSED BEFORE SENDING, so it cannot be sent as-is.
+
+    It is fitted rather than passed through, and the truncation is reported: the
+    comment is how the trade is found in the terminal afterwards, so quietly
+    sending a different label would be its own defect.
+    """
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    sent, out = _wire_order(cli, monkeypatch, _OrderMT5(info, tick))
+    long_comment = "verify-" + "x" * 40
+
+    assert cli.cmd_order(_order_args(sl=4283.18, volume=0.1, comment=long_comment)) == 0
+    assert len(sent[0]["comment"]) == cli.ORDER_COMMENT_MAX
+    assert sent[0]["comment"] == long_comment[: cli.ORDER_COMMENT_MAX]
+    assert out["comment_truncated"] == {
+        "requested": long_comment,
+        "sent": long_comment[: cli.ORDER_COMMENT_MAX],
+        "limit": cli.ORDER_COMMENT_MAX,
+    }
+
+    # A comment that already fits is passed through untouched and NOT reported as
+    # truncated -- otherwise the notice stops meaning anything.
+    sent.clear()
+    out.clear()
+    assert cli.cmd_order(_order_args(sl=4283.18, volume=0.1, comment="verify-book")) == 0
+    assert sent[0]["comment"] == "verify-book"
+    assert "comment_truncated" not in out
+
+
+def test_a_comment_is_folded_onto_one_line(cli):
+    """The Wine layer writes arguments into a line-based .bat.
+
+    A comment carrying a newline would end that line early and turn the rest of
+    the call into a second, broken command -- the same failure that made
+    ``run --code`` return nothing at all. A comment is a label, so it is folded
+    rather than refused: keeping all of it on one line beats quoting half of it.
+    """
+    assert cli._fit_comment("gold\nbreakout\tidea   two") == "gold breakout idea two"
+    assert cli._fit_comment("") == ""
+    assert cli._fit_comment(None) == ""
+    assert len(cli._fit_comment("=" * 200)) == cli.ORDER_COMMENT_MAX
+
+
+def test_the_split_group_budget_is_derived_from_the_comment_budget(cli):
+    """The group tag is capped by the comment budget, not by a round number.
+
+    ``pwx:<group>:<n>of<total>`` must fit for the WIDEST possible index suffix
+    (``50of50``, since SPLIT_MAX_TICKETS is 50). Cutting the group afterwards
+    instead would break the ``:group:`` match `close --group` depends on, and
+    cutting the index would make "close the first three" pick tickets by accident.
+    """
+    assert cli.SPLIT_GROUP_MAX == (
+        cli.ORDER_COMMENT_MAX - len(cli.SPLIT_COMMENT_PREFIX) - 2 - len("50of50")
+    )
+    widest = cli._split_group_tag("g" * 50)
+    assert len(widest) == cli.SPLIT_GROUP_MAX
+    assert len(f"{cli.SPLIT_COMMENT_PREFIX}:{widest}:50of50") <= cli.ORDER_COMMENT_MAX
+    # A tag that already fits is left alone, and the separator is still ':group:'.
+    assert cli._split_group_tag("verify-split") == "verify-split"
+    assert cli._split_group_tag(" xau leg 2 ") == "xauleg2"
+
+
+def _wire_split(cli, monkeypatch, sent, positions=(), send=None):
+    class _Info:
+        volume_min, volume_max, volume_step, digits = 0.01, 100.0, 0.01, 2
+        filling_mode = 1
+
+    class _Tick:
+        bid, ask = 4285.00, 4285.18
+
+    monkeypatch.setattr(
+        cli, "require_bridge", lambda: (_FakeMT5(sent, _Info(), _Tick(), positions), None)
+    )
+    monkeypatch.setattr(cli, "filling_candidates", lambda mt5, info: [1])
+    if send is None:
+        def send(mt5, req, fillings):
+            sent.append(dict(req))
+            return {
+                "ok": True, "retcode": 10009, "comment": "Done",
+                "result": {"order": len(sent), "deal": len(sent), "price": req["price"]},
+            }
+    monkeypatch.setattr(cli, "_order_send", send)
+
+
+def _split_args(**over):
+    base = dict(
+        symbol="XAUUSD", side="buy", volume=0.03, splits=3, group="", sl=4270.0,
+        tp=4320.0, deviation=20, magic=0, comment="powerx-split",
+        stop_on_failure=False, check_cost=False, allow_no_stop=False,
+    )
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+def test_every_split_comment_fits_for_the_group_that_failed_live(cli, monkeypatch):
+    """THE LIVE REGRESSION: `--group verify-split` made all three tickets vanish.
+
+    Its comment was ``powerx-split:verify-split:1of3`` -- 30 characters, one over
+    the wrapper's ceiling -- so every ticket was refused locally and the split
+    reported 0 of 3 filled with no reason on a symbol a plain `order` filled.
+    """
+    sent: list = []
+    _wire_split(cli, monkeypatch, sent)
+
+    assert cli.cmd_split(_split_args(group="verify-split")) == 0
+    assert len(sent) == 3
+    for index, req in enumerate(sent, start=1):
+        assert len(req["comment"]) <= cli.ORDER_COMMENT_MAX, req["comment"]
+        # The tag is still a field, with its colons, so `close --group` finds it.
+        assert f":verify-split:" in req["comment"]
+        assert req["comment"].endswith(f":{index}of3")
+    # The exact live group is comfortably inside the budget now.
+    assert sent[0]["comment"] == "pwx:verify-split:1of3"
+
+
+def test_split_refuses_a_named_group_that_is_already_open(cli, monkeypatch):
+    """It fires ONCE. A second split on the same group doubles the position.
+
+    The comments still read as one group, so `close --group` would then take off
+    twice what the caller believes is there, at a blend of two prices. Refused
+    before anything is sent -- and the tag is the caller's own, since
+    `_split_group_tag` truncates a long name to the same tag the tickets carry.
+    """
+    existing = [types.SimpleNamespace(ticket=11, volume=0.01,
+                                      comment="pwx:verify-split:1of3")]
+    sent: list = []
+    _wire_split(cli, monkeypatch, sent, positions=existing)
+    out: dict = {}
+
+    def _emit(payload, text=None, code=0):
+        out.update(payload)
+        out["__text"] = text
+        return code
+
+    monkeypatch.setattr(cli, "emit", _emit)
+    code = cli.cmd_split(_split_args(group="verify-split"))
+
+    assert code != 0, "a split that would double the position must not be sent"
+    assert sent == []
+    assert "already open" in str(out.get("error", ""))
+    assert out["open_tickets"] == 1
+    assert out["open_volume"] == 0.01
+
+    # AND THE UNNAMED CASE STILL WORKS: the default tag is the constant "split",
+    # so refusing it would block a legitimate second split for everyone who never
+    # named one. The guarantee belongs to the group the caller chose.
+    sent.clear()
+    _wire_split(cli, monkeypatch, sent)
+    assert cli.cmd_split(_split_args(group="")) == 0
+    assert len(sent) == 3
+
+
+def test_a_split_ticket_that_never_left_reports_why(cli, monkeypatch, capsys):
+    """A ticket with no retcode never reached the broker, and the reason is the point.
+
+    MEASURED 2026-09-24: the 30-character comment produced three entries reading
+    ``retcode: null, comment: null`` while the cause sat in ``error`` and was
+    dropped by the per-ticket report -- so the caller was told "0 of 3 tickets
+    filled" and nothing about why.
+    """
+    sent: list = []
+
+    def _refused(mt5, req, fillings):
+        return {
+            "ok": False,
+            "stage": "not_sent",
+            "error": "(-2, 'Invalid \"comment\" argument')",
+            "comment": 'refused before sending: (-2, \'Invalid "comment" argument\')',
+            "request": dict(req),
+        }
+
+    _wire_split(cli, monkeypatch, sent, send=_refused)
+    assert cli.cmd_split(_split_args(group="verify-split")) != 0
+
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["ok"] is False
+    assert payload["splits_filled"] == 0
+    for entry in payload["results"]:
+        assert entry["stage"] == "not_sent"
+        assert "Invalid" in entry["error"]
+    assert "Invalid" in payload["warning"]
+
+
+def test_order_send_labels_a_locally_refused_request(cli):
+    """``order_send`` returning None means NOTHING was sent: no retcode exists.
+
+    The reason is put into ``comment`` as well as ``error``, because every caller
+    that reports an outcome reads ``comment`` -- and the sentence it produced
+    before this was "order rejected: None".
+    """
+    class _Refuser(FakeMT5):
+        def order_send(self, request):
+            return None
+
+    out = cli._order_send(_Refuser([10009]), {"type_filling": 1}, [1])
+
+    assert out["ok"] is False
+    assert out["stage"] == "not_sent"
+    assert out["retcode"] is None
+    assert out["comment"].startswith("refused before sending:")
+    assert out["error"] == "fake-last-error"
+
+
+def test_an_order_rejection_never_reads_as_none(cli, monkeypatch, capsys):
+    """The human sentence has to carry the reason, not the word "None".
+
+    ``fail``/``emit`` print the text on stderr, so that is where the sentence a
+    person reads comes from.
+    """
+    info = _sym(2, 100.0)
+    tick = types.SimpleNamespace(bid=4285.00, ask=4285.18)
+    mt5 = _OrderMT5(info, tick)
+
+    def _refused(m, req, fillings):
+        return {
+            "ok": False, "stage": "not_sent", "retcode": None,
+            "error": "(-2, 'Invalid \"comment\" argument')",
+            "comment": 'refused before sending: (-2, \'Invalid "comment" argument\')',
+        }
+
+    monkeypatch.setattr(cli, "require_bridge", lambda: (mt5, None))
+    monkeypatch.setattr(cli, "filling_candidates", lambda m, i: [2])
+    monkeypatch.setattr(cli, "_order_send", _refused)
+
+    assert cli.cmd_order(_order_args(sl=4283.18, volume=0.1)) != 0
+    text = capsys.readouterr().err.strip().splitlines()[0]
+    assert "NOT SENT" in text
+    assert "Invalid" in text
+    assert "None" not in text

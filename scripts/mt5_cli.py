@@ -67,7 +67,7 @@ from typing import Any
 #: branch URL can quietly deliver a revision several pushes old. The bootstrap
 #: greps for this marker so a stale file is rejected instead of executed — the
 #: agent then sees a loud warning rather than debugging code that is not running.
-CLI_VERSION = "2026-09-24.14"
+CLI_VERSION = "2026-09-24.15"
 
 MT5_ROOT = Path(os.environ.get("MT5_ROOT") or (Path.home() / ".mt5"))
 WINE_PREFIX = Path(os.environ.get("WINE_PREFIX") or (Path.home() / ".wine-mt5"))
@@ -3232,7 +3232,28 @@ def _order_send(mt5, request: dict[str, Any],
         req["type_filling"] = filling
         result = mt5.order_send(req)
         if result is None:
-            last = {"ok": False, "error": str(mt5.last_error()), "request": req}
+            # NO RETCODE EXISTS HERE, because nothing was sent: the wrapper
+            # rejected the request before it reached the terminal. Say that in the
+            # payload's own vocabulary -- `stage`, and a `comment` carrying the
+            # reason -- so every caller that reads `comment` for the outcome (the
+            # split's per-ticket entries, the order's rejection note) reports the
+            # real cause instead of "None". The one failure this exists for was
+            # MEASURED: a 30-character comment is refused with
+            # '(-2, \'Invalid "comment" argument\')' and nothing else.
+            reason = str(mt5.last_error())
+            last = {
+                "ok": False,
+                # retcode is present and null ON PURPOSE. Omitting the key would
+                # leave a reader unable to tell "no retcode exists because nothing
+                # was sent" from "the field was dropped", and every consumer of
+                # this payload branches on exactly that difference.
+                "retcode": None,
+                "stage": "not_sent",
+                "error": reason,
+                "comment": f"refused before sending: {reason}",
+                "filling_used": filling,
+                "request": req,
+            }
             continue
         payload: dict[str, Any] = {
             "ok": result.retcode == mt5.TRADE_RETCODE_DONE,
@@ -3290,11 +3311,71 @@ def _order_send(mt5, request: dict[str, Any],
 SPLIT_MAX_TICKETS = 50
 
 
+#: The longest order comment this bridge can SEND, in CHARACTERS.
+#:
+#: MEASURED 2026-09-24 on a live Deriv-Demo terminal (build 5390, MetaTrader5
+#: python 5.0.6180), by asking the terminal itself with ``order_check`` -- a
+#: request that validates and prices but sends nothing:
+#:
+#:   comment of 29 chars -> retcode 0 (accepted)
+#:   comment of 30 chars -> order_check returns None, last_error
+#:                          "(-2, 'Invalid \"comment\" argument')"
+#:
+#: The limit counts CHARACTERS, not bytes: 29 accented characters (58 bytes) are
+#: accepted. It is the Python wrapper's own validation, so an over-long comment
+#: never reaches the broker -- ``order_send`` returns None and there is no retcode
+#: to report, which is exactly the shape of failure that reads as "the broker
+#: said no" when nothing was sent at all.
+#:
+#: This is why ``split`` was broken: its comment is
+#: ``<base>:<group>:<n>of<total>`` with a 16-char base, so ``--group verify-split``
+#: built a 30-character comment and EVERY ticket came back ``retcode: null`` --
+#: a split that reported 0 of 3 filled with no reason, on a symbol where a plain
+#: ``order`` filled fine 30 seconds earlier.
+ORDER_COMMENT_MAX = 29
+
+#: ``split``'s comment prefix. Short by necessity: the comment carries the group
+#: name (which is the identity ``close --group`` matches on) and the ticket's
+#: position in the split, and all three have to fit inside ORDER_COMMENT_MAX.
+SPLIT_COMMENT_PREFIX = "pwx"
+
+#: The longest group tag a split will write, derived from the budget above rather
+#: than guessed: ``pwx:`` + group + ``:`` + ``50of50`` <= 29. A group longer than
+#: this is truncated BY ``_split_group_tag``, so ``close --group`` with the same
+#: name truncates to the same tag and still finds its tickets.
+SPLIT_GROUP_MAX = ORDER_COMMENT_MAX - len(SPLIT_COMMENT_PREFIX) - 2 - len("50of50")
+
+
+def _fit_comment(text: str, limit: int = ORDER_COMMENT_MAX) -> str:
+    """A comment the bridge can actually send: single-line, <= ``limit`` chars.
+
+    Two separate limits, both real. The Python wrapper refuses more than
+    :data:`ORDER_COMMENT_MAX` characters outright (measured above), and the Wine
+    command layer writes arguments into a line-based ``.bat``, so a comment
+    carrying a newline would end that line early and turn the rest of the call
+    into a second, broken command. Newlines are folded to spaces here rather than
+    refused, because a comment is a label: silently quoting half of it is worse
+    than carrying all of it on one line.
+    """
+    folded = " ".join(
+        str(text or "").replace("\r", " ").replace("\n", " ").replace("\t", " ").split()
+    )
+    return folded[:limit]
+
+
 def _split_group_tag(group: str) -> str:
-    """A comment-safe group tag. Broker comments are short and often truncated."""
+    """A comment-safe group tag, short enough for the whole comment to fit.
+
+    ``:``, whitespace and everything else outside ``[A-Za-z0-9._-]`` is dropped,
+    because the tag is matched as ``:<tag>:`` inside the broker's comment and a
+    colon inside it would make the field boundary ambiguous. The length is capped
+    by :data:`SPLIT_GROUP_MAX` so ``pwx:<tag>:<n>of<total>`` can never exceed
+    ORDER_COMMENT_MAX -- the failure it prevents is not a long comment but a split
+    whose every ticket the wrapper refuses before sending.
+    """
     safe = "".join(
         c for c in str(group or "").strip() if c.isalnum() or c in "._-"
-    )[:24]
+    )[:SPLIT_GROUP_MAX]
     return safe
 
 
@@ -3455,11 +3536,55 @@ def cmd_split(args: argparse.Namespace) -> int:
                     code=1,
                 )
 
-    group = _split_group_tag(getattr(args, "group", "") or "") or _split_group_tag(
-        args.comment or "split"
-    )
+    requested_group = _split_group_tag(getattr(args, "group", "") or "")
+    group = requested_group or _split_group_tag(args.comment or "split")
+
+    # FIRES ONCE. The section above promises it; nothing implemented it. A second
+    # `split` on a group that is already open does not "add to" the idea in any
+    # sense the method supports -- it doubles the position while the comment still
+    # reads as one group, so `close --group` then takes off twice as much as the
+    # caller thinks is there, at a blend of two prices. Refused before anything is
+    # sent, for the group the caller NAMED.
+    #
+    # Only a named group is checked, on purpose: an unnamed split falls back to the
+    # constant tag "split", and refusing that would block a legitimate second split
+    # for everyone who did not invent a name. The guarantee belongs where it is
+    # actionable -- the group `close --group` will later act on.
+    if requested_group:
+        open_tickets = _positions_in_group(mt5, group)
+        if open_tickets:
+            open_volume = round(sum(float(p.volume) for p in open_tickets), 8)
+            return fail(
+                f"split group '{group}' is already open with {len(open_tickets)} "
+                f"ticket(s) totalling {open_volume} lots. A split fires exactly once, "
+                "at one price, with one stop -- a second one on the same group "
+                "doubles the position while the comments still read as a single "
+                f"group, so `close --group {group}` would take off twice what you "
+                "think is there. Close it first (`close --group "
+                f"{group}`), or use a new --group name if this is genuinely a "
+                "separate idea.",
+                code=1,
+                group=group,
+                open_tickets=len(open_tickets),
+                open_volume=open_volume,
+            )
     fillings = filling_candidates(mt5, info)
-    base_comment = (args.comment or "powerx-split")[:16]
+    # The comment is the ticket's identity -- ``:<group>:`` is what `close --group`
+    # matches, and ``<n>of<total>`` is the ticket's place in the split -- so it is
+    # BUILT to fit ORDER_COMMENT_MAX rather than cut afterwards: cutting the tag
+    # would break the group match, and cutting the index would make "close the
+    # first three" select tickets by accident. The group is already capped by
+    # _split_group_tag, so the widest possible comment here is exactly 29 chars. A
+    # comment the wrapper refuses means EVERY ticket fails with no retcode, which
+    # is a split that does nothing and says nothing.
+    def _ticket_comment(index: int) -> str:
+        return _fit_comment(
+            f"{SPLIT_COMMENT_PREFIX}:{group}:{index + 1}of{count}"
+        )
+    # The widest comment this can build is exactly ORDER_COMMENT_MAX characters:
+    # SPLIT_GROUP_MAX is derived from that budget, and the index suffix can never
+    # exceed "50of50". A test pins the arithmetic, because the whole point is that
+    # a comment the wrapper refuses would fail EVERY ticket with no reason given.
 
     results: list[dict[str, Any]] = []
     filled = 0
@@ -3474,7 +3599,7 @@ def cmd_split(args: argparse.Namespace) -> int:
             "price": price,
             "deviation": int(args.deviation),
             "magic": int(args.magic),
-            "comment": f"{base_comment}:{group}:{index + 1}of{count}",
+            "comment": _ticket_comment(index),
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": fillings[0],
         }
@@ -3490,6 +3615,17 @@ def cmd_split(args: argparse.Namespace) -> int:
             "retcode": payload.get("retcode"),
             "comment": payload.get("comment"),
         }
+        # A payload with no retcode NEVER REACHED THE BROKER: the request was
+        # refused locally (``order_send`` returned None and set ``last_error``).
+        # MEASURED 2026-09-24: a 30-character comment made every ticket of a split
+        # answer ``retcode: null, comment: null`` while the real cause --
+        # ``(-2, 'Invalid "comment" argument')`` -- sat in ``error`` and was
+        # dropped here, so the caller was told "0 of 3 tickets filled" and nothing
+        # about why. A failure with no reason is the one thing this file's whole
+        # history is about.
+        if payload.get("retcode") is None:
+            entry["error"] = payload.get("error") or payload.get("last_error")
+            entry["stage"] = payload.get("stage") or "not_sent"
         result = payload.get("result") or {}
         for key in ("order", "deal", "price"):
             if result.get(key) is not None:
@@ -4594,10 +4730,14 @@ def cmd_order(args: argparse.Namespace) -> int:
         "price": float(price),
         "deviation": int(args.deviation),
         "magic": int(args.magic),
-        "comment": args.comment or "powerx-mt5",
+        # Fitted to ORDER_COMMENT_MAX, never passed through: an over-long comment
+        # makes order_send return None, which is a request that never reaches the
+        # broker and reports no retcode. See ORDER_COMMENT_MAX for the measurement.
+        "comment": _fit_comment(args.comment or "powerx-mt5"),
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": fillings[0],
     }
+    _comment_requested = str(args.comment or "powerx-mt5")
     if args.sl is not None:
         request["sl"] = float(args.sl)
     if args.tp is not None:
@@ -4605,6 +4745,15 @@ def cmd_order(args: argparse.Namespace) -> int:
 
     payload = _order_send(mt5, request, fillings)
     payload["risk_money"] = order_risk
+    if request["comment"] != _comment_requested:
+        # Truncation is REPORTED, not silent: the comment is how a human finds this
+        # trade in the terminal later, and how a split's group is matched, so the
+        # caller has to know the label the account actually carries.
+        payload["comment_truncated"] = {
+            "requested": _comment_requested,
+            "sent": request["comment"],
+            "limit": ORDER_COMMENT_MAX,
+        }
     # BOOK BEFORE / BOOK AFTER, measured either side of the send.
     #
     # `book_after` used to be built from the exposure the risk gate read BEFORE
@@ -4684,7 +4833,21 @@ def cmd_order(args: argparse.Namespace) -> int:
             f"the broker (retcode {payload.get('retcode')})."
         )
     else:
-        note = f"order rejected: {payload.get('comment')}"
+        # The reason, in this order: the broker's own retcode/comment, then the
+        # local refusal (``_order_send`` fills `comment` with it when nothing was
+        # sent). It used to print "order rejected: None" whenever no broker
+        # response existed, which is the least useful sentence in the file.
+        reason = (
+            payload.get("comment")
+            or payload.get("error")
+            or payload.get("last_error")
+            or "the request was refused before it was sent"
+        )
+        note = (
+            f"order rejected (retcode {payload.get('retcode')}): {reason}"
+            if payload.get("retcode") is not None
+            else f"order NOT SENT: {reason}"
+        )
     return emit(payload, text=note, code=code)
 
 def _close_one(mt5: Any, pos: Any, args: argparse.Namespace) -> dict[str, Any]:
