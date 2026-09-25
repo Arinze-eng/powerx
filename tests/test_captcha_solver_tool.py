@@ -57,6 +57,8 @@ class _FakeClient:
     async def post(self, url: str, data: Any = None) -> _FakeResponse:
         _FakeClient.posts.append((url, dict(data or {})))
         reply = _FakeClient.post_replies.pop(0) if _FakeClient.post_replies else ""
+        if isinstance(reply, tuple):
+            return _FakeResponse(reply[0], reply[1])
         return _FakeResponse(reply)
 
     async def get(self, url: str, params: Any = None) -> _FakeResponse:
@@ -100,6 +102,10 @@ def _fields(tool: CaptchaSolverTool, action: str, **overrides: Any) -> dict[str,
         "challenge_url": None,
         "data": None,
         "pagedata": None,
+        "publickey": None,
+        "surl": None,
+        "text": None,
+        "min_score": None,
     }
     values.update(overrides)
     return tool._fields_for(action, **values)
@@ -342,3 +348,135 @@ def test_missing_image_is_rejected(tmp_path) -> None:
     tool = CaptchaSolverTool(base_url="http://solver.test", api_key="k", workspace=tmp_path)
     with pytest.raises(ValueError, match="does not exist"):
         _fields(tool, "solve_image", image_path="absent.png")
+
+
+# --- the wider solver surface -----------------------------------------------
+
+
+def test_hcaptcha_sends_the_sitekey_and_page() -> None:
+    tool = CaptchaSolverTool(base_url="http://solver.test", api_key="k")
+    fields = _fields(tool, "hcaptcha", sitekey="hc-key", url="https://example.com")
+    assert fields == {
+        "method": "hcaptcha",
+        "sitekey": "hc-key",
+        "pageurl": "https://example.com",
+    }
+
+
+def test_hcaptcha_marks_an_invisible_widget() -> None:
+    tool = CaptchaSolverTool(base_url="http://solver.test", api_key="k")
+    fields = _fields(
+        tool, "hcaptcha", sitekey="hc-key", url="https://example.com", invisible=True
+    )
+    assert fields["invisible"] == 1
+
+
+def test_funcaptcha_requires_a_publickey() -> None:
+    tool = CaptchaSolverTool(base_url="http://solver.test", api_key="k")
+    with pytest.raises(ValueError, match="publickey"):
+        _fields(tool, "funcaptcha", url="https://example.com")
+
+
+def test_funcaptcha_carries_an_optional_service_url() -> None:
+    tool = CaptchaSolverTool(base_url="http://solver.test", api_key="k")
+    fields = _fields(
+        tool,
+        "funcaptcha",
+        publickey="pk-1",
+        url="https://example.com",
+        surl="https://client-api.arkoselabs.com",
+    )
+    assert fields["method"] == "funcaptcha"
+    assert fields["publickey"] == "pk-1"
+    assert fields["surl"] == "https://client-api.arkoselabs.com"
+
+
+def test_coordinates_needs_both_an_image_and_an_instruction(tmp_path) -> None:
+    """A grid challenge cannot be answered without being told the task."""
+    image = tmp_path / "grid.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+    tool = CaptchaSolverTool(
+        base_url="http://solver.test", api_key="k", workspace=tmp_path
+    )
+
+    with pytest.raises(ValueError, match="text"):
+        _fields(tool, "coordinates", image_path=str(image))
+
+    fields = _fields(
+        tool, "coordinates", image_path=str(image), text="click the traffic lights"
+    )
+    assert fields["method"] == "base64"
+    assert fields["coordinates"] == 1
+    assert fields["textinstructions"] == "click the traffic lights"
+    assert fields["body"]
+
+
+def test_solve_image_passes_an_optional_instruction(tmp_path) -> None:
+    image = tmp_path / "text.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+    tool = CaptchaSolverTool(
+        base_url="http://solver.test", api_key="k", workspace=tmp_path
+    )
+    fields = _fields(tool, "solve_image", image_path=str(image), text="type the letters")
+    assert fields["textinstructions"] == "type the letters"
+
+
+def test_recaptcha_v3_clamps_the_score_threshold() -> None:
+    tool = CaptchaSolverTool(base_url="http://solver.test", api_key="k")
+    high = _fields(
+        tool,
+        "recaptcha",
+        sitekey="sk",
+        url="https://example.com",
+        version="v3",
+        min_score=1.0,
+    )
+    assert high["min_score"] == 0.9
+
+    low = _fields(
+        tool,
+        "recaptcha",
+        sitekey="sk",
+        url="https://example.com",
+        version="v3",
+        min_score=0.0,
+    )
+    assert low["min_score"] == 0.1
+
+
+def test_recaptcha_v2_ignores_the_score_threshold() -> None:
+    tool = CaptchaSolverTool(base_url="http://solver.test", api_key="k")
+    fields = _fields(
+        tool, "recaptcha", sitekey="sk", url="https://example.com", min_score=0.7
+    )
+    assert "min_score" not in fields
+
+
+def test_submit_retries_a_server_error_then_succeeds() -> None:
+    """A solve is paid for on submit, so a 5xx must not lose the task."""
+    _FakeClient.post_replies.extend([("upstream exploded", 502), "OK|task-retry"])
+    solver = CaptchaSolver("http://solver.test", "k")
+
+    assert asyncio.run(solver.submit({"method": "turnstile"})) == "task-retry"
+    assert len(_FakeClient.posts) == 2
+
+
+def test_submit_gives_up_after_the_retry_budget() -> None:
+    _FakeClient.post_replies.extend(
+        [("down", 503), ("down", 503), ("down", 503), ("down", 503)]
+    )
+    solver = CaptchaSolver("http://solver.test", "k")
+
+    with pytest.raises(SolverError, match="503"):
+        asyncio.run(solver.submit({"method": "turnstile"}))
+    assert len(_FakeClient.posts) == 3
+
+
+def test_submit_does_not_retry_a_rejected_task() -> None:
+    """A bad key or bad fields fails identically on retry, and costs a call."""
+    _FakeClient.post_replies.append(json.dumps({"status": 0, "request": "ERROR_KEY_DENIED"}))
+    solver = CaptchaSolver("http://solver.test", "k")
+
+    with pytest.raises(SolverError, match="ERROR_KEY_DENIED"):
+        asyncio.run(solver.submit({"method": "turnstile"}))
+    assert len(_FakeClient.posts) == 1

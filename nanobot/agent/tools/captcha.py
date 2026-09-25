@@ -136,12 +136,33 @@ class CaptchaSolver:
             return request
         raise SolverError(request or "the solver reported a failure")
 
-    async def submit(self, fields: dict[str, Any]) -> str:
-        """Create a solve task and return its id."""
+    async def submit(self, fields: dict[str, Any], *, attempts: int = 3) -> str:
+        """Create a solve task and return its id.
+
+        A solve is paid for on submission, so a transient connection failure
+        must not silently become a lost task. Only transport errors and 5xx
+        responses are retried; a rejected task (bad key, malformed fields) is
+        raised immediately, because retrying it would just fail the same way.
+        """
         payload: dict[str, Any] = {**fields, "key": self.api_key, "json": 1}
-        async with httpx.AsyncClient(timeout=self.request_timeout) as client:
-            response = await client.post(self._endpoint("in.php"), data=payload)
-        return self._parse_submit(response.text)
+        last_error: Exception | None = None
+        for attempt in range(max(1, attempts)):
+            try:
+                async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+                    response = await client.post(self._endpoint("in.php"), data=payload)
+                if response.status_code >= 500:
+                    last_error = SolverError(
+                        f"the solver returned HTTP {response.status_code}"
+                    )
+                else:
+                    return self._parse_submit(response.text)
+            except httpx.HTTPError as exc:
+                last_error = exc
+            if attempt + 1 < max(1, attempts):
+                await asyncio.sleep(1.0 * (attempt + 1))
+        if isinstance(last_error, httpx.HTTPError):
+            raise last_error
+        raise last_error or SolverError("the solver could not accept the task")
 
     async def poll(self, task_id: str) -> str:
         """Poll a task once for its solved token."""
@@ -197,7 +218,17 @@ class CaptchaSolverTool(Tool):
     _MAX_SITEKEY = 200
     _MAX_TEXT = 4_000
     _ACTIONS = frozenset(
-        {"solve_image", "recaptcha", "turnstile", "geetest", "altcha", "balance"}
+        {
+            "solve_image",
+            "recaptcha",
+            "turnstile",
+            "geetest",
+            "altcha",
+            "balance",
+            "hcaptcha",
+            "funcaptcha",
+            "coordinates",
+        }
     )
     #: Longest window a single solve may occupy, so one call cannot pin a turn.
     _MAX_SOLVE_SECONDS = 600.0
@@ -262,11 +293,18 @@ class CaptchaSolverTool(Tool):
     def description(self) -> str:
         return (
             "Solve a captcha with the configured solver and return the token to submit. "
-            "Actions: balance, solve_image (a local image file), recaptcha (v2/v3/Enterprise), "
-            "turnstile, geetest and altcha. Use this when a page you are working on presents a "
-            "captcha you are authorized to pass; solving one is a step, not a licence to "
-            "circumvent access controls. The solver endpoint is fixed by configuration, so no "
-            "argument here can redirect it."
+            "Actions: balance, solve_image (a local image file, optionally steered with text), "
+            "recaptcha (v2/v3/Enterprise), turnstile, hcaptcha, funcaptcha, geetest, altcha and "
+            "coordinates (an image grid, answered with click coordinates). Every token action "
+            "needs the sitekey the widget was rendered with and the url of the page it sits on; "
+            "the human_browser tool's auto_captcha action detects both and calls this for you, so "
+            "prefer that. Use this tool directly when you already have a sitekey, or for a "
+            "picture challenge you can point at a file. Coverage is limited to what the "
+            "configured solver supports and what the balance allows: an unsupported type or an "
+            "empty balance fails, and there is no local fallback model. Solving a captcha is a "
+            "step on a page you are authorized to use, not a licence to circumvent access "
+            "controls. The solver endpoint is fixed by configuration, so no argument here can "
+            "redirect it."
         )
 
     @property
@@ -291,6 +329,10 @@ class CaptchaSolverTool(Tool):
                 "challenge_url": {"type": ["string", "null"], "maxLength": self._MAX_URL},
                 "data": {"type": ["string", "null"], "maxLength": self._MAX_TEXT},
                 "pagedata": {"type": ["string", "null"], "maxLength": self._MAX_TEXT},
+                "publickey": {"type": ["string", "null"], "maxLength": self._MAX_SITEKEY},
+                "surl": {"type": ["string", "null"], "maxLength": self._MAX_URL},
+                "text": {"type": ["string", "null"], "maxLength": self._MAX_TEXT},
+                "min_score": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
             },
             "required": ["action"],
             "additionalProperties": False,
@@ -343,12 +385,32 @@ class CaptchaSolverTool(Tool):
         challenge_url: str | None,
         data: str | None,
         pagedata: str | None,
+        publickey: str | None = None,
+        surl: str | None = None,
+        text: str | None = None,
+        min_score: float | None = None,
     ) -> dict[str, Any]:
         """Map tool arguments onto the solver's submit fields."""
         if action == "solve_image":
             # base64 rather than a file part: the image never leaves the
             # workspace as a path, and the size cap is enforced locally.
-            return {"method": "base64", "body": self._read_image(image_path)}
+            fields = {"method": "base64", "body": self._read_image(image_path)}
+            if str(text or "").strip():
+                # Optional steer for a challenge that asks a question, e.g.
+                # "type the letters" or "what colour is the car".
+                fields["textinstructions"] = str(text).strip()
+            return fields
+
+        if action == "coordinates":
+            # An image grid: the answer is where to click, not what to type, so
+            # the instruction is required -- the solver cannot guess the task.
+            fields = {
+                "method": "base64",
+                "body": self._read_image(image_path),
+                "coordinates": 1,
+                "textinstructions": self._require(text, "text", action),
+            }
+            return fields
 
         page_url = self._require(url, "url", action)
 
@@ -362,6 +424,11 @@ class CaptchaSolverTool(Tool):
                 fields["version"] = "v3"
                 if str(action_name or "").strip():
                     fields["action"] = str(action_name).strip()
+                if min_score is not None:
+                    # v3 returns a score, not a pass/fail; the threshold decides
+                    # how much solving effort is spent reaching it.
+                    threshold = min(max(float(min_score), 0.1), 0.9)
+                    fields["min_score"] = threshold
             if enterprise:
                 fields["enterprise"] = 1
             if invisible:
@@ -380,6 +447,28 @@ class CaptchaSolverTool(Tool):
                 fields["data"] = data
             if pagedata:
                 fields["pagedata"] = pagedata
+            return fields
+
+        if action == "hcaptcha":
+            fields = {
+                "method": "hcaptcha",
+                "sitekey": self._require(sitekey, "sitekey", action),
+                "pageurl": page_url,
+            }
+            if str(action_name or "").strip():
+                fields["action"] = str(action_name).strip()
+            if invisible:
+                fields["invisible"] = 1
+            return fields
+
+        if action == "funcaptcha":
+            fields = {
+                "method": "funcaptcha",
+                "publickey": self._require(publickey, "publickey", action),
+                "pageurl": page_url,
+            }
+            if str(surl or "").strip():
+                fields["surl"] = str(surl).strip()
             return fields
 
         if action == "geetest":
@@ -423,6 +512,10 @@ class CaptchaSolverTool(Tool):
         challenge_url: str | None = None,
         data: str | None = None,
         pagedata: str | None = None,
+        publickey: str | None = None,
+        surl: str | None = None,
+        text: str | None = None,
+        min_score: float | None = None,
     ) -> Any:
         action = str(action or "").strip().lower()
         if action not in self._ACTIONS:
@@ -453,13 +546,24 @@ class CaptchaSolverTool(Tool):
                 challenge_url=challenge_url,
                 data=data,
                 pagedata=pagedata,
+                publickey=publickey,
+                surl=surl,
+                text=text,
+                min_score=min_score,
             )
+            started = time.monotonic()
             token = await solver.solve(
                 fields,
                 timeout=min(float(self.timeout_seconds), self._MAX_SOLVE_SECONDS),
                 poll_interval=self.poll_interval_seconds,
             )
-            return json.dumps({"captcha_type": action, "token": token})
+            return json.dumps(
+                {
+                    "captcha_type": action,
+                    "token": token,
+                    "elapsed_seconds": round(time.monotonic() - started, 2),
+                }
+            )
         except ValueError as exc:
             return ToolResult.error(f"Error: {exc}")
         except SolverError as exc:

@@ -736,3 +736,338 @@ def test_config_defaults_enable_turnstile_solving() -> None:
     cfg = Config().tools.human_browser
     assert cfg.solve_cloudflare is True
     assert cfg.cloudflare_timeout_seconds == 15.0
+
+
+# --------------------------------------------------------------------------
+# Page inventory, form filling and the wider action surface
+#
+# A real page needs a real Chromium, so the scripts are matched by a marker and
+# answered from a table. What is pinned is the contract with the model: which
+# targets come back, what each action does with them, and what it says when it
+# cannot do it.
+# --------------------------------------------------------------------------
+
+
+class _RoutingTab(_FakeTab):
+    """A tab that answers each script by matching a marker inside it."""
+
+    def __init__(self, routes: dict[str, Any]) -> None:
+        super().__init__()
+        self.routes = routes
+        self.scripts: list[str] = []
+
+    @property
+    def execute_script(self):  # type: ignore[override]
+        async def _script(expression: str) -> Any:
+            self.scripts.append(expression)
+            for marker, value in self.routes.items():
+                if marker in expression:
+                    return value
+            return ""
+
+        return _script
+
+
+_INVENTORY = json.dumps(
+    [
+        {
+            "i": 0,
+            "target": '[data-powerx-idx="0"]',
+            "tag": "input",
+            "name": "email",
+            "text": "Email",
+        },
+        {
+            "i": 1,
+            "target": '[data-powerx-idx="1"]',
+            "tag": "button",
+            "text": "Sign in",
+        },
+    ]
+)
+
+
+def test_find_returns_clickable_targets_the_model_can_reuse() -> None:
+    tab = _RoutingTab({"a,button,input,select": _INVENTORY})
+    tool = _tool_with_session(tab)
+
+    payload = json.loads(asyncio.run(tool.execute("find")))
+
+    assert payload["count"] == 2
+    assert payload["elements"][0]["target"] == '[data-powerx-idx="0"]'
+    assert payload["elements"][1]["text"] == "Sign in"
+
+
+def test_find_does_not_invent_targets_when_the_page_answers_nothing() -> None:
+    tool = _tool_with_session(_FakeTab())
+    payload = json.loads(asyncio.run(tool.execute("find")))
+    assert payload["count"] == 0
+    assert payload["elements"] == []
+
+
+def test_fill_form_types_every_field_in_order() -> None:
+    tab = _RoutingTab({})
+    tool = _tool_with_session(tab)
+
+    out = asyncio.run(
+        tool.execute(
+            "fill_form",
+            fields=[
+                {"target": "#email", "text": "a@b.test"},
+                {"target": "#name", "text": "Ada"},
+            ],
+        )
+    )
+
+    assert json.loads(out)["count"] == 2
+    assert tab.element.typed == [("a@b.test", True), ("Ada", True)]
+
+
+def test_fill_form_rejects_an_empty_list() -> None:
+    tool = _tool_with_session(_FakeTab())
+    out = asyncio.run(tool.execute("fill_form", fields=[]))
+    assert "Error" in out and "fields list" in out
+
+
+def test_fill_form_rejects_an_entry_without_a_target() -> None:
+    tool = _tool_with_session(_FakeTab())
+    out = asyncio.run(tool.execute("fill_form", fields=[{"text": "orphan"}]))
+    assert "Error" in out and "target" in out
+
+
+def test_fill_form_caps_the_number_of_fields() -> None:
+    tool = _tool_with_session(_FakeTab())
+    too_many = [{"target": f"#f{i}", "text": "x"} for i in range(tool._MAX_FORM_FIELDS + 1)]
+    out = asyncio.run(tool.execute("fill_form", fields=too_many))
+    assert "Error" in out and "at most" in out
+
+
+def test_press_rejects_a_key_that_is_not_on_the_list() -> None:
+    tool = _tool_with_session(_FakeTab())
+    out = asyncio.run(tool.execute("press", key="F13"))
+    assert "Error" in out and "unsupported key" in out
+
+
+def test_press_without_a_key_is_rejected() -> None:
+    tool = _tool_with_session(_FakeTab())
+    out = asyncio.run(tool.execute("press"))
+    assert "Error" in out and "key is required" in out
+
+
+def test_press_falls_back_to_a_real_form_submit_when_no_driver_keyboard() -> None:
+    """A synthetic KeyboardEvent is untrusted; requestSubmit is not."""
+    tab = _RoutingTab({"KeyboardEvent('keydown'": "submitted"})
+    tool = _tool_with_session(tab)
+
+    out = asyncio.run(tool.execute("press", key="Enter"))
+
+    assert "Enter" in out and "submitted" in out
+    script = next(script for script in tab.scripts if "requestSubmit" in script)
+    assert "requestSubmit" in script
+
+
+def test_select_reports_an_option_the_control_does_not_have() -> None:
+    tab = _RoutingTab({"root.options": "no-option"})
+    tool = _tool_with_session(tab)
+    out = asyncio.run(tool.execute("select", target="#country", option="Atlantis"))
+    assert "Error" in out and "not an option" in out
+
+
+def test_select_refuses_to_report_success_on_a_page_it_could_not_drive() -> None:
+    """An empty script reply is not a selected option."""
+    tool = _tool_with_session(_FakeTab())
+    out = asyncio.run(tool.execute("select", target="#country", option="France"))
+    assert "Error" in out and "no result" in out
+
+
+def test_select_reports_a_selector_that_matched_nothing() -> None:
+    tab = _RoutingTab({"root.options": "no-element"})
+    tool = _tool_with_session(tab)
+    out = asyncio.run(tool.execute("select", target="#country", option="France"))
+    assert "Error" in out and "no element matched" in out
+
+
+def test_hover_requires_a_selector() -> None:
+    tool = _tool_with_session(_FakeTab())
+    out = asyncio.run(tool.execute("hover"))
+    assert "Error" in out and "selector is required" in out
+
+
+def test_hover_refuses_to_report_success_on_a_page_it_could_not_drive() -> None:
+    tool = _tool_with_session(_FakeTab())
+    out = asyncio.run(tool.execute("hover", target="#menu"))
+    assert "Error" in out and "no result" in out
+
+
+def test_hover_dispatches_the_mouse_events_a_menu_listens_for() -> None:
+    tab = _RoutingTab({"pointerover": "hovered"})
+    tool = _tool_with_session(tab)
+
+    assert asyncio.run(tool.execute("hover", target="#menu")) == "Hovered."
+    script = next(s for s in tab.scripts if "pointerover" in s)
+    for event in ("pointerover", "mouseover", "mouseenter", "mousemove"):
+        assert event in script
+
+
+def test_wait_for_text_returns_the_page_once_the_text_appears() -> None:
+    tab = _RoutingTab({"document.body.innerText": "Your order is confirmed"})
+    tool = _tool_with_session(tab)
+
+    payload = json.loads(asyncio.run(tool.execute("wait_for_text", text="confirmed")))
+
+    assert "confirmed" in payload["text"]
+
+
+def test_wait_for_text_reports_a_timeout_instead_of_hanging() -> None:
+    tab = _RoutingTab({"document.body.innerText": "nothing to see"})
+    tool = _tool_with_session(tab)
+
+    out = asyncio.run(tool.execute("wait_for_text", text="never", timeout_ms=500))
+
+    assert "Error" in out and "did not appear" in out
+
+
+def test_back_returns_the_page_summary() -> None:
+    tab = _RoutingTab({"history.back()": "back", "document.body.innerText": "previous page"})
+    tool = _tool_with_session(tab)
+
+    payload = json.loads(asyncio.run(tool.execute("back")))
+
+    assert "previous page" in payload["text"]
+
+
+# --------------------------------------------------------------------------
+# Captcha integration
+# --------------------------------------------------------------------------
+
+
+class _FakeSolver:
+    """Stands in for the captcha solver tool, recording what it was asked."""
+
+    def __init__(self, reply: Any) -> None:
+        self.reply = reply
+        self.calls: list[dict[str, Any]] = []
+
+    async def execute(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self.reply if isinstance(self.reply, str) else json.dumps(self.reply)
+
+
+_TURNSTILE_PAGE = json.dumps(
+    {"kind": "turnstile", "sitekey": "0x4AAA", "target": '[data-powerx-idx="captcha"]'}
+)
+
+
+def test_auto_captcha_detects_solves_and_injects_the_token() -> None:
+    tab = _RoutingTab(
+        {
+            "const pick = (sels)": _TURNSTILE_PAGE,
+            "kinds.forEach": json.dumps({"filled": 1, "callbacks": 1, "ok": True}),
+            "document.body.innerText": "Welcome back",
+        }
+    )
+    solver = _FakeSolver({"captcha_type": "turnstile", "token": "solved-token"})
+    tool = _tool_with_session(tab, captcha_solver=solver)
+
+    payload = json.loads(asyncio.run(tool.execute("auto_captcha")))
+
+    assert payload["solved"] is True
+    assert payload["kind"] == "turnstile"
+    assert payload["fields_filled"] == 1
+    assert solver.calls[0]["action"] == "turnstile"
+    assert solver.calls[0]["sitekey"] == "0x4AAA"
+    token_script = next(s for s in tab.scripts if "kinds.forEach" in s)
+    assert "solved-token" in token_script
+
+
+def test_auto_captcha_uses_the_page_url_when_none_is_given() -> None:
+    tab = _RoutingTab(
+        {
+            "const pick = (sels)": _TURNSTILE_PAGE,
+            "kinds.forEach": json.dumps({"filled": 1, "callbacks": 0, "ok": True}),
+        }
+    )
+    solver = _FakeSolver({"token": "t"})
+    tool = _tool_with_session(tab, captcha_solver=solver)
+
+    asyncio.run(tool.execute("auto_captcha"))
+
+    assert solver.calls[0]["url"] == "https://example.com/"
+
+
+def test_auto_captcha_says_plainly_when_no_solver_is_configured() -> None:
+    tool = _tool_with_session(_FakeTab())
+    payload = json.loads(asyncio.run(tool.execute("auto_captcha")))
+    assert payload["solved"] is False
+    assert "no captcha solver" in payload["reason"]
+
+
+def test_auto_captcha_reports_an_absent_captcha_rather_than_claiming_a_solve() -> None:
+    tab = _RoutingTab({"const pick = (sels)": json.dumps({"kind": None})})
+    tool = _tool_with_session(tab, captcha_solver=_FakeSolver({"token": "t"}))
+
+    payload = json.loads(asyncio.run(tool.execute("auto_captcha")))
+
+    assert payload["solved"] is False
+    assert "no captcha was detected" in payload["reason"]
+
+
+def test_auto_captcha_points_an_image_challenge_at_the_other_action() -> None:
+    tab = _RoutingTab(
+        {
+            "const pick = (sels)": json.dumps(
+                {"kind": "image", "target": '[data-powerx-idx="captcha"]'}
+            )
+        }
+    )
+    tool = _tool_with_session(tab, captcha_solver=_FakeSolver({"token": "t"}))
+
+    payload = json.loads(asyncio.run(tool.execute("auto_captcha")))
+
+    assert payload["solved"] is False
+    assert "solve_image_captcha" in payload["reason"]
+
+
+def test_auto_captcha_reports_a_token_the_solver_never_returned() -> None:
+    tab = _RoutingTab({"const pick = (sels)": _TURNSTILE_PAGE})
+    tool = _tool_with_session(
+        tab, captcha_solver=_FakeSolver("Error: the captcha solver has no API key")
+    )
+
+    payload = json.loads(asyncio.run(tool.execute("auto_captcha")))
+
+    assert payload["solved"] is False
+    assert "no token" in payload["reason"]
+
+
+def test_auto_captcha_marks_a_token_solved_but_not_injected() -> None:
+    """A token the page never accepted is not a solved challenge."""
+    tab = _RoutingTab(
+        {
+            "const pick = (sels)": _TURNSTILE_PAGE,
+            "kinds.forEach": json.dumps({"filled": 0, "callbacks": 0, "ok": False}),
+        }
+    )
+    tool = _tool_with_session(tab, captcha_solver=_FakeSolver({"token": "t"}))
+
+    payload = json.loads(asyncio.run(tool.execute("auto_captcha")))
+
+    assert payload["solved"] is False
+    assert payload["fields_filled"] == 0
+
+
+def test_solve_image_captcha_explains_itself_with_no_solver() -> None:
+    tool = _tool_with_session(_FakeTab())
+    payload = json.loads(asyncio.run(tool.execute("solve_image_captcha")))
+    assert payload["solved"] is False
+    assert "no captcha solver" in payload["reason"]
+
+
+def test_solve_image_captcha_without_a_challenge_is_reported() -> None:
+    tab = _RoutingTab({"const pick = (sels)": json.dumps({"kind": None})})
+    tool = _tool_with_session(tab, captcha_solver=_FakeSolver({"token": "t"}))
+
+    payload = json.loads(asyncio.run(tool.execute("solve_image_captcha")))
+
+    assert payload["solved"] is False
+    assert "no picture challenge" in payload["reason"]

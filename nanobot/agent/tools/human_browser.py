@@ -34,6 +34,7 @@ The tool is disabled until an operator enables it; see
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 import re
@@ -113,6 +114,141 @@ _CLOUDFLARE_CHECKBOX_SELECTOR = 'input[type="checkbox"]'
 #: How often the shadow DOM is re-scanned while waiting for the widget.
 _CLOUDFLARE_POLL_SECONDS = 0.5
 
+#: Stamp every interactive element with a stable attribute and report it. The
+#: model then clicks by that stamp, which means one lookup path (the CSS query
+#: that already works) serves both the inventory and the interaction - no new
+#: driver call, and no coordinate arithmetic that breaks on scroll.
+_FIND_SCRIPT = r"""
+(() => {
+  const sel = 'a,button,input,select,textarea,[role=button],[role=link],' +
+              '[contenteditable=true],[onclick],label,summary';
+  const out = [];
+  document.querySelectorAll(sel).forEach((el, i) => {
+    const r = el.getBoundingClientRect();
+    const st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return;
+    if (r.width < 2 || r.height < 2) return;
+    el.setAttribute('data-powerx-idx', String(i));
+    const tag = el.tagName.toLowerCase();
+    out.push({
+      i: i,
+      target: '[data-powerx-idx="' + i + '"]',
+      tag: tag,
+      type: el.getAttribute('type') || '',
+      name: el.getAttribute('name') || '',
+      id: el.id || '',
+      placeholder: el.getAttribute('placeholder') || '',
+      text: (el.getAttribute('aria-label') || el.innerText || el.value || '')
+              .trim().replace(/\s+/g, ' ').slice(0, 120),
+      required: !!el.required,
+      disabled: !!el.disabled,
+      value: (typeof el.value === 'string' ? el.value : '').slice(0, 80)
+    });
+  });
+  return JSON.stringify(out);
+})()
+"""
+
+#: Find any captcha the page has rendered, and the sitekey that identifies it.
+#: Reporting the sitekey is what lets the solver be called at all: a token
+#: request without one is not answerable.
+_DETECT_CAPTCHA_SCRIPT = r"""
+(() => {
+  const attr = (el, a) => (el && el.getAttribute(a)) || null;
+  const pick = (sels) => { for (const s of sels) { const el = document.querySelector(s);
+                           if (el) return el; } return null; };
+  const found = { kind: null, sitekey: null, target: null, image_src: null };
+  const rec = pick(['.g-recaptcha[data-sitekey]', '[data-sitekey][class*="g-recaptcha"]',
+                    '[data-sitekey][data-callback]']);
+  const ts = pick(['.cf-turnstile[data-sitekey]', '[data-sitekey][class*="cf-turnstile"]',
+                   'div[data-sitekey][id*="turnstile"]']);
+  const hc = pick(['.h-captcha[data-sitekey]', '[data-sitekey][class*="h-captcha"]']);
+  if (ts) { found.kind = 'turnstile'; found.sitekey = attr(ts, 'data-sitekey'); }
+  else if (hc) { found.kind = 'hcaptcha'; found.sitekey = attr(hc, 'data-sitekey'); }
+  else if (rec) { found.kind = 'recaptcha'; found.sitekey = attr(rec, 'data-sitekey');
+                  found.enterprise = !!attr(rec, 'data-s'); }
+  if (!found.kind) {
+    const imgs = document.querySelectorAll('img');
+    for (const im of imgs) {
+      const hay = ((im.src || '') + ' ' + (im.alt || '') + ' ' + (im.id || '') + ' ' +
+                   (im.className || '')).toLowerCase();
+      if (/(captcha|verify|securimage|kcaptcha|valida|code)[^a-z]/.test(hay + ' ') ||
+          /captcha|verify|securimage|kcaptcha/.test(hay)) {
+        const r = im.getBoundingClientRect();
+        if (r.width >= 40 && r.height >= 20) {
+          im.setAttribute('data-powerx-idx', 'captcha');
+          found.kind = 'image';
+          found.image_src = im.src || '';
+          found.target = '[data-powerx-idx="captcha"]';
+          found.image_size = [Math.round(r.width), Math.round(r.height)];
+          const box = im.closest('form') || document;
+          const inp = box.querySelector('input[type=text]:not([style*="display: none"]),' +
+                                        'input[name*="captcha" i],input[id*="captcha" i]');
+          if (inp) { inp.setAttribute('data-powerx-answer', 'captcha'); found.answer_target = '[data-powerx-answer="captcha"]'; }
+          break;
+        }
+      }
+    }
+  }
+  if (found.sitekey) {
+    const host = (found.kind === 'turnstile' ? '[data-sitekey][class*="cf-turnstile"],.cf-turnstile[data-sitekey]'
+                : found.kind === 'hcaptcha' ? '.h-captcha[data-sitekey]'
+                : '.g-recaptcha[data-sitekey]');
+    const el = document.querySelector(host);
+    if (el) { el.setAttribute('data-powerx-idx', 'captcha'); found.target = '[data-powerx-idx="captcha"]'; }
+  }
+  return JSON.stringify(found);
+})()
+""".strip()
+
+#: Write a solver token into whichever response field the widget rendered, and
+#: fire the page's own success callback. Setting the textarea alone leaves
+#: single-page sites that never re-read it stuck; the callback is what unblocks
+#: them, so both are attempted and the result says which landed.
+_INJECT_TOKEN_SCRIPT = r"""
+(() => {
+  const token = __POWERX_TOKEN__;
+  const kinds = __POWERX_KINDS__;
+  let filled = 0;
+  const names = ['g-recaptcha-response', 'cf-turnstile-response', 'h-captcha-response'];
+  kinds.forEach(k => names.push(k + '-response'));
+  names.forEach(n => {
+    document.querySelectorAll('textarea[name="' + n + '"],textarea#' + n +
+                              ',input[name="' + n + '"]').forEach(el => {
+      el.value = token; filled++;
+    });
+  });
+  document.querySelectorAll('textarea[id$="-response"],input[name$="-response"]').forEach(el => {
+    if (!el.value) { el.value = token; filled++; }
+  });
+  let called = 0;
+  try {
+    const cfg = window.___grecaptcha_cfg;
+    if (cfg && cfg.clients) {
+      Object.keys(cfg.clients).forEach(k => {
+        const walk = (o, d) => {
+          if (!o || typeof o !== 'object' || d > 5) return;
+          Object.keys(o).forEach(kk => {
+            let v; try { v = o[kk]; } catch (e) { return; }
+            if (v && typeof v === 'object' && typeof v.callback === 'function') {
+              try { v.callback(token); called++; } catch (e) {}
+            } else if (v && typeof v === 'object') { walk(v, d + 1); }
+          });
+        };
+        walk(cfg.clients[k], 0);
+      });
+    }
+    document.querySelectorAll('[data-callback]').forEach(el => {
+      const fn = el.getAttribute('data-callback');
+      if (fn && typeof window[fn] === 'function') {
+        try { window[fn](token); called++; } catch (e) {}
+      }
+    });
+  } catch (e) {}
+  return JSON.stringify({ filled: filled, callbacks: called, ok: filled > 0 || called > 0 });
+})()
+""".strip()
+
 
 def _strip_html(html: str) -> str:
     """Reduce markup to readable text (last-resort fallback for page text)."""
@@ -127,6 +263,25 @@ def _strip_html(html: str) -> str:
         .replace("&#39;", "'")
     )
     return re.sub(r"[ \t\r\f\v]+", " ", text)
+
+
+def _build_captcha_solver(ctx: ToolContext) -> Any:
+    """Build the captcha solver, or None when the operator has not enabled one.
+
+    Imported lazily and swallowed on failure: browsing must keep working when
+    the solver is absent or misconfigured, and ``auto_captcha`` needs to be
+    able to say "no solver configured" instead of raising at construction.
+    """
+    try:
+        from nanobot.agent.tools.captcha import CaptchaSolverTool
+    except Exception:  # noqa: BLE001 - optional collaborator
+        return None
+    try:
+        if not CaptchaSolverTool.enabled(ctx):
+            return None
+        return CaptchaSolverTool.create(ctx)
+    except Exception:  # noqa: BLE001 - a broken solver must not break browsing
+        return None
 
 
 class HumanBrowserTool(Tool):
@@ -150,8 +305,30 @@ class HumanBrowserTool(Tool):
             "screenshot",
             "solve_cloudflare",
             "close",
+            "find",
+            "fill_form",
+            "press",
+            "select",
+            "hover",
+            "back",
+            "forward",
+            "refresh",
+            "wait_for_text",
+            "auto_captcha",
+            "solve_image_captcha",
         }
     )
+
+    #: Keys ``press`` accepts, so the model cannot ask for an arbitrary
+    #: printable character under a name the driver will not recognise.
+    _KEYS = frozenset(
+        {
+            "Enter", "Tab", "Escape", "Backspace", "Delete", "ArrowUp", "ArrowDown",
+            "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Space",
+        }
+    )
+    _MAX_FORM_FIELDS = 40
+    _FIND_MAX_ELEMENTS = 150
 
     def __init__(
         self,
@@ -171,6 +348,7 @@ class HumanBrowserTool(Tool):
         solve_cloudflare: bool = True,
         cloudflare_timeout_seconds: float = 15.0,
         allowed_domains: list[str] | None = None,
+        captcha_solver: Any = None,
     ) -> None:
         self.workspace = workspace
         self.provider = str(provider or "novita").strip().lower()
@@ -191,6 +369,10 @@ class HumanBrowserTool(Tool):
             for domain in (allowed_domains or [])
             if str(domain).strip()
         ]
+        # The solver is optional and injected: browsing must work with no
+        # captcha capability configured, and auto_captcha says so plainly
+        # rather than pretending the page had nothing on it.
+        self.captcha_solver = captcha_solver
         self._sessions: dict[str, _HumanBrowserSession] = {}
         self._lock = asyncio.Lock()
 
@@ -232,6 +414,7 @@ class HumanBrowserTool(Tool):
             solve_cloudflare=cfg.solve_cloudflare,
             cloudflare_timeout_seconds=cfg.cloudflare_timeout_seconds,
             allowed_domains=cfg.allowed_domains,
+            captcha_solver=_build_captcha_solver(ctx),
         )
 
     @property
@@ -242,11 +425,23 @@ class HumanBrowserTool(Tool):
     def description(self) -> str:
         return (
             "Browse a public website with human-like mouse, typing and scrolling, attaching to an "
-            "existing Chrome over the DevTools Protocol. Actions: navigate, read_page, click, type, "
-            "scroll, wait_for, screenshot, solve_cloudflare and close. Prefer this over the plain "
-            "browser tool when a site is sensitive to obviously automated input. navigate and click "
-            "automatically click through a Cloudflare Turnstile challenge when the page presents "
-            "one; use solve_cloudflare to retry that explicitly and wait for it to clear. "
+            "existing Chrome over the DevTools Protocol.\n\n"
+            "Look: read_page (title, url, visible text), find (every interactive element on the "
+            "page with a ready-made target selector and its label, type, name and placeholder), "
+            "screenshot. Call find first on any page you have not seen: it returns the targets that "
+            "click, type and select accept, so you never guess a selector.\n"
+            "Move: navigate, back, forward, refresh, click, hover, scroll, wait_for, "
+            "wait_for_text. Type: type, fill_form (many fields in one call), press (Enter, Tab, "
+            "Escape, arrows, ...), select (a dropdown option).\n"
+            "Captcha: auto_captcha detects what the page actually rendered (Turnstile, reCAPTCHA, "
+            "hCaptcha, or an image challenge), solves it and writes the token back into the page "
+            "including firing the site's own callback; call it and then re-read the page rather "
+            "than assuming success. solve_image_captcha does the same for a picture challenge by "
+            "cropping it, solving it and typing the answer. solve_cloudflare retries the Cloudflare "
+            "Turnstile click-through explicitly; navigate and click already attempt it. close ends "
+            "the session.\n"
+            "Prefer this over the plain browser tool when a site is sensitive to obviously "
+            "automated input. "
             "Private/internal URLs are blocked. Never submit purchases, publish content, send "
             "messages, or enter credentials unless the user explicitly authorized that exact action "
             "in the conversation."
@@ -271,6 +466,32 @@ class HumanBrowserTool(Tool):
                     "maximum": self._MAX_SCROLL,
                 },
                 "full_page": {"type": ["boolean", "null"]},
+                "fields": {
+                    "type": ["array", "null"],
+                    "description": (
+                        "For fill_form: the fields to fill, in order."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "target": {"type": "string", "maxLength": self._MAX_TARGET},
+                            "text": {"type": "string", "maxLength": self._MAX_TYPED_TEXT},
+                            "clear": {"type": "boolean"},
+                        },
+                        "required": ["target", "text"],
+                        "additionalProperties": False,
+                    },
+                },
+                "key": {
+                    "type": ["string", "null"],
+                    "description": "For press: the key to press.",
+                    "enum": sorted(self._KEYS) + [None],
+                },
+                "option": {
+                    "type": ["string", "null"],
+                    "maxLength": self._MAX_TARGET,
+                    "description": "For select: the visible option text or value to choose.",
+                },
                 "timeout_ms": {
                     "type": ["integer", "null"],
                     "minimum": 500,
@@ -516,6 +737,389 @@ class HumanBrowserTool(Tool):
             raise ValueError(f"no element matched {wanted!r}")
         return element
 
+    async def _run_script(self, tab: Any, script: str) -> str:
+        """Run *script* in the page and return its unwrapped string value."""
+        runner = getattr(tab, "execute_script", None)
+        if runner is None:
+            return ""
+        try:
+            raw = await runner(script)
+        except Exception:  # noqa: BLE001 - a failed probe is reported as empty
+            return ""
+        return self._unwrap_script_value(raw)
+
+    @staticmethod
+    def _json_value(raw: str, fallback: Any) -> Any:
+        if not raw:
+            return fallback
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return fallback
+        return parsed if isinstance(parsed, type(fallback)) else fallback
+
+    async def _inventory(self, tab: Any) -> list[dict[str, Any]]:
+        """Every interactive element on the page, each with a usable selector."""
+        return self._json_value(await self._run_script(tab, _FIND_SCRIPT), [])[
+            : self._FIND_MAX_ELEMENTS
+        ]
+
+    async def _detect_captcha(self, tab: Any) -> dict[str, Any]:
+        return self._json_value(await self._run_script(tab, _DETECT_CAPTCHA_SCRIPT), {})
+
+    async def _fill_form(self, tab: Any, fields: Any) -> list[str]:
+        """Fill many fields in one call, so a form is one round trip not ten."""
+        if not isinstance(fields, list) or not fields:
+            raise ValueError("fill_form needs a non-empty fields list")
+        if len(fields) > self._MAX_FORM_FIELDS:
+            raise ValueError(f"fill_form accepts at most {self._MAX_FORM_FIELDS} fields")
+        filled: list[str] = []
+        for entry in fields:
+            if not isinstance(entry, dict):
+                raise ValueError("each fill_form entry must be an object with target and text")
+            target = str(entry.get("target") or "").strip()
+            if not target:
+                raise ValueError("each fill_form entry needs a target selector")
+            element = await self._resolve_element(tab, target)
+            if entry.get("clear"):
+                clearer = getattr(element, "clear", None)
+                if clearer is not None:
+                    try:
+                        await clearer()
+                    except Exception:  # noqa: BLE001 - clearing is best effort
+                        pass
+            value = entry.get("text")
+            await asyncio.wait_for(
+                element.type_text(
+                    str("" if value is None else value)[: self._MAX_TYPED_TEXT],
+                    humanize=self.humanize,
+                ),
+                timeout=self.action_timeout_ms / 1000,
+            )
+            filled.append(target)
+        return filled
+
+    async def _press(self, tab: Any, key: str | None) -> str:
+        """Press a named key, preferring a real driver event.
+
+        A synthetic ``KeyboardEvent`` is untrusted and some sites ignore it, so
+        the driver's own keyboard is tried first. When only the script path is
+        available the key is dispatched on the focused element and, for Enter,
+        the enclosing form is submitted through ``requestSubmit`` - which is a
+        genuine browser-initiated submit, not a scripted one.
+        """
+        name = str(key or "").strip()
+        if not name:
+            raise ValueError("a key is required for press")
+        if name not in self._KEYS:
+            raise ValueError(f"unsupported key {name!r}")
+
+        keyboard = getattr(tab, "keyboard", None)
+        presser = getattr(keyboard, "press", None)
+        if presser is not None:
+            for module_name in ("pydoll.constants", "pydoll.keyboard", "pydoll.enums"):
+                try:
+                    module = importlib.import_module(module_name)
+                except Exception:  # noqa: BLE001
+                    continue
+                enum_cls = getattr(module, "Key", None)
+                enum_key = getattr(enum_cls, name.upper(), None) if enum_cls else None
+                if enum_key is None:
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        presser(enum_key), timeout=self.action_timeout_ms / 1000
+                    )
+                    return f"Pressed {name} with the driver keyboard."
+                except Exception:  # noqa: BLE001 - fall back to the script path
+                    break
+
+        script = f"""
+(() => {{
+  const key = {json.dumps(name)};
+  const el = document.activeElement || document.body;
+  const opts = {{ key: key, code: key, bubbles: true, cancelable: true }};
+  el.dispatchEvent(new KeyboardEvent('keydown', opts));
+  el.dispatchEvent(new KeyboardEvent('keypress', opts));
+  el.dispatchEvent(new KeyboardEvent('keyup', opts));
+  if (key === 'Enter') {{
+    const form = el.form || (el.closest ? el.closest('form') : null);
+    if (form) {{
+      if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(); return 'submitted'; }}
+      form.submit();
+      return 'submitted';
+    }}
+  }}
+  return 'dispatched';
+}})()
+""".strip()
+        outcome = await self._run_script(tab, script)
+        return f"Pressed {name} ({outcome or 'no effect'})."
+
+    async def _select_option(self, tab: Any, target: str, option: str | None) -> str:
+        """Choose a <select> option by visible label or value.
+
+        Requires a CSS selector rather than a text target: the option text is
+        not unique across the page, and picking the wrong control silently is
+        worse than asking for a selector.
+        """
+        selector = str(target or "").strip()
+        if not selector:
+            raise ValueError("select needs a CSS selector as target")
+        wanted = str(option or "").strip()
+        if not wanted:
+            raise ValueError("an option is required for select")
+        script = f"""
+(() => {{
+  const root = document.querySelector({json.dumps(selector)});
+  if (!root) return 'no-element';
+  const opts = Array.from(root.options || []);
+  const want = {json.dumps(wanted)};
+  const hit = opts.find(o => (o.text || '').trim() === want || o.value === want);
+  if (!hit) return 'no-option';
+  root.value = hit.value;
+  root.dispatchEvent(new Event('input', {{ bubbles: true }}));
+  root.dispatchEvent(new Event('change', {{ bubbles: true }}));
+  return 'selected:' + hit.value;
+}})()
+""".strip()
+        outcome = await self._run_script(tab, script)
+        if outcome.startswith("no-element"):
+            raise ValueError(f"no element matched {selector!r}")
+        if outcome.startswith("no-option"):
+            raise ValueError(f"{wanted!r} is not an option of {selector!r}")
+        if not outcome.startswith("selected:"):
+            # An empty reply means the script never ran. Reporting success here
+            # would tell the model a dropdown was set when nothing happened.
+            raise ValueError(
+                f"could not drive the select control {selector!r}: the page returned no result"
+            )
+        return f"Selected {outcome.split(':', 1)[-1]}."
+
+    async def _hover(self, tab: Any, target: str) -> str:
+        selector = str(target or "").strip()
+        if not selector:
+            raise ValueError("a selector is required for hover")
+        script = f"""
+(() => {{
+  const el = document.querySelector({json.dumps(selector)});
+  if (!el) return 'no-element';
+  ['pointerover', 'mouseover', 'mouseenter', 'mousemove'].forEach(t => {{
+    el.dispatchEvent(new MouseEvent(t, {{ bubbles: true, cancelable: true, view: window }}));
+  }});
+  return 'hovered';
+}})()
+""".strip()
+        outcome = await self._run_script(tab, script)
+        if outcome.startswith("no-element"):
+            raise ValueError(f"no element matched {selector!r}")
+        if outcome != "hovered":
+            raise ValueError(
+                f"could not hover {selector!r}: the page returned no result"
+            )
+        return "Hovered."
+
+    async def _history(self, tab: Any, direction: str) -> str:
+        """Go back or forward through history and let the page settle."""
+        js = (
+            "history.back(); return 'back';"
+            if direction == "back"
+            else "history.forward(); return 'forward';"
+        )
+        await self._run_script(tab, js)
+        await asyncio.sleep(1.0)
+        return await self._summary(tab)
+
+    async def _wait_for_text(self, tab: Any, needle: str | None, timeout_ms: int) -> bool:
+        wanted = str(needle or "").strip().lower()
+        if not wanted:
+            raise ValueError("text is required for wait_for_text")
+        deadline = time.monotonic() + max(0.5, timeout_ms / 1000)
+        while time.monotonic() < deadline:
+            if wanted in (await self._page_text(tab)).lower():
+                return True
+            await asyncio.sleep(0.35)
+        return False
+
+    # --- captcha ----------------------------------------------------------
+
+    @staticmethod
+    def _token_from(result: Any) -> str:
+        """Pull the token out of the solver tool's JSON reply, if there is one."""
+        if isinstance(result, str):
+            try:
+                payload = json.loads(result)
+            except ValueError:
+                return ""
+            if isinstance(payload, dict):
+                return str(payload.get("token") or "").strip()
+        return ""
+
+    async def _page_url(self, tab: Any, given: str | None) -> str:
+        provided = str(given or "").strip()
+        if provided:
+            return provided
+        try:
+            return str(await tab.current_url or "")
+        except Exception:  # noqa: BLE001 - the solver can still try without it
+            return ""
+
+    async def _inject_token(self, tab: Any, token: str, kind: str) -> dict[str, Any]:
+        script = _INJECT_TOKEN_SCRIPT.replace(
+            "__POWERX_TOKEN__", json.dumps(token)
+        ).replace("__POWERX_KINDS__", json.dumps([kind]))
+        outcome = self._json_value(await self._run_script(tab, script), {})
+        return outcome if isinstance(outcome, dict) else {}
+
+    async def _auto_captcha(self, tab: Any, url: str | None) -> dict[str, Any]:
+        """Detect the captcha the page actually rendered, solve it, inject it."""
+        if self.captcha_solver is None:
+            return {
+                "solved": False,
+                "reason": (
+                    "no captcha solver is configured for this deployment, so nothing was "
+                    "attempted; report the challenge to the user rather than retrying"
+                ),
+            }
+        found = await self._detect_captcha(tab)
+        kind = str(found.get("kind") or "")
+        if not kind:
+            return {"solved": False, "reason": "no captcha was detected on the page"}
+        if kind == "image":
+            return {
+                "solved": False,
+                "kind": "image",
+                "target": found.get("target"),
+                "answer_target": found.get("answer_target"),
+                "reason": "the page shows a picture challenge; call solve_image_captcha",
+            }
+
+        sitekey = str(found.get("sitekey") or "").strip()
+        if not sitekey:
+            return {"solved": False, "kind": kind, "reason": "the widget exposed no sitekey"}
+
+        page_url = await self._page_url(tab, url)
+        arguments: dict[str, Any] = {"action": kind, "sitekey": sitekey, "url": page_url}
+        if kind == "recaptcha" and found.get("enterprise"):
+            arguments["enterprise"] = True
+        result = await self.captcha_solver.execute(**arguments)
+        token = self._token_from(result)
+        if not token:
+            return {
+                "solved": False,
+                "kind": kind,
+                "reason": "the solver returned no token",
+                "solver": str(result)[:400],
+            }
+        injected = await self._inject_token(tab, token, kind)
+        return {
+            "solved": bool(injected.get("ok")),
+            "kind": kind,
+            "token_chars": len(token),
+            "fields_filled": injected.get("filled", 0),
+            "callbacks_called": injected.get("callbacks", 0),
+            "note": (
+                "the token is written into the page; re-read the page to confirm the "
+                "challenge cleared before continuing"
+            ),
+        }
+
+    async def _solve_image_captcha(self, tab: Any) -> dict[str, Any]:
+        """Crop the picture challenge, solve it, and type the answer back."""
+        if self.captcha_solver is None:
+            return {"solved": False, "reason": "no captcha solver is configured"}
+        found = await self._detect_captcha(tab)
+        target = str(found.get("target") or "").strip()
+        if found.get("kind") != "image" or not target:
+            return {"solved": False, "reason": "no picture challenge was detected"}
+
+        rect_raw = await self._run_script(
+            tab,
+            "(() => { const el = document.querySelector("
+            f"{json.dumps(target)}"
+            "); if (!el) return ''; const r = el.getBoundingClientRect();"
+            " return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height,"
+            "dpr: window.devicePixelRatio || 1}); })()",
+        )
+        rect = self._json_value(rect_raw, {})
+
+        root = Path(self.workspace) if self.workspace else Path.cwd()
+        shot = (root / f"captcha-{int(time.time())}.png").resolve()
+        try:
+            await asyncio.wait_for(
+                tab.take_screenshot(path=str(shot), beyond_viewport=False),
+                timeout=self.action_timeout_ms / 1000,
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced as a solver result
+            return {"solved": False, "reason": f"could not screenshot the challenge: {exc}"}
+
+        cropped = self._crop_capture(shot, rect)
+        answer_result = await self.captcha_solver.execute(
+            action="solve_image", image_path=str(cropped)
+        )
+        answer = self._token_from(answer_result)
+        if not answer:
+            return {
+                "solved": False,
+                "kind": "image",
+                "reason": "the solver returned no answer",
+                "solver": str(answer_result)[:400],
+            }
+
+        answer_target = str(found.get("answer_target") or "").strip()
+        if not answer_target:
+            return {
+                "solved": False,
+                "kind": "image",
+                "answer": answer,
+                "reason": "solved, but no answer field was identified; type it yourself",
+            }
+        element = await self._resolve_element(tab, answer_target)
+        await asyncio.wait_for(
+            element.type_text(str(answer)[: self._MAX_TYPED_TEXT], humanize=self.humanize),
+            timeout=self.action_timeout_ms / 1000,
+        )
+        return {
+            "solved": True,
+            "kind": "image",
+            "answer_chars": len(answer),
+            "typed_into": answer_target,
+            "note": "the answer is typed in but not submitted; confirm before submitting",
+        }
+
+    def _crop_capture(self, path: Path, rect: dict[str, Any]) -> Path:
+        """Crop the element out of a viewport screenshot when Pillow is present.
+
+        The solver does better on a tight crop than on a whole desktop. Pillow
+        may be absent in a slim image, so a failure keeps the full screenshot
+        rather than losing the solve.
+        """
+        try:
+            width = float(rect.get("w") or 0)
+            height = float(rect.get("h") or 0)
+        except (TypeError, ValueError):
+            return path
+        if width < 8 or height < 8:
+            return path
+        try:
+            from PIL import Image
+        except ImportError:
+            return path
+        try:
+            with Image.open(path) as image:
+                scale = float(rect.get("dpr") or 1) or 1.0
+                left, top = int(float(rect.get("x", 0)) * scale), int(float(rect.get("y", 0)) * scale)
+                right = min(image.width, left + int(width * scale))
+                bottom = min(image.height, top + int(height * scale))
+                if right <= left or bottom <= top:
+                    return path
+                crop = image.crop((max(0, left), max(0, top), right, bottom))
+                target = path.with_name(f"{path.stem}-crop{path.suffix}")
+                crop.save(target)
+            return target
+        except Exception:  # noqa: BLE001 - a bad crop must not lose the solve
+            return path
+
     # --- Cloudflare Turnstile ---------------------------------------------
 
     async def _find_cloudflare_shadow_root(self, tab: Any) -> Any:
@@ -681,6 +1285,9 @@ class HumanBrowserTool(Tool):
         pixels: int | None = None,
         full_page: bool | None = None,
         timeout_ms: int | None = None,
+        fields: list[dict[str, Any]] | None = None,
+        key: str | None = None,
+        option: str | None = None,
     ) -> Any:
         action = str(action or "").strip().lower()
         if action not in self._ACTIONS:
@@ -720,6 +1327,63 @@ class HumanBrowserTool(Tool):
                     return json.dumps(
                         {"cloudflare": await self._solve_cloudflare(tab)}
                     )
+
+                if action == "find":
+                    elements = await self._inventory(tab)
+                    return json.dumps(
+                        {
+                            "count": len(elements),
+                            "elements": elements,
+                            "note": (
+                                "target is a live CSS selector for click, type, select or hover"
+                            ),
+                        }
+                    )
+
+                if action == "fill_form":
+                    filled = await self._fill_form(tab, fields)
+                    return json.dumps({"filled": filled, "count": len(filled)})
+
+                if action == "press":
+                    return await self._press(tab, key)
+
+                if action == "select":
+                    return await self._select_option(tab, str(target or ""), option)
+
+                if action == "hover":
+                    return await self._hover(tab, str(target or ""))
+
+                if action in {"back", "forward"}:
+                    return await self._history(tab, action)
+
+                if action == "refresh":
+                    refresher = getattr(tab, "refresh", None)
+                    if refresher is not None:
+                        try:
+                            await asyncio.wait_for(
+                                refresher(), timeout=self.navigation_timeout_ms / 1000
+                            )
+                            return await self._summary(tab)
+                        except Exception:  # noqa: BLE001 - fall back to the script path
+                            pass
+                    await self._run_script(tab, "location.reload(); return 'ok';")
+                    await asyncio.sleep(1.0)
+                    return await self._summary(tab)
+
+                if action == "wait_for_text":
+                    budget = int(timeout_ms or self.action_timeout_ms)
+                    if await self._wait_for_text(tab, text, budget):
+                        return await self._summary(tab)
+                    wanted = str(text or "")[:200]
+                    return ToolResult.error(
+                        f"Error: {wanted!r} did not appear within {budget} ms"
+                    )
+
+                if action == "auto_captcha":
+                    return json.dumps(await self._auto_captcha(tab, url))
+
+                if action == "solve_image_captcha":
+                    return json.dumps(await self._solve_image_captcha(tab))
 
                 if action == "type":
                     if text is None:
