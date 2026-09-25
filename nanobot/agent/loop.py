@@ -31,6 +31,7 @@ from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
+from nanobot.agent.steering import SteeringInbox
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.exec_session import ExecSessionManager
@@ -187,6 +188,7 @@ class TurnContext:
     on_retry_wait: Callable[[str], Awaitable[None]] | None = None
 
     pending_queue: asyncio.Queue[InboundMessage] | None = None
+    steering_inbox: SteeringInbox | None = None
     pending_summary: SessionSummary | None = None
 
     ephemeral: bool = False
@@ -465,6 +467,11 @@ class AgentLoop:
         # When a session has an active task, new messages for that session
         # are routed here instead of creating a new task.
         self._pending_queues: dict[str, asyncio.Queue[InboundMessage]] = {}
+        # Live steering inboxes, published by the task that owns the session
+        # lock and removed when that turn ends. Separate from _pending_queues:
+        # that path *injects* follow-ups for the model to notice later, while a
+        # steer preempts the continuation the model has already proposed.
+        self._steering_inboxes: dict[str, SteeringInbox] = {}
         self._deferred_automation_turns: dict[str, list[InboundMessage]] = {}
         self._cron_turns = CronTurnCoordinator(
             publish_inbound=self.bus.publish_inbound,
@@ -1197,6 +1204,7 @@ class AgentLoop:
         session_key: str | None = None,
         original_user_text: str | None = None,
         pending_queue: asyncio.Queue[InboundMessage] | None = None,
+        steering_inbox: SteeringInbox | None = None,
         ephemeral: bool = False,
         run_extra_hooks_for_ephemeral: bool = False,
         hooks: list[AgentHook] | None = None,
@@ -1483,6 +1491,10 @@ class AgentLoop:
                 retry_wait_callback=on_retry_wait,
                 checkpoint_callback=_checkpoint,
                 injection_callback=_drain_pending,
+                # Live steering producer: the inbox published by _dispatch for
+                # this session. None on paths with no live turn (direct
+                # programmatic calls), which keeps steering inert there.
+                steering_inbox=steering_inbox,
                 # Sustained goals may legitimately exceed NANOBOT_LLM_TIMEOUT_S; idle stall
                 # is still capped by NANOBOT_STREAM_IDLE_TIMEOUT_S in streaming providers.
                 llm_timeout_s=runner_wall_llm_timeout_s(
@@ -1659,6 +1671,32 @@ class AgentLoop:
         finally:
             await self.aclose()
 
+    def steer(self, session_key: str, text: str, *, source: str = "user") -> bool:
+        """Queue a mid-run steer for a session that is currently executing.
+
+        This is the producer entry point for live steering: a channel, the
+        web UI, or an automation calls it while a turn is in flight, and the
+        running loop drains it at the next seam -- preempting whatever
+        continuation the model had already proposed.
+
+        Returns True only when a live turn actually accepted the steer. When
+        the session is idle the caller gets ``False`` and should deliver the
+        message as an ordinary turn instead, so a steer typed between turns can
+        never be silently swallowed.
+        """
+        inbox = self._steering_inboxes.get(session_key)
+        if inbox is None:
+            return False
+        accepted = inbox.push(text, source=source)
+        if accepted:
+            logger.info("Steer queued for live session {}", session_key)
+        return accepted
+
+    def can_steer(self, session_key: str) -> bool:
+        """Whether *session_key* has a live turn that can be steered."""
+        inbox = self._steering_inboxes.get(session_key)
+        return inbox is not None and not inbox.closed
+
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
         session_key = self._effective_session_key(msg)
@@ -1669,12 +1707,20 @@ class AgentLoop:
 
         delivery = self.turn_delivery_factory.unrouted(msg, session_key)
         pending: asyncio.Queue[InboundMessage] | None = None
+        # Declared out here so the finally is safe even if registration raises
+        # before the inbox is created.
+        steering_inbox: SteeringInbox | None = None
         try:
             async with lock, gate:
                 # Only the task that owns the session lock may publish the
                 # active mid-turn injection queue for this session.
                 pending = asyncio.Queue(maxsize=20)
                 self._pending_queues[session_key] = pending
+                # Published alongside the injection queue and removed in the
+                # same finally, so a steer can only ever reach the turn that
+                # currently owns this session's lock.
+                steering_inbox = SteeringInbox()
+                self._steering_inboxes[session_key] = steering_inbox
                 try:
                     delivery = self.turn_delivery_factory.create(
                         msg,
@@ -1686,6 +1732,7 @@ class AgentLoop:
                         on_stream=delivery.on_stream,
                         on_stream_end=delivery.on_stream_end,
                         pending_queue=pending,
+                        steering_inbox=steering_inbox,
                         delivery=delivery,
                     )
                     continuing = turn_continuation.internal_continuation_pending(msg.metadata)
@@ -1753,6 +1800,13 @@ class AgentLoop:
                         queue = self._pending_queues.pop(session_key, None)
                     else:
                         queue = pending
+                    # Identity-checked like the queue above: close and remove our
+                    # own inbox only, so a successor turn that already registered
+                    # its inbox cannot have it stolen by this finally.
+                    own_inbox = self._steering_inboxes.get(session_key)
+                    if own_inbox is steering_inbox:
+                        own_inbox.close()
+                        self._steering_inboxes.pop(session_key, None)
                     if queue is not None:
                         leftover = 0
                         while True:
@@ -1849,6 +1903,7 @@ class AgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue[InboundMessage] | None = None,
+        steering_inbox: SteeringInbox | None = None,
         ephemeral: bool = False,
         run_extra_hooks_for_ephemeral: bool = False,
         hooks: list[AgentHook] | None = None,
@@ -1900,6 +1955,7 @@ class AgentLoop:
             on_stream_end=on_stream_end,
             on_runtime_admitted=on_runtime_admitted,
             pending_queue=pending_queue,
+            steering_inbox=steering_inbox,
             ephemeral=ephemeral,
             run_extra_hooks_for_ephemeral=run_extra_hooks_for_ephemeral,
             hooks=list(hooks or []),
@@ -2470,6 +2526,7 @@ class AgentLoop:
             session_key=ctx.session_key,
             original_user_text=ctx.original_user_text,
             pending_queue=ctx.pending_queue,
+            steering_inbox=ctx.steering_inbox,
             ephemeral=ctx.ephemeral,
             run_extra_hooks_for_ephemeral=ctx.run_extra_hooks_for_ephemeral,
             hooks=ctx.hooks,
