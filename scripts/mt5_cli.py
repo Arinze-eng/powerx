@@ -1296,7 +1296,44 @@ def _pending_install_target() -> str:
         return ""
     if not target:
         return ""
-    return target if target != _installed_url() else ""
+    if target != _installed_url():
+        return target
+    # The URLs MATCH, which used to be the whole answer. It is not: two different
+    # installs write the same URL, and one of them can have failed. So the record is
+    # believed only when the disk backs it -- a terminal in the directory the install
+    # recorded. Without this, a stale URL from a failed run made this install look
+    # already-landed and `status` answered "done" 7 s in, with the install still at
+    # its wineprefix stage (measured live, 2026-09-25).
+    if not _recorded_terminal_exists():
+        return target
+    return ""
+
+
+def _recorded_terminal_exists() -> bool:
+    """Whether the install's own records name a terminal that is ACTUALLY on disk.
+
+    The records are claims; the disk is the fact. A URL alone is not evidence that a
+    terminal was installed -- MEASURED 2026-09-25, live: a box carried
+    ``.installed.url`` = AXI's URL from a run that reported ``done`` and installed
+    nothing, and every reader of that record (``status``, the pending-build check)
+    believed it.
+
+    Checked in the order the records are trustworthy:
+
+    * the directory an install recorded, when there is one -- written only on a
+      real success, and the only answer for a broker with no registry entry;
+    * otherwise the ``dir_name`` the REGISTRY gives for the URL that landed, which
+      covers a record written before the installer recorded directories;
+    * and for anything else, no -- an unregistered broker's legacy record cannot be
+      checked at all, so it must not be treated as proof.
+    """
+    dir_name = _installed_dir_name()
+    if not dir_name:
+        build = _broker_build_by_url(_installed_url())
+        dir_name = str((build or {}).get("dir_name") or "")
+    if not dir_name:
+        return False
+    return (WINE_PREFIX / "drive_c" / "Program Files" / dir_name / "terminal64.exe").exists()
 
 
 def _read_install_status() -> tuple[str, str]:
@@ -1556,7 +1593,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         # in -- both read from the installer's own records, so a reader can tell a
         # resolved install apart from a guess without walking the prefix.
         "installed_dir_name": _installed_dir_name() or None,
-        "installed_url": _installed_url() or None,
+        # Reported only when a terminal actually backs it: a URL written by a run
+        # that installed nothing is the record this whole change exists to stop
+        # trusting.
+        "installed_url": _installed_url() if _recorded_terminal_exists() else None,
         "terminal_running": running,
         # Distinguishes the installer's credential-less "materialise the MQL5
         # library" terminal from one that was launched with our /config: file.

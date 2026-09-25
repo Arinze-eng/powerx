@@ -1492,10 +1492,20 @@ def test_a_broker_switch_is_not_reported_as_done_before_it_has_started(
     assert captured["in_progress"] is True
     assert captured["installing_target"].endswith("exness5setup.exe")
 
-    # 2. Once that build has landed, status reports done again.
+    # 2. Once that build has really landed, status reports done again -- and "really"
+    #    means its terminal is on disk, not merely that its URL was recorded. A URL
+    #    record with no terminal behind it is what a FAILED install leaves (measured
+    #    live 2026-09-25), and believing it is the false ``done`` this pins against.
     (mt5_root / ".installed.url").write_text(
         cli.broker_for_server("Exness-MT5Trial9")["url"], encoding="utf-8"
     )
+    cli.cmd_status(argparse.Namespace(lines=5))
+    assert captured["stage"] != "done", "a URL with no terminal behind it is not a build"
+    assert captured["installing_target"] is not None
+
+    exness = cli.WINE_PREFIX / "drive_c" / "Program Files" / "MetaTrader 5 EXNESS"
+    exness.mkdir(parents=True)
+    (exness / "terminal64.exe").write_bytes(b"MZ")
     cli.cmd_status(argparse.Namespace(lines=5))
     assert captured["stage"] == "done"
     assert captured["installing_target"] is None
@@ -2467,11 +2477,19 @@ def test_a_generic_install_records_the_url_it_will_actually_land(monkeypatch, tm
     assert recorded == cli.GENERIC_INSTALLER_URL
     assert recorded != cli.DEFAULT_INSTALLER_URL
 
-    # The property that matters: once the installer has landed that same URL, the
-    # install stops reading as "a different build is being installed" and the
-    # poll loop can terminate.
+    # The property that matters: once the installer has landed that same URL AND the
+    # build is on disk, the install stops reading as "a different build is being
+    # installed" and the poll loop can terminate.
     assert cli._pending_install_target() == recorded
     cli.INSTALLED_URL_FILE.write_text(recorded, encoding="utf-8")
+    # The URL alone is NOT enough: a failed run writes the same URL and no terminal,
+    # and believing that pair made `status` answer "done" 7 s into a live install
+    # (2026-09-25). The record is believed when the registry's directory for it holds
+    # a terminal.
+    assert cli._pending_install_target() == recorded
+    generic = cli.WINE_PREFIX / "drive_c" / "Program Files" / "MetaTrader 5"
+    generic.mkdir(parents=True)
+    (generic / "terminal64.exe").write_bytes(b"MZ")
     assert cli._pending_install_target() == ""
 
 
@@ -6485,3 +6503,222 @@ async def test_a_failed_resolved_install_does_not_claim_it_installed_anything(mo
     assert "no_new_terminal" in rendered
     assert "did not produce a terminal" in rendered
     assert "Do not retry this install" in rendered
+
+
+def _run_skip_marker_block(tmp_path, prefix, root, dir_name, url, body):
+    """Run the REAL skip-marker block from the installer against a fake prefix."""
+    import subprocess as _subprocess
+
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
+    ).read_text(encoding="utf-8")
+    start = script.index('_RESOLVED_URL="${MT5_BROKER_INSTALLER_URL')
+    end = script.index('if [ "${_TERMINAL_ALREADY_INSTALLED}" -eq 0 ]')
+    slice_ = script[start:end]
+    helpers = tmp_path / "skip-marker.sh"
+    helpers.write_text(
+        "set -uo pipefail\n"
+        'WINE_PREFIX="${FAKE_PREFIX}"\n'
+        'MT5_ROOT="${FAKE_ROOT}"\n'
+        'DONE_MARKER="${MT5_ROOT}/.installed.broker"\n'
+        'INSTALLER="${MT5_ROOT}/broker_setup.exe"\n'
+        'MT5_BROKER_DIR_NAME="${FAKE_DIR_NAME}"\n'
+        'TERM_DISPLAY_NAME="${FAKE_DIR_NAME}"\n'
+        'MT5_BROKER_INSTALLER_URL="${FAKE_URL}"\n'
+        'MT5_INSTALLER_URL=""\n'
+        "status() { :; }\n"
+        "log() { :; }\n"
+        + slice_
+        + "\n",
+        encoding="utf-8",
+    )
+    driver = tmp_path / "skip-driver.sh"
+    driver.write_text(". \"${HELPERS}\"\n" + body, encoding="utf-8")
+    return _subprocess.run(
+        ["bash", str(driver)],
+        env={
+            **os.environ,
+            "HELPERS": str(helpers),
+            "FAKE_PREFIX": str(prefix),
+            "FAKE_ROOT": str(root),
+            "FAKE_DIR_NAME": dir_name,
+            "FAKE_URL": url,
+        },
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_a_marker_left_by_a_failed_install_does_not_skip_the_next_one(tmp_path):
+    """The SECOND route to the same lie, measured live.
+
+    MEASURED 2026-09-25 (box i1msgk2l82okd3m0kqycs): a run that reported ``done`` and
+    installed nothing left ``.installed.broker`` + ``.installed.url`` = AXI's URL. The
+    next ``install --server AXI-Live`` short-circuited on that pair -- no download, no
+    installer, no AXI directory -- and printed ``install complete`` at the end. So the
+    skip needs the terminal the record names to be ON DISK.
+    """
+    prefix = tmp_path / ".wine-mt5"
+    root = tmp_path / ".mt5"
+    (prefix / "drive_c" / "Program Files" / "MetaTrader 5 Terminal").mkdir(parents=True)
+    (prefix / "drive_c" / "Program Files" / "MetaTrader 5 Terminal" / "terminal64.exe").write_bytes(b"MZ")
+    root.mkdir(parents=True)
+    (root / ".installed.broker").write_text("", encoding="utf-8")
+    (root / ".installed.url").write_text(_AXI_URL, encoding="utf-8")
+
+    result = _run_skip_marker_block(
+        tmp_path,
+        prefix,
+        root,
+        "MetaTrader 5 AXI",
+        _AXI_URL,
+        'echo "SKIP=${_TERMINAL_ALREADY_INSTALLED}"\n',
+    )
+    assert result.returncode == 0, result.stderr
+    assert "SKIP=0" in result.stdout, (
+        "a marker written by an install that produced no terminal skipped the install"
+    )
+
+
+def test_a_backed_record_still_skips_a_repeat_install(tmp_path):
+    """The fix must not throw away the fast path it sits on top of.
+
+    Two ways a record can be backed: the directory the install RECORDED (a
+    discovery-derived broker, whose name nobody predicted) or the requested build's
+    own directory (a registered broker, where the caller's name is the real one).
+    """
+    prefix = tmp_path / ".wine-mt5"
+    root = tmp_path / ".mt5"
+    axi_dir = prefix / "drive_c" / "Program Files" / "MetaTrader 5 AXICorp"
+    axi_dir.mkdir(parents=True)
+    (axi_dir / "terminal64.exe").write_bytes(b"MZ")
+    root.mkdir(parents=True)
+    (root / ".installed.broker").write_text("", encoding="utf-8")
+    (root / ".installed.url").write_text(_AXI_URL, encoding="utf-8")
+
+    # (a) the recorded directory holds the terminal
+    (root / ".installed.dir_name").write_text("MetaTrader 5 AXICorp", encoding="utf-8")
+    result = _run_skip_marker_block(
+        tmp_path,
+        prefix,
+        root,
+        "MetaTrader 5 AXI",
+        _AXI_URL,
+        'echo "SKIP=${_TERMINAL_ALREADY_INSTALLED}"\necho "DIR=${TERM_DISPLAY_NAME}"\n',
+    )
+    assert result.returncode == 0, result.stderr
+    assert "SKIP=1" in result.stdout
+    # The recorded directory is adopted, so the MQL5 step and the closing check look
+    # at the directory that actually holds the terminal rather than at the guess.
+    assert "DIR=MetaTrader 5 AXICorp" in result.stdout
+
+    # (b) no record, but the requested build's own directory is there (legacy box)
+    (root / ".installed.dir_name").unlink()
+    result = _run_skip_marker_block(
+        tmp_path,
+        prefix,
+        root,
+        "MetaTrader 5 AXICorp",
+        _AXI_URL,
+        'echo "SKIP=${_TERMINAL_ALREADY_INSTALLED}"\n',
+    )
+    assert result.returncode == 0, result.stderr
+    assert "SKIP=1" in result.stdout
+
+    # (c) a DIFFERENT url is never skipped, whatever is on disk
+    result = _run_skip_marker_block(
+        tmp_path,
+        prefix,
+        root,
+        "MetaTrader 5 AXICorp",
+        "https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe",
+        'echo "SKIP=${_TERMINAL_ALREADY_INSTALLED}"\n',
+    )
+    assert result.returncode == 0, result.stderr
+    assert "SKIP=0" in result.stdout
+
+
+def test_the_install_cannot_report_complete_without_its_terminal(tmp_path):
+    """``status done`` used to be printed on every route out of the terminal section.
+
+    It is what ``status`` then shows an agent for the rest of the box's life, so it has
+    to be gated on the terminal this run identified.
+    """
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
+    ).read_text(encoding="utf-8")
+    assert (
+        'if [ ! -f "${WINE_PREFIX}/drive_c/Program Files/${TERM_DISPLAY_NAME}/terminal64.exe" ]'
+        in script
+    )
+    assert 'status failed "install finished with no terminal in' in script
+    assert '"failure": "terminal_not_produced"' in script
+    # ...and the closing line still reports the install it completed.
+    assert 'status done "install complete: prefix=${WINE_PREFIX}' in script
+
+
+def test_a_stale_url_record_is_not_proof_that_a_build_landed(monkeypatch, tmp_path):
+    """The same lie one layer up: a URL on disk with no terminal behind it.
+
+    MEASURED 2026-09-25, live: the URL record left by a failed install matched the
+    ``.install.target`` this install wrote, so ``_pending_install_target`` answered
+    "nothing pending", ``status`` reported ``stage: done`` 7 s in, and the tool stopped
+    waiting with the install still at its wineprefix stage. A URL is a claim; the
+    terminal is the fact.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path, brands=("MetaTrader 5 Terminal",))
+    cli.INSTALLED_URL_FILE.write_text(_AXI_URL, encoding="utf-8")
+    cli.INSTALL_TARGET_FILE.write_text(_AXI_URL, encoding="utf-8")
+
+    # Nothing on disk backs the record: the install is still pending, whatever the URLs say.
+    assert cli._recorded_terminal_exists() is False
+    assert cli._pending_install_target() == _AXI_URL
+
+    # With the directory the install recorded in place, the record is backed and the
+    # install is genuinely over.
+    axi_dir = cli.WINE_PREFIX / "drive_c" / "Program Files" / "MetaTrader 5 AXICorp"
+    axi_dir.mkdir(parents=True)
+    (axi_dir / "terminal64.exe").write_bytes(b"MZ")
+    cli.INSTALLED_DIR_NAME_FILE.write_text("MetaTrader 5 AXICorp", encoding="utf-8")
+    assert cli._recorded_terminal_exists() is True
+    assert cli._pending_install_target() == ""
+
+
+def test_a_registered_brokers_legacy_record_is_still_believed(monkeypatch, tmp_path):
+    """A record written before directories were recorded must keep working.
+
+    The registry knows where that broker's terminal lives, so the URL can still be
+    checked against the disk. Without this fallback every box installed before this
+    change would re-install from scratch on the next call.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path, brands=("MetaTrader 5 EXNESS",))
+    cli.INSTALLED_URL_FILE.write_text(
+        "https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe",
+        encoding="utf-8",
+    )
+    assert cli._recorded_terminal_exists() is True
+
+
+def test_status_withholds_a_url_that_nothing_backs(monkeypatch, tmp_path):
+    """``installed_url`` is what a reader trusts; it must not be a claim with no terminal."""
+    import argparse
+
+    cli = _broker_cli(monkeypatch, tmp_path, brands=("MetaTrader 5 Terminal",))
+    cli.INSTALLED_URL_FILE.write_text(_AXI_URL, encoding="utf-8")
+    captured: dict[str, Any] = {}
+
+    def _capture(payload: dict[str, Any], **_kw: Any) -> int:
+        captured.clear()
+        captured.update(payload)
+        return 0
+
+    monkeypatch.setattr(cli, "emit", _capture)
+    cli.cmd_status(argparse.Namespace(lines=3))
+    assert captured["installed_url"] is None
+
+    axi_dir = cli.WINE_PREFIX / "drive_c" / "Program Files" / "MetaTrader 5 AXICorp"
+    axi_dir.mkdir(parents=True)
+    (axi_dir / "terminal64.exe").write_bytes(b"MZ")
+    cli.INSTALLED_DIR_NAME_FILE.write_text("MetaTrader 5 AXICorp", encoding="utf-8")
+    cli.cmd_status(argparse.Namespace(lines=3))
+    assert captured["installed_url"] == _AXI_URL

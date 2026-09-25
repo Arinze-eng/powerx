@@ -798,8 +798,33 @@ fi
 # resolve the new broker's server names and fails silently at login.
 _RESOLVED_URL="${MT5_BROKER_INSTALLER_URL:-${MT5_INSTALLER_URL}}"
 _PREV_URL="$(cat "${MT5_ROOT}/.installed.url" 2>/dev/null || true)"
-if [ -f "${DONE_MARKER}" ] && [ "${_PREV_URL}" = "${_RESOLVED_URL}" ]; then
+# AND THE RECORD MUST BE BACKED BY THE DISK.
+#
+# MEASURED FAILURE (2026-09-25, live): the marker + URL pair was written by a run that
+# reported ``done`` and installed nothing, so the NEXT install short-circuited on it --
+# skipping the download, the installer and the directory entirely -- and the script's
+# own last line still printed ``status done "install complete"``. A record of an
+# install that failed is not evidence that the next one may be skipped.
+#
+# The directory the install RECORDED is the one to check, and it is also adopted as
+# this run's display name so the MQL5 step and the closing check use the directory
+# that actually holds the terminal.
+_PREV_DIR_NAME="$(cat "${MT5_ROOT}/.installed.dir_name" 2>/dev/null || true)"
+_PREV_TERMINAL_PRESENT=0
+if [ -n "${_PREV_DIR_NAME}" ] \
+   && [ -f "${WINE_PREFIX}/drive_c/Program Files/${_PREV_DIR_NAME}/terminal64.exe" ]; then
+  _PREV_TERMINAL_PRESENT=1
+fi
+# The requested build's own directory counts too: a repeat install of a REGISTERED
+# broker passes that broker's real directory name, which is how this stays a no-op
+# for the common case.
+_PREDICTED_TERMINAL="${WINE_PREFIX}/drive_c/Program Files/${MT5_BROKER_DIR_NAME}/terminal64.exe"
+if [ -f "${DONE_MARKER}" ] && [ "${_PREV_URL}" = "${_RESOLVED_URL}" ] \
+   && { [ "${_PREV_TERMINAL_PRESENT}" -eq 1 ] || [ -f "${_PREDICTED_TERMINAL}" ]; }; then
   _TERMINAL_ALREADY_INSTALLED=1
+  if [ "${_PREV_TERMINAL_PRESENT}" -eq 1 ]; then
+    TERM_DISPLAY_NAME="${_PREV_DIR_NAME}"
+  fi
 else
   _TERMINAL_ALREADY_INSTALLED=0
   # A different broker's installer is on disk under the same filename; keeping it
@@ -1493,6 +1518,23 @@ if [ -d "${MT5_DIR}/MQL5/Include" ]; then
   fi
 fi
 
+# THE LAST LINE HAS TO BE TRUE.
+#
+# ``status done`` was printed unconditionally, so every route out of the terminal
+# section reported success -- including the one that SKIPPED the terminal because of a
+# marker left by a run that had installed nothing. Measured live 2026-09-25: this line
+# reported a successful AXI install over a prefix whose only terminal was Deriv's, and
+# it is what ``status`` then showed an agent for the rest of the box's life.
+#
+# The gate is the terminal in the directory this run identified -- either one it just
+# installed and read back off the disk, or the one the record it trusted names.
+if [ ! -f "${WINE_PREFIX}/drive_c/Program Files/${TERM_DISPLAY_NAME}/terminal64.exe" ]; then
+  status failed "install finished with no terminal in '${TERM_DISPLAY_NAME}'"
+  printf '{"ok": false, "stage": "failed", "failure": "terminal_not_produced",\n' >&2
+  printf ' "error": "no terminal64.exe in %s after the install"}\n' \
+    "Program Files/${TERM_DISPLAY_NAME}" >&2
+  exit 5
+fi
 status done "install complete: prefix=${WINE_PREFIX} win_python=${WIN_PY}"
 printf '{"ok": true, "stage": "done", "wine_prefix": "%s", "mt5_root": "%s", "windows_python": "%s"}\n' \
   "${WINE_PREFIX}" "${MT5_ROOT}" "${WIN_PY}"
