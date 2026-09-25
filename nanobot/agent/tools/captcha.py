@@ -48,10 +48,18 @@ class CaptchaSolverToolConfig(Base):
     """
 
     enable: bool = False
+    #: "capskip" speaks the 2captcha in.php/res.php protocol. "solvegate"
+    #: speaks SolveGate's own JSON /v1/solve, which is synchronous and covers
+    #: the Cloudflare WAF challenge the CapSkip protocol has no method for.
     provider: str = "capskip"
     base_url: str = "http://127.0.0.1:8080"
     api_key: str = ""
     api_key_env: str = "CAPSKIP_API_KEY"
+    solvegate_base_url: str = "https://api.solvegate.io"
+    solvegate_api_key: str = ""
+    #: The requested name was "CLOUDFLARE WAF"; a POSIX variable name cannot
+    #: hold a space, so the underscored form is what is read.
+    solvegate_api_key_env: str = "CLOUDFLARE_WAF_API_KEY"
     timeout_seconds: int = Field(default=180, ge=10, le=900)
     poll_interval_seconds: float = Field(default=5.0, ge=0.25, le=30.0)
     request_timeout_seconds: float = Field(default=30.0, ge=5.0, le=120.0)
@@ -208,6 +216,139 @@ class CaptchaSolver:
         return text
 
 
+class SolveGateSolver:
+    """Client for SolveGate's ``POST /v1/solve``.
+
+    The protocol here was read off the live API rather than assumed:
+
+    * The body must be **JSON**. The documented ``curl -d`` example sends
+      ``application/x-www-form-urlencoded`` and the API answers ``415
+      Unsupported Media Type``, so form encoding is not used.
+    * ``gate``, ``sitekey`` and ``url`` are all required. A missing one is a
+      ``400`` with ``{"error": {"code": "bad_request", "message": "Required"}}``.
+    * ``gate`` is an enum of exactly ``turnstile`` and ``waf``. The API refuses
+      anything else, so the tool refuses it first and names the provider that
+      does support it.
+    * The call is **synchronous**: one request returns ``status: "solved"``
+      with the token, so there is no task id and nothing to poll.
+    * A test key answers with ``mode: "sandbox"`` and a ``SANDBOX.``-prefixed
+      token, which will not pass a real challenge. That is reported as sandbox
+      rather than passed off as a solve.
+    """
+
+    #: The only two gates the API accepts.
+    GATES = ("turnstile", "waf")
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        request_timeout: float = 30.0,
+    ) -> None:
+        # Pinned from configuration, exactly as the CapSkip client is, so no
+        # tool argument can point the solver at another host.
+        self.base_url = str(base_url or "").strip().rstrip("/")
+        self.api_key = api_key
+        self.request_timeout = request_timeout
+
+    @property
+    def endpoint(self) -> str:
+        return f"{self.base_url}/v1/solve"
+
+    @staticmethod
+    def _describe_error(body: str) -> str:
+        """Read SolveGate's ``{"error": {...}}`` envelope into a readable line."""
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            return str(body or "").strip()[:200]
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(error, dict):
+            code = str(error.get("code") or "").strip()
+            message = str(error.get("message") or "").strip()
+            return f"{code}: {message}" if code else message
+        return str(body or "").strip()[:200]
+
+    async def solve(self, payload: dict[str, Any], *, attempts: int = 3) -> dict[str, Any]:
+        """Submit one solve, retrying only transport and 5xx failures.
+
+        A 4xx is the API saying the request itself is wrong - a bad gate, a
+        missing field, a revoked key. Retrying that fails identically, so it is
+        raised on the first attempt instead of burning the retry budget.
+        """
+        last: Exception | None = None
+        for attempt in range(max(1, attempts)):
+            try:
+                async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+                    response = await client.post(
+                        self.endpoint,
+                        json=payload,
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Accept": "application/json",
+                        },
+                    )
+                if response.status_code == 415:
+                    raise SolverError(
+                        "SolveGate requires a JSON body; the documented curl -d "
+                        "form encoding answers 415 Unsupported Media Type"
+                    )
+                if response.status_code >= 500:
+                    last = SolverError(f"SolveGate returned HTTP {response.status_code}")
+                elif response.status_code == 401:
+                    raise SolverError(
+                        f"SolveGate rejected the key: {self._describe_error(response.text)}"
+                    )
+                elif response.status_code >= 400:
+                    raise SolverError(
+                        f"SolveGate refused the task: {self._describe_error(response.text)}"
+                    )
+                else:
+                    return self._parse(response.text)
+            except httpx.HTTPError as exc:
+                last = exc
+            if attempt + 1 < max(1, attempts):
+                await asyncio.sleep(1.0 * (attempt + 1))
+        if isinstance(last, httpx.HTTPError):
+            raise last
+        raise last or SolverError("SolveGate could not accept the task")
+
+    @staticmethod
+    def _parse(body: str) -> dict[str, Any]:
+        try:
+            payload = json.loads(body)
+        except ValueError as exc:
+            raise SolverError(f"SolveGate returned unreadable JSON: {body[:200]}") from exc
+        if not isinstance(payload, dict):
+            raise SolverError("SolveGate returned an unexpected body")
+        status = str(payload.get("status") or "").strip().lower()
+        token = str(payload.get("token") or "").strip()
+        if status == "solved" and token:
+            return {
+                "token": token,
+                "gate": str(payload.get("gate") or ""),
+                "id": str(payload.get("id") or ""),
+                "solve_ms": payload.get("solve_ms"),
+                "expires_at": payload.get("expires_at"),
+                # A sandbox token is not a real solve, so the caller has to be
+                # able to tell the two apart before trusting one.
+                "sandbox": (
+                    str(payload.get("mode") or "").strip().lower() == "sandbox"
+                    or token.startswith("SANDBOX.")
+                ),
+                "billed": bool(payload.get("billed")),
+            }
+        detail = (
+            str(payload.get("error_message") or "").strip()
+            or str(payload.get("error_code") or "").strip()
+            or str(payload.get("status") or "").strip()
+        )
+        raise SolverError(
+            f"SolveGate did not solve the challenge: {detail or 'no token returned'}"
+        )
+
+
 class CaptchaSolverTool(Tool):
     """Solve a captcha through the configured CapSkip-compatible solver."""
 
@@ -228,8 +369,13 @@ class CaptchaSolverTool(Tool):
             "hcaptcha",
             "funcaptcha",
             "coordinates",
+            "waf",
         }
     )
+
+    #: Which gates the SolveGate provider accepts, and which CapSkip method
+    #: answers the same challenge. SolveGate covers only these two.
+    _SOLVEGATE_GATES = {"turnstile": "turnstile", "waf": "waf"}
     #: Longest window a single solve may occupy, so one call cannot pin a turn.
     _MAX_SOLVE_SECONDS = 600.0
 
@@ -243,7 +389,13 @@ class CaptchaSolverTool(Tool):
         poll_interval_seconds: float = 5.0,
         request_timeout_seconds: float = 30.0,
         max_image_bytes: int = 5_000_000,
+        provider: str = "capskip",
+        solvegate_base_url: str = "https://api.solvegate.io",
+        solvegate_api_key: str = "",
     ) -> None:
+        self.provider = str(provider or "capskip").strip().lower()
+        self.solvegate_base_url = solvegate_base_url
+        self.solvegate_api_key = solvegate_api_key
         self.base_url = base_url
         self.api_key = api_key
         self.workspace = workspace
@@ -258,7 +410,20 @@ class CaptchaSolverTool(Tool):
 
     @staticmethod
     def resolve_api_key(cfg: CaptchaSolverToolConfig) -> str:
-        """The literal configured key, or the value of ``api_key_env``."""
+        """The key for the configured provider: the literal, else the env var.
+
+        Each provider reads its own pair of fields, so pointing the tool at
+        SolveGate cannot accidentally pick up a CapSkip key that happens to be
+        set in the same environment.
+        """
+        if str(getattr(cfg, "provider", "capskip") or "capskip").strip().lower() == "solvegate":
+            literal = str(getattr(cfg, "solvegate_api_key", "") or "").strip()
+            if literal:
+                return literal
+            env_name = str(getattr(cfg, "solvegate_api_key_env", "") or "").strip()
+            if not env_name:
+                return ""
+            return os.getenv(env_name, "").strip()
         literal = str(getattr(cfg, "api_key", "") or "").strip()
         if literal:
             return literal
@@ -283,6 +448,9 @@ class CaptchaSolverTool(Tool):
             poll_interval_seconds=cfg.poll_interval_seconds,
             request_timeout_seconds=cfg.request_timeout_seconds,
             max_image_bytes=cfg.max_image_bytes,
+            provider=cfg.provider,
+            solvegate_base_url=cfg.solvegate_base_url,
+            solvegate_api_key=cls.resolve_api_key(cfg) if str(cfg.provider or "").strip().lower() == "solvegate" else "",
         )
 
     @property
@@ -293,13 +461,19 @@ class CaptchaSolverTool(Tool):
     def description(self) -> str:
         return (
             "Solve a captcha with the configured solver and return the token to submit. "
+            "Which challenges are answerable depends on the configured provider. The solvegate "
+            "provider answers gate=turnstile (a Cloudflare Turnstile widget) and gate=waf (a "
+            "Cloudflare WAF challenge) and nothing else; capsolve/capskip answers recaptcha, "
+            "hcaptcha, funcaptcha, turnstile, geetest, altcha, an image file and an image grid. "
             "Actions: balance, solve_image (a local image file, optionally steered with text), "
             "recaptcha (v2/v3/Enterprise), turnstile, hcaptcha, funcaptcha, geetest, altcha and "
             "coordinates (an image grid, answered with click coordinates). Every token action "
             "needs the sitekey the widget was rendered with and the url of the page it sits on; "
             "the human_browser tool's auto_captcha action detects both and calls this for you, so "
             "prefer that. Use this tool directly when you already have a sitekey, or for a "
-            "picture challenge you can point at a file. Coverage is limited to what the "
+            "picture challenge you can point at a file. A reply carrying \"sandbox\": true is a "
+            "test-mode token that no real site will accept - say so instead of treating the "
+            "challenge as passed. Coverage is limited to what the "
             "configured solver supports and what the balance allows: an unsupported type or an "
             "empty balance fails, and there is no local fallback model. Solving a captcha is a "
             "step on a page you are authorized to use, not a licence to circumvent access "
@@ -496,6 +670,67 @@ class CaptchaSolverTool(Tool):
 
         raise ValueError("unsupported captcha action")
 
+    async def _execute_solvegate(
+        self,
+        action: str,
+        *,
+        sitekey: str | None,
+        url: str | None,
+        action_name: str | None = None,
+        min_score: float | None = None,
+    ) -> Any:
+        """Answer a Cloudflare challenge through SolveGate.
+
+        SolveGate's ``gate`` is an enum of two, so an action it cannot serve is
+        refused here with the reason, rather than being sent and coming back as
+        a generic bad_request the model cannot act on.
+        """
+        gate = self._SOLVEGATE_GATES.get(action)
+        if gate is None:
+            raise ValueError(
+                f"the solvegate provider answers only "
+                f"{', '.join(sorted(self._SOLVEGATE_GATES))}; {action!r} is not one of them"
+            )
+        if not self.solvegate_api_key:
+            return ToolResult.error(
+                "Error: the solvegate provider has no API key configured"
+            )
+        payload: dict[str, Any] = {
+            "gate": gate,
+            "sitekey": self._require(sitekey, "sitekey", action),
+            # SolveGate requires the page url; it is metadata for the solve, not
+            # a request target, and the endpoint stays pinned to configuration.
+            "url": self._require(url, "url", action),
+        }
+        if str(action_name or "").strip():
+            payload["action"] = str(action_name).strip()
+        if gate == "turnstile" and min_score is not None:
+            payload["min_score"] = min(max(float(min_score), 0.1), 0.9)
+
+        solver = SolveGateSolver(
+            self.solvegate_base_url,
+            self.solvegate_api_key,
+            request_timeout=self.request_timeout_seconds,
+        )
+        started = time.monotonic()
+        result = await solver.solve(payload)
+        return json.dumps(
+            {
+                "captcha_type": action,
+                "provider": "solvegate",
+                "token": result["token"],
+                "sandbox": result["sandbox"],
+                "solve_ms": result.get("solve_ms"),
+                "expires_at": result.get("expires_at"),
+                "elapsed_seconds": round(time.monotonic() - started, 2),
+                "note": (
+                    "test-mode token; a real challenge will not accept it"
+                    if result["sandbox"]
+                    else "submit this token to the page"
+                ),
+            }
+        )
+
     async def execute(
         self,
         action: str,
@@ -520,8 +755,14 @@ class CaptchaSolverTool(Tool):
         action = str(action or "").strip().lower()
         if action not in self._ACTIONS:
             return ToolResult.error("Error: unsupported captcha action")
-        if not self.api_key:
+        if self.provider != "solvegate" and not self.api_key:
             return ToolResult.error("Error: the captcha solver has no API key configured")
+        if self.provider == "solvegate" and action not in self._SOLVEGATE_GATES:
+            return ToolResult.error(
+                "Error: the solvegate provider answers only "
+                + ", ".join(sorted(self._SOLVEGATE_GATES))
+                + f"; {action!r} is configured for a different provider"
+            )
 
         solver = CaptchaSolver(
             self.base_url,
@@ -529,6 +770,18 @@ class CaptchaSolverTool(Tool):
             request_timeout=self.request_timeout_seconds,
         )
         try:
+            if self.provider == "solvegate":
+                # Kept inside the try so a rejected key, a refused task or a
+                # missing field comes back as a tool error like every other
+                # failure, rather than escaping as an exception.
+                return await self._execute_solvegate(
+                    action,
+                    sitekey=sitekey,
+                    url=url,
+                    action_name=action_name,
+                    min_score=min_score,
+                )
+
             if action == "balance":
                 return json.dumps({"balance": await solver.balance()})
             fields = self._fields_for(
