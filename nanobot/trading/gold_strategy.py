@@ -46,6 +46,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 __all__ = [
+    "backtest_bars",
     "GOLD_PIP",
     "SL_PIPS",
     "TARGET_RR",
@@ -533,3 +534,278 @@ def plan(
         }
     out["ok"] = not out["violations"]
     return out
+
+
+# --------------------------------------------------------------------------- #
+# BACKTESTING -- the playbook over HISTORY, not over memory
+# --------------------------------------------------------------------------- #
+# WHY THIS EXISTS: every number in this module so far was arithmetic over prices
+# the caller supplied. Nothing here could answer "does this playbook actually
+# work?" -- and a strategy that has never been run over history is a belief, not
+# a method. The agent is asked to trade this playbook by default, so it must be
+# able to MEASURE it over the broker's own bars before risking anything.
+#
+# The rules are the document's own, applied bar by bar with no discretion and no
+# look-ahead beyond the next bar's OPEN, which is where the fill happens:
+#
+#   1. Bias  -- MA ribbon (9/21) AND the 50% range midpoint must agree.
+#   2. Signal-- pin bar / engulfing / inside-bar break on the last CLOSED bar.
+#   3. Level -- the entry must be AT a range sub-level (within a tolerance).
+#   4. Risk  -- a 20-pip stop and a 1:7 target from the FILL, per the document.
+#
+# What this does NOT model, stated up front so no result is read as more than it
+# is: no commission or swap, the spread as a flat pip cost rather than a live
+# quote, fills at the next bar's open (an intrabar tick could be better), and a
+# bar that touches both the stop and the target counted as a LOSS. Those all
+# bias the result DOWNWARD, which is the direction a backtest should err.
+_BACKTEST_SKIP_REASONS: tuple[str, ...] = (
+    "warmup",
+    "bias_none",
+    "no_signal",
+    "signal_against_bias",
+    "inside_bar_no_break",
+    "not_at_a_level",
+    "no_next_bar",
+)
+
+
+def backtest_bars(
+    bars: Sequence[Mapping[str, Any]],
+    *,
+    symbol: str = "XAUUSD",
+    digits: int | None = None,
+    sl_pips: float = SL_PIPS,
+    rr: float = TARGET_RR,
+    range_bars: int = 24,
+    ribbon_fast: int = 9,
+    ribbon_slow: int = 21,
+    entry_tolerance_pips: float = 2.0,
+    spread_pips: float = 0.0,
+    risk_money: float | None = None,
+    volume: float = 0.1,
+    max_bars_held: int | None = None,
+    sample_trades: int = 10,
+) -> dict[str, Any]:
+    """Run the Gold playbook over ``bars`` and return the measured result.
+
+    ``bars`` is the OHLCV list ``mt5_cli.py candles`` returns, oldest first. The
+    walk is strictly causal: every decision at bar ``i`` uses only bars up to and
+    including ``i``, and the fill is the OPEN of bar ``i + 1``.
+
+    ``range_bars`` is the lookback that defines the "session range" whose
+    sub-levels the document trades at. The guide does not fix a bar count, so it
+    is a parameter (default: the 24 bars before the signal) and it is returned in
+    ``params`` rather than hidden.
+    """
+    rows: list[dict[str, Any]] = []
+    for bar in bars or []:
+        try:
+            rows.append({
+                "time": bar.get("time"),
+                "open": float(bar["open"]),
+                "high": float(bar["high"]),
+                "low": float(bar["low"]),
+                "close": float(bar["close"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    pip = pip_size(symbol, digits)
+    cost_r = (float(spread_pips) / float(sl_pips)) if sl_pips else 0.0
+    warmup = max(int(ribbon_slow), int(range_bars)) + 1
+
+    skipped = dict.fromkeys(_BACKTEST_SKIP_REASONS, 0)
+    signals: dict[str, dict[str, int]] = {}
+    trades: list[dict[str, Any]] = []
+    equity_r = 0.0
+    peak_r = 0.0
+    max_dd_r = 0.0
+    open_at_end = 0
+    ambiguous = 0
+
+    for i in range(warmup, len(rows) - 1):
+        window = rows[max(0, i - int(range_bars) + 1): i + 1]
+        low = min(b["low"] for b in window)
+        high = max(b["high"] for b in window)
+        levels = level_prices(low, high)
+        ribbon = ma_ribbon(rows[max(0, i - int(ribbon_slow) + 1): i + 1], ribbon_fast, ribbon_slow)
+        verdict = bias(rows[i]["close"], ribbon["fast"], ribbon["slow"], levels["50%"])
+
+        sig = entry_signal([rows[i - 1], rows[i]])
+        names = list(sig["signals"])
+        side = sig["side"]
+        if not names and i >= 2 and inside_bar(rows[i - 2], rows[i - 1]):
+            # The document's third setup: an inside bar is a COIL, not a
+            # direction. The trade is the break of its mother bar (bars[i-2]),
+            # which can only happen on a later bar -- so the setup and the
+            # trigger are two bars apart and both are checked here.
+            if rows[i]["close"] > rows[i - 2]["high"]:
+                names, side = ["inside_bar_break"], "buy"
+            elif rows[i]["close"] < rows[i - 2]["low"]:
+                names, side = ["inside_bar_break"], "sell"
+        if not names:
+            skipped["no_signal"] += 1
+            continue
+        if side is None:
+            # An inside bar on the CURRENT bar: the coil exists, the break has
+            # not happened yet. Nothing to trade, and worth counting separately
+            # from "no setup at all".
+            skipped["inside_bar_no_break"] += 1
+            continue
+        if verdict["bias"] not in ("bullish", "bearish"):
+            skipped["bias_none"] += 1
+            continue
+        if (verdict["bias"] == "bullish") != (side == "buy"):
+            skipped["signal_against_bias"] += 1
+            continue
+
+        fill = rows[i + 1]["open"]
+        nearest, distance = None, None
+        for level_name, price in levels.items():
+            if level_name == "150%":
+                continue
+            gap = abs(fill - price)
+            if distance is None or gap < distance:
+                nearest, distance = level_name, gap
+        if distance is None or distance > entry_tolerance_pips * pip:
+            skipped["not_at_a_level"] += 1
+            continue
+
+        # The order is the document's: a 20-pip stop and a 1:7 target from the
+        # fill, built by the SAME `plan` the live path uses, so a backtest cannot
+        # quietly trade a different strategy than the one that gets executed.
+        order = plan(
+            side, fill, volume=volume, symbol=symbol, sl_pips=sl_pips, rr=rr, digits=digits,
+        )
+        stop, target = float(order["setup"]["sl"]), float(order["setup"]["tp"])
+        direction = 1.0 if side == "buy" else -1.0
+
+        outcome, exit_price, held, both = None, None, 0, False
+        for j in range(i + 1, len(rows)):
+            held += 1
+            bar = rows[j]
+            hit_stop = bar["low"] <= stop if direction > 0 else bar["high"] >= stop
+            hit_target = bar["high"] >= target if direction > 0 else bar["low"] <= target
+            if hit_stop and hit_target:
+                # Both levels inside one bar: the bar does not say which came
+                # first, so the trade is scored as the LOSS. Counting it as a win
+                # is the single most common way a backtest is made to look good.
+                both = True
+                outcome, exit_price = "loss", stop
+                break
+            if hit_stop:
+                outcome, exit_price = "loss", stop
+                break
+            if hit_target:
+                outcome, exit_price = "win", target
+                break
+            if max_bars_held is not None and held >= int(max_bars_held):
+                break
+        if outcome is None:
+            open_at_end += 1
+            continue
+        if both:
+            ambiguous += 1
+
+        gross_r = float(rr) if outcome == "win" else -1.0
+        net_r = gross_r - cost_r
+        equity_r += net_r
+        peak_r = max(peak_r, equity_r)
+        max_dd_r = max(max_dd_r, peak_r - equity_r)
+        for name in names:
+            bucket = signals.setdefault(name, {"trades": 0, "wins": 0, "net_r": 0.0})
+            bucket["trades"] += 1
+            bucket["wins"] += 1 if outcome == "win" else 0
+            bucket["net_r"] = round(bucket["net_r"] + net_r, 4)
+        trades.append({
+            "signal": names[0] if len(names) == 1 else "+".join(names),
+            "signals": names,
+            "side": side,
+            "bias": verdict["bias"],
+            "time": rows[i]["time"],
+            "level": nearest,
+            "fill": fill,
+            "sl": stop,
+            "tp": target,
+            "outcome": outcome,
+            "exit": exit_price,
+            "bars_held": held,
+            "net_r": round(net_r, 4),
+        })
+
+    wins = sum(1 for t in trades if t["outcome"] == "win")
+    losses = len(trades) - wins
+    total = len(trades)
+    gross_profit_r = sum(t["net_r"] for t in trades if t["net_r"] > 0)
+    gross_loss_r = sum(t["net_r"] for t in trades if t["net_r"] < 0)
+    net_r = round(equity_r, 4)
+    result: dict[str, Any] = {
+        "ok": True,
+        "strategy": "gold-20pip-1to7",
+        "symbol": symbol,
+        "pip": pip,
+        "params": {
+            "sl_pips": float(sl_pips),
+            "rr": float(rr),
+            "range_bars": int(range_bars),
+            "ribbon_fast": int(ribbon_fast),
+            "ribbon_slow": int(ribbon_slow),
+            "entry_tolerance_pips": float(entry_tolerance_pips),
+            "spread_pips": float(spread_pips),
+            "fill": "next bar's open",
+            "volume_per_trade": float(volume),
+            "risk_money_per_trade": risk_money,
+        },
+        "bars": len(rows),
+        "range_covered": {
+            "from": rows[0]["time"] if rows else None,
+            "to": rows[-1]["time"] if rows else None,
+        },
+        "trades": total,
+        "wins": wins,
+        "losses": losses,
+        "open_at_end": open_at_end,
+        "win_rate_pct": round(wins / total * 100.0, 2) if total else None,
+        "expectancy_r": round(net_r / total, 4) if total else None,
+        "net_r": net_r,
+        "gross_profit_r": round(gross_profit_r, 4),
+        "gross_loss_r": round(gross_loss_r, 4),
+        "max_drawdown_r": round(max_dd_r, 4),
+        "cost_per_trade_r": round(cost_r, 4),
+        "net_pips": round(net_r * float(sl_pips), 1),
+        "net_money": (
+            round(net_r * float(risk_money), 2) if risk_money is not None else None
+        ),
+        "ambiguous_bars": ambiguous,
+        "by_signal": signals,
+        "skipped": skipped,
+        "skipped_total": sum(skipped.values()),
+        "sample_trades": trades[: max(0, int(sample_trades))],
+        "last_trades": trades[-max(0, int(sample_trades)):] if total > int(sample_trades) else [],
+    }
+    if total == 0:
+        result["ok"] = False
+        result["note"] = (
+            "No trade met every rule in this window. That is a RESULT, not a "
+            "failure: the document's filter (ribbon and midpoint agreeing, a "
+            "signal, and the entry AT a level) is meant to reject most bars. Read "
+            "`skipped` to see which rule did the rejecting."
+        )
+    else:
+        result["verdict"] = (
+            f"{total} trades, {wins} wins / {losses} losses "
+            f"({result['win_rate_pct']}%), expectancy {result['expectancy_r']}R, "
+            f"net {net_r}R over {len(rows)} bars. Break-even at 1:{float(rr):g} needs "
+            f"{round(100.0 / (1.0 + float(rr)), 2)}% wins; "
+            + ("the playbook is above that line in this window."
+               if (result["win_rate_pct"] or 0) > 100.0 / (1.0 + float(rr))
+               else "the playbook is BELOW that line in this window.")
+        )
+        result["note"] = (
+            "Measured over the broker's own bars, fills at the next bar's open, a "
+            "flat spread cost per trade, and any bar touching both the stop and "
+            "the target scored as a loss -- so these numbers are biased downward. "
+            "A window this small is evidence about the RULES, not a forecast: run "
+            "it on several symbols and windows before sizing anything on it."
+        )
+    return result

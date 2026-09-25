@@ -479,3 +479,75 @@ async def test_a_model_wait_reaches_the_progress_hook_as_thinking():
     assert not calls[0].get("tool_hint"), "the model wait is not a tool call"
     assert "waiting for the model" in calls[0]["content"]
     assert "2m10s" in calls[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_watching_tool_narrates_its_observation_instead_of_just_waiting():
+    """The heartbeat carries what the tool SAW, when the tool is watching something.
+
+    MEASURED COMPLAINT (2026-09-25): the user asked to SEE the agent watch a live
+    trade, and got "I am monitoring your trade" -- a claim they cannot check. A
+    generic "still running (24s)" has the same defect one level down: it cannot be
+    told apart from waiting on a download. A tool that observes publishes what it
+    last read (``nanobot.utils.live_label``) and the progress line carries that
+    instead.
+    """
+    from nanobot.agent.hook import CompositeHook
+    from nanobot.agent.progress_hook import AgentProgressHook
+    from nanobot.utils.live_label import clear_live_label, publish_live_label
+
+    calls: list[dict] = []
+
+    async def on_progress(content, **kwargs):
+        calls.append({"content": content, **kwargs})
+
+    clear_live_label("mt5_sandbox")
+    publish_live_label(
+        "mt5_sandbox", "12:04:31 EYES ON: #777 EURUSD buy 0.1 - bid 1.1419, +0.42R"
+    )
+    try:
+        await CompositeHook([AgentProgressHook(on_progress=on_progress)]).on_tool_heartbeat(
+            AgentHookContext(iteration=0, messages=[]),
+            ToolCallRequest(id="c1", name="mt5_sandbox", arguments={"action": "watch"}),
+            24.0,
+        )
+    finally:
+        clear_live_label("mt5_sandbox")
+
+    assert len(calls) == 1
+    assert calls[0]["tool_hint"] is True
+    assert "bid 1.1419" in calls[0]["content"]
+    assert "still running" not in calls[0]["content"]
+    # The elapsed time stays on the end. It is what stops the UI from
+    # de-duplicating an unchanged string, so a stable observation ("guard live")
+    # keeps advancing instead of freezing the line.
+    assert calls[0]["content"].endswith("24s in")
+
+
+@pytest.mark.asyncio
+async def test_a_stale_label_falls_back_to_the_generic_hint():
+    """The label must expire, or a crashed tool narrates a market forever."""
+    from nanobot.agent.hook import CompositeHook
+    from nanobot.agent.progress_hook import AgentProgressHook
+    from nanobot.utils.live_label import clear_live_label, live_label_for, publish_live_label
+
+    calls: list[dict] = []
+
+    async def on_progress(content, **kwargs):
+        calls.append({"content": content, **kwargs})
+
+    clear_live_label("mt5_sandbox")
+    publish_live_label("mt5_sandbox", "bid 1.1419")
+    try:
+        assert live_label_for("mt5_sandbox") is not None
+    finally:
+        clear_live_label("mt5_sandbox")
+
+    await CompositeHook([AgentProgressHook(on_progress=on_progress)]).on_tool_heartbeat(
+        AgentHookContext(iteration=0, messages=[]),
+        ToolCallRequest(id="c1", name="mt5_sandbox", arguments={"action": "watch"}),
+        24.0,
+    )
+
+    assert len(calls) == 1
+    assert "still running" in calls[0]["content"]

@@ -340,3 +340,134 @@ def test_plan_refuses_an_impossible_side():
 def test_the_plan_is_json_serialisable():
     """It is returned through a tool result; a set or a Decimal would break it."""
     assert json.loads(json.dumps(gs.plan(side="buy", entry=4285.0, volume=0.1)))
+
+
+# ---------------------------------------------------------------------------
+# Backtesting: the playbook measured over history, not believed
+# ---------------------------------------------------------------------------
+def _playbook_bars(*, after=frozenset(), bars_after=5, step=4.0):
+    """A series the playbook MUST trade: a coil at the range high, then a run.
+
+    Built so the entry is unambiguous rather than lucky: a steady uptrend puts
+    the bias bullish and the price on the range's 100% level, a mother bar is
+    followed by an inside bar (the guide's coil), and the bar after that closes
+    through the mother's high. ``after`` names the bars of the move that should
+    be poisoned -- "both" makes one bar span the stop AND the target.
+    """
+    bars: list[dict[str, float]] = []
+    price = 4000.0
+    for i in range(30):
+        price += 1.0
+        bars.append({"time": i, "open": price - 1.0, "high": price + 0.05,
+                     "low": price - 1.1, "close": price})
+    bars.append({"time": 30, "open": 4030.0, "high": 4035.0, "low": 4029.0, "close": 4034.0})
+    bars.append({"time": 31, "open": 4031.0, "high": 4033.0, "low": 4030.0, "close": 4032.0})
+    bars.append({"time": 32, "open": 4032.0, "high": 4036.0, "low": 4031.5, "close": 4035.5})
+    run = 4036.0
+    for i in range(bars_after):
+        nxt = run + step
+        low, high = run, nxt
+        if "both" in after and i == 1:
+            # A single bar that reaches the target AND the stop: the bar does not
+            # say which came first.
+            low, high = 4030.0, 4060.0
+        bars.append({"time": 33 + i, "open": run, "high": high, "low": low, "close": nxt})
+        run = nxt
+    return bars
+
+
+def test_backtest_trades_the_playbook_and_reaches_the_target():
+    """The measurement exists so a playbook can be checked, not asserted.
+
+    Every rule has to line up for this trade to exist at all -- ribbon and
+    midpoint agreeing, a coil broken, the entry AT the range high -- and the
+    result has to carry the arithmetic a caller would otherwise redo by hand.
+    """
+    result = gs.backtest_bars(_playbook_bars(), risk_money=100.0)
+
+    assert result["ok"] is True
+    assert result["trades"] == 1
+    assert result["wins"] == 1 and result["losses"] == 0
+    assert result["win_rate_pct"] == 100.0
+    trade = result["sample_trades"][0]
+    assert trade["signal"] == "inside_bar_break"
+    assert trade["side"] == "buy"
+    assert trade["bias"] == "bullish"
+    assert trade["level"] == "100%"          # entered AT a range level
+    assert trade["outcome"] == "win"
+    # 20 pips of stop and 7x of target, from the fill -- the playbook's own
+    # numbers, not a default that drifted.
+    assert trade["fill"] - trade["sl"] == pytest.approx(2.00)
+    assert trade["tp"] - trade["fill"] == pytest.approx(14.00)
+    assert result["expectancy_r"] == 7.0
+    assert result["net_r"] == pytest.approx(7.0)
+    assert result["net_money"] == pytest.approx(700.0)
+    assert "1:7 needs 12.5% wins" in result["verdict"]
+
+
+def test_backtest_charges_the_spread_and_says_so():
+    """A result without its costs is a sales pitch, not a measurement."""
+    free = gs.backtest_bars(_playbook_bars())
+    charged = gs.backtest_bars(_playbook_bars(), spread_pips=1.0)
+
+    assert free["net_r"] == pytest.approx(7.0)
+    # One pip of spread against a 20-pip stop is 0.05R per trade, so the win is
+    # 6.95R -- a tenth as much as the target claims, which is the point.
+    assert charged["net_r"] == pytest.approx(6.95)
+    assert charged["cost_per_trade_r"] == pytest.approx(0.05)
+    assert free["params"]["spread_pips"] == 0.0
+
+
+def test_backtest_scores_a_bar_that_touches_both_levels_as_a_loss():
+    """The single most common way a backtest is made to look good.
+
+    When one bar reaches the stop and the target, the bar does not say which came
+    first. Scoring it as a win is a choice; scoring it as a loss is the
+    conservative one, and the trade is counted separately in `ambiguous_bars` so
+    the caller can see how much of the result rests on that choice.
+    """
+    result = gs.backtest_bars(
+        _playbook_bars(after=frozenset({"both"})), spread_pips=0.0
+    )
+
+    assert result["trades"] == 1
+    assert result["sample_trades"][0]["outcome"] == "loss"
+    assert result["ambiguous_bars"] == 1
+    assert result["net_r"] == pytest.approx(-1.0)
+    assert result["wins"] == 0
+
+
+def test_backtest_says_which_rule_rejected_each_bar():
+    """`trades: 0` is a result, and the reason has to be readable.
+
+    The guide's filter is meant to reject most bars, so "nothing traded" without
+    the per-rule counts is indistinguishable from a broken backtest.
+    """
+    flat = [
+        {"time": i, "open": 4000.0, "high": 4000.5, "low": 3999.5, "close": 4000.0}
+        for i in range(80)
+    ]
+    result = gs.backtest_bars(flat)
+
+    assert result["ok"] is False
+    assert result["trades"] == 0
+    assert result["expectancy_r"] is None
+    assert result["skipped_total"] > 0
+    assert sum(result["skipped"].values()) == result["skipped_total"]
+    assert "RESULT, not a" in result["note"]
+
+
+def test_backtest_keeps_the_money_arithmetic_in_the_played_pip():
+    """Every distance is in Gold pips (0.10), not the quote's points (0.01).
+
+    The 10x trap this module exists to prevent: measured against a 4000-wide
+    series, a 20-pip stop is $2.00 of price. A backtest that read `digits=2` as
+    the pip would call it $0.20, stop out on the next bar, and report a strategy
+    that cannot work.
+    """
+    result = gs.backtest_bars(_playbook_bars())
+
+    assert result["pip"] == pytest.approx(0.10)
+    assert result["net_pips"] == pytest.approx(140.0)   # 7R of a 20-pip stop
+    assert result["params"]["fill"] == "next bar's open"
+    assert result["bars"] == len(_playbook_bars())

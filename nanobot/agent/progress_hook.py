@@ -11,6 +11,7 @@ from loguru import logger
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.providers.base import ToolCallRequest
 from nanobot.utils.helpers import IncrementalThinkExtractor, strip_think
+from nanobot.utils.live_label import live_label_for
 from nanobot.utils.progress_events import (
     build_tool_event_finish_payloads,
     build_tool_event_start_payload,
@@ -217,22 +218,45 @@ class AgentProgressHook(AgentHook):
         tool_call: Any,
         elapsed_s: float,
     ) -> None:
-        """Say that a blocked tool is still running, and for how long.
+        """Say what a blocked tool is doing, and for how long.
 
-        Reuses the tool-hint channel rather than inventing a new event type, so
-        every surface that already renders "checking ..." renders this too and
+        Two shapes, in order of preference:
+
+        * A tool that OBSERVES something over time publishes a live label (see
+          ``nanobot.utils.live_label``). When one is fresh we send that instead
+          of the generic hint, because "watching XAUUSD - bid 4167.30, +0.42R"
+          is the thing the user asked to see, and "still running" tells them
+          nothing except that they are still waiting. The label is always a
+          statement about the LAST frame the tool actually read, never a
+          prediction.
+        * Every other tool gets the hint it always got: "checking X - still
+          running (24s)".
+
+        Both reuse the tool-hint channel rather than inventing a new event type,
+        so every surface that already renders "checking ..." renders this too and
         nothing has to learn a new message shape. The hint is re-sent with the
         elapsed time appended, which is the part that makes it progress: an
         identical string repeated would be deduped by the UI and would look
-        exactly as frozen as saying nothing.
+        exactly as frozen as saying nothing. That is also why the elapsed time
+        stays on a live label -- without it, a tool whose observation is stable
+        across beats ("guard live, +0.10R") would render as a frozen line.
 
         Failure here is already handled by the caller (the runner swallows it), so
         this stays deliberately small.
         """
         if not self._on_progress:
             return
-        base = self._tool_hint([tool_call])
         name = getattr(tool_call, "name", None)
+        live = live_label_for(name)
+        if live:
+            await invoke_on_progress(
+                self._on_progress,
+                f"{live} - {_format_elapsed(elapsed_s)} in",
+                tool_hint=True,
+                usage=self._live_usage(context),
+            )
+            return
+        base = self._tool_hint([tool_call])
         label = self._strip_think(base) or (name if isinstance(name, str) and name else "tool")
         await invoke_on_progress(
             self._on_progress,

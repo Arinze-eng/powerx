@@ -49,6 +49,7 @@ from loguru import logger
 
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import ToolContext
+from nanobot.utils.live_label import clear_live_label, live_label_for, publish_live_label
 
 #: Raw GitHub base for the two sandbox-side scripts. The sandbox has internet
 #: access (the Novita tool creates boxes with ``allow_internet_access=True``), so
@@ -91,6 +92,32 @@ _BOOTSTRAP_LOG = f"{_MT5_HOME}/bin/.bootstrap.log"
 _MAX_SANDBOX_COMMAND_TIMEOUT = 900
 _INSTALL_COMMAND_TIMEOUT = 120
 
+#: The name this tool publishes its live label under. The progress line knows a
+#: tool by name, so the two spellings have to agree exactly.
+_LIVE_LABEL_NAME = "mt5_sandbox"
+
+#: How long ONE frame of a visible watch covers, when the caller asked to be
+#: shown the watching but did not name a cadence.
+WATCH_FRAME_SECONDS = 15.0
+
+#: The shortest a frame may be. Each frame costs a whole sandbox command (the
+#: CLI bootstrap plus a Wine-side read of the terminal), so a faster cadence buys
+#: round trips rather than information -- and shows the user the same price twice.
+WATCH_MIN_FRAME_SECONDS = 5.0
+
+#: Wall-clock ceiling for ONE framed watch call. The sandbox caps a command at
+#: 900 s and the CLI caps a single watch at 90 s, but a FRAMED watch is a
+#: sequence of those: without a total budget, ``wait_seconds=90,
+#: pulse_seconds=5`` would spend ten minutes inside one tool call. 100 s keeps
+#: the whole call inside the envelope of a single long watch, so nothing
+#: downstream has to learn a new timeout.
+WATCH_VISIBLE_BUDGET_S = 100.0
+
+#: Never spend more than this many sandbox commands on one watch call. A cap on
+#: the COUNT as well as on the clock, so a fast cadence cannot turn one call into
+#: an unbounded burst of commands if a segment ever returns instantly.
+WATCH_MAX_FRAMES = 8
+
 #: Actions that move money. Blocked unless explicitly enabled.
 #:
 #: ``modify`` belongs here because it changes where a LIVE position exits, and
@@ -117,6 +144,12 @@ _READ_ONLY_ACTIONS = frozenset(
     {
         "status", "doctor", "account", "quote", "candles", "positions", "orders",
         "history", "symbol", "symbols", "logs", "experts", "run",
+        # `backtest` reads history and computes over it. It places nothing, moves
+        # nothing and needs no terminal state beyond the bars themselves, so it
+        # must never be gated behind the trading opt-in: measuring whether a
+        # strategy works is precisely what a caller should do BEFORE enabling
+        # live trading, not after.
+        "backtest",
         # `watch` reads positions, prices and the guard's files and changes
         # nothing, so it must never be gated behind the trading opt-in: the
         # caller most in need of watching a live trade is the one who has just
@@ -192,6 +225,9 @@ _TIMEOUTS: dict[str, int] = {
     # file, so neither is anywhere near the ceiling.
     "risk": 120,
     "limits": 120,
+    # `backtest` is ONE `candles` fetch (a few thousand bars is a single IPC
+    # read) plus arithmetic on the host, so it lands far inside the ceiling.
+    "backtest": 120,
 }
 _DEFAULT_TIMEOUT = 120
 
@@ -342,11 +378,12 @@ def _sh(value: Any) -> str:
 #: into the wrong one of, these two sets.
 _FLOAT_FIELDS: frozenset[str] = frozenset(
     {
-        "activate_at", "entry", "equity", "exit_at", "max_daily_loss_money",
-        "max_total_risk_money", "max_total_risk_pct", "poll_seconds", "price",
-        "range_high", "range_low", "risk_money", "risk_pct", "rr", "sl",
-        "sl_pips", "spread", "tp", "trail_distance", "trigger_price",
-        "volume", "wait_seconds", "when_r",
+        "activate_at", "entry", "entry_tolerance_pips", "equity", "exit_at",
+        "max_daily_loss_money", "max_total_risk_money", "max_total_risk_pct",
+        "poll_seconds", "price", "pulse_seconds", "range_high", "range_low",
+        "risk_money", "risk_pct", "rr", "sl", "sl_pips", "spread",
+        "spread_pips", "tp",
+        "trail_distance", "trigger_price", "volume", "wait_seconds", "when_r",
     }
 )
 _INT_FIELDS: frozenset[str] = frozenset(
@@ -356,8 +393,8 @@ _INT_FIELDS: frozenset[str] = frozenset(
         # compares these sets against `properties`, which is what keeps a nested
         # keyword from sneaking in again.
         "count", "days", "deviation", "interval_ms", "limit", "lines",
-        "login", "max_positions", "max_seconds", "splits", "ticket", "timeout",
-        "wait",
+        "login", "max_bars_held", "max_positions", "max_seconds", "range_bars",
+        "splits", "ticket", "timeout", "wait",
     }
 )
 _NUMERIC_FIELDS: frozenset[str] = _FLOAT_FIELDS | _INT_FIELDS
@@ -986,6 +1023,38 @@ def _fetch_page_text(url: str, timeout: float = 25.0) -> str:
         return ""
 
 
+def _with_bootstrap(command: str) -> str:
+    """Wrap a CLI invocation in the bootstrap and the stderr tail.
+
+    One place, because two callers need exactly this and a second copy would
+    drift: the framed watch (``_pulse_watch``) builds a command per frame and
+    only the FIRST of them carries the bootstrap -- that is what fetches the CLI
+    into a cold box, and re-fetching it before every frame would spend the
+    frame budget on curl.
+    """
+    return (
+        f"{bootstrap_command()} >/dev/null 2>{_BOOTSTRAP_LOG} || true; "
+        f"{command}; tail -c 400 {_BOOTSTRAP_LOG} 1>&2"
+    )
+
+
+def _frames_report(frames: list[dict[str, Any]]) -> dict[str, Any]:
+    """The frames a watch SHOWED, so the model knows the user has already seen them."""
+    return {
+        "count": len(frames),
+        "shown_to_user": True,
+        "frames": frames,
+        "note": (
+            f"{len(frames)} frame(s) of this watch were shown to the user on the "
+            "progress line as they arrived -- those frames ARE the visible watch. "
+            "Print only the newest headline, or none at all: the user has already "
+            "seen them. Never summarise this as 'I am monitoring the trade', "
+            "because the frames are the monitoring. To keep the timeline going, "
+            "call watch again with the same watch_session."
+        ),
+    }
+
+
 def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
     """Translate tool kwargs into an ``mt5_cli.py`` invocation."""
     # Coerce once, here, so no branch below has to remember that a model may send
@@ -1073,6 +1142,21 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
             "--timeframe", _sh(kwargs.get("timeframe") or "M15"),
             "--count", str(int(kwargs.get("count") or 200)),
         ]
+    elif action == "backtest":
+        # A backtest sends NO backtest command: the only thing it needs from the
+        # sandbox is the bars, and the strategy arithmetic runs on the host (see
+        # `_backtest`). The nanobot package is not inside the sandbox -- only
+        # `mt5_cli.py` is fetched there -- so a strategy engine cannot run under
+        # Wine, and one `candles` fetch is the whole sandbox side of this.
+        # Delegating means `dry_run` shows exactly the command that would run.
+        return build_cli_command(
+            "candles",
+            {
+                "symbol": kwargs.get("symbol") or "",
+                "timeframe": kwargs.get("timeframe") or "M15",
+                "count": int(kwargs.get("count") or 3000),
+            },
+        )
     elif action == "history":
         parts += ["--days", str(int(kwargs.get("days") or 7))]
     elif action == "symbols":
@@ -1239,6 +1323,12 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
                 "--wait-seconds", str(wait),
                 "--poll-seconds", str(float(kwargs.get("poll_seconds") or 1.0)),
             ]
+        # The VISIBLE cadence. A watch whose only output is a sentence saying it
+        # is watching shows the user nothing: the frame has to come back often
+        # enough to be seen arriving, and `pulse_seconds` is the cap that makes
+        # that true even when the caller asked for a 90 s wait.
+        if float(kwargs.get("pulse_seconds") or 0.0) > 0:
+            parts += ["--pulse-seconds", str(float(kwargs["pulse_seconds"]))]
         parts += ["--lines", str(int(kwargs.get("lines") or 20))]
         # One observation, many calls. Passed through unchanged so consecutive
         # watches fold into a single timeline instead of reporting a fresh
@@ -1420,6 +1510,24 @@ class MT5SandboxTool(Tool):
             "(latency_ms), and use guard_action=\"status\" only when asked whether "
             "the exit is still armed. A position you leave with no SL/TP has no "
             "server-side exit at all, so offer to arm one. "
+            "BACKTESTING (action='backtest') -- MEASURE THE PLAYBOOK INSTEAD OF "
+            "BELIEVING IT. It reads the broker's own bars (one `candles` fetch), "
+            "replays the playbook bar by bar -- ribbon AND 50% midpoint must agree, "
+            "a pin bar / engulfing / inside-bar break, the entry AT a range level, a "
+            "20-pip stop and a 1:7 target -- and returns the measurement: trades, "
+            "win rate, expectancy in R, net R, max drawdown, a breakdown per signal, "
+            "and counts of which rule rejected each bar it skipped. Fill is the next "
+            "bar's OPEN, any bar that touches both the stop and the target is scored "
+            "as a LOSS, and no spread is charged unless spread_pips is passed, so the "
+            "result is biased DOWNWARD -- say that when you report it, and pass the "
+            "live spread from action='quote' when you can. The headline number to "
+            "read is win_rate_pct against the break-even rate 1/(1+rr) = 12.5% at "
+            "1:7. Report net_r and max_drawdown_r, never the win rate alone: a 1:7 "
+            "playbook wins a minority of its trades by construction. Use it whenever "
+            "asked whether the strategy works, when choosing between symbols or "
+            "timeframes, and BEFORE sizing a live trade on a rule you have not "
+            "measured. It reads history only: it places nothing, arms nothing, and "
+            "works with trading disabled."
             "DEFAULT PLAYBOOK (Gold, and the default for every trade until told "
             "otherwise): 20-pip stop, 1:7 reward-to-risk, entered AT a range level. "
             "Call action='plan' with entry/side/volume/equity BEFORE order: it returns "
@@ -1457,16 +1565,28 @@ class MT5SandboxTool(Tool):
             "against account equity. Both need 'sl'. "
             "POLLING A LIVE TRADE -- do it, and keep doing it: while a position is "
             "open you watch it in REAL TIME instead of setting a cron and walking "
-            "away, and you think between calls. Loop action='watch' with "
-            "wait_seconds=90 and ALWAYS pass watch_session=<one name for this "
+            "away, and you think between calls. SHOW THE WATCH, NEVER ANNOUNCE IT: "
+            "the user does not want to be TOLD they are being watched, they want to "
+            "SEE it, so every watch call returns watch_live.headline plus "
+            "timestamped watch_live.lines, and with pulse_seconds set every frame is "
+            "published to the user's progress line AS IT IS READ -- they watch the "
+            "bid, the R and the guard move while the call is still blocking, with "
+            "nothing for you to print. 'I am monitoring your trade' with no frame "
+            "behind it is the failure this field exists to remove; the frames moving "
+            "are the proof. So loop action='watch' with wait_seconds=90 AND "
+            "pulse_seconds=15 -- the budget and the cadence: one call, ~6 frames "
+            "shown, instead of one silence the user has only your word for. Print the "
+            "newest headline only when the frame says something new, and ALWAYS pass watch_session=<one name for this "
             "trade>. Each call returns the moment something happens (a rule fires, a "
             "close is refused, a level is touched and reverted, the watcher dies, the "
             "position set changes), and session.price_path_total plus "
             "session.since_last_call carry the WHOLE trade across calls -- so call "
             "after call is one continuous observation, not unrelated snapshots. A "
             "watch that returns watched.timed_out=true is a normal result: nothing "
-            "happened in that 90 s, the trade is still open, and the right next move "
-            "is to watch again. Stop looping only when the position is closed, the "
+            "happened in that frame, the trade is still open, and the right next move "
+            "is to watch again. Do not reply with a status sentence instead of a frame, "
+            "and never narrate the mechanism ('I am watching and will report'): "
+            "watching is SHOWN, not described. Stop looping only when the position is closed, the "
             "user says stop, or you have something to report to the user. Cron and "
             "scheduled tasks are for things that must happen with nobody watching; "
             "a trade you are following is not one of them. YOU ARE THE MANAGEMENT: "
@@ -1597,7 +1717,7 @@ class MT5SandboxTool(Tool):
                 "trigger_op": {"type": "string", "enum": [">=", "<="], "description": "action=guard (arm): \">=\" fires at or above the level, \"<=\" at or below. Omit it and the direction is inferred from the live price."},
                 "trigger_side": {"type": "string", "enum": ["mid", "bid", "ask"], "description": "action=guard (arm): which price is compared to the level (default mid = (bid+ask)/2, which is what \"the price\" usually means)."},
                 "interval_ms": {"type": "integer", "description": "action=guard (arm): how often the watcher reads the tick stream, in milliseconds (default 100). Lowering it does NOT make the guard see more of the market: MEASURED 2026-09-23, one symbol_info_tick call inside Wine costs 334.7 us (~2988/s is the absolute ceiling for a Python poll) and each call returns ONE tick, while the recorded feed carries several a second at its quietest (MEASURED, same day: 282 rows over 60.5 s; another reading counted 618.85 tick/s -- the rate is bursty). The watcher already reads every tick that was RECORDED since the last loop and reports the one that truly crossed, so the interval is how often it decides, not how much it sees."},
-                "wait_seconds": {"type": "number", "description": "BLOCKS instead of returning a snapshot, and is how a long-running thing is WATCHED rather than assumed. action=watch: watch the live trade for this many seconds and return the moment something happens (a rule fires, a close is refused, a level is touched and reverted, the watcher stops, the set of open positions changes). action=guard, guard_action=status: same, on the guard. action=status: watch the INSTALL and return the moment it moves (the stage changes, the installer writes more output, or the installer process exits); a finished install returns immediately. Capped at 90 s on every path, so the whole command still fits the 120 s ceiling for one sandbox command. Use it to actually observe an install/exit/live trade instead of reporting that it is 'monitoring' -- every answer carries watched.timed_out and watched.observed_event, so 'nothing happened yet' is never read as 'something happened'."},
+                "wait_seconds": {"type": "number", "description": "BLOCKS instead of returning a snapshot, and is how a long-running thing is WATCHED rather than assumed. action=watch: watch the live trade for this many seconds and return the moment something happens (a rule fires, a close is refused, a level is touched and reverted, the watcher stops, the set of open positions changes). WHILE A TRADE IS LIVE, pass 90 with pulse_seconds=15: wait_seconds is the BUDGET for the watch and pulse_seconds is the cadence inside it, so one call shows the user ~6 frames instead of one 90-second silence in which they see nothing and have only your word for it. Each frame is published to the progress line as it is read (watch_frames.shown_to_user=true) and also returned as watch_live with a headline and timestamped lines. action=guard, guard_action=status: same, on the guard. action=status: watch the INSTALL and return the moment it moves (the stage changes, the installer writes more output, or the installer process exits); a finished install returns immediately. Capped at 90 s on every path, so the whole command still fits the 120 s ceiling for one sandbox command. Use it to actually observe an install/exit/live trade instead of reporting that it is 'monitoring' -- every answer carries watched.timed_out and watched.observed_event, so 'nothing happened yet' is never read as 'something happened'."},
                 "poll_seconds": {"type": "number", "description": "action=watch/guard/status with wait_seconds: how often to sample while waiting (default 1 s; 2 s for status)."},
                 "max_seconds": {"type": "integer", "description": "action=guard (arm/ensure): how long the guard may keep watching before it stops itself. Omit it (the default) and it holds the level for as long as it takes -- there is no time limit. Only set it for a deliberately bounded run; a guard that stops is reported by guard status as alert=guard_not_running, never as protection."},
                 "rule": {"type": "object", "description": "action=guard (arm): advanced -- an explicit rule object instead of trigger_* fields. Normally omit it and pass symbol/trigger_price/trigger_op."},
@@ -1615,11 +1735,16 @@ class MT5SandboxTool(Tool):
                 "dry_run": {"type": "boolean", "description": "For order/close: validate inputs and report the planned request without sending."},
                 "entry": {"type": "number", "description": "action=plan: the entry price to build the stop and target from. The playbook's stop and target are derived from it -- 20 pips below a buy, 140 above -- so the same entry always gives the same plan."},
                 "equity": {"type": "number", "description": "action=plan: account equity, so the plan can report the risk in percent of the account instead of only in dollars. Read it from action=account (equity, not balance)."},
-                "sl_pips": {"type": "number", "description": "action=plan: stop distance in pips. Default 20, which is the playbook's Gold stop and should not be changed without saying why."},
-                "rr": {"type": "number", "description": "action=plan: reward-to-risk target. Default 7 (the playbook's 20-pip stop / 140-pip target). Lower it only deliberately: it is the whole source of the edge in a 20-pip-stop strategy, which loses most of the time by construction."},
+                "sl_pips": {"type": "number", "description": "action=plan: stop distance in pips. Default 20, which is the playbook's Gold stop and should not be changed without saying why. action=backtest uses it too this is also the unit every result is expressed in (net_pips), so changing it changes what the measurement means, not just how it is displayed."},
+                "rr": {"type": "number", "description": "action=plan: reward-to-risk target. Default 7 (the playbook's 20-pip stop / 140-pip target). Action=backtest scores with it as well. Lower it only deliberately: it is the whole source of the edge in a 20-pip-stop strategy, which loses most of the time by construction. In a backtest, the break-even win rate is 1/(1+rr), and it is returned next to the measured one so the two can be compared rather than assumed."},
                 "range_low": {"type": "number", "description": "action=plan: the low of the session range. With range_high it adds the playbook's range sub-levels (25/50/62.5/75/87.5/100/150%) and says which level the entry sits on -- the strategy enters AT a level, so an entry between levels is reported as a violation."},
                 "range_high": {"type": "number", "description": "action=plan: the high of the session range. See range_low."},
                 "spread": {"type": "number", "description": "action=plan: live spread in price, from action=quote. A 20-pip Gold stop is only ~10x a typical spread, so the plan flags a spread that eats more than a quarter of the stop."},
+                "spread_pips": {"type": "number", "description": "action=backtest: charge this many pips per trade as the cost of the round trip. Strongly recommended: on Gold the spread is roughly one tenth of a 20-pip stop, so leaving it out scores every trade ~0.05R too well. Read the live spread with action='quote' and pass it here (spread / 0.10 for Gold). With none passed, the result says so in spread_note."},
+                "range_bars": {"type": "integer", "description": "action=backtest: how many bars the 'session range' is measured over, which is what the sub-levels (25/50/62.5/75/87.5/100%) are projected from. Default 24. The guide fixes the DIVISOR (4.68) but not the lookback, so this is the one trading parameter of theirs the backtest has to choose -- it is returned in params and is worth sweeping."},
+                "entry_tolerance_pips": {"type": "number", "description": "action=backtest: how close to a range level an entry must be to count as 'AT a level'. Default 2 pips, per the guide's own wording. Widen it and the backtest will find more trades than the strategy actually takes."},
+                "max_bars_held": {"type": "integer", "description": "action=backtest: close a trade that has not hit its stop or target after this many bars and count it as unresolved (excluded, never scored as a win). Leave it out to hold every trade until one of the levels is hit, which is what the live playbook does."},
+                "pulse_seconds": {"type": "number", "description": "action=watch: the CADENCE at which the user is shown the watching. Pass 15 while a trade is live: the call then runs as a framed sequence — several short watches back to back — and each frame is published to the user's progress line THE MOMENT it is read, so they watch the bid, the R and the guard move while the call is still running. wait_seconds is the budget for the whole sequence and pulse_seconds is the cadence inside it, so wait_seconds=90, pulse_seconds=15 is 90 seconds of watching shown in ~15-second frames. The returned watch_frames lists the frames already shown (shown_to_user=true), so do NOT repeat them: print the headline only if it says something the frames did not. Never announce that you are monitoring without a frame — that is exactly the behaviour this field exists to remove."},
                 "splits": {"type": "integer", "description": "action=split: how many positions to open (2..50, default 10). SPLIT TRADING -- one idea as N equal tickets at one price instead of one big position: same direction, same stop, and the SAME TOTAL RISK, but the exits stop being all-or-nothing. It is how you take 3 off into a run and leave 7 working. It is NOT a grid: it fires once, at one price, with one stop, and never adds tickets as the price goes against you."},
                 "group": {"type": "string", "description": "action=split: a label for the tickets so the set can be addressed later (action=close with group/count). action=close: close the tickets of this split group instead of one ticket."},
                 "stop_on_failure": {"type": "boolean", "description": "action=split: stop sending tickets after the first rejection (default: try them all and report which filled). Either way a partial split is reported as alert=split_incomplete, never as a filled position."},
@@ -1636,12 +1761,210 @@ class MT5SandboxTool(Tool):
             "required": ["action"],
         }
 
+    async def _pulse_watch(
+        self,
+        sandbox: Any,
+        kwargs: dict[str, Any],
+        timeout: int,
+        pulse: float,
+        frames: list[dict[str, Any]],
+    ) -> Any:
+        """Run a watch as a SEQUENCE of short, framed watches, shown as they arrive.
+
+        WHY A SEQUENCE AND NOT A BACKGROUND TASK: the sandbox serialises commands
+        per session (``novita_sandbox`` takes one lock per session), so a second
+        command started while the first is in flight does not run beside it -- it
+        queues, and returns only after the watch it was supposed to narrate. The
+        same lock means the host cannot read the box while a watch blocks. So a
+        frame has to come from a command of its own, one after the other: several
+        short watches instead of one long silent one.
+
+        Each segment is a real ``watch --wait-seconds <frame>``, so every frame is
+        a deliberate observation -- the price sampled across that segment, the
+        positions, the guard, the events the watcher logged -- and each is
+        published to the live label that the caller's progress line renders. That
+        is what makes the watching VISIBLE while the call is still blocking,
+        instead of a progress line that only says the tool is working.
+
+        ``wait_seconds`` is the budget for the whole sequence and ``pulse_seconds``
+        is the cadence inside it. A later segment that fails at the transport
+        level does NOT discard the frames already observed: a partial watch is
+        still an observation, and throwing it away for a failed tail would be the
+        worst of both.
+        """
+        total = float(kwargs.get("wait_seconds") or 0.0)
+        if total <= 0.0:
+            # A cadence with no budget is one frame of that length, which is
+            # exactly what the caller asked for. Watching for the full 100 s
+            # budget because they named a cadence would be inventing a request.
+            total = pulse
+        budget = max(WATCH_MIN_FRAME_SECONDS, min(total, WATCH_VISIBLE_BUDGET_S))
+        segment = max(WATCH_MIN_FRAME_SECONDS, min(pulse, budget))
+        started = time.monotonic()
+
+        # The first frame of the FIRST watch has no predecessor to show, so the
+        # progress line would read "still running" for its whole duration -- the
+        # exact silence this exists to remove. Say what is actually happening
+        # instead, and invent no number: nothing has been read yet, and the label
+        # says so.
+        if live_label_for(_LIVE_LABEL_NAME) is None:
+            publish_live_label(
+                _LIVE_LABEL_NAME,
+                f"opening the watch - reading the first {segment:g}s frame "
+                "(nothing read yet)",
+            )
+
+        rendered: Any = None
+        while True:
+            left = budget - (time.monotonic() - started)
+            if rendered is not None and left < WATCH_MIN_FRAME_SECONDS:
+                break
+            this = min(segment, max(left, WATCH_MIN_FRAME_SECONDS))
+            segment_kwargs = dict(kwargs)
+            segment_kwargs["wait_seconds"] = this
+            cli = build_cli_command("watch", segment_kwargs)
+            try:
+                text = await sandbox.execute(
+                    action="run",
+                    # The FIRST frame carries the bootstrap, because that is what
+                    # puts the CLI in a cold box. The rest do not: the frame budget
+                    # is for watching, not for fetching a file that is already there.
+                    command=_with_bootstrap(cli) if rendered is None else cli,
+                    timeout=max(timeout, int(this) + 30),
+                )
+            except Exception:  # noqa: BLE001 - transport failure mid-sequence
+                if rendered is None:
+                    raise
+                logger.warning(
+                    "mt5_sandbox: watch frame {} failed; returning the {} frame(s) "
+                    "already shown",
+                    len(frames) + 1,
+                    len(frames),
+                )
+                break
+
+            rendered = text
+            frame = _parse_payload(str(text)) or {}
+            headline = str((frame.get("watch_live") or {}).get("headline") or "").strip()
+            if headline:
+                frames.append(
+                    {
+                        "at": time.strftime("%H:%M:%S"),
+                        "headline": headline,
+                        "watched_s": (frame.get("watched") or {}).get("waited_s"),
+                    }
+                )
+                # Published the moment it is read, so the NEXT segment's blocks are
+                # narrated with the newest observation the tool actually has.
+                publish_live_label(_LIVE_LABEL_NAME, f"{frames[-1]['at']} {headline}")
+            if len(frames) >= WATCH_MAX_FRAMES:
+                break
+
+        return rendered
+
+    async def _backtest(self, sandbox: Any, kwargs: dict[str, Any]) -> ToolResult | str:
+        """Measure the playbook over the broker's OWN history.
+
+        WHY THIS IS SPLIT ACROSS TWO MACHINES: the bars can only come from the
+        terminal, and the terminal only exists inside the sandbox -- but the
+        sandbox holds `mt5_cli.py`, not the `nanobot` package, so
+        ``gold_strategy.backtest_bars`` cannot run there. So the sandbox does the
+        one thing it is required for (one ``candles`` read) and the strategy runs
+        here, where the module that defines it already lives. Exactly one sandbox
+        command is spent, which is what keeps the whole call inside the ceiling.
+
+        Nothing is traded, nothing is armed, and no live state is touched: this
+        is arithmetic over history, and it is the thing to do BEFORE risking
+        anything -- a playbook that has never been measured against history is a
+        belief, not a method.
+        """
+        from nanobot.trading.gold_strategy import backtest_bars
+
+        symbol = str(kwargs.get("symbol") or "").strip()
+        if not symbol:
+            return ToolResult.error(
+                "action=backtest requires 'symbol' (e.g. XAUUSD) — there is no "
+                "default instrument to measure a playbook on."
+            )
+        candles_command = build_cli_command("backtest", kwargs)
+        full_command = (
+            f"{bootstrap_command()} >/dev/null 2>{_BOOTSTRAP_LOG} || true; "
+            f"{candles_command}; tail -c 400 {_BOOTSTRAP_LOG} 1>&2"
+        )
+        try:
+            rendered = await sandbox.execute(
+                action="run",
+                command=full_command,
+                timeout=_TIMEOUTS["backtest"],
+            )
+        except Exception as exc:  # noqa: BLE001 - transport-level failure
+            return ToolResult.error(
+                f"action=backtest could not read history: {type(exc).__name__}: {exc}. "
+                "This is a transport error, not a strategy result — no measurement "
+                "was made. Retry, or call action='status' to see whether the "
+                "terminal is up."
+            )
+        payload = _parse_payload(str(rendered))
+        bars = (payload or {}).get("bars")
+        if not bars:
+            return ToolResult.error(
+                "action=backtest got no bars back, so nothing was measured. The "
+                "symbol may not be in Market Watch, or the terminal may be "
+                "disconnected. Raw tail:\n" + str(rendered)[-600:]
+            )
+
+        spread_pips = kwargs.get("spread_pips")
+        result = backtest_bars(
+            bars,
+            symbol=symbol,
+            sl_pips=float(kwargs.get("sl_pips") or 20.0),
+            rr=float(kwargs.get("rr") or 7.0),
+            range_bars=int(kwargs.get("range_bars") or 24),
+            entry_tolerance_pips=float(kwargs.get("entry_tolerance_pips") or 2.0),
+            spread_pips=float(spread_pips or 0.0),
+            risk_money=(
+                float(kwargs["risk_money"])
+                if kwargs.get("risk_money") is not None
+                else None
+            ),
+            max_bars_held=(
+                int(kwargs["max_bars_held"])
+                if kwargs.get("max_bars_held") is not None
+                else None
+            ),
+        )
+        result["timeframe"] = str(kwargs.get("timeframe") or "M15").upper()
+        result["bars_read"] = len(bars)
+        result["bars_source"] = (
+            f"candles --symbol {symbol} --timeframe {result['timeframe']} "
+            f"--count {int(kwargs.get('count') or 3000)}"
+        )
+        if not spread_pips:
+            # Saying this out loud is the difference between "this playbook makes
+            # 7R a win" and "this playbook makes 7R a win before costs". Gold's
+            # spread is not roundable to zero: it is a real share of a 20-pip stop.
+            result["spread_note"] = (
+                "No spread was charged. Every trade is therefore scored ~"
+                f"(live spread / {result['params']['sl_pips']:g} pips) R too well. "
+                "Pass spread_pips (or read it from `quote`) before treating the "
+                "result as achievable."
+            )
+        return json.dumps(result, default=str)
+
     async def execute(self, **kwargs: Any) -> ToolResult | str:  # type: ignore[override]
         action = str(kwargs.get("action") or "").strip().lower()
         if action not in _ALL_ACTIONS:
             return ToolResult.error(
                 f"Unknown action '{action}'. Valid actions: {', '.join(_ALL_ACTIONS)}"
             )
+
+        if action != "watch":
+            # A frame is a statement about a market that was being watched, and the
+            # moment the caller does anything else with this tool -- closes the
+            # trade, arms a level, reads the book -- it stops describing the
+            # current state of the world. Leaving it on the progress line would be
+            # the "it is being monitored" claim in a different font, so it goes.
+            clear_live_label(_LIVE_LABEL_NAME)
 
         # Coerce the model's numbers BEFORE anything reads them -- the guard-rule
         # builder, the plan preview and the command builder all take numeric input.
@@ -1888,6 +2211,9 @@ class MT5SandboxTool(Tool):
                 "terminal on the application host."
             )
 
+        if action == "backtest":
+            return await self._backtest(sandbox, kwargs)
+
         command = build_cli_command(action, kwargs)
         # Always refresh the CLI before using it so a fixed bridge ships without
         # rebuilding the sandbox or the image.
@@ -1898,10 +2224,7 @@ class MT5SandboxTool(Tool):
         # the expected CLI version" warning, and that warning is exactly what a
         # "no JSON result" failure needs to be interpretable. Trailing stderr
         # cannot confuse the parser, which scans for the first balanced JSON.
-        full_command = (
-            f"{bootstrap_command()} >/dev/null 2>{_BOOTSTRAP_LOG} || true; "
-            f"{command}; tail -c 400 {_BOOTSTRAP_LOG} 1>&2"
-        )
+        full_command = _with_bootstrap(command)
         timeout = int(kwargs.get("timeout") or _TIMEOUTS.get(action, _DEFAULT_TIMEOUT))
         # A WATCH runs for as long as the caller asked -- on the guard, on a live
         # trade (``watch``), or on an install (``status``) -- so the command
@@ -1917,12 +2240,20 @@ class MT5SandboxTool(Tool):
             if wait > 0:
                 timeout = max(timeout, int(wait) + 30)
 
+        # A watch the user is meant to SEE cannot be one silent block: the frames
+        # the progress line shows come from a sequence of short watches, so the
+        # caller gets a timeline rather than a spinner (see _pulse_watch).
+        frames: list[dict[str, Any]] = []
+        pulse = float(kwargs.get("pulse_seconds") or 0.0)
         try:
-            rendered = await sandbox.execute(
-                action="run",
-                command=full_command,
-                timeout=timeout,
-            )
+            if action == "watch" and pulse > 0.0:
+                rendered = await self._pulse_watch(sandbox, kwargs, timeout, pulse, frames)
+            else:
+                rendered = await sandbox.execute(
+                    action="run",
+                    command=full_command,
+                    timeout=timeout,
+                )
         except Exception as exc:  # noqa: BLE001 - transport-level failure
             # Novita raises for any non-zero exit status and drops stdout. The CLI
             # now always exits 0, but an older cached CLI (or a hard transport
@@ -1977,6 +2308,9 @@ class MT5SandboxTool(Tool):
         # Never echo a password back, even if a broker/library logged it.
         if "password" in payload:
             payload["password"] = "***"
+
+        if frames:
+            payload["watch_frames"] = _frames_report(frames)
 
         # A position with no SL and no TP has no server-side exit at all: the only
         # way it can ever close is a model turn calling `close`, which is the exact

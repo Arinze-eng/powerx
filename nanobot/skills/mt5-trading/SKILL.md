@@ -787,9 +787,20 @@ watching — three trips, three different instants, no memory between them. A
 caller doing that is looking at three photographs and guessing at the film.
 
 ```
-mt5_sandbox(action="watch", wait_seconds=60, poll_seconds=1, lines=20)
-mt5_sandbox(action="watch", symbols="EURUSD XAUUSD", wait_seconds=60)
+# the VISIBLE cadence: 90 s of watching, a fresh frame every 15 s, every frame
+# published to the user's progress line THE MOMENT it is read.
+mt5_sandbox(action="watch", watch_session="xau-leg-2",
+            wait_seconds=90, pulse_seconds=15, poll_seconds=1)
+mt5_sandbox(action="watch", symbols="EURUSD XAUUSD", wait_seconds=90)
 ```
+
+`wait_seconds` is the **budget** for the call and `pulse_seconds` is the
+**cadence inside it**. Pass both and one call becomes a framed sequence: the tool
+runs several short watches back to back, and each frame is published to the
+progress line the user is already watching while the call is still blocking. That
+is the difference between a user who *sees* the watching and a user who is told
+about it. Without `pulse_seconds` a watch is still one bounded blocking call, as
+it always was.
 
 `watch` returns one frame of the film, every time:
 
@@ -801,7 +812,9 @@ mt5_sandbox(action="watch", symbols="EURUSD XAUUSD", wait_seconds=60)
 | `guard`, `guard_state` | liveness, `rules_armed`, `alert`, retrying/gave-up closes, heartbeat age |
 | `ticks_scanned`, `near_miss` | proof the watcher is LOOKING, per symbol, as counts |
 | `events` | the guard's own log, including `fired` with its measured `latency_ms` |
-| `watched` | why this call came back: `observed_event`, `waited_s`, `samples`, `timed_out`, `capped_at_s`, `note` |
+| `watched` | why this call came back: `observed_event`, `waited_s`, `samples`, `timed_out`, `capped_at_s`, `pulse_seconds`, `wait_seconds_asked`, `note` |
+| `watch_live` | **the frame in words, meant to be SHOWN** — `headline`, timestamped `lines[]`, `relay`, `anything_watching_the_level` |
+| `watch_frames` | present only on a framed watch: `count`, `frames[]` (`at`, `headline`, `watched_s`) — the frames that were **already shown to the user as they arrived**. Do not repeat them; at most print the newest headline |
 
 * **Omit `symbols` and it watches the symbols of the OPEN POSITIONS** — the set
   that actually carries risk. Name symbols only for a market you care about but
@@ -827,9 +840,24 @@ mt5_sandbox(action="watch", symbols="EURUSD XAUUSD", wait_seconds=60)
   (`alert: "terminal_unavailable"` — the positions in that payload are **not**
   known to be the whole picture) all mean the position is not covered the way the
   caller thinks. Act on it or say it out loud.
-* **Capped at 90 s per call.** There is no daemon and there never will be:
-  "continuous" means a bounded blocking call, repeated. Call `watch` again to
-  continue where the last one stopped.
+* **Capped at 90 s per call**, and a framed watch is capped at both 100 s of
+  wall clock and a handful of frames, so `wait_seconds=90, pulse_seconds=5` cannot
+  turn one tool call into ten minutes of it. There is no daemon and there never
+  will be: "continuous" means a bounded blocking call, repeated. Call `watch`
+  again to continue where the last one stopped.
+* **Show the frame — this is what `pulse_seconds` is for.** `watch_live.headline`
+  and its `lines` are the observation written out so it can be repeated to the
+  user verbatim, with a timestamp on each line. With `pulse_seconds` set, the
+  frames are published for you as they are read: the user's progress line becomes
+  `12:04:31 EYES ON: #777 EURUSD buy 0.1 — bid 1.1419, +0.42R - 18s in` and updates
+  every few seconds **while the call is still blocking**, which is the watching
+  itself. Print nothing at all and they still see it. When the call returns, print
+  the newest headline *only if it says something the frames did not* — the rest is
+  already on their screen (`watch_frames.shown_to_user` is `true`). **Never say
+  "I am monitoring your trade" with no frame behind it** — a watcher nobody can
+  see is indistinguishable from a watcher that does nothing, and that sentence is
+  the whole reason `watch_live` exists. The frames differ every call — price,
+  drift, ticks scanned, R — so this is observation, not a repeated status line.
 * `watch` is **read-only** and works with `MT5_ALLOW_TRADING` off — observing is
   never the thing that moves money.
 
@@ -909,6 +937,52 @@ fixed stop and the level-based entry, not in the target being reached. If the
 user asks for a different RR or stop, pass `rr=`/`sl_pips=`, and mention that
 `violations` will then flag it as off-playbook.
 
+## Backtesting — measure the playbook instead of believing it
+
+A playbook that has never been run over history is a belief, not a method, and
+this one is unusual enough to be worth measuring: it risks 20 pips to make 140,
+so it *should* lose most of its trades and the only real question is whether the
+wins come often enough to pay for the losses.
+
+```
+mt5_sandbox(action="backtest", symbol="XAUUSD", timeframe="M15", count=3000,
+            range_bars=24, spread_pips=<live spread in pips from quote>)
+```
+
+One `candles` fetch in the sandbox, then the playbook is replayed **bar by bar**
+on the host with no discretion: the MA ribbon (9/21) and the 50% midpoint must
+agree, a pin bar / engulfing / inside-bar break gives the side, the entry has to
+be **at** a range sub-level, and every trade gets the document's 20-pip stop and
+1:7 target from its fill.
+
+| Field | What to read it for |
+|---|---|
+| `win_rate_pct` | compare it against **`1/(1+rr)` = 12.5%** at 1:7 — that is the break-even rate, and `verdict` states the comparison explicitly |
+| `expectancy_r`, `net_r` | what one trade is worth on average, and the whole window, in units of the money risked |
+| `max_drawdown_r` | how many R the equity curve gave back — the number that decides whether a run of losers is survivable |
+| `by_signal` | which of the three entry signals earned its keep |
+| `skipped` | how many bars each rule rejected, and therefore which rule is doing the filtering |
+| `ambiguous_bars`, `open_at_end` | bars that touched **both** levels (scored as a loss) and trades unresolved at the end of the window (excluded) |
+| `net_money` | `net_r` against `risk_money`, when you passed one — the only figure a user actually feels |
+
+**Say how the measurement was made, every time.** Fills are the **next bar's
+OPEN**, any bar that touches both the stop and the target is scored as a **LOSS**,
+and **no spread is charged unless you pass `spread_pips`** — so the result is
+biased *downward*, and the honest sentence is "net +18.4R over 3,000 M15 bars,
+7.2% wins, max drawdown 6R, with no spread charged". On Gold the spread is roughly
+a tenth of a 20-pip stop, so leaving it out makes every trade about 0.05R too
+good. Read the live spread with `action='quote'` and pass it.
+
+* **A window is evidence about the RULES, not a forecast.** 3,000 bars of one
+  symbol on one timeframe is a sample. Run several symbols and timeframes before
+  sizing anything on the result, and say which window you ran.
+* **`trades: 0` is a result, not a failure.** The filter is meant to reject most
+  bars; read `skipped` to see which rule said no.
+* `range_bars` is the one trading parameter the guide does not fix (it fixes the
+  divisor, 4.68, not the lookback). Sweep it, and say which value you used.
+* The backtest **trades nothing, arms nothing, and works with
+  `MT5_ALLOW_TRADING` off** — measuring is what you do *before* risking money.
+
 ## Polling a live trade in real time — not a cron
 
 While a position is open, **watch it for real**. A scheduled task that checks the
@@ -918,8 +992,11 @@ after the fact. Cron is for work that must happen with nobody watching. A trade
 you are following is the opposite: you are there, so observe it.
 
 ```
-# call this in a LOOP until the position is closed or the user says stop
-mt5_sandbox(action="watch", watch_session="xau-leg-2", wait_seconds=90)
+# call this in a LOOP until the position is closed or the user says stop.
+# 90 s of watching, a frame every 15 s, each one shown to the user AS IT ARRIVES.
+mt5_sandbox(action="watch", watch_session="xau-leg-2",
+            wait_seconds=90, pulse_seconds=15)
+# -> the frames are already on the user's screen; call watch again immediately.
 ```
 
 **Always pass `watch_session`.** Without it every call starts from zero: each one
@@ -980,69 +1057,49 @@ human's money on it; `timed_out: true` means nothing happened *yet*, not that yo
 are done. Watch until the position set is empty, or until you have told the user
 something they need to answer.
 
-### Don't narrate. Manage.
+### Show the watch. Do not announce it.
 
-While the trade is being managed, **keep the loop to yourself**. "Still watching,
-nothing yet" every 90 seconds is noise, and a user who asked you to run a trade
-does not want forty status updates — they want the trade run. Work quietly and
-speak only when one of these is true:
+The loop is **visible, and the visibility is the point**. When a user asks you to
+run a trade they are not asking to be told it is being run — they want to *see*
+it happen, so that "you were watching" is something they witnessed rather than
+something you assert. Two different things, and only one of them is checkable:
+
+| Do this | Not this |
+|---|---|
+| Print `watch_live.headline` as each frame lands, and the frame line that changed | "I'm monitoring your position and will report back." |
+| Call `watch` again immediately after showing the frame | Going quiet for minutes and then summarising |
+| Let the frames differ — price, `drift_pips`, `ticks_scanned`, `r_multiple` | A repeated "still watching, nothing yet" |
+
+Every frame carries a fresh, timestamped observation, and with a
+`pulse_seconds` cadence each one is published to the user's progress line as it
+is read — so the transcript shows the bid, the R and the guard moving *while the
+call is still running*, not only at the end of each turn. That is the evidence
+the user asked for. What is *not* wanted is filler: one frame per pulse, no
+colour commentary, no speculation about what the price might do. The frames ARE
+the message, and they arrive whether or not you also print them.
+
+**Do not describe the mechanism to the user, and do not promise a report.** "I am
+now watching, the frames will appear every 15 s" is still an announcement — show
+the frame instead. The one thing worse than announcing it is narrating the
+framing: the user does not need to know what a pulse is any more than they need
+to know which sandbox command ran.
+
+Keep the loop going while the position is open. **Say something more than the
+frame** only when one of these is true:
 
 * **The job is done** — the position set is empty. Then report the outcome with
   the real numbers: every fill, the exit price of each part, the net P&L, and the
   R multiple. From `history`, not from your memory of the loop.
 * **You need a decision only the user can make** — they said "close half at the
-  first target" and the target is here but the size was never specified; or the
-  setup has gone invalid and the choice is theirs.
-* **Something is wrong that they must know now** — a position with no stop, an
-  account that turns out to be netting, margin that will not cover the plan, the
+  first target" and the size was never specified; or the setup has gone invalid
+  and the choice is theirs.
+* **Something is wrong that they must know now** — a position with no stop, a
+  netting account where you need hedging, margin that will not cover the plan, the
   watcher dying, a broker rejection you cannot work around. A problem is not
   noise; silence on a problem is the failure mode.
 
-Everything else is the loop doing its job. Acting on `trade_state` — taking a
-partial off, moving a stop to breakeven — is **management, not a report**: do it
-and carry on watching. Do not stop the loop to announce what you just did; the
-numbers will be in the final summary, and stopping mid-trade to narrate is how a
-trade ends up unwatched.
-
-**Stay inside the turn while the trade is live.** "Quiet" means "no messages to
-the user", never "end the turn and wait". If you reply with prose and no tool
-call, the turn is over, the watcher has no driver, and the trade is now unwatched
-until the human prompts you again — the opposite of autonomous. So each poll that
-comes back still-open must be followed by another poll **in the same turn**, until
-the position set is empty or one of the three report conditions above is met. If a
-long wait is needed, use the blocking form (`status` with `wait_seconds`, or
-`guard status wait_seconds=`) so the tool waits rather than you ending the turn to
-sleep. The user asked you to run a trade, not to be told that a trade is running.
-
-### How the loop works
-
-1. `watch` blocks up to **90 s** and returns the moment something happens.
-2. If `watched.timed_out` is `true`, **nothing happened** — that is a normal
-   result, not a failure and not an error. Read the price path, think, call
-   `watch` again with the same session.
-3. If `watched.observed_event` is set, something happened (a fire, a refused
-   close, a near miss, a dead watcher, a position opened/closed). Read it, decide,
-   act.
-4. Stop the loop when: the position set is empty (the trade is done), the user
-   tells you to stop, or you have something to say to the user.
-
-**Keep the thinking in the loop.** Each call gives you the cumulative path, the
-delta since last time, the guard's tick counts and any near miss. That is enough
-to say whether the trade is working, whether the level is being respected, and
-whether the stop should move — say it, don't just keep polling in silence.
-
-**The 90 s cap is not a limit on how long you watch.** It is the ceiling on one
-sandbox command. Watching for an hour is ~40 calls, and they are one
-observation because they share a session name. There is no daemon behind this and
-there does not need to be one: the loop is you, and you are the part that thinks.
-
-### Never poll with `quote`
-
-`quote` in a loop costs a sandbox round trip per poll and returns a price with no
-history, no guard state and no event log — and it is exactly the pattern that
-misses a level touched between two polls. `watch` samples inside the box at 1 Hz
-and hands you the path, for one round trip. Use `quote` once, when you want a
-price; use `watch` when you want to know what the price is doing.
+And when the user says stop watching, **stop** — a watch loop that outlives the
+request is the same failure as one that never showed its frames.
 
 ## Split trading — one idea, N positions
 

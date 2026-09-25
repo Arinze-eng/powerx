@@ -38,6 +38,7 @@ from nanobot.agent.tools.mt5_sandbox import (
     _INSTALL_COMMAND_TIMEOUT,
     _INT_FIELDS,
     _TIMEOUTS,
+    _TRADING_ACTIONS,
     BadNumberError,
     MT5SandboxTool,
     _normalize_numeric,
@@ -6770,3 +6771,572 @@ def test_the_missing_broker_recipe_is_a_search_not_a_guess():
     assert "download.mql5.com/cdn/web" in recipe, "the search that actually works"
     assert "page_urls" in recipe, "the escape hatch when search finds only a page"
     assert "136" in recipe, "the measured cost of guessing, which is the point"
+
+
+# --------------------------------------------------------------------------- #
+# Watching must be SEEN -- a frame the user can be shown, on a cadence
+# --------------------------------------------------------------------------- #
+def test_watch_pulse_caps_the_wait_so_a_frame_comes_back(monkeypatch, tmp_path):
+    """A user cannot tell watching from doing nothing unless a frame arrives.
+
+    MEASURED COMPLAINT (2026-09-25): the model reported "I am monitoring your
+    trade" and showed nothing, which is the one thing the caller cannot verify.
+    The pulse is the fix at the CLI level: a long wait is capped to the cadence,
+    so the call RETURNS a fresh frame instead of holding the transcript silent,
+    and the cap is reported rather than applied silently.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    _live_guard_state(cli)
+    mt5 = _WatchMT5(
+        positions=[_watch_position(777, "EURUSD")],
+        ticks={"EURUSD": (1.14190, 1.14210)},
+    )
+    _serve_watch(monkeypatch, cli, mt5)
+
+    payload = json.loads(_capture_emit(
+        cli, cli.cmd_watch,
+        types.SimpleNamespace(
+            symbol=[], wait_seconds=90.0, pulse_seconds=0.2, poll_seconds=0.05, lines=5
+        ),
+    ))
+
+    watched = payload["watched"]
+    assert watched["capped_at_s"] == pytest.approx(0.2)
+    assert watched["pulse_seconds"] == pytest.approx(0.2)
+    # The request is kept visible next to what was granted: a silent clamp is
+    # how a caller concludes the tool ignored it.
+    assert watched["wait_seconds_asked"] == pytest.approx(90.0)
+    assert watched["waited_s"] < 5.0
+    assert "pulse" in watched["note"]
+
+
+def test_watch_without_a_pulse_still_uses_the_full_cap(monkeypatch, tmp_path):
+    """The visible cadence is the default ADVICE, not a silent behaviour change."""
+    cli = _broker_cli(monkeypatch, tmp_path)
+    _live_guard_state(cli)
+    mt5 = _WatchMT5(
+        positions=[_watch_position(777, "EURUSD")],
+        ticks={"EURUSD": (1.14190, 1.14210)},
+    )
+    _serve_watch(monkeypatch, cli, mt5)
+
+    payload = json.loads(_capture_emit(
+        cli, cli.cmd_watch,
+        types.SimpleNamespace(
+            symbol=[], wait_seconds=0.2, pulse_seconds=0.0, poll_seconds=0.05, lines=5
+        ),
+    ))
+
+    assert payload["watched"]["capped_at_s"] == cli.WATCH_MAX_WAIT_SECONDS
+    assert payload["watched"]["pulse_seconds"] is None
+
+
+def test_watch_returns_the_frame_in_words_so_it_can_be_shown(monkeypatch, tmp_path):
+    """The observation, written out, with a timestamp on every line.
+
+    Every number in this payload was already available and a caller still ended
+    up telling the user "I am monitoring it". This is the part that is meant to
+    be repeated VERBATIM: the price it read, the position it read, what the
+    watcher has scanned, and the plain fact that it just looked.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    _live_guard_state(cli, ticks_scanned={"EURUSD": 35})
+    cli.GUARD_RULES_FILE.write_text(
+        json.dumps([{"id": "g-1", "symbol": "EURUSD", "trigger_price": 1.15}]),
+        encoding="utf-8",
+    )
+    mt5 = _WatchMT5(
+        positions=[_watch_position(777, "EURUSD")],
+        ticks={"EURUSD": (1.14190, 1.14210)},
+    )
+    _serve_watch(monkeypatch, cli, mt5)
+
+    payload = json.loads(_capture_emit(
+        cli, cli.cmd_watch,
+        types.SimpleNamespace(
+            symbol=[], wait_seconds=0.2, pulse_seconds=0.2, poll_seconds=0.05, lines=5
+        ),
+    ))
+
+    live = payload["watch_live"]
+    assert live["headline"].startswith("EYES ON: #777 EURUSD buy 0.1")
+    assert "bid 1.1419" in live["headline"]
+    body = "\n".join(live["lines"])
+    assert "EURUSD bid 1.1419" in body
+    assert "spread 20 pips" in body  # (1.1421 - 1.1419) / 0.0001
+    assert "#777 EURUSD buy 0.1 from 1.1419" in body
+    assert "guard live: 1 rule(s) armed, 35 ticks scanned" in body
+    assert "watched 0.2s" in body
+    assert live["anything_watching_the_level"] is True
+    assert live["rules_armed"] == 1
+    # The instruction travels WITH the frame, because a frame with no instruction
+    # to show it is a frame nobody sees.
+    assert "Print `headline`" in live["relay"]
+    # Every line is timestamped: an observation the user can place in time.
+    assert all(line[:8].count(":") == 2 for line in live["lines"])
+
+
+def test_the_frame_says_when_nothing_is_watching_the_level(monkeypatch, tmp_path):
+    """A frame that cannot see the guard must not read like one that can."""
+    cli = _broker_cli(monkeypatch, tmp_path)
+    mt5 = _WatchMT5(
+        positions=[_watch_position(777, "EURUSD")],
+        ticks={"EURUSD": (1.14190, 1.14210)},
+    )
+    _serve_watch(monkeypatch, cli, mt5)
+
+    payload = json.loads(_capture_emit(
+        cli, cli.cmd_watch,
+        types.SimpleNamespace(
+            symbol=[], wait_seconds=0.2, pulse_seconds=0.2, poll_seconds=0.05, lines=5
+        ),
+    ))
+
+    live = payload["watch_live"]
+    # A live watcher with NOTHING armed protects nothing: it is polling the feed
+    # and comparing it against an empty list. Collapsing that into "guard live"
+    # would let the frame report protection that does not exist -- the same
+    # failure this frame exists to remove, one level up.
+    assert live["guard_live"] is False
+    assert live["rules_armed"] == 0
+    assert live["anything_watching_the_level"] is False
+    assert any("guard NOT running" in line for line in live["lines"])
+
+
+def test_a_live_watcher_with_no_rule_is_not_protection(monkeypatch, tmp_path):
+    """`guard live` alone is not "your level is covered" and must not read as it."""
+    cli = _broker_cli(monkeypatch, tmp_path)
+    _live_guard_state(cli, ticks_scanned={"EURUSD": 35})
+    mt5 = _WatchMT5(
+        positions=[_watch_position(777, "EURUSD")],
+        ticks={"EURUSD": (1.14190, 1.14210)},
+    )
+    _serve_watch(monkeypatch, cli, mt5)
+
+    payload = json.loads(_capture_emit(
+        cli, cli.cmd_watch,
+        types.SimpleNamespace(
+            symbol=[], wait_seconds=0.2, pulse_seconds=0.2, poll_seconds=0.05, lines=5
+        ),
+    ))
+
+    live = payload["watch_live"]
+    assert live["guard_live"] is True and live["rules_armed"] == 0
+    assert live["anything_watching_the_level"] is False
+    assert any("NO rule armed" in line for line in live["lines"])
+
+
+def test_the_frame_carries_the_arithmetic_a_user_wants_to_see(monkeypatch, tmp_path):
+    """The frame is the whole message -- nothing has to be invented to show it.
+
+    A caller relaying this has the price, the movement, the position's own R and
+    the tick count in plain words, so the user sees the WORK rather than a claim
+    that work is happening.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+
+    view = cli._watch_live_view(
+        [{"ticket": 12, "symbol": "XAUUSD", "volume": 0.1, "price_open": 4163.10,
+          "type": 0, "profit": 4.2}],
+        {"XAUUSD": {"bid": 4167.30, "ask": 4167.60, "mid": 4167.45, "spread": 0.3}},
+        {"XAUUSD": {"drift_pips": 4.2, "range_pips": 5.1, "first_mid": 4167.03,
+                    "last_mid": 4167.45, "samples": 20}},
+        {"live": True, "rules_armed": 1, "heartbeat_age_s": 0.3},
+        {"ticks_scanned": {"XAUUSD": 812}},
+        {"positions": [{"ticket": 12, "r_multiple": 0.42, "pips_to_sl": 41.0,
+                        "pips_to_tp": 99.0}],
+         "totals": {"positions": 1, "profit_money": 4.2, "risk_money": 2.0}},
+        [],
+        20.0,
+        20,
+        {"XAUUSD": 0.10},
+    )
+
+    assert view["headline"].startswith("EYES ON: #12 XAUUSD buy 0.1")
+    assert "4167.3" in view["headline"]
+    assert "2.0 at risk" in view["headline"]
+    assert any("+0.42R" in line for line in view["lines"])
+    assert any("812 ticks scanned" in line for line in view["lines"])
+    assert any("41 pips to the stop" in line for line in view["lines"])
+    body = "\n".join(view["lines"])
+    assert "spread 3 pips" in body
+    assert "nothing triggered, frame complete" in body
+
+
+# --------------------------------------------------------------------------- #
+# Backtesting from the tool: one bars fetch in the sandbox, the measurement here
+# --------------------------------------------------------------------------- #
+def _playbook_bars() -> list[dict[str, float]]:
+    """Bars the playbook MUST trade: a coil at the range high, then a run."""
+    rows: list[dict[str, float]] = []
+    price = 4000.0
+    for i in range(30):
+        price += 1.0
+        rows.append({"time": i, "open": price - 1.0, "high": price + 0.05,
+                     "low": price - 1.1, "close": price})
+    rows.append({"time": 30, "open": 4030.0, "high": 4035.0, "low": 4029.0, "close": 4034.0})
+    rows.append({"time": 31, "open": 4031.0, "high": 4033.0, "low": 4030.0, "close": 4032.0})
+    rows.append({"time": 32, "open": 4032.0, "high": 4036.0, "low": 4031.5, "close": 4035.5})
+    run = 4036.0
+    for i in range(5):
+        nxt = run + 4.0
+        rows.append({"time": 33 + i, "open": run, "high": nxt, "low": run, "close": nxt})
+        run = nxt
+    return rows
+
+
+def test_a_backtest_is_one_candles_fetch_and_the_measurement_is_made_here(monkeypatch):
+    """The split is forced, and worth pinning: the strategy module is NOT in the box.
+
+    The sandbox is bootstrapped with ``mt5_cli.py`` alone -- the ``nanobot``
+    package is not fetched there -- so a strategy engine cannot run under Wine.
+    The terminal is needed for exactly one thing (the bars), so exactly one sandbox
+    command is spent and the arithmetic happens where the module lives.
+    """
+    import asyncio
+
+    monkeypatch.delenv("MT5_ALLOW_TRADING", raising=False)
+    bars = _playbook_bars()
+    sandbox = _FakeSandbox(
+        json.dumps({"ok": True, "symbol": "XAUUSD", "timeframe": "M15", "bars": bars})
+        + "\n[exit_code=0]"
+    )
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+
+    result = asyncio.run(
+        tool.execute(action="backtest", symbol="XAUUSD", timeframe="M15", count=3000)
+    )
+    payload = json.loads(str(result))
+
+    assert len(sandbox.calls) == 1
+    command = sandbox.calls[0]["command"]
+    assert "mt5_cli.py candles --symbol XAUUSD --timeframe M15 --count 3000" in command
+    assert "mt5_cli.py backtest" not in command, "there is no backtest subcommand in the box"
+
+    assert payload["trades"] == 1
+    assert payload["sample_trades"][0]["outcome"] == "win"
+    assert payload["net_r"] == pytest.approx(7.0)
+    assert payload["timeframe"] == "M15"
+    assert payload["bars_read"] == len(bars)
+    assert "candles --symbol XAUUSD" in payload["bars_source"]
+    # No spread was passed, so the result must SAY it is biased upward -- the one
+    # thing a caller reading a 7R must not be allowed to miss.
+    assert "No spread was charged" in payload["spread_note"]
+
+
+def test_a_backtest_charges_the_spread_it_is_given(monkeypatch):
+    """Costs are the difference between a measurement and a sales pitch."""
+    import asyncio
+
+    bars = _playbook_bars()
+    sandbox = _FakeSandbox(json.dumps({"ok": True, "bars": bars}) + "\n[exit_code=0]")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+
+    result = asyncio.run(
+        tool.execute(action="backtest", symbol="XAUUSD", spread_pips=1.0)
+    )
+    payload = json.loads(str(result))
+
+    assert payload["net_r"] == pytest.approx(6.95)
+    assert "spread_note" not in payload
+
+
+def test_a_backtest_without_a_symbol_is_refused(monkeypatch):
+    """There is no default instrument to measure a playbook on."""
+    import asyncio
+
+    sandbox = _FakeSandbox()
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+    result = asyncio.run(tool.execute(action="backtest"))
+
+    assert result.is_error
+    assert "symbol" in str(result)
+    assert sandbox.calls == [], "nothing to measure must not cost a sandbox command"
+
+
+def test_a_backtest_that_reads_no_bars_reports_no_measurement(monkeypatch):
+    """An empty read is a transport fact, and must never be filled in with a guess."""
+    import asyncio
+
+    sandbox = _FakeSandbox('{"ok": true, "bars": []}\n[exit_code=0]')
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+    result = asyncio.run(tool.execute(action="backtest", symbol="XAUUSD"))
+
+    assert result.is_error
+    assert "nothing was measured" in str(result)
+
+
+def test_a_backtest_arms_nothing_and_is_not_gated_by_the_trading_opt_in(monkeypatch):
+    """Measuring is what a caller does BEFORE enabling live trading."""
+    import asyncio
+
+    monkeypatch.delenv("MT5_ALLOW_TRADING", raising=False)
+    sandbox = _FakeSandbox(
+        json.dumps({"ok": True, "bars": _playbook_bars()}) + "\n[exit_code=0]"
+    )
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+    result = asyncio.run(tool.execute(action="backtest", symbol="XAUUSD"))
+
+    assert not getattr(result, "is_error", False)
+    assert "backtest" in _ALL_ACTIONS
+    assert "backtest" not in _TRADING_ACTIONS
+    assert _TIMEOUTS["backtest"] == 120
+
+
+def test_the_watch_pulse_is_passed_through_to_the_bridge():
+    """The visible cadence has to survive the tool -> CLI hop, or it is advice only."""
+    command = build_cli_command(
+        "watch", {"symbol": "XAUUSD", "wait_seconds": 90, "pulse_seconds": 20}
+    )
+    assert "--pulse-seconds 20.0" in command
+    assert "--wait-seconds 90.0" in command
+    # No pulse, no flag: a caller who asked for the long wait keeps it.
+    assert "--pulse-seconds" not in build_cli_command("watch", {"wait_seconds": 90})
+
+
+def test_the_watch_description_demands_a_frame_rather_than_an_announcement():
+    """The model reads the schema, and the schema is where the behaviour is set."""
+    described = MT5SandboxTool().parameters["properties"]
+    watch_pulse = described["pulse_seconds"]["description"]
+    assert "monitoring" in watch_pulse
+    # The cadence is the budget with a frame rate inside it, and the frames are
+    # published for the model: the schema has to say both, or the model keeps
+    # treating one 90 s silence as "watching".
+    assert "watch_frames" in watch_pulse
+    assert "shown_to_user=true" in watch_pulse
+    assert "progress line" in watch_pulse
+    guard = described["wait_seconds"]["description"]
+    assert "pulse_seconds=15" in guard
+    assert "90-second silence" in guard
+    assert "BUDGET" in guard
+    # And the big action description carries the same instruction, because that is
+    # what the model reads when it decides HOW to watch.
+    body = MT5SandboxTool().description
+    assert "SHOW THE WATCH, NEVER ANNOUNCE IT" in body
+    assert "watch_live.headline" in body
+
+
+# --------------------------------------------------------------------------- #
+# The visible watch: the user sees the frames while the call is still blocking
+# --------------------------------------------------------------------------- #
+def _watch_frame(headline: str) -> str:
+    return json.dumps(
+        {
+            "ok": True,
+            "watch_live": {"headline": headline, "lines": [f"12:00:00  {headline}"]},
+            "watched": {"waited_s": 10.0, "timed_out": True},
+        }
+    ) + "\n[exit_code=0]"
+
+
+def test_a_framed_watch_returns_a_timeline_not_one_silent_block(monkeypatch, tmp_path):
+    """A watch the user is meant to SEE cannot be one block with no frames in it.
+
+    MEASURED COMPLAINT (2026-09-25): the user wanted to see the agent watching a
+    live trade and was given "I am monitoring your trade" instead. A single long
+    block cannot show anything -- so ``pulse_seconds`` turns a watch into a
+    SEQUENCE of short watches, each one a real observation, each one published to
+    the progress line the user is already looking at.
+    """
+    import asyncio
+
+    from nanobot.utils.live_label import clear_live_label, live_label_for
+
+    class _Framed(_FakeSandbox):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen_labels: list[str | None] = []
+
+        async def execute(self, **kwargs: Any) -> str:
+            self.calls.append(kwargs)
+            self.seen_labels.append(live_label_for("mt5_sandbox"))
+            return _watch_frame(f"EYES ON: #777 EURUSD buy 0.1 - bid 1.14{len(self.calls)}")
+
+    clear_live_label("mt5_sandbox")
+    sandbox = _Framed()
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+    try:
+        result = asyncio.run(
+            tool.execute(action="watch", wait_seconds=30, pulse_seconds=10)
+        )
+    finally:
+        clear_live_label("mt5_sandbox")
+    payload = json.loads(str(result))
+
+    # More than one frame came back, so the call is a timeline rather than one
+    # silence with a single reading at the end of it.
+    assert payload["watch_frames"]["count"] > 1
+    assert payload["watch_frames"]["shown_to_user"] is True
+    assert len(sandbox.calls) == payload["watch_frames"]["count"]
+    headlines = [f["headline"] for f in payload["watch_frames"]["frames"]]
+    assert len(set(headlines)) == len(headlines), "each frame is its own reading"
+    assert all(f["at"].count(":") == 2 for f in payload["watch_frames"]["frames"])
+
+    # The FIRST command carries the bootstrap (it is what fetches the CLI into a
+    # cold box); the rest do not, because the frame budget is for watching rather
+    # than re-downloading a file that is already there.
+    assert "mt5_cli.py watch" in sandbox.calls[0]["command"]
+    assert "curl" in sandbox.calls[0]["command"]
+    assert "--wait-seconds 10" in sandbox.calls[0]["command"]
+    for call in sandbox.calls[1:]:
+        assert "curl" not in call["command"]
+        assert "--wait-seconds 10" in call["command"]
+
+    # Every frame is published BEFORE the next one starts, which is the whole
+    # mechanism: that label is what the progress line renders while the call blocks.
+    # The first command is preceded by a placeholder that claims no reading.
+    assert "nothing read yet" in str(sandbox.seen_labels[0])
+    assert sandbox.seen_labels[1] and "bid 1.141" in str(sandbox.seen_labels[1])
+    assert sandbox.seen_labels[2] and "bid 1.142" in str(sandbox.seen_labels[2])
+
+
+def test_a_framed_watch_says_what_it_is_doing_before_the_first_reading(monkeypatch, tmp_path):
+    """Between frames the line must say so, and invent no number.
+
+    The generic "still running" for the first frame is the silence this exists to
+    remove, but the opposite failure -- a shot of a price that has not been read
+    yet -- would be worse. The placeholder names the frame length and states that
+    nothing has been read.
+    """
+    import asyncio
+
+    from nanobot.utils.live_label import clear_live_label, live_label_for
+
+    seen: list[str | None] = []
+
+    class _Framed(_FakeSandbox):
+        async def execute(self, **kwargs: Any) -> str:
+            self.calls.append(kwargs)
+            seen.append(live_label_for("mt5_sandbox"))
+            return _watch_frame("EYES ON: #777 EURUSD buy 0.1 - bid 1.1419")
+
+    clear_live_label("mt5_sandbox")
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _Framed()}))
+    try:
+        asyncio.run(tool.execute(action="watch", wait_seconds=15, pulse_seconds=15))
+        opening = seen[0] or ""
+        assert "nothing read yet" in opening
+        assert "15" in opening
+    finally:
+        clear_live_label("mt5_sandbox")
+
+
+def test_a_watch_without_a_pulse_is_still_one_command(monkeypatch, tmp_path):
+    """The framing is what the caller asked for, not a silent behaviour change."""
+    import asyncio
+
+    sandbox = _FakeSandbox(_watch_frame("EYES ON: #777 EURUSD buy 0.1 - bid 1.1419"))
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+    result = asyncio.run(tool.execute(action="watch", wait_seconds=90))
+
+    assert len(sandbox.calls) == 1
+    payload = json.loads(str(result))
+    assert "watch_frames" not in payload
+
+
+def test_a_frame_that_fails_mid_sequence_keeps_the_frames_already_shown():
+    """A partial watch is still an observation.
+
+    Throwing away two real frames because the third command hit a transport error
+    would be the worst of both: nothing shown, and nothing returned either.
+    """
+    import asyncio
+
+    from nanobot.utils.live_label import clear_live_label
+
+    class _Flaky(_FakeSandbox):
+        async def execute(self, **kwargs: Any) -> str:
+            self.calls.append(kwargs)
+            if len(self.calls) == 3:
+                raise RuntimeError("transport died")
+            return _watch_frame(f"EYES ON: #777 EURUSD buy 0.1 - bid 1.14{len(self.calls)}")
+
+    clear_live_label("mt5_sandbox")
+    sandbox = _Flaky()
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+    try:
+        result = asyncio.run(tool.execute(action="watch", wait_seconds=60, pulse_seconds=15))
+    finally:
+        clear_live_label("mt5_sandbox")
+
+    assert not getattr(result, "is_error", False)
+    payload = json.loads(str(result))
+    assert payload["watch_frames"]["count"] == 2
+    assert "- bid 1.142" in payload["watch_live"]["headline"], "the last GOOD frame is returned"
+
+
+def test_a_first_frame_that_fails_is_still_a_transport_error():
+    """Nothing observed is not a result: it must surface as the failure it is."""
+    import asyncio
+
+    class _Dead(_FakeSandbox):
+        async def execute(self, **kwargs: Any) -> str:
+            self.calls.append(kwargs)
+            raise RuntimeError("Command ended without an end event")
+
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": _Dead()}))
+    result = asyncio.run(tool.execute(action="watch", wait_seconds=30, pulse_seconds=15))
+
+    assert result.is_error
+    assert "MT5 sandbox call failed" in str(result)
+
+
+def test_a_framed_watch_is_bounded_in_time_and_in_commands():
+    """A frame sequence must not become a ten-minute tool call.
+
+    ``wait_seconds=90, pulse_seconds=5`` is a legitimate request (90 s of watching,
+    a reading every 5 s) and would be 18 round trips if it were taken literally.
+    Both caps are therefore part of the contract, not a detail.
+    """
+    from nanobot.agent.tools.mt5_sandbox import (
+        WATCH_FRAME_SECONDS,
+        WATCH_MAX_FRAMES,
+        WATCH_MIN_FRAME_SECONDS,
+        WATCH_VISIBLE_BUDGET_S,
+    )
+
+    assert WATCH_VISIBLE_BUDGET_S <= 120.0
+    assert WATCH_MAX_FRAMES <= 12
+    assert WATCH_MIN_FRAME_SECONDS >= 5.0, "each frame costs a whole sandbox command"
+    assert WATCH_FRAME_SECONDS >= WATCH_MIN_FRAME_SECONDS
+
+    import asyncio
+
+    from nanobot.utils.live_label import clear_live_label
+
+    class _Fast(_FakeSandbox):
+        """Answers instantly, which is the shape that would burst without a cap."""
+
+        async def execute(self, **kwargs: Any) -> str:
+            self.calls.append(kwargs)
+            return _watch_frame("EYES ON: #777 EURUSD buy 0.1 - bid 1.1419")
+
+    clear_live_label("mt5_sandbox")
+    sandbox = _Fast()
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+    try:
+        asyncio.run(tool.execute(action="watch", wait_seconds=90, pulse_seconds=1))
+    finally:
+        clear_live_label("mt5_sandbox")
+
+    # pulse_seconds=1 is below the floor, so the cadence is raised to it rather
+    # than obeyed: 18 round trips is not a watch, it is a hot loop.
+    assert len(sandbox.calls) == WATCH_MAX_FRAMES
+    assert "--wait-seconds 5" in sandbox.calls[1]["command"]
+
+
+def test_doing_anything_else_retires_the_frame():
+    """A frame describes a market being watched, and stops being true afterwards."""
+    import asyncio
+
+    from nanobot.utils.live_label import clear_live_label, live_label_for, publish_live_label
+
+    clear_live_label("mt5_sandbox")
+    sandbox = _FakeSandbox('{"ok": true, "positions": []}\n[exit_code=0]')
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+    publish_live_label("mt5_sandbox", "12:04:31 EYES ON: #777 EURUSD buy 0.1")
+    try:
+        asyncio.run(tool.execute(action="positions"))
+        assert live_label_for("mt5_sandbox") is None
+    finally:
+        clear_live_label("mt5_sandbox")

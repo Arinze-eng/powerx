@@ -2721,6 +2721,152 @@ def _watch_session_fold(
     }
 
 
+def _watch_live_view(
+    positions: list[Any],
+    prices: dict[str, Any],
+    steps: dict[str, Any],
+    guard: dict[str, Any],
+    state: dict[str, Any] | None,
+    trade_state: dict[str, Any],
+    observed: list[dict[str, Any]],
+    watched_seconds: float,
+    samples: int,
+    pips: dict[str, float],
+) -> dict[str, Any]:
+    """The frame, in words, so the watching can be SHOWN rather than claimed.
+
+    WHY THIS EXISTS: every number a watch produces was already in this payload,
+    and a caller still ended up telling the user "I am monitoring your trade".
+    The user cannot see a payload and cannot see a claim -- they can only see
+    what they are shown. This converts one frame of observation into the two or
+    three sentences that ARE the watching: the price it saw, the position it
+    saw, what the watcher has scanned, and the fact that it just looked.
+
+    Deliberately plain text with a timestamp on every line: it is meant to be
+    relayed to the user VERBATIM, and anything that needs decoding before it can
+    be repeated will not be repeated.
+    """
+    stamp = time.strftime("%H:%M:%S")
+    lines: list[str] = []
+    for symbol, row in (prices or {}).items():
+        if not row:
+            lines.append(f"{stamp}  {symbol}: no price could be read — not watching it")
+            continue
+        step = steps.get(symbol) or {}
+        pip = pips.get(symbol) or 0.0
+        moved = step.get("range_pips")
+        drift = step.get("drift_pips")
+        bits = [f"{symbol} bid {row.get('bid')}"]
+        if drift is not None and pip:
+            bits.append(f"{float(drift):+g} pips this frame")
+        if moved is not None and pip:
+            bits.append(f"range {float(moved):g} pips")
+        if row.get("spread") is not None and pip:
+            bits.append(f"spread {round(float(row['spread']) / pip, 1):g} pips")
+        lines.append(f"{stamp}  " + ", ".join(bits))
+
+    totals = (trade_state or {}).get("totals") or {}
+    # `_analyse_trade` reports its per-position arithmetic as a LIST; index it by
+    # ticket here so the frame can pair a position with its own R and distances.
+    analysed = {
+        str(row.get("ticket")): row
+        for row in (trade_state or {}).get("positions") or []
+    }
+    for position in positions or []:
+        ticket = position.get("ticket")
+        row = analysed.get(str(ticket)) or {}
+        symbol = position.get("symbol")
+        side = "buy" if float(position.get("type") or 0) == 0 else "sell"
+        bits = [
+            f"#{ticket} {symbol} {side} {position.get('volume')} from {position.get('price_open')}"
+        ]
+        if row.get("r_multiple") is not None:
+            bits.append(f"{float(row['r_multiple']):+.2f}R")
+        if row.get("pips_to_sl") is not None:
+            bits.append(f"{float(row['pips_to_sl']):g} pips to the stop")
+        if row.get("pips_to_tp") is not None:
+            bits.append(f"{float(row['pips_to_tp']):g} pips to the target")
+        profit = position.get("profit")
+        if profit is not None:
+            bits.append(f"P/L {profit}")
+        lines.append(f"{stamp}  " + ", ".join(bits))
+
+    ticks = (state or {}).get("ticks_scanned") or {}
+    scanned = sum(int(v or 0) for v in ticks.values()) if ticks else 0
+    # A live watcher with no armed rule protects NOTHING: it is polling the feed
+    # and comparing it against an empty list. Collapsing those two into "guard
+    # live" would let a frame report protection that does not exist, which is the
+    # same failure this frame was built to remove -- one level up.
+    rules = int(guard.get("rules_armed") or 0)
+    protected = bool(guard.get("live")) and rules > 0
+    if protected:
+        lines.append(
+            f"{stamp}  guard live: {rules} rule(s) armed, {scanned} ticks scanned"
+            + (
+                f", heartbeat {round(float(guard['heartbeat_age_s']), 1)}s ago"
+                if guard.get("heartbeat_age_s") is not None
+                else ""
+            )
+        )
+    elif guard.get("live"):
+        lines.append(
+            f"{stamp}  guard running but NO rule armed ({scanned} ticks scanned): "
+            "this frame can see the price and nothing is watching a level — arm one "
+            "with guard_action='arm'"
+        )
+    else:
+        lines.append(
+            f"{stamp}  guard NOT running: this frame can see the price but nothing "
+            "will act on it"
+        )
+
+    lines.append(
+        f"{stamp}  watched {watched_seconds:g}s ({samples} samples)"
+        + (
+            f" — observed {observed[-1].get('event')}"
+            if observed
+            else " — nothing triggered, frame complete"
+        )
+    )
+
+    if positions:
+        first = positions[0]
+        symbol = first.get("symbol")
+        head = (
+            f"EYES ON: #{first.get('ticket')} {symbol} "
+            f"{'buy' if float(first.get('type') or 0) == 0 else 'sell'} "
+            f"{first.get('volume')} — bid "
+            f"{(prices.get(symbol) or {}).get('bid')}"
+        )
+        if totals.get("profit_money") is not None:
+            head += f", P/L {totals['profit_money']}"
+        if totals.get("risk_money") is not None:
+            head += f", {totals['risk_money']} at risk"
+    elif prices:
+        symbol = next(iter(prices))
+        head = f"EYES ON: {symbol} — bid {(prices.get(symbol) or {}).get('bid')}, no position open"
+    else:
+        head = "NOTHING TO WATCH: no open position and no symbol given"
+
+    risk_money = totals.get("risk_money")
+    return {
+        "headline": head,
+        "lines": lines,
+        "relay": (
+            "Print `headline` and one `lines` entry to the user verbatim as this "
+            "frame arrives -- that print IS the visible watch. Then call watch "
+            "again with the same watch_session to continue the timeline. Never say "
+            "'I am monitoring' or 'I will report back': show the frame instead."
+        ),
+        "watched_s": watched_seconds,
+        "samples": samples,
+        "risk_money_still_open": risk_money,
+        "anything_watching_the_level": protected,
+        "guard_live": bool(guard.get("live")),
+        "rules_armed": rules,
+    }
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Watch a live trade: block, sample, and return what to think about.
 
@@ -2751,9 +2897,16 @@ def cmd_watch(args: argparse.Namespace) -> int:
         for s in (getattr(args, "symbol", None) or [])
         if str(s).strip()
     ]
-    budget = max(
-        0.0, min(float(getattr(args, "wait_seconds", 0.0) or 0.0), WATCH_MAX_WAIT_SECONDS)
+    asked_for = max(0.0, float(getattr(args, "wait_seconds", 0.0) or 0.0))
+    pulse = max(0.0, float(getattr(args, "pulse_seconds", 0.0) or 0.0))
+    # The cap is the PULSE when one was asked for, so a visible watch returns a
+    # frame instead of one long silence. `effective_cap` is reported below, and
+    # `wait_seconds_asked` keeps the request visible next to what was granted --
+    # a silent clamp is how a caller concludes the tool ignored it.
+    effective_cap = min(
+        WATCH_MAX_WAIT_SECONDS, pulse if pulse > 0.0 else WATCH_MAX_WAIT_SECONDS
     )
+    budget = max(0.0, min(asked_for, effective_cap))
     poll = max(0.2, float(getattr(args, "poll_seconds", 1.0) or 1.0))
     started = time.time()
 
@@ -2859,7 +3012,24 @@ def cmd_watch(args: argparse.Namespace) -> int:
         equity = None
     trade_state = _analyse_trade(positions, pips, prices, contracts, equity)
 
+    live_view = _watch_live_view(
+        [p._asdict() for p in positions],
+        prices,
+        steps,
+        guard,
+        state,
+        trade_state,
+        observed,
+        watched_seconds,
+        samples,
+        pips,
+    )
     payload: dict[str, Any] = {
+        # THE FRAME, IN WORDS, FIRST. Everything below is the same observation in
+        # structured form; this is the part that is meant to be SHOWN to the user
+        # as it arrives, because a watch that is never shown is a watch nobody
+        # can tell from no watch at all.
+        "watch_live": live_view,
         "ok": True,
         "position_count": len(positions),
         # The trade's own arithmetic: R multiple, pips to the stop and the
@@ -2893,7 +3063,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
             "samples": samples,
             "poll_seconds": poll,
             "timed_out": not observed,
-            "capped_at_s": WATCH_MAX_WAIT_SECONDS,
+            "capped_at_s": effective_cap,
+            "pulse_seconds": pulse or None,
+            "wait_seconds_asked": asked_for,
             "positions_at_start": sorted(tickets_at_start),
             "note": (
                 f"observed '{observed[-1].get('event')}' after {watched_seconds} s "
@@ -2903,6 +3075,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     f"nothing happened in {watched_seconds} s of watching "
                     f"({samples} samples): no fire, no refused close, no near miss, "
                     "no position change, and the watcher is still up. "
+                    + (
+                        f"This frame is {watched_seconds:g} s of a visible "
+                        f"{effective_cap:g} s pulse: show watch_live.headline to the "
+                        "user and call watch again to keep the frames coming. "
+                        if pulse > 0.0
+                        else ""
+                    )
+                    + ""
                     + (
                         "Price moved: "
                         + "; ".join(
@@ -5232,6 +5412,21 @@ GUARD_NEAR_MISS_COOLDOWN_SECONDS = 5.0
 #: the ceiling. Every answer carries ``capped_at_s`` and ``timed_out``, so the
 #: model calls again rather than being cut off with nothing to show.
 WATCH_MAX_WAIT_SECONDS = 90.0
+
+#: The cadence a VISIBLE watch is expected to use, in seconds.
+#:
+#: WHY THIS NUMBER EXISTS: a caller that watches a trade but never says so is
+#: indistinguishable from one that is doing nothing -- "I am monitoring it" is a
+#: claim, and the user cannot see a claim. Observation has to be SHOWN, and what
+#: makes it visible is the frames arriving: a short wait returns a fresh frame
+#: often enough that the watching is the thing on screen. 20 s is the balance --
+#: long enough that a frame says something (a 20 s price path, a tick count that
+#: moved), short enough that the next one is visibly coming.
+#:
+#: This is a CAP, not a requirement: ``--wait-seconds`` above it is clamped down
+#: to it, and the payload carries ``capped_at_s`` and ``pulse_seconds`` so a
+#: caller can always tell why the wait was shorter than it asked for.
+WATCH_PULSE_SECONDS = 20.0
 
 #: The guard's wait is whichever name a reader looks for; it is the same number
 #: and must stay the same number, or one path would be holding a command open
@@ -8333,6 +8528,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="watch --wait-seconds: how often to sample (default 1 s)",
+    )
+    p.add_argument(
+        "--pulse-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "cap this call at N seconds so it returns a VISIBLE frame instead of "
+            "one long silence. A watch nobody can see is indistinguishable from no "
+            f"watch: pass {int(WATCH_PULSE_SECONDS)} while a trade is live, print "
+            "the returned watch_live.headline, and call again -- the frames "
+            "arriving IS the watching. 0 (default) leaves --wait-seconds alone"
+        ),
     )
     p.add_argument("--lines", type=int, default=20, help="guard events to return")
     p.add_argument(
