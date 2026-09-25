@@ -1645,6 +1645,13 @@ class AgentLoop:
                             session_key_override=effective_key,
                         )
                     try:
+                        if await self._try_route_steer(pending_msg, effective_key, raw):
+                            logger.info(
+                                "Steered live turn for session {} instead of "
+                                "queuing for injection",
+                                effective_key,
+                            )
+                            continue
                         self._pending_queues[effective_key].put_nowait(pending_msg)
                     except asyncio.QueueFull:
                         logger.warning(
@@ -1670,6 +1677,58 @@ class AgentLoop:
                 task.add_done_callback(active_tasks.discard)
         finally:
             await self.aclose()
+
+    def steering_enabled(self) -> bool:
+        """Global default: should plain follow-ups steer a live turn?
+
+        Off by default so behaviour is unchanged until explicitly turned on
+        with POWERX_STEER_MID_SESSION=1. Per-message metadata always beats
+        this switch.
+        """
+        return bool(os.environ.get("POWERX_STEER_MID_SESSION"))
+
+    def _should_steer(self, msg: InboundMessage, raw: str) -> bool:
+        """Decide whether this follow-up preempts the running turn.
+
+        Precedence: an explicit per-message ``steer`` flag wins both ways, so
+        metadata can force steering on, or veto the global default. Anything
+        that is not plain user input never steers: system turns, control
+        messages and commands keep their existing paths, because routing those
+        into a steer would change semantics the caller did not ask for.
+        """
+        flag = msg.metadata.get("steer")
+        if flag is not None:
+            return bool(flag)
+        if not self.steering_enabled():
+            return False
+        if msg.channel == "system" or not msg.is_user_input:
+            return False
+        if self.commands.is_dispatchable_command(raw) or self.commands.is_priority(raw):
+            return False
+        return True
+
+    async def _try_route_steer(
+        self, msg: InboundMessage, session_key: str, raw: str
+    ) -> bool:
+        """Steer the live turn for *session_key*; False if injection should run.
+
+        Falls back rather than swallowing: if the policy declines, or no inbox
+        is published (or it has already closed as the turn wound down), the
+        caller still routes the message to the pending queue, so a follow-up is
+        never lost.
+        """
+        if not self._should_steer(msg, raw):
+            return False
+        text = msg.content if isinstance(msg.content, str) else str(msg.content or "")
+        if not text.strip():
+            return False
+        if not self.steer(session_key, text):
+            logger.debug(
+                "No live inbox for session {}; falling back to injection",
+                session_key,
+            )
+            return False
+        return True
 
     def steer(self, session_key: str, text: str, *, source: str = "user") -> bool:
         """Queue a mid-run steer for a session that is currently executing.
