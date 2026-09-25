@@ -916,19 +916,30 @@ async def test_not_installed_refusal_auto_provisions_instead_of_erroring(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_install_action_itself_does_not_recurse_into_auto_provision():
-    """action='install' must not auto-provision itself forever."""
-    payload = (
-        '{"ok": true, "detached": true, "stage": "in_progress"}\n[exit_code=0]'
+async def test_install_action_waits_without_re_issuing_itself():
+    """action='install' waits for its OWN install, and must not restart it.
+
+    A detached start is work in flight, not a result, so the tool watches it to a
+    terminal stage inside this call. This pins the two properties that keeps true:
+    the wait polls ``status``, and it never fires a second install -- the
+    re-provisioning path exists for actions that need a chain, not for install
+    itself, and a self-restarting install is an install that never finishes.
+    """
+    sandbox = _QueuedSandbox(
+        [
+            '{"ok": true, "detached": true, "pid": "14144"}\n[exit_code=0]',
+            '{"ok": true, "stage": "done", "installed": true}\n[exit_code=0]',
+        ]
     )
-    sandbox = _FakeSandbox(payload)
     tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
 
     result = await tool.execute(action="install")
+    rendered = str(result)
 
-    # Exactly one forwarded call: install must not trigger a second one.
-    assert len(sandbox.calls) == 1
-    assert "detached" in str(result)
+    installs = [c for c in sandbox.calls if "mt5_cli.py install" in str(c["command"])]
+    assert len(installs) == 1, "install must not re-issue itself"
+    assert '"stage": "done"' in rendered
+    assert '"detached": true' not in rendered
 
 
 def test_tool_description_mandates_install_before_compile():
@@ -6087,3 +6098,44 @@ async def test_an_install_refusal_is_resolved_by_the_tool_not_the_user(monkeypat
     assert "exness5setup.exe" not in str(installs[-1]["command"])
     assert "MT5_BROKER_DIR_NAME" in str(installs[-1]["command"])
     assert "resolved_installer_url" in rendered
+
+
+def test_an_install_that_started_detached_is_still_work_in_flight():
+    """``stage`` is not the only shape an unfinished install has.
+
+    A detached start answers with ``detached: true`` and a pid and NO ``stage``, so a
+    wait keyed on ``stage`` alone skips every ordinary install. MEASURED 2026-09-25,
+    live: the agent's own ``install --server AXI-Live`` returned in 3 s with
+    ``{"detached": true, "pid": "14144"}`` and a "poll until done" hint -- the poll
+    handed back to the caller, against this tool's own rule.
+    """
+    from nanobot.agent.tools.mt5_sandbox import _install_in_flight
+
+    assert _install_in_flight({"ok": True, "detached": True, "pid": "14144"}) is True
+    assert _install_in_flight({"ok": True, "stage": "installing"}) is True
+    # Everything that is over, or never started, must NOT be waited on.
+    assert _install_in_flight({"ok": True, "stage": "done"}) is False
+    assert _install_in_flight({"ok": False, "detached": True}) is False
+    assert _install_in_flight({"ok": True, "stage": "failed"}) is False
+    assert _install_in_flight({}) is False
+
+
+@pytest.mark.asyncio
+async def test_the_agent_install_waits_out_a_detached_start():
+    """One call does the whole job: kick the install, then watch it to a terminal stage."""
+    sandbox = _QueuedSandbox(
+        [
+            '{"ok": true, "detached": true, "pid": "14144", "broker": "deriv"}\n[exit_code=0]',
+            '{"ok": true, "stage": "done", "installed": true}\n[exit_code=0]',
+        ]
+    )
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+
+    result = await tool.execute(action="install", server="Deriv-Demo")
+    rendered = str(result)
+
+    assert '"stage": "done"' in rendered
+    assert '"detached": true' not in rendered, "the start payload must not be the answer"
+    assert any("mt5_cli.py status" in str(c["command"]) for c in sandbox.calls), (
+        "the tool must poll status rather than hand the poll back to the model"
+    )

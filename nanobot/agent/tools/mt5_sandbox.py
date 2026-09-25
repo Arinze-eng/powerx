@@ -726,6 +726,28 @@ def _host_plan(kwargs: dict[str, Any]) -> str:
     return json.dumps(result)
 
 
+def _install_in_flight(payload: dict[str, Any]) -> bool:
+    """Whether an ``install`` payload describes work that STARTED and has not ended.
+
+    ``stage`` is the polled vocabulary, but a DETACHED start answers with no ``stage``
+    at all: it carries ``detached: true`` and a pid. Keying the wait on ``stage`` alone
+    therefore skipped the wait for every ordinary install -- which is exactly the stall
+    the wait exists to remove. The tool answered "installing, poll until done", the
+    model ended its turn, and the install carried on with nobody watching it.
+
+    MEASURED 2026-09-25, live (box i1msgk2l82okd3m0kqycs): the agent's own
+    ``install --server AXI-Live`` returned in **3 seconds** with
+    ``{"detached": true, "pid": "14144", ...}`` -- no ``stage``, so neither wait
+    branch fired and the poll was handed straight back to the caller, against this
+    tool's own documented rule and against the skill's "install waits for you now".
+    """
+    if payload.get("ok") is False:
+        return False
+    if payload.get("detached"):
+        return True
+    return str(payload.get("stage") or "") == "installing"
+
+
 def _page_urls(kwargs: dict[str, Any]) -> list[str]:
     """The caller's ``page_urls`` as minable text: each entry both fetched and raw.
 
@@ -2041,7 +2063,7 @@ class MT5SandboxTool(Tool):
         # action='install' is detached and reports "installing" immediately. Rather
         # than handing that back and hoping the model comes back to poll (the stall
         # this fixes), wait for a terminal stage here so one call does the whole job.
-        if action == "install" and str(payload.get("stage") or "") == "installing":
+        if action == "install" and _install_in_flight(payload):
             waited = await self._wait_for_install(sandbox)
             if waited:
                 if "password" in waited:
@@ -2267,7 +2289,7 @@ class MT5SandboxTool(Tool):
 
         # Same wait discipline as a normal install: detached, so this call owns the
         # wait rather than handing the model an "installing, go poll" instruction.
-        if str(payload.get("stage") or "") == "installing":
+        if _install_in_flight(payload):
             waited = await self._wait_for_install(sandbox)
             if waited:
                 if "password" in waited:
