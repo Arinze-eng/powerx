@@ -202,4 +202,76 @@ describe("useScreenStream", () => {
       }
     }
   });
+
+  it("takes the capture location from the ack, since frames cannot say where they came from", async () => {
+    const { client, emit } = makeClient();
+    const { result } = renderHook(() => useScreenStream("chat-1"), {
+      wrapper: wrapper(client),
+    });
+
+    // Pixels are identical either way, so the subscribe ack is the only thing
+    // that can tell a sandbox desktop from the gateway's own display.
+    expect(result.current.location).toBeNull();
+
+    act(() => {
+      emit("chat-1", {
+        event: "screen_subscribed",
+        chat_id: "chat-1",
+        display: ":99",
+        location: "host",
+        interval_s: 1,
+      });
+    });
+
+    await waitFor(() => expect(result.current.location).toBe("host"));
+    expect(result.current.display).toBe(":99");
+    expect(result.current.intervalS).toBe(1);
+    expect(result.current.subscribed).toBe(true);
+  });
+
+  it("keeps the announced location when frames and errors arrive", async () => {
+    const { client, emit } = makeClient();
+    const { result } = renderHook(() => useScreenStream("chat-1"), {
+      wrapper: wrapper(client),
+    });
+
+    act(() => {
+      emit("chat-1", {
+        event: "screen_subscribed",
+        chat_id: "chat-1",
+        display: ":99",
+        location: "sandbox",
+        interval_s: 2,
+      });
+    });
+    await waitFor(() => expect(result.current.location).toBe("sandbox"));
+
+    act(() => emit("chat-1", frame()));
+    await waitFor(() => expect(result.current.imageSrc).not.toBeNull());
+    expect(result.current.location).toBe("sandbox");
+
+    // A transient capture failure must not silently relocate the panel.
+    act(() => emit("chat-1", { event: "screen_error", chat_id: "chat-1", detail: "boom" }));
+    await waitFor(() => expect(result.current.error).toBe("boom"));
+    expect(result.current.location).toBe("sandbox");
+  });
+
+  it("does not invent a location when the ack omits one", async () => {
+    const { client, emit } = makeClient();
+    const { result } = renderHook(() => useScreenStream("chat-1"), {
+      wrapper: wrapper(client),
+    });
+
+    act(() => {
+      emit("chat-1", {
+        event: "screen_subscribed",
+        chat_id: "chat-1",
+        display: ":99",
+        interval_s: 1,
+      });
+    });
+
+    await waitFor(() => expect(result.current.display).toBe(":99"));
+    expect(result.current.location).toBeNull();
+  });
 });
