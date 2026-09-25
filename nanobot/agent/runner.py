@@ -1616,6 +1616,7 @@ class AgentRunner:
             )
         elif wants_progress_streaming:
             stream_buf = ""
+            thinking_buf = ""
             think_extractor = IncrementalThinkExtractor()
             progress_state = {"reasoning_open": False}
 
@@ -1642,10 +1643,53 @@ class AgentRunner:
                     if callback is not None:
                         await callback(incremental)
 
+            async def _thinking_progress(delta: str) -> None:
+                """Stream reasoning that arrives in its own field, not in content.
+
+                The streaming branch has always had this; the progress branch
+                did not, and two things went wrong without it. A provider that
+                returns reasoning as ``reasoning_content`` (GLM, DeepSeek,
+                Claude) delivered nothing to the user for the whole think, so a
+                slow model produced minutes of silence. And because
+                ``_generation_delta`` is what stops the "still waiting on the
+                model" narrator, that narrator kept ticking while the model was
+                visibly working -- the UI reported waiting on a model that had
+                already started answering.
+
+                ``IncrementalThinkExtractor`` above covers models that put
+                reasoning *inline* in content; this covers the separate-field
+                ones. The two cannot overlap for one model:
+                ``_extract_text_content`` drops Mistral-style ``thinking``
+                blocks from the content callback, and the provider only invokes
+                this callback from ``reasoning_content``/``reasoning`` or from
+                those same blocks. Each chunk therefore reaches exactly one
+                handler.
+
+                Deliberately a line-for-line copy of ``_thinking`` in the
+                ``wants_streaming`` branch. A gateway that wraps
+                ``reasoning_content`` in ``<think>`` tags must render the same
+                way on both branches, and the non-streaming path already strips
+                them in ``extract_reasoning``. Buffering is what makes the strip
+                safe when a tag straddles a delta boundary.
+                """
+                nonlocal thinking_buf
+                if not delta:
+                    return
+                _generation_delta(delta)
+                prev_clean = strip_reasoning_tags(thinking_buf)
+                thinking_buf += delta
+                new_clean = strip_reasoning_tags(thinking_buf)
+                incremental = new_clean[len(prev_clean):]
+                if incremental:
+                    context.streamed_reasoning = True
+                    progress_state["reasoning_open"] = True
+                    await hook.emit_reasoning(incremental)
+
             coro = spec.runtime.provider.chat_stream_with_retry(
                 **kwargs,
                 provider_context=provider_context,
                 on_content_delta=_stream_progress,
+                on_thinking_delta=_thinking_progress,
                 on_tool_call_delta=_provider_tool_event,
             )
         else:

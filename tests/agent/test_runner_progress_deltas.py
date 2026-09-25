@@ -498,3 +498,221 @@ async def test_runner_marks_file_edit_activity_failed_when_cancelled(tmp_path):
     assert progress_events[-1]["status"] == "error"
     assert progress_events[-1]["error"] == "Task interrupted before this tool finished."
     provider.chat_with_retry.assert_not_awaited()
+
+
+def _reasoning_progress_recorder() -> tuple[
+    "Callable[..., object]",
+    list[str],
+    list[str],
+    list[int],
+]:
+    """Return (callback, reasoning_chunks, answer_chunks, reasoning_end_count)."""
+    reasoning_chunks: list[str] = []
+    answer_chunks: list[str] = []
+    ends: list[int] = [0]
+
+    async def progress_cb(content, *, reasoning=False, reasoning_end=False, **kwargs):
+        if reasoning:
+            reasoning_chunks.append(content)
+        elif reasoning_end:
+            ends[0] += 1
+        else:
+            answer_chunks.append(content)
+
+    return progress_cb, reasoning_chunks, answer_chunks, ends
+
+
+async def _run_progress_branch(provider, progress_cb) -> object:
+    """Drive one turn down the wants_progress_streaming branch.
+
+    ``AgentProgressHook`` without ``on_stream`` reports ``wants_streaming()``
+    False, which is what selects the branch under test.
+    """
+    runner = AgentRunner()
+    return await runner.run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "hi"}],
+        tools=MagicMock(get_definitions=lambda: []),
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        progress_callback=progress_cb,
+        hook=AgentProgressHook(on_progress=progress_cb),
+    ))
+
+
+@pytest.mark.asyncio
+async def test_progress_branch_streams_reasoning_from_the_provider_field():
+    """Reasoning in ``reasoning_content`` reaches the user while the model thinks.
+
+    Regression guard for the gap this fixed: the ``wants_progress_streaming``
+    branch of ``_request_model`` never passed ``on_thinking_delta``, so a model
+    that returns reasoning in its own field (GLM, DeepSeek, Claude) emitted
+    nothing for the whole think -- minutes of silence on a slow model -- and
+    ``_generation_delta`` never ran, so the "waiting on the model" narrator
+    kept ticking while the model was already talking.
+    """
+    provider = MagicMock()
+    provider.supports_progress_deltas = True
+    seen_thinking_callback: list[object] = []
+
+    async def chat_stream_with_retry(
+        *, on_content_delta, on_thinking_delta=None, **kwargs
+    ):
+        seen_thinking_callback.append(on_thinking_delta)
+        await on_thinking_delta("We")
+        await on_thinking_delta("igh.")
+        await on_content_delta("42")
+        return LLMResponse(
+            content="42",
+            tool_calls=[],
+            usage={},
+            reasoning_content="Weigh.",
+        )
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    provider.chat_with_retry = AsyncMock()
+
+    progress_cb, reasoning_chunks, answer_chunks, ends = _reasoning_progress_recorder()
+    result = await _run_progress_branch(provider, progress_cb)
+
+    assert seen_thinking_callback and seen_thinking_callback[0] is not None, (
+        "the progress branch must hand the provider a real on_thinking_delta"
+    )
+    assert reasoning_chunks == ["We", "igh."]
+    # Exactly one close, and no replay of the full reasoning block afterwards.
+    assert ends[0] == 1
+    assert "42" in answer_chunks
+    assert result.final_content == "42"
+    provider.chat_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_renders_identically_on_both_streaming_branches():
+    """The same provider output must render the same reasoning either way.
+
+    The streaming branch and the progress branch are the same request made for
+    two kinds of consumer. Before this change the progress branch had no
+    reasoning handler at all, so a reasoning-field model showed its think to a
+    streaming client and nothing to a progress-only one. Feeding both branches
+    the identical delta sequence is the cheapest way to hold them together.
+    """
+    deltas = ["<thi", "nk>Weigh", " it.</think>", "Done."]
+
+    async def drive(*, streaming: bool) -> list[str]:
+        provider = MagicMock()
+        provider.supports_progress_deltas = True
+
+        async def chat_stream_with_retry(
+            *, on_content_delta, on_thinking_delta=None, on_stream_recover=None,
+            **kwargs,
+        ):
+            for chunk in deltas:
+                await on_thinking_delta(chunk)
+            await on_content_delta("42")
+            return LLMResponse(
+                content="42",
+                tool_calls=[],
+                usage={},
+                reasoning_content="".join(deltas),
+            )
+
+        provider.chat_stream_with_retry = chat_stream_with_retry
+        provider.chat_with_retry = AsyncMock()
+
+        reasoning_chunks: list[str] = []
+
+        async def progress_cb(content, *, reasoning=False, reasoning_end=False, **kwargs):
+            if reasoning:
+                reasoning_chunks.append(content)
+
+        hook = AgentProgressHook(
+            on_progress=progress_cb,
+            on_stream=((lambda delta: asyncio.sleep(0)) if streaming else None),
+        )
+        runner = AgentRunner()
+        await runner.run(make_run_spec(provider,
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=MagicMock(get_definitions=lambda: []),
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            progress_callback=progress_cb,
+            hook=hook,
+        ))
+        return reasoning_chunks
+
+    streamed = await drive(streaming=True)
+    progressed = await drive(streaming=False)
+
+    assert progressed == streamed
+
+
+@pytest.mark.asyncio
+async def test_progress_branch_ignores_empty_thinking_deltas():
+    """An empty thinking delta must not open an empty reasoning bubble.
+
+    Providers legitimately send keep-alive chunks with no reasoning text. If
+    those set ``reasoning_open``, the turn closes a reasoning segment that never
+    had content and the UI shows an empty block.
+    """
+    provider = MagicMock()
+    provider.supports_progress_deltas = True
+
+    async def chat_stream_with_retry(
+        *, on_content_delta, on_thinking_delta=None, **kwargs
+    ):
+        await on_thinking_delta("")
+        await on_content_delta("42")
+        return LLMResponse(content="42", tool_calls=[], usage={})
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    provider.chat_with_retry = AsyncMock()
+
+    progress_cb, reasoning_chunks, answer_chunks, ends = _reasoning_progress_recorder()
+    await _run_progress_branch(provider, progress_cb)
+
+    assert reasoning_chunks == []
+    assert ends[0] == 0
+    assert "42" in answer_chunks
+
+
+@pytest.mark.asyncio
+async def test_reasoning_delta_stops_the_waiting_narrator(monkeypatch):
+    """The first reasoning delta ends the "waiting on the model" narration.
+
+    ``_generation_delta`` is what ``_watch_model_wait`` polls; the progress
+    branch previously only called it from content deltas, so a model that thinks
+    first was narrated as silent for the whole think.
+    """
+    monkeypatch.setenv("NANOBOT_MODEL_HEARTBEAT_S", "0.02")
+    provider = MagicMock()
+    provider.supports_progress_deltas = True
+
+    async def chat_stream_with_retry(
+        *, on_content_delta, on_thinking_delta=None, **kwargs
+    ):
+        await asyncio.sleep(0.06)
+        await on_thinking_delta("thinking")
+        await asyncio.sleep(0.4)
+        await on_content_delta("42")
+        return LLMResponse(content="42", tool_calls=[], usage={})
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    provider.chat_with_retry = AsyncMock()
+
+    progress_cb, _reasoning, _answer, _ends = _reasoning_progress_recorder()
+    beats: list[str] = []
+
+    async def counting_cb(content, *, reasoning=False, reasoning_end=False, **kwargs):
+        if not reasoning and not reasoning_end and isinstance(content, str):
+            beats.append(content)
+        await progress_cb(
+            content, reasoning=reasoning, reasoning_end=reasoning_end, **kwargs
+        )
+
+    await _run_progress_branch(provider, counting_cb)
+
+    narrations = [b for b in beats if b.startswith("waiting for the model")]
+    # ~0.46s at a 0.02s tick would be ~23 narrations if the thinking delta did
+    # not stop the watcher.
+    assert len(narrations) < 10, narrations
