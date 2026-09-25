@@ -7,16 +7,19 @@ import {
   Play,
   RefreshCw,
   Shrink,
+  TerminalSquare,
   TriangleAlert,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
+import { SandboxActivityPanel } from "@/components/screen/SandboxActivityPanel";
 import {
   SCREEN_DEFAULT_INTERVAL_S,
   SCREEN_MIN_INTERVAL_S,
   useScreenStream,
 } from "@/hooks/useScreenStream";
+import { useSandboxActivity } from "@/hooks/useSandboxActivity";
 import type { ChatSummary } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -63,11 +66,32 @@ export function ScreenView(props: ScreenViewProps) {
   const [zoomed, setZoomed] = useState(false);
   const [intervalS, setIntervalS] = useState<number>(SCREEN_DEFAULT_INTERVAL_S);
   const [showPicker, setShowPicker] = useState(false);
+  const [showActivity, setShowActivity] = useState(true);
+  // Clearing is the panel's own scrollback, not the agent's history: rows are
+  // hidden by timestamp so nothing the agent is still doing is discarded, and a
+  // re-open of the panel does not resurrect lines the operator cleared away.
+  const [clearedBefore, setClearedBefore] = useState(0);
 
   const stream = useScreenStream(props.chatId, {
     enabled: !paused,
     intervalS,
   });
+
+  // Fed from the chat's own tool events, so it works on any sandbox backend and
+  // does not depend on the desktop repainting — see `lib/sandbox-activity.ts`.
+  const activity = useSandboxActivity(props.chatId, { enabled: showActivity });
+
+  const visibleActivity = useMemo(() => {
+    if (clearedBefore === 0) return activity;
+    const rows = activity.rows.filter((row) => row.startedAt > clearedBefore);
+    return {
+      ...activity,
+      rows,
+      trades: activity.trades.filter((row) => row.startedAt > clearedBefore),
+    };
+  }, [activity, clearedBefore]);
+
+  const handleClearActivity = useCallback(() => setClearedBefore(Date.now()), []);
 
   const chatLabel = useMemo(() => {
     if (!props.chatId) return null;
@@ -112,6 +136,22 @@ export function ScreenView(props: ScreenViewProps) {
               {t("screen.changeChat", { defaultValue: "Change topic" })}
             </Button>
           )}
+          <Button
+            type="button"
+            variant={showActivity ? "secondary" : "ghost"}
+            size="sm"
+            onClick={() => setShowActivity((value) => !value)}
+            aria-pressed={showActivity}
+            className="gap-1.5 text-xs"
+          >
+            <TerminalSquare className="h-3.5 w-3.5" />
+            {t("screen.activityToggle", { defaultValue: "Terminal" })}
+            {activity.trades.length > 0 ? (
+              <span className="rounded-full bg-amber-500/20 px-1.5 text-[10px] font-medium text-amber-400">
+                {activity.trades.length}
+              </span>
+            ) : null}
+          </Button>
           <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <span className="sr-only">{t("screen.rate", { defaultValue: "Refresh rate" })}</span>
             <select
@@ -198,6 +238,15 @@ export function ScreenView(props: ScreenViewProps) {
         </div>
       ) : null}
 
+      <div
+        className={cn(
+          "flex min-h-0 flex-1",
+          // Stacked below the frame on a phone, side by side once there is width
+          // for both: the feed is the primary surface for a trade, but the
+          // desktop is what the panel exists for.
+          showActivity && "flex-col lg:flex-row",
+        )}
+      >
       <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-auto bg-neutral-950 p-3 sm:p-6">
         {!props.chatId ? (
           <EmptyPanel
@@ -258,6 +307,21 @@ export function ScreenView(props: ScreenViewProps) {
             </span>
           </div>
         ) : null}
+      </div>
+
+      {showActivity ? (
+        <SandboxActivityPanel
+          rows={visibleActivity.rows}
+          trades={visibleActivity.trades}
+          busy={visibleActivity.busy}
+          chatId={props.chatId}
+          onClear={handleClearActivity}
+          className={cn(
+            "shrink-0 rounded-none border-0 border-t border-border/60 lg:w-[26rem] lg:border-l lg:border-t-0 xl:w-[30rem]",
+            "h-64 lg:h-auto",
+          )}
+        />
+      ) : null}
       </div>
 
       <footer className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-border/60 px-4 py-2 text-[11px] text-muted-foreground sm:px-6">
