@@ -1240,6 +1240,113 @@ class NovitaSandboxTool(Tool):
                         timeout=30,
                     )
 
+    async def _analyze_telegram_images_vercel(
+        self,
+        image_paths: list[tuple[Path, bytes]],
+        *,
+        config: Any,
+        session_key: str,
+        _retry_on_failure: bool = True,
+    ) -> str:
+        """Tesseract OCR for Telegram images inside a Vercel Sandbox.
+
+        Mirrors the Upstash path, with one difference worth stating plainly: a
+        Vercel Sandbox runs as the unprivileged ``vercel`` user in a stock
+        runtime, so the package install below is best-effort and normally cannot
+        succeed — there is no sudo to drive and no package manager the sandbox
+        user may use. That is not a failure of this path: the OCR script degrades
+        to a Pillow-only reading and says so, which is a useful answer.
+
+        What was *not* acceptable was the previous behaviour. A Vercel deployment
+        had no branch here at all, so every image fell through to the Novita path
+        — running OCR in the wrong sandbox when a Novita key happened to be
+        configured, and refusing outright when it was not. That is the reported
+        "OCR doesn't work on Vercel".
+        """
+        backend = self._vercel_backend(config, session_key or "telegram")
+        root = backend.workspace
+        ocr_dir = f"{root}/.nanobot"
+        remote_paths: list[str] = []
+        manifest_path = f"{ocr_dir}/telegram_image_manifest.json"
+        script_path = f"{ocr_dir}/telegram_image_ocr.py"
+        sandbox_reset = False
+        try:
+            await backend.run(
+                f"mkdir -p {shlex.quote(ocr_dir)} {shlex.quote(f'{root}/telegram-images')}",
+                timeout=60,
+            )
+            probe = await backend.run(
+                "if command -v tesseract >/dev/null 2>&1; then printf READY; else printf MISSING; fi",
+                timeout=30,
+            )
+            if "READY" not in probe:
+                # Reuse the shared resilient installer: it tries each candidate
+                # package group independently and never raises, which matters
+                # here because a Vercel Sandbox is an unprivileged stock
+                # runtime — `apt-get` usually cannot run at all, and a single
+                # combined install would hard-fail the whole OCR pass. The
+                # script then degrades to a Pillow-only reading and reports
+                # that honestly instead of claiming OCR ran.
+                installed = await _install_tesseract_resilient(backend)
+                if not installed:
+                    logger.info(
+                        "Vercel Sandbox: tesseract could not be installed; the OCR script "
+                        "will report the Pillow-only reading instead"
+                    )
+            await backend.write(script_path, _TELEGRAM_IMAGE_SCRIPT)
+            for path, raw in image_paths:
+                suffix = path.suffix.lower() if path.suffix else ".img"
+                remote_path = f"{root}/telegram-images/{uuid4().hex}{suffix}"
+                remote_paths.append(remote_path)
+                await backend.write_bytes(remote_path, raw)
+            await backend.write(manifest_path, json.dumps(remote_paths))
+            output = await backend.run(
+                "env NANOBOT_OCR_ALLOW_INSTALL=1 NANOBOT_OCR_ALLOW_PILLOW_INSTALL=1 "
+                "NANOBOT_OCR_TIMEOUT_SECONDS=90 "
+                f"python3 {shlex.quote(script_path)} {shlex.quote(manifest_path)}",
+                timeout=180,
+            )
+            stdout = output.split("\n[stderr]", 1)[0].strip()
+            parsed: Any | None = None
+            try:
+                parsed = json.loads(stdout)
+            except (TypeError, ValueError):
+                for line in reversed(stdout.splitlines()):
+                    candidate = line.strip()
+                    if not candidate.startswith("{"):
+                        continue
+                    try:
+                        parsed = json.loads(candidate)
+                        break
+                    except ValueError:
+                        continue
+            if not isinstance(parsed, dict) or not str(parsed.get("content") or "").strip():
+                logger.warning("Vercel Sandbox returned no usable Tesseract OCR result")
+                return "[Vercel Sandbox OCR returned no readable result.]"
+            return str(parsed["content"]).strip()[:_MAX_IMAGE_ANALYSIS_RESULT_CHARS]
+        except Exception as exc:
+            logger.warning("Vercel Sandbox OCR failed: {}", type(exc).__name__)
+            if _retry_on_failure:
+                sandbox_reset = True
+                with suppress(Exception):
+                    await backend.reset(_VERCEL_STORE.sandbox_id(session_key or "telegram"))
+                _VERCEL_STORE.remove(session_key or "telegram")
+                return await self._analyze_telegram_images_vercel(
+                    image_paths,
+                    config=config,
+                    session_key=session_key,
+                    _retry_on_failure=False,
+                )
+            return "[Vercel Sandbox Tesseract OCR failed.]"
+        finally:
+            if remote_paths and not sandbox_reset:
+                with suppress(Exception):
+                    await backend.run(
+                        "rm -f " + " ".join(shlex.quote(path) for path in remote_paths)
+                        + f" {shlex.quote(manifest_path)} {shlex.quote(script_path)}",
+                        timeout=30,
+                    )
+
     async def analyze_telegram_images(
         self,
         image_paths: list[str],
@@ -1316,6 +1423,26 @@ class NovitaSandboxTool(Tool):
                 return "[No readable Telegram images were available to Upstash Box.]"
             return await self._analyze_telegram_images_upstash(
                 upstash_images, config=backend_config, session_key=session_key
+            )
+        if selected_backend == "vercel":
+            if backend_config is None or not str(backend_config.token or "").strip():
+                return "[Vercel execution is selected but no token is configured.]"
+            vercel_images: list[tuple[Path, bytes]] = []
+            for raw_path in image_paths[:_MAX_TELEGRAM_IMAGE_COUNT]:
+                path = Path(raw_path).expanduser().resolve()
+                try:
+                    raw = path.read_bytes()
+                except OSError:
+                    continue
+                if not raw or len(raw) > _MAX_TELEGRAM_IMAGE_BYTES:
+                    continue
+                mime = detect_image_mime(raw) or mimetypes.guess_type(str(path))[0]
+                if mime and mime.startswith("image/"):
+                    vercel_images.append((path, raw))
+            if not vercel_images:
+                return "[No readable Telegram images were available to the Vercel Sandbox.]"
+            return await self._analyze_telegram_images_vercel(
+                vercel_images, config=backend_config, session_key=session_key
             )
         if selected_backend == "vps":
             if backend_config is None or not str(backend_config.host or "").strip():

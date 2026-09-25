@@ -82,6 +82,70 @@ _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 # Runtimes accepted by the Vercel Sandbox ``runtime`` field.
 RUNTIMES: tuple[str, ...] = ("node22", "node24", "python3.13")
 
+# A Vercel Sandbox is **Amazon Linux 2023** (``ID=amzn``, ``ID_LIKE=fedora``), so
+# ``dnf`` is the package manager and ``apt-get``/``apk`` do not exist. Callers
+# across the sandbox contract ask for the Debian names, and several of those do
+# not exist under that name on Amazon Linux even though the package is right
+# there — ``dnf install xvfb`` answers "No match for argument: xvfb" while
+# ``xorg-x11-server-Xvfb`` installs fine. The alias table below is what makes
+# ``install xvfb`` work on Vercel; it is only consulted after the plain name
+# fails, so Debian/Alpine images keep their existing behaviour.
+#
+# Verified live on 2026-09-25 against runtime ``node22`` (see
+# ``docs``/commit notes): ``sudo -n`` succeeds, ``dnf search xvfb`` matches
+# ``xorg-x11-server-Xvfb``, and both ``tesseract`` and ``wine`` are absent from
+# the only configured repository (``amazonlinux``).
+PACKAGE_ALIASES: dict[str, tuple[str, ...]] = {
+    "xvfb": ("xorg-x11-server-Xvfb",),
+    "xauth": ("xorg-x11-xauth",),
+    "x11-utils": ("xorg-x11-utils",),
+    "x11-xserver-utils": ("xorg-x11-utils", "xrandr"),
+    "xserver-xorg-core": ("xorg-x11-server-Xorg",),
+    "imagemagick": ("ImageMagick",),
+    "build-essential": ("gcc", "gcc-c++", "make"),
+    "tesseract-ocr": ("tesseract",),
+    "tesseract-ocr-eng": ("tesseract-langpack-eng",),
+    "python3-pip": ("python3-pip", "python3-devel"),
+    "libgtk-3-0": ("gtk3",),
+    "libnss3": ("nss",),
+    "libasound2": ("alsa-lib",),
+}
+
+
+def _installer_command(cleaned: list[str]) -> str:
+    """The one shell line that installs ``cleaned`` on whichever family this is.
+
+    ``apt-get`` first (Debian-based images), then ``apk``, then ``dnf`` — a
+    stock Vercel Sandbox lands on the ``dnf`` branch, which is where the alias
+    table earns its keep.
+    """
+    quoted = " ".join(shlex.quote(item) for item in cleaned)
+    return (
+        "export DEBIAN_FRONTEND=noninteractive; "
+        "if command -v sudo >/dev/null 2>&1; then SUDO='sudo -n'; else SUDO=''; fi; "
+        "if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update -qq && $SUDO apt-get install -y -qq "
+        + quoted
+        + "; elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache "
+        + quoted
+        + "; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y "
+        + quoted
+        + "; else echo 'no supported package manager found' >&2; exit 127; fi"
+    )
+
+# Packages known not to exist in the Amazon Linux 2023 repositories at all, with
+# the reason. Asking for one of these is not a name problem and retrying an
+# alias would only waste an installer round-trip, so it is reported as an
+# actionable limitation instead of a generic install failure.
+UNAVAILABLE_ON_VERCEL: dict[str, str] = {
+    "wine": "Wine is not packaged for Amazon Linux 2023 (dnf search wine: no matches)",
+    "wine32": "Wine is not packaged for Amazon Linux 2023 (dnf search wine: no matches)",
+    "winetricks": "winetricks is not packaged for Amazon Linux 2023",
+    "tesseract": "tesseract is not in the amazonlinux repository (dnf search tesseract: no matches)",
+    "tesseract-ocr": "tesseract is not in the amazonlinux repository (dnf search tesseract: no matches)",
+    "tesseract-ocr-eng": "tesseract is not in the amazonlinux repository (dnf search tesseract: no matches)",
+    "tesseract-langpack-eng": "tesseract is not in the amazonlinux repository (dnf search tesseract: no matches)",
+}
+
 # Sandbox statuses that mean "ready to run commands".
 _READY_STATES = frozenset({"running", "ready"})
 
@@ -759,19 +823,36 @@ class VercelExecutionBackend:
         ]
         if not cleaned:
             raise ValueError("no valid package names supplied")
-        quoted = " ".join(shlex.quote(item) for item in cleaned)
-        command = (
-            "export DEBIAN_FRONTEND=noninteractive; "
-            "if command -v sudo >/dev/null 2>&1; then SUDO='sudo -n'; else SUDO=''; fi; "
-            "if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update -qq && $SUDO apt-get install -y -qq "
-            + quoted
-            + "; elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache "
-            + quoted
-            + "; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y "
-            + quoted
-            + "; else echo 'no supported package manager found' >&2; exit 127; fi"
-        )
-        return await self.run(command, timeout=min(timeout, _MAX_TIMEOUT))
+        budget = min(timeout, _MAX_TIMEOUT)
+        found_unavailable = [item for item in cleaned if item in UNAVAILABLE_ON_VERCEL]
+        result = await self.run(_installer_command(cleaned), timeout=budget)
+        if "[exit_code=" not in result or "[exit_code=0]" in result:
+            return result
+        # The plain names did not install. On Amazon Linux that is usually a name
+        # mismatch rather than a missing package (`xvfb` vs
+        # `xorg-x11-server-Xvfb`), so retry once with the per-family alias.
+        aliased: list[str] = []
+        for item in cleaned:
+            aliased.extend(PACKAGE_ALIASES.get(item, (item,)))
+        aliased = list(dict.fromkeys(aliased))
+        if aliased != cleaned:
+            retried = await self.run(_installer_command(aliased), timeout=budget)
+            if "[exit_code=" not in retried or "[exit_code=0]" in retried:
+                return retried
+            result = f"{result}\n[alias retry]\n{retried}"
+        if found_unavailable:
+            # Deliberately returned rather than raised: every caller of this
+            # method treats it as "returns rendered output", and callers such as
+            # the tesseract installer swallow exceptions — which would hide the
+            # one piece of information that explains the failure.
+            reasons = "; ".join(
+                f"{item}: {UNAVAILABLE_ON_VERCEL[item]}" for item in dict.fromkeys(found_unavailable)
+            )
+            result += (
+                f"\n[unavailable on Vercel] {reasons}. These must be baked into a "
+                "custom Vercel Sandbox image (create with the `image` field, not `runtime`)."
+            )
+        return result
 
     async def test_connection(self) -> dict[str, Any]:
         async with aiohttp.ClientSession() as session:
