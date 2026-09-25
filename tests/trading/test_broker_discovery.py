@@ -429,10 +429,10 @@ def test_a_verified_brand_is_reported_as_verified():
 def test_an_inferred_brand_is_not_reported_as_verified():
     """The table is bigger than the knowledge in it, and must say so.
 
-    Audited 2026-09-24: 6 of 28 entries resolve against the CDN. The other 22
-    carry a domain inferred from the broker's website. Treating those as known is
-    what produced "the agent cannot resolve my broker": the model burns its whole
-    probe budget on a guaranteed 404, then concludes the broker is unsupported.
+    Audited 2026-09-25: 17 of 33 entries resolve against the CDN. The rest carry a
+    domain inferred from the broker's website. Treating those as known is what
+    produced "the agent cannot resolve my broker": the model burns its whole probe
+    budget on a guaranteed 404, then concludes the broker is unsupported.
     """
     assert bd.broker_is_verified("Pepperstone-Demo") is False
     assert bd.broker_is_verified("TotallyUnknown-Live") is False
@@ -457,6 +457,19 @@ def test_every_verified_brand_resolves_without_a_page_hint():
         "Exness-MT5Real8": "exness.technologies.ltd",
         "Deriv-Demo": "deriv.com.limited",
         "AXI-Live": "axicorp.financial.services",
+        # Mined in the 2026-09-25 sweep. Every one of these is a slug no amount of
+        # brand reasoning produces: an operator entity (robomarkets.ltd), an
+        # unrelated domain (tf.global.markets), or a bare numeric id (19497).
+        "FBS-Demo": "fbs.markets.inc",
+        "ThinkMarkets-Live": "tf.global.markets",
+        "FPMarkets-Live": "first.prudential.markets",
+        "JustMarkets-Live": "just.global.markets",
+        "JMarkets-Live": "just.global.markets",
+        "OANDA-Live": "oanda.corporation",
+        "BlackBullMarkets-Live": "black.bull.group",
+        "Errante-Live": "errante.securities.seychelles",
+        "Tickmill-Live": "19497",
+        "RoboForex-Live": "robomarkets.ltd",
     }
     for server, slug in winners.items():
         urls = bd.candidate_installer_urls(server)

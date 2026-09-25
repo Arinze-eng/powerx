@@ -892,6 +892,17 @@ def _host_list_brokers(kwargs: dict[str, Any]) -> str:
                 "Installer confirmed live against the CDN. Discovery should resolve "
                 "this brand on the first probe."
             )
+            if candidates:
+                # The whole point of a confirmed entry: there is nothing left to
+                # find. Handing over the URL removes a network round trip AND the
+                # chance that a probe of an already-known URL is what gets rate
+                # limited instead of the download that matters.
+                item["confirmed_installer_url"] = candidates[0]
+                item["confirmed_note"] = (
+                    "Mined from a page that publishes it and probed live (HTTP 200, "
+                    "executable, multi-MB). Pass this straight as broker_installer_url "
+                    "to skip discovery."
+                )
         else:
             item["inferred_note"] = (
                 "Domain GUESSED from the broker's website; NOT confirmed against the "
@@ -932,13 +943,20 @@ def _host_list_brokers(kwargs: dict[str, Any]) -> str:
             "broker's own download page -- that always beats a table entry."
         ),
         "if_the_broker_is_missing": (
-            "Web-search '<broker> download MT5', fetch the broker's own download "
-            "page, and pass it as page_urls to action='discover_broker'. The link "
-            "there is authoritative. Do NOT hand-build an installer URL: the CDN "
-            "slug is a legal entity domain (AXI is axicorp.financial.services, "
-            "Exness exness.technologies.ltd, Deriv deriv.com.limited) and cannot be "
-            "guessed from the brand -- 210 blind guesses across 21 brokers produced "
-            "2 hits."
+            "Two searches, in this order, then pass what you found: (1) web-search "
+            "'download.mql5.com/cdn/web <broker>' -- forums, IPA checkers and "
+            "aggregator pages quote the real installer URL verbatim; (2) web-search "
+            "'<broker> download MT5', open the broker's OWN download page in a "
+            "browser, and pass it as page_urls to action='discover_broker'. The link "
+            "there is authoritative. Do NOT hand-build an installer URL and do not "
+            "burn probe budget on slug permutations: MEASURED 2026-09-25, 136 "
+            "candidates across 42 brands produced 0 hits, after 210 across 21 "
+            "produced 2. The slug is variously a legal entity "
+            "(first.prudential.markets for FP Markets, black.bull.group for "
+            "BlackBull, tf.global.markets for ThinkMarkets), the brand's own domain "
+            "(oanda.corporation, just.global.markets), or a bare NUMERIC id "
+            "(cdn/web/19497/mt5/tickmill5setup.exe) -- and the filename varies too. "
+            "Only a page can tell you which."
         ),
         "add_a_broker_permanently": (
             "Set MT5_BROKER_INSTALLERS='brand|slug|name;brand2|slug2|name2' in the "

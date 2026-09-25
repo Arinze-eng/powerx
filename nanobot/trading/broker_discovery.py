@@ -13,7 +13,19 @@ The fix is not "guess harder". MEASURED 2026-09-24 on this box: 210 blind slug
 permutations across 21 well-known brokers produced **2** live URLs (alpari,
 nordfx.ltd). The slug is genuinely unguessable -- ``deriv`` needs
 ``deriv.com.limited`` while ``icmarkets`` needs a form none of six suffixes
-matched. So this module is SEARCH-DRIVEN and VALIDATE-FIRST:
+matched. RE-CONFIRMED HARDER 2026-09-25: 136 candidate URLs across 42 brands
+(7 suffixes x brand tokens) produced **0** live URLs -- do not spend budget
+guessing. What that sweep DID establish is the SHAPE of the answer, because it
+is not one shape: a slug is sometimes a legal entity
+(``first.prudential.markets`` for FP Markets, ``black.bull.group`` for
+BlackBull, ``tf.global.markets`` for ThinkMarkets), sometimes the brand's own
+domain (``oanda.corporation``, ``just.global.markets``), and sometimes a bare
+MQL5 NUMERIC ID (``cdn/web/19497/mt5/tickmill5setup.exe``). The filename varies
+too, and not always to match the brand. Neither is derivable, so the only
+reliable route to either is to read the answer off a page the broker (or MQL5)
+publishes it on -- a search the MODEL can run, which is exactly what
+``list_brokers`` and the trading skill tell it to do. So this module is
+SEARCH-DRIVEN and VALIDATE-FIRST:
 
 1. Derive brand tokens from the server name the user actually gave us.
 2. Propose candidate installer URLs from those tokens (cheap, no network).
@@ -39,7 +51,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Sequence
 
 __all__ = [
     "brand_tokens",
@@ -288,25 +300,49 @@ _KNOWN_BROKERS: dict[str, dict[str, Any]] = {
     "fxtm": {"candidates": [("forextime.com", "fxtm"), ("fxtm.limited", "fxtm")]},
     "hotforex": {"candidates": [("hfmarkets.limited", "hotforex"), ("hotforex.com", "hotforex")]},
     "hfm": {"candidates": [("hfmarkets.limited", "hfm")]},
-    "fbs": {"candidates": [("fbs.trade", "fbs"), ("fbs.com", "fbs")]},
+    # CONFIRMED LIVE 2026-09-25 (mined from the broker's own MT5 page). The
+    # entity is ``fbs.markets.inc`` -- not ``fbs.trade`` or ``fbs.com``, the two
+    # guesses that sat here and 404.
+    "fbs": {"candidates": [("fbs.markets.inc", "fbs"), ("fbs.trade", "fbs")]},
     "vantage": {"candidates": [("vantagemarkets.com", "vantage"), ("vantagefx.limited", "vantage")]},
     "eightcap": {"candidates": [("eightcap.com", "eightcap"), ("eightcap.limited", "eightcap")]},
-    "tickmill": {"candidates": [("tickmill.limited", "tickmill"), ("tickmill.com", "tickmill")]},
+    # CONFIRMED LIVE 2026-09-25: Tickmill's CDN slug is a bare NUMERIC id, so no
+    # amount of brand reasoning reaches it. ``tickmill.limited`` and
+    # ``tickmill.com`` were probed and 404.
+    "tickmill": {"candidates": [("19497", "tickmill"), ("tickmill.limited", "tickmill")]},
     "avatrade": {"candidates": [("avatrade.com", "avatrade")]},
     "admiralmarkets": {"candidates": [("admiralmarkets.com", "admiralmarkets")]},
     "fxpro": {"candidates": [("fxpro.com", "fxpro")]},
-    "thinkmarkets": {"candidates": [("thinkmarkets.com", "thinkmarkets")]},
-    "fpmarkets": {"candidates": [("fpmarkets.com", "fpmarkets")]},
-    "oanda": {"candidates": [("oanda.com", "oanda")]},
-    "justmarkets": {"candidates": [("justmarkets.com", "justmarkets")]},
+    # CONFIRMED LIVE 2026-09-25: ThinkMarkets installs from ``tf.global.markets``
+    # -- the slug shares no word with the brand.
+    "thinkmarkets": {"candidates": [("tf.global.markets", "thinkmarkets")]},
+    # CONFIRMED LIVE 2026-09-25 (5.53 MB installer): FP Markets' entity is
+    # ``first.prudential.markets``.
+    "fpmarkets": {"candidates": [("first.prudential.markets", "fpmarkets")]},
+    # CONFIRMED LIVE 2026-09-25 (4.73 MB). NOTE: the slug OANDA publishes on its
+    # own FAQ (``dom.maklerski.Oanda``) 404s -- the live one is the corporate
+    # entity. A broker's own page is authoritative about DIRECTION, not infallible.
+    "oanda": {"candidates": [("oanda.corporation", "oanda")]},
+    # CONFIRMED LIVE 2026-09-25 (4.86 MB). Server names arrive as both
+    # ``JustMarkets-Live`` and ``JMarkets-Live``, so ``jmarkets`` is an alias key.
+    "justmarkets": {"candidates": [("just.global.markets", "justmarkets")]},
+    "jmarkets": {"candidates": [("just.global.markets", "justmarkets")]},
     "fxopen": {"candidates": [("fxopen.com", "fxopen")]},
     "instaforex": {"candidates": [("instaforex.com", "instaforex")]},
     "litefinance": {"candidates": [("litefinance.org", "litefinance")]},
-    "robofx": {"candidates": [("roboforex.com", "robofx"), ("roboforex.com", "roboforex")]},
+    # CONFIRMED LIVE 2026-09-25: RoboForex's operator entity is
+    # ``robomarkets.ltd`` -- the brand appears nowhere in the slug. The
+    # ``roboforex.cy.ltd`` form circulating on forums 404s.
+    "robofx": {"candidates": [("robomarkets.ltd", "roboforex")]},
+    "roboforex": {"candidates": [("robomarkets.ltd", "roboforex")]},
     "windsorbrokers": {"candidates": [("windsorbrokers.com", "windsor")]},
     "alpari": {"candidates": [("alpari", "alpari"), ("alpari.com", "alpari")]},
     "nordfx": {"candidates": [("nordfx.ltd", "nordfx"), ("nordfx.com", "nordfx")]},
     "axicorp": {"candidates": [("axicorp.financial.services", "axi")]},
+    # CONFIRMED LIVE 2026-09-25.
+    "blackbull": {"candidates": [("black.bull.group", "blackbullmarkets")]},
+    "blackbullmarkets": {"candidates": [("black.bull.group", "blackbullmarkets")]},
+    "errante": {"candidates": [("errante.securities.seychelles", "errantesc")]},
 }
 
 
@@ -318,6 +354,14 @@ _KNOWN_BROKERS: dict[str, dict[str, Any]] = {
 #: returned 404. The mined three (Exness, Deriv, AXI) work; the rest were inferred
 #: from a broker's marketing domain, which is not the same string as the CDN slug
 #: (``icmarkets.com`` is not ``icmarkets.limited``, which is not what MQL5 hosts).
+#:
+#: SECOND SWEEP 2026-09-25 took it to **15 of 30**: every added brand below was
+#: mined from a page that publishes the link, then probed (HTTP 200, executable
+#: content type, and the byte count recorded here). The 136 blind candidates tried
+#: in the same sweep yielded nothing, which is why the method is mining, not
+#: guessing. A brand that is NOT below is still only plausibly known, and the
+#: model must treat a failed probe on it as "we guessed wrong", never as "this
+#: broker is unsupported".
 #:
 #: That distinction is load-bearing because of what it feeds:
 #:
@@ -338,6 +382,18 @@ _VERIFIED_BRANDS: frozenset[str] = frozenset(
         "axicorp",  # same URL as `axi`        -- confirmed 2026-09-24
         "alpari",  # alpari                    -- confirmed 2026-09-24
         "nordfx",  # nordfx.ltd                -- confirmed 2026-09-24
+        # ---- second sweep, 2026-09-25 (mined from a page, then probed) ---- #
+        "fbs",  # fbs.markets.inc          -- 5,001,600 B  2026-09-25
+        "thinkmarkets",  # tf.global.markets        -- 4,789,616 B  2026-09-25
+        "fpmarkets",  # first.prudential.markets -- 5,534,256 B  2026-09-25
+        "justmarkets",  # just.global.markets      -- 4,864,488 B  2026-09-25
+        "jmarkets",  # same URL as justmarkets  -- 4,864,488 B  2026-09-25
+        "oanda",  # oanda.corporation        -- 4,730,592 B  2026-09-25
+        "blackbull",  # black.bull.group         -- 4,526,752 B  2026-09-25
+        "blackbullmarkets",  # same as blackbull    -- 4,526,752 B  2026-09-25
+        "errante",  # errante.securities.seychelles -- 4,518,376 B 2026-09-25
+        "tickmill",  # 19497 (numeric slug!)    -- 4,516,888 B  2026-09-25
+        "roboforex",  # robomarkets.ltd          -- 3,761,552 B  2026-09-25
     }
 )
 

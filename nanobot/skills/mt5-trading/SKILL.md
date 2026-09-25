@@ -28,11 +28,19 @@ Order of effort, cheapest first:
    server at all, so that "successful" install is a dead end wearing a green tick.
 3. If it still refuses: `action="list_brokers"` (what it knows), then
    `action="discover_broker"`, `server="<their server>"`.
-4. If discovery fails, **web-search `<broker> download MT5`**, fetch that page, and
-   pass it: `action="discover_broker", server=..., page_urls=["<the page url>"]`.
-   The link on the broker's own page is authoritative; a derived guess usually is not.
-   Then `install` with the `broker_installer_url` it returned. You can also hand
+4. If discovery fails, **search for the installer URL itself first** — search
+   `download.mql5.com/cdn/web <broker> mt5 setup`. Forums, link-checker pages and
+   broker-aggregator sites quote these URLs verbatim, and this is how the entries
+   confirmed on 2026-09-25 were found. Feed what you get to
+   `action="discover_broker"` (it re-validates before anything installs).
+5. If that finds nothing, **web-search `<broker> download MT5`**, open the broker's
+   OWN download page in a browser, and pass it:
+   `action="discover_broker", server=..., page_urls=["<the page url>"]`. The link on
+   the broker's own page is authoritative; a derived guess usually is not. Then
+   `install` with the `broker_installer_url` it returned. You can also hand
    `page_urls` straight to `install` and it does the fetch-and-validate itself.
+   Prefer a browser over a plain fetch: most broker platform pages build the
+   download control in JavaScript, and several refuse a non-browser client outright.
 
 Three things that keep you from going in circles:
 
@@ -45,9 +53,21 @@ Three things that keep you from going in circles:
   `verified: true|false`. A `false` brand carries a *guessed* domain and often 404s
   — that means "our guess was wrong", **never** "this broker is unsupported". Go to
   step 3 instead of retrying guesses.
-* **Never invent an installer URL.** Unverified slugs on `download.mql5.com` 404,
-  and a bad guess costs a two-minute Wine install to discover it. Every URL you act
-  on must come back `valid` from `discover_broker`.
+* **A `verified: true` brand comes with its URL.** Read `confirmed_installer_url`
+  off that entry and pass it straight as `broker_installer_url` — it is the URL that
+  was mined and probed live, and it is the same one discovery would try first.
+  Probing a URL you were already handed wastes the round trip (and the CDN's
+  patience, which matters: a sweep can get the egress IP rate-limited into refusing
+  the very download the install needs next).
+* **Never invent an installer URL, and never guess a slug.** MEASURED 2026-09-25:
+  136 candidate slugs across 42 brands produced **0** live URLs (an earlier sweep
+  got 2 from 210). The CDN slug is variously a legal entity (`first.prudential.markets`
+  for FP Markets, `black.bull.group` for BlackBull, `robomarkets.ltd` for RoboForex),
+  an unrelated domain (`tf.global.markets` for ThinkMarkets), the brand's own domain
+  (`oanda.corporation`, `just.global.markets`), or a bare NUMERIC ID
+  (`cdn/web/19497/mt5/tickmill5setup.exe` for Tickmill) — and the filename varies
+  independently. Nothing about the brand predicts any of it, so only a page can tell
+  you. Every URL you act on must come back `valid` from `discover_broker`.
 * **Do not ask the user for their download link before step 3.** Asking early is
   the old behaviour and it is what this section replaces.
 * **`done` means a terminal was installed, and the directory is read back off the

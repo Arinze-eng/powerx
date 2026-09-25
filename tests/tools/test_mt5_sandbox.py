@@ -6722,3 +6722,51 @@ def test_status_withholds_a_url_that_nothing_backs(monkeypatch, tmp_path):
     cli.INSTALLED_DIR_NAME_FILE.write_text("MetaTrader 5 AXICorp", encoding="utf-8")
     cli.cmd_status(argparse.Namespace(lines=3))
     assert captured["installed_url"] == _AXI_URL
+
+
+def test_list_brokers_hands_over_the_url_it_already_confirmed():
+    """A confirmed brand's URL is knowledge, not a hypothesis: hand it over.
+
+    The scarce resource is the probe round trip -- and the CDN's patience, which a
+    sweep can exhaust into refusing the download the install needs next. Spending a
+    probe on a URL this tool has already verified live buys nothing, so a verified
+    brand must arrive carrying the exact URL to pass as ``broker_installer_url``.
+    An unverified brand must NOT carry one: a guessed domain presented in the same
+    field would read as confirmed, which is the conflation that makes a model stop
+    at the broker it is about to get wrong.
+    """
+    import nanobot.agent.tools.mt5_sandbox as module
+
+    payload = json.loads(module._host_list_brokers({}))
+    by_brand = {item["brand"]: item for item in payload["brokers"]}
+
+    verified = by_brand["tickmill"]
+    assert verified["verified"] is True
+    assert verified["confirmed_installer_url"].endswith("/cdn/web/19497/mt5/tickmill5setup.exe")
+    # The handover is only honest if it is the same URL discovery would probe
+    # first; otherwise the model is being pointed somewhere the resolver will not go.
+    assert verified["confirmed_installer_url"] == verified["candidate_installer_urls"][0]
+
+    inferred = by_brand["pepperstone"]
+    assert inferred["verified"] is False
+    assert "confirmed_installer_url" not in inferred
+    assert "inferred_note" in inferred
+
+    assert payload["verified_broker_count"] == sum(1 for b in payload["brokers"] if b["verified"])
+    assert payload["verified_broker_count"] < payload["known_broker_count"]
+
+
+def test_the_missing_broker_recipe_is_a_search_not_a_guess():
+    """The guidance for an unknown broker must lead with search, not with slugs.
+
+    Measured 2026-09-25: 136 slug permutations across 42 brands yielded 0 live
+    URLs. A recipe that does not say so invites the model to spend its budget the
+    exact way that was measured to fail, and then report the broker unsupported.
+    """
+    import nanobot.agent.tools.mt5_sandbox as module
+
+    payload = json.loads(module._host_list_brokers({}))
+    recipe = payload["if_the_broker_is_missing"]
+    assert "download.mql5.com/cdn/web" in recipe, "the search that actually works"
+    assert "page_urls" in recipe, "the escape hatch when search finds only a page"
+    assert "136" in recipe, "the measured cost of guessing, which is the point"
