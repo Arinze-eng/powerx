@@ -28,7 +28,10 @@ from nanobot.agent.tools.captcha import (
     SolverError,
 )
 from nanobot.agent.tools.loader import ToolLoader
-from nanobot.config.schema import Config
+from nanobot.agent.tools.human_browser import HumanBrowserTool
+from nanobot.agent.tools.context import ToolContext
+from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.config.schema import Config, ToolsConfig
 
 
 class _FakeResponse:
@@ -759,3 +762,105 @@ def test_the_advertised_actions_include_waf() -> None:
     assert "waf" in tool.parameters["properties"]["action"]["enum"]
 
 
+# --------------------------------------------------------------------------
+# is the model actually aware of this tool?
+#
+# Registration, gating and the schema the model reads, through the real loader.
+# "The tool exists" is not the claim; "a deployment that configures a solver
+# ends up offering the model a callable, accurately-bounded action" is.
+# --------------------------------------------------------------------------
+
+
+def _loader_ctx(tmp_path, **overrides: Any) -> Any:
+    """A real ToolContext with only the solver config swapped out."""
+    cfg = CaptchaSolverToolConfig()
+    for field, value in overrides.items():
+        setattr(cfg, field, value)
+    return ToolContext(
+        config=ToolsConfig(captcha_solver=cfg),
+        workspace=str(tmp_path),
+    )
+
+
+def test_the_solver_is_off_unless_an_operator_enables_it_and_supplies_a_key(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default must stay off: it talks to a service the agent does not own."""
+    monkeypatch.delenv("CAPSKIP_API_KEY", raising=False)
+    monkeypatch.delenv("CLOUDFLARE_WAF_API_KEY", raising=False)
+
+    assert CaptchaSolverTool.enabled(_loader_ctx(tmp_path)) is False
+
+    registry = ToolRegistry()
+    ToolLoader().load(_loader_ctx(tmp_path), registry)
+    assert "captcha_solver" not in registry.tool_names
+
+    # An enabled flag with no resolvable key is still off.
+    assert CaptchaSolverTool.enabled(_loader_ctx(tmp_path, enable=True)) is False
+
+
+def test_the_loader_registers_the_solver_when_the_operator_configures_it(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Configured, it reaches the model -- discovery, gating and creation."""
+    monkeypatch.setenv("CLOUDFLARE_WAF_API_KEY", "sk_test_probe")
+
+    registry = ToolRegistry()
+    ToolLoader().load(_loader_ctx(tmp_path, enable=True, provider="solvegate"), registry)
+
+    assert "captcha_solver" in registry.tool_names
+    schema = registry.get("captcha_solver").parameters
+    assert schema["properties"]["action"]["enum"] == ["turnstile", "waf"]
+    # The sitekey and url the provider requires are describable to the model.
+    assert {"sitekey", "url"} <= set(schema["properties"])
+
+
+def test_the_enum_offers_a_solvegate_deployment_only_its_two_gates() -> None:
+    tool = CaptchaSolverTool(
+        base_url="", api_key="", provider="solvegate", solvegate_api_key="sk_test_probe"
+    )
+
+    assert tool.answerable_actions == ["turnstile", "waf"]
+
+
+def test_the_enum_keeps_turnstile_for_a_capskip_deployment_but_drops_waf() -> None:
+    """CapSkip serves Turnstile; the WAF gate is the gap SolveGate was added for."""
+    tool = CaptchaSolverTool(base_url="", api_key="sk_test_probe", provider="capskip")
+
+    assert "turnstile" in tool.answerable_actions
+    assert "waf" not in tool.answerable_actions
+    assert "recaptcha" in tool.answerable_actions
+
+
+def test_the_description_names_the_provider_boundary_and_not_just_the_hosts() -> None:
+    """The model has to know that solvegate answers two challenges and nothing else."""
+    described = CaptchaSolverTool(
+        base_url="", api_key="", provider="solvegate", solvegate_api_key="sk_test_probe"
+    ).description
+
+    assert "turnstile" in described and "waf" in described
+    assert "nothing else" in described
+    # And that a test-mode token must not be reported as a pass.
+    assert "sandbox" in described
+
+
+def test_the_browser_tool_is_handed_a_solver_so_its_own_captcha_action_works(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """auto_captcha is only useful if the browser tool was built with a solver."""
+    monkeypatch.setenv("CLOUDFLARE_WAF_API_KEY", "sk_test_probe")
+
+    browser = HumanBrowserTool.create(_loader_ctx(tmp_path, enable=True, provider="solvegate"))
+
+    assert isinstance(browser, HumanBrowserTool)
+    assert browser.captcha_solver is not None
+    assert isinstance(browser.captcha_solver, CaptchaSolverTool)
+    assert "auto_captcha" in browser.parameters["properties"]["action"]["enum"]
+
+
+def test_without_a_solver_configured_the_browser_still_builds(tmp_path) -> None:
+    """Browsing must not depend on the solver: the solver is an optional collaborator."""
+    browser = HumanBrowserTool.create(_loader_ctx(tmp_path))
+
+    assert isinstance(browser, HumanBrowserTool)
+    assert browser.captcha_solver is None

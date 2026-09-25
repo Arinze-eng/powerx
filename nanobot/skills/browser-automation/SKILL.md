@@ -1,160 +1,193 @@
 ---
 name: browser-automation
-description: "Drive a real browser inside the sandbox to browse sites, log in, tap/click, type, scroll, navigate, screenshot, and read interfaces. Use whenever a task needs to interact with a live website or web app (login flows, dashboards, forms, scraping JS-rendered pages) rather than plain HTTP fetch."
+description: "Browse and operate live websites with the human_browser tool — a real Chromium (pydoll, over CDP) inside the sandbox: navigate, read a page, find elements, click, type, fill a form, press keys, choose a dropdown option, hover, scroll, screenshot, wait for text, and solve a captcha including Cloudflare Turnstile and WAF via the captcha_solver tool. Use for any task that needs a real browser rather than a plain HTTP fetch: login flows, dashboards, forms, checkout-style flows, JS-rendered pages, or a site behind a bot wall. Playwright or Selenium in the sandbox is the fallback when the tool is not available."
 metadata: {"nanobot":{"emoji":"🌐","requires":{"bins":["python3"]}}}
 ---
 
-# Browser Automation in the Sandbox
+# Browser Automation
 
-You drive a real Linux sandbox through the **`novita_sandbox`** tool (actions: `run`, `write`,
-`read`, `install`, `upload`, `download_url`, `list`).
-Treat it as a desktop you can control with a headless browser. Prefer **Playwright**; fall back to
-**Selenium** only if Playwright cannot be installed. Never claim browsing is unsupported —
-install what you need first.
+Two ways to drive a browser, in this order.
 
-> How to call: run shell commands via `novita_sandbox(action="run", command="...")`, write files
-> via `novita_sandbox(action="write", path="/workspace/x.py", content="...")`, then execute them.
-> For multi-step flows chain commands with `&&` inside one `run` so intermediate output stays in the sandbox.
+**1. The `human_browser` tool — use this by default.** It already owns a real Chromium
+(pydoll, over the DevTools Protocol) with humanized mouse and typing, so there is nothing to
+install and no browser to launch. One call, one action. Reach for it first for anything on a
+live site.
 
-## Golden rules
+**2. Playwright / Selenium inside the sandbox — only when the tool is not available.** See the
+last section. Do not start here: installing a browser and writing a script is minutes of work
+that the tool does in one call.
 
-1. **Prefer Playwright over Selenium.** Playwright bundles its own browser + driver, handles
-   waits, and is far more reliable for scripted interaction. Use `playwright` (Python).
-2. **Install once, reuse.** Check before installing; the sandbox may already have deps.
-3. **Always wait for the page, never `sleep(N)` blindly.** Use explicit waits / auto-waiting.
-4. **Screenshot to *see*, then act.** Capture the screen, read it with vision, decide the next
-   selector. This is how you understand unfamiliar interfaces.
-5. **Verify every action landed.** After a click/login/submit, assert the expected change
-   (URL, element text, new content) before continuing.
-6. **Never hardcode secrets.** Read credentials from env vars / config passed by the user; do
-   not paste passwords into logs or replies.
+## The one discipline that makes this work: find, then act
 
-## Setup (idempotent — run via `novita_sandbox(action="run")`)
+Call `human_browser(action="find")` on any page you have not seen, and act on the `target` it
+returns. Every action that touches an element takes that exact string.
+
+`find` returns every interactive element the page has actually rendered — links, buttons,
+inputs, selects, textareas, labels, `[role=…]`, `[contenteditable]`, `[onclick]`, summaries:
+
+```json
+{"count": 12, "elements": [
+  {"i": 1, "target": "[data-powerx-idx=\"1\"]", "tag": "input", "type": "text",
+   "name": "my-text", "id": "", "placeholder": "", "text": "", "required": false,
+   "disabled": false, "value": ""}
+], "note": "target is a live CSS selector for click, type, select or hover"}
+```
+
+`target` is stamped onto the live node, so it resolves against the page as it is right now. A
+plain CSS selector or `#id` works too — but do not guess one when `find` will tell you. Elements
+that are `display:none`, `visibility:hidden`, zero-opacity, or smaller than 2px are left out on
+purpose, because those are the ones that cannot be clicked.
+
+## Actions
+
+| Goal | Call |
+|---|---|
+| Open a page | `navigate` + `url` → returns `{title, url, text, cloudflare}` |
+| See what is there | `read_page` (title, url, visible text), `screenshot` (`full_page: true` for below the fold), `find` |
+| Get every element | `find` → the inventory above |
+| Click / tap | `click` + `target` |
+| Type into one field | `type` + `target` + `text` |
+| Fill a whole form | `fill_form` + `fields: [{target, text, clear}]` — up to 40 fields in **one** call |
+| Choose a dropdown option | `select` + `target` (a CSS selector) + `option` (its visible label or value) |
+| Press a key | `press` + `key`: `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, `ArrowUp/Down/Left/Right`, `Home`, `End`, `PageUp`, `PageDown`, `Space` |
+| Hover | `hover` + `target` |
+| Scroll | `scroll` + `direction` + `pixels` |
+| Wait for an element | `wait_for` + `target` |
+| Wait for text | `wait_for_text` + `text` + `timeout_ms` |
+| History | `back`, `forward`, `refresh` |
+| Captcha | `auto_captcha`, `solve_image_captcha`, `solve_cloudflare` |
+| Finish | `close` |
+
+Notes that save a round trip:
+
+- `navigate`, `click`, `back`, `forward` and `refresh` return a fresh page summary, so you do
+  not need a `read_page` after them. Read the summary you already have.
+- `fill_form` beats repeated `type` calls: one call instead of one per field.
+- `select` needs a CSS selector, not a text target — an option's label is not unique on the page.
+- Every action answers with either a result or `Error: …`. Read the error; it names the reason.
+  `Error: no element matched '…'` means nothing on the page answered to that target — re-run
+  `find`, do not retry the same string.
+
+## Captcha
+
+A Cloudflare Turnstile widget is normally handled for you: `navigate` and `click` attempt it and
+report the outcome under a `cloudflare` key in their summary.
+
+```json
+"cloudflare": {"challenge_present": true, "solved": true, "attempts": 2}
+"cloudflare": {"challenge_present": false, "solved": false, "attempts": 1,
+               "reason": "no Cloudflare Turnstile challenge was found"}
+```
+
+When a challenge is still there, use `auto_captcha`. It does the whole job in one call: detects
+what the page actually rendered, reads the sitekey off the widget, asks the configured solver,
+writes the token into every response field the widget created, and fires the page's own success
+callback.
+
+```json
+{"solved": true, "kind": "turnstile", "token_chars": 40,
+ "fields_filled": 2, "callbacks_called": 1,
+ "note": "the token is written into the page; re-read the page to confirm the challenge cleared before continuing"}
+```
+
+**Then re-read the page.** `solved: true` means the token was written and a callback fired — not
+that the site accepted it. `read_page` (or `screenshot`) and confirm the challenge is gone and
+the page moved on. Never tell the user a challenge was passed on the strength of `solved: true`
+alone.
+
+Honest outcomes `auto_captcha` returns, and what each means:
+
+| Reply | What it means, and what to do |
+|---|---|
+| `solved: false, reason: "no captcha was detected on the page"` | Nothing to solve. Carry on with the task. |
+| `solved: false, reason: "no captcha solver is configured…"` | No solver on this deployment. **Tell the user the page has a challenge and stop** — retrying cannot help. |
+| `solved: false, kind: "image", reason: "…call solve_image_captcha"` | A picture challenge. Call `solve_image_captcha`. |
+| `solved: false, reason: "the widget exposed no sitekey"` | The widget rendered without a sitekey, so a token cannot be requested. Report it. |
+| `solved: false, reason: "the solver returned no token"` | The solver refused or failed. The `solver` field carries its own words — quote them. |
+
+`solve_image_captcha` crops the picture, solves it, and types the answer into the field it
+identified. It does **not** submit — confirm the answer is in the box before submitting.
+
+### The `captcha_solver` tool, called directly
+
+`auto_captcha` is a convenience over this. Call `captcha_solver` yourself when you already have a
+sitekey, or when you have an image file to solve:
+
+- `action="turnstile" | "waf" | "recaptcha" | "hcaptcha" | "funcaptcha" | "geetest" | "altcha"`
+  with `sitekey` and `url` — the page the widget sits on. Both are required: a token request
+  without a sitekey is unanswerable. **Read the `action` enum in this tool's own schema before
+  choosing**: it lists only what the configured provider can answer, which may be as few as two
+  actions. Do not pass an action that is not in the enum.
+- `action="solve_image"` with `image_path` — a local file. `text` steers the answer.
+- `action="balance"` — what is left, before starting a long job.
+- `action="coordinates"` — an image grid, answered with click coordinates.
+
+**What is answerable depends on the configured provider, and nothing else.** Both providers are
+configured by the operator, and the tool refuses an action the configured one cannot serve:
+
+- **solvegate** answers exactly two: `turnstile` and `waf`. It is synchronous — one request,
+  one token, no polling. Any other action returns an error saying so; pick a different approach
+  rather than retrying.
+- **capskip / capsolve** (2captcha-style) answers `recaptcha`, `hcaptcha`, `funcaptcha`,
+  `turnstile`, `geetest`, `altcha`, an image file, and an image grid.
+
+A reply carrying `"sandbox": true` is a test-mode token that **no real site will accept**. Say
+so plainly instead of reporting the challenge as passed.
+
+The solver endpoint is fixed by configuration. No argument can redirect it, so never try to pass
+a different URL or key through a call.
+
+## Worked example — log in
+
+```
+1. human_browser(action="navigate", url="https://site.example/login")
+2. human_browser(action="find")
+     → locate the email field, the password field, the submit button in the inventory
+3. human_browser(action="fill_form", fields=[
+       {"target": "<email target>",    "text": os.environ["SITE_EMAIL"],    "clear": true},
+       {"target": "<password target>", "text": os.environ["SITE_PASSWORD"], "clear": true}])
+4. human_browser(action="click", target="<submit target>")
+     → the returned summary shows whether you landed on the dashboard
+5. Confirm from the summary: URL changed, and the expected text is present. If not, `find`
+   again and see what the page actually says — do not re-click blindly.
+```
+
+Never hardcode credentials in the script or the reply: read them from the environment or from
+configuration the user gave you.
+
+## Understanding an unfamiliar page
+
+1. `navigate`, then read the summary it returns.
+2. `find` — that is your map of what can be clicked and typed into.
+3. `screenshot` when the text summary is not enough; read it with vision.
+4. Act, then read the summary the action returns. It is how you tell whether the page changed.
+5. If an action failed, `find` again. Pages re-render, and a stamped target from before a
+   navigation is gone.
+
+## Limits to respect
+
+- Private, internal, and loopback URLs are refused on purpose — a browser action must not become
+  a way to reach the host's own services. Do not try to work around it.
+- Solving a captcha is a step on a page you are authorized to use. It is not a licence to
+  circumvent access controls, and not a way into an account that is not yours.
+- Never submit a purchase, publish content, send a message, or enter credentials unless the user
+  explicitly authorized that exact action in this conversation.
+
+## Fallback: Playwright or Selenium in the sandbox
+
+Only when `human_browser` is not registered on this deployment. It reports its absence rather
+than failing silently, so check before assuming.
 
 ```bash
-# Detect existing install first
 python3 -c "import playwright" 2>/dev/null && echo HAVE_PW || echo NO_PW
-
-# Install Playwright + Chromium (headless shell) and system deps
-pip install --quiet playwright
+pip install --break-system-packages playwright     # PEP 668 externally-managed env
 playwright install --with-deps chromium
 ```
 
-If `pip` is blocked by an externally-managed environment, use one of:
-```bash
-pip install --break-system-packages playwright   # Debian/Ubuntu PEP668
-python3 -m venv /tmp/bvenv && /tmp/bvenv/bin/pip install playwright && /tmp/bvenv/bin/playwright install --with-deps chromium
-apt-get update && apt-get install -y python3-pip   # if pip itself is missing
-```
-Only escalate to `sudo`/`apt-get` when genuinely required. If `apt-get` fails due to a
-read-only rootfs, that is expected on hardened sandboxes — rely on `pip`/`venv`, and report
-the specific blocker instead of giving up.
+Prefer it over Selenium: it bundles its own browser and driver, auto-waits, and is far less
+flaky. Wait for the page — `page.wait_for_selector(sel, state="visible")` — never a bare
+`sleep`. Screenshot to `/workspace/` so the image is a downloadable artifact. Chain a whole flow
+into one `run` command (or one `run_plan`) so intermediate output stays in the sandbox and you
+pull back only the final screenshot or extracted JSON.
 
-### Selenium fallback (only if Playwright is impossible)
-```bash
-pip install selenium webdriver-manager
-# chromedriver must match Chrome version; webdriver-manager resolves it
-```
-
-## Minimal working pattern (Playwright, sync API)
-
-```python
-from playwright.sync_api import sync_playwright
-
-with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True)
-    ctx = browser.new_context(
-        viewport={"width": 1280, "height": 900},
-        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    )
-    page = ctx.new_page()
-    page.goto("https://example.com", wait_until="domcontentloaded")
-    page.screenshot(path="/workspace/page.png", full_page=True)
-    browser.close()
-```
-Save screenshots under `/workspace/` so they are downloadable artifacts, then deliver them.
-
-## Core interactions — the verbs you were asked to teach
-
-| Task | Playwright call | Notes |
-|---|---|---|
-| Navigate | `page.goto(url)` / `page.click(a[href])` | prefer role/text selectors after nav |
-| Wait | `page.wait_for_selector(css)`, `expect(locator).to_be_visible()` | NEVER bare `sleep` |
-| Click / Tap | `page.get_by_role("button", name="Submit").click()` | role-based beats brittle CSS |
-| Type | `page.fill("#email", value)` | clears then types; use `.type()` for keystrokes |
-| Scroll | `page.mouse.wheel(0, 800)` or `el.scroll_into_view_if_needed()` | loop to reach lazy content |
-| Screenshot | `page.screenshot(path=..., full_page=True)` | full_page captures below-fold |
-| Read DOM | `page.inner_text(sel)`, `page.content()` | extract data after render |
-| Login | fill user/pass → click submit → `wait_for_url("**/dashboard")` | verify success explicitly |
-| Handle dialogs | `page.on("dialog", lambda d: d.accept())` | alerts/confirmations |
-| New tab/window | `ctx.expect_page()` around a click | popups |
-
-### Login flow example
-```python
-page.goto("https://site.example/login")
-page.fill('input[name="email"]', os.environ["SITE_EMAIL"])
-page.fill('input[name="password"]', os.environ["SITE_PASSWORD"])
-page.get_by_role("button", name=re.compile("log ?in", re.I)).click()
-page.wait_for_url(re.compile(r"/(dashboard|home|app)"), timeout=15000)
-assert page.locator("text=Welcome").is_visible(), "login did not succeed"
-```
-
-## How to understand an unfamiliar interface (be smart)
-
-Do this loop instead of guessing selectors blindly:
-
-1. **Load & screenshot** the page (`full_page=True`).
-2. **Read it visually** — identify headings, buttons, inputs, menus, tables, pagination.
-3. **Dump structure** when needed:
-   ```python
-   print(page.evaluate("""() => [...document.querySelectorAll(
-     'a,button,input,select,[role],h1,h2,nav,table')].slice(0,80).map(e => ({
-       tag:e.tagName.toLowerCase(), role:e.getAttribute('role'),
-       text:(e.innerText||e.value||'').trim().slice(0,60),
-       href:e.href||null, id:e.id||null, name:e.name||null }))"""))
-   ```
-4. **Pick robust selectors**: prefer `get_by_role` / `get_by_label` / `get_by_text` / stable
-   `data-testid` over generated class names. Avoid absolute XPath.
-5. **Act → observe → adapt**: after each action, re-screenshot or re-read to confirm state
-   changed as expected; if not, try another selector/strategy.
-
-## Scrolling & infinite feeds
-```python
-for _ in range(20):
-    prev = page.evaluate("document.body.scrollHeight")
-    page.mouse.wheel(0, 1200)
-    page.wait_for_timeout(400)          # let lazy content load
-    if page.evaluate("document.body.scrollHeight") == prev:
-        break                            # reached bottom
-```
-
-## Waiting strategies (avoid flakiness)
-- `wait_until="networkidle"` for SPA-heavy pages (but add a timeout; some pages never idle).
-- `page.wait_for_selector(sel, state="visible")` before interacting.
-- `expect(locator).to_have_text(...)` for assertions.
-- Set generous timeouts (`page.set_default_timeout(30000)`) on slow sites.
-
-## Run many steps cheaply
-Chain the whole flow into ONE `run` command (`a && b && c`) — or better, emit one `run_plan` —
-so intermediate output stays in the sandbox and you only pull back the final
-screenshot(s)/extracted JSON. This keeps context small and cuts round-trips. Write the script to
-a file with `novita_sandbox(action="write", ...)`, then run it, then read results.
-
-## Troubleshooting
-- **Browser won't launch / missing libs:** rerun `playwright install --with-deps chromium`; if
-  `--with-deps` needs root and is blocked, install the named shared libraries individually.
-- **Timeouts:** increase default timeout, switch `wait_until` to `domcontentloaded`.
-- **Cloudflare/bot walls:** set a realistic UA + viewport, `page.wait_for_load_state`, retry
-  once; if still blocked, tell the user the site blocks automation rather than looping.
-  When you are already using the `human_browser` tool, its `navigate` and `click` actions
-  click through a Cloudflare Turnstile challenge automatically and report the outcome under
-  a `cloudflare` key (`challenge_present`, `solved`). If a challenge reappears, call
-  `human_browser(action="solve_cloudflare")` to retry it and wait.
-- **Empty screenshots:** ensure `wait_for_load_state("networkidle")` or a selector wait first.
-- **Headless detection:** some sites block headless; try `chromium.launch(channel="chrome")`
-  or `headless=False` with `xvfb-run` if a virtual display is available.
-
-## Deliverables
-Return concrete artifacts: screenshot paths under `/workspace/`, extracted data as JSON/markdown,
-and a short statement of what was verified (e.g., "logged in successfully, dashboard visible").
+If the site blocks the automated browser, say so and report the specific blocker. Do not loop.

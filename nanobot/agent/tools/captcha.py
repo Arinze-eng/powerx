@@ -482,13 +482,31 @@ class CaptchaSolverTool(Tool):
         )
 
     @property
+    def answerable_actions(self) -> list[str]:
+        """The actions THIS deployment's provider can actually answer.
+
+        The full action set is an implementation detail: a SolveGate deployment
+        answers two gates and nothing else, so offering the model a recaptcha
+        action it will always refuse only invites a wasted call. The schema is
+        built from what can succeed.
+
+        ``waf`` is the one action outside SolveGate's reach: the CapSkip
+        2captcha protocol this provider speaks has no method for a Cloudflare
+        WAF challenge, which is the gap SolveGate was added to cover. Turnstile
+        itself is served by both, so it stays in the CapSkip enum.
+        """
+        if self.provider == "solvegate":
+            return sorted(self._SOLVEGATE_GATES)
+        return sorted(self._ACTIONS - {"waf"})
+
+    @property
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": sorted(self._ACTIONS),
+                    "enum": self.answerable_actions,
                 },
                 "image_path": {"type": ["string", "null"], "maxLength": self._MAX_URL},
                 "sitekey": {"type": ["string", "null"], "maxLength": self._MAX_SITEKEY},
