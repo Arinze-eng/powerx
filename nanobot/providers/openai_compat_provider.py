@@ -156,6 +156,19 @@ _QWEN_THINKING_MODELS: frozenset[str] = frozenset({
     "qwen3.5-flash",
 })
 
+# GLM toggles thinking the same way DeepSeek does -- ``thinking: {"type":
+# "enabled"|"disabled"}`` -- but is matched by PREFIX rather than an exact list
+# because Zhipu ships a new ``glm-4.x``/``glm-5.x`` on a rolling basis and a
+# fixed slug list goes stale silently. Only the generations that actually
+# support the parameter are listed: GLM-4 and earlier have no thinking mode and
+# would reject the field.
+_GLM_TOGGLE_PREFIXES: tuple[str, ...] = ("glm-4.5", "glm-4.6", "glm-4.7", "glm-5.")
+
+# GLM generations where thinking is forced and CANNOT be disabled -- sending
+# "disabled" is an error, not a no-op (Z.AI: GLM-5.3 and GLM-5.3-FLASH).
+_GLM_ALWAYS_THINKING_PREFIXES: tuple[str, ...] = ("glm-5.3",)
+
+
 _MODEL_THINKING_STYLES: dict[str, str] = {
     **dict.fromkeys(_KIMI_THINKING_MODELS, "thinking_type"),
     **dict.fromkeys(_MIMO_THINKING_MODELS, "thinking_type"),
@@ -180,7 +193,18 @@ def _requires_max_completion_tokens(model_name: str) -> bool:
 
 
 def _model_thinking_style(model_name: str) -> str:
-    return _MODEL_THINKING_STYLES.get(_model_slug(model_name), "")
+    slug = _model_slug(model_name)
+    exact = _MODEL_THINKING_STYLES.get(slug)
+    if exact:
+        return exact
+    # A forced-thinking GLM gets no style at all rather than "disabled": the
+    # disabled value is rejected by the API, and "enabled" is already its
+    # default, so sending nothing is both correct and safe.
+    if slug.startswith(_GLM_ALWAYS_THINKING_PREFIXES):
+        return ""
+    if slug.startswith(_GLM_TOGGLE_PREFIXES):
+        return "thinking_type"
+    return ""
 
 
 def _thinking_styles_for(spec: ProviderSpec | None, model_name: str) -> list[str]:
