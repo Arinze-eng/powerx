@@ -5804,3 +5804,286 @@ def test_numeric_fields_match_the_schema():
     )
     # A field in both sets would be parsed as an integer by accident of iteration.
     assert not (_FLOAT_FIELDS & _INT_FIELDS)
+
+
+# --------------------------------------------------------------------------- #
+# A NAMED server is never answered with the deployment's default build
+# --------------------------------------------------------------------------- #
+#: A broker this repo does not register, i.e. the case the registry cannot serve.
+_PEPPERSTONE_URL = (
+    "https://download.mql5.com/cdn/web/pepperstone.design/mt5/pepperstone5setup.exe"
+)
+
+
+def _install_namespace(script, *, server=None, url="", dir_name=""):
+    import argparse
+
+    return argparse.Namespace(
+        script=str(script),
+        server=server,
+        broker_installer_url=url,
+        broker_dir_name=dir_name,
+        timeout=60,
+        detach=True,
+        foreground=False,
+    )
+
+
+def _install_script(tmp_path):
+    script = tmp_path / "install_mt5_sandbox.sh"
+    script.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    return script
+
+
+def _launcher(monkeypatch, cli):
+    """Record every process the CLI tries to start, and start none of them."""
+    import subprocess as _subprocess
+
+    launched: list[list[Any]] = []
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *a, **k: (
+            launched.append(list(a))
+            or _subprocess.CompletedProcess(a, 0, "4242\n", "")
+        ),
+    )
+    return launched
+
+
+def test_an_unregistered_server_is_refused_not_given_the_default_build(
+    monkeypatch, tmp_path, capsys
+):
+    """``install --server <unknown>`` must NOT lay down the deployment's broker.
+
+    MEASURED FAILURE (2026-09-24, live): ``install --server Pepperstone-Demo`` fell
+    through to the installer's own default and the EXNESS build landed on disk, under
+    a green result. That terminal carries no Pepperstone server list, so it could not
+    perform the login it was installed for -- and the wrong build only becomes
+    visible a call later, as a refused login, which reads as an MT5 or network fault.
+
+    A refusal costs one turn. A silent wrong build costs the whole run, so this is
+    the property worth pinning: nothing is downloaded, nothing is recorded, and the
+    answer says what to do instead.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    monkeypatch.delenv("MT5_BROKER_INSTALLER_URL", raising=False)
+    launched = _launcher(monkeypatch, cli)
+
+    code = cli.cmd_install(
+        _install_namespace(_install_script(tmp_path), server="Pepperstone-Demo")
+    )
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    assert code == 2
+    assert payload["ok"] is False
+    assert payload["failure"] == "server_not_resolved"
+    assert payload["requested_server"] == "Pepperstone-Demo"
+    # The machine itself: no installer ran, and no target was recorded for `status`
+    # to poll -- an install that never started must not look like one that did.
+    assert launched == []
+    assert not cli.INSTALL_TARGET_FILE.exists()
+    # The remedy is a URL from the broker's own page, reachable without a human.
+    assert "broker_installer_url" in payload["remedy"]
+    assert "discover_broker" in payload["next"]
+    assert "exness" in payload["registry_brokers"]
+
+
+def test_an_inherited_default_url_cannot_answer_for_a_named_server(
+    monkeypatch, tmp_path, capsys
+):
+    """The box exports its default URL; a NAMED server must not be resolved by it.
+
+    MEASURED (2026-09-24, live): the sandbox carries ``MT5_BROKER_INSTALLER_URL`` in
+    its environment for its own bare installs. Reading that variable as "the answer"
+    made every ``install --server <unknown>`` look like an explicit request, so the
+    resolver had nothing left to refuse and the default build shipped anyway. argv is
+    now authoritative for a named server; the environment only chooses the default
+    for a bare install, which is what the variable is for.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    monkeypatch.setenv("MT5_BROKER_INSTALLER_URL", cli.DEFAULT_INSTALLER_URL)
+    launched = _launcher(monkeypatch, cli)
+
+    code = cli.cmd_install(
+        _install_namespace(_install_script(tmp_path), server="Pepperstone-Demo")
+    )
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    assert code == 2
+    assert payload["failure"] == "server_not_resolved"
+    assert launched == []
+
+
+def test_a_registered_server_beats_an_inherited_default_url(monkeypatch, tmp_path):
+    """The refusal must not swallow the registry path it sits next to.
+
+    The default URL is in the environment AND the server is one the registry knows:
+    the registry wins, so a bare ``install --server Deriv-Demo`` on a box that
+    exports the Exness default still lays down the Deriv build.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    monkeypatch.setenv("MT5_BROKER_INSTALLER_URL", cli.DEFAULT_INSTALLER_URL)
+    _launcher(monkeypatch, cli)
+
+    cli.cmd_install(_install_namespace(_install_script(tmp_path), server="Deriv-Demo"))
+
+    recorded = cli.INSTALL_TARGET_FILE.read_text(encoding="utf-8").strip()
+    assert recorded == cli.broker_for_server("Deriv-Demo")["url"]
+    assert recorded != cli.DEFAULT_INSTALLER_URL
+
+
+def test_a_url_the_caller_supplies_is_still_the_way_through(monkeypatch, tmp_path):
+    """Discovery's escape hatch: an explicit URL installs an unregistered broker.
+
+    This is what the tool uses after it resolves a URL itself, so refusing without
+    accepting a URL would trade a silent wrong build for a dead end.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path)
+    _launcher(monkeypatch, cli)
+
+    cli.cmd_install(
+        _install_namespace(
+            _install_script(tmp_path),
+            server="Pepperstone-Demo",
+            url=_PEPPERSTONE_URL,
+            dir_name="MetaTrader 5 Pepperstone",
+        )
+    )
+
+    assert cli.INSTALL_TARGET_FILE.read_text(encoding="utf-8").strip() == _PEPPERSTONE_URL
+
+
+def test_the_installer_url_is_passed_in_argv_where_the_cli_trusts_it():
+    """Both spellings, because the two layers read different ones.
+
+    The installer reads the environment variable; the CLI trusts argv. Emitting only
+    the env prefix is what let an inherited deployment default masquerade as the
+    caller's answer.
+    """
+    command = build_cli_command(
+        "install",
+        {
+            "server": "Pepperstone-Demo",
+            "broker_installer_url": _PEPPERSTONE_URL,
+            "broker_dir_name": "MetaTrader 5 Pepperstone",
+        },
+    )
+
+    assert "--broker-installer-url" in command
+    assert "--broker-dir-name" in command
+    assert f"MT5_BROKER_INSTALLER_URL={_PEPPERSTONE_URL}" in command
+
+
+def test_the_installer_script_refuses_to_build_a_default_for_a_named_server(tmp_path):
+    """Layer 2 of the same rule, at the layer that actually downloads.
+
+    ``mt5_cli.py`` refuses the combination before it reaches here. This guard is the
+    same decision in the script itself, so a hand-run install cannot slip past the
+    CLI -- and it reads the CALLER's URL, which is why it has to sit above the
+    ``:-default`` assignment in the script.
+    """
+    import subprocess as _subprocess
+
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
+    )
+    text = script.read_text(encoding="utf-8")
+    # Everything up to and including the guard; past it the script needs Wine.
+    end = text.index("  exit 64\nfi\n") + len("  exit 64\nfi\n")
+    head = tmp_path / "installer-guard.sh"
+    head.write_text(text[:end], encoding="utf-8")
+
+    def run(**env):
+        return _subprocess.run(
+            ["bash", str(head)],
+            env={**os.environ, **env},
+            capture_output=True,
+            text=True,
+        )
+
+    refused = run(MT5_BROKER_SERVER="AXI-Live", MT5_BROKER_INSTALLER_URL="")
+    assert refused.returncode == 64
+    assert "AXI-Live" in refused.stderr
+
+    # A URL for that broker, and the MetaQuotes generic build, both proceed.
+    assert run(
+        MT5_BROKER_SERVER="AXI-Live", MT5_BROKER_INSTALLER_URL=_PEPPERSTONE_URL
+    ).returncode == 0
+    assert run(
+        MT5_BROKER_SERVER="MetaQuotes-Demo",
+        MT5_BROKER_INSTALLER_URL="",
+        MT5_GENERIC_INSTALLER="1",
+    ).returncode == 0
+    # And a bare install -- no server named -- still gets the deployment default.
+    assert run(MT5_BROKER_INSTALLER_URL="").returncode == 0
+
+
+class _QueuedSandbox:
+    """A sandbox that answers each command with the next scripted reply."""
+
+    name = "novita_sandbox"
+
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    async def execute(self, **kwargs: Any) -> str:
+        self.calls.append(kwargs)
+        if not self.responses:
+            return '{"ok": true, "stage": "done"}\n[exit_code=0]'
+        return self.responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_an_install_refusal_is_resolved_by_the_tool_not_the_user(monkeypatch):
+    """The agent owns the install: a refusal is resolved, not handed back.
+
+    Refusing ``install --server X`` is right -- the alternative is a terminal that
+    cannot resolve X -- but "install my broker" still has an answer the agent can
+    find, so returning the refusal would leave the user holding a resolver puzzle.
+    The tool discovers a validated URL and runs the install in the same call.
+    """
+    import nanobot.agent.tools.mt5_sandbox as module
+
+    discovery_calls: list[tuple[str, Any]] = []
+
+    async def fake_discover(server, page_urls=None):
+        discovery_calls.append((server, page_urls))
+        return {"url": _PEPPERSTONE_URL, "dir_name": "MetaTrader 5 Pepperstone"}
+
+    monkeypatch.setattr(module, "_discover_for_server", fake_discover)
+
+    refusal = json.dumps(
+        {
+            "ok": False,
+            "failure": "server_not_resolved",
+            "requested_server": "Pepperstone-Demo",
+            "remedy": {"action": "install", "server": "Pepperstone-Demo"},
+            "next": "pass broker_installer_url",
+        }
+    )
+    sandbox = _QueuedSandbox(
+        [
+            refusal + "\n[exit_code=2]",
+            '{"ok": true, "stage": "installing"}\n[exit_code=0]',
+            '{"ok": true, "stage": "done", "installed": true}\n[exit_code=0]',
+        ]
+    )
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+
+    result = await tool.execute(action="install", server="Pepperstone-Demo")
+    rendered = str(result)
+
+    assert "server_not_resolved" not in rendered, rendered
+    assert _PEPPERSTONE_URL in rendered
+    assert discovery_calls == [("Pepperstone-Demo", [])]
+
+    installs = [c for c in sandbox.calls if "mt5_cli.py install" in str(c["command"])]
+    # Twice: the refused first attempt, then the resolved one. The second carries
+    # the URL discovery validated -- never the deployment default.
+    assert len(installs) == 2
+    assert _PEPPERSTONE_URL in str(installs[-1]["command"])
+    assert "exness5setup.exe" not in str(installs[-1]["command"])
+    assert "MT5_BROKER_DIR_NAME" in str(installs[-1]["command"])
+    assert "resolved_installer_url" in rendered

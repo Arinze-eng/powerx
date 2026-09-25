@@ -546,7 +546,9 @@ def _server_is_known(server: str | None) -> bool:
     return bool(name) and any(name.startswith(prefix) for prefix in _KNOWN_SERVER_PREFIXES)
 
 
-async def _discover_for_server(server: str | None) -> dict[str, Any] | None:
+async def _discover_for_server(
+    server: str | None, page_urls: list[str] | None = None
+) -> dict[str, Any] | None:
     """Resolve + VALIDATE an installer URL for *server* using the discovery table.
 
     WHY THIS EXISTS. The gate it sits in front of used to compare the server name
@@ -576,7 +578,9 @@ async def _discover_for_server(server: str | None) -> dict[str, Any] | None:
     try:
         from nanobot.trading.broker_discovery import discover_installer
 
-        result = await asyncio.to_thread(discover_installer, str(server))
+        result = await asyncio.to_thread(
+            discover_installer, str(server), tuple(page_urls or ())
+        )
     except Exception as exc:  # noqa: BLE001 - discovery must never crash the tool
         logger.warning("mt5_sandbox: broker discovery for {!r} failed ({})", server, exc)
         return None
@@ -722,6 +726,31 @@ def _host_plan(kwargs: dict[str, Any]) -> str:
     return json.dumps(result)
 
 
+def _page_urls(kwargs: dict[str, Any]) -> list[str]:
+    """The caller's ``page_urls`` as minable text: each entry both fetched and raw.
+
+    A single entry may be a URL to FETCH or already-fetched page text (an agent that
+    already has the page should not pay for it twice). Fetching is best-effort -- a
+    page that 404s must not sink the derived search -- and the raw URL is kept
+    alongside the body because the URL ITSELF carries the slug.
+    """
+    pages: list[str] = []
+    raw_pages = kwargs.get("page_urls")
+    if isinstance(raw_pages, str):
+        pages.append(raw_pages)
+    elif isinstance(raw_pages, (list, tuple)):
+        pages.extend(str(p) for p in raw_pages if p)
+
+    fetched: list[str] = []
+    for page in pages:
+        text = page
+        if page.lower().startswith(("http://", "https://")):
+            text = _fetch_page_text(page)
+        fetched.append(text)
+        fetched.append(page)
+    return fetched
+
+
 def _host_discover_broker(kwargs: dict[str, Any]) -> str:
     """``action='discover_broker'``: find an unknown broker's MT5 installer URL.
 
@@ -755,22 +784,7 @@ def _host_discover_broker(kwargs: dict[str, Any]) -> str:
             "from it."
         )
 
-    pages: list[str] = []
-    raw_pages = kwargs.get("page_urls")
-    if isinstance(raw_pages, str):
-        pages.append(raw_pages)
-    elif isinstance(raw_pages, (list, tuple)):
-        pages.extend(str(p) for p in raw_pages if p)
-
-    # A single caller-supplied page may be a URL to FETCH or already-fetched text.
-    # Fetching is best-effort: a page that 404s must not sink the derived search.
-    fetched: list[str] = []
-    for page in pages:
-        text = page
-        if page.lower().startswith(("http://", "https://")):
-            text = _fetch_page_text(page)
-        fetched.append(text)
-        fetched.append(page)
+    fetched = _page_urls(kwargs)
 
     try:
         result = discover_installer(server, page_urls=fetched)
@@ -947,10 +961,17 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
         # because that is how the installer already reads it.
         broker_url = kwargs.get("broker_installer_url")
         if broker_url:
+            # Kept as an env prefix because that is how the installer reads it, and
+            # ALSO passed in argv because that is what the CLI trusts. The two must
+            # not disagree: an inherited MT5_BROKER_INSTALLER_URL is the deployment's
+            # own default build, and the CLI must never let it answer a question
+            # about a server the caller NAMED (see cmd_install).
             parts.insert(0, f"MT5_BROKER_INSTALLER_URL={_sh(broker_url)}")
+            parts += ["--broker-installer-url", _sh(broker_url)]
         broker_dir = kwargs.get("broker_dir_name")
         if broker_dir:
             parts.insert(0, f"MT5_BROKER_DIR_NAME={_sh(broker_dir)}")
+            parts += ["--broker-dir-name", _sh(broker_dir)]
         # The SERVER decides which build is installed, so passing it here is what
         # makes the FIRST install correct for any broker instead of paying for a
         # re-install after a refused login. The CLI resolves it against the broker
@@ -2048,6 +2069,13 @@ class MT5SandboxTool(Tool):
                 return await self._auto_install_for_broker(
                     sandbox, action, kwargs, payload
                 )
+            # `install --server X` for a server the CLI cannot resolve is REFUSED
+            # rather than answered with the deployment's default build -- a wrong
+            # terminal that reports success. That refusal is not a dead end: the
+            # installer URL is discoverable, and the agent discovers it here instead
+            # of handing the model a resolver puzzle.
+            if payload.get("failure") == "server_not_resolved":
+                return await self._resolve_then_install(sandbox, kwargs, payload)
             return ToolResult.error(json.dumps(payload))
 
         return json.dumps(payload)
@@ -2160,6 +2188,103 @@ class MT5SandboxTool(Tool):
                 "reply with only a status update and no tool call",
             ],
         }
+
+    async def _resolve_then_install(
+        self,
+        sandbox: Any,
+        kwargs: dict[str, Any],
+        refusal: dict[str, Any],
+    ) -> str:
+        """Resolve an installer for an unregistered server, then install it.
+
+        THE AGENT OWNS THE INSTALL. ``install --server X`` refusing a server it
+        cannot resolve is the right answer -- the alternative is silently laying down
+        the deployment's default build, which is a terminal that cannot resolve X at
+        all -- but "install my broker" still HAS an answer the agent can find, so
+        the refusal must not arrive as a dead end the user has to clear. This
+        resolves the URL through the same HTTP-validated discovery table the
+        ``discover_broker`` action uses, then runs the install in this same call, the
+        way ``_auto_install_for_broker`` does for a terminal that cannot resolve a
+        server.
+
+        The one thing it cannot invent is the authoritative page: if the discovery
+        table has nothing that validates, the caller is told to fetch the broker's
+        own 'Download MT5' page and pass it back as ``page_urls``.
+        """
+        server = str(kwargs.get("server") or refusal.get("requested_server") or "")
+        discovered = await _discover_for_server(server, page_urls=_page_urls(kwargs))
+        if not discovered:
+            return ToolResult.error(
+                json.dumps(
+                    {
+                        **refusal,
+                        "message": (
+                            f"No MT5 installer could be validated for server "
+                            f"{server!r} -- neither from the discovery table nor from "
+                            "any page passed in. The deployment's default build cannot "
+                            "resolve this server, so installing it would only produce a "
+                            "terminal that never attempts the login."
+                        ),
+                        "next": (
+                            "Fetch the broker's own 'Download MT5' page, then call "
+                            f"action='discover_broker' with server={server!r} and "
+                            "page_urls=<that page's text> -- the link on the broker's "
+                            "own page is the authoritative one. Retry action='install' "
+                            "with the broker_installer_url it returns."
+                        ),
+                    }
+                )
+            )
+
+        install_kwargs = dict(kwargs)
+        install_kwargs["broker_installer_url"] = discovered["url"]
+        if discovered.get("dir_name") and not install_kwargs.get("broker_dir_name"):
+            install_kwargs["broker_dir_name"] = discovered["dir_name"]
+        logger.info(
+            "mt5_sandbox: resolved installer for server {!r} -> {}",
+            server,
+            discovered["url"],
+        )
+
+        kick = build_cli_command("install", install_kwargs)
+        try:
+            rendered = await sandbox.execute(
+                action="run",
+                command=f"{bootstrap_command()} >/dev/null 2>&1 || true; {kick}",
+                timeout=_TIMEOUTS["install"],
+            )
+        except Exception as exc:  # noqa: BLE001 - transport-level failure
+            logger.warning("mt5_sandbox: discovered install failed ({})", exc)
+            return ToolResult.error(
+                f"The install for server {server!r} failed to start: "
+                f"{type(exc).__name__}: {exc}. Retry action='install' with "
+                f"server={server!r} and broker_installer_url={discovered['url']!r}."
+            )
+
+        payload = _parse_payload(str(rendered)) or {}
+        if "password" in payload:
+            payload["password"] = "***"
+
+        # Same wait discipline as a normal install: detached, so this call owns the
+        # wait rather than handing the model an "installing, go poll" instruction.
+        if str(payload.get("stage") or "") == "installing":
+            waited = await self._wait_for_install(sandbox)
+            if waited:
+                if "password" in waited:
+                    waited["password"] = "***"
+                payload = waited
+
+        payload["resolved_installer_url"] = discovered["url"]
+        payload["requested_server"] = server
+        payload.setdefault(
+            "message",
+            f"The CLI's registry cannot resolve server {server!r}, so the tool found "
+            "that broker's installer itself, validated it over HTTP, and installed it "
+            "-- no user action was needed.",
+        )
+        if payload.get("ok") is False:
+            return ToolResult.error(json.dumps(payload))
+        return json.dumps(payload)
 
     async def _auto_install_for_broker(
         self,

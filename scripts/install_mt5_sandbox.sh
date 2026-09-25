@@ -76,6 +76,29 @@ DISPLAY_NUM="${MT5_DISPLAY_NUM:-99}"
 # correct one. Unset, this deployment's default build is installed and a mismatched
 # login is refused up front with the install to run instead (never a silent hang).
 MT5_INSTALLER_URL="${MT5_INSTALLER_URL:-https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe}"
+
+# A NAMED server with no build to match it is a STOP, not a default.
+#
+# The defaults above are this deployment's own choice of broker, which is the right
+# answer to "install MT5" and the wrong answer to "install MT5 for AXI-Live": it
+# lays down a terminal that carries only Exness's servers, cannot resolve that name
+# at all, and reports a healthy install while doing it. mt5_cli.py already refuses
+# that combination before it gets here (``install --server <unknown>``); this guard
+# is the same rule at the layer that actually downloads, so a hand-run script
+# cannot slip past it.
+# Every read is ``:-``-guarded: this script runs under ``set -u``, and neither
+# variable is guaranteed to exist this early -- an unguarded read would kill the
+# installer here with "unbound variable" instead of with the reason.
+if [ -n "${MT5_BROKER_SERVER:-}" ] \
+   && [ -z "${MT5_BROKER_INSTALLER_URL:-}" ] \
+   && [ "${MT5_GENERIC_INSTALLER:-0}" != "1" ]; then
+  echo "[mt5-install] FATAL: MT5_BROKER_SERVER=${MT5_BROKER_SERVER} names a broker" >&2
+  echo "[mt5-install] but MT5_BROKER_INSTALLER_URL is empty, so this run would" >&2
+  echo "[mt5-install] install the default build, which cannot resolve that server." >&2
+  echo "[mt5-install] Pass MT5_BROKER_INSTALLER_URL (and MT5_BROKER_DIR_NAME) for" >&2
+  echo "[mt5-install] that broker, or MT5_GENERIC_INSTALLER=1 for MetaQuotes." >&2
+  exit 64
+fi
 MT5_BROKER_INSTALLER_URL="${MT5_BROKER_INSTALLER_URL:-https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe}"
 # Explicit opt-in to the generic MetaQuotes build. Only a MetaQuotes-Demo account
 # can use it; a real broker cannot log in on it at all.
@@ -86,6 +109,7 @@ fi
 # "MetaTrader 5 <BRAND>" as the directory name and refuses to overwrite a generic
 # install, so the two can coexist and the terminal finder must know both names.
 MT5_BROKER_DIR_NAME="${MT5_BROKER_DIR_NAME:-MetaTrader 5 EXNESS}"
+
 # MetaTrader5's PyPI wheels are Windows-only, so the bridge needs a Windows
 # python inside the Wine prefix (see section 5 below).
 MT5_WINPY_VERSION="${MT5_WINPY_VERSION:-3.11.9}"

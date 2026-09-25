@@ -1019,6 +1019,57 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     return emit(info, text=text)
 
 
+def fail_server_not_resolved(server: str) -> int:
+    """Refuse to install a build for a server this CLI cannot resolve.
+
+    WHY REFUSE RATHER THAN FALL BACK: the installer's own default is this
+    deployment's broker (Exness). Falling through to it turned "install the build
+    for Pepperstone-Demo" into a perfectly healthy Exness terminal -- a wrong
+    answer that reports success, is only detectable a call later, and reads as an
+    MT5 or network fault rather than a wrong build. A refusal costs one turn, names
+    the URL to pass, and cannot be mistaken for an install that worked.
+
+    The remedy is deliberately a SEQUENCE and not just "pass a URL": the agent can
+    find that URL itself (the tool's ``discover_broker`` validates candidates over
+    HTTP), so nothing here requires a human.
+    """
+    message = (
+        f"cannot install for server {server!r}: this CLI's broker registry has no "
+        "build that can resolve it, and installing the deployment default instead "
+        "would lay down a terminal that cannot even attempt that login. Pass the "
+        "installer URL from the broker's own 'Download MT5' page with "
+        "--broker-installer-url."
+    )
+    return fail(
+        message,
+        code=2,
+        failure="server_not_resolved",
+        requested_server=server,
+        registry_brokers=sorted(b["key"] for b in broker_builds()),
+        remedy={
+            "action": "install",
+            "server": server,
+            "broker_installer_url": (
+                "https://download.mql5.com/cdn/web/<broker-slug>/mt5/<name>5setup.exe"
+            ),
+            "broker_dir_name": "MetaTrader 5 <BRAND>",
+            "note": (
+                "Pass BOTH. A branded installer creates 'MetaTrader 5 <BRAND>' and "
+                "the terminal finder keys off that exact directory name -- Deriv is "
+                "the standing exception and creates 'MetaTrader 5 Terminal'."
+            ),
+        },
+        next=(
+            "Use the mt5_sandbox tool's action='discover_broker' with "
+            f"server={server!r} -- pass page_urls=<the broker's own 'Download MT5' "
+            "page> if you have fetched it; that validates candidates over HTTP and "
+            f"returns a URL that works. Then action='install' with server={server!r} "
+            "and broker_installer_url=<that URL>. Registering the broker once with "
+            "MT5_BROKER_BUILDS='<server-prefix>|<url>|<install-dir>' also works."
+        ),
+    )
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     script = Path(args.script).expanduser()
     if not script.exists():
@@ -1046,15 +1097,36 @@ def cmd_install(args: argparse.Namespace) -> int:
     # time makes the FIRST install the right one instead of paying for a re-install.
     env = wine_env()
     server = getattr(args, "server", None)
+    # WHICH URL THE CALLER NAMED, kept strictly apart from the deployment default.
+    #
+    # MEASURED FAILURE (2026-09-24, live): ``install --server Pepperstone-Demo`` --
+    # a server this registry does not know -- fell through to the installer's own
+    # default and silently laid down the EXNESS build. Nothing said so: the install
+    # reported ok, ``status`` reported a healthy branded terminal, and the wrong
+    # build only surfaced a call later as a refused login. Worse, the URL was read
+    # straight out of ``MT5_BROKER_INSTALLER_URL`` in the ENVIRONMENT, which the box
+    # exports for its own bare installs -- so the deployment's default answered a
+    # question the caller had actually left open.
+    #
+    # argv is therefore authoritative for a NAMED server, and an unresolvable one is
+    # refused rather than shipped the default build. ``MT5_BROKER_INSTALLER_URL`` is
+    # still honoured when NO server was named: that is the deployment's own choice
+    # of default build, which is exactly what the variable is for.
+    caller_url = str(getattr(args, "broker_installer_url", "") or "").strip()
+    caller_dir = str(getattr(args, "broker_dir_name", "") or "").strip()
+    if server and not caller_url and broker_for_server(server) is None:
+        return fail_server_not_resolved(server)
+    env_url = str(os.environ.get("MT5_BROKER_INSTALLER_URL") or "").strip()
     resolved = resolve_build_for_server(
         server,
-        url=str(
-            getattr(args, "broker_installer_url", "")
-            or os.environ.get("MT5_BROKER_INSTALLER_URL")
-            or ""
-        ),
-        dir_name=str(getattr(args, "broker_dir_name", "") or ""),
+        url=caller_url or ("" if server else env_url),
+        dir_name=caller_dir,
     )
+    if server:
+        # The installer reads this and refuses to build a default for a NAMED
+        # server (see install_mt5_sandbox.sh's MT5_BROKER_SERVER guard), so the two
+        # layers cannot disagree about which broker this install is for.
+        env["MT5_BROKER_SERVER"] = str(server)
     if resolved is not None:
         if resolved.get("url"):
             env["MT5_BROKER_INSTALLER_URL"] = str(resolved["url"])
@@ -1066,8 +1138,6 @@ def cmd_install(args: argparse.Namespace) -> int:
             env["MT5_GENERIC_INSTALLER"] = "1"
             env.pop("MT5_BROKER_INSTALLER_URL", None)
         env["MT5_BROKER_KEY"] = str(resolved["key"])
-        if server:
-            env["MT5_BROKER_SERVER"] = str(server)
 
     # Switching broker must invalidate the cached terminal path and the recorded
     # build, or the next command hands out the PREVIOUS broker's terminal -- the
