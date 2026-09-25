@@ -315,6 +315,21 @@ export interface ToolProgressEvent {
   arguments?: unknown;
   result?: unknown;
   error?: unknown;
+  /**
+   * How the call ended, decided by the host: `"ok"`, `"error"`, or `"refused"`.
+   *
+   * `refused` is a guard saying no — the MT5 live-trading gate, a path guard —
+   * and is not a failure. Only the producer can tell those apart, so it does.
+   */
+  outcome?: string | null;
+  /**
+   * What kind of live-feed row this call makes: `"command"`, `"trade"`, `"nav"`
+   * or `"sandbox"`. `null` means the feed has no row for it.
+   *
+   * Sent by the host because a tool-name set kept in the client cannot see which
+   * tools exist and goes stale silently. Render this; never match on `name`.
+   */
+  kind?: string | null;
   files?: unknown[];
   embeds?: unknown[];
 }

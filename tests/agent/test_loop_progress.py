@@ -101,6 +101,11 @@ class TestToolEventProgress:
                     "arguments": {"path": "foo.txt"},
                     "result": None,
                     "error": None,
+                    # A call the Live screen's activity feed has no row for. The
+                    # producer says so rather than leaving the client to match on
+                    # a tool name it cannot keep current.
+                    "outcome": None,
+                    "kind": None,
                     "files": [],
                     "embeds": [],
                 }],
@@ -116,6 +121,8 @@ class TestToolEventProgress:
                     "arguments": {"path": "foo.txt"},
                     "result": "ok",
                     "error": None,
+                    "outcome": "ok",
+                    "kind": None,
                     "files": [],
                     "embeds": [],
                 }],

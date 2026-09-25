@@ -145,7 +145,7 @@ export function ScreenView(props: ScreenViewProps) {
             className="gap-1.5 text-xs"
           >
             <TerminalSquare className="h-3.5 w-3.5" />
-            {t("screen.activityToggle", { defaultValue: "Terminal" })}
+            {t("screen.activityToggle", { defaultValue: "Activity" })}
             {activity.trades.length > 0 ? (
               <span className="rounded-full bg-amber-500/20 px-1.5 text-[10px] font-medium text-amber-400">
                 {activity.trades.length}

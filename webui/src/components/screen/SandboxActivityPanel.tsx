@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from "react";
-import { Ban, Check, Loader2, TerminalSquare } from "lucide-react";
+import { Ban, Check, Loader2, ShieldAlert, TerminalSquare } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
@@ -40,6 +40,7 @@ function durationLabel(row: SandboxActivityRow): string | null {
 const KIND_LABEL: Record<SandboxActivityKind, string> = {
   command: "cmd",
   trade: "trade",
+  nav: "nav",
   sandbox: "sandbox",
 };
 
@@ -48,6 +49,9 @@ const KIND_CLASS: Record<SandboxActivityKind, string> = {
   // A trade is the one line an operator must never miss, so it is the one line
   // that gets a tint rather than a shade of grey.
   trade: "text-amber-300",
+  // Browsing is a different activity from running a command, so it reads in a
+  // different colour rather than blending into the command blue.
+  nav: "text-teal-300/80",
   sandbox: "text-violet-300/80",
 };
 
@@ -77,7 +81,8 @@ export function SandboxActivityPanel(props: SandboxActivityPanelProps) {
     if (props.rows.length === 0) return null;
     const running = props.rows.filter((row) => row.status === "running").length;
     const failed = props.rows.filter((row) => row.status === "error").length;
-    return { running, failed };
+    const refused = props.rows.filter((row) => row.status === "refused").length;
+    return { running, failed, refused };
   }, [props.rows]);
 
   return (
@@ -90,7 +95,7 @@ export function SandboxActivityPanel(props: SandboxActivityPanelProps) {
       <header className="flex shrink-0 items-center gap-2 border-b border-border/60 px-3 py-2">
         <TerminalSquare className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
         <h2 className="text-xs font-medium">
-          {t("screen.activityTitle", { defaultValue: "Sandbox terminal" })}
+          {t("screen.activityTitle", { defaultValue: "Live activity" })}
         </h2>
         {tradeCount > 0 ? (
           <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
@@ -110,6 +115,14 @@ export function SandboxActivityPanel(props: SandboxActivityPanelProps) {
           {summary?.failed ? (
             <span className="text-red-400">
               {t("screen.activityFailed", { defaultValue: "{{count}} failed", count: summary.failed })}
+            </span>
+          ) : null}
+          {summary?.refused ? (
+            <span className="text-amber-400">
+              {t("screen.activityRefused", {
+                defaultValue: "{{count}} refused",
+                count: summary.refused,
+              })}
             </span>
           ) : null}
           <Button
@@ -146,7 +159,7 @@ export function SandboxActivityPanel(props: SandboxActivityPanelProps) {
           <p className="py-6 text-center text-white/40">
             {t("screen.activityEmpty", {
               defaultValue:
-                "Nothing yet. Every shell command and MT5 action the agent runs appears here as it runs — including the ones it reflexively overrides.",
+                "Nothing yet. Every command the agent runs, every page it opens and every MT5 action it takes appears here as it happens — on any sandbox, in any chat.",
             })}
           </p>
         ) : (
@@ -174,6 +187,10 @@ function ActivityLine({ row }: { row: SandboxActivityRow }) {
           "w-3 shrink-0 pt-px",
           row.status === "running" && "text-sky-400",
           row.status === "ok" && "text-emerald-400",
+          // A guard saying no is not a failure. Colouring it red next to a real
+          // broker rejection would train an operator to ignore red, which is the
+          // one thing this panel exists to prevent.
+          row.status === "refused" && "text-amber-400",
           row.status === "error" && "text-red-400",
         )}
         title={row.status}
@@ -182,6 +199,8 @@ function ActivityLine({ row }: { row: SandboxActivityRow }) {
           <Loader2 className="h-3 w-3 animate-spin motion-reduce:animate-none" />
         ) : row.status === "ok" ? (
           <Check className="h-3 w-3" />
+        ) : row.status === "refused" ? (
+          <ShieldAlert className="h-3 w-3" />
         ) : (
           <Ban className="h-3 w-3" />
         )}
