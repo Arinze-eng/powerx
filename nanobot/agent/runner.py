@@ -30,6 +30,12 @@ from nanobot.agent.shape_router import (
     steer_message_for,
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
+from nanobot.agent.steering import (
+    MAX_STEER_CYCLES,
+    SteeringInbox,
+    build_steering_messages,
+    close_pending_tool_calls,
+)
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
 from nanobot.agent.plan_cache import (
     make_plan_cache,
@@ -114,6 +120,11 @@ _MAX_LENGTH_RECOVERIES = 3
 #: only ever emits a little at a time, so no length floor is needed.
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
+
+#: Placeholder returned in place of a tool result for a call the user's steer
+#: abandoned before it started. Normalised into a readable tool message by the
+#: caller, so the transcript still answers every emitted tool_call.
+_STEERING_ABANDONED = "__steering_abandoned__"
 
 #: How long one tool call may run before the agent says it is still running.
 #:
@@ -323,6 +334,13 @@ class AgentRunSpec:
     # Mirrors Manus's "API called: N" telemetry so efficiency is observable.
     # Initialized by _run_core; safe under concurrency because it is per-spec.
     llm_calls: list[int] = field(default_factory=list)
+    # Mid-run user steering inbox (nanobot.agent.steering). When set, the loop
+    # lets the user redirect a run that is already going: a steer drained
+    # before the model's proposed continuation wins over that continuation, and
+    # tool calls abandoned because of it are closed with synthetic results so
+    # the transcript stays valid. None disables the feature entirely and every
+    # existing run behaves byte-for-byte as before.
+    steering_inbox: Any | None = None
 
 
 @dataclass(slots=True)
@@ -461,6 +479,84 @@ class AgentRunner:
                 messages[-1] = merged
                 continue
             messages.append(injection)
+
+    async def _drain_steering(
+        self, spec: AgentRunSpec, messages: list[dict[str, Any]],
+    ) -> int:
+        """Append any queued steers to *messages*. Returns the count appended.
+
+        Kept separate from ``_try_drain_injections`` on purpose: injections are
+        system-generated follow-ups (goal continuation, error retry) that are
+        budgeted by ``_MAX_INJECTION_CYCLES``, while a steer is a *user*
+        interrupting a run that is already going. Mixing them would let one
+        crowd out the other's budget.
+        """
+        inbox = getattr(spec, "steering_inbox", None)
+        if inbox is None or not inbox.has_pending():
+            return 0
+        updates = inbox.drain()
+        if not updates:
+            return 0
+        for message in build_steering_messages(updates):
+            self._append_injected_messages(messages, [message])
+        logger.info(
+            "Steered run {} with {} user update(s)",
+            spec.session_key or "default", len(updates),
+        )
+        return len(updates)
+
+    async def _steer_before_continuation(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+        assistant_message: dict[str, Any] | None,
+        pending_tool_calls: list[Any],
+        steer_cycles: int,
+        *,
+        iteration: int | None = None,
+        conversation_state: ProviderConversationStateController | None = None,
+    ) -> bool:
+        """Give a queued steer precedence over the model's proposed next step.
+
+        This is the behaviour that distinguishes steering from injection. When
+        the user interrupts while the model is streaming, the model has often
+        already emitted tool calls for the *old* direction. Honouring the steer
+        means refusing to run them -- and every refused call must still be
+        answered with a synthetic tool result, because an unanswered
+        ``tool_call`` makes the transcript invalid for every later turn.
+
+        Returns True when a steer was applied (caller should re-consult the
+        model instead of executing the abandoned calls).
+        """
+        inbox = getattr(spec, "steering_inbox", None)
+        if inbox is None or steer_cycles >= MAX_STEER_CYCLES or not inbox.has_pending():
+            return False
+
+        if assistant_message is not None:
+            messages.append(assistant_message)
+        if pending_tool_calls:
+            closed = close_pending_tool_calls(messages, pending_tool_calls)
+            logger.info(
+                "Steer abandoned {} pending tool call(s) in run {} ({}/{} closed)",
+                closed, spec.session_key or "default", steer_cycles + 1, MAX_STEER_CYCLES,
+            )
+        applied = await self._drain_steering(spec, messages)
+        if not applied:
+            return False
+
+        if assistant_message is not None and iteration is not None:
+            checkpoint: dict[str, Any] = {
+                "phase": "steered",
+                "iteration": iteration,
+                "model": spec.runtime.model,
+                "assistant_message": assistant_message,
+                "completed_tool_results": [],
+                "pending_tool_calls": [],
+            }
+            if conversation_state is not None:
+                checkpoint["provider_state"] = conversation_state.checkpoint(messages)
+            await self._emit_checkpoint(spec, checkpoint)
+        return True
 
     async def _try_drain_injections(
         self,
@@ -713,6 +809,8 @@ class AgentRunner:
         length_recovery_parts: list[str] = []
         had_injections = False
         injection_cycles = 0
+        # How many times a user steer has preempted the model this run.
+        steer_cycles = 0
         compacted_tool_call_ids: set[str] = set()
         repeat_tool_state: dict[str, Any] = {"fingerprint": None, "count": 0}
         pending_stream_content: str | None = None
@@ -880,6 +978,12 @@ class AgentRunner:
             )
 
         for iteration in range(spec.max_iterations):
+            # Seam 1 of 3 for steering: a steer queued between iterations is
+            # applied before the model is consulted again, so the next request
+            # already reflects the user's new direction.
+            if await self._drain_steering(spec, messages):
+                had_injections = True
+                steer_cycles += 1
             if spec.strip_image_content_before_provider:
                 # Injections and recovery/finalization messages are appended
                 # between iterations, so scrub again immediately before model
@@ -981,6 +1085,24 @@ class AgentRunner:
 
                 await hook.before_execute_tools(context)
 
+                # Seam 2 of 3 for steering: precedence over the proposed
+                # continuation. The calls below were chosen for the direction
+                # the user has just abandoned, so drop them (closing each with a
+                # synthetic result) and re-consult the model instead.
+                if await self._steer_before_continuation(
+                    spec,
+                    messages,
+                    assistant_message,
+                    response.tool_calls,
+                    steer_cycles,
+                    iteration=iteration,
+                    conversation_state=conversation_state,
+                ):
+                    steer_cycles += 1
+                    had_injections = True
+                    await hook.after_iteration(context)
+                    continue
+
                 results, new_events, fatal_error = await self._execute_tools(
                     spec,
                     response.tool_calls,
@@ -1063,17 +1185,30 @@ class AgentRunner:
                 context.tool_events = list(new_events)
                 completed_tool_results: list[dict[str, Any]] = []
                 for tool_call, result in zip(response.tool_calls, results):
-                    tool_message = {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_call.name,
-                        "content": self.context_governor.normalize_tool_result(
-                            governance_config,
-                            tool_call.id,
-                            tool_call.name,
-                            result,
-                        ),
-                    }
+                    if result is _STEERING_ABANDONED:
+                        # Bypass the context governor: this is not a real tool
+                        # output, and offloading/measuring it would be nonsense.
+                        tool_message = {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.name,
+                            "content": (
+                                "Not executed: the user steered the run in a new "
+                                "direction before this call started."
+                            ),
+                        }
+                    else:
+                        tool_message = {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.name,
+                            "content": self.context_governor.normalize_tool_result(
+                                governance_config,
+                                tool_call.id,
+                                tool_call.name,
+                                result,
+                            ),
+                        }
                     messages.append(tool_message)
                     completed_tool_results.append(tool_message)
                 if fatal_error is not None:
@@ -2197,7 +2332,27 @@ class AgentRunner:
         context = context or AgentHookContext(iteration=0, messages=[])
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
-        for batch in batches:
+        # Seam 3 of 3 for steering: checked between batches, so a run with a
+        # long queue of tool calls can stop early instead of finishing work the
+        # user has already redirected. Only active for a serial batch: splitting
+        # a concurrent batch mid-flight would leave calls half-run with no
+        # result, which is worse than letting the batch finish.
+        abandoned_from: int | None = None
+        inbox = getattr(spec, "steering_inbox", None)
+        flat_index = 0
+        for batch_index, batch in enumerate(batches):
+            if (
+                abandoned_from is None
+                and inbox is not None
+                and not (spec.concurrent_tools and len(batch) > 1)
+                and inbox.has_pending()
+            ):
+                abandoned_from = flat_index
+                logger.info(
+                    "Steer abandoned {} unstarted tool call(s) mid-batch",
+                    len(tool_calls) - flat_index,
+                )
+                break
             if spec.concurrent_tools and len(batch) > 1:
                 # Bounded, not a bare gather: the model may now emit many
                 # parallel calls in one turn, and running all of them at once
@@ -2219,6 +2374,7 @@ class AgentRunner:
                     _tool_concurrency_limit(),
                 )
                 tool_results.extend(batch_results)
+                flat_index += len(batch)
             else:
                 batch_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
                 for tool_call in batch:
@@ -2233,6 +2389,19 @@ class AgentRunner:
                     )
                     tool_results.append(result)
                     batch_results.append(result)
+                    flat_index += 1
+
+        if abandoned_from is not None:
+            # Every abandoned call still needs an entry: the caller zips
+            # results against tool_calls one-for-one, and a short list would
+            # leave the trailing calls unanswered in the transcript.
+            for tool_call in tool_calls[abandoned_from:]:
+                tool_results.append((
+                    _STEERING_ABANDONED,
+                    {"tool_call_id": tool_call.id, "name": tool_call.name,
+                     "status": "skipped"},
+                    None,
+                ))
 
         results: list[Any] = []
         events: list[dict[str, str]] = []
@@ -2251,6 +2420,7 @@ class AgentRunner:
         # error verdict, unparseable output) falls through unchanged.
         if (
             fatal_error is None
+            and abandoned_from is None
             and getattr(spec, "tool_middleware", False)
             and tool_calls
         ):
