@@ -24,6 +24,7 @@ from loguru import logger
 from pydantic.alias_generators import to_snake
 
 from nanobot.providers.base import (
+    resolve_stream_chunk_gap_timeout_s,
     LLMProvider,
     LLMResponse,
     ProviderCallContext,
@@ -2144,6 +2145,10 @@ class OpenAICompatProvider(LLMProvider):
     ) -> LLMResponse:
         client = await self._ensure_client()
         idle_timeout_s = resolve_stream_idle_timeout_s()
+        # Separate ceiling for the gaps after the first chunk: see
+        # resolve_stream_chunk_gap_timeout_s. A mid-stream stall must be able to
+        # reach the recovery path without waiting out the prefill budget.
+        gap_timeout_s = resolve_stream_chunk_gap_timeout_s()
         try:
             if self._should_use_responses_api(model, reasoning_effort):
                 try:
@@ -2160,14 +2165,21 @@ class OpenAICompatProvider(LLMProvider):
 
                     async def _timed_stream() -> AsyncIterator[Any]:
                         stream_iter: AsyncIterator[Any] = responses_stream.__aiter__()
+                        first_chunk = True
                         while True:
                             try:
-                                yield await asyncio.wait_for(
+                                chunk = await asyncio.wait_for(
                                     stream_iter.__anext__(),
-                                    timeout=idle_timeout_s,
+                                    timeout=(
+                                        idle_timeout_s
+                                        if first_chunk
+                                        else gap_timeout_s
+                                    ),
                                 )
                             except StopAsyncIteration:
                                 break
+                            first_chunk = False
+                            yield chunk
 
                     capture = ResponsesStreamCapture()
                     (
@@ -2230,14 +2242,16 @@ class OpenAICompatProvider(LLMProvider):
             )
             chunks: list[Any] = []
             stream_iter: AsyncIterator[Any] = chat_stream.__aiter__()
+            first_chunk = True
             while True:
                 try:
                     chunk: Any = await asyncio.wait_for(
                         stream_iter.__anext__(),
-                        timeout=idle_timeout_s,
+                        timeout=idle_timeout_s if first_chunk else gap_timeout_s,
                     )
                 except StopAsyncIteration:
                     break
+                first_chunk = False
                 chunks.append(chunk)
                 if chunk.choices:
                     delta_obj = chunk.choices[0].delta

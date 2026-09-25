@@ -39,9 +39,79 @@ STREAM_IDLE_TIMEOUT_ENV = "NANOBOT_STREAM_IDLE_TIMEOUT_S"
 # operator can extend it further via the env var without a redeploy.
 DEFAULT_STREAM_IDLE_TIMEOUT_S = 1800.0
 MAX_STREAM_IDLE_TIMEOUT_S = 3600.0
+
+# Ceiling on the gap BETWEEN streamed chunks, as opposed to time to the first
+# one. Deliberately a different number from the above: the 1800s budget exists so
+# a slow prefill is never mistaken for a dead connection, but applying it to
+# every subsequent gap made a mid-stream stall indistinguishable from that same
+# slow prefill. Chunks are tokens -- a provider that goes quiet for 90s in the
+# middle of a stream has stopped, and the recovery path should run.
+STREAM_CHUNK_GAP_TIMEOUT_ENV = "NANOBOT_STREAM_CHUNK_GAP_TIMEOUT_S"
+DEFAULT_STREAM_CHUNK_GAP_TIMEOUT_S = 90.0
+MIN_STREAM_CHUNK_GAP_TIMEOUT_S = 5.0
+
 RETRY_AFTER_BUFFER = 1
 
 RetryEventCallback = Callable[[str], Awaitable[None]]
+
+
+def resolve_stream_chunk_gap_timeout_s(
+    *,
+    env_value: str | None = None,
+    default: float = DEFAULT_STREAM_CHUNK_GAP_TIMEOUT_S,
+    maximum: float = DEFAULT_STREAM_IDLE_TIMEOUT_S,
+) -> float:
+    """Return the ceiling on silence BETWEEN streamed chunks.
+
+    Distinct from :func:`resolve_stream_idle_timeout_s`, which bounds time to the
+    FIRST chunk and stays generous because prefill is real work. This one bounds
+    the gaps after it, where silence means the stream has stopped rather than
+    that the model is busy.
+
+    A value above ``maximum`` is clamped rather than accepted, so this can never
+    be configured into being less safe than the old behaviour; a value below
+    ``MIN_STREAM_CHUNK_GAP_TIMEOUT_S`` is raised, so a typo cannot turn every
+    healthy stream into a retry storm.
+    """
+    raw = (
+        os.environ.get(STREAM_CHUNK_GAP_TIMEOUT_ENV)
+        if env_value is None
+        else env_value
+    )
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring invalid {}={!r}; using {}",
+            STREAM_CHUNK_GAP_TIMEOUT_ENV,
+            raw,
+            default,
+        )
+        return default
+    if value <= 0:
+        logger.warning(
+            "Ignoring non-positive {}={!r}; using {}",
+            STREAM_CHUNK_GAP_TIMEOUT_ENV,
+            raw,
+            default,
+        )
+        return default
+    if value > maximum:
+        logger.warning(
+            "Clamping {}={!r} to {}", STREAM_CHUNK_GAP_TIMEOUT_ENV, raw, maximum
+        )
+        return maximum
+    if value < MIN_STREAM_CHUNK_GAP_TIMEOUT_S:
+        logger.warning(
+            "Raising {}={!r} to the {}s floor",
+            STREAM_CHUNK_GAP_TIMEOUT_ENV,
+            raw,
+            MIN_STREAM_CHUNK_GAP_TIMEOUT_S,
+        )
+        return MIN_STREAM_CHUNK_GAP_TIMEOUT_S
+    return value
 
 
 def resolve_stream_idle_timeout_s(
@@ -50,7 +120,11 @@ def resolve_stream_idle_timeout_s(
     default: float = DEFAULT_STREAM_IDLE_TIMEOUT_S,
     maximum: float = MAX_STREAM_IDLE_TIMEOUT_S,
 ) -> float:
-    """Return a safe streaming idle timeout from env/config text."""
+    """Return a safe streaming idle timeout from env/config text.
+
+    Bounds time to the FIRST chunk only; see
+    :func:`resolve_stream_chunk_gap_timeout_s` for the gaps after it.
+    """
     raw = os.environ.get(STREAM_IDLE_TIMEOUT_ENV) if env_value is None else env_value
     if raw is None or not raw.strip():
         return default
