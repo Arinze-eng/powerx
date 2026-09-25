@@ -772,7 +772,10 @@ class CaptchaSolverTool(Tool):
     ) -> Any:
         action = str(action or "").strip().lower()
         if action not in self._ACTIONS:
-            return ToolResult.error("Error: unsupported captcha action")
+            return ToolResult.error(
+                "Error: unsupported captcha action. Valid actions: "
+                + ", ".join(self.answerable_actions)
+            )
         if self.provider != "solvegate" and not self.api_key:
             return ToolResult.error("Error: the captcha solver has no API key configured")
         if self.provider == "solvegate" and action not in self._SOLVEGATE_GATES:

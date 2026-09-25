@@ -864,3 +864,14 @@ def test_without_a_solver_configured_the_browser_still_builds(tmp_path) -> None:
 
     assert isinstance(browser, HumanBrowserTool)
     assert browser.captcha_solver is None
+
+
+def test_an_unsupported_captcha_action_names_the_ones_this_provider_serves() -> None:
+    """The refusal has to carry the answer, not just the word 'unsupported'."""
+    tool = CaptchaSolverTool(
+        base_url="", api_key="", provider="solvegate", solvegate_api_key="sk_test_probe"
+    )
+
+    result = asyncio.run(tool.execute(action="image"))
+
+    assert "Valid actions: turnstile, waf" in str(result)

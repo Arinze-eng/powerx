@@ -1026,6 +1026,50 @@ class HumanBrowserTool(Tool):
         outcome = self._json_value(await self._run_script(tab, script), {})
         return outcome if isinstance(outcome, dict) else {}
 
+    def _solver_provider(self) -> str:
+        return str(getattr(self.captcha_solver, "provider", "") or "").strip() or "the configured"
+
+    def _solver_can_answer(self, action: str) -> bool | None:
+        """Whether the configured solver advertises this action.
+
+        ``answerable_actions`` is the deployment's own statement of what it can
+        serve. It is asked before the call so a challenge the provider has no
+        method for is reported as exactly that -- the provider boundary -- and
+        not as a bare failure the model has to guess at. Returns None when the
+        solver does not say, in which case the call is still attempted.
+        """
+        advertised = getattr(self.captcha_solver, "answerable_actions", None)
+        if not isinstance(advertised, (list, tuple, set, frozenset)):
+            return None
+        return action in {str(item) for item in advertised}
+
+    def _solver_boundary(self, kind: str) -> dict[str, Any]:
+        """The report for a challenge the configured provider cannot answer.
+
+        This is the honest answer, and it is also the whole answer: the model
+        is told what the solver is, what it can do, that retrying is pointless,
+        and what to do instead -- so it can act on it or explain it to the user
+        rather than reporting that it was unable to finish.
+        """
+        advertised = getattr(self.captcha_solver, "answerable_actions", None)
+        can = ", ".join(sorted(str(item) for item in advertised)) if advertised else "nothing"
+        return {
+            "solved": False,
+            "kind": kind,
+            "reason": (
+                f"the {self._solver_provider()} captcha solver has no method for a {kind} "
+                f"challenge, so no solve was attempted"
+            ),
+            "solver_can_answer": can,
+            "next_step": (
+                f"This is a provider limit, not a transient failure - do NOT retry auto_captcha. "
+                f"The configured solver answers only: {can}. Either finish the task by another "
+                f"route, or tell the user a {kind} challenge needs a solver with that method "
+                f"enabled (capsolve/capskip covers recaptcha, hcaptcha, funcaptcha, turnstile, "
+                f"geetest, altcha, image and image grid)."
+            ),
+        }
+
     async def _auto_captcha(self, tab: Any, url: str | None) -> dict[str, Any]:
         """Detect the captcha the page actually rendered, solve it, inject it."""
         if self.captcha_solver is None:
@@ -1041,6 +1085,10 @@ class HumanBrowserTool(Tool):
         if not kind:
             return {"solved": False, "reason": "no captcha was detected on the page"}
         if kind == "image":
+            # A picture challenge is solved through solve_image_captcha -- but
+            # only if the provider has that method at all.
+            if self._solver_can_answer("solve_image") is False:
+                return self._solver_boundary("picture")
             return {
                 "solved": False,
                 "kind": "image",
@@ -1053,6 +1101,12 @@ class HumanBrowserTool(Tool):
         if not sitekey:
             return {"solved": False, "kind": kind, "reason": "the widget exposed no sitekey"}
 
+        # Ask the provider boundary first: a challenge the configured solver has
+        # no method for is a fact about the deployment, and calling anyway only
+        # converts it into a generic error the model cannot act on.
+        if self._solver_can_answer(kind) is False:
+            return self._solver_boundary(kind)
+
         page_url = await self._page_url(tab, url)
         arguments: dict[str, Any] = {"action": kind, "sitekey": sitekey, "url": page_url}
         if kind == "recaptcha" and found.get("enterprise"):
@@ -1060,11 +1114,24 @@ class HumanBrowserTool(Tool):
         result = await self.captcha_solver.execute(**arguments)
         token = self._token_from(result)
         if not token:
+            # The solver's own sentence is the useful part; "returned no token"
+            # alone told the model nothing about what to do next.
+            detail = str(result).strip()
+            for prefix in ("Error: ", "error: "):
+                if detail.startswith(prefix):
+                    detail = detail[len(prefix):]
+                    break
             return {
                 "solved": False,
                 "kind": kind,
-                "reason": "the solver returned no token",
-                "solver": str(result)[:400],
+                "reason": detail[:600] or "the solver returned no token and no reason",
+                "solver": self._solver_provider(),
+                "retryable": False,
+                "next_step": (
+                    "the solver answered but did not solve it; read the reason above. Do not "
+                    "retry the same call unchanged - a rejected key, an exhausted balance or an "
+                    "unsupported challenge all look like this and none is fixed by repeating it."
+                ),
             }
         injected = await self._inject_token(tab, token, kind)
         return {
@@ -1346,7 +1413,10 @@ class HumanBrowserTool(Tool):
     ) -> Any:
         action = str(action or "").strip().lower()
         if action not in self._ACTIONS:
-            return ToolResult.error("Error: unsupported human browser action")
+            return ToolResult.error(
+                "Error: unsupported human browser action. Valid actions: "
+                + ", ".join(sorted(self._ACTIONS))
+            )
         session_key = self._session_key()
         async with self._lock:
             try:
@@ -1485,7 +1555,10 @@ class HumanBrowserTool(Tool):
                     )
                     return json.dumps({"screenshot": str(path)})
 
-                raise ValueError("unsupported human browser action")
+                raise ValueError(
+                    "unsupported human browser action; valid actions: "
+                    + ", ".join(sorted(self._ACTIONS))
+                )
             except ValueError as exc:
                 return ToolResult.error(f"Error: {exc}")
             except TimeoutError:

@@ -17,6 +17,7 @@ from typing import Any, cast
 
 from loguru import logger
 
+from nanobot.agent import speed
 from nanobot.agent.context_governance import (
     ContextGovernanceConfig,
     ContextGovernor,
@@ -1481,9 +1482,19 @@ class AgentRunner:
             "on_retry_wait": spec.retry_wait_callback,
         }
         generation = spec.runtime.generation
-        kwargs["temperature"] = generation.temperature
-        kwargs["max_tokens"] = generation.max_tokens
-        kwargs["reasoning_effort"] = generation.reasoning_effort
+        # A forced speed profile lands here, at the one point every model call
+        # is built, so it applies to reasoning turns, tool-call turns and the
+        # closing answer alike. With no profile forced this is the identity.
+        tuned = speed.apply_to_generation(
+            {
+                "temperature": generation.temperature,
+                "max_tokens": generation.max_tokens,
+                "reasoning_effort": generation.reasoning_effort,
+            }
+        )
+        kwargs["temperature"] = tuned["temperature"]
+        kwargs["max_tokens"] = tuned["max_tokens"]
+        kwargs["reasoning_effort"] = tuned["reasoning_effort"]
         return kwargs
 
     async def _request_model(

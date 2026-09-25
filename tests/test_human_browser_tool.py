@@ -1036,8 +1036,11 @@ def test_auto_captcha_reports_a_token_the_solver_never_returned() -> None:
 
     payload = json.loads(asyncio.run(tool.execute("auto_captcha")))
 
+    # The solver's own sentence reaches the model. It used to be replaced by
+    # "the solver returned no token", which named no cause and no next step.
     assert payload["solved"] is False
-    assert "no token" in payload["reason"]
+    assert "no API key" in payload["reason"]
+    assert not payload["reason"].startswith("Error: ")
 
 
 def test_auto_captcha_marks_a_token_solved_but_not_injected() -> None:
@@ -1213,3 +1216,124 @@ def test_fill_form_types_through_a_selector_that_resolves() -> None:
 
     assert "Error" not in out, out
     assert element.typed and element.typed[0][0] == "hello from powerx"
+# --- a refusal the model can act on ------------------------------------------
+#
+# Before this, a SolveGate deployment facing a reCAPTCHA got a tool error from
+# the solver, threw the text away and reported {"reason": "the solver returned
+# no token"} -- a sentence with no next action in it, which is how a run ends
+# in "unable to complete the browser task". The boundary is now checked first,
+# and a real solver failure is passed through verbatim.
+
+
+class _ConfiguredSolver(_FakeSolver):
+    """A solver that states, like the real one, what it can answer."""
+
+    def __init__(self, reply: Any, *, provider: str, answerable: list[str]) -> None:
+        super().__init__(reply)
+        self.provider = provider
+        self.answerable_actions = answerable
+
+
+_RECAPTCHA_PAGE = json.dumps(
+    {"kind": "recaptcha", "sitekey": "0x4BBB", "target": '[data-powerx-idx="captcha"]'}
+)
+_IMAGE_PAGE = json.dumps(
+    {"kind": "image", "target": '[data-powerx-idx="captcha"]', "answer_target": None}
+)
+
+
+def test_auto_captcha_names_the_provider_boundary_instead_of_calling_it() -> None:
+    """A challenge the provider has no method for is a fact, not a failure."""
+    tab = _RoutingTab({"const pick = (sels)": _RECAPTCHA_PAGE})
+    solver = _ConfiguredSolver(
+        {"token": "never-used"}, provider="solvegate", answerable=["turnstile", "waf"]
+    )
+    tool = _tool_with_session(tab, captcha_solver=solver)
+
+    payload = json.loads(asyncio.run(tool.execute("auto_captcha")))
+
+    # The call was never made: the provider boundary is known in advance.
+    assert solver.calls == []
+    assert payload["solved"] is False
+    assert payload["kind"] == "recaptcha"
+    assert "has no method for a recaptcha challenge" in payload["reason"]
+    assert payload["solver_can_answer"] == "turnstile, waf"
+    assert "do NOT retry" in payload["next_step"]
+    assert "hcaptcha" in payload["next_step"]
+
+
+def test_auto_captcha_surfaces_the_solvers_own_reason_not_a_generic_one() -> None:
+    """'returned no token' told the model nothing; the solver's sentence does."""
+    tab = _RoutingTab({"const pick = (sels)": _TURNSTILE_PAGE})
+    solver = _ConfiguredSolver(
+        "Error: SolveGate rejected the key: invalid_key: Missing or revoked API key.",
+        provider="solvegate",
+        answerable=["turnstile", "waf"],
+    )
+    tool = _tool_with_session(tab, captcha_solver=solver)
+
+    payload = json.loads(asyncio.run(tool.execute("auto_captcha")))
+
+    assert payload["solved"] is False
+    assert "invalid_key" in payload["reason"]
+    assert payload["reason"].startswith("SolveGate rejected the key")
+    assert payload["retryable"] is False
+    assert "Do not retry" in payload["next_step"]
+    # And it did try, because turnstile IS in the advertised set.
+    assert solver.calls[0]["action"] == "turnstile"
+
+
+def test_auto_captcha_still_calls_a_solver_that_advertises_nothing() -> None:
+    """A solver with no opinion is not second-guessed -- absence is not a refusal."""
+    tab = _RoutingTab(
+        {
+            "const pick = (sels)": _TURNSTILE_PAGE,
+            "kinds.forEach": json.dumps({"filled": 1, "callbacks": 1, "ok": True}),
+        }
+    )
+    solver = _FakeSolver({"token": "t"})
+    tool = _tool_with_session(tab, captcha_solver=solver)
+
+    payload = json.loads(asyncio.run(tool.execute("auto_captcha")))
+
+    assert payload["solved"] is True
+    assert solver.calls[0]["action"] == "turnstile"
+
+
+def test_auto_captcha_does_not_send_the_model_to_an_action_the_provider_lacks() -> None:
+    """Pointing at solve_image_captcha is only useful if the provider has it."""
+    tab = _RoutingTab({"const pick = (sels)": _IMAGE_PAGE})
+    solver = _ConfiguredSolver(
+        {"token": "t"}, provider="solvegate", answerable=["turnstile", "waf"]
+    )
+    tool = _tool_with_session(tab, captcha_solver=solver)
+
+    payload = json.loads(asyncio.run(tool.execute("auto_captcha")))
+
+    assert payload["solved"] is False
+    assert "solve_image_captcha" not in payload.get("reason", "")
+    assert "has no method for a picture challenge" in payload["reason"]
+    assert solver.calls == []
+
+
+def test_a_picture_challenge_is_still_referred_when_the_provider_has_the_method() -> None:
+    tab = _RoutingTab({"const pick = (sels)": _IMAGE_PAGE})
+    solver = _ConfiguredSolver(
+        {"token": "t"},
+        provider="capsolve",
+        answerable=["recaptcha", "solve_image", "turnstile"],
+    )
+    tool = _tool_with_session(tab, captcha_solver=solver)
+
+    payload = json.loads(asyncio.run(tool.execute("auto_captcha")))
+
+    assert payload["kind"] == "image"
+    assert "solve_image_captcha" in payload["reason"]
+
+
+def test_an_unsupported_action_names_the_ones_that_work() -> None:
+    tool = _tool_with_session(_FakeTab())
+    result = asyncio.run(tool.execute("teleport"))
+    assert getattr(result, "is_error", False) is True
+    assert "Valid actions:" in str(result)
+    assert "auto_captcha" in str(result)
