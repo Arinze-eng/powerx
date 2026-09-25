@@ -1071,3 +1071,145 @@ def test_solve_image_captcha_without_a_challenge_is_reported() -> None:
 
     assert payload["solved"] is False
     assert "no picture challenge" in payload["reason"]
+
+
+# --------------------------------------------------------------------------
+# element lookup
+#
+# A live run found that a find-stamped selector resolved to a phantom node:
+# pydoll answers a *text* search for a selector string with a WebElement that
+# has no tag name and no ownerDocument, and `find` reported it as a match. The
+# next interaction then failed with ElementNotVisible. These tests pin the
+# lookup rule that stops that, using the two disagreeing answer shapes a real
+# pydoll build produces.
+# --------------------------------------------------------------------------
+
+
+class _Phantom:
+    """What pydoll hands back for a lookup that matched nothing."""
+
+    _attributes = {"tag_name": "", "id": ""}
+
+
+class _LookupTab(_FakeTab):
+    """A tab whose two lookups can disagree, as pydoll's genuinely do."""
+
+    def __init__(self, *, find_result: Any = None, query_result: Any = None) -> None:
+        super().__init__()
+        self._find_result = find_result
+        self._query_result = query_result
+        self.find_calls: list[dict[str, Any]] = []
+        self.query_calls: list[str] = []
+
+    async def find(self, **kwargs: Any) -> Any:
+        self.find_calls.append(kwargs)
+        return self._find_result
+
+    async def query(self, selector: str, **_kwargs: Any) -> Any:
+        self.query_calls.append(selector)
+        return self._query_result
+
+
+@pytest.mark.parametrize(
+    "wanted",
+    [
+        '[data-powerx-idx="0"]',
+        "#country",
+        ".menu-item",
+        "input[name='my-text']",
+        "a > span",
+        "form",
+    ],
+)
+def test_a_target_that_reads_as_markup_is_treated_as_a_selector(wanted: str) -> None:
+    assert HumanBrowserTool._looks_like_selector(wanted) is True
+
+
+@pytest.mark.parametrize("wanted", ["Learn more", "Sign in", "", "Read the docs"])
+def test_a_target_that_reads_as_prose_is_not_treated_as_a_selector(wanted: str) -> None:
+    assert HumanBrowserTool._looks_like_selector(wanted) is False
+
+
+def test_a_stamped_selector_is_queried_as_css_not_searched_as_text() -> None:
+    """The stamped target is markup, so the text search must not be asked first."""
+    element = _FakeElement()
+    tab = _LookupTab(find_result=_Phantom(), query_result=element)
+    tool = _tool_with_session(tab)
+
+    out = asyncio.run(tool.execute("click", target='[data-powerx-idx="1"]'))
+
+    assert "Error" not in out, out
+    assert element.clicks, "the resolved element was never clicked"
+    assert tab.query_calls == ['[data-powerx-idx="1"]']
+    assert tab.find_calls == [], "a CSS lookup must not be sent to the text search"
+
+
+def test_a_phantom_lookup_is_not_reported_as_a_located_element() -> None:
+    """Nothing matched, so the tool must say so rather than return a ghost."""
+    tab = _LookupTab(find_result=_Phantom(), query_result=None)
+    tool = _tool_with_session(tab)
+
+    out = asyncio.run(tool.execute("click", target='[data-powerx-idx="9"]'))
+
+    assert "Error" in out and "no element matched" in out, out
+
+
+def test_a_prose_target_is_still_searched_for_by_text() -> None:
+    """The fix must not cost the text lookup, which is how prose targets resolve."""
+    element = _FakeElement()
+    tab = _LookupTab(find_result=element, query_result=_Phantom())
+    tool = _tool_with_session(tab)
+
+    out = asyncio.run(tool.execute("click", target="Learn more"))
+
+    assert "Error" not in out, out
+    assert tab.find_calls and tab.find_calls[0]["text"] == "Learn more"
+    assert tab.query_calls == [], "prose must be resolved by text, not by CSS"
+
+
+def test_a_selector_the_page_does_not_have_falls_back_to_the_text_search() -> None:
+    """One strategy finding nothing is not the end of the lookup."""
+    element = _FakeElement()
+    tab = _LookupTab(find_result=element, query_result=None)
+    tool = _tool_with_session(tab)
+
+    out = asyncio.run(tool.execute("click", target="#missing"))
+
+    assert "Error" not in out, out
+    assert tab.query_calls == ["#missing"]
+    assert tab.find_calls and tab.find_calls[0]["text"] == "#missing"
+
+
+def test_a_lookup_that_raises_tries_the_other_strategy() -> None:
+    """pydoll raises for a selector it cannot express; that is not a dead end."""
+
+    class _RaisingQueryTab(_LookupTab):
+        async def query(self, selector: str, **_kwargs: Any) -> Any:
+            self.query_calls.append(selector)
+            raise RuntimeError("invalid selector")
+
+    element = _FakeElement()
+    tab = _RaisingQueryTab(find_result=element, query_result=None)
+    tool = _tool_with_session(tab)
+
+    out = asyncio.run(tool.execute("click", target='[data-powerx-idx="2"]'))
+
+    assert "Error" not in out, out
+    assert tab.find_calls and tab.find_calls[0]["text"] == '[data-powerx-idx="2"]'
+
+
+def test_fill_form_types_through_a_selector_that_resolves() -> None:
+    """The live failure was a form field: the same lookup is what filled it."""
+    element = _FakeElement()
+    tab = _LookupTab(find_result=_Phantom(), query_result=element)
+    tool = _tool_with_session(tab)
+
+    out = asyncio.run(
+        tool.execute(
+            "fill_form",
+            fields=[{"target": '[data-powerx-idx="1"]', "text": "hello from powerx"}],
+        )
+    )
+
+    assert "Error" not in out, out
+    assert element.typed and element.typed[0][0] == "hello from powerx"

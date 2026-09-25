@@ -716,26 +716,81 @@ class HumanBrowserTool(Tool):
         body = await self._page_text(tab)
         return json.dumps({"title": str(title or ""), "url": str(url or ""), "text": body})
 
+    #: Characters that can only begin a selector, never visible text.
+    _SELECTOR_LEAD = "#.[>+*:"
+
+    @classmethod
+    def _looks_like_selector(cls, wanted: str) -> bool:
+        """Whether *target* is markup to query rather than prose to search for."""
+        if not wanted:
+            return False
+        if wanted[0] in cls._SELECTOR_LEAD:
+            return True
+        if re.fullmatch(r"[a-zA-Z][a-zA-Z0-9-]*", wanted):
+            return True  # a bare tag name, e.g. "form"
+        return any(ch in wanted for ch in "#.[>+*")
+
+    @staticmethod
+    def _is_live_element(element: Any) -> bool:
+        """Whether a lookup returned a real node rather than a phantom.
+
+        pydoll hands back a ``WebElement`` even when a lookup matched nothing: a
+        node with no tag name and no ``ownerDocument``, whose every interaction
+        then fails with ``ElementNotVisible``. Checking the node here is what
+        stops a failed lookup being reported to the model as a located element.
+        """
+        if element is None:
+            return False
+        attributes = getattr(element, "_attributes", None)
+        if isinstance(attributes, dict) and not attributes.get("tag_name"):
+            return False
+        return True
+
     async def _resolve_element(self, tab: Any, target: str) -> Any:
-        """Find an element by CSS selector, or by its visible text."""
+        """Find an element by CSS selector, or by its visible text.
+
+        The strategy follows the shape of the target: a stamped target such as
+        ``[data-powerx-idx="3"]`` is markup and is queried as CSS, while only a
+        target that reads as prose is searched for by text. Asking the text
+        search first for a selector string used to return a phantom node, which
+        then failed the next interaction with ``ElementNotVisible`` - so each
+        candidate is checked before it is returned, and the other strategy is
+        tried when the first finds nothing.
+        """
         wanted = str(target or "").strip()
         if not wanted:
             raise ValueError("a CSS selector or visible text target is required")
-        finder = getattr(tab, "find", None)
-        if finder is not None:
-            try:
-                element = await finder(text=wanted, timeout=5, raise_exc=False)
-            except Exception:  # noqa: BLE001 - fall through to the CSS query
-                element = None
-            if element is not None:
-                return element
+
         query = getattr(tab, "query", None)
-        if query is None:
+        finder = getattr(tab, "find", None)
+        attempts = (
+            ("selector", "text") if self._looks_like_selector(wanted) else ("text", "selector")
+        )
+
+        looked = False
+        for kind in attempts:
+            if kind == "selector":
+                if query is None:
+                    continue
+                looked = True
+                try:
+                    element = await query(wanted)
+                except Exception:  # noqa: BLE001 - try the other strategy
+                    continue
+            else:
+                if finder is None:
+                    continue
+                looked = True
+                try:
+                    element = await finder(text=wanted, timeout=5, raise_exc=False)
+                except Exception:  # noqa: BLE001 - try the other strategy
+                    continue
+            if self._is_live_element(element):
+                return element
+
+        if not looked:
             raise ValueError("this pydoll build exposes no element lookup")
-        element = await query(wanted)
-        if element is None:
-            raise ValueError(f"no element matched {wanted!r}")
-        return element
+        raise ValueError(f"no element matched {wanted!r}")
 
     async def _run_script(self, tab: Any, script: str) -> str:
         """Run *script* in the page and return its unwrapped string value."""
