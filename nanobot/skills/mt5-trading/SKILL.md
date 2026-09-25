@@ -21,14 +21,26 @@ Order of effort, cheapest first:
 
 1. `action="start"` / `action="login"` as normal. If the build is wrong the tool
    resolves and installs it **and replays your action** — usually you never see it.
-2. If it still refuses: `action="list_brokers"` (what it knows), then
+2. `action="install", server="<their server>"` when provisioning from scratch. An
+   unregistered server is **resolved for you**: the tool discovers that broker's
+   installer, validates it over HTTP, and installs it. It never quietly falls back
+   to the default build — a terminal for a different broker cannot resolve their
+   server at all, so that "successful" install is a dead end wearing a green tick.
+3. If it still refuses: `action="list_brokers"` (what it knows), then
    `action="discover_broker"`, `server="<their server>"`.
-3. If discovery fails, **web-search `<broker> download MT5`**, fetch that page, and
+4. If discovery fails, **web-search `<broker> download MT5`**, fetch that page, and
    pass it: `action="discover_broker", server=..., page_urls=["<the page url>"]`.
    The link on the broker's own page is authoritative; a derived guess usually is not.
+   Then `install` with the `broker_installer_url` it returned. You can also hand
+   `page_urls` straight to `install` and it does the fetch-and-validate itself.
 
-Two things that keep you from going in circles:
+Three things that keep you from going in circles:
 
+* **`install` refusing on a named server is not a wall, and not an unsupported
+  broker.** It comes back as `failure: "server_not_resolved"` with `remedy` and
+  `next` spelling out the one call to make (`discover_broker`). A *bare* `install`
+  with no `server` still gets the deployment's default build — that is correct, and
+  it is the only case where a default is the right answer.
 * **Only some table entries are confirmed.** `list_brokers` marks each brand
   `verified: true|false`. A `false` brand carries a *guessed* domain and often 404s
   — that means "our guess was wrong", **never** "this broker is unsupported". Go to
