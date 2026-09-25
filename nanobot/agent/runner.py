@@ -100,11 +100,17 @@ _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model 
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 #: A ``finish_reason="length"`` response is only worth continuing when it made
-#: real textual progress. A blank segment, or one byte-identical to the segment
-#: we just appended, means the model is re-emitting the same truncated prefix:
+#: textual progress. A blank segment, or one byte-identical to the segment we
+#: just appended, means the model is re-emitting the same truncated prefix:
 #: continuing would pay another provider call for zero new work, forever. This
 #: is the burn-loop (documented in tools/run_plan.py) and it is refused here.
-_LENGTH_SEGMENT_PROGRESS_CHARS = 16
+#:
+#: Length is deliberately NOT part of that test. An earlier version also refused
+#: any segment under 16 characters, which mistook an ordinary early truncation
+#: for a burn loop and ended the turn: a short segment is novel content, and
+#: refusing it threw away the rest of the answer plus any tool call the model was
+#: about to make. _MAX_LENGTH_RECOVERIES already bounds the cost of a model that
+#: only ever emits a little at a time, so no length floor is needed.
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 
@@ -1195,7 +1201,7 @@ class AgentRunner:
 
             if response.finish_reason == "length":
                 segment = _restore_outer_whitespace(clean or "", original_content)
-                # --- burn-loop guard (see _LENGTH_SEGMENT_PROGRESS_CHARS) ------
+                # --- burn-loop guard (see _MAX_LENGTH_RECOVERIES) --------------
                 # Continuing a truncated response is only worthwhile if the
                 # segment actually advanced the answer. When the model re-emits
                 # a blank or byte-identical truncated prefix, every further
@@ -1203,9 +1209,8 @@ class AgentRunner:
                 # the exact failure documented in tools/run_plan.py. Refuse to
                 # replay and finish with whatever we already have instead.
                 prior = "".join(length_recovery_parts)
-                stalled = (
-                    len(segment.strip()) < _LENGTH_SEGMENT_PROGRESS_CHARS
-                    or (bool(prior) and segment.strip() == prior.strip())
+                stalled = not segment.strip() or (
+                    bool(prior) and segment.strip() == prior.strip()
                 )
                 if (
                     not stalled

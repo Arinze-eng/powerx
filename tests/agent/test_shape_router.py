@@ -585,3 +585,89 @@ class TestBurnLoopGuard:
         assert provider.calls == 3
         assert "segment-1" in result.final_content
         assert "segment-3" in result.final_content
+
+
+    async def test_a_short_but_novel_segment_is_not_a_burn_loop(self) -> None:
+        """The guard refuses replays that add nothing, not replays that are brief.
+
+        An earlier version also refused any segment under 16 characters. That is
+        not a burn loop: a short segment is ordinary early truncation, and
+        refusing it ENDED the turn, discarding the rest of the answer and any
+        tool call the model was about to make. The replay budget already bounds
+        the cost of a model that only ever emits a little at a time.
+        """
+
+        class _ShortButProgressingProvider(ProviderBase):
+            def __init__(self) -> None:
+                super().__init__(api_key="test")
+                self.calls = 0
+
+            async def chat(self, messages, tools=None, **kwargs):  # type: ignore[override]
+                self.calls += 1
+                if self.calls == 1:
+                    return LLMResponse(content="working", finish_reason="length")
+                if self.calls == 2:
+                    return LLMResponse(content="harder", finish_reason="length")
+                return LLMResponse(content="done", finish_reason="stop")
+
+            async def chat_stream(self, messages, tools=None, **kwargs):  # pragma: no cover
+                return await self.chat(messages, tools, **kwargs)
+
+            def get_default_model(self) -> str:
+                return "length-test"
+
+        provider = _ShortButProgressingProvider()
+        result = await AgentRunner().run(
+            make_run_spec(
+                provider,
+                initial_messages=[{"role": "user", "content": "keep going"}],
+                model="length-test",
+                tools=ToolRegistry(),
+                max_iterations=20,
+                max_tool_result_chars=8_000,
+            )
+        )
+
+        assert provider.calls == 3, "a short segment must be continued, not refused"
+        assert result.stop_reason == "completed"
+        # Every segment is kept: "working harder done", whitespace-normalised by
+        # the runner's per-segment bookkeeping.
+        assert "working" in result.final_content
+        assert "harder" in result.final_content
+        assert "done" in result.final_content
+        assert result.usage["llm_calls"] == 3
+
+    async def test_a_short_segment_still_cannot_be_replayed_forever(self) -> None:
+        """Brevity is allowed; repeating yourself is not. The budget is the limit."""
+
+        class _ShortAndRepetitiveProvider(ProviderBase):
+            def __init__(self) -> None:
+                super().__init__(api_key="test")
+                self.calls = 0
+
+            async def chat(self, messages, tools=None, **kwargs):  # type: ignore[override]
+                self.calls += 1
+                return LLMResponse(content="ab", finish_reason="length")
+
+            async def chat_stream(self, messages, tools=None, **kwargs):  # pragma: no cover
+                return await self.chat(messages, tools, **kwargs)
+
+            def get_default_model(self) -> str:
+                return "length-test"
+
+        provider = _ShortAndRepetitiveProvider()
+        result = await AgentRunner().run(
+            make_run_spec(
+                provider,
+                initial_messages=[{"role": "user", "content": "do a long thing"}],
+                model="length-test",
+                tools=ToolRegistry(),
+                max_iterations=50,
+                max_tool_result_chars=8_000,
+            )
+        )
+
+        # "ab" is novel once, then byte-identical on every replay, so the guard
+        # stops it after two calls rather than running to max_iterations.
+        assert provider.calls <= 3, f"burn loop: {provider.calls} provider calls"
+        assert result.final_content

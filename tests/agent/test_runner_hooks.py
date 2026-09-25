@@ -384,6 +384,9 @@ async def test_runner_calls_run_level_hooks_on_success():
                 "completion_tokens": 2,
                 "total_tokens": 5,
                 "provider_tokens": 5,
+                # The runner reports how many provider calls the turn made; the
+                # stats panel reads it. This case makes exactly one.
+                "llm_calls": 1,
             },
             ["user", "assistant"],
         ),
