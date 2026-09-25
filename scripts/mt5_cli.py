@@ -147,6 +147,19 @@ BROKER_KEY_FILE = MT5_ROOT / ".broker_key"
 #: must not make a decidable build undecidable.
 INSTALLED_URL_FILE = MT5_ROOT / ".installed.url"
 
+#: The install directory the terminal ACTUALLY landed in, written by
+#: ``install_mt5_sandbox.sh`` once it has found the terminal on disk.
+#:
+#: WHY IT EXISTS: the directory name was always a PREDICTION, and a wrong one more
+#: often than not -- Exness's installer writes ``MetaTrader 5 Terminal`` while the
+#: registry (and every caller) calls that build ``MetaTrader 5 EXNESS``, and a
+#: discovery-derived broker has no verified name at all. MEASURED 2026-09-25: a
+#: resolved install of an uncovered broker (``axicorp.financial.services``) laid
+#: down its terminal under a name no guess produced, so :func:`find_terminal` went
+#: on hunting a directory that does not exist while a perfectly good terminal sat
+#: on disk.
+INSTALLED_DIR_NAME_FILE = MT5_ROOT / ".installed.dir_name"
+
 #: Recorded ``.broker_key`` values that name the route, not the build.
 #:
 #: ``unknown`` is the installer's ``${MT5_BROKER_KEY:-unknown}`` default (nobody
@@ -333,6 +346,18 @@ def _installed_url() -> str:
     """The installer URL on disk, or "" when the installer never recorded one."""
     try:
         return INSTALLED_URL_FILE.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def _installed_dir_name() -> str:
+    """The install directory the terminal ACTUALLY landed in, or "".
+
+    Read from the installer's own record rather than derived from the broker name:
+    only the installer has seen the directory it wrote.
+    """
+    try:
+        return INSTALLED_DIR_NAME_FILE.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return ""
 
@@ -642,6 +667,22 @@ def find_terminal(prefer_key: str | None = None) -> Path | None:
             if requested.exists():
                 _cache_terminal(requested)
                 return requested
+
+    # 0b) The directory the INSTALL recorded, read back off the disk in the prefix.
+    #
+    #     Consulted only when the caller named NO registry build: a caller that did
+    #     name one has a directory of its own to check above, and must not be
+    #     overridden by a record that may predate a broker switch. This is the step
+    #     that makes a discovery-derived broker work end to end -- its installer URL
+    #     is known (the tool resolved it) but its directory name is not knowable
+    #     until the install has run.
+    if _broker_build_by_key(prefer_key or "") is None:
+        recorded_dir = _installed_dir_name()
+        if recorded_dir:
+            recorded = drive_c / "Program Files" / recorded_dir / "terminal64.exe"
+            if recorded.exists():
+                _cache_terminal(recorded)
+                return recorded
 
     if TERMINAL_MARKER.exists():
         cached = Path(TERMINAL_MARKER.read_text(encoding="utf-8").strip())
@@ -1142,7 +1183,15 @@ def cmd_install(args: argparse.Namespace) -> int:
     # Switching broker must invalidate the cached terminal path and the recorded
     # build, or the next command hands out the PREVIOUS broker's terminal -- the
     # silent no-login trap. (The marker is a pure cache: it is always safe to drop.)
-    for stale in (TERMINAL_MARKER, METAEDITOR_MARKER, BROKER_KEY_FILE):
+    # INSTALLED_DIR_NAME_FILE is dropped for the same reason as TERMINAL_MARKER: it
+    # is a claim about what is on disk, and this install has not run yet. If it
+    # fails, the old claim must not be left behind to answer for it.
+    for stale in (
+        TERMINAL_MARKER,
+        METAEDITOR_MARKER,
+        BROKER_KEY_FILE,
+        INSTALLED_DIR_NAME_FILE,
+    ):
         if stale.exists():
             stale.unlink()
 
@@ -1502,6 +1551,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         "installed": installed,
         "installing_target": pending_target or None,
         "terminal_path": str(terminal) if terminal else None,
+        # WHAT is on disk, separately from WHERE. ``installed_url`` is the installer
+        # URL that actually landed and ``installed_dir_name`` the directory it landed
+        # in -- both read from the installer's own records, so a reader can tell a
+        # resolved install apart from a guess without walking the prefix.
+        "installed_dir_name": _installed_dir_name() or None,
+        "installed_url": _installed_url() or None,
         "terminal_running": running,
         # Distinguishes the installer's credential-less "materialise the MQL5
         # library" terminal from one that was launched with our /config: file.

@@ -50,6 +50,18 @@ Three things that keep you from going in circles:
   on must come back `valid` from `discover_broker`.
 * **Do not ask the user for their download link before step 3.** Asking early is
   the old behaviour and it is what this section replaces.
+* **`done` means a terminal was installed, and the directory is read back off the
+  disk.** A resolved broker's install directory cannot be predicted (Exness's own
+  installer writes `MetaTrader 5 Terminal` for the build everyone calls
+  `MetaTrader 5 EXNESS`, and a discovered broker has no verified name at all), so
+  the installer records the one it actually used and `status` reports it as
+  `installed_dir_name` beside `installed_url`. Read those two rather than assuming
+  the name — and never call a broker "not installed" while they name its terminal.
+* **`failure: "no_new_terminal"` is not a download failure.** It means the sandbox
+  already carried a terminal that predates this install and the installer would not
+  add a second one beside it, so *nothing was installed for this broker*. The
+  payload names the pre-existing terminal in `existing_terminal` and the fix in
+  `remedy`. Retrying on that sandbox repeats the same outcome — use a fresh one.
 
 ## The one rule that matters
 

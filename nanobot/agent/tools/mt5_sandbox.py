@@ -2298,14 +2298,41 @@ class MT5SandboxTool(Tool):
 
         payload["resolved_installer_url"] = discovered["url"]
         payload["requested_server"] = server
+        if payload.get("ok") is False:
+            # The SUCCESS message must not be attached here. MEASURED 2026-09-25:
+            # this setdefault ran before the ``ok`` check, so a resolved install that
+            # ran and FAILED reported "the tool found that broker's installer itself
+            # ... and installed it -- no user action was needed" beside ``ok: false``.
+            # The failure payload carries the installer's own reason (``error``,
+            # ``failure``, ``remedy``); say what actually happened and let the remedy
+            # stand on its own.
+            payload.setdefault(
+                "message",
+                f"The tool resolved an installer for server {server!r} over HTTP and "
+                "ran it, but the install did not produce a terminal. The URL was "
+                "right; nothing was installed for it.",
+            )
+            if payload.get("failure") == "no_new_terminal":
+                # Retrying this install cannot help: the prefix it would install into
+                # already carries a terminal, and the installer will not add a second
+                # one beside it. Say so, so the caller does not spend a second install
+                # discovering the same thing.
+                payload.setdefault(
+                    "next",
+                    (
+                        "Do not retry this install on the same sandbox -- a terminal "
+                        "that predates it is already there and the installer will not "
+                        "add another. Use a fresh sandbox, or clear the Wine prefix "
+                        "first, and install the broker you actually need."
+                    ),
+                )
+            return ToolResult.error(json.dumps(payload))
         payload.setdefault(
             "message",
             f"The CLI's registry cannot resolve server {server!r}, so the tool found "
             "that broker's installer itself, validated it over HTTP, and installed it "
             "-- no user action was needed.",
         )
-        if payload.get("ok") is False:
-            return ToolResult.error(json.dumps(payload))
         return json.dumps(payload)
 
     async def _auto_install_for_broker(

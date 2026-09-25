@@ -1361,12 +1361,26 @@ def test_installer_records_which_build_landed_and_for_which_url():
 
 
 def test_install_clears_the_cached_terminal_and_broker_record():
-    """Switching broker has to invalidate the cache, or the old terminal is reused."""
+    """Switching broker has to invalidate the cache, or the old terminal is reused.
+
+    ``INSTALLED_DIR_NAME_FILE`` is in the list for the same reason as
+    ``TERMINAL_MARKER``: it is a claim about what is on disk, and the install that
+    will make it true has not run yet. Left behind, a FAILED install would go on
+    answering for the previous broker's directory.
+    """
     source = (
         Path(__file__).resolve().parents[2] / "scripts" / "mt5_cli.py"
     ).read_text(encoding="utf-8")
 
-    assert "for stale in (TERMINAL_MARKER, METAEDITOR_MARKER, BROKER_KEY_FILE):" in source
+    marker = source.index("TERMINAL_MARKER,\n        METAEDITOR_MARKER")
+    stale = source[source.rindex("for stale in (", 0, marker) : source.index("):", marker)]
+    for name in (
+        "TERMINAL_MARKER",
+        "METAEDITOR_MARKER",
+        "BROKER_KEY_FILE",
+        "INSTALLED_DIR_NAME_FILE",
+    ):
+        assert name in stale, f"{name} must be dropped when an install starts"
 
 
 def test_sandbox_polling_never_exceeds_120_seconds():
@@ -1903,11 +1917,16 @@ def test_a_failed_install_always_lands_its_log_in_install_log():
     assert '} >>"${MT5_ROOT}/install.log" 2>/dev/null || true' in script
     assert "installer output (%s, last 2000 bytes)" in script
     # The status line must say how many attempts were spent and which log holds
-    # the evidence.
+    # the evidence -- and WHICH failure it was. "terminal64.exe was not produced"
+    # is the wrong sentence when a terminal that predates the install is on disk:
+    # the installer did not fail to download anything, it declined to add a second
+    # terminal beside one it found. Only ONE of the two reasons may be reported.
     assert (
-        'status failed "terminal64.exe was not produced after ${_attempt} attempt(s) '
+        'status failed "${_REASON} after ${_attempt} attempt(s) '
         '(installer log: ${_last_attempt_log})"' in script
     )
+    assert '_FAILURE="no_new_terminal"' in script
+    assert '_FAILURE="terminal_not_produced"' in script
 
 
 # --------------------------------------------------------------------------- #
@@ -6030,6 +6049,16 @@ def test_the_installer_script_refuses_to_build_a_default_for_a_named_server(tmp_
     assert run(MT5_BROKER_INSTALLER_URL="").returncode == 0
 
 
+_AXI_URL = (
+    "https://download.mql5.com/cdn/web/axicorp.financial.services/mt5/axi5setup.exe"
+)
+_UNRESOLVED_SERVER_REFUSAL = (
+    '{"ok": false, "failure": "server_not_resolved", "requested_server": "AXI-Live", '
+    '"registry_brokers": [], "remedy": {"action": "install"}, '
+    '"next": "discover the broker"}\n[exit_code=3]'
+)
+
+
 class _QueuedSandbox:
     """A sandbox that answers each command with the next scripted reply."""
 
@@ -6139,3 +6168,320 @@ async def test_the_agent_install_waits_out_a_detached_start():
     assert any("mt5_cli.py status" in str(c["command"]) for c in sandbox.calls), (
         "the tool must poll status rather than hand the poll back to the model"
     )
+
+
+# --------------------------------------------------------------------------- #
+# "installed" must mean a terminal THIS install produced
+# --------------------------------------------------------------------------- #
+def _installer_helpers_script(tmp_path) -> Path:
+    """The terminal-identity helpers, lifted verbatim out of the installer.
+
+    Sliced rather than retyped: a copy would pass while the real script rotted. The
+    slice runs under bash with a fake prefix, so the properties below are proven
+    against the shipped code rather than against a string search.
+    """
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
+    ).read_text(encoding="utf-8")
+    start = script.index("  # WHICH terminals existed BEFORE the installer ran")
+    end = script.index("  # Run the installer in the BACKGROUND")
+    body = "\n".join(
+        line[2:] if line.startswith("  ") else line for line in script[start:end].splitlines()
+    )
+    out = tmp_path / "terminal-identity.sh"
+    out.write_text(
+        "set -u\n"
+        'WINE_PREFIX="${FAKE_PREFIX}"\n'
+        'MT5_ROOT="${FAKE_ROOT}"\n'
+        'TERM_DISPLAY_NAME="${FAKE_DIR_NAME}"\n'
+        'MT5_BROKER_DIR_NAME="${FAKE_DIR_NAME}"\n'
+        'RESOLVED="${FAKE_URL}"\n'
+        '_RESOLVED_URL="${FAKE_URL}"\n'
+        '_want_dir="${WINE_PREFIX}/drive_c/Program Files/${TERM_DISPLAY_NAME}"\n'
+        + body
+        + "\n",
+        encoding="utf-8",
+    )
+    return out
+
+
+def _run_installer_helpers(tmp_path, prefix, root, dir_name, url, body):
+    import subprocess as _subprocess
+
+    helpers = _installer_helpers_script(tmp_path)
+    driver = tmp_path / "driver.sh"
+    driver.write_text(
+        ". \"${HELPERS}\"\n" + body,
+        encoding="utf-8",
+    )
+    return _subprocess.run(
+        ["bash", str(driver)],
+        env={
+            **os.environ,
+            "HELPERS": str(helpers),
+            "FAKE_PREFIX": str(prefix),
+            "FAKE_ROOT": str(root),
+            "FAKE_DIR_NAME": dir_name,
+            "FAKE_URL": url,
+        },
+        capture_output=True,
+        text=True,
+    )
+
+
+_AXI_URL = (
+    "https://download.mql5.com/cdn/web/axicorp.financial.services/mt5/axi5setup.exe"
+)
+
+
+def test_a_terminal_that_predates_the_install_is_not_evidence_of_success(tmp_path):
+    """THE bug this fixes, reproduced as a property.
+
+    MEASURED FAILURE (2026-09-25, live Novita box i1msgk2l82okd3m0kqycs): with
+    Deriv's terminal already on disk, ``install --server AXI-Live`` resolved the AXI
+    installer URL correctly, reaped the installer ~0 s in because the poll's bare
+    ``find`` matched the PRE-EXISTING Deriv terminal, and reported
+    ``stage: done`` with ``.installed.url`` = AXI's. No AXI terminal existed. The URL
+    was right; the outcome was fiction.
+
+    So: a terminal the install did not create must never satisfy the poll, and when
+    nothing new appeared the install must have NO directory to claim.
+    """
+    prefix = tmp_path / ".wine-mt5"
+    root = tmp_path / ".mt5"
+    (prefix / "drive_c" / "Program Files" / "MetaTrader 5 Terminal").mkdir(parents=True)
+    (prefix / "drive_c" / "Program Files" / "MetaTrader 5 Terminal" / "terminal64.exe").write_bytes(b"MZ")
+    root.mkdir(parents=True)
+
+    result = _run_installer_helpers(
+        tmp_path,
+        prefix,
+        root,
+        "MetaTrader 5 AXI",
+        _AXI_URL,
+        "if _have_terminal; then echo HAVE=yes; else echo HAVE=no; fi\n"
+        'if d="$(_installed_dir)"; then echo DIR="+$d+"; else echo DIR=none; fi\n'
+        "echo TOKENS=$(_brand_tokens | tr '\\n' ',')\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "HAVE=no" in result.stdout, "a pre-existing terminal was accepted as installed"
+    assert "DIR=none" in result.stdout, "a directory was claimed with nothing installed"
+    # The brand is still mined, so the reinstall case below can work at all.
+    assert "TOKENS=axicorp,axi," in result.stdout
+
+
+def test_a_terminal_the_install_created_is_success_even_under_an_unpredicted_name(tmp_path):
+    """A discovery-derived broker's directory is not knowable in advance.
+
+    ``MT5_BROKER_DIR_NAME`` for an uncovered broker is a guess, so the install has to
+    be accepted on the terminal it actually produced -- and the directory has to be
+    read back off the disk, because that name is what every later call resolves the
+    terminal from.
+    """
+    prefix = tmp_path / ".wine-mt5"
+    root = tmp_path / ".mt5"
+    (prefix / "drive_c" / "Program Files").mkdir(parents=True)
+    root.mkdir(parents=True)
+
+    result = _run_installer_helpers(
+        tmp_path,
+        prefix,
+        root,
+        "MetaTrader 5 AXI",
+        _AXI_URL,
+        "echo HAVE=$([ -f \"${_want_dir}/terminal64.exe\" ] && echo pre || echo no)\n"
+        "_snapshot=\"$(_new_terminals)\"\n"
+        "mkdir -p \"${WINE_PREFIX}/drive_c/Program Files/MetaTrader 5 AXICorp\"\n"
+        "touch \"${WINE_PREFIX}/drive_c/Program Files/MetaTrader 5 AXICorp/terminal64.exe\"\n"
+        "if _have_terminal; then echo AFTER=yes; else echo AFTER=no; fi\n"
+        "echo DIR=$(_installed_dir)\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "HAVE=no" in result.stdout
+    assert "AFTER=yes" in result.stdout, "the install's own terminal must count"
+    assert "MetaTrader 5 AXICorp" in result.stdout, "the real directory was not read back"
+
+
+def test_the_installer_records_the_directory_it_actually_used(tmp_path):
+    """The record is what stops a wrong prediction from stranding the terminal.
+
+    The success path must set ``TERM_DISPLAY_NAME`` from the directory found on disk
+    (the MQL5 materialisation step and every later CLI call resolve through it) and
+    write ``.installed.dir_name``, or a correctly installed terminal stays invisible.
+    """
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
+    ).read_text(encoding="utf-8")
+    assert 'printf \'%s\' "${_INSTALLED_DIR_NAME}" > "${MT5_ROOT}/.installed.dir_name"' in script
+    assert 'TERM_DISPLAY_NAME="${_INSTALLED_DIR_NAME}"' in script
+    assert '_INSTALLED_DIR="$(_installed_dir || true)"' in script
+    assert "if [ -n \"${_INSTALLED_DIR}\" ]; then" in script
+    # The old predicate -- success on ANY terminal in the prefix -- must be gone.
+    assert (
+        "|| find \"${WINE_PREFIX}/drive_c\" -maxdepth 3 -iname 'terminal64.exe' "
+        "2>/dev/null | grep -q ."
+    ) not in script
+
+
+def test_a_refused_install_says_which_failure_it_was(tmp_path):
+    """``terminal64.exe was not produced`` is the wrong sentence half the time.
+
+    When a terminal that predates the install is on disk, the installer did not
+    fail to download anything -- it declined to add a second terminal beside one it
+    found. The payload has to say that, name the existing terminal, and give the one
+    remedy that works, or the reader re-runs the install and gets the same outcome.
+    """
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh"
+    ).read_text(encoding="utf-8")
+    assert '_FAILURE="no_new_terminal"' in script
+    assert '_FAILURE="terminal_not_produced"' in script
+    assert '"remedy": "%s", "existing_terminal": "%s"' in script
+    assert "install into a fresh sandbox, or clear the prefix" in script
+
+
+def test_the_cli_prefers_the_directory_the_install_recorded(monkeypatch, tmp_path):
+    """Reading the record back is what makes a discovery-derived broker usable.
+
+    For a broker with no registry entry there is no directory name to look up, so
+    before the record existed ``find_terminal`` walked past a correctly installed
+    terminal and settled for whatever it found first.
+    """
+    cli = _broker_cli(monkeypatch, tmp_path, brands=("MetaTrader 5 AXICorp",))
+    cli.INSTALLED_DIR_NAME_FILE.write_text("MetaTrader 5 AXICorp", encoding="utf-8")
+
+    assert cli._installed_dir_name() == "MetaTrader 5 AXICorp"
+    found = cli.find_terminal()
+    assert found is not None
+    assert "MetaTrader 5 AXICorp" in str(found)
+
+    # A DIRECTORY THE RECORD NAMES THAT IS NOT THERE must not be believed: the record
+    # is a claim about the disk, not a substitute for it.
+    cli.TERMINAL_MARKER.unlink(missing_ok=True)
+    cli.INSTALLED_DIR_NAME_FILE.write_text("MetaTrader 5 Nowhere", encoding="utf-8")
+    found = cli.find_terminal()
+    assert found is not None and "Nowhere" not in str(found)
+
+
+def test_a_requested_registry_build_is_not_overridden_by_the_record(monkeypatch, tmp_path):
+    """A caller who names a build gets that build, or nothing.
+
+    Only the caller knows which server they are about to log in to, and the record is
+    whatever was installed LAST. Handing back the recorded terminal for a different
+    requested broker is the silent no-login trap this finder exists to avoid.
+    """
+    cli = _broker_cli(
+        monkeypatch,
+        tmp_path,
+        brands=("MetaTrader 5 EXNESS", "MetaTrader 5 Terminal"),
+    )
+    cli.INSTALLED_DIR_NAME_FILE.write_text("MetaTrader 5 Terminal", encoding="utf-8")
+
+    # deriv's registered directory ("MetaTrader 5 Terminal") exists, so it wins...
+    assert "MetaTrader 5 Terminal" in str(cli.find_terminal(prefer_key="deriv"))
+    # ...and with that directory gone the record must NOT stand in for it: the
+    # recorded directory is where the LAST install landed, which is a different
+    # broker's terminal the moment the caller names another one.
+    import shutil
+
+    recorded = cli.WINE_PREFIX / "drive_c" / "Program Files" / "MetaTrader 5 Terminal"
+    shutil.rmtree(recorded)
+    cli.TERMINAL_MARKER.unlink(missing_ok=True)
+    found = cli.find_terminal(prefer_key="deriv")
+    assert found is None or found.parent != recorded
+
+
+def test_status_reports_the_url_and_directory_that_landed(monkeypatch, tmp_path):
+    """``installed_url`` + ``installed_dir_name``: WHAT and WHERE, both from records.
+
+    A reader deciding whether the box is the one they think it is needs both, and
+    needs them to come from the installer's own records rather than from a guess.
+    """
+    import argparse
+
+    cli = _broker_cli(monkeypatch, tmp_path, brands=("MetaTrader 5 AXICorp",))
+    cli.INSTALLED_URL_FILE.write_text("https://example.invalid/axi5setup.exe", encoding="utf-8")
+    cli.INSTALLED_DIR_NAME_FILE.write_text("MetaTrader 5 AXICorp", encoding="utf-8")
+    (cli.MT5_ROOT / "install.status").write_text(
+        "done|MT5 terminal installed (MetaTrader 5 AXICorp)\n", encoding="utf-8"
+    )
+    captured: dict[str, Any] = {}
+
+    def _capture(payload: dict[str, Any], **_kw: Any) -> int:
+        captured.clear()
+        captured.update(payload)
+        return 0
+
+    monkeypatch.setattr(cli, "emit", _capture)
+    cli.cmd_status(argparse.Namespace(lines=3))
+
+    assert captured["installed_dir_name"] == "MetaTrader 5 AXICorp"
+    assert captured["installed_url"] == "https://example.invalid/axi5setup.exe"
+
+
+def test_install_drops_the_recorded_directory_with_the_other_caches(monkeypatch, tmp_path):
+    """An install that has not run yet must not answer for the directory with the OLD claim."""
+    import argparse
+    import subprocess as _subprocess
+
+    cli = _broker_cli(monkeypatch, tmp_path)
+    cli.INSTALLED_DIR_NAME_FILE.write_text("MetaTrader 5 EXNESS", encoding="utf-8")
+    cli.BROKER_KEY_FILE.write_text("exness", encoding="utf-8")
+    script = tmp_path / "install_mt5_sandbox.sh"
+    script.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *a, **k: _subprocess.CompletedProcess(a, 0, "4242\n", ""),
+    )
+
+    cli.cmd_install(
+        argparse.Namespace(
+            script=str(script),
+            server="AXI-Live",
+            broker_installer_url="https://example.invalid/axi5setup.exe",
+            broker_dir_name="MetaTrader 5 AXI",
+            timeout=60,
+            detach=True,
+            foreground=False,
+        )
+    )
+
+    assert not cli.INSTALLED_DIR_NAME_FILE.exists()
+    assert not cli.BROKER_KEY_FILE.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_resolved_install_does_not_claim_it_installed_anything(monkeypatch):
+    """The resolved-install path set its success message before checking ``ok``.
+
+    So a discovery-derived install that ran and FAILED reported "the tool found that
+    broker's installer itself ... and installed it -- no user action was needed" next
+    to ``ok: false``. Two lies in one payload; the failure's own reason has to stand.
+    """
+    # The refusal comes FIRST (install --server AXI-Live, unresolvable server), then
+    # the re-issued install fails. Both are what the live path sees.
+    sandbox = _QueuedSandbox(
+        [
+            _UNRESOLVED_SERVER_REFUSAL,
+            '{"ok": false, "stage": "failed", "failure": "no_new_terminal", '
+            '"error": "the installer produced no new terminal", '
+            '"remedy": "use a fresh sandbox"}\n[exit_code=5]',
+        ]
+    )
+    tool = MT5SandboxTool.create(_ctx({"novita_sandbox": sandbox}))
+    discovered = {"url": _AXI_URL, "dir_name": "MetaTrader 5 AXI"}
+
+    async def _fake_discover(server, page_urls=None):
+        return dict(discovered)
+
+    import nanobot.agent.tools.mt5_sandbox as mt5mod
+
+    monkeypatch.setattr(mt5mod, "_discover_for_server", _fake_discover)
+    result = await tool.execute(action="install", server="AXI-Live")
+
+    rendered = str(result)
+    assert "no user action was needed" not in rendered
+    assert "no_new_terminal" in rendered
+    assert "did not produce a terminal" in rendered
+    assert "Do not retry this install" in rendered

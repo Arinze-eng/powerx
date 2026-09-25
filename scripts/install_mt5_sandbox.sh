@@ -980,10 +980,113 @@ if [ "${_TERMINAL_ALREADY_INSTALLED}" -eq 0 ]; then
   # OTHER build's binary, conclude success, and hand the bridge a terminal that
   # cannot reach the broker — reintroducing exactly the silent no-authorization
   # failure this change fixes.
+  #
+  # MEASURED FAILURE (2026-09-25, live Novita box): the fallback DID fall back to a
+  # bare ``find``, reintroducing exactly the failure the paragraph above warns
+  # about. On a box that already carried Deriv's terminal, ``install --server
+  # AXI-Live`` reported ``done`` and wrote AXI's URL into ``.installed.url`` while
+  # only Deriv's terminal existed: the FIRST poll matched the PRE-EXISTING
+  # terminal, so the AXI installer was reaped ~0 s after it started and the script
+  # advanced to its own "MT5 terminal installed" line. The URL was right; the
+  # reported outcome was not, and the next command found a terminal that could not
+  # resolve the server.
+  #
+  # So "installed" now means a terminal THIS INSTALL produced -- one that was not on
+  # disk before it ran -- or the directory the caller named. A terminal that
+  # predates the install is evidence of nothing.
   _want_dir="${WINE_PREFIX}/drive_c/Program Files/${TERM_DISPLAY_NAME}"
+
+  # WHICH terminals existed BEFORE the installer ran. Read back rather than assumed:
+  # the installer's own choice of directory is the only reliable answer, which is
+  # why the record it writes at the end is ``.installed.dir_name``.
+  _TERMINALS_BEFORE="${MT5_ROOT}/.terminals.before"
+  _list_terminals() {
+    find "${WINE_PREFIX}/drive_c" -maxdepth 3 -iname 'terminal64.exe' 2>/dev/null | sort
+  }
+  _list_terminals > "${_TERMINALS_BEFORE}" 2>/dev/null || : > "${_TERMINALS_BEFORE}"
+
+  # Terminals that appeared AFTER the snapshot: exactly the ones this install made.
+  _new_terminals() {
+    if [ ! -s "${_TERMINALS_BEFORE}" ]; then
+      _list_terminals
+      return 0
+    fi
+    _list_terminals | comm -13 "${_TERMINALS_BEFORE}" - 2>/dev/null || true
+  }
+
+  # Brand tokens mined out of the installer URL, so the directory the installer
+  # ACTUALLY used can still be recognised when the name we were given is wrong.
+  #
+  # A discovery-derived install has no registry entry, so MT5_BROKER_DIR_NAME is a
+  # GUESS ("MetaTrader 5 AXI" for slug ``axicorp.financial.services``); Exness's own
+  # installer ignores the brand outright and lays down "MetaTrader 5 Terminal". No
+  # caller-supplied name can be trusted to predict the directory.
+  _brand_tokens() {
+    printf '%s' "${_RESOLVED_URL}" \
+      | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://##; s#[?#].*$##' \
+      | tr '/._-' '\n' \
+      | tr 'A-Z' 'a-z' \
+      | sed -E 's/[0-9]+setup$//; s/setup$//; s/^[0-9]+//' \
+      | grep -E '^[a-z][a-z0-9]{2,}$' \
+      | grep -vxE 'http|https|www|com|net|org|cdn|web|mql5|metaquotes|setup|exe|mt4|mt5|download|downloads|terminal|platform|trade|trading|group|ltd|limited|inc|llc|financial|services|technology|technologies|broker|brokers|global|markets|capital|online|invest|investing'
+  }
+
+  # "MetaTrader 5 AXI" -> "axi"; the bare generic build -> "".
+  _dir_brand() {
+    printf '%s' "$(basename "$1")" \
+      | tr 'A-Z' 'a-z' \
+      | sed -E 's/^metatrader[ _-]*5[ _-]*//' \
+      | tr -d ' _-'
+  }
+
+  # Does this directory name carry the brand this installer is for? Consulted ONLY
+  # for a directory that ALREADY existed -- the reinstall/update case, where an
+  # installer refreshes the terminal it does not duplicate.
+  _dir_is_brand() {
+    _db="$(_dir_brand "$1")"
+    [ -n "${_db}" ] || return 1
+    for _tok in $(_brand_tokens); do
+      case "${_db}" in
+        "${_tok}"*) return 0 ;;
+      esac
+      case "${_tok}" in
+        "${_db}"*) return 0 ;;
+      esac
+    done
+    return 1
+  }
+
+  # The directory this install can actually claim, in order of strength:
+  #   1. the directory the caller named, if a terminal is there;
+  #   2. a directory that did not exist before this install ran;
+  #   3. a directory whose name carries this installer's brand.
+  _installed_dir() {
+    if [ -f "${_want_dir}/terminal64.exe" ]; then
+      printf '%s' "${_want_dir}"
+      return 0
+    fi
+    _cand="$(_new_terminals | head -n 1)"
+    if [ -n "${_cand}" ]; then
+      printf '%s' "$(dirname "${_cand}")"
+      return 0
+    fi
+    for _d in "${WINE_PREFIX}/drive_c/Program Files"/*/; do
+      [ -f "${_d}terminal64.exe" ] || continue
+      if _dir_is_brand "${_d}"; then
+        printf '%s' "${_d%/}"
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  # Predicate for the poll loops: only the two signals that mean "this install has
+  # produced its terminal". The brand fallback is deliberately NOT here -- a
+  # pre-existing branded terminal would end the loop ~0 s in and reap an install
+  # that is still working. It is consulted once, after the loop.
   _have_terminal() {
-    [ -f "${_want_dir}/terminal64.exe" ] \
-      || find "${WINE_PREFIX}/drive_c" -maxdepth 3 -iname 'terminal64.exe' 2>/dev/null | grep -q .
+    [ -f "${_want_dir}/terminal64.exe" ] && return 0
+    [ -n "$(_new_terminals | head -n 1)" ]
   }
 
   # Run the installer in the BACKGROUND and poll for the terminal WHILE it works.
@@ -1101,13 +1204,31 @@ if [ "${_TERMINAL_ALREADY_INSTALLED}" -eq 0 ]; then
     _attempt=$(( _attempt + 1 ))
   done
 
-  if _have_terminal; then
+  _INSTALLED_DIR="$(_installed_dir || true)"
+  if [ -n "${_INSTALLED_DIR}" ]; then
     touch "${DONE_MARKER}"
     printf '%s' "${_RESOLVED_URL}" > "${MT5_ROOT}/.installed.url"
     # WHICH build landed. Read by mt5_cli.py's preflight, which refuses a login whose
     # server this build cannot resolve instead of letting it hang on the IPC timeout.
     printf '%s' "${MT5_BROKER_KEY:-unknown}" > "${MT5_ROOT}/.broker_key"
-    status mt5 "MT5 terminal installed"
+    # WHERE it landed, read back from the disk instead of assumed.
+    #
+    # MT5_BROKER_DIR_NAME is a prediction: Exness's installer writes "MetaTrader 5
+    # Terminal" (not "MetaTrader 5 EXNESS") and a discovery-derived broker has no
+    # verified name at all. Everything downstream that uses the name -- the MQL5
+    # standard-library materialisation below, and mt5_cli.py's terminal finder on
+    # every later call -- therefore looked in a directory the terminal is not in, so
+    # a correct install reported a missing MQL5 tree and a terminal that "was never
+    # installed".
+    #
+    # so the truth is read off the disk and recorded once, here.
+    _INSTALLED_DIR_NAME="$(basename "${_INSTALLED_DIR}")"
+    TERM_DISPLAY_NAME="${_INSTALLED_DIR_NAME}"
+    printf '%s' "${_INSTALLED_DIR_NAME}" > "${MT5_ROOT}/.installed.dir_name"
+    status mt5 "MT5 terminal installed (${_INSTALLED_DIR_NAME})"
+    if [ "${_INSTALLED_DIR_NAME}" != "${MT5_BROKER_DIR_NAME}" ]; then
+      log "the installer used '${_INSTALLED_DIR_NAME}', not the predicted '${MT5_BROKER_DIR_NAME}'; recorded in .installed.dir_name"
+    fi
   else
     # Surface the installer's own output so the failure is actionable instead of
     # looking like a silent no-op -- AND land it in install.log.
@@ -1124,13 +1245,29 @@ if [ "${_TERMINAL_ALREADY_INSTALLED}" -eq 0 ]; then
       tr -d '\000' <"${_last_attempt_log}" 2>/dev/null | tail -c 2000
       printf '\n'
     } >>"${MT5_ROOT}/install.log" 2>/dev/null || true
+    # TWO different failures used to share one message. "terminal64.exe was not
+    # produced" is right for an installer that failed outright; it is wrong, and
+    # actively misleading, when a terminal that PREDATES this install is sitting on
+    # disk -- the reader concludes the download broke, when the real answer is that
+    # this prefix already carried a terminal and the installer did not add one.
+    _PRE_EXISTING_TERMINAL="$(head -n 1 "${_TERMINALS_BEFORE}" 2>/dev/null || true)"
+    if [ -n "${_PRE_EXISTING_TERMINAL}" ]; then
+      _FAILURE="no_new_terminal"
+      _REASON="the installer produced no new terminal; a terminal that predates this install is all that is on disk (${_PRE_EXISTING_TERMINAL})"
+      _REMEDY="this Wine prefix already carried ${_PRE_EXISTING_TERMINAL} and the installer did not add a second terminal beside it: install into a fresh sandbox, or clear the prefix and install once, for the broker you want"
+    else
+      _FAILURE="terminal_not_produced"
+      _REASON="terminal64.exe was not produced"
+      _REMEDY="read the installer log tail in the payload; a wedged download peer and a 404 installer are the two common causes"
+    fi
     {
-      printf '{"ok": false, "stage": "failed", "error": "terminal64.exe was not produced",\n'
+      printf '{"ok": false, "stage": "failed", "failure": "%s", "error": "%s",\n' "${_FAILURE}" "${_REASON}"
+      printf ' "remedy": "%s", "existing_terminal": "%s",\n' "${_REMEDY}" "${_PRE_EXISTING_TERMINAL}"
       printf ' "attempts": %s, "installer_log": "' "${_attempt}"
       tr -d '\000' <"${_last_attempt_log}" 2>/dev/null | tail -c 900 | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '
       printf '"}\n'
     } >&2
-    status failed "terminal64.exe was not produced after ${_attempt} attempt(s) (installer log: ${_last_attempt_log})"
+    status failed "${_REASON} after ${_attempt} attempt(s) (installer log: ${_last_attempt_log})"
     exit 5
   fi
 fi
