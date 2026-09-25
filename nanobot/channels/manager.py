@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import os
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from pathlib import Path
@@ -74,6 +75,63 @@ def _default_channel_config(name: str) -> dict[str, Any] | None:
     if not plugin.default_enabled:
         return None
     return channel_default_config(plugin)
+
+
+# --- stream delta coalescing bounds ---------------------------------------
+#
+# WHY A CAP AT ALL. Coalescing exists to cut channel API calls when the model
+# generates faster than the channel can send, and it does that by draining the
+# whole queue into one message. Unbounded, that trades a latency win for a
+# presentation loss: the user sees nothing for as long as the merge took and
+# then a wall of text, and streaming stops looking like streaming precisely
+# when the model is at its fastest. Measured against the previous behaviour, a
+# fast model's backlog collapsed into a single multi-hundred-character send.
+#
+# Soft cap: past this length, stop at the next natural boundary.
+# Hard cap: stop regardless, so a model emitting one long unbroken token run
+# (code, a URL, a hash) cannot stall the stream indefinitely.
+_STREAM_COALESCE_SOFT_CHARS = 160
+_STREAM_COALESCE_HARD_CHARS = 640
+_TERMINAL_PUNCTUATION = (".", "!", "?", "\n")
+
+
+def _resolve_stream_coalesce_chars(env_name: str, default: int) -> int:
+    """Env override, else the module default; a bad value falls back."""
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+def _stream_coalesce_soft_chars() -> int:
+    return _resolve_stream_coalesce_chars(
+        "POWERX_STREAM_COALESCE_SOFT_CHARS", _STREAM_COALESCE_SOFT_CHARS
+    )
+
+
+def _stream_coalesce_hard_chars() -> int:
+    return _resolve_stream_coalesce_chars(
+        "POWERX_STREAM_COALESCE_HARD_CHARS", _STREAM_COALESCE_HARD_CHARS
+    )
+
+
+def _stream_coalesce_boundary_reached(text: str) -> bool:
+    """Whether the accumulated delta should be sent now rather than merged on.
+
+    Breaking *before* consuming the next queued message is deliberate: anything
+    left on the queue is simply handled on the next dispatcher pass, so a cap
+    can only ever cost one extra send, never lose or reorder a delta.
+    """
+    if len(text) >= _stream_coalesce_hard_chars():
+        return True
+    if len(text) < _stream_coalesce_soft_chars():
+        return False
+    if text[-1:].isspace():
+        return True
+    return text.rstrip().endswith(_TERMINAL_PUNCTUATION)
 
 
 class ChannelManager:
@@ -880,6 +938,11 @@ class ChannelManager:
         # Only merge consecutive deltas. As soon as we hit any other message,
         # stop and hand that boundary back to the dispatcher via `pending`.
         while True:
+            # Stop at a size boundary too, so one fast burst cannot become a
+            # single wall-of-text send. Checked before consuming, so nothing is
+            # taken off the queue that this call will not report.
+            if _stream_coalesce_boundary_reached(combined_content):
+                break
             try:
                 next_msg = self.bus.outbound.get_nowait()
             except asyncio.QueueEmpty:
