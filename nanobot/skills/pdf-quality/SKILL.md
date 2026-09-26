@@ -10,6 +10,10 @@ Every PDF you produce must look like it was designed by a person who cares. The 
 always a finished, typeset `.pdf` — **never** raw text, never a `.tex`/`.html`/`.md` file handed
 over as the deliverable, never a wall of unstyled paragraphs.
 
+For sourced images — fetching one to disk, embedding it, and checking it really landed in the
+PDF — see the **`document-images`** skill. The short version: `web_fetch` with `saveTo` (a bare
+image URL returns a picture with no path), then `\includegraphics` on that local path.
+
 ## The one rule that matters
 
 **Typeset with LaTeX (`pdflatex`).** A PDF is a typesetting target, not a text dump. If you find

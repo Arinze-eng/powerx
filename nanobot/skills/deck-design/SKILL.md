@@ -10,6 +10,11 @@ A `.pptx` that opens with white slides, default Calibri and a stack of bullets i
 deliverable. Every deck you produce must have a deliberate visual identity: a palette, a type
 scale, a layout system, aligned content, real charts, and images that belong to the story.
 
+For getting those images onto disk and confirming they are really in the file, read the
+**`document-images`** skill first: `web_fetch` with `saveTo` (not a bare URL — that returns a
+picture you can see and no path to embed), `human_browser` for a screenshot, then
+`add_picture` with the saved path.
+
 Build everything with **`python-pptx`** (no pandoc, no LaTeX, no missing binaries). One script
 generates the whole deck.
 

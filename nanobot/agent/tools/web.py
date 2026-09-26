@@ -10,6 +10,7 @@ import json
 import os
 import re
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, cast
 from urllib.parse import parse_qsl, quote, urljoin, urlparse
 
@@ -1054,6 +1055,10 @@ class WebSearchTool(Tool):
             "default": "markdown",
         },
         maxChars=IntegerSchema(minimum=100),
+        saveTo=StringSchema(
+            "Workspace path to write a fetched image to, e.g. 'assets/logo.png'. "
+            "Use it whenever the picture is going into a document."
+        ),
         required=["url"],
     )
 )
@@ -1065,7 +1070,11 @@ class WebFetchTool(Tool):
     description = (  # pyright: ignore[reportIncompatibleMethodOverride, reportAssignmentType]
         "Fetch a URL and extract readable content (HTML → markdown/text). "
         "Output is capped at maxChars (default 50 000). "
-        "Works for most web pages and docs; may fail on login-walled or JS-heavy sites."
+        "Works for most web pages and docs; may fail on login-walled or JS-heavy sites. "
+        "Set save_to to write a fetched image to disk: fetching an image URL normally returns "
+        "the picture itself, which a PDF/DOCX/PPTX cannot embed, whereas save_to returns a file "
+        "path you can pass to add_picture (python-docx, python-pptx) or \\includegraphics (LaTeX). "
+        "That plus human_browser's screenshot action is how an image gets into a document."
     )
 
     config_key = "web"
@@ -1084,13 +1093,74 @@ class WebFetchTool(Tool):
             config=ctx.config.web.fetch,
             proxy=ctx.config.web.proxy,
             user_agent=ctx.config.web.user_agent,
+            workspace=ctx.workspace,
         )
 
-    def __init__(self, config: WebFetchConfig | None = None, proxy: str | None = None, user_agent: str | None = None, max_chars: int = 50000):
+    def __init__(self, config: WebFetchConfig | None = None, proxy: str | None = None, user_agent: str | None = None, max_chars: int = 50000, workspace: str | Path | None = None):
         self.config = config if config is not None else WebFetchConfig()
         self.proxy = proxy
         self.user_agent = user_agent or _DEFAULT_USER_AGENT
         self.max_chars = max_chars
+        #: Where a ``save_to`` path is resolved from, and the fence that keeps
+        #: one inside it. Saving is this tool's only write, and the path is
+        #: always the caller's.
+        self.workspace = Path(workspace).expanduser().resolve() if workspace else None
+
+    #: Reported as read-only: it reads the web. ``save_to`` is the single
+    #: deliberate write, and the destination is a workspace-confined path the
+    #: caller names, so two fetches cannot collide on a shared file.
+
+    #: A fetched image larger than this is refused rather than written: it is
+    #: destined for a document, and a document-embedded picture that big is a
+    #: mistake the caller wants told about before it lands on disk.
+    _MAX_SAVED_IMAGE_BYTES = 20_000_000
+
+    def _save_image(self, raw: bytes, ctype: str, url: str, save_to: str) -> str:
+        """Write a fetched image into the workspace, returning its path.
+
+        An image returned as content blocks is something the model can look at
+        and nothing more - there is no path for python-docx, python-pptx or
+        LaTeX to consume. Saving is what turns "I found a picture" into "the
+        document contains that picture".
+        """
+        root = self.workspace or Path.cwd().resolve()
+        candidate = Path(str(save_to).strip())
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve()
+        # resolve() collapses '..', so this containment check is the real fence.
+        if resolved != root and root not in resolved.parents:
+            return json.dumps(
+                {"error": "save_to must point inside the agent workspace", "url": url},
+                ensure_ascii=False,
+            )
+        if len(raw) > self._MAX_SAVED_IMAGE_BYTES:
+            return json.dumps(
+                {
+                    "error": (
+                        f"image is {len(raw)} bytes, above the "
+                        f"{self._MAX_SAVED_IMAGE_BYTES} byte limit for a saved image"
+                    ),
+                    "url": url,
+                },
+                ensure_ascii=False,
+            )
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        resolved.write_bytes(raw)
+        return json.dumps(
+            {
+                "url": url,
+                "saved_to": str(resolved),
+                "bytes": len(raw),
+                "content_type": ctype,
+                "note": (
+                    "a file path, not an image: pass saved_to to "
+                    "python-docx add_picture / python-pptx add_picture, or to "
+                    "\\includegraphics in pdflatex"
+                ),
+            },
+            ensure_ascii=False,
+        )
 
     @property
     def read_only(self) -> bool:
@@ -1101,10 +1171,12 @@ class WebFetchTool(Tool):
         url: str,
         extract_mode: str = "markdown",
         max_chars: int | None = None,
+        save_to: str | None = None,
         **kwargs: Any,
     ) -> Any:  # pyright: ignore[reportIncompatibleMethodOverride]
         url = url.strip(" \t\r\n`\"'")
         extract_mode = kwargs.pop("extractMode", extract_mode)
+        save_to = kwargs.pop("saveTo", save_to)
         max_chars = cast(int, kwargs.pop("maxChars", max_chars) or self.max_chars)
         is_valid, error_msg = _validate_url_safe(url)
         if not is_valid:
@@ -1136,6 +1208,8 @@ class WebFetchTool(Tool):
                     if ctype.startswith("image/"):
                         r.raise_for_status()
                         raw = await r.aread()
+                        if save_to:
+                            return self._save_image(raw, ctype, url, save_to)
                         return build_image_content_blocks(raw, ctype, url, f"(Image fetched from: {url})")
                 finally:
                     if stream is not None:
@@ -1226,6 +1300,8 @@ class WebFetchTool(Tool):
 
             ctype = r.headers.get("content-type", "")
             if ctype.startswith("image/"):
+                if save_to:
+                    return self._save_image(r.content, ctype, url, save_to)
                 return build_image_content_blocks(r.content, ctype, url, f"(Image fetched from: {url})")
 
             if "application/json" in ctype:
