@@ -301,10 +301,14 @@ class SolveGateSolver:
       ``pending``. Retrieval is free and never re-bills the solve.
     * ``async: true`` is sent on every submit. Without it the server runs its own
       synchronous wait and holds the socket for the whole attempt: measured, a
-      ``202`` arrived only after **20.2s**, against ``0.1s`` with the flag. A
-      submit that authenticates and stays ``pending`` for minutes on a target a
-      test key solves instantly is the account's capacity or balance, not the
-      request - the id is the thing to hand to SolveGate.
+      ``202`` arrived only after **20.2s**, against ``0.1s`` with the flag.
+    * **Live latency is a queue, and a long one.** Measured on a busy account, a
+      live solve sat ``pending`` for **13 minutes** (792s) and then returned a
+      real Cloudflare token; an unrelated sitekey in the same batch came back
+      ``failed`` with ``unknown_sitekey`` after the same wait. A pending live
+      solve is therefore *not* evidence of a dead key, and a short timeout reads
+      as a broken solver when it is only a slow queue. Retrieval is free, so the
+      id is always worth keeping.
     * **A test key answers synchronously**, ``200`` with ``status: "solved"``
       and a fabricated token, which is where the earlier "nothing to poll"
       reading of this API came from. Treating that as the only shape made every
@@ -418,10 +422,12 @@ class SolveGateSolver:
             if time.monotonic() >= deadline:
                 raise SolverError(
                     f"SolveGate was still solving {task_id} after {int(timeout)}s "
-                    f"(status {record['status']!r}). A live solve normally lands in about "
-                    f"a second, so a solve that never leaves pending points at the "
-                    f"SolveGate account rather than at this request - retrieve it later "
-                    f"with the same id, or quote {task_id} to SolveGate"
+                    f"(status {record['status']!r}). This is a queue, not a failure: a "
+                    f"backed-up live solve was measured completing after ~13 minutes, "
+                    f"while a sandbox key answers instantly. The solve is not lost and "
+                    f"retrieval never re-bills it, so either retrieve {task_id} later "
+                    f"with the same id, or raise timeout_seconds (up to 900) to wait it "
+                    f"out in one call"
                 )
             await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
             record = await self.retrieve(task_id)
@@ -557,7 +563,10 @@ class CaptchaSolverTool(Tool):
     #: answers the same challenge. SolveGate covers only these two.
     _SOLVEGATE_GATES = {"turnstile": "turnstile", "waf": "waf"}
     #: Longest window a single solve may occupy, so one call cannot pin a turn.
-    _MAX_SOLVE_SECONDS = 600.0
+    #: Matches the config schema's own ceiling: a deep queue was measured taking
+    #: ~13 minutes, so a cap below what the operator may configure would silently
+    #: truncate the wait they asked for.
+    _MAX_SOLVE_SECONDS = 900.0
     #: SolveGate's own limits on the two optional turnstile fields, measured off
     #: the live API: a longer action or cdata, or one carrying any character
     #: outside this set, is a 400. Checking locally names the rule instead of
