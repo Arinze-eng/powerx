@@ -40,4 +40,5 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `poll` | Real-time polling & vigilance: watch anything over time and react — live trading or any repeated non-trading task |
 | `alpaca-hackathon` | ICT/SMC + TMA + HMM five-cluster trading strategy playbook (backing the `alpaca_trade` tool) |
 | `mt5-trading` | Headless MetaTrader 5 in the sandbox: install Wine + MT5, compile MQL5, read logs, and place/close orders from the command line (backing the `mt5_sandbox` tool) |
+| `engineering-draw` | Real 2D engineering drawings and 3D CAD parts, inside the execution sandbox: editable DXF `DIMENSION` entities on layers with a title block (`ezdxf`), and solids exported as STEP/STL/3MF plus projected, sectioned and hatched views (`build123d`) — backing the `engineering_draw` tool |
 | `vulnerability-hunting` | Find **real** vulnerabilities in an authorised target (site, API, host, app, repo, network) entirely inside the execution sandbox — recon → exploit → verify. Enforces sandbox-only probing and *no working exploit, no finding*, and reports unproven candidates separately |
