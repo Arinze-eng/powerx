@@ -728,6 +728,34 @@ def test_a_drawing_view_is_not_treated_as_consuming_the_part() -> None:
     assert 'if str(getattr(obj, "TypeId", "")).startswith("TechDraw::"):' in driver
 
 
+def test_the_sheet_has_white_paper_behind_it() -> None:
+    """MEASURED: FreeCAD's A4 template fills nothing, so the rasterised sheet was
+    transparent background with near-black lines -- a blank image to any viewer
+    that is not white. Live: the exported PNG carried mean alpha 10.8 and
+    RGB 2.0 where it was opaque, and composited on white it is a real drawing."""
+    driver = cli.FREECAD_DRIVER
+    assert "fill=\"#ffffff\"" in driver
+    assert "text[:opened + 1] + paper + text[opened + 1:]" in driver
+    assert 'r\'width="([0-9.]+)mm"\'' in driver
+
+
+def test_the_gui_photo_waits_for_the_window_to_stop_changing() -> None:
+    """MEASURED: `view_png` came back as FreeCAD's splash screen.
+
+    A 106 011-byte frame, 93% black, luminance spread 28.6 -- handed to the user
+    as their drawing. No byte threshold separates a splash screen from a window,
+    so the capture now keeps the first frame that passes the size test and only
+    returns once two consecutive frames share ImageMagick's signature: motion is
+    what says the document is still opening. A window that never settles still
+    yields its best frame rather than an error.
+    """
+    source = Path(cli.__file__).read_text()
+    assert "def _frame_signature(path: Path) -> str:" in source
+    assert '["identify", "-format", "%#", str(path)]' in source
+    assert "if signature and signature == previous:" in source
+    assert "if previous:" in source
+
+
 def test_asking_for_a_drawing_without_a_sheet_still_produces_one() -> None:
     """MEASURED: `--formats step,dxf,svg,pdf` with no add_page() gave one DXF and
     three "no TechDraw sheet to render" errors. Asking for svg/pdf/png IS asking

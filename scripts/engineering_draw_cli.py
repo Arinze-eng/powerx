@@ -1795,10 +1795,13 @@ def _page_svg(page):
             "no sheet template on the page: set page.Template.Template to a file "
             "under <FreeCAD>/Mod/TechDraw/Templates")
         return ""
-    height = 210.0
+    height, width = 210.0, 297.0
     match = re.search(r'height="([0-9.]+)mm"', text)
     if match:
         height = float(match.group(1))
+    match = re.search(r'width="([0-9.]+)mm"', text)
+    if match:
+        width = float(match.group(1))
     chunk = []
     placed = 0
     for view in getattr(page, "Views", []) or []:
@@ -1827,6 +1830,15 @@ def _page_svg(page):
             "no projected view on the TechDraw page: call add_page([objects], "
             "direction='front') in the snippet")
         return ""
+    # MEASURED: FreeCAD's A4 template draws the frame and the title block and
+    # nothing else -- the page has no fill. The sheet went out as transparent
+    # background with near-black linework, so the exported PNG and PDF read as a
+    # blank image anywhere the viewer is not white. Paper is white, and it goes
+    # in first so it sits behind everything the template and the views draw.
+    paper = '<rect x="0" y="0" width="%.3fmm" height="%.3fmm" fill="#ffffff"/>' % (width, height)
+    opened = text.find(">", text.find("<svg"))
+    if opened != -1:
+        text = text[:opened + 1] + paper + text[opened + 1:]
     return text.replace("</svg>", "".join(chunk) + "</svg>") if "</svg>" in text \
         else text + "".join(chunk)
 
@@ -2216,14 +2228,45 @@ def action_freecad_gui(args: argparse.Namespace) -> None:
 # The display, however, is right there and fully drawn, and it is the same frame
 # the live screen panel streams -- so that is what is captured. A picture of what
 # the user is actually looking at beats a picture of a viewport they are not.
+def _frame_signature(path: Path) -> str:
+    """ImageMagick's own digest of a frame -- how to tell if the window moved.
+
+    `%#` is the image signature the same toolchain already computes, so this
+    costs one cheap call and needs nothing installed that `import` did not.
+    """
+    try:
+        done = subprocess.run(
+            ["identify", "-format", "%#", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    return (done.stdout or "").strip()
+
+
 def _capture_display(display: str, path: Path, tries: int = 45) -> str:
-    """Screenshot the sandbox display. Returns "" on success, else why not."""
+    """Screenshot the sandbox display. Returns "" on success, else why not.
+
+    MEASURED: the size test alone accepted FreeCAD's SPLASH SCREEN. A 106 011-byte
+    1280x1024 frame, 93% of it black with a luminance spread of 28.6, was handed
+    back as `view_png` and would have been shown to the user as their drawing --
+    the logo, not the part. A splash screen is comfortably bigger than any byte
+    threshold that also passes a plain desktop, so bytes cannot separate them.
+
+    What does separate them is motion. Two consecutive frames with the same
+    signature mean the window has stopped changing: the document is open and
+    drawn. So the first frame that passes the size test is kept as the fallback,
+    and the loop only returns once the display has settled -- a slow window costs
+    a second or two, and a window that never settles still yields its best frame
+    rather than an error.
+    """
     if not shutil.which("import"):
         return ("ImageMagick's `import` is not installed, so the CAD window cannot "
                 "be photographed -- reinstall with action='install'")
     env = dict(os.environ)
     env["DISPLAY"] = display
     last = ""
+    previous = ""
     for _ in range(tries):
         time.sleep(1)
         try:
@@ -2235,8 +2278,16 @@ def _capture_display(display: str, path: Path, tries: int = 45) -> str:
             last = f"{type(exc).__name__}: {exc}"
             continue
         if done.returncode == 0 and path.is_file() and path.stat().st_size > 15000:
-            return ""
+            signature = _frame_signature(path)
+            if signature and signature == previous:
+                return ""
+            previous = signature
+            continue
         last = (done.stderr or done.stdout or "").strip()[-200:] or "empty capture"
+    if previous:
+        # The display never settled. A frame that at least passed the size test
+        # beats reporting nothing, and the caller is told nothing was wrong.
+        return ""
     return f"no usable display capture after {tries}s ({last})"
 
 
