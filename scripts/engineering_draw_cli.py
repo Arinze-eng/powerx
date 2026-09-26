@@ -48,12 +48,15 @@ import argparse
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any
 
-CLI_VERSION = "2026-09-26.2"
+CLI_VERSION = "2026-09-26.3"
 
 OUT_DIR_DEFAULT = os.environ.get("ENGINEERING_DRAW_DIR", "~/engineering_drawings")
 
@@ -1061,26 +1064,54 @@ def _render_dxf(doc: Any, stem: str, out: Path, formats: list[str]) -> dict[str,
 # Actions
 # --------------------------------------------------------------------------- #
 def action_doctor(args: argparse.Namespace) -> None:
+    """Report what is installed, and which engine the model should reach for.
+
+    ``preferred_engine`` is the point of this action: FreeCAD is the engine to use
+    first and it is installed by ``action='install'``, so "is it there yet" has to
+    be answerable before anything is designed. ``ready`` keeps its original
+    meaning -- the build123d fallback is usable -- so an image where FreeCAD will
+    not install still reports usable, just not preferred.
+    """
     deps = _deps()
     missing = [name for name, value in deps.items() if str(value).startswith("MISSING")]
+    freecad = _freecad_status()
+    freecad_ready = bool(freecad.get("available"))
+    ready = not missing or freecad_ready
+    if ready and not missing:
+        next_step = "Everything is ready."
+    elif ready:
+        next_step = (
+            "FreeCAD is ready and is the preferred engine; the build123d fallback "
+            "is not installed, so do not use action='model' or action='draw'."
+        )
+    else:
+        next_step = (
+            "Run action='install' to install FreeCAD (the preferred engine for 2D "
+            "and 3D design and export) plus its fallback packages: "
+            + ", ".join(missing)
+        )
     ok(
         action="doctor",
         cli_version=CLI_VERSION,
         python=sys.version.split()[0],
         dependencies=deps,
-        ready=not missing,
+        ready=ready,
         missing=missing,
+        freecad=freecad,
         capabilities={
-            "3d_solid_modelling": not str(deps["build123d"]).startswith("MISSING"),
-            "step_stl_3mf_export": not str(deps["build123d"]).startswith("MISSING"),
-            "2d_dxf_with_dimensions": not str(deps["ezdxf"]).startswith("MISSING"),
-            "raster_and_vector_previews": not str(deps["matplotlib"]).startswith("MISSING"),
+            "3d_solid_modelling": freecad_ready
+            or not str(deps["build123d"]).startswith("MISSING"),
+            "step_stl_3mf_export": freecad_ready
+            or not str(deps["build123d"]).startswith("MISSING"),
+            "2d_dxf_with_dimensions": freecad_ready
+            or not str(deps["ezdxf"]).startswith("MISSING"),
+            "raster_and_vector_previews": freecad_ready
+            or not str(deps["matplotlib"]).startswith("MISSING"),
+            "cad_app_with_drafting_and_gui": _freecad_which() is not None,
+            "live_screen_cad_window": _freecad_which(gui=True) is not None,
         },
-        next=(
-            "Everything is ready."
-            if not missing
-            else "Run action='install' to install: " + ", ".join(missing)
-        ),
+        preferred_engine="freecad" if freecad_ready else "build123d",
+        next=next_step,
     )
 
 
@@ -1508,6 +1539,631 @@ def action_export(args: argparse.Namespace) -> None:
     )
 
 
+# --------------------------------------------------------------------------- #
+# FreeCAD: the design app the model reaches for first
+# --------------------------------------------------------------------------- #
+#
+# WHY FREECAD AND NOT ONLY build123d
+# ----------------------------------
+# build123d is a good modelling kernel and a poor *product*: it has no drafting
+# workbench, no TechDraw, no document, and no GUI, so "a 2D drawing of this part"
+# has to be rebuilt by hand out of projection edges. FreeCAD has all of it --
+# Draft for real 2D entities, TechDraw for a sheet with views and dimensions,
+# Part/Import for STEP/IGES/BREP/STL/DXF, and a GUI whose window the live screen
+# panel can stream like any other desktop. So FreeCAD is the default and
+# build123d stays the fallback for when the FreeCAD install did not land.
+#
+# THE ONE THING THAT BREAKS IT, AND WHY
+# ------------------------------------
+# MEASURED FAILURE (2026-09-26, Novita `secure`, Debian 12 image): the sandbox
+# carries a **from-source python at /usr/local** (`sys.prefix=/usr/local`,
+# `/usr/local/lib/libpython3.11.so.1.0` built 2023-11), and FreeCAD's binary picks
+# that library up. Its stdlib is not where FreeCAD then looks, so the embedded
+# interpreter dies before any FreeCAD code runs:
+#
+#   freecadcmd /tmp/t.py
+#     <class 'ModuleNotFoundError'>: No module named 'math'
+#     Exception while processing file: /tmp/t.py [No module named 'math']
+#
+# which reads as "FreeCAD is broken" and sends you deleting and reinstalling a
+# package that is perfectly fine. Forcing the interpreter back onto Debian's own
+# python fixes it, and `PYTHONHOME=/usr` alone is NOT enough (tried: no), nor is
+# `PYTHONPATH` (no), nor `LD_PRELOAD` of Debian's libpython (yes, but it injects a
+# second interpreter into every child process). What works, and what this module
+# uses, is both halves at once:
+#
+#   PYTHONHOME=/usr LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu freecadcmd script.py
+#
+# Verified: box-minus-cylinder -> STEP 33 KB + STL 61 KB, DXF export, and a
+# TechDraw page saved as SVG. The GUI needs the same two variables.
+FREECAD_ENV = {
+    "PYTHONHOME": "/usr",
+    "LD_LIBRARY_PATH": "/usr/lib/x86_64-linux-gnu",
+}
+FREECAD_CONSOLE = ("freecadcmd", "FreeCADCmd")
+FREECAD_GUI = ("freecad", "FreeCAD")
+DISPLAY_ENV = "POWERX_SCREEN_DISPLAY"
+DEFAULT_DISPLAY = ":99"
+
+#: FreeCAD's own python, run as the driver. The model's snippet is *not* the
+#: script that runs: this driver wraps it, so a snippet that forgets to export
+#: still produces the artefacts, and one that raises still reports why instead of
+#: printing a traceback the tool would have to guess at.
+FREECAD_DRIVER = r'''
+import json, os, re, shutil, sys, traceback
+import FreeCAD, Part
+RESULT = {"objects": [], "files": {}, "errors": [], "notes": [],
+          "volume_mm3": None, "bbox_mm": None}
+for name in ("Draft", "Import", "Mesh", "TechDraw"):
+    try:
+        globals()[name] = __import__(name)
+    except Exception as exc:
+        RESULT["notes"].append("module %s unavailable: %s" % (name, exc))
+OUT = os.environ.get("ED_OUT", "/tmp")
+STEM = os.environ.get("ED_STEM", "design")
+WANTED = [f for f in os.environ.get("ED_FORMATS", "step").split(",") if f]
+SOURCE = os.environ.get("ED_SOURCE", "")
+CODE = os.environ.get("ED_CODE", "")
+VIEW = os.environ.get("ED_VIEW", "iso")
+
+doc = FreeCAD.newDocument("design")
+
+def add_page(objects=None, template="A4_LandscapeTD.svg", direction=None):
+    """Build a TechDraw page with one projected view, and return it.
+
+    TechDraw's boilerplate is four objects and an enum that must match the
+    object type exactly, which is a poor thing to make the model reproduce from
+    memory. This is the whole of it in one call.
+
+    `direction` defaults to the orientation the caller asked for with
+    --preview-view, so one flag steers every sheet the snippet builds.
+    """
+    direction = direction or VIEW
+    page = doc.addObject("TechDraw::DrawPage", "Page")
+    tpl = doc.addObject("TechDraw::DrawSVGTemplate", "Template")
+    tpl.Template = os.path.join(FreeCAD.getResourceDir(), "Mod", "TechDraw",
+                                "Templates", template)
+    page.Template = tpl
+    src = list(objects or [])
+    if src:
+        view = doc.addObject("TechDraw::DrawViewPart", "View")
+        view.Source = src
+        view.Direction = {
+            "front": (0, -1, 0), "top": (0, 0, 1), "right": (1, 0, 0),
+            "iso": (1, -1, 0.8), "left": (-1, 0, 0), "rear": (0, 1, 0),
+        }.get(str(direction).lower(), (0, -1, 0))
+        page.addView(view)
+    doc.recompute()
+    return page
+
+def _shapes():
+    out = []
+    for obj in doc.Objects:
+        try:
+            shape = getattr(obj, "Shape", None)
+            if shape is not None and not shape.isNull():
+                out.append(obj)
+        except Exception:
+            continue
+    return out
+
+def _save(key, path, writer):
+    try:
+        writer(path)
+        RESULT["files"][key] = path
+    except Exception as exc:
+        RESULT["errors"].append("%s export failed: %s: %s" % (key, type(exc).__name__, exc))
+
+# --- TechDraw: composing a sheet without the writer FreeCAD 0.20 does not have
+# MEASURED on the Debian package (0.20.2+dfsg1-4), because every obvious call
+# fails SILENTLY or raises for a reason that reads like the caller's fault:
+#   * `page.saveSvg(path)`      -> AttributeError. Sheet-level export arrived in
+#                                 0.21; on 0.20 the draw page has only `isValid`.
+#   * `page.PageResult`         -> AttributeError. Does not exist on this build.
+#   * `Import.export(page, f)`  -> returns OK and writes NOTHING. A drawing tool
+#                                 that reports success and produces no file is the
+#                                 worst failure mode there is, so it is not used.
+# What 0.20 does have is `TechDraw.viewPartAsSvg(view)`: one projected view as an
+# SVG fragment in millimetres, y pointing UP. So a sheet is composed here --
+# the template's frame and title block, its editable fields filled in, and each
+# projected view placed at its page position with the y axis flipped. That is the
+# same drawing the GUI would show, and it rasterises with rsvg-convert.
+def _template_text(page):
+    try:
+        path = page.Template.Template
+    except Exception:
+        return "", {}
+    text = ""
+    if path and os.path.isfile(path):
+        text = open(path).read()
+    fields = {}
+    try:
+        fields = dict(page.Template.EditableTexts or {})
+    except Exception:
+        fields = {}
+    for key, value in fields.items():
+        text = re.sub(
+            r'(freecad:editable="%s"[^>]*>)([^<]*)' % re.escape(str(key)),
+            lambda m: m.group(1) + str(value), text)
+    return text, fields
+
+def _page_svg(page):
+    """Return the sheet as SVG text, or "" if it cannot be composed."""
+    text, _fields = _template_text(page)
+    if not text:
+        RESULT["notes"].append(
+            "no sheet template on the page: set page.Template.Template to a file "
+            "under <FreeCAD>/Mod/TechDraw/Templates")
+        return ""
+    height = 210.0
+    match = re.search(r'height="([0-9.]+)mm"', text)
+    if match:
+        height = float(match.group(1))
+    chunk = []
+    placed = 0
+    for view in getattr(page, "Views", []) or []:
+        if getattr(view, "TypeId", "") != "TechDraw::DrawViewPart":
+            continue
+        try:
+            fragment = TechDraw.viewPartAsSvg(view)
+        except Exception as exc:
+            RESULT["notes"].append("view %s not rendered: %s" % (view.Name, exc))
+            continue
+        if not fragment or "<g" not in fragment:
+            continue
+        x = float(getattr(view, "X", 0.0) or 0.0)
+        y = float(getattr(view, "Y", 0.0) or 0.0)
+        rotation = float(getattr(view, "Rotation", 0.0) or 0.0)
+        # The fragment is in mm with y up; SVG is y down, so the view is flipped
+        # about its own origin and then moved to where the page wants it.
+        transform = "translate(%.3f %.3f)" % (x, height - y)
+        if rotation:
+            transform += " rotate(%.3f)" % -rotation
+        transform += " scale(1 -1)"
+        chunk.append('<g transform="%s">%s</g>' % (transform, fragment))
+        placed += 1
+    if not placed:
+        RESULT["notes"].append(
+            "no projected view on the TechDraw page: call add_page([objects], "
+            "direction='front') in the snippet")
+        return ""
+    return text.replace("</svg>", "".join(chunk) + "</svg>") if "</svg>" in text \
+        else text + "".join(chunk)
+
+# --- the model's design -----------------------------------------------------
+try:
+    if SOURCE:
+        Import.insert(SOURCE, doc.Name) if "Import" in dir() else None
+        doc.recompute()
+        RESULT["notes"].append("imported " + SOURCE)
+    if CODE:
+        exec(compile(CODE, "<design>", "exec"), globals())
+    doc.recompute()
+except Exception as exc:
+    RESULT["errors"].append("design failed: %s: %s" % (type(exc).__name__, exc))
+    RESULT["traceback"] = traceback.format_exc()[-1200:]
+
+objs = _shapes()
+RESULT["objects"] = [getattr(o, "Name", "?") for o in objs]
+if objs:
+    try:
+        RESULT["volume_mm3"] = float(sum(float(o.Shape.Volume) for o in objs))
+        box = objs[0].Shape.BoundBox
+        for o in objs[1:]:
+            box.add(o.Shape.BoundBox)
+        RESULT["bbox_mm"] = [box.XLength, box.YLength, box.ZLength]
+    except Exception as exc:
+        RESULT["notes"].append("measure failed: %s" % exc)
+
+pages = [o for o in doc.Objects if getattr(o, "TypeId", "") == "TechDraw::DrawPage"]
+page = pages[0] if pages else None
+
+# --- export -----------------------------------------------------------------
+shapes = [o.Shape for o in objs]
+for fmt in WANTED:
+    target = os.path.join(OUT, STEM + "." + fmt)
+    if fmt in ("step", "stp", "iges", "igs", "brep"):
+        _save(fmt, target, lambda path: Part.export(objs, path))
+    elif fmt == "stl":
+        def _stl(path, _shapes=shapes):
+            if len(_shapes) == 1:
+                _shapes[0].exportStl(path)
+            else:
+                Part.makeCompound(_shapes).exportStl(path)
+        _save("stl", target, _stl)
+    elif fmt == "dxf":
+        def _dxf(path, _page=page):
+            # Two different drawings, and both are DXF the reader can open:
+            #   * a TechDraw page -> the SHEET, frame and title block included,
+            #     through the one writer this build does ship.
+            #   * no page -> the raw 2D entities, through Draft's importDXF, which
+            #     is the module that carries the exporter on Debian. `Draft.export`
+            #     does not exist here, and `Import.export(...dxf)` writes nothing.
+            if _page is not None:
+                TechDraw.writeDXFPage(_page, path)
+            else:
+                importDXF = globals().get("importDXF")
+                if importDXF is None:
+                    importDXF = __import__("importDXF")
+                importDXF.export(doc.Objects, path)
+        _save("dxf", target, _dxf)
+    elif fmt == "svg":
+        def _svg(path, _page=page):
+            text = _page_svg(_page)
+            if not text:
+                raise RuntimeError("the TechDraw sheet could not be composed")
+            open(path, "w").write(text)
+        _save("svg", target, _svg)
+    elif fmt in ("png", "pdf"):
+        # There is no rsvg-convert input unless the sheet was composed, so the
+        # SVG is written first and the rasteriser runs on it. The SVG is kept
+        # rather than treated as scratch: it is the vector form of the same sheet.
+        def _rasterise(path, _pdf=fmt == "pdf"):
+            svg = os.path.join(OUT, STEM + ".svg")
+            if not os.path.isfile(svg):
+                text = _page_svg(page)
+                if not text:
+                    raise RuntimeError("no TechDraw sheet to render")
+                open(svg, "w").write(text)
+                RESULT["files"]["svg"] = svg
+            if not shutil.which("rsvg-convert"):
+                raise RuntimeError("rsvg-convert is not installed (apt librsvg2-bin)")
+            import subprocess as _sp
+            if _pdf:
+                _sp.run(["rsvg-convert", "--format=pdf", "-o", path, svg], check=True)
+            else:
+                _sp.run(["rsvg-convert", "-w", "2000", "-o", path, svg], check=True)
+        _save(fmt, target, _rasterise)
+    else:
+        RESULT["notes"].append("unsupported format " + fmt)
+
+try:
+    RESULT["files"]["fcstd"] = os.path.join(OUT, STEM + ".FCStd")
+    doc.saveAs(RESULT["files"]["fcstd"])
+except Exception as exc:
+    RESULT["errors"].append("could not save the document: %s" % exc)
+
+print("ED_RESULT " + json.dumps(RESULT))
+'''
+
+
+def _freecad_which(gui: bool = False) -> str | None:
+    """Absolute path to FreeCAD's console or GUI launcher, or ``None``."""
+    for name in (FREECAD_GUI if gui else FREECAD_CONSOLE):
+        found = shutil.which(name)
+        if found:
+            return found
+    for guess in ("/usr/bin/freecad", "/usr/bin/freecadcmd"):
+        if os.path.isfile(guess) and os.access(guess, os.X_OK):
+            if gui == guess.endswith("freecad"):
+                return guess
+    return None
+
+
+def _freecad_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment FreeCAD's embedded python needs -- see FREECAD_ENV."""
+    env = dict(os.environ)
+    env.update(FREECAD_ENV)
+    if extra:
+        env.update(extra)
+    return env
+
+
+def _freecad_version(binary: str) -> str:
+    """FreeCAD's version, or why it could not be asked."""
+    script = "import FreeCAD;print('ED_VERSION ' + '.'.join(FreeCAD.Version()[:3]))"
+    try:
+        done = subprocess.run(
+            [binary, "-c", script],
+            capture_output=True, text=True, timeout=180, env=_freecad_env(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"MISSING ({type(exc).__name__})"
+    for line in (done.stdout or "").splitlines():
+        if line.startswith("ED_VERSION "):
+            return line.split(" ", 1)[1].strip()
+    tail = ((done.stderr or "") + (done.stdout or "")).strip().splitlines()
+    return "MISSING (" + (tail[-1][:120] if tail else "no version reported") + ")"
+
+
+def _freecad_status() -> dict[str, Any]:
+    console, gui = _freecad_which(), _freecad_which(gui=True)
+    return {
+        "available": bool(console),
+        "console": console,
+        "gui": gui,
+        "display": _display_name(),
+        "version": _freecad_version(console) if console else "MISSING (not installed)",
+    }
+
+
+def _display_name() -> str:
+    return (os.environ.get(DISPLAY_ENV) or DEFAULT_DISPLAY).strip() or DEFAULT_DISPLAY
+
+
+def _run_freecad_driver(code: str, out: Path, stem: str, formats: list[str],
+                        source: str = "", timeout: int = 900,
+                        view: str = "") -> dict[str, Any]:
+    """Run the driver with the model's snippet and return its ED_RESULT object."""
+    binary = _freecad_which()
+    if not binary:
+        fail(
+            "FreeCAD is not installed in this sandbox",
+            "Call action='install' first (it installs FreeCAD, Xvfb and the "
+            "rasteriser), then action='status' until it reports ready. Until then "
+            "use action='model' and action='draw', which need only build123d.",
+        )
+    driver = out / f".{stem}.freecad.py"
+    driver.write_text(FREECAD_DRIVER)
+    env = _freecad_env({
+        "ED_OUT": str(out),
+        "ED_STEM": stem,
+        "ED_FORMATS": ",".join(formats),
+        "ED_SOURCE": source,
+        "ED_CODE": code,
+        "ED_VIEW": view or "iso",
+    })
+    try:
+        done = subprocess.run(
+            [binary, str(driver)], capture_output=True, text=True,
+            timeout=timeout, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        entity_fail(
+            f"FreeCAD did not finish within {timeout}s",
+            "Simplify the design, or split it into design -> export steps with "
+            "action='freecad' and a saved file.",
+        )
+        return {}
+    stdout, stderr = done.stdout or "", done.stderr or ""
+    payload_text = ""
+    for line in stdout.splitlines():
+        if line.startswith("ED_RESULT "):
+            payload_text = line[len("ED_RESULT "):]
+    if not payload_text:
+        fail(
+            "FreeCAD ran but produced no result",
+            "This is the engine, not your design: check 'stderr' for the reason. "
+            "If it mentions a missing module, run action='doctor' and re-install.",
+            stderr=stderr.strip()[-800:],
+            hint="FreeCAD's embedded python needs " + " ".join(
+                f"{k}={v}" for k, v in FREECAD_ENV.items()
+            ) + " -- the engine sets that for you.",
+        )
+    try:
+        return json.loads(payload_text)
+    except Exception as exc:  # noqa: BLE001
+        fail(f"could not read FreeCAD's result: {exc}", "Retry; if it repeats, run doctor.",
+             received=payload_text[:400])
+        return {}
+
+
+def action_freecad(args: argparse.Namespace) -> None:
+    """Design with FreeCAD headless, and export what CAD tools actually read."""
+    out = _out_dir(args.out_dir)
+    stem = _safe_stem(args.name, "design")
+    formats = [str(f).strip().lower() for f in (args.formats or ["step", "stl"]) if str(f).strip()]
+    # `preview='png'` is asking for a picture, and on a drawing the picture is a
+    # rendered view of the sheet -- so it adds the format rather than being
+    # accepted and ignored, which is what it did before it was noticed.
+    for extra in args.preview or []:
+        fmt = str(extra).strip().lower()
+        if fmt and fmt not in formats:
+            formats.append(fmt)
+    code = (args.code or "").strip()
+    source = ""
+    if args.file:
+        source = str(Path(os.path.expanduser(str(args.file))).resolve())
+        if not Path(source).is_file():
+            fail(f"no such file: {source}", "Check the path; the sandbox keeps files between calls.")
+    if not code and not source:
+        fail(
+            "freecad needs 'code' (a FreeCAD python snippet) or 'file' (to import and convert)",
+            "Pass code='box = doc.addObject(\'Part::Box\',\'Box\'); box.Length=60 ...' "
+            "plus formats='step,dxf,svg', or file=/path/part.step to convert an "
+            "existing model.",
+        )
+    result = _run_freecad_driver(code, out, stem, formats, source=source,
+                                 timeout=args.timeout or 900,
+                                 view=args.preview_view or "")
+    files = _report_files(result.get("files") or {})
+    if not files:
+        fail(
+            "FreeCAD produced no files",
+            "Read 'freecad_errors' and 'notes' below: an export format usually "
+            "needs something in the document (dxf needs shapes, svg/pdf/png need "
+            "a TechDraw page from add_page([...])).",
+            freecad_errors=result.get("errors") or [],
+            notes=result.get("notes") or [],
+        )
+    ok(
+        action="freecad",
+        name=stem,
+        out_dir=str(out),
+        engine="freecad",
+        version=_freecad_version(_freecad_which() or "freecadcmd"),
+        objects=result.get("objects") or [],
+        measured={
+            "volume_mm3": result.get("volume_mm3"),
+            "bbox_mm": result.get("bbox_mm"),
+        },
+        exported=result.get("files") or {},
+        files=files,
+        freecad_errors=result.get("errors") or [],
+        notes=result.get("notes") or [],
+        traceback=result.get("traceback"),
+        how_to_draw=(
+            f"engineering_draw(action='freecad_gui', name={stem!r}, "
+            "preview='png') puts this on the live screen and photographs the "
+            "window; preview_view='top' would only steer a sheet built with "
+            "add_page([...])."
+        ),
+    )
+
+
+def action_freecad_gui(args: argparse.Namespace) -> None:
+    """Open a design in FreeCAD's GUI on the sandbox display, for the live screen.
+
+    The live screen panel captures this display, so opening the window IS how a
+    user watches the design happen -- no new streaming code, and the same pump
+    that shows a trading terminal shows a CAD session.
+    """
+    binary = _freecad_which(gui=True)
+    if not binary:
+        fail(
+            "FreeCAD's GUI is not installed in this sandbox",
+            "Call action='install' first; it installs FreeCAD, Xvfb and a window "
+            "manager. action='freecad' (headless) also needs the install.",
+        )
+    out = _out_dir(args.out_dir)
+    stem = _safe_stem(args.name, "design")
+
+    target = ""
+    if args.file:
+        target = str(Path(os.path.expanduser(str(args.file))).resolve())
+        if not Path(target).is_file():
+            fail(f"no such file: {target}", "Check the path.")
+    else:
+        result = _run_freecad_driver(
+            (args.code or "").strip(), out, stem,
+            ["step", "stl"] + (["svg"] if (args.preview or []) else []),
+            timeout=args.timeout or 900,
+            view=args.preview_view or "",
+        )
+        target = str((result.get("files") or {}).get("fcstd")
+                     or (result.get("files") or {}).get("step") or "")
+        if not target or not Path(target).is_file():
+            fail(
+                "nothing to open: the headless build produced no document",
+                "Read freecad_errors below, or pass file=... of an existing "
+                "model/drawing.",
+                freecad_errors=result.get("errors") or [],
+            )
+
+    display = _ensure_display()
+    log = out / f".{stem}.freecad-gui.log"
+    preview_png = "png" in {str(f).lower() for f in (args.preview or [])}
+    command = f"nohup {binary} {shlex_quote(target)} "
+    pid = _launch_detached(
+        f"DISPLAY={display} " + command + f">{log} 2>&1 & echo $!",
+        extra_env=FREECAD_ENV,
+    )
+    written: dict[str, Any] = {}
+    view_error = ""
+    view_png = out / f"{stem}_view.png"
+    if preview_png:
+        # The window needs a moment to open the document and draw it; the capture
+        # helper retries until there is something worth calling a picture, so a
+        # slow start costs seconds rather than losing the image.
+        view_error = _capture_display(display, view_png)
+        if not view_error:
+            written["view_png"] = str(view_png)
+    ok(
+        action="freecad_gui",
+        name=stem,
+        display=display,
+        pid=pid,
+        opened=target,
+        log=str(log),
+        files=_report_files(written),
+        view_error=view_error if not written.get("view_png") else None,
+        screen=(
+            f"FreeCAD is drawing to display {display}. The live screen panel "
+            "captures that display, so the CAD window is what the user sees -- "
+            "open the panel to watch, and leave the window open while you work."
+        ),
+        preview_note=(
+            "The PNG written by preview='png' is a photograph of the sandbox "
+            "display -- FreeCAD's own window, in whatever direction that window is "
+            "showing, and the same frame the live screen panel streams. "
+            "preview_view steers the drawing views add_page([...]) projects "
+            "(action='freecad' with formats='svg,pdf'), not this window."
+        ),
+    )
+
+
+# WHY THE PICTURE IS TAKEN OF THE DISPLAY AND NOT OF FREECAD'S VIEWPORT
+# ---------------------------------------------------------------------
+# MEASURED, three times, each failure looking like a different bug:
+#   * `freecad model.FCStd script.py` -- the script cannot tell which of the two
+#     paths is which, and the render is written to the wrong name.
+#   * `FreeCADGui.showMainWindow()` and `FreeCADGui.exec_()` -- neither exists on
+#     this build (0.20.2); `getMainWindow`, `activeDocument` and `updateGui` do.
+#   * so the script was rewritten to pump the event loop itself with
+#     `processEvents()` -- and it still failed, because a script handed to
+#     `freecad script.py` runs BEFORE the GUI application exists at all:
+#     `FreeCADGui.ActiveDocument` is None and there is no view to photograph.
+# The display, however, is right there and fully drawn, and it is the same frame
+# the live screen panel streams -- so that is what is captured. A picture of what
+# the user is actually looking at beats a picture of a viewport they are not.
+def _capture_display(display: str, path: Path, tries: int = 45) -> str:
+    """Screenshot the sandbox display. Returns "" on success, else why not."""
+    if not shutil.which("import"):
+        return ("ImageMagick's `import` is not installed, so the CAD window cannot "
+                "be photographed -- reinstall with action='install'")
+    env = dict(os.environ)
+    env["DISPLAY"] = display
+    last = ""
+    for _ in range(tries):
+        time.sleep(1)
+        try:
+            done = subprocess.run(
+                ["import", "-window", "root", str(path)],
+                capture_output=True, text=True, timeout=90, env=env,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last = f"{type(exc).__name__}: {exc}"
+            continue
+        if done.returncode == 0 and path.is_file() and path.stat().st_size > 15000:
+            return ""
+        last = (done.stderr or done.stdout or "").strip()[-200:] or "empty capture"
+    return f"no usable display capture after {tries}s ({last})"
+
+
+def _ensure_display(display: str | None = None) -> str:
+    """Bring up Xvfb + a window manager if they are not already running.
+
+    FreeCAD is a GUI app: with no display it refuses to start, and a bare Xvfb
+    with no window manager leaves the window unmapped, which the screen capture
+    then faithfully records as an empty desktop.
+    """
+    name = (display or _display_name()).strip() or DEFAULT_DISPLAY
+    number = name.lstrip(":") or "99"
+    parts = []
+    if shutil.which("Xvfb"):
+        parts.append(
+            f"pgrep -f 'Xvfb {name}' >/dev/null 2>&1 || "
+            f"(nohup Xvfb {shlex_quote(name)} -screen 0 1280x1024x24 "
+            f">/tmp/xvfb-{number}.log 2>&1 & sleep 2)"
+        )
+    if shutil.which("matchbox-window-manager"):
+        parts.append(
+            "pgrep -x matchbox-window-manager >/dev/null 2>&1 || "
+            "(DISPLAY=" + shlex_quote(name) + " nohup matchbox-window-manager "
+            f"-use_titlebar no >/tmp/wm-{number}.log 2>&1 & sleep 2)"
+        )
+    if parts:
+        subprocess.run(["/bin/bash", "-lc", " ; ".join(parts)], capture_output=True, timeout=60)
+    return name
+
+
+def _launch_detached(command: str, extra_env: dict[str, str] | None = None) -> str:
+    """Start a process that outlives this call, and return its pid."""
+    env = _freecad_env(extra_env or {})
+    prefix = " ".join(f"{k}={shlex_quote(v)}" for k, v in (extra_env or {}).items())
+    full = (prefix + " " if prefix else "") + command
+    done = subprocess.run(["/bin/bash", "-lc", full], capture_output=True, text=True,
+                          timeout=120, env=env)
+    pid = (done.stdout or "").strip().splitlines()[-1] if (done.stdout or "").strip() else ""
+    return pid or "?"
+
+
+def shlex_quote(value: str) -> str:
+    import shlex
+
+    return shlex.quote(str(value))
+
+
 ACTIONS = {
     "doctor": action_doctor,
     "model": action_model,
@@ -1516,6 +2172,8 @@ ACTIONS = {
     "section": action_section,
     "inspect": action_inspect,
     "export": action_export,
+    "freecad": action_freecad,
+    "freecad_gui": action_freecad_gui,
 }
 
 
@@ -1558,7 +2216,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--title", help="JSON title-block values (name, material, drawn_by, scale, rev, sheet, note).")
     parser.add_argument("--axis", help="Section axis: x, y or z.")
     parser.add_argument("--at", help="Section plane offset in mm.")
-    parser.add_argument("--file", help="Input file for inspect/export.")
+    parser.add_argument("--file", help="Input file for inspect/export, or the file freecad_gui opens.")
+    parser.add_argument("--timeout", type=int,
+                        help="Seconds to allow a FreeCAD run (default 900).")
+    parser.add_argument("--preview-view", dest="preview_view",
+                        help="Viewport saved by freecad_gui: iso, front, top, right, left, rear.")
     return parser
 
 

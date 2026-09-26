@@ -55,7 +55,7 @@ _REPO = os.getenv("ENGINEERING_DRAW_REPO", "Arinze-eng/powerx")
 #: MUST equal ``CLI_VERSION`` in ``scripts/engineering_draw_cli.py``. The bootstrap
 #: refuses to run a CLI that does not carry this marker, so a stale cached copy
 #: is detected rather than silently used. Bump both together.
-_CLI_VERSION = "2026-09-26.2"
+_CLI_VERSION = "2026-09-26.3"
 
 _ED_HOME = "$HOME/.engineering_draw"
 _CLI_PATH = f"{_ED_HOME}/bin/engineering_draw_cli.py"
@@ -71,6 +71,8 @@ _ACTIONS = (
     "doctor",
     "install",
     "status",
+    "freecad",
+    "freecad_gui",
     "model",
     "draw",
     "project",
@@ -82,9 +84,11 @@ _ACTIONS = (
 #: Command deadlines. A build of a moderately complex part is seconds; the
 #: ceiling is for a first call in a cold box where the bootstrap runs too.
 _TIMEOUTS: dict[str, int] = {
-    "doctor": 120,
+    "doctor": 180,
     "install": 120,
     "status": 60,
+    "freecad": 900,
+    "freecad_gui": 600,
     "model": 300,
     "draw": 180,
     "project": 420,
@@ -291,6 +295,17 @@ def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
         parts += ["--at", str(kwargs["at"])]
     if kwargs.get("file"):
         parts += ["--file", _sh(kwargs["file"])]
+    if action in ("freecad", "freecad_gui"):
+        # A viewport render only exists on the GUI action, and asking for a
+        # particular view IS asking for the render -- so `preview_view` implies
+        # `preview=png` rather than silently doing nothing when the model passes
+        # one and forgets the other.
+        if kwargs.get("preview_view") and not kwargs.get("preview"):
+            parts += ["--preview", "png"]
+        if kwargs.get("preview_view"):
+            parts += ["--preview-view", _sh(kwargs["preview_view"])]
+        if kwargs.get("timeout") is not None:
+            parts += ["--timeout", str(kwargs["timeout"])]
     return " ".join(parts)
 
 
@@ -330,21 +345,24 @@ class EngineeringDrawTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Create real engineering drawings and 3D CAD models by running "
-            "build123d and ezdxf inside the user's sandbox. Use it to design a "
-            "part, export a STEP/STL/3MF solid, produce an orthographic drawing "
-            "with editable DXF dimensions, cut a section, or inspect an existing "
-            "CAD file. Everything is in millimetres. Actions: doctor (is the "
-            "engine installed), install (install it once, detached), status "
-            "(install progress), model (3D solid from a spec or a build123d "
-            "snippet, export STEP/STL/3MF/BREP/OBJ/glTF plus a shaded preview), "
-            "draw (2D drawing: lines, circles, arcs, polylines, hatches, text, and "
-            "REAL dim_linear/dim_aligned/dim_radius/dim_diameter/dim_angular "
-            "entities, on a bordered sheet with a title block), project (project a "
-            "3D part into front/top/right/iso views with hidden lines), section "
-            "(cut a 3D part on a plane and hatch it), inspect (measure an existing "
-            "STEP/STL/DXF), export (convert an existing file). Files persist in the "
-            "sandbox between calls."
+            "Create real engineering drawings and 3D CAD in the user's sandbox. "
+            "FREECAD IS THE DEFAULT ENGINE: reach for action='freecad' first for "
+            "both 2D and 3D design and for every export, because it carries a real "
+            "document, a Draft workbench, TechDraw sheets and the STEP/DXF writers. "
+            "It is installed into the sandbox by action='install' and you must not "
+            "use it before action='doctor' reports it available. Everything is in "
+            "millimetres. Actions: doctor (what is installed, and which engine to "
+            "use), install (installs FreeCAD + build123d once, detached), status "
+            "(install progress), freecad (design headlessly with a FreeCAD python "
+            "snippet and export step/stl/iges/brep/dxf/svg/pdf/png plus the FCStd "
+            "document), freecad_gui (open the design in FreeCAD's GUI on the "
+            "sandbox display so the user WATCHES it being drawn on the live screen, "
+            "and optionally save a shaded viewport PNG), model (build123d fallback "
+            "for a solid from a spec), draw (build123d/ezdxf fallback 2D drawing "
+            "with editable DXF dimensions), project (orthographic views with hidden "
+            "lines), section (cut a part on a plane and hatch it), inspect (measure "
+            "an existing STEP/STL/DXF), export (convert an existing file). Files "
+            "persist in the sandbox between calls."
         )
 
     @property
@@ -372,11 +390,16 @@ class EngineeringDrawTool(Tool):
                 "code": {
                     "type": "string",
                     "description": (
-                        "A build123d snippet for a part the spec vocabulary cannot "
-                        "express. Assign the shape to a variable named 'result'; "
-                        "'params' is in scope. Example: \"result = Box(50,30,10) - "
-                        "Cylinder(6,40)\". Reuse the same snippet with action='project' "
-                        "to draw it."
+                        "The design itself. For action='freecad'/'freecad_gui' this is "
+                        "a FreeCAD python snippet run inside a document already bound "
+                        "to `doc`, with `FreeCAD`, `Part`, `Draft`, `Import` and "
+                        "`Mesh` in scope, plus a helper: call add_page([objects]) to "
+                        "build a TechDraw sheet (that is what makes svg/pdf/png "
+                        "exports possible). Example: \"b = doc.addObject('Part::Box',"
+                        "'Plate'); b.Length, b.Width, b.Height = 80, 50, 12; "
+                        "doc.recompute(); add_page([b], direction='iso')\". For the "
+                        "build123d fallback actions, it is a build123d snippet that "
+                        "assigns the shape to a variable named 'result'."
                     ),
                 },
                 "params": {
@@ -393,7 +416,12 @@ class EngineeringDrawTool(Tool):
                 },
                 "formats": {
                     "type": "string",
-                    "description": "Comma-separated 3D export formats: step, stl, 3mf, brep, obj, gltf.",
+                    "description": (
+                        "Comma-separated export formats. FreeCAD: step, stp, iges, "
+                        "brep, stl, dxf, svg, pdf, png (dxf and svg/pdf/png need "
+                        "shapes, and svg/pdf/png need a TechDraw page from "
+                        "add_page). build123d: step, stl, 3mf, brep, obj, gltf."
+                    ),
                 },
                 "preview": {
                     "type": "string",
@@ -427,7 +455,26 @@ class EngineeringDrawTool(Tool):
                 },
                 "file": {
                     "type": "string",
-                    "description": "Input file for action='inspect' or 'export', e.g. ~/engineering_drawings/bracket.step.",
+                    "description": (
+                        "Input file: for action='inspect' or 'export' the CAD file to "
+                        "read, with action='freecad' a model to import and convert, "
+                        "and for action='freecad_gui' an existing model/F.CStd to open "
+                        "on the live screen instead of building one. e.g. "
+                        "~/engineering_drawings/bracket.step."
+                    ),
+                },
+                "preview_view": {
+                    "type": "string",
+                    "description": (
+                        "Which way the drawing views face: iso, front, top, right, "
+                        "left or rear. Every sheet built with add_page([...]) in the "
+                        "snippet projects from that direction, so it steers the "
+                        "dxf/svg/pdf views without the snippet having to pass "
+                        "direction= itself. On action='freecad_gui' it also renders "
+                        "the picture preview (same as preview='png'), but that "
+                        "picture is a photograph of FreeCAD's own window, so the "
+                        "window's orientation is whatever FreeCAD opened with."
+                    ),
                 },
                 "timeout": {
                     "type": "integer",
@@ -473,7 +520,15 @@ class EngineeringDrawTool(Tool):
             # Detached: a pip install of OpenCASCADE outlives any single sandbox
             # command. The model polls action='status' itself -- it must never
             # hand that job to the user.
+            # `mkdir -p` first: the installer writes its own log, but the shell
+            # creates the REDIRECT before the script runs, so a missing home
+            # directory makes the redirect the thing that fails and the detached
+            # install never starts -- while `status` then reports "not yet"
+            # forever, which reads as a slow install rather than as one that
+            # never began. MEASURED: exactly that, with ENGINEERING_DRAW_HOME
+            # pointed at a directory that did not exist yet.
             command = _with_bootstrap(
+                f"mkdir -p {_ED_HOME}; "
                 f"nohup bash {_INSTALLER_PATH} >{_INSTALL_LOG} 2>&1 & echo install_started"
             )
             return await self._run(sandbox, action, command, timeout)

@@ -595,7 +595,250 @@ def test_an_unexpected_engine_error_never_shows_a_bare_traceback(capsys, monkeyp
 def test_every_engine_action_is_wired_up() -> None:
     """A CLI action with no entry point in ACTIONS is unreachable from the tool."""
     assert set(cli.ACTIONS) == {
-        "doctor", "model", "draw", "project", "section", "inspect", "export",
+        "doctor", "freecad", "freecad_gui", "model", "draw", "project", "section",
+        "inspect", "export",
     }
     for name, function in cli.ACTIONS.items():
         assert callable(function), name
+
+
+# --------------------------------------------------------------------------- #
+# FreeCAD: the default engine
+# --------------------------------------------------------------------------- #
+# Every case below is a failure that was reproduced against the FreeCAD the
+# sandbox actually gets (Debian 12's `0.20.2+dfsg1-4`) on 2026-09-26.
+def test_the_freecad_scripts_are_valid_python() -> None:
+    """The driver is a string until FreeCAD executes it.
+
+    A syntax error inside it cannot be caught by importing this module, and it
+    surfaces in the sandbox as FreeCAD refusing to run -- which reads like the
+    engine is missing rather than like a typo. This caught exactly that.
+    """
+    import ast
+
+    ast.parse(cli.FREECAD_DRIVER, "<fre".replace("<fre", "<driver>"))
+
+
+def test_the_gui_preview_photographs_the_display() -> None:
+    """The GUI action photographs the sandbox display, not a viewport.
+
+    MEASURED: a script handed to ``freecad script.py`` runs BEFORE the GUI
+    application exists, so ``FreeCADGui.ActiveDocument`` is None and there is no
+    view to save; and 0.20.2's ``FreeCADGui`` has no ``showMainWindow`` or
+    ``exec_`` to pump. What is on the display is the window the live screen panel
+    streams, so that is what gets captured.
+    """
+    import inspect
+
+    body = inspect.getsource(cli._capture_display)
+    assert "import" in body and "-window" in body and "root" in body
+    assert "DISPLAY" in body
+    assert not hasattr(cli, "_FREECAD_VIEW_SCRIPT")
+    assert "_capture_display(" in inspect.getsource(cli.action_freecad_gui)
+
+
+def test_the_driver_exports_dxf_through_a_writer_that_ships() -> None:
+    """0.20 has no ``DrawPage.saveSvg``, so the driver must not call one.
+
+    MEASURED: ``page.saveSvg`` raises AttributeError, ``page.PageResult`` does not
+    exist, and ``Import.export(..., '.dxf')`` returns OK and writes NOTHING. The
+    writers that do exist are ``TechDraw.writeDXFPage`` (the sheet) and Draft's
+    ``importDXF.export`` (the raw entities), so those are what the driver names.
+    """
+    driver = cli.FREECAD_DRIVER
+    # The comments here name the calls that DO NOT work, so only the executed
+    # lines are checked -- otherwise the explanation of the trap trips the trap's
+    # own guard.
+    code = "\n".join(
+        line for line in driver.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "TechDraw.writeDXFPage" in code
+    assert "importDXF" in code
+    assert ".saveSvg(" not in code, "0.20.2 has no sheet-level SVG writer"
+    assert ".savePDF(" not in code, "0.20.2 has no sheet-level PDF writer"
+
+
+def test_the_driver_composes_a_sheet_from_the_views() -> None:
+    """``viewPartAsSvg`` is the only SVG this build produces, so it is used."""
+    assert "viewPartAsSvg" in cli.FREECAD_DRIVER
+    assert "rsvg-convert" in cli.FREECAD_DRIVER, "the rasteriser is how png/pdf land"
+
+
+def test_preview_view_reaches_the_drawing_views() -> None:
+    """``--preview-view`` has to land somewhere real, or it is a lie.
+
+    It is the exit of a pipeline that is easy to leave half-wired: the driver
+    reads ``ED_VIEW``, ``add_page`` has to default to it, and the runner has to
+    set it. ``ED_VIEW`` was read into a constant nothing used -- i.e. the flag
+    was accepted and did nothing -- which is exactly the bug this pins.
+    """
+    assert 'os.environ.get("ED_VIEW"' in cli.FREECAD_DRIVER
+    assert "direction = direction or VIEW" in cli.FREECAD_DRIVER
+    import inspect
+
+    assert '"ED_VIEW": view or "iso"' in inspect.getsource(cli._run_freecad_driver)
+    assert "view=args.preview_view" in inspect.getsource(cli.action_freecad)
+
+
+def test_preview_png_on_the_headless_action_asks_for_a_png() -> None:
+    """``--preview png`` used to be accepted on `freecad` and do nothing.
+
+    The headless action reads ``--formats`` for what to write, so a picture asked
+    for with ``--preview`` has to be folded into that list; otherwise the model
+    asks for a PNG, gets ``ok: true``, and no PNG.
+    """
+    import inspect
+
+    body = inspect.getsource(cli.action_freecad)
+    assert "for extra in args.preview or []" in body
+    assert "formats.append(fmt)" in body
+
+
+def test_the_freecad_environment_pins_the_debian_interpreter() -> None:
+    """The whole engine depends on this pair; a regression here is a silent death.
+
+    Without both, FreeCAD's embedded python dies on ``import math`` and the model
+    sees "FreeCAD is broken" instead of "this env var is missing".
+    """
+    assert cli.FREECAD_ENV["PYTHONHOME"] == "/usr"
+    assert "/usr/lib/x86_64-linux-gnu" in cli.FREECAD_ENV["LD_LIBRARY_PATH"]
+
+
+def test_freecad_which_finds_the_launcher_even_without_a_path_entry(monkeypatch) -> None:
+    """A sandbox rc file may not export /usr/bin, so the fallback path matters."""
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli.os.path, "isfile", lambda path: path == "/usr/bin/freecadcmd")
+    monkeypatch.setattr(cli.os, "access", lambda path, mode: True)
+    assert cli._freecad_which() == "/usr/bin/freecadcmd"
+    monkeypatch.setattr(cli.os.path, "isfile", lambda path: path == "/usr/bin/freecad")
+    assert cli._freecad_which(gui=True) == "/usr/bin/freecad"
+
+
+def test_the_display_can_be_pointed_elsewhere(monkeypatch) -> None:
+    """The live screen panel reads its display from the environment, so this must too."""
+    monkeypatch.setenv(cli.DISPLAY_ENV, ":7")
+    assert cli._display_name() == ":7"
+    monkeypatch.delenv(cli.DISPLAY_ENV, raising=False)
+    assert cli._display_name() == ":99"
+
+
+def test_doctor_names_freecad_as_the_preferred_engine(capsys, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_freecad_which", lambda gui=False: "/usr/bin/freecadcmd")
+    monkeypatch.setattr(cli, "_freecad_version", lambda binary: "0.20.2")
+    monkeypatch.setitem(cli.ACTIONS, "doctor", cli.ACTIONS["doctor"])
+    with pytest.raises(SystemExit):
+        cli.action_doctor(type("A", (), {"json": False, "out_dir": None,
+                                        "name": None, "sheet": None,
+                                        "spec": None, "code": None,
+                                        "formats": None, "preview": None,
+                                        "views": None, "title": None,
+                                        "axis": None, "at": None, "file": None,
+                                        "timeout": None, "preview_view": None})())
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["preferred_engine"] == "freecad"
+    assert payload["freecad"]["version"] == "0.20.2"
+    assert payload["capabilities"]["live_screen_cad_window"] is True
+
+
+def test_doctor_falls_back_when_freecad_is_absent(capsys, monkeypatch) -> None:
+    """An image without FreeCAD must still be usable, and must say so."""
+    monkeypatch.setattr(cli, "_freecad_which", lambda gui=False: None)
+    with pytest.raises(SystemExit):
+        cli.action_doctor(type("A", (), {"json": False, "out_dir": None,
+                                        "name": None, "sheet": None,
+                                        "spec": None, "code": None,
+                                        "formats": None, "preview": None,
+                                        "views": None, "title": None,
+                                        "axis": None, "at": None, "file": None,
+                                        "timeout": None, "preview_view": None})())
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["preferred_engine"] == "build123d"
+    assert payload["freecad"]["available"] is False
+    assert payload["capabilities"]["live_screen_cad_window"] is False
+
+
+def test_freecad_refuses_to_run_before_it_is_installed(capsys, monkeypatch) -> None:
+    """The install is the only thing that puts FreeCAD there, so say that."""
+    monkeypatch.setattr(cli, "_freecad_which", lambda gui=False: None)
+    with pytest.raises(SystemExit):
+        cli.action_freecad(type("A", (), {"out_dir": None, "name": "x", "code": "pass",
+                                        "file": None, "formats": None,
+                                        "preview_view": None, "preview": None,
+                                        "timeout": None})())
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["ok"] is False
+    assert "install" in payload["next"]
+
+
+def test_freecad_gui_says_the_gui_is_missing_when_it_is(capsys, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_freecad_which", lambda gui=False: None)
+    with pytest.raises(SystemExit):
+        cli.action_freecad_gui(type("A", (), {"out_dir": None, "name": "x", "code": None,
+                                              "file": None, "preview": None,
+                                              "preview_view": None, "timeout": None})())
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["ok"] is False
+    assert "GUI" in payload["error"]
+
+
+# --------------------------------------------------------------------------- #
+# The sandbox installer
+# --------------------------------------------------------------------------- #
+# FreeCAD is installed by the installer and nowhere else -- the model is never
+# allowed to use an engine that is not on the box yet -- so the installer is the
+# thing that has to be right.
+INSTALLER_PATH = Path(__file__).resolve().parents[1] / "scripts" / "install_engineering_draw.sh"
+
+
+def _installer_text() -> str:
+    return INSTALLER_PATH.read_text()
+
+
+def test_the_installer_installs_freecad() -> None:
+    text = _installer_text()
+    assert "freecad freecad-python3" in text, (
+        "FreeCAD is the default engine, so the installer is what must put it there"
+    )
+    assert "xvfb" in text, "a GUI engine needs a display, and that is what the live screen captures"
+    assert "matchbox-window-manager" in text, (
+        "a bare Xvfb leaves the window unmapped and the screen capture records an empty desktop"
+    )
+    assert "librsvg2-bin" in text, "rsvg-convert is how a TechDraw sheet becomes a PNG"
+
+
+def test_the_installer_exports_the_environment_freecad_needs() -> None:
+    text = _installer_text()
+    assert "export PYTHONHOME=/usr" in text
+    assert "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu" in text
+    assert "export DISPLAY=:99" in text
+
+
+def test_the_installer_proves_freecad_builds_a_solid() -> None:
+    """Starting is not working: the smoke test cuts a solid and exports it."""
+    text = _installer_text()
+    assert "ed_freecad_smoke" in text
+    assert "Part.export" in text
+    assert "solids" in text, "a startable FreeCAD that produces no solid is not a working engine"
+
+
+def test_the_installer_accepts_a_freecad_only_sandbox() -> None:
+    """FreeCAD alone must be enough to call the install a success.
+
+    It is the preferred engine; requiring build123d on top of it would leave a
+    sandbox where FreeCAD works reporting itself broken.
+    """
+    text = _installer_text()
+    assert '[ "$freecad_ready" = "yes" ]' in text
+
+
+def test_the_installer_writes_what_landed() -> None:
+    text = _installer_text()
+    assert "install.json" in text
+    assert "freecad.status" in text
+
+
+def test_the_installer_is_valid_bash() -> None:
+    import subprocess
+
+    done = subprocess.run(["bash", "-n", str(INSTALLER_PATH)], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr

@@ -1,138 +1,160 @@
 ---
 name: engineering-draw
-description: "Design real 2D engineering drawings and 3D CAD parts, and export them, inside the user's execution sandbox (build123d + ezdxf, never on the app host). Use when the user asks for an engineering/technical drawing, a DXF, a part model, a STEP/STL/3MF export, an orthographic or section view, a mechanical design, a bracket/plate/flange/shaft, or a CAD file."
+description: "Design real 2D engineering drawings and 3D CAD parts, watch the design happen on the live screen, and export DXF/STEP/STL/PNG — inside the user's execution sandbox (FreeCAD first, build123d as fallback, never on the app host). Use when the user asks for an engineering/technical drawing, a DXF, a part model, a STEP/STL/3MF export, a render of a 3D design, an orthographic or section view, a mechanical design, a bracket/plate/flange/shaft, or a CAD file."
 metadata: {"nanobot":{"emoji":"📐","requires":{"tools":["engineering_draw"],"env":["NOVITA_API_KEY"]}}}
 ---
 
 # Engineering drawings and 3D CAD (sandbox-only)
 
-The `engineering_draw` tool runs `build123d` (3D solids) and `ezdxf` (2D drawings)
-**inside the user's execution sandbox**. OpenCASCADE is hundreds of megabytes and
-has no business on the application host, so the engine is a CLI that lives in the
-sandbox and this tool only drives it — the same arrangement as `mt5_sandbox`.
+The `engineering_draw` tool runs a CAD engine **inside the user's execution
+sandbox**. OpenCASCADE and FreeCAD are hundreds of megabytes and have no business
+on the application host, so the engine is a CLI that lives in the sandbox and this
+tool only drives it — the same arrangement as `mt5_sandbox`.
 
 Everything is **millimetres**. Angles are degrees.
 
-## The two things it makes
+## FreeCAD is the engine you use first
 
-**A drawing** (`action="draw"`) — a bordered sheet with a title block and
-*layers*, and crucially **real DXF `DIMENSION` entities**: `dim_linear`,
-`dim_vertical`, `dim_aligned`, `dim_radius`, `dim_diameter`, `dim_angular`. These
-are parametric objects, not exploded lines, so the user opens the file in AutoCAD,
-QCAD, LibreCAD or FreeCAD and the dimensions are still editable, still associated
-with the geometry, and still re-scale with the drawing. That editability is
-usually the whole point — never substitute a picture of a drawing for it.
+For any design task — 2D or 3D, model or export — reach for **`action="freecad"`**
+and then **`action="freecad_gui"`**. FreeCAD carries a real document, the Draft
+workbench, TechDraw sheets, the STEP/DXF writers, and a GUI window the live screen
+can stream; `build123d` has a kernel and nothing else. So:
 
-**A part** (`action="model"`) — a real solid, exported as **STEP** (what a
-machinist and every CAM tool read), plus STL, 3MF, BREP, OBJ, glTF, and a shaded
-PNG preview so a human can see it without a CAD viewer.
+| task | action |
+| --- | --- |
+| design a part or a drawing, and export it | `freecad` |
+| let the user **watch** it being designed | `freecad_gui` |
+| a solid from a JSON spec, no FreeCAD | `model` (fallback) |
+| a 2D drawing with editable DXF dimensions, no FreeCAD | `draw` (fallback) |
+| orthographic views / a section of a solid | `project`, `section` |
 
-## Deciding: `spec` or `code`?
+Use the build123d fallbacks **only** when `action="doctor"` says FreeCAD is
+unavailable. Say which engine you used in the reply.
 
-`spec` is a JSON description. It covers the shapes most parts actually are — a
-box, plate, cylinder, shaft, sphere, cone or tube, with drilled holes, bolt
-circles, fillets and chamfers. Prefer it: it does not depend on getting Python
-exactly right, and it fails with a named field rather than a traceback.
+### Design and export with `freecad`
 
-```json
-{"kind": "plate", "length": 120, "width": 80, "height": 12,
- "holes": [{"diameter": 10, "at": [0, 0]},
-           {"diameter": 6, "count": 4, "bolt_circle_radius": 28}]}
-```
-
-`code` is a build123d snippet, and it is the escape hatch that makes the engine
-general. Assign the shape to `result`; `params` is in scope:
+`code` is a FreeCAD python snippet. It runs inside a document already bound to
+`doc`, with `FreeCAD`, `Part`, `Draft`, `Import`, `Mesh` and `TechDraw` in scope,
+plus one helper, `add_page(objects, template="A4_LandscapeTD.svg", direction="front")`.
 
 ```python
-result = Box(50, 30, 10) - Cylinder(6, 40)
+plate = doc.addObject("Part::Box", "Plate")
+plate.Length, plate.Width, plate.Height = 80.0, 50.0, 12.0
+bore = doc.addObject("Part::Cylinder", "Bore")
+bore.Radius, bore.Height = 8.0, 20.0
+bore.Placement.Base = FreeCAD.Vector(40, 25, 0)
+body = doc.addObject("Part::Cut", "Bracket")
+body.Base, body.Tool = plate, bore
+doc.recompute()
+page = add_page([body], direction="iso")
 ```
 
-Reach for `code` the moment the part is not a primitive with holes — a bracket
-with an angled web, a profile you extrude, a part you revolve. Do not contort a
-`spec` to fit.
+`formats` accepts `step`, `stp`, `iges`, `brep`, `stl`, `dxf`, `svg`, `png`,
+`pdf`. The `.FCStd` document is always saved too.
 
-A model and its drawing are the **same** input: pass the same `spec` or the same
-`code` to `action="project"` and you get the drawing of the part you just built.
+**`add_page([...])` is what makes a drawing.** Without it `svg`, `png` and `pdf`
+have nothing to render and come back with a note saying so — they are sheet
+formats, not model formats. `dxf` works either way and means different things:
 
-## Drawing a real drawing
+- **with** a page it is the **sheet** — frame, title block and the projected view.
+- **without** a page it is the raw 2D entities in the document.
 
-`action="draw"` takes `spec` as a sheet description. Draw the outline at its
-**true size in millimetres** — the dimensions measure the geometry you draw, so a
-100 mm edge is `p1=[0,0], p2=[100,0]`, not a scaled sketch.
+Both are real DXF a reader opens. Read `exported` and `files` in the result, not
+your hopes: every action reports each artefact's path and byte size, and an export
+that failed arrives in `freecad_errors` while the others still succeeded. A partial
+result reported honestly beats a confident summary that is wrong about what exists.
 
-```json
-{"sheet": "A4", "orientation": "landscape",
- "title": {"name": "FLANGE", "material": "AL 6082", "drawn_by": "powerx", "scale": "1:1"},
- "entities": [
-   {"type": "rect", "p1": [0, 0], "p2": [100, 60]},
-   {"type": "circle", "center": [50, 30], "radius": 18},
-   {"type": "centerline", "p1": [50, -6], "p2": [50, 66]},
-   {"type": "dim_linear", "p1": [0, 0], "p2": [100, 0], "offset": -14, "axis": "x"},
-   {"type": "dim_linear", "p1": [0, 0], "p2": [0, 60], "offset": -14, "axis": "y"},
-   {"type": "dim_radius", "center": [50, 30], "radius": 18, "angle": 45, "text": "R18"},
-   {"type": "dim_angular", "center": [50, 30], "radius": 19, "start_angle": 20, "end_angle": 70},
-   {"type": "text", "at": [8, 72], "text": "PLATE 100x60x12", "height": 5}
- ]}
-```
+### Show the user with `freecad_gui`
 
-Entity types: `line`, `rect`, `circle` (with optional `count` +
-`bolt_circle_radius`), `arc`, `ellipse`, `polyline`, `text`, `hatch`,
-`centerline`, and the six dimension types. A rect takes either its two opposite
-corners (`p1`/`p2`) or `size`/`width`+`height`. A `centerline` takes two points
-for an axis, or a `center` for a cross. Give dimensions an `offset` in mm to push
-the dimension line clear of the part; negative puts it below/left.
+`freecad_gui` builds or opens the design and **opens it in FreeCAD's GUI on the
+sandbox display**. The live screen panel captures that display, so opening the
+window *is* the live view — the user watches the part being drawn in the CAD app
+itself. Nothing else is needed to stream it.
 
-**Layers are already set up** and entities land on sensible ones: OUTLINE, HIDDEN,
-CENTER, DIMENSIONS, ANNOTATION, HATCH, BORDER, TITLE. Pass `"layer": "HIDDEN"` on
-an entity to override.
+- `file` — open an existing model or `.FCStd` instead of building one. Chain it
+  after `freecad` with `file=~/engineering_drawings/bracket.FCStd`.
+- `preview_view` — `iso`, `front`, `top`, `right`, `left` or `rear`. This also
+  writes the **PNG** (`bracket_view.png`), which is the picture to quote when
+  someone asks to see the 3D design. Without it you get the window and no still.
+  Be exact about what that PNG is: a photograph of FreeCAD's window on the
+  display, so it shows whatever direction that window happens to be facing.
+  `preview_view` steers the *drawing* views — every sheet `add_page([...])` builds
+  projects from it — which is what the dxf/svg/pdf carry.
 
-Do not put all the measurements on the drawing. Dimension what a machinist needs
-to make the part: overall size, hole positions and diameters, and any feature
-whose size is not obvious.
+Use `freecad_gui` whenever the user is watching or wants an image of a 3D design;
+use `freecad` alone when you only need files.
 
-## From 3D to 2D
-
-`action="project"` projects a solid into `front`, `top`, `right` and `iso` views,
-hidden lines removed and drawn on the HIDDEN layer, laid out on a sheet and
-scaled to fit (`--views front,top,right,iso`). `action="section"` cuts a solid on
-a plane (`axis` x/y/z, `at` an mm offset) and hatches the cut — `at=0` cuts through
-the centre. Both need the **same `spec` or `code`** as the model.
-
-## Files, output and where they go
-
-Output defaults to `~/engineering_drawings` in the sandbox and **persists between
-calls**, so a model built in one call can be projected, sectioned, inspected or
-exported in the next. Every action returns `files` with each artefact's path,
-existence and byte size — read that to know what actually got written, and never
-claim a file exists because the action succeeded.
-
-`inspect` measures an existing `.step`/`.stp`/`.brep`/`.stl`/`.dxf` — bounding
-box, volume, solid count, face/edge count, and mass at steel density. For a DXF it
-also reports the entity census and whether the dimensions are editable objects.
-Use it to confirm a drawing really carries `DIMENSION` entities rather than
-asserting it.
+Start the display before you need it — `freecad_gui` does this itself, but the
+installer does it too, and both are idempotent.
 
 ## Install once, then draw
 
-First call in a session may report `build123d` missing. The order is:
+**FreeCAD must be installed before it can be used, and you never install it by
+hand.** The order is:
 
-1. `action="doctor"` — what is installed and what is ready.
-2. `action="install"` if something is missing. It runs **detached** (OpenCASCADE
-   is a slow download) and returns immediately.
-3. `action="status"` — poll this **yourself** until it reports `ready`, then
-   `doctor` again. Never tell the user to check back, and never report a drawing
-   as done while the engine is still installing.
-4. Then draw.
+1. `action="doctor"` — what is installed; it names `preferred_engine`, and reports
+   `freecad.available`, its `version`, the `display`, and whether the GUI is there.
+2. `action="install"` if FreeCAD or the python packages are missing. It runs
+   **detached** — it apt-installs `freecad`, `xvfb`, a window manager and
+   `rsvg-convert`, then pip-installs build123d/ezdxf/matplotlib — and returns
+   immediately.
+3. `action="status"` — poll this **yourself** until it reports done, then `doctor`
+   again. Never tell the user to check back, and never report a drawing as done
+   while the engine is still installing.
+4. Then design.
 
-The sandbox runs as an unprivileged user, so the installer reaches the system
-libraries OpenCASCADE wants through passwordless `sudo`, treats an apt failure as
-a warning, and calls the install a success **only** once `build123d`, `ezdxf` and
-`matplotlib` all import. `pip` exiting 0 is not the acceptance test.
+The install writes `install.json` and `freecad.status` in the sandbox so both the
+model and a human can see what landed. It is called a success once FreeCAD builds
+and exports a solid, or — if FreeCAD is genuinely unavailable on the image —
+once `build123d`, `ezdxf` and `matplotlib` import, in which case the fallback
+actions are what you use. `apt` failing is a warning, never a failed install, and
+`pip` exiting 0 is not the acceptance test.
+
+One measured trap, so you recognise it rather than chasing it: on this image
+FreeCAD's binary links a from-source python at `/usr/local` and its embedded
+interpreter then dies with `No module named 'math'`, which reads like a broken
+install and is not one. The engine exports `PYTHONHOME=/usr` and
+`LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu` for every FreeCAD call and that fixes
+it. Do not "repair" FreeCAD by reinstalling it.
+
+## The fallbacks, when FreeCAD is not there
+
+**A part** (`action="model"`) — a solid from a JSON `spec`
+(`{"kind":"plate","length":120,"width":80,"height":12,"holes":[{"diameter":10,"at":[0,0]}]}`)
+or a build123d `code` snippet assigning the shape to `result`, exported as STEP,
+STL, 3MF, BREP, OBJ or glTF with a shaded preview.
+
+**A drawing** (`action="draw"`) — a bordered sheet with a title block and real DXF
+`DIMENSION` entities (`dim_linear`, `dim_vertical`, `dim_aligned`, `dim_radius`,
+`dim_diameter`, `dim_angular`). They are parametric, so the user opens the file and
+the dimensions are still editable and still re-scale with the drawing — that
+editability is usually the whole point. Never substitute a picture of a drawing for
+it. Draw the outline at **true size**: a 100 mm edge is `p1=[0,0], p2=[100,0]`.
+Entity types: `line`, `rect`, `circle` (with optional `count` +
+`bolt_circle_radius`), `arc`, `ellipse`, `polyline`, `text`, `hatch`, `centerline`,
+and the six dimension types. Layers are pre-set (OUTLINE, HIDDEN, CENTER,
+DIMENSIONS, ANNOTATION, HATCH, BORDER, TITLE); override with `"layer": "HIDDEN"`.
+
+Dimension what a machinist needs to make the part — overall size, hole positions
+and diameters, anything not obvious. Do not dimension every edge.
+
+**`project`** projects a solid into `front`/`top`/`right`/`iso` with hidden lines
+on the HIDDEN layer; **`section`** cuts it on `axis` x/y/z at `at` mm and hatches
+the cut. Both take the same `spec` or `code` as the model.
+
+## Files and output
+
+Output defaults to `~/engineering_drawings` in the sandbox and **persists between
+calls**, so a model built in one call can be opened in the GUI, projected, sectioned
+or exported in the next. `inspect` measures an existing
+`.step`/`.stp`/`.brep`/`.stl`/`.dxf` — bounding box, volume, solid count,
+face/edge count, mass at steel density — and for a DXF reports the entity census
+and whether the dimensions are editable objects. Use it to confirm a claim rather
+than asserting it.
 
 ## Reporting back
 
-Say what was made and in what format, name the file paths, and quote the measured
-numbers (volume, mass, bounding box) rather than paraphrasing them. If a drawing
-or an export came back with `entity_errors`, or an export failed, say so in plain
-terms and say which artefact is missing — a partial result reported honestly is
-worth more than a confident summary that is wrong about what exists.
+Say what was made, in what formats, and with which engine; name the file paths, and
+quote measured numbers (volume, mass, bounding box) rather than paraphrasing them.
+If an export failed, or a format came back with a note explaining why it needs a
+page, say which artefact is missing in plain terms.

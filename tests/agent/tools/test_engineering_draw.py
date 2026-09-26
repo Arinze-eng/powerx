@@ -179,6 +179,45 @@ def test_build_cli_command_joins_format_lists() -> None:
     assert "--formats step,stl,3mf" in command
 
 
+def test_build_cli_command_reaches_the_freecad_engine() -> None:
+    """FreeCAD is the default engine, so its two actions must be reachable."""
+    command = build_cli_command(
+        "freecad",
+        {"code": "b = doc.addObject('Part::Box', 'P')", "formats": ["step", "dxf"],
+         "name": "bracket", "timeout": 600},
+    )
+    assert " freecad " in command
+    assert "--formats step,dxf" in command
+    assert "--name bracket" in command
+    assert "--timeout 600" in command, "the engine's own deadline must travel too"
+
+
+def test_build_cli_command_asks_for_the_viewport_render_by_itself() -> None:
+    """Asking for a view IS asking for the render.
+
+    A caller that passes ``preview_view`` and forgets ``preview`` would otherwise
+    get a CAD window and no picture of it, which is the half of the request the
+    user can actually see.
+    """
+    command = build_cli_command("freecad_gui", {"preview_view": "iso"})
+    assert "--preview-view iso" in command
+    assert "--preview png" in command
+
+
+def test_build_cli_command_does_not_double_the_preview_flag() -> None:
+    command = build_cli_command("freecad_gui", {"preview": "svg", "preview_view": "top"})
+    assert command.count("--preview ") == 1
+    assert "--preview svg" in command
+    assert "--preview-view top" in command
+
+
+def test_build_cli_command_keeps_freecad_only_flags_out_of_the_other_actions() -> None:
+    """``--timeout`` is a FreeCAD flag; leaking it into another action is a bad request."""
+    command = build_cli_command("draw", {"timeout": 600, "preview_view": "iso"})
+    assert "--timeout" not in command
+    assert "--preview-view" not in command
+
+
 def test_build_cli_command_passes_a_code_snippet_through() -> None:
     command = build_cli_command("model", {"code": "result = Box(50,30,10) - Cylinder(6,40)"})
     assert "--code" in command
@@ -334,6 +373,6 @@ def test_every_enum_is_a_list_of_plain_strings() -> None:
 
     walk(schema)
     assert schema["properties"]["action"]["enum"] == [
-        "doctor", "install", "status", "model", "draw", "project", "section",
-        "inspect", "export",
+        "doctor", "install", "status", "freecad", "freecad_gui", "model", "draw",
+        "project", "section", "inspect", "export",
     ]
