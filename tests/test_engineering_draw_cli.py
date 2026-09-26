@@ -945,3 +945,182 @@ def test_the_installer_is_valid_bash() -> None:
 
     done = subprocess.run(["bash", "-n", str(INSTALLER_PATH)], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Breadth: the 2D sheet has to accept a drawing described the way a model
+# describes it, which is what the live 26-entity A3 stress sheet showed.
+# --------------------------------------------------------------------------- #
+def test_a_line_accepts_the_p1_p2_spelling_the_dimensions_use() -> None:
+    """MEASURED FAILURE (2026-09-26, live sandbox, A3 sheet): a line written as
+    ``{"type": "line", "p1": [0, 0], "p2": [100, 0]}`` came back
+    ``entity #12 (line): line is missing 'start'`` -- while the *same response*,
+    in its own ``note`` field, told the caller to write lines as
+    ``p1=[0,0], p2=[100,0]``. Every dimension type takes p1/p2 and the rect branch
+    already accepted four spellings; the line branch was the one that did not.
+    """
+    _doc, msp, _w, _h = _msp()
+    assert cli._entity_2d(msp, {"type": "line", "p1": [0, 0], "p2": [100, 0]}) == 1
+    assert cli._entity_2d(msp, {"type": "line", "from": [0, 10], "to": [100, 10]}) == 1
+    assert cli._entity_2d(msp, {"type": "line", "start": [0, 20], "end": [100, 20]}) == 1
+    lines = msp.query("LINE")
+    assert len(lines) == 3
+    assert (lines[0].dxf.start.x, lines[0].dxf.end.x) == (0.0, 100.0)
+
+
+def test_a_line_with_only_one_end_is_still_refused() -> None:
+    """Accepting more spellings must not turn a half-specified line into a dot."""
+    _doc, msp, _w, _h = _msp()
+    with pytest.raises(cli.EntityError):
+        cli._entity_2d(msp, {"type": "line", "p1": [0, 0]})
+
+
+def test_a_polyline_honours_close_as_well_as_closed() -> None:
+    """MEASURED FAILURE (live, identical spec): ``"close": true`` on a three-point
+    polyline wrote ``LWPOLYLINE closed = False points = 3`` -- a closed triangle
+    silently became an open two-segment path. Only ``"closed"`` was read, and the
+    difference is geometry, not a warning."""
+    _doc, msp, _w, _h = _msp()
+    cli._entity_2d(msp, {"type": "polyline", "points": [[0, 0], [10, 0], [10, 10]], "close": True})
+    cli._entity_2d(
+        msp, {"type": "polyline", "points": [[20, 0], [30, 0], [30, 10]], "closed": True}
+    )
+    cli._entity_2d(msp, {"type": "polyline", "points": [[40, 0], [50, 0], [50, 10]]})
+    polys = msp.query("LWPOLYLINE")
+    assert [p.closed for p in polys] == [True, True, False], "close and closed both mean closed"
+
+
+def test_text_and_hatch_keep_the_layer_they_were_asked_for() -> None:
+    """MEASURED FAILURE (live): the text branch hard-coded
+    ``dxfattribs={"layer": "ANNOTATION"}`` and the hatch branch hard-coded
+    ``{"layer": "HATCH"}``, so a text asked onto HIDDEN landed on ANNOTATION and a
+    hatch asked onto HIDDEN landed on HATCH. ``SKILL.md`` promises
+    ``override with "layer": "HIDDEN"``, and the layer decides colour, linetype and
+    lineweight -- a hatch on the wrong layer is the wrong drawing."""
+    _doc, msp, _w, _h = _msp()
+    cli._entity_2d(msp, {"type": "text", "at": [10, 10], "text": "NOTE", "layer": "HIDDEN"})
+    cli._entity_2d(
+        msp,
+        {"type": "hatch", "points": [[0, 0], [10, 0], [10, 10]], "layer": "HIDDEN"},
+    )
+    cli._entity_2d(msp, {"type": "text", "at": [20, 20], "text": "PLAIN"})
+    assert [e.dxf.layer for e in msp.query("TEXT")] == ["HIDDEN", "ANNOTATION"]
+    assert [e.dxf.layer for e in msp.query("HATCH")] == ["HIDDEN"]
+
+
+def test_a_hatch_with_no_boundary_is_refused_rather_than_drawn_empty() -> None:
+    """MEASURED FAILURE (live): a hatch entity with no ``points`` took a fallback
+    whose comment claimed it "fills the entities already drawn, which is what a
+    drafter would do". It never did -- it called ``add_hatch().set_solid_fill()``
+    with no path, which writes a HATCH with zero boundary paths, renders as
+    nothing, and reports success. A shapeless entity in the user's DXF plus a
+    "drawn" tally is worse than a named error."""
+    _doc, msp, _w, _h = _msp()
+    with pytest.raises(cli.EntityError) as info:
+        cli._entity_2d(msp, {"type": "hatch"})
+    assert "boundary" in str(info.value)
+    assert len(msp.query("HATCH")) == 0, "nothing shapeless may reach the DXF"
+
+
+def test_a_dimension_placed_with_at_lands_on_the_line_that_was_asked_for() -> None:
+    """MEASURED FAILURE (live): the linear-dimension branch read only ``offset``,
+    so the natural ``at=[120, 8]`` -- the same key a text entity uses for its
+    position -- was silently dropped and every dimension fell back to the default
+    -12 mm. Dimensions that land where nobody asked for them are the ones the user
+    then measures by hand."""
+    _doc, msp, _w, _h = _msp()
+    cli._entity_2d(msp, {"type": "dim_linear", "p1": [20, 20], "p2": [220, 20], "at": [120, 8]})
+    cli._entity_2d(
+        msp, {"type": "dim_vertical", "p1": [220, 20], "p2": [220, 140], "at": [238, 80]}
+    )
+    cli._entity_2d(msp, {"type": "dim_aligned", "p1": [30, 120], "p2": [70, 120], "at": [50, 128]})
+    dims = msp.query("DIMENSION")
+    assert len(dims) == 3
+    # defpoint is where the dimension line starts, so it carries the offset asked for.
+    assert dims[0].dxf.defpoint.y == pytest.approx(8.0), "horizontal dim on y=8"
+    assert dims[1].dxf.defpoint.x == pytest.approx(238.0), "vertical dim on x=238"
+    assert dims[2].dxf.defpoint.y == pytest.approx(128.0), "aligned dim offset 8 mm in +y"
+
+
+def test_an_explicit_offset_still_wins_over_at() -> None:
+    _doc, msp, _w, _h = _msp()
+    cli._entity_2d(
+        msp,
+        {"type": "dim_linear", "p1": [0, 0], "p2": [100, 0], "at": [50, 5], "offset": -30.0},
+    )
+    assert msp.query("DIMENSION")[0].dxf.defpoint.y == pytest.approx(-30.0)
+
+
+def test_the_raster_preview_puts_black_on_white_so_colour_7_is_readable() -> None:
+    """MEASURED FAILURE (live sandbox, A3 sheet, 26 entities): the whole PNG had
+    **0 dark pixels**. ``ezdxf`` resolves AutoCAD colour 7 -- "white or black,
+    whichever the paper is not" -- against the drawing *background policy*, and
+    ``Configuration()``'s default resolves it to **white**. OUTLINE, BORDER and
+    TITLE are all colour 7, so the frame, the title block, every outline, 2 of the
+    6 dimension types and 24 of the 37 entities were painted white on white and
+    were absent from every PNG, PDF and SVG the engine had ever produced.
+
+    Before/after on the identical spec: png 22 635 B, mean 254.78, dark<128 **0**
+    -> png 84 089 B, mean 248.82, dark<128 **25 246**.
+    """
+    import tempfile
+
+    doc, msp, width, height = _msp()
+    cli._border_and_title(msp, width, height, {"name": "CONTRAST", "material": "STEEL"})
+    # One line per layer, so the ink can be attributed to a colour.
+    for name in ("OUTLINE", "BORDER", "TITLE"):
+        assert cli.LAYERS[name]["color"] == 7, "colour 7 is the one that flips with the paper"
+    msp.add_line((20, 20), (200, 20), dxfattribs={"layer": "OUTLINE"})
+    msp.add_line((20, 40), (200, 40), dxfattribs={"layer": "BORDER"})
+    msp.add_line((20, 60), (200, 60), dxfattribs={"layer": "TITLE"})
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        cli._render_dxf(doc, "contrast", out, ["png"])
+        png = out / "contrast.png"
+        assert png.is_file(), "the preview must exist"
+        from PIL import Image
+        import numpy as np
+
+        array = np.asarray(Image.open(png).convert("L"))
+        dark = int((array < 128).sum())
+    assert dark > 2000, f"the frame and title block must be visible; got {dark} dark pixels"
+
+    source = Path(cli.__file__).read_text()
+    assert "BackgroundPolicy.WHITE" in source
+    assert "config=Configuration(background_policy=BackgroundPolicy.WHITE)" in source
+
+
+def test_a_whole_sheet_of_every_entity_type_draws_with_no_errors() -> None:
+    """The live stress sheet, as a test: every 2D entity type the engine advertises
+    on one A3 page, and nothing is allowed to fall over. The live run reported
+    ``entities_drawn: 26, entity_errors: []``."""
+    _doc, msp, _w, _h = _msp()
+    entities = [
+        {"type": "rect", "p1": [20, 20], "p2": [220, 140]},
+        {"type": "circle", "center": [120, 80], "radius": 45},
+        {"type": "circle", "center": [120, 80], "radius": 12, "layer": "HIDDEN"},
+        {"type": "circle", "center": [120, 80], "radius": 22, "count": 6, "bolt_circle_radius": 33},
+        {"type": "centerline", "p1": [70, 80], "p2": [170, 80]},
+        {"type": "centerline", "center": [10, 10]},
+        {"type": "arc", "center": [120, 80], "radius": 60, "start_angle": 20, "end_angle": 130},
+        {"type": "ellipse", "center": [195, 110], "major_radius": 26, "minor_radius": 14},
+        {"type": "polyline", "points": [[30, 120], [50, 135], [70, 120]], "close": True},
+        {"type": "hatch", "points": [[30, 30], [70, 30], [70, 55], [30, 55]]},
+        {"type": "text", "text": "SECTION A-A", "at": [26, 148], "height": 5},
+        {"type": "line", "p1": [0, 0], "p2": [10, 10], "layer": "CONSTRUCTION"},
+        {"type": "dim_linear", "p1": [20, 20], "p2": [220, 20], "at": [120, 8]},
+        {"type": "dim_vertical", "p1": [220, 20], "p2": [220, 140], "at": [238, 80]},
+        {"type": "dim_aligned", "p1": [30, 120], "p2": [70, 120], "at": [50, 128]},
+        {"type": "dim_radius", "center": [120, 80], "radius": 45, "angle": 150},
+        {"type": "dim_diameter", "center": [120, 80], "diameter": 24},
+        {"type": "dim_angular", "center": [120, 80], "radius": 70, "start_angle": 20,
+         "end_angle": 130},
+    ]
+    drawn = 0
+    for entity in entities:
+        drawn += cli._entity_2d(msp, entity)
+    assert drawn >= len(entities) - 1, "the bolt circle adds four extra circles"
+    assert len(msp.query("DIMENSION")) == 6
+    for dimension in msp.query("DIMENSION"):
+        assert dimension.dxf.text_midpoint is not None, "every dimension must be renderable"

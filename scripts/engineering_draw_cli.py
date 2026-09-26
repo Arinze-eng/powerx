@@ -56,7 +56,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-CLI_VERSION = "2026-09-26.4"
+CLI_VERSION = "2026-09-26.5"
 
 OUT_DIR_DEFAULT = os.environ.get("ENGINEERING_DRAW_DIR", "~/engineering_drawings")
 
@@ -735,8 +735,18 @@ def _entity_2d(msp: Any, entity: dict[str, Any]) -> int:
     kind = str(entity.get("type") or "").strip().lower()
     layer = str(entity.get("layer") or "OUTLINE").upper()
     attribs = {"layer": layer if layer in LAYERS else "OUTLINE"}
-    if layer not in LAYERS:
-        attribs["layer"] = "OUTLINE"
+
+    def layer_for(default: str) -> dict[str, str]:
+        """The caller's layer if they named one, else this entity's own layer.
+
+        A text belongs on ANNOTATION and a hatch on HATCH when nobody says
+        otherwise, but an explicit ``"layer"`` is part of the contract and must
+        win. Hard-coding the default ignored the override; defaulting to
+        OUTLINE would take a hatch off its own layer the moment the caller
+        stopped asking for it.
+        """
+        asked = str(entity.get("layer") or "").strip().upper()
+        return {"layer": asked if asked in LAYERS else default}
 
     def point(key: str, required: bool = True) -> tuple[float, float] | None:
         value = entity.get(key)
@@ -756,7 +766,21 @@ def _entity_2d(msp: Any, entity: dict[str, Any]) -> int:
             )
 
     if kind == "line":
-        start, end = point("start"), point("end")
+        # p1/p2 is the spelling the dimensions use and the one the response's own
+        # note recommends, so a line is asked for that way constantly. Accept the
+        # same forgiving set the rect branch takes rather than failing a line the
+        # model described correctly.
+        start = point("start", required=False) or point("p1", required=False) or point(
+            "from", required=False
+        )
+        end = point("end", required=False) or point("p2", required=False) or point(
+            "to", required=False
+        )
+        if start is None or end is None:
+            entity_fail(
+                "a line needs both of its ends",
+                "Pass start=[x, y], end=[x, y] (p1/p2 and from/to also work).",
+            )
         msp.add_line(start, end, dxfattribs=attribs)
         return 1
     if kind in ("rect", "rectangle"):
@@ -832,7 +856,9 @@ def _entity_2d(msp: Any, entity: dict[str, Any]) -> int:
             entity_fail("a polyline needs at least two points", "Pass points=[[x, y], [x, y], ...].")
         msp.add_lwpolyline(
             [(float(p[0]), float(p[1])) for p in points],
-            close=bool(entity.get("closed")),
+            # A closed triangle is not the same drawing as an open one, so
+            # silently dropping the request is a geometry change, not a warning.
+            close=bool(entity.get("closed") or entity.get("close")),
             dxfattribs=attribs,
         )
         return 1
@@ -851,8 +877,10 @@ def _entity_2d(msp: Any, entity: dict[str, Any]) -> int:
         value = entity.get("text") or entity.get("value") or ""
         height = float(entity.get("height") or 3.5)
         rotation = float(entity.get("rotation") or 0)
+        # layer_for, not a hard-coded ANNOTATION: the caller's own "layer" is part
+        # of the contract, and dropping it silently moves the note off its layer.
         text = msp.add_text(
-            str(value), height=height, rotation=rotation, dxfattribs={"layer": "ANNOTATION"}
+            str(value), height=height, rotation=rotation, dxfattribs=layer_for("ANNOTATION")
         )
         # set_placement asserts on a plain string: it wants the enum, so map the
         # common names the model will write onto it.
@@ -865,7 +893,9 @@ def _entity_2d(msp: Any, entity: dict[str, Any]) -> int:
     if kind in ("hatch", "section"):
         points = entity.get("boundary_points") or entity.get("points") or []
         if isinstance(points, list) and len(points) >= 3:
-            hatch = msp.add_hatch(color=int(entity.get("color") or 9), dxfattribs={"layer": "HATCH"})
+            hatch = msp.add_hatch(
+                color=int(entity.get("color") or 9), dxfattribs=layer_for("HATCH")
+            )
             hatch.paths.add_polyline_path(
                 [(float(p[0]), float(p[1])) for p in points], is_closed=True
             )
@@ -875,10 +905,17 @@ def _entity_2d(msp: Any, entity: dict[str, Any]) -> int:
             except Exception:  # noqa: BLE001 - a missing PAT definition must not lose the hatch
                 hatch.set_solid_fill(color=int(entity.get("color") or 9))
             return 1
-        # A hatch without a boundary is a section of the whole view: fall back to
-        # filling the entities already drawn, which is what a drafter would do.
-        msp.add_hatch(color=9, dxfattribs={"layer": "HATCH"}).set_solid_fill(color=9)
-        return 1
+        # A hatch with no boundary path is not a drawing of anything. ezdxf writes
+        # the HATCH entity with zero paths, which renders as nothing and leaves a
+        # CAD user a shapeless object to delete. The old code claimed this "fills
+        # the entities already drawn" -- it never did, it just dropped the ink and
+        # reported success. Say so instead.
+        entity_fail(
+            "a hatch needs its boundary",
+            "Pass points=[[x, y], [x, y], [x, y], ...] going round the area to fill "
+            "(at least three), or use a 'section' entity, which takes its boundary "
+            "from the solid.",
+        )
     if kind in ("dim_linear", "dimension", "dim_horizontal", "dim_vertical", "dim_aligned"):
         p1 = point("p1", required=False) or point("start", required=False)
         p2 = point("p2", required=False) or point("end", required=False)
@@ -887,8 +924,35 @@ def _entity_2d(msp: Any, entity: dict[str, Any]) -> int:
                 f"{kind} needs p1 and p2 — the two points being measured",
                 "Pass p1=[x, y] and p2=[x, y].",
             )
-        offset = float(entity.get("offset") or -12.0)
         text = str(entity["text"]) if entity.get("text") else "<>"
+        # "at" is where the dimension LINE should sit, which is the same thing as
+        # ezdxf's signed "offset" and what a caller writes for a text entity. It
+        # was silently dropped, so every dimension landed on the default -12 mm
+        # offset wherever the caller asked for it.
+        asked = point("at", required=False)
+        if entity.get("offset") is not None and entity.get("offset") != "":
+            offset = float(entity["offset"])
+        elif asked is not None:
+            # Which way the dimension line runs: the explicit type first, then the
+            # requested axis, then the same "measure the longer leg" rule the
+            # linear branch uses for axis="auto", so the offset points along the
+            # line the dimension actually gets drawn on.
+            way = str(entity.get("axis") or "auto").lower()
+            if kind in ("dim_linear", "dimension") and way == "auto":
+                way = "x" if abs(p2[0] - p1[0]) >= abs(p2[1] - p1[1]) else "y"
+            if kind == "dim_vertical" or way == "y":
+                offset = asked[0] - p1[0]
+            elif kind == "dim_aligned":
+                span = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                if span > 0:
+                    cross = (p2[0] - p1[0]) * (asked[1] - p1[1]) - (p2[1] - p1[1]) * (asked[0] - p1[0])
+                    offset = cross / span
+                else:
+                    offset = -12.0
+            else:
+                offset = asked[1] - p1[1]
+        else:
+            offset = -12.0
         dim: Any
         if kind == "dim_horizontal":
             dim = msp.add_linear_dim(
@@ -1020,6 +1084,7 @@ def _render_dxf(doc: Any, stem: str, out: Path, formats: list[str]) -> dict[str,
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from ezdxf.addons.drawing import Frontend, RenderContext
+        from ezdxf.addons.drawing.config import BackgroundPolicy, Configuration
         from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
 
         # An unrendered DIMENSION (text_midpoint unset) makes ezdxf's drawing
@@ -1042,7 +1107,16 @@ def _render_dxf(doc: Any, stem: str, out: Path, formats: list[str]) -> dict[str,
         figure = plt.figure(figsize=(14, 10), dpi=110)
         axes = figure.add_axes([0, 0, 1, 1])
         axes.set_axis_off()
-        frontend = Frontend(RenderContext(doc), MatplotlibBackend(axes))
+        # WHITE, not the default: ezdxf resolves AutoCAD's colour 7 ("white or
+        # black, whichever the paper is not") against the *background policy*,
+        # and DEFAULT resolves it to white. OUTLINE, BORDER and TITLE are all
+        # colour 7, so the frame, the title block and every outline were drawn
+        # white-on-white and the preview came out blank.
+        frontend = Frontend(
+            RenderContext(doc),
+            MatplotlibBackend(axes),
+            config=Configuration(background_policy=BackgroundPolicy.WHITE),
+        )
         frontend.draw_layout(
             doc.modelspace(),
             finalize=True,

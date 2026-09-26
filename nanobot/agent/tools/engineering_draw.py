@@ -55,7 +55,7 @@ _REPO = os.getenv("ENGINEERING_DRAW_REPO", "Arinze-eng/powerx")
 #: MUST equal ``CLI_VERSION`` in ``scripts/engineering_draw_cli.py``. The bootstrap
 #: refuses to run a CLI that does not carry this marker, so a stale cached copy
 #: is detected rather than silently used. Bump both together.
-_CLI_VERSION = "2026-09-26.4"
+_CLI_VERSION = "2026-09-26.5"
 
 _ED_HOME = "$HOME/.engineering_draw"
 _CLI_PATH = f"{_ED_HOME}/bin/engineering_draw_cli.py"

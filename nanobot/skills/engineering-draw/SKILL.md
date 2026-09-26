@@ -93,6 +93,30 @@ everything you built. If a snippet leaves several live solids side by side, each
 is a result and their volumes are summed — a note says so, and overlapping solids
 then double-count, so fuse them into one body with `Part::MultiFuse` instead.
 
+A box and a cylinder are not the limit of the engine. All of these were run live
+on FreeCAD 0.20.2 and checked: an **extruded profile** (`Part.Face(...).extrude`),
+a **solid of revolution** (`.revolve(base, axis, 360)`), a **loft** between two
+closed profiles (`Part.makeLoft([wire1, wire2], True)`), a **boolean fuse**
+(`Part::MultiFuse`) and **cut** (`Part::Cut`), and the three shape-shaping calls
+`makeFillet(radius, edges)`, `makeChamfer(radius, edges)` and
+`makeThickness(faces, -2.0, 1e-3)` (a negative thickness hollows inward).
+
+Two things make those fiddly ones work first time:
+
+- **Pick edges by their centre of mass, and check the pick before you use it.**
+  `survivors = [e for e in solid.Edges if abs(e.CenterOfMass.y - 45) < 1e-6]` is
+  reliable where indexing `solid.Edges[i]` is not. If the list is empty, or the
+  call comes back with zero volume, that feature did not happen — report it rather
+  than shipping a shape that silently kept its sharp edge.
+- **A fillet radius larger than the local geometry raises, it does not clamp.**
+  Wrap it, keep the previous solid on failure, and say which feature was skipped.
+
+The measurement is exact enough to trust as a check on the geometry: an L-profile
+of area 3200 mm² extruded 30 mm and bored out measured 89 968.142105108 mm³ against
+96000 − 64π·30 by hand, and a revolved profile measured 105 557.5132 mm³ against
+2π × 16 800. If your hand arithmetic and `measured.volume_mm3` disagree, the
+geometry is wrong — not the engine.
+
 `formats` accepts `step`, `stp`, `iges`, `brep`, `stl`, `dxf`, `svg`, `png`,
 `pdf`. The `.FCStd` document is always saved too.
 
@@ -178,6 +202,17 @@ Entity types: `line`, `rect`, `circle` (with optional `count` +
 `bolt_circle_radius`), `arc`, `ellipse`, `polyline`, `text`, `hatch`, `centerline`,
 and the six dimension types. Layers are pre-set (OUTLINE, HIDDEN, CENTER,
 DIMENSIONS, ANNOTATION, HATCH, BORDER, TITLE); override with `"layer": "HIDDEN"`.
+Without an override, `text` goes to ANNOTATION and `hatch` to HATCH and everything
+else to OUTLINE.
+
+Every entity takes its two end points as `start`/`end`, and `line` also accepts
+`p1`/`p2` and `from`/`to` — the same spelling the dimensions use, so one pair of
+names works throughout. `polyline` accepts `close` or `closed`; neither means an
+open path, and closing it is real geometry, not a cosmetic flag. `hatch` needs its
+`points` boundary: a hatch with no boundary is refused rather than written as an
+empty HATCH entity. A dimension's `at=[x, y]` is where its dimension line sits
+(`dim_linear`, `dim_horizontal`, `dim_vertical`, `dim_aligned`); `offset` is the
+same thing as a signed distance and wins if you pass both.
 
 Dimension what a machinist needs to make the part — overall size, hole positions
 and diameters, anything not obvious. Do not dimension every edge.
