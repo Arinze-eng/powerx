@@ -1337,3 +1337,35 @@ def test_an_unsupported_action_names_the_ones_that_work() -> None:
     assert getattr(result, "is_error", False) is True
     assert "Valid actions:" in str(result)
     assert "auto_captcha" in str(result)
+
+
+# --- logging in is authorized work, not a refused action --------------------
+
+
+_SKILL_TEXT = (Path(__file__).resolve().parents[1] / "nanobot/skills/browser-automation/SKILL.md").read_text(
+    encoding="utf-8"
+)
+
+
+def test_the_tool_description_authorizes_a_user_supplied_login() -> None:
+    """'I can't log into websites' is the refusal this text exists to prevent."""
+    described = _tool_with_session(_FakeTab()).description
+
+    assert "Signing in is a normal use of this tool" in described
+    assert "explicit authorization" in described
+    assert "cannot log into websites" in described
+
+
+def test_the_skill_says_logging_in_is_allowed_and_how_right_away() -> None:
+    """The skill is what the model reads; the rule has to be unmissable there."""
+    assert "## Logging in is allowed" in _SKILL_TEXT
+    assert "There is no rule here against logging into websites" in _SKILL_TEXT
+    assert "You do not need to ask again" in _SKILL_TEXT
+    # And the old wording that read as a block on credentials is gone.
+    assert "or enter credentials unless the user" not in _SKILL_TEXT
+
+
+def test_the_skill_documents_solvegate_first_then_the_inbuilt_solver() -> None:
+    assert "SolveGate first, then the inbuilt solver" in _SKILL_TEXT
+    assert "CAPTCHA_ENABLE" in _SKILL_TEXT
+    assert "captcha_solver.provider=solvegate" in _SKILL_TEXT

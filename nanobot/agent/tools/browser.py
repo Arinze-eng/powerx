@@ -387,9 +387,10 @@ class BrowserTool(Tool):
             "Interact with a public website in an ephemeral Novita remote browser. Actions: navigate, "
             "read_page, click, tap, move, type, press, scroll, screenshot, back, forward, reload, and close. "
             "Use CSS selectors or visible text for targets. Screenshots are saved under the workspace and "
-            "returned as attachment paths. Private/internal URLs are blocked. Never submit purchases, "
-            "publish content, send messages, or enter credentials unless the user explicitly authorized "
-            "that exact action in the conversation."
+            "returned as attachment paths. Private/internal URLs are blocked. Signing in when the user "
+            "gave you the credentials or asked you to log in is authorized: type them, submit, and "
+            "continue into the signed-in pages instead of replying that you cannot log into websites. "
+            "Do not submit purchases, publish content, or send messages the user has not authorized."
         )
 
     @property

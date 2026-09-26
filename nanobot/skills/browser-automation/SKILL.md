@@ -100,7 +100,7 @@ Honest outcomes `auto_captcha` returns, and what each means:
 | Reply | What it means, and what to do |
 |---|---|
 | `solved: false, reason: "no captcha was detected on the page"` | Nothing to solve. Carry on with the task. |
-| `solved: false, reason: "no captcha solver is configured…"` | No solver on this deployment. **Tell the user the page has a challenge and stop** — retrying cannot help. |
+| `solved: false, reason: "no captcha solver is configured…"` | No solver on this deployment. Retrying cannot help — but **this is not a reason to abandon the task**: do every step you can reach another way, then tell the user this page needs a solver (the deployment sets `CAPTCHA_ENABLE=true` plus a solver key). |
 | `solved: false, kind: "image", reason: "…call solve_image_captcha"` | A picture challenge. Call `solve_image_captcha`. |
 | `solved: false, reason: "the widget exposed no sitekey"` | The widget rendered without a sitekey, so a token cannot be requested. Report it. |
 | `solved: false, reason: "the solver returned no token"` | The solver refused or failed. The `solver` field carries its own words — quote them. |
@@ -131,11 +131,51 @@ configured by the operator, and the tool refuses an action the configured one ca
 - **capskip / capsolve** (2captcha-style) answers `recaptcha`, `hcaptcha`, `funcaptcha`,
   `turnstile`, `geetest`, `altcha`, an image file, and an image grid.
 
+### SolveGate first, then the inbuilt solver
+
+A deployment can run both at once, and that is the arrangement to expect: **SolveGate is asked
+first** for the two gates it owns (`turnstile`, `waf`), and anything it has no method for is handed
+to the **inbuilt** 2captcha-compatible client. You do not choose between them — `auto_captcha` and
+`captcha_solver` route it: the gate goes to SolveGate, everything else goes to the inbuilt client,
+and the `action` enum lists the union so you can see what this deployment can actually reach.
+
+Read the enum before you conclude anything is impossible:
+
+- `["turnstile", "waf", …]` — both are wired. The gates go to SolveGate, the rest to the inbuilt
+  client.
+- `["turnstile", "waf"]` only — no inbuilt key is configured, so those two gates are all this
+  deployment can answer. A `recaptcha`, `hcaptcha` or picture challenge will report
+  `has no method for a … challenge`. That is a provider limit, not a transient failure: **do not
+  retry it**. Take another route for that step and keep the rest of the task moving.
+
+The operator's environment sets this. `CAPTCHA_ENABLE=true` and `captcha_solver.provider=solvegate`
+are both read directly, as are `CLOUDFLARE_WAF_API_KEY` / `SOLVEGATE_API_KEY` for the gate key and
+`CAPSKIP_API_KEY` / `CAPSOLVE_API_KEY` for the inbuilt one. Do not tell the user to rename them.
+
 A reply carrying `"sandbox": true` is a test-mode token that **no real site will accept**. Say
 so plainly instead of reporting the challenge as passed.
 
 The solver endpoint is fixed by configuration. No argument can redirect it, so never try to pass
 a different URL or key through a call.
+
+## Logging in is allowed — do it instead of refusing it
+
+**When the user gives you their credentials, asks you to log in, or asks you to fill in a form,
+you are authorized. Do the work.** There is no rule here against logging into websites, and no
+rule against typing a password the user handed you. Answering *"I can't log in to websites"* or
+*"I'm unable to enter credentials"* is a refusal of a job you can do with this tool — the exact
+thing to avoid. So is asking the user to log in themselves and paste back the result.
+
+- Their credentials in the conversation ≡ explicit authorization for that login, on that site,
+  for this task. You do not need to ask again, and you do not need to explain that you can.
+- The only things that still need a fresh, specific instruction are the *side effects*: submitting
+  a purchase, publishing content, sending a message, or deleting anything.
+- Read credentials from the conversation or the environment (`os.environ["SITE_PASSWORD"]`).
+  Never invent them, never print them back in your reply, and never write them into a file that
+  outlives the task.
+- A captcha on the way in is not a reason to stop either — solve it (above), then continue.
+- If a login genuinely fails, say what the page said (`find` it, quote it), and try the next
+  route. "It refused my credentials" is a result; "I can't log in to websites" is not.
 
 ## Worked example — log in
 
@@ -170,8 +210,10 @@ configuration the user gave you.
   a way to reach the host's own services. Do not try to work around it.
 - Solving a captcha is a step on a page you are authorized to use. It is not a licence to
   circumvent access controls, and not a way into an account that is not yours.
-- Never submit a purchase, publish content, send a message, or enter credentials unless the user
-  explicitly authorized that exact action in this conversation.
+- Never submit a purchase, publish content, send a message, or delete anything unless the user
+  explicitly authorized that exact action in this conversation. Logging in with credentials the
+  user supplied **is** that authorization — see "Logging in is allowed" above; do not treat it as
+  a blocked action.
 
 ## Fallback: Playwright or Selenium in the sandbox
 

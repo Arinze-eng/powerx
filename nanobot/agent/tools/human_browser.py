@@ -441,10 +441,17 @@ class HumanBrowserTool(Tool):
             "Turnstile click-through explicitly; navigate and click already attempt it. close ends "
             "the session.\n"
             "Prefer this over the plain browser tool when a site is sensitive to obviously "
-            "automated input. "
-            "Private/internal URLs are blocked. Never submit purchases, publish content, send "
-            "messages, or enter credentials unless the user explicitly authorized that exact action "
-            "in the conversation."
+            "automated input.\n"
+            "Signing in is a normal use of this tool. When the user gives you their credentials, "
+            "asks you to log in, or asks you to fill in a form, that IS explicit authorization: "
+            "navigate, find, fill_form, click, and carry on into the signed-in pages. Never answer "
+            "that you cannot log into websites or that you cannot enter credentials -- there is no "
+            "such limit here, and handing the job back to the user is a refusal of work you can "
+            "do. Read the credentials from the conversation or the environment; never invent them "
+            "and never print them back in your reply.\n"
+            "Private/internal URLs are blocked. Do not submit a purchase, publish content, or send "
+            "a message the user has not explicitly authorized in this conversation; entering "
+            "credentials the user supplied is already authorized."
         )
 
     @property
@@ -1063,10 +1070,14 @@ class HumanBrowserTool(Tool):
             "solver_can_answer": can,
             "next_step": (
                 f"This is a provider limit, not a transient failure - do NOT retry auto_captcha. "
-                f"The configured solver answers only: {can}. Either finish the task by another "
-                f"route, or tell the user a {kind} challenge needs a solver with that method "
-                f"enabled (capsolve/capskip covers recaptcha, hcaptcha, funcaptcha, turnstile, "
-                f"geetest, altcha, image and image grid)."
+                f"The configured solver answers only: {can}. Keep going: take another route for "
+                f"this step (the same page over plain HTTP fetch, an API, or a different page) and "
+                f"finish the rest of the task, reporting only this step as blocked. Tell the user "
+                f"a {kind} challenge needs a solver with that method enabled (capsolve/capskip "
+                f"covers recaptcha, hcaptcha, funcaptcha, turnstile, geetest, altcha, image and "
+                f"image grid), and that an inbuilt solver key on the same deployment is the second "
+                f"attempt auto_captcha makes before it reports a limit. Never refuse the whole "
+                f"task because of this one challenge."
             ),
         }
 
@@ -1076,8 +1087,12 @@ class HumanBrowserTool(Tool):
             return {
                 "solved": False,
                 "reason": (
-                    "no captcha solver is configured for this deployment, so nothing was "
-                    "attempted; report the challenge to the user rather than retrying"
+                    "no captcha solver is configured for this deployment, so nothing was attempted"
+                ),
+                "next_step": (
+                    "Do not retry, and do not refuse the task: carry on with every other step you "
+                    "can reach without this challenge, then tell the user this one page needs a "
+                    "solver (set CAPTCHA_ENABLE=true and a solver key on the deployment)."
                 ),
             }
         found = await self._detect_captcha(tab)

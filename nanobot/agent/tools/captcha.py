@@ -27,16 +27,47 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
 
 import httpx
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import ToolContext
 from nanobot.config_base import Base
+
+#: Deployment settings arrive as environment variables, and the spelling an
+#: operator actually writes is often not the nested field name. The root
+#: settings model prefixes everything with ``NANOBOT_`` and nests with ``__``,
+#: so ``NANOBOT_TOOLS__CAPTCHA_SOLVER__ENABLE`` is the derived form -- but the
+#: deployments in the field export ``CAPTCHA_ENABLE`` and
+#: ``captcha_solver.provider``, which pydantic-settings cannot match. Those
+#: spellings are honoured here so a correctly configured deployment is never
+#: silently left with the solver off, which looks exactly like a missing
+#: feature from the outside.
+#:
+#: The boolean is "env wins": for enable/provider the environment is the
+#: operator's most specific statement about *this* deployment, so it overrides
+#: whatever a config file carries. That matters because a dumped default config
+#: file contains ``enable: false`` and would otherwise beat the live env.
+_ENV_ALIASES: dict[str, tuple[bool, tuple[str, ...]]] = {
+    "enable": (True, ("CAPTCHA_ENABLE", "CAPTCHA_SOLVER_ENABLE", "NANOBOT_CAPTCHA_ENABLE")),
+    "provider": (
+        True,
+        ("CAPTCHA_SOLVER_PROVIDER", "CAPTCHA_PROVIDER", "CAPTCHA_SOLVER.PROVIDER"),
+    ),
+    "inbuilt_fallback": (
+        False,
+        ("CAPTCHA_INBUILT_FALLBACK", "CAPTCHA_SOLVER_INBUILT_FALLBACK"),
+    ),
+    "base_url": (False, ("CAPTCHA_SOLVER_URL", "CAPTCHA_SOLVER_BASE_URL", "CAPSOLVE_BASE_URL")),
+    "api_key_env": (False, ("CAPTCHA_API_KEY_ENV", "CAPSOLVE_API_KEY_ENV")),
+    "solvegate_base_url": (False, ("SOLVEGATE_BASE_URL", "SOLVEGATE_API_URL")),
+    "solvegate_api_key_env": (False, ("SOLVEGATE_API_KEY_ENV",)),
+}
 
 
 class CaptchaSolverToolConfig(Base):
@@ -64,6 +95,41 @@ class CaptchaSolverToolConfig(Base):
     poll_interval_seconds: float = Field(default=5.0, ge=0.25, le=30.0)
     request_timeout_seconds: float = Field(default=30.0, ge=5.0, le=120.0)
     max_image_bytes: int = Field(default=5_000_000, ge=1_024, le=25_000_000)
+    #: "SolveGate first, then the solver this agent already carries." With this
+    #: on (the default) SolveGate answers its own two gates and any challenge it
+    #: has no method for is handed to the built-in 2captcha-compatible client
+    #: when one is configured -- so a single deployment covers both the
+    #: Cloudflare gates and a reCAPTCHA / picture page. Off makes the configured
+    #: provider a hard boundary.
+    inbuilt_fallback: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _apply_env_aliases(cls, data: Any) -> Any:
+        """Read the deployment's own spelling of these settings.
+
+        Only the names in :data:`_ENV_ALIASES` are consulted, and a value is
+        injected only when the variable is set to something non-empty, so an
+        environment that says nothing about a field leaves it exactly as it was.
+        """
+        if not isinstance(data, dict):
+            return data
+        environ = {str(key).strip().lower(): value for key, value in os.environ.items()}
+        merged: dict[Any, Any] = dict(data)
+        present = {
+            re.sub(r"[^a-z0-9]", "", str(key).lower()) for key in data
+        }
+        for field, (overrides, names) in _ENV_ALIASES.items():
+            if not overrides and re.sub(r"[^a-z0-9]", "", field) in present:
+                # The config file spoke about this field; the env is a fallback.
+                continue
+            for name in names:
+                value = environ.get(name.lower())
+                if value is None or not str(value).strip():
+                    continue
+                merged[field] = value
+                break
+        return merged
 
 
 class SolverError(RuntimeError):
@@ -392,12 +458,17 @@ class CaptchaSolverTool(Tool):
         provider: str = "capskip",
         solvegate_base_url: str = "https://api.solvegate.io",
         solvegate_api_key: str = "",
+        inbuilt_fallback: bool = True,
     ) -> None:
         self.provider = str(provider or "capskip").strip().lower()
         self.solvegate_base_url = solvegate_base_url
         self.solvegate_api_key = solvegate_api_key
         self.base_url = base_url
+        #: The built-in 2captcha-compatible client's key. On a solvegate
+        #: deployment this is a *second*, optional key: it is what the inbuilt
+        #: fallback uses when SolveGate has no method for a challenge.
         self.api_key = api_key
+        self.inbuilt_fallback = bool(inbuilt_fallback)
         self.workspace = workspace
         self.timeout_seconds = timeout_seconds
         self.poll_interval_seconds = poll_interval_seconds
@@ -432,6 +503,32 @@ class CaptchaSolverTool(Tool):
             return ""
         return os.getenv(env_name, "").strip()
 
+    @staticmethod
+    def resolve_inbuilt_api_key(cfg: CaptchaSolverToolConfig) -> str:
+        """The built-in (2captcha-compatible) client's key, if one is configured.
+
+        Read regardless of the configured provider, because it is what the
+        inbuilt fallback uses on a SolveGate deployment. ``CAPSOLVE_API_KEY`` is
+        accepted as well as the configured ``api_key_env`` name so a deployment
+        that renamed the variable is still found.
+        """
+        literal = str(getattr(cfg, "api_key", "") or "").strip()
+        if literal:
+            return literal
+        names = [
+            str(getattr(cfg, "api_key_env", "") or "").strip(),
+            "CAPSOLVE_API_KEY",
+        ]
+        seen: set[str] = set()
+        for env_name in names:
+            if not env_name or env_name in seen:
+                continue
+            seen.add(env_name)
+            value = os.getenv(env_name, "").strip()
+            if value:
+                return value
+        return ""
+
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
         cfg = ctx.config.captcha_solver
@@ -440,9 +537,13 @@ class CaptchaSolverTool(Tool):
     @classmethod
     def create(cls, ctx: ToolContext) -> Tool:
         cfg = ctx.config.captcha_solver
+        solvegate = str(cfg.provider or "").strip().lower() == "solvegate"
         return cls(
             base_url=cfg.base_url,
-            api_key=cls.resolve_api_key(cfg),
+            # On a solvegate deployment the 2captcha client is the *inbuilt
+            # fallback*, so it takes its own key -- never SolveGate's, which
+            # must not be handed to a different endpoint.
+            api_key=cls.resolve_inbuilt_api_key(cfg),
             workspace=ctx.workspace,
             timeout_seconds=cfg.timeout_seconds,
             poll_interval_seconds=cfg.poll_interval_seconds,
@@ -450,7 +551,8 @@ class CaptchaSolverTool(Tool):
             max_image_bytes=cfg.max_image_bytes,
             provider=cfg.provider,
             solvegate_base_url=cfg.solvegate_base_url,
-            solvegate_api_key=cls.resolve_api_key(cfg) if str(cfg.provider or "").strip().lower() == "solvegate" else "",
+            solvegate_api_key=cls.resolve_api_key(cfg) if solvegate else "",
+            inbuilt_fallback=bool(getattr(cfg, "inbuilt_fallback", True)),
         )
 
     @property
@@ -461,10 +563,15 @@ class CaptchaSolverTool(Tool):
     def description(self) -> str:
         return (
             "Solve a captcha with the configured solver and return the token to submit. "
-            "Which challenges are answerable depends on the configured provider. The solvegate "
-            "provider answers gate=turnstile (a Cloudflare Turnstile widget) and gate=waf (a "
-            "Cloudflare WAF challenge) and nothing else; capsolve/capskip answers recaptcha, "
-            "hcaptcha, funcaptcha, turnstile, geetest, altcha, an image file and an image grid. "
+            "Which challenges are answerable depends on the configured provider, and the action "
+            "enum is built from exactly that, so never pass an action it does not list. The "
+            "solvegate provider answers gate=turnstile (a Cloudflare Turnstile widget) and "
+            "gate=waf (a Cloudflare WAF challenge) and nothing else; when an inbuilt 2captcha-"
+            "compatible "
+            "client is configured as well, SolveGate is tried first for its own two gates and the "
+            "inbuilt client answers the rest -- recaptcha, hcaptcha, funcaptcha, turnstile, "
+            "geetest, altcha, an image file and an image grid -- which is how one deployment "
+            "covers both. On its own, capsolve/capskip answers everything but the waf gate. "
             "Actions: balance, solve_image (a local image file, optionally steered with text), "
             "recaptcha (v2/v3/Enterprise), turnstile, hcaptcha, funcaptcha, geetest, altcha and "
             "coordinates (an image grid, answered with click coordinates). Every token action "
@@ -475,7 +582,10 @@ class CaptchaSolverTool(Tool):
             "test-mode token that no real site will accept - say so instead of treating the "
             "challenge as passed. Coverage is limited to what the "
             "configured solver supports and what the balance allows: an unsupported type or an "
-            "empty balance fails, and there is no local fallback model. Solving a captcha is a "
+            "empty balance fails, and there is no local fallback model. A provider limit is a fact "
+            "about this deployment, not a dead end: do not repeat the same call, take another "
+            "route for that step, keep working through the rest of the task, and report only the "
+            "blocked step -- never refuse the whole task over one unsolvable challenge. Solving a "
             "step on a page you are authorized to use, not a licence to circumvent access "
             "controls. The solver endpoint is fixed by configuration, so no argument here can "
             "redirect it."
@@ -494,9 +604,19 @@ class CaptchaSolverTool(Tool):
         2captcha protocol this provider speaks has no method for a Cloudflare
         WAF challenge, which is the gap SolveGate was added to cover. Turnstile
         itself is served by both, so it stays in the CapSkip enum.
+
+        A SolveGate deployment with the inbuilt fallback wired to a key is a
+        *hybrid*: SolveGate answers its two gates, and the built-in client
+        answers the rest, so the whole set is honest to advertise. With no
+        inbuilt key the fallback cannot fire and the enum stays at the two
+        gates rather than offering a call that can only fail.
         """
         if self.provider == "solvegate":
-            return sorted(self._SOLVEGATE_GATES)
+            actions = set(self._SOLVEGATE_GATES)
+            if self.inbuilt_fallback and self.api_key:
+                # The inbuilt client is 2captcha-compatible: turnstile included.
+                actions |= self._ACTIONS - {"waf"}
+            return sorted(actions)
         return sorted(self._ACTIONS - {"waf"})
 
     @property
@@ -778,12 +898,28 @@ class CaptchaSolverTool(Tool):
             )
         if self.provider != "solvegate" and not self.api_key:
             return ToolResult.error("Error: the captcha solver has no API key configured")
-        if self.provider == "solvegate" and action not in self._SOLVEGATE_GATES:
-            return ToolResult.error(
-                "Error: the solvegate provider answers only "
-                + ", ".join(sorted(self._SOLVEGATE_GATES))
-                + f"; {action!r} is configured for a different provider"
-            )
+        # SolveGate first: its two gates are the reason it is configured at all,
+        # and it is the provider whose answer is authoritative for them.
+        solvegate_handles = self.provider == "solvegate" and action in self._SOLVEGATE_GATES
+        if self.provider == "solvegate" and not solvegate_handles:
+            # SolveGate's gate enum is two wide. The inbuilt fallback is the
+            # documented second attempt, not a silent substitution: it fires
+            # only when the built-in client actually has a key, and otherwise
+            # the error says what to do next instead of stopping the task.
+            if not (self.inbuilt_fallback and self.api_key):
+                return ToolResult.error(
+                    "Error: the solvegate provider answers only "
+                    + ", ".join(sorted(self._SOLVEGATE_GATES))
+                    + f", so there is no method for {action!r} here"
+                    + (
+                        "; the inbuilt fallback has no key either (set CAPSKIP_API_KEY or "
+                        "CAPSOLVE_API_KEY to give the built-in client one)."
+                        if self.inbuilt_fallback
+                        else "; the inbuilt fallback is switched off in configuration."
+                    )
+                    + " Do not retry this call unchanged - continue with the rest of the task "
+                    "and report only this step as blocked."
+                )
 
         solver = CaptchaSolver(
             self.base_url,
@@ -791,7 +927,7 @@ class CaptchaSolverTool(Tool):
             request_timeout=self.request_timeout_seconds,
         )
         try:
-            if self.provider == "solvegate":
+            if solvegate_handles:
                 # Kept inside the try so a rejected key, a refused task or a
                 # missing field comes back as a tool error like every other
                 # failure, rather than escaping as an exception.
