@@ -35,7 +35,21 @@ unavailable. Say which engine you used in the reply.
 
 `code` is a FreeCAD python snippet. It runs inside a document already bound to
 `doc`, with `FreeCAD`, `Part`, `Draft`, `Import`, `Mesh` and `TechDraw` in scope,
-plus one helper, `add_page(objects, template="A4_LandscapeTD.svg", direction="front")`.
+plus one helper:
+
+```python
+add_page(objects=None, template="A4_LandscapeTD.svg", direction=None, views=None, scale=None)
+```
+
+- `objects` — what to sheet. Omit it and the **result solids of the design** are
+  used: the shapes you left live, with every construction solid they consumed
+  filtered out. That is almost always what you want, so `add_page()` with no
+  arguments sheets the finished part.
+- `direction` — one view, `front`, `top`, `right`, `left`, `rear`, `bottom` or `iso`.
+- `views` — several projections on **one sheet**, laid out in a grid:
+  `add_page(views=["front", "right", "top", "iso"])`. Prefer this: a drawing a
+  machinist can actually read is three orthographic views plus an iso, not one
+  lone view. Up to four fit an A4 landscape sheet.
 
 ```python
 plate = doc.addObject("Part::Box", "Plate")
@@ -49,10 +63,40 @@ doc.recompute()
 page = add_page([body], direction="iso")
 ```
 
+A part built as a chain of cuts wants the multi-view sheet, and wants it to
+sheet the finished body rather than the scaffolding:
+
+```python
+plate = doc.addObject("Part::Box", "Plate")
+plate.Length, plate.Width, plate.Height = 80.0, 50.0, 12.0
+bore = doc.addObject("Part::Cylinder", "Bore")
+bore.Radius, bore.Height = 8.0, 60.0
+bore.Placement.Base = FreeCAD.Vector(40, 25, -10)
+current = doc.addObject("Part::Cut", "PlateBored")
+current.Base, current.Tool = plate, bore
+for i, (x, y) in enumerate([(8.0, 8.0), (72.0, 8.0)]):
+    hole = doc.addObject("Part::Cylinder", "Hole%d" % i)
+    hole.Radius, hole.Height = 3.2, 40.0
+    hole.Placement.Base = FreeCAD.Vector(x, y, -10)
+    cut = doc.addObject("Part::Cut", "Stage%d" % i)
+    cut.Base, cut.Tool = current, hole
+    current = cut
+doc.recompute()
+# The finished body only -- Plate, Bore and every Stage are scaffolding.
+page = add_page(views=["front", "right", "top", "iso"])
+```
+
+Read `objects` in the result back to yourself: it lists the solids that were
+measured, so it is the check on whether you sheeted the part or its scaffolding.
+`measured.volume_mm3` and `measured.bbox_mm` are that part's, not the sum of
+everything you built. If a snippet leaves several live solids side by side, each
+is a result and their volumes are summed — a note says so, and overlapping solids
+then double-count, so fuse them into one body with `Part::MultiFuse` instead.
+
 `formats` accepts `step`, `stp`, `iges`, `brep`, `stl`, `dxf`, `svg`, `png`,
 `pdf`. The `.FCStd` document is always saved too.
 
-**`add_page([...])` is what makes a drawing.** Without it `svg`, `png` and `pdf`
+**`add_page(...)` is what makes a drawing.** Without it `svg`, `png` and `pdf`
 have nothing to render and come back with a note saying so — they are sheet
 formats, not model formats. `dxf` works either way and means different things:
 

@@ -55,7 +55,7 @@ _REPO = os.getenv("ENGINEERING_DRAW_REPO", "Arinze-eng/powerx")
 #: MUST equal ``CLI_VERSION`` in ``scripts/engineering_draw_cli.py``. The bootstrap
 #: refuses to run a CLI that does not carry this marker, so a stale cached copy
 #: is detected rather than silently used. Bump both together.
-_CLI_VERSION = "2026-09-26.3"
+_CLI_VERSION = "2026-09-26.4"
 
 _ED_HOME = "$HOME/.engineering_draw"
 _CLI_PATH = f"{_ED_HOME}/bin/engineering_draw_cli.py"
@@ -429,7 +429,14 @@ class EngineeringDrawTool(Tool):
                 },
                 "views": {
                     "type": "string",
-                    "description": "Comma-separated projection views for action='project': front, top, right, iso.",
+                    "description": (
+                        "Comma-separated projection views: front, top, right, "
+                        "left, rear, bottom, iso. On action='freecad' this is the "
+                        "set of views on the drawing SHEET -- pass "
+                        "views='front,right,top,iso' for a drawing that can "
+                        "actually be read. On action='project' it selects the "
+                        "projected views."
+                    ),
                 },
                 "sheet": {
                     "type": "string",

@@ -56,7 +56,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-CLI_VERSION = "2026-09-26.3"
+CLI_VERSION = "2026-09-26.4"
 
 OUT_DIR_DEFAULT = os.environ.get("ENGINEERING_DRAW_DIR", "~/engineering_drawings")
 
@@ -1590,7 +1590,7 @@ DEFAULT_DISPLAY = ":99"
 #: still produces the artefacts, and one that raises still reports why instead of
 #: printing a traceback the tool would have to guess at.
 FREECAD_DRIVER = r'''
-import json, os, re, shutil, sys, traceback
+import json, math, os, re, shutil, sys, traceback
 import FreeCAD, Part
 RESULT = {"objects": [], "files": {}, "errors": [], "notes": [],
           "volume_mm3": None, "bbox_mm": None}
@@ -1605,11 +1605,16 @@ WANTED = [f for f in os.environ.get("ED_FORMATS", "step").split(",") if f]
 SOURCE = os.environ.get("ED_SOURCE", "")
 CODE = os.environ.get("ED_CODE", "")
 VIEW = os.environ.get("ED_VIEW", "iso")
+# `--views` reaches the sheet, not just the `project` action: it is how the caller
+# asks for a readable multi-view sheet without writing add_page() itself.
+SHEET_VIEWS = [v for v in (os.environ.get("ED_VIEWS") or "").split(",") if v.strip()]
+AUTO_SHEET = os.environ.get("ED_AUTO_SHEET", "1") not in ("", "0")
 
 doc = FreeCAD.newDocument("design")
 
-def add_page(objects=None, template="A4_LandscapeTD.svg", direction=None):
-    """Build a TechDraw page with one projected view, and return it.
+def add_page(objects=None, template="A4_LandscapeTD.svg", direction=None,
+             views=None, scale=None):
+    """Build a TechDraw page of projected views, and return it.
 
     TechDraw's boilerplate is four objects and an enum that must match the
     object type exactly, which is a poor thing to make the model reproduce from
@@ -1617,26 +1622,90 @@ def add_page(objects=None, template="A4_LandscapeTD.svg", direction=None):
 
     `direction` defaults to the orientation the caller asked for with
     --preview-view, so one flag steers every sheet the snippet builds.
+
+    `views` puts several projections on ONE sheet, which is what a real drawing
+    is: a single view cannot be dimensioned or read for shape. Views are placed
+    in a third-angle grid on the page -- front bottom-left, right bottom-right,
+    top above front, iso top-right -- so the defaults line up the way an
+    engineering drawing is meant to be read:
+
+        add_page(views=['front', 'right', 'top', 'iso'])
+
+    `objects` defaults to the design's result solids (see _results()), so
+    `add_page()` with no arguments sheets the finished part and not its
+    scaffolding.
     """
-    direction = direction or VIEW
+    wanted = [str(v).strip().lower() for v in (views or []) if str(v).strip()]
+    if not wanted:
+        wanted = [str(direction or VIEW).strip().lower()]
     page = doc.addObject("TechDraw::DrawPage", "Page")
     tpl = doc.addObject("TechDraw::DrawSVGTemplate", "Template")
     tpl.Template = os.path.join(FreeCAD.getResourceDir(), "Mod", "TechDraw",
                                 "Templates", template)
     page.Template = tpl
-    src = list(objects or [])
+    src = list(objects or []) or _results()
     if src:
-        view = doc.addObject("TechDraw::DrawViewPart", "View")
-        view.Source = src
-        view.Direction = {
-            "front": (0, -1, 0), "top": (0, 0, 1), "right": (1, 0, 0),
-            "iso": (1, -1, 0.8), "left": (-1, 0, 0), "rear": (0, 1, 0),
-        }.get(str(direction).lower(), (0, -1, 0))
-        page.addView(view)
+        columns = 1 if len(wanted) == 1 else 2
+        # A4 landscape is 297x210 mm. Two columns sit either side of the centre
+        # line so the two rows read as a drawing rather than a list.
+        slots = [(85.0, 62.0), (212.0, 62.0), (85.0, 145.0), (212.0, 145.0)]
+        for index, name in enumerate(wanted):
+            view = doc.addObject("TechDraw::DrawViewPart", "View%d" % index)
+            view.Source = src
+            view.Direction = PAGE_VIEW_DIRECTIONS.get(name, (0, -1, 0))
+            view.Label = name.capitalize()
+            page.addView(view)
+            x, y = slots[index % len(slots)] if columns == 2 else (148.5, 105.0)
+            view.X = float(x)
+            view.Y = float(y)
+            if scale:
+                view.Scale = float(scale)
     doc.recompute()
     return page
 
+PAGE_VIEW_DIRECTIONS = {
+    "front": (0, -1, 0), "top": (0, 0, 1), "right": (1, 0, 0),
+    "iso": (1, -1, 0.8), "left": (-1, 0, 0), "rear": (0, 1, 0),
+    "bottom": (0, 0, -1),
+}
+
+# Second-order defect, measured: a design is built out of scaffolding. The
+# snippet makes a box, a cylinder and a cut, and every one of those carries a
+# non-null Shape -- so "the objects with a shape" is NOT the part. Reporting that
+# set as the design gave a 47 360 mm3 bracket as 362 021 mm3 with a 60 mm Z, and
+# wrote all 14 solids into the STEP file. Both numbers are what the model reads
+# to check its own work, so a wrong one is worse than none.
+def _consumed():
+    """Names of objects that an INPUT to another object, not a result.
+
+    Only 3D objects count. A TechDraw page -- and every view on it -- references
+    the part as its `Source`, and a drawing view is not a consumer of the part:
+    it is a *view* of it. Counting those as consumers emptied the result set the
+    moment a snippet called add_page(), so the measurement fell straight back to
+    the scaffolding it was introduced to exclude. MEASURED: same 14-object,
+    362 021 mm3 answer as before the fix, with the note silently explaining the
+    wrong number.
+    """
+    used = set()
+    for obj in doc.Objects:
+        if str(getattr(obj, "TypeId", "")).startswith("TechDraw::"):
+            continue
+        for prop in ("Base", "Tool", "Shapes", "Source", "Objects", "BaseFeature"):
+            try:
+                value = getattr(obj, prop, None)
+            except Exception:
+                continue
+            if value is None:
+                continue
+            items = value if isinstance(value, (list, tuple)) else [value]
+            for item in items:
+                name = getattr(item, "Name", None)
+                if name:
+                    used.add(name)
+    return used
+
 def _shapes():
+    """Every object carrying a solid -- scaffolding included."""
     out = []
     for obj in doc.Objects:
         try:
@@ -1646,6 +1715,37 @@ def _shapes():
         except Exception:
             continue
     return out
+
+def _results():
+    """The solids the design actually produced: `_shapes()` minus the inputs.
+
+    An object that another object consumes as Base/Tool/Shapes is scaffolding --
+    the box behind a Part::Cut, the cylinder behind it, the intermediate cut
+    itself -- and must not be measured or exported as if it were the part.
+    """
+    consumed = _consumed()
+    out = [o for o in _shapes() if getattr(o, "Name", "") not in consumed]
+    return out or _shapes()
+
+def _measure_results(objs):
+    """Volume and bounding box of the produced solids only."""
+    if not objs:
+        return
+    try:
+        shapes = [o.Shape for o in objs]
+        RESULT["volume_mm3"] = float(sum(float(s.Volume) for s in shapes))
+        box = shapes[0].BoundBox
+        for shape in shapes[1:]:
+            box.add(shape.BoundBox)
+        RESULT["bbox_mm"] = [box.XLength, box.YLength, box.ZLength]
+        RESULT["solids"] = sum(len(getattr(s, "Solids", []) or []) for s in shapes)
+        if len(shapes) > 1:
+            RESULT["notes"].append(
+                "measured %d separate result solids; volume_mm3 is their sum, "
+                "so overlapping solids would double-count -- fuse them with "
+                "Part::MultiFuse for one part." % len(shapes))
+    except Exception as exc:
+        RESULT["notes"].append("measure failed: %s" % exc)
 
 def _save(key, path, writer):
     try:
@@ -1743,19 +1843,30 @@ except Exception as exc:
     RESULT["errors"].append("design failed: %s: %s" % (type(exc).__name__, exc))
     RESULT["traceback"] = traceback.format_exc()[-1200:]
 
-objs = _shapes()
+objs = _results()
 RESULT["objects"] = [getattr(o, "Name", "?") for o in objs]
-if objs:
-    try:
-        RESULT["volume_mm3"] = float(sum(float(o.Shape.Volume) for o in objs))
-        box = objs[0].Shape.BoundBox
-        for o in objs[1:]:
-            box.add(o.Shape.BoundBox)
-        RESULT["bbox_mm"] = [box.XLength, box.YLength, box.ZLength]
-    except Exception as exc:
-        RESULT["notes"].append("measure failed: %s" % exc)
+# Keep the scaffolding visible but out of the measurement and the export: it is
+# how the model tells "I built this much" from "this is the part".
+RESULT["construction_objects"] = sorted(_consumed())
+_measure_results(objs)
 
 pages = [o for o in doc.Objects if getattr(o, "TypeId", "") == "TechDraw::DrawPage"]
+if not pages and objs and AUTO_SHEET and (
+        SHEET_VIEWS or any(f in WANTED for f in ("svg", "png", "pdf"))):
+    # MEASURED: asking for a drawing and forgetting add_page() returned one DXF,
+    # three "no TechDraw sheet to render" errors and no drawing. A sheet format
+    # IS the request, so build the sheet from the result solids -- add_page() with
+    # no objects is exactly that -- and say so, rather than failing three exports.
+    try:
+        add_page(views=SHEET_VIEWS or ["front", "right", "top", "iso"])
+        pages = [o for o in doc.Objects if getattr(o, "TypeId", "") == "TechDraw::DrawPage"]
+        RESULT["notes"].append(
+            "the snippet drew no sheet; one was built from the result solids "
+            "(%s). Pass --views to choose the projections."
+            % ", ".join(SHEET_VIEWS or ["front", "right", "top", "iso"]))
+    except Exception as exc:
+        RESULT["notes"].append(
+            "could not build a sheet automatically: %s: %s" % (type(exc).__name__, exc))
 page = pages[0] if pages else None
 
 # --- export -----------------------------------------------------------------
@@ -1883,7 +1994,8 @@ def _display_name() -> str:
 
 def _run_freecad_driver(code: str, out: Path, stem: str, formats: list[str],
                         source: str = "", timeout: int = 900,
-                        view: str = "") -> dict[str, Any]:
+                        view: str = "", views: list[str] | None = None,
+                        auto_sheet: bool = True) -> dict[str, Any]:
     """Run the driver with the model's snippet and return its ED_RESULT object."""
     binary = _freecad_which()
     if not binary:
@@ -1902,6 +2014,8 @@ def _run_freecad_driver(code: str, out: Path, stem: str, formats: list[str],
         "ED_SOURCE": source,
         "ED_CODE": code,
         "ED_VIEW": view or "iso",
+        "ED_VIEWS": ",".join(views or []),
+        "ED_AUTO_SHEET": "1" if auto_sheet else "0",
     })
     try:
         done = subprocess.run(
@@ -1965,14 +2079,16 @@ def action_freecad(args: argparse.Namespace) -> None:
         )
     result = _run_freecad_driver(code, out, stem, formats, source=source,
                                  timeout=args.timeout or 900,
-                                 view=args.preview_view or "")
+                                 view=args.preview_view or "",
+                                 views=args.views or [])
     files = _report_files(result.get("files") or {})
     if not files:
         fail(
             "FreeCAD produced no files",
             "Read 'freecad_errors' and 'notes' below: an export format usually "
             "needs something in the document (dxf needs shapes, svg/pdf/png need "
-            "a TechDraw page from add_page([...])).",
+            "a sheet -- add_page(views=[...]) draws one, and it is built "
+            "automatically from the result solids when the snippet draws none).",
             freecad_errors=result.get("errors") or [],
             notes=result.get("notes") or [],
         )
@@ -2029,6 +2145,10 @@ def action_freecad_gui(args: argparse.Namespace) -> None:
             ["step", "stl"] + (["svg"] if (args.preview or []) else []),
             timeout=args.timeout or 900,
             view=args.preview_view or "",
+            # The GUI action opens a window; it is not a drawing request, and the
+            # incidental `svg` it asks for must not sheet the document behind the
+            # model's back. A sheet here is the model's call, via add_page().
+            auto_sheet=False,
         )
         target = str((result.get("files") or {}).get("fcstd")
                      or (result.get("files") or {}).get("step") or "")

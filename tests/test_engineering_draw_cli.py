@@ -673,11 +673,86 @@ def test_preview_view_reaches_the_drawing_views() -> None:
     was accepted and did nothing -- which is exactly the bug this pins.
     """
     assert 'os.environ.get("ED_VIEW"' in cli.FREECAD_DRIVER
-    assert "direction = direction or VIEW" in cli.FREECAD_DRIVER
+    # add_page defaults its projection direction to VIEW when the caller names
+    # neither `views` nor `direction`.
+    assert 'wanted = [str(direction or VIEW).strip().lower()]' in cli.FREECAD_DRIVER
     import inspect
 
     assert '"ED_VIEW": view or "iso"' in inspect.getsource(cli._run_freecad_driver)
     assert "view=args.preview_view" in inspect.getsource(cli.action_freecad)
+
+
+def test_add_page_can_put_several_views_on_one_sheet() -> None:
+    """One view is not a drawing: shape cannot be read from a single projection.
+
+    `views=[...]` places front/right/top/iso in a third-angle grid on one page,
+    and `objects` falls back to the design's result solids rather than requiring
+    the caller to name them (which is how the scaffolding got sheeted before).
+    """
+    driver = cli.FREECAD_DRIVER
+    assert "views=None" in driver
+    assert "slots = [(85.0, 62.0), (212.0, 62.0), (85.0, 145.0), (212.0, 145.0)]" in driver
+    assert "or _results()" in driver
+
+
+def test_the_design_is_measured_from_its_result_solids_not_its_scaffolding() -> None:
+    """MEASURED DEFECT: a plate+cylinder Part::Cut reported 362 021 mm3.
+
+    The part was 47 360 mm3. Every primitive behind a boolean carries a non-null
+    Shape, so "objects with a shape" is not the part -- it also made the STEP
+    export contain all 14 solids. The result set is the shapes minus the ones
+    another object consumes as Base/Tool/Shapes.
+    """
+    driver = cli.FREECAD_DRIVER
+    assert "def _consumed()" in driver
+    assert "def _results()" in driver
+    assert 'for prop in ("Base", "Tool", "Shapes", "Source", "Objects", "BaseFeature")' in driver
+    assert "objs = _results()" in driver
+    assert "_measure_results(objs)" in driver
+    # The scaffolding is reported, just not measured or exported as the part.
+    assert 'RESULT["construction_objects"] = sorted(_consumed())' in driver
+
+
+def test_a_drawing_view_is_not_treated_as_consuming_the_part() -> None:
+    """MEASURED DEFECT: add_page() made the result set vanish, so the scaffolding came back.
+
+    A `TechDraw::DrawViewPart` carries the part body in its `Source`, exactly like
+    a `Part::Cut` carries its base in `Base`. Counting it as a consumer swallowed
+    the finished body too, `_results()` came back empty, and the driver fell back
+    to "every object with a shape" -- the 359 705 mm3 / 14-object answer, with a
+    sheet on the page. A view is a view of the part, not a consumer of it, so
+    drawing objects are skipped when the consumed set is built. Live: the same
+    chain measures 47 360.62 mm3 with and without a page.
+    """
+    driver = cli.FREECAD_DRIVER
+    assert 'if str(getattr(obj, "TypeId", "")).startswith("TechDraw::"):' in driver
+
+
+def test_asking_for_a_drawing_without_a_sheet_still_produces_one() -> None:
+    """MEASURED: `--formats step,dxf,svg,pdf` with no add_page() gave one DXF and
+    three "no TechDraw sheet to render" errors. Asking for svg/pdf/png IS asking
+    for a sheet, so the driver builds one from the result solids and says so."""
+    driver = cli.FREECAD_DRIVER
+    assert 'AUTO_SHEET = os.environ.get("ED_AUTO_SHEET", "1") not in ("", "0")' in driver
+    assert 'SHEET_VIEWS = [v for v in (os.environ.get("ED_VIEWS") or "").split(",")' in driver
+    assert 'any(f in WANTED for f in ("svg", "png", "pdf"))' in driver
+    assert "add_page(views=SHEET_VIEWS or" in driver
+    # `--views` is how the caller picks the projections without writing add_page().
+    source = Path(cli.__file__).read_text() if hasattr(cli, "__file__") else ""
+    assert '"ED_VIEWS": ",".join(views or [])' in source
+    assert "views=args.views or []" in source
+
+
+def test_the_gui_action_does_not_sheet_the_document_behind_the_models_back() -> None:
+    """`freecad_gui` opens a window; it is not a drawing request.
+
+    It asks for an incidental `svg`, which under the auto-sheet rule would build a
+    TechDraw page nobody asked for and change what the window shows. A sheet on
+    the GUI path is the model's call, through add_page() in its own snippet.
+    """
+    source = Path(cli.__file__).read_text()
+    assert "auto_sheet: bool = True" in source
+    assert "            auto_sheet=False," in source
 
 
 def test_preview_png_on_the_headless_action_asks_for_a_png() -> None:
@@ -764,7 +839,7 @@ def test_freecad_refuses_to_run_before_it_is_installed(capsys, monkeypatch) -> N
         cli.action_freecad(type("A", (), {"out_dir": None, "name": "x", "code": "pass",
                                         "file": None, "formats": None,
                                         "preview_view": None, "preview": None,
-                                        "timeout": None})())
+                                        "views": None, "timeout": None})())
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload["ok"] is False
     assert "install" in payload["next"]
