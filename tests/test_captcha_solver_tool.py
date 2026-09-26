@@ -71,9 +71,11 @@ class _FakeClient:
             return _FakeResponse(reply[0], reply[1])
         return _FakeResponse(reply)
 
-    async def get(self, url: str, params: Any = None) -> _FakeResponse:
+    async def get(self, url: str, params: Any = None, headers: Any = None) -> _FakeResponse:
         _FakeClient.gets.append((url, dict(params or {})))
         reply = _FakeClient.get_replies.pop(0) if _FakeClient.get_replies else ""
+        if isinstance(reply, tuple):
+            return _FakeResponse(reply[0], reply[1])
         return _FakeResponse(reply)
 
 
@@ -543,9 +545,27 @@ def test_solvegate_posts_json_with_a_bearer_token() -> None:
     url, body, headers = _FakeClient.json_posts[-1]
     assert url == "https://api.solvegate.io/v1/solve"
     assert headers["Authorization"] == "Bearer sg-test-key"
-    assert body == {"gate": "turnstile", "sitekey": "sk", "url": "https://a.test"}
+    # async: true goes on every submit: without it the server runs its own
+    # synchronous wait and holds the socket for the whole attempt, measured at
+    # 20.2s against a 30s client timeout.
+    assert body == {
+        "gate": "turnstile",
+        "sitekey": "sk",
+        "url": "https://a.test",
+        "async": True,
+    }
     # The documented curl -d form body answers 415, so it must not be used.
     assert _FakeClient.posts[-1][1] == {}
+
+
+def test_solvegate_always_asks_for_async_even_when_the_caller_says_otherwise() -> None:
+    """A caller cannot put this client back on the held-connection path."""
+    _FakeClient.post_replies.append(_solvegate_reply())
+    solver = SolveGateSolver("https://api.solvegate.io", "k")
+
+    asyncio.run(solver.solve({"gate": "turnstile", "async": False}))
+
+    assert _FakeClient.json_posts[-1][1]["async"] is True
 
 
 def test_solvegate_reads_the_token_and_timing() -> None:
@@ -875,3 +895,206 @@ def test_an_unsupported_captcha_action_names_the_ones_this_provider_serves() -> 
     result = asyncio.run(tool.execute(action="image"))
 
     assert "Valid actions: turnstile, waf" in str(result)
+
+
+# --- a live solve is asynchronous -------------------------------------------
+#
+# Measured against the real API on 2026-09-26 with a live key: POST /v1/solve
+# answers **202** with {"id": "slv_...", "status": "pending", "token": null},
+# and the finished solve comes from GET /v1/solve/{id}. A test key answers 200
+# / solved at once, which is where the earlier "synchronous, nothing to poll"
+# reading came from -- and which made every real solve fail on `pending`.
+# --------------------------------------------------------------------------
+
+
+def _solvegate_pending(**overrides: Any) -> str:
+    return _solvegate_reply(status="pending", token=None, solve_ms=None, expires_at=None, **overrides)
+
+
+def test_solvegate_polls_a_pending_live_solve_until_it_is_solved() -> None:
+    _FakeClient.post_replies.append(_solvegate_pending())
+    _FakeClient.get_replies.extend(
+        [_solvegate_pending(), _solvegate_reply(token="live-token", billed=True)]
+    )
+    solver = SolveGateSolver("https://api.solvegate.io", "sk_live_key")
+
+    result = asyncio.run(solver.solve({"gate": "turnstile"}, poll_interval=0.25))
+
+    assert result["token"] == "live-token"
+    assert result["billed"] is True
+    assert result["sandbox"] is False
+    # Retrieval by id, with the same bearer token, and never re-submitted.
+    assert [url for url, _ in _FakeClient.gets] == [
+        "https://api.solvegate.io/v1/solve/slv_wi4jrI6i7OTc",
+        "https://api.solvegate.io/v1/solve/slv_wi4jrI6i7OTc",
+    ]
+    assert len(_FakeClient.json_posts) == 1
+
+
+def test_solvegate_reports_a_failed_poll_with_the_apis_reason() -> None:
+    _FakeClient.post_replies.append(_solvegate_pending())
+    _FakeClient.get_replies.append(
+        _solvegate_reply(status="failed", token=None, error_message="the widget was not reachable")
+    )
+    solver = SolveGateSolver("https://api.solvegate.io", "sk_live_key")
+
+    with pytest.raises(SolverError, match="the widget was not reachable"):
+        asyncio.run(solver.solve({"gate": "turnstile"}, poll_interval=0.25))
+
+
+def test_solvegate_gives_up_with_the_id_when_a_solve_stays_pending() -> None:
+    """A solve still running at the deadline is reported with what to ask for later."""
+    _FakeClient.post_replies.append(_solvegate_pending())
+    solver = SolveGateSolver("https://api.solvegate.io", "sk_live_key")
+
+    with pytest.raises(SolverError, match="still solving slv_wi4jrI6i7OTc"):
+        asyncio.run(solver.solve({"gate": "turnstile"}, timeout=0, poll_interval=0.25))
+
+
+def test_solvegate_refuses_a_pending_solve_it_cannot_poll() -> None:
+    _FakeClient.post_replies.append(_solvegate_pending(id=None))
+    solver = SolveGateSolver("https://api.solvegate.io", "sk_live_key")
+
+    with pytest.raises(SolverError, match="without an id"):
+        asyncio.run(solver.solve({"gate": "turnstile"}, poll_interval=0.25))
+
+
+def test_solvegate_names_an_expired_solve_on_retrieval() -> None:
+    from nanobot.agent.tools.captcha import SolveGateSolver as _S
+
+    _FakeClient.get_replies.append(("gone", 404))
+    solver = _S("https://api.solvegate.io", "sk_live_key")
+
+    with pytest.raises(SolverError, match="no solve slv_gone"):
+        asyncio.run(solver.retrieve("slv_gone"))
+
+
+def test_the_tool_polls_a_pending_live_solve_and_returns_the_token() -> None:
+    """One call from the model's side: submit, wait, token -- no id to chase."""
+    _FakeClient.post_replies.append(_solvegate_pending())
+    _FakeClient.get_replies.append(_solvegate_reply(token="live-token", billed=True))
+    tool = _solvegate_tool(solvegate_api_key="sk_live_key", poll_interval_seconds=0.25)
+
+    payload = json.loads(
+        asyncio.run(tool.execute("turnstile", sitekey="0x4AAA", url="https://example.com"))
+    )
+
+    assert payload["token"] == "live-token"
+    assert payload["sandbox"] is False
+    assert payload["billed"] is True
+    assert payload["solve_id"] == "slv_wi4jrI6i7OTc"
+    assert payload["note"].startswith("live token")
+
+
+# --- the two optional widget fields -----------------------------------------
+#
+# Measured against the live API on 2026-09-26: `action` and `cdata` are accepted
+# for gate=turnstile (and documented as ignored for waf), with the API's own
+# limits -- "at most 32"/"at most 255 ASCII letters, digits, underscores or
+# hyphens". Both are 400s at the API, so they are refused locally instead.
+# --------------------------------------------------------------------------
+
+
+def test_the_tool_sends_action_name_and_cdata_for_turnstile() -> None:
+    _FakeClient.post_replies.append(_solvegate_reply())
+    tool = _solvegate_tool()
+
+    asyncio.run(
+        tool.execute(
+            "turnstile",
+            sitekey="0x4AAA",
+            url="https://example.com",
+            action_name="login",
+            cdata="user-42_a",
+        )
+    )
+
+    body = _FakeClient.json_posts[-1][1]
+    assert body["action"] == "login"
+    assert body["cdata"] == "user-42_a"
+
+
+def test_the_two_widget_fields_are_left_off_a_waf_solve() -> None:
+    """The API documents both as ignored for WAF, so they are not sent."""
+    _FakeClient.post_replies.append(_solvegate_reply(gate="waf"))
+    tool = _solvegate_tool()
+
+    asyncio.run(
+        tool.execute(
+            "waf",
+            sitekey="0x4AAA",
+            url="https://example.com",
+            action_name="login",
+            cdata="user-42",
+        )
+    )
+
+    body = _FakeClient.json_posts[-1][1]
+    assert "action" not in body
+    assert "cdata" not in body
+
+
+def test_an_action_name_over_the_apis_limit_is_refused_locally() -> None:
+    tool = _solvegate_tool()
+
+    result = asyncio.run(
+        tool.execute(
+            "turnstile",
+            sitekey="0x4AAA",
+            url="https://example.com",
+            action_name="a" * 33,
+        )
+    )
+
+    assert "at most 32 characters" in str(result)
+    assert _FakeClient.json_posts == []
+
+
+def test_cdata_over_the_apis_limit_is_refused_locally() -> None:
+    tool = _solvegate_tool()
+
+    result = asyncio.run(
+        tool.execute("turnstile", sitekey="0x4AAA", url="https://example.com", cdata="c" * 256)
+    )
+
+    assert "at most 255 characters" in str(result)
+    assert _FakeClient.json_posts == []
+
+
+def test_a_widget_field_outside_the_permitted_characters_is_refused_locally() -> None:
+    tool = _solvegate_tool()
+
+    result = asyncio.run(
+        tool.execute(
+            "turnstile",
+            sitekey="0x4AAA",
+            url="https://example.com",
+            action_name="log in!",
+        )
+    )
+
+    assert "only ASCII letters, digits, underscores and hyphens" in str(result)
+    assert _FakeClient.json_posts == []
+
+
+def test_the_inbuilt_client_carries_cdata_on_its_turnstile_method() -> None:
+    """The 2captcha protocol names the same field, so both providers agree."""
+    _FakeClient.get_replies.append(("OK|tok", 200))
+    tool = CaptchaSolverTool(
+        base_url="http://solver.test",
+        api_key="inbuilt-key",
+        provider="capskip",
+    )
+
+    asyncio.run(
+        tool.execute(
+            "turnstile",
+            sitekey="0x4AAA",
+            url="https://example.com",
+            cdata="user-42",
+        )
+    )
+
+    submitted = _FakeClient.posts[-1][1]
+    assert submitted["method"] == "turnstile"
+    assert submitted["cdata"] == "user-42"

@@ -295,8 +295,20 @@ class SolveGateSolver:
     * ``gate`` is an enum of exactly ``turnstile`` and ``waf``. The API refuses
       anything else, so the tool refuses it first and names the provider that
       does support it.
-    * The call is **synchronous**: one request returns ``status: "solved"``
-      with the token, so there is no task id and nothing to poll.
+    * **Live solves are asynchronous.** A ``sk_live_`` key gets ``202`` back
+      with ``{"id": "slv_...", "status": "pending"}`` and no token; the finished
+      solve is fetched from ``GET /v1/solve/{id}`` until ``status`` leaves
+      ``pending``. Retrieval is free and never re-bills the solve.
+    * ``async: true`` is sent on every submit. Without it the server runs its own
+      synchronous wait and holds the socket for the whole attempt: measured, a
+      ``202`` arrived only after **20.2s**, against ``0.1s`` with the flag. A
+      submit that authenticates and stays ``pending`` for minutes on a target a
+      test key solves instantly is the account's capacity or balance, not the
+      request - the id is the thing to hand to SolveGate.
+    * **A test key answers synchronously**, ``200`` with ``status: "solved"``
+      and a fabricated token, which is where the earlier "nothing to poll"
+      reading of this API came from. Treating that as the only shape made every
+      real solve fail the moment it returned ``pending``.
     * A test key answers with ``mode: "sandbox"`` and a ``SANDBOX.``-prefixed
       token, which will not pass a real challenge. That is reported as sandbox
       rather than passed off as a solve.
@@ -304,6 +316,11 @@ class SolveGateSolver:
 
     #: The only two gates the API accepts.
     GATES = ("turnstile", "waf")
+
+    #: What a live solve reports while it is still running.
+    PENDING_STATUSES = ("pending", "queued", "processing", "running")
+    #: The one status that carries a token.
+    SOLVED_STATUS = "solved"
 
     def __init__(
         self,
@@ -336,24 +353,102 @@ class SolveGateSolver:
             return f"{code}: {message}" if code else message
         return str(body or "").strip()[:200]
 
-    async def solve(self, payload: dict[str, Any], *, attempts: int = 3) -> dict[str, Any]:
-        """Submit one solve, retrying only transport and 5xx failures.
+    @property
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+        }
 
-        A 4xx is the API saying the request itself is wrong - a bad gate, a
-        missing field, a revoked key. Retrying that fails identically, so it is
-        raised on the first attempt instead of burning the retry budget.
+    async def retrieve(self, task_id: str) -> dict[str, Any]:
+        """Fetch one solve by id. Free: retrieval never re-bills the solve."""
+        identifier = str(task_id or "").strip()
+        if not identifier:
+            raise SolverError("a solve id is required to retrieve a solve")
+        async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+            response = await client.get(
+                f"{self.endpoint}/{identifier}",
+                headers=self._headers,
+            )
+        if response.status_code == 404:
+            raise SolverError(
+                f"SolveGate has no solve {identifier} - it may have expired, since a "
+                f"retrieved solve is held only briefly"
+            )
+        if response.status_code == 401:
+            raise SolverError(
+                f"SolveGate rejected the key: {self._describe_error(response.text)}"
+            )
+        if response.status_code >= 400:
+            raise SolverError(
+                f"SolveGate refused the retrieval: {self._describe_error(response.text)}"
+            )
+        return self._parse(response.text)
+
+    async def solve(
+        self,
+        payload: dict[str, Any],
+        *,
+        attempts: int = 3,
+        timeout: float = 180.0,
+        poll_interval: float = 5.0,
+    ) -> dict[str, Any]:
+        """Submit one solve and return it solved, polling a live one to the end.
+
+        A 4xx on submit is the API saying the request itself is wrong - a bad
+        gate, a missing field, a revoked key. Retrying that fails identically,
+        so it is raised on the first attempt instead of burning the retry
+        budget. A ``202 / pending`` answer is not an error: it is the live API
+        saying the solve is running, and it is polled until it is terminal or
+        *timeout* runs out.
+        """
+        record = await self._submit(payload, attempts=attempts)
+        if record["status"] not in self.PENDING_STATUSES:
+            return self._finish(record)
+
+        task_id = str(record.get("id") or "").strip()
+        if not task_id:
+            raise SolverError(
+                "SolveGate reported a pending solve without an id, so it cannot be polled"
+            )
+
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        interval = max(float(poll_interval), 0.25)
+        while True:
+            if time.monotonic() >= deadline:
+                raise SolverError(
+                    f"SolveGate was still solving {task_id} after {int(timeout)}s "
+                    f"(status {record['status']!r}). A live solve normally lands in about "
+                    f"a second, so a solve that never leaves pending points at the "
+                    f"SolveGate account rather than at this request - retrieve it later "
+                    f"with the same id, or quote {task_id} to SolveGate"
+                )
+            await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+            record = await self.retrieve(task_id)
+            if record["status"] not in self.PENDING_STATUSES:
+                return self._finish(record)
+
+    async def _submit(self, payload: dict[str, Any], *, attempts: int) -> dict[str, Any]:
+        """POST the solve, retrying only transport and 5xx failures.
+
+        ``async: true`` is sent on every submit, whatever the caller passed. It is
+        not an optimisation: measured against the live API, a submit without it
+        holds the socket open for the server's own synchronous wait - a ``202``
+        came back only after **20.2s** - while the same submit with it returns in
+        ``0.1s`` and the solve is polled. That 20s sits inside this client's
+        request timeout, so a slower gate would surface as a read timeout, which
+        reads like a network fault rather than a slow solve. SolveGate's own MCP
+        client sends it for the same reason.
         """
         last: Exception | None = None
+        body = {**payload, "async": True}
         for attempt in range(max(1, attempts)):
             try:
                 async with httpx.AsyncClient(timeout=self.request_timeout) as client:
                     response = await client.post(
                         self.endpoint,
-                        json=payload,
-                        headers={
-                            "Authorization": f"Bearer {self.api_key}",
-                            "Accept": "application/json",
-                        },
+                        json=body,
+                        headers=self._headers,
                     )
                 if response.status_code == 415:
                     raise SolverError(
@@ -371,6 +466,8 @@ class SolveGateSolver:
                         f"SolveGate refused the task: {self._describe_error(response.text)}"
                     )
                 else:
+                    # 200 and 202 both land here: 202 is a live solve that is
+                    # still running, and its record is what gets polled.
                     return self._parse(response.text)
             except httpx.HTTPError as exc:
                 last = exc
@@ -381,7 +478,28 @@ class SolveGateSolver:
         raise last or SolverError("SolveGate could not accept the task")
 
     @staticmethod
+    def _finish(record: dict[str, Any]) -> dict[str, Any]:
+        """Return a solved record, or raise with the API's own reason."""
+        if record.get("status") == "solved":
+            return record
+        detail = (
+            str(record.get("error_message") or "").strip()
+            or str(record.get("error_code") or "").strip()
+            or str(record.get("status") or "").strip()
+        )
+        raise SolverError(
+            f"SolveGate did not solve the challenge: {detail or 'no token returned'}"
+        )
+
+    @staticmethod
     def _parse(body: str) -> dict[str, Any]:
+        """Read one solve object, pending or finished.
+
+        A record comes back for every status the API can answer with: a pending
+        one is not an error, it is the live API's running state, and
+        :meth:`solve` is what polls it to the end. Only a shape that cannot be
+        used at all is raised here.
+        """
         try:
             payload = json.loads(body)
         except ValueError as exc:
@@ -390,29 +508,25 @@ class SolveGateSolver:
             raise SolverError("SolveGate returned an unexpected body")
         status = str(payload.get("status") or "").strip().lower()
         token = str(payload.get("token") or "").strip()
-        if status == "solved" and token:
-            return {
-                "token": token,
-                "gate": str(payload.get("gate") or ""),
-                "id": str(payload.get("id") or ""),
-                "solve_ms": payload.get("solve_ms"),
-                "expires_at": payload.get("expires_at"),
-                # A sandbox token is not a real solve, so the caller has to be
-                # able to tell the two apart before trusting one.
-                "sandbox": (
-                    str(payload.get("mode") or "").strip().lower() == "sandbox"
-                    or token.startswith("SANDBOX.")
-                ),
-                "billed": bool(payload.get("billed")),
-            }
-        detail = (
-            str(payload.get("error_message") or "").strip()
-            or str(payload.get("error_code") or "").strip()
-            or str(payload.get("status") or "").strip()
-        )
-        raise SolverError(
-            f"SolveGate did not solve the challenge: {detail or 'no token returned'}"
-        )
+        if status == "solved" and not token:
+            raise SolverError("SolveGate reported a solved challenge with no token")
+        return {
+            "status": status,
+            "token": token,
+            "gate": str(payload.get("gate") or ""),
+            "id": str(payload.get("id") or ""),
+            "solve_ms": payload.get("solve_ms"),
+            "expires_at": payload.get("expires_at"),
+            # A sandbox token is not a real solve, so the caller has to be able
+            # to tell the two apart before trusting one.
+            "sandbox": (
+                str(payload.get("mode") or "").strip().lower() == "sandbox"
+                or token.startswith("SANDBOX.")
+            ),
+            "billed": bool(payload.get("billed")),
+            "error_code": payload.get("error_code"),
+            "error_message": payload.get("error_message"),
+        }
 
 
 class CaptchaSolverTool(Tool):
@@ -444,6 +558,13 @@ class CaptchaSolverTool(Tool):
     _SOLVEGATE_GATES = {"turnstile": "turnstile", "waf": "waf"}
     #: Longest window a single solve may occupy, so one call cannot pin a turn.
     _MAX_SOLVE_SECONDS = 600.0
+    #: SolveGate's own limits on the two optional turnstile fields, measured off
+    #: the live API: a longer action or cdata, or one carrying any character
+    #: outside this set, is a 400. Checking locally names the rule instead of
+    #: costing a round trip.
+    _TURNSTILE_FIELD = re.compile(r"[A-Za-z0-9_-]+")
+    _MAX_ACTION_NAME = 32
+    _MAX_CDATA = 255
 
     def __init__(
         self,
@@ -575,7 +696,9 @@ class CaptchaSolverTool(Tool):
             "Actions: balance, solve_image (a local image file, optionally steered with text), "
             "recaptcha (v2/v3/Enterprise), turnstile, hcaptcha, funcaptcha, geetest, altcha and "
             "coordinates (an image grid, answered with click coordinates). Every token action "
-            "needs the sitekey the widget was rendered with and the url of the page it sits on; "
+            "needs the sitekey the widget was rendered with and the url of the page it sits on. "
+            "A turnstile widget rendered with data-action or data-cdata must be solved with those "
+            "same strings in action_name and cdata, or the site's own check will reject the token; "
             "the human_browser tool's auto_captcha action detects both and calls this for you, so "
             "prefer that. Use this tool directly when you already have a sitekey, or for a "
             "picture challenge you can point at a file. A reply carrying \"sandbox\": true is a "
@@ -643,6 +766,7 @@ class CaptchaSolverTool(Tool):
                 "pagedata": {"type": ["string", "null"], "maxLength": self._MAX_TEXT},
                 "publickey": {"type": ["string", "null"], "maxLength": self._MAX_SITEKEY},
                 "surl": {"type": ["string", "null"], "maxLength": self._MAX_URL},
+                "cdata": {"type": ["string", "null"], "maxLength": self._MAX_CDATA},
                 "text": {"type": ["string", "null"], "maxLength": self._MAX_TEXT},
                 "min_score": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
             },
@@ -680,6 +804,25 @@ class CaptchaSolverTool(Tool):
             raise ValueError(f"{field} is required for {action}")
         return text
 
+    @classmethod
+    def _turnstile_field(cls, value: str | None, field: str, limit: int) -> str:
+        """Clean an optional turnstile ``action_name``/``cdata`` value.
+
+        Both travel inside the token Cloudflare issues, so they have to match
+        what the page's widget was rendered with; returning ``""`` means "leave
+        it out" rather than "send an empty one".
+        """
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if len(text) > limit:
+            raise ValueError(f"{field} must be at most {limit} characters")
+        if cls._TURNSTILE_FIELD.fullmatch(text) is None:
+            raise ValueError(
+                f"{field} may contain only ASCII letters, digits, underscores and hyphens"
+            )
+        return text
+
     def _fields_for(
         self,
         action: str,
@@ -701,6 +844,7 @@ class CaptchaSolverTool(Tool):
         surl: str | None = None,
         text: str | None = None,
         min_score: float | None = None,
+        cdata: str | None = None,
     ) -> dict[str, Any]:
         """Map tool arguments onto the solver's submit fields."""
         if action == "solve_image":
@@ -755,6 +899,8 @@ class CaptchaSolverTool(Tool):
             }
             if str(action_name or "").strip():
                 fields["action"] = str(action_name).strip()
+            if str(cdata or "").strip():
+                fields["cdata"] = str(cdata).strip()
             if data:
                 fields["data"] = data
             if pagedata:
@@ -815,13 +961,16 @@ class CaptchaSolverTool(Tool):
         sitekey: str | None,
         url: str | None,
         action_name: str | None = None,
+        cdata: str | None = None,
         min_score: float | None = None,
     ) -> Any:
         """Answer a Cloudflare challenge through SolveGate.
 
         SolveGate's ``gate`` is an enum of two, so an action it cannot serve is
         refused here with the reason, rather than being sent and coming back as
-        a generic bad_request the model cannot act on.
+        a generic bad_request the model cannot act on. A live solve comes back
+        pending and is polled to the token here, inside the tool's own timeout,
+        so the caller gets one answer rather than a task id to chase.
         """
         gate = self._SOLVEGATE_GATES.get(action)
         if gate is None:
@@ -840,10 +989,17 @@ class CaptchaSolverTool(Tool):
             # a request target, and the endpoint stays pinned to configuration.
             "url": self._require(url, "url", action),
         }
-        if str(action_name or "").strip():
-            payload["action"] = str(action_name).strip()
-        if gate == "turnstile" and min_score is not None:
-            payload["min_score"] = min(max(float(min_score), 0.1), 0.9)
+        if gate == "turnstile":
+            # The API documents both of these as ignored for WAF, so they are
+            # only sent for the widget.
+            widget_action = self._turnstile_field(action_name, "action_name", self._MAX_ACTION_NAME)
+            widget_cdata = self._turnstile_field(cdata, "cdata", self._MAX_CDATA)
+            if widget_action:
+                payload["action"] = widget_action
+            if widget_cdata:
+                payload["cdata"] = widget_cdata
+            if min_score is not None:
+                payload["min_score"] = min(max(float(min_score), 0.1), 0.9)
 
         solver = SolveGateSolver(
             self.solvegate_base_url,
@@ -851,20 +1007,27 @@ class CaptchaSolverTool(Tool):
             request_timeout=self.request_timeout_seconds,
         )
         started = time.monotonic()
-        result = await solver.solve(payload)
+        result = await solver.solve(
+            payload,
+            timeout=min(float(self.timeout_seconds), self._MAX_SOLVE_SECONDS),
+            poll_interval=self.poll_interval_seconds,
+        )
+        waited = round(time.monotonic() - started, 2)
         return json.dumps(
             {
                 "captcha_type": action,
                 "provider": "solvegate",
                 "token": result["token"],
                 "sandbox": result["sandbox"],
+                "billed": result.get("billed"),
+                "solve_id": result.get("id"),
                 "solve_ms": result.get("solve_ms"),
                 "expires_at": result.get("expires_at"),
-                "elapsed_seconds": round(time.monotonic() - started, 2),
+                "elapsed_seconds": waited,
                 "note": (
                     "test-mode token; a real challenge will not accept it"
                     if result["sandbox"]
-                    else "submit this token to the page"
+                    else f"live token for {action}; write it into the page and submit"
                 ),
             }
         )
@@ -889,6 +1052,7 @@ class CaptchaSolverTool(Tool):
         surl: str | None = None,
         text: str | None = None,
         min_score: float | None = None,
+        cdata: str | None = None,
     ) -> Any:
         action = str(action or "").strip().lower()
         if action not in self._ACTIONS:
@@ -936,6 +1100,7 @@ class CaptchaSolverTool(Tool):
                     sitekey=sitekey,
                     url=url,
                     action_name=action_name,
+                    cdata=cdata,
                     min_score=min_score,
                 )
 
@@ -960,6 +1125,7 @@ class CaptchaSolverTool(Tool):
                 surl=surl,
                 text=text,
                 min_score=min_score,
+                cdata=cdata,
             )
             started = time.monotonic()
             token = await solver.solve(
