@@ -89,7 +89,83 @@ prs.save("deck.pptx")
 A full-bleed image is a picture at `(0, 0)` sized to the slide, with the text on top —
 `left=top=0`, `width=prs.slide_width`, `height=prs.slide_height`.
 
-## 3. Verify the picture is really in the file
+## 3. Put it where the user asked
+
+"Put the chart in section 3.2" is a **placement** requirement, and it means something
+different in each format. Getting this wrong is the difference between a document that looks
+professional and one where a figure floats four pages from the text discussing it.
+
+**DOCX and PDF flow. PowerPoint does not.**
+
+| Format | Placement | Exact spot? |
+|---|---|---|
+| PPTX | absolute — `Inches(2)`, `Inches(1.5)` | **Yes.** A slide is a fixed canvas. |
+| DOCX | a *paragraph* in a stream of paragraphs | "In this section", not "on page 4". |
+| LaTeX PDF | a float, unless forced | `[H]` forces it; `[htbp]` lets it migrate. |
+
+**DOCX — place by section, in document order.** A long document is the case that breaks: the
+figure belongs after the paragraph that introduces it, not merely somewhere near it. Build
+from an ordered outline so the figure is inserted where it is meant to sit:
+
+```python
+for block in blocks:                       # your outline, in order
+    if block.kind == "heading":
+        doc.add_heading(block.text, level=1)
+    elif block.kind == "figure":
+        doc.add_paragraph().add_run().add_picture(block.path, width=Inches(4))
+    else:
+        doc.add_paragraph(block.text)
+```
+
+Two hard limits to know before promising a layout:
+
+- **python-docx has no anchored (floating) image.** Every picture is inline, in a paragraph,
+  so there are no absolute page coordinates: the page a figure lands on depends on everything
+  above it, and it moves if the text grows. Place it by section and accept that.
+- **A table is how you pin a picture beside text** — a two-column look, a logo beside contact
+  details, a caption alongside a chart:
+
+```python
+table = doc.add_table(rows=1, cols=2)
+table.cell(0, 0).text = "Caption or body text beside the figure."
+table.cell(0, 1).paragraphs[0].add_run().add_picture("assets/chart.png", width=Inches(2.5))
+```
+
+**LaTeX — if the position matters, force it.** An unforced float is why a figure appears pages
+from its reference:
+
+```latex
+\usepackage{graphicx}
+\usepackage{float}                        % provides [H]
+\begin{figure}[H]                         % NOT [htbp] when placement matters
+  \centering
+  \includegraphics[width=0.8\linewidth]{assets/chart.png}
+  \caption{Caption}
+\end{figure}
+```
+
+If `pdflatex` is not installed (check `which pdflatex` first — it is absent from some
+sandboxes), build the DOCX instead and convert with `libreoffice --headless --convert-to pdf`;
+placement then follows the DOCX rules above.
+
+**Verify placement the way you verify presence** — read the file back and ask *which section*
+holds the picture, rather than trusting the builder:
+
+```python
+import docx
+from docx.oxml.ns import qn
+current = ""
+for para in docx.Document("report.docx").paragraphs:
+    if para.style.name.startswith("Heading"):
+        current = para.text
+    elif para._p.findall(".//" + qn("a:blip")):
+        print("figure sits under:", current)   # must be the section you were asked for
+        break
+```
+
+A figure that is present but in the wrong section has still failed the brief.
+
+## 4. Verify the picture is really in the file
 
 Do not trust "the script ran". Read the artifact back.
 
@@ -119,3 +195,8 @@ white-on-white has still failed the brief.
 - **Opened as text** — `.jpg` bytes that are actually an HTML error page. Check `content_type`
   and `bytes`, and prefer re-fetching over shipping it.
 - **Too big** — 20 MB+ images are refused by `web_fetch` on purpose; resize first with Pillow.
+- **Present but in the wrong section** — the figure was appended at the end instead of inserted
+  at its place in the outline. In a long document check which heading it sits under.
+- **Floated away** — an unforced LaTeX float migrated; use `[H]`, not `[htbp]`.
+- **Squashed or cropped** — width *and* height both set, or a full-bleed forced onto a
+  different aspect ratio. Set one dimension, or crop deliberately.
