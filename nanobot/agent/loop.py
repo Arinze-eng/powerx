@@ -1684,8 +1684,19 @@ class AgentLoop:
         Off by default so behaviour is unchanged until explicitly turned on
         with POWERX_STEER_MID_SESSION=1. Per-message metadata always beats
         this switch.
+
+        Parsed with the same opt-in convention as POWERX_REFLECTION et al, and
+        deliberately NOT with a bare bool(). ``bool(os.environ.get(...))`` is
+        True for the string "0", so an operator setting
+        POWERX_STEER_MID_SESSION=0 in a dashboard to mean "off" would have
+        silently turned steering ON. Only an explicit affirmative value
+        enables it; anything else -- unset, "", "0", "false", "no", "off" --
+        leaves the existing injection behaviour untouched.
         """
-        return bool(os.environ.get("POWERX_STEER_MID_SESSION"))
+        raw = os.environ.get("POWERX_STEER_MID_SESSION")
+        if raw is None:
+            return False
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
 
     def _should_steer(self, msg: InboundMessage, raw: str) -> bool:
         """Decide whether this follow-up preempts the running turn.

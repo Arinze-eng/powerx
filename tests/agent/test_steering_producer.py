@@ -189,6 +189,25 @@ class TestSteeringPolicy:
         msg = self._msg(metadata={"steer": True})
         assert loop._should_steer(msg, "follow up") is True
 
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off", "", "  "])
+    def test_explicit_negative_values_do_not_enable_steering(self, monkeypatch, value):
+        """Regression: bool(os.environ.get(...)) is True for the string "0".
+
+        An operator setting POWERX_STEER_MID_SESSION=0 in a deploy dashboard to
+        mean OFF must not switch steering ON. Only affirmative values enable it.
+        """
+        monkeypatch.setenv("POWERX_STEER_MID_SESSION", value)
+        loop = self._loop()
+        assert loop.steering_enabled() is False
+        assert loop._should_steer(self._msg(), "follow up") is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", " 1 "])
+    def test_affirmative_values_enable_steering(self, monkeypatch, value):
+        monkeypatch.setenv("POWERX_STEER_MID_SESSION", value)
+        loop = self._loop()
+        assert loop.steering_enabled() is True
+        assert loop._should_steer(self._msg(), "follow up") is True
+
     def test_metadata_vetoes_env(self, monkeypatch):
         """An explicit steer=False must beat the global switch."""
         monkeypatch.setenv("POWERX_STEER_MID_SESSION", "1")
