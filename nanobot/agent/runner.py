@@ -1059,6 +1059,9 @@ class AgentRunner:
                     self._append_final_message(messages, formatted)
                     usage["prompt_tokens"] += response.usage.get("prompt_tokens", 0)
                     usage["completion_tokens"] += response.usage.get("completion_tokens", 0)
+                    usage["cached_tokens"] = usage.get("cached_tokens", 0) + int(
+                        response.usage.get("cached_tokens", 0) or 0
+                    )
                     usage["middleware_formatted"] = int(
                         usage.get("middleware_formatted", 0)
                     ) + 1

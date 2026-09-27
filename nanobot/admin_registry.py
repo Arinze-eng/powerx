@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,8 @@ from nanobot.agent.tools.vps_backend import (
     validate_vps_workspace,
 )
 from nanobot.config.loader import load_config, resolve_env_refs, save_config
+from nanobot.providers.prompt_cache import normalize_cache_mode, resolve_cache_mode
+from nanobot.providers.registry import find_by_name
 from nanobot.execution_env import apply_render_execution_env
 from nanobot.webui.http_utils import http_error, http_json_response, http_response
 
@@ -210,16 +213,25 @@ def _provider_settings() -> dict[str, Any]:
         model = str(resolve_env_refs(config.agents.defaults.model or "") or "")
         if model.startswith("custom/"):
             model = model[len("custom/"):]
+        spec = find_by_name("custom")
         return {
             "apiBase": str(api_base or "").strip(),
             "model": model.strip(),
             "apiKeyConfigured": bool(str(api_key or "").strip()),
+            # "" means "not chosen here": the env var, the provider spec and the
+            # safe default decide, and effectivePromptCache reports which won.
+            "promptCache": str(getattr(provider, "prompt_cache", "") or ""),
+            "effectivePromptCache": resolve_cache_mode(
+                configured=getattr(provider, "prompt_cache", None), spec=spec,
+            ),
         }
     except Exception:
         return {
             "apiBase": os.getenv("LLM_BASE_URL", ""),
             "model": os.getenv("LLM_MODEL", ""),
             "apiKeyConfigured": bool(os.getenv("LLM_API_KEY", "").strip()),
+            "promptCache": "",
+            "effectivePromptCache": resolve_cache_mode(),
         }
 
 
@@ -330,6 +342,16 @@ def _save_response(
         config.providers.custom.api_base = api_base
         if api_key:
             config.providers.custom.api_key = api_key
+        cache_mode = _text(payload, "promptCache", maximum=16)
+        if cache_mode:
+            normalized = normalize_cache_mode(cache_mode)
+            if normalized is None:
+                # An explicit "off" must be distinguishable from "unset", which
+                # is why the empty string means "keep whatever is saved".
+                normalized = "off" if cache_mode.strip().lower() in ("off", "none", "disable") else None
+            if normalized is None:
+                raise ValueError("promptCache must be one of: auto, markers, off")
+            config.providers.custom.prompt_cache = normalized  # type: ignore[assignment]
         config.agents.defaults.model = f"custom/{model}"
         save_config(config, config_path)
         if refresh_runtime_config is not None:
@@ -1280,6 +1302,155 @@ def _pool_models_response(payload: dict[str, Any]) -> Response:
         return http_error(502, f"Could not load models: {type(exc).__name__}")
 
 
+def _cache_probe_call(
+    client: httpx.Client,
+    api_base: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """One measured chat completion; returns usage plus the reply text."""
+    response = _request_with_auth_fallback(
+        lambda headers: client.post(
+            f"{api_base}/chat/completions",
+            headers={**headers, "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": messages,
+                # Room for a thinking model to finish its reasoning and still
+                # reach the answer: a truncated reply would look like a lost
+                # context block when it is really just a short budget.
+                "max_tokens": 256,
+                "temperature": 0,
+            },
+        ),
+        api_key,
+    )
+    response.raise_for_status()
+    body = response.json()
+    choices = body.get("choices") or []
+    message = (choices[0] or {}).get("message") if choices else {}
+    content = message.get("content") if isinstance(message, dict) else ""
+    if isinstance(content, list):
+        content = " ".join(
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict)
+        )
+    # Reasoning models put the trace in a separate field; the vault code can
+    # legitimately appear there, so both are searched for the recital check.
+    visible = str(content or "")
+    reasoning = message.get("reasoning_content") if isinstance(message, dict) else ""
+    if reasoning:
+        visible = f"{visible}\n{reasoning}"
+    usage = body.get("usage") or {}
+    details = usage.get("prompt_tokens_details") or {}
+    cached = usage.get("cached_tokens", details.get("cached_tokens", 0)) or 0
+    prompt = int(usage.get("prompt_tokens") or 0)
+    return {
+        "reply": visible,
+        "prompt_tokens": prompt,
+        "cached_tokens": int(cached),
+        "hit_pct": round(int(cached) * 100.0 / prompt, 1) if prompt > 0 else 0.0,
+        "cache_discount": usage.get("cache_discount", 0) or 0,
+        "cost": usage.get("cost", 0) or 0,
+    }
+
+
+def _cache_test_response(payload: dict[str, Any]) -> Response:
+    """Measure whether the configured endpoint caches, and whether markers are safe.
+
+    Two questions a cost-conscious operator cannot answer from the settings
+    screen: does this gateway serve a repeated prefix from cache, and does it
+    tolerate explicit ``cache_control`` breakpoints? Both are answered by
+    sending the same large prefix twice and comparing the usage blocks - and,
+    for markers, by asking the model to recite a token that exists only inside
+    the marked block. A gateway that accepts the field and then drops the block
+    still returns HTTP 200, so the recital is the only honest check.
+    """
+    try:
+        api_base, model, api_key = _credentials(payload)
+        secret = f"ZULU-{uuid.uuid4().hex[:6].upper()}-7719"
+        filler = (
+            "Reference line for the powerx trading platform prompt-cache probe. " * 320
+        )
+        prefix = f"The internal vault code is {secret}.\n{filler}"
+        question = [
+            {
+                "role": "user",
+                "content": "Reply with only the internal vault code, exactly as given.",
+            }
+        ]
+        plain = [{"role": "system", "content": prefix}, *question]
+        marked = [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
+                ],
+            },
+            *question,
+        ]
+        with httpx.Client(timeout=120.0, follow_redirects=False) as client:
+            first = _cache_probe_call(client, api_base, api_key, model, plain)
+            second = _cache_probe_call(client, api_base, api_key, model, plain)
+            result: dict[str, Any] = {
+                "ok": True,
+                "model": model,
+                "apiBase": api_base,
+                "secretEchoed": secret in first["reply"],
+                "auto": {
+                    "cached_tokens": second["cached_tokens"],
+                    "prompt_tokens": second["prompt_tokens"],
+                    "hit_pct": second["hit_pct"],
+                    "cache_discount": second["cache_discount"],
+                },
+            }
+            try:
+                marked_reply = _cache_probe_call(client, api_base, api_key, model, marked)
+                result["markers"] = {
+                    "accepted": True,
+                    "cached_tokens": marked_reply["cached_tokens"],
+                    "hit_pct": marked_reply["hit_pct"],
+                    "context_kept": secret in marked_reply["reply"],
+                    "prompt_tokens": marked_reply["prompt_tokens"],
+                }
+            except httpx.HTTPStatusError as exc:
+                result["markers"] = {
+                    "accepted": False,
+                    "status": exc.response.status_code,
+                    "reason": exc.response.text[:200],
+                }
+        auto_hit = bool(result["auto"]["cached_tokens"])
+        markers = result["markers"]
+        if markers.get("accepted") and markers.get("context_kept"):
+            recommended = "markers" if not auto_hit else "auto"
+        else:
+            recommended = "auto"
+        result["recommended"] = recommended
+        result["detail"] = (
+            "Automatic prefix caching is working; leave the mode on auto."
+            if auto_hit and not (markers.get("accepted") and markers.get("context_kept"))
+            else "Set the mode to markers: this endpoint needs explicit breakpoints."
+            if markers.get("accepted") and markers.get("context_kept") and not auto_hit
+            else "The endpoint did not report any cached tokens: a repeat request is billed in full."
+            if not auto_hit
+            else "Both automatic caching and explicit markers work here; auto is the safer default."
+        )
+        if markers.get("accepted") and not markers.get("context_kept"):
+            result["detail"] = (
+                "Do NOT use markers on this endpoint: it accepted the marked request "
+                "but the model never received the marked block."
+            )
+        return http_json_response(result)
+    except ValueError as exc:
+        return http_error(400, str(exc))
+    except httpx.HTTPStatusError as exc:
+        return http_error(502, f"Cache probe failed with HTTP {exc.response.status_code}.")
+    except (httpx.HTTPError, ValueError) as exc:
+        return http_error(502, f"Cache probe failed: {type(exc).__name__}")
+
+
 def _admin_page(rows: list[dict[str, Any]]) -> str:
     body_rows = "".join(
         "<tr>"
@@ -1291,8 +1462,8 @@ def _admin_page(rows: list[dict[str, Any]]) -> str:
         "</tr>"
         for row in rows
     )
-    return f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Nanobot Admin</title><style>body{{font-family:system-ui,sans-serif;background:#0b1020;color:#eef2ff;margin:2rem;max-width:1100px}}section{{background:#121a31;border:1px solid #2a3557;border-radius:12px;padding:1.2rem;margin:1rem 0}}table{{border-collapse:collapse;width:100%;background:#121a31}}th,td{{padding:.7rem;border:1px solid #2a3557;text-align:left}}th{{color:#93c5fd}}input,select,textarea{{box-sizing:border-box;width:100%;padding:.65rem;border-radius:7px;border:1px solid #46557e;background:#0b1020;color:#eef2ff;margin:.25rem 0 .7rem}}button{{padding:.65rem .9rem;border:0;border-radius:7px;background:#2563eb;color:white;cursor:pointer;margin:.25rem .4rem .25rem 0}}button.secondary{{background:#334155}}#status{{min-height:1.4rem;color:#a7f3d0;white-space:pre-wrap}}.hint{{color:#aab6d3;font-size:.9rem}}code{{color:#a7f3d0}}@media (max-width:680px){{body{{margin:.5rem;max-width:none}}section{{padding:.75rem;border-radius:8px}}button{{width:100%;margin:.25rem 0}}label{{display:block}}table{{font-size:.78rem;min-width:680px}}#dbqRowsView,#dbqSchemaView{{-webkit-overflow-scrolling:touch}}pre{{font-size:.78rem;max-height:20rem;overflow:auto;white-space:pre-wrap;word-break:break-word}}}}</style></head><body><h1>Nanobot Admin</h1><section><h2>Provider settings</h2><p class='hint'>Update the OpenAI-compatible API base URL, API key, and model ID. The API key is never displayed after saving.</p><label>API base URL<input id='apiBase' type='url' placeholder='https://example.com/v1'></label><label>API key<input id='apiKey' type='password' placeholder='Leave blank to keep the current key'></label><label>Model ID<input id='model' list='modelList' placeholder='gemini-3.1-flash-lite'><datalist id='modelList'></datalist></label><button id='loadModels' class='secondary'>Load models</button><button id='testProvider'>Test connection</button><button id='saveProvider'>Save settings</button><p id='status'></p></section>{_provider_pool_section()}{_execution_admin_section()}{_dbq_admin_section()}<section><h2>Supabase users, credits and payments</h2><p class='hint'>This view reads the existing Supabase <code>profiles</code>, <code>telegram_accounts</code>, and <code>payment_claims</code> tables. Credit changes use the database-backed ledger path.</p><button id='refreshSupabase' class='secondary'>Load database users</button><div style='overflow:auto;margin-top:1rem'><table><thead><tr><th>User ID</th><th>Name / email</th><th>Role</th><th>Status</th><th>Credits</th><th>Last seen</th><th>Questions</th><th>Telegram</th></tr></thead><tbody id='supabaseRows'><tr><td colspan='8'>Click Load database users.</td></tr></tbody></table></div><label>Selected user ID<input id='supabaseUserId' placeholder='UUID from the table'></label><label>Grant credits<input id='grantAmount' type='number' min='1' max='1000000' value='1000'></label><label><input id='blockState' type='checkbox'> Block selected user</label><button id='grantCredits'>Grant credits</button><button id='blockUser' class='secondary'>Block / unblock selected user</button><button id='deleteUser' class='secondary'>Delete selected user</button><h3>Announcement</h3><label>Title<input id='announcementTitle' value='Nanobot announcement'></label><label>Message<textarea id='announcementMessage' rows='3' placeholder='Message shown to users'></textarea></label><button id='sendAnnouncement'>Publish announcement</button><h3>Payment claims</h3><button id='loadPayments' class='secondary'>Load payment claims</button><pre id='paymentRows' class='hint'>No payment claims loaded.</pre></section><section><h2>Telegram user questions</h2><p class='hint'>Recent task instructions captured from Telegram. Credentials and token-like values are redacted before storage.</p><button id='loadQuestions' class='secondary'>Load question history</button><pre id='questionRows' class='hint'>No question history loaded.</pre></section><section><h2>WebUI user questions</h2><p class='hint'>Questions asked by users on the WebUI website, with their name/email and the type/category of each question.</p><button id='loadWebuiQuestions' class='secondary'>Load WebUI question history</button><pre id='webuiQuestionRows' class='hint'>No WebUI question history loaded.</pre></section><section><h2>APK users &mdash; last seen &amp; questions</h2><p class='hint'>Mobile (APK) users connect through the same gateway as the WebUI, so their presence lands in the same tables. Last seen is rendered in West Africa Time (WAT, UTC+1). Each question shows its source channel (apk / webui); APK clients tag themselves automatically.</p><button id='loadApkUsers' class='secondary'>Load APK users</button><div style='overflow:auto;margin-top:1rem'><table><thead><tr><th>User</th><th>Last seen (WAT)</th><th>Questions</th><th>Recent questions</th></tr></thead><tbody id='apkRows'><tr><td colspan='4'>Click Load APK users.</td></tr></tbody></table></div></section><section><h2>Telegram users</h2><p>Telegram users recorded: <strong>{len(rows)}</strong></p><table><thead><tr><th>Username</th><th>Name</th><th>Telegram ID</th><th>Last seen</th><th>Messages</th></tr></thead><tbody>{body_rows or '<tr><td colspan="5">No users recorded yet.</td></tr>'}</tbody></table><p class='hint'><code>GET /api/admin/users</code> is available with the same Basic Auth credentials.</p></section><script>(()=>{{const $=id=>document.getElementById(id);const status=(text,ok=true)=>{{$('status').textContent=text;$('status').style.color=ok?'#a7f3d0':'#fca5a5';}};const fmtWAT=(v)=>{{if(!v)return '—';const d=new Date(v);if(isNaN(d.getTime()))return String(v);const w=new Date(d.getTime()+60*60*1000);const p=n=>String(n).padStart(2,'0');return `${{w.getUTCFullYear()}}-${{p(w.getUTCMonth()+1)}}-${{p(w.getUTCDate())}} ${{p(w.getUTCHours())}}:${{p(w.getUTCMinutes())}} WAT`;}};
-let socket=null;const pending=new Map();const request=(action,payload={{}})=>new Promise(async(resolve,reject)=>{{try{{if(!socket||socket.readyState!==1){{const boot=await fetch('/api/admin/ws-bootstrap',{{cache:'no-store'}}).then(r=>r.ok?r.json():Promise.reject(Object.assign(new Error(r.status===401?'Admin session expired':'Admin service unavailable (HTTP '+r.status+'). Retrying...'),{{status:r.status}})));const scheme=location.protocol==='https:'?'wss':'ws';socket=new WebSocket(`${{scheme}}://${{location.host}}${{boot.ws_path}}?token=${{encodeURIComponent(boot.token)}}&client_id=admin`);socket.onmessage=e=>{{const msg=JSON.parse(e.data);if(msg.event==='webui_response'&&pending.has(msg.request_id)){{const p=pending.get(msg.request_id);pending.delete(msg.request_id);msg.ok?p.resolve(msg.result):p.reject(new Error(msg.error?.message||'Admin request failed'));}}}};socket.onclose=()=>{{for(const p of pending.values())p.reject(new Error('The admin socket closed before a reply arrived.'));pending.clear();}};socket.onerror=()=>{{for(const p of pending.values())p.reject(new Error('Admin socket failed'));pending.clear();}};await new Promise((res,rej)=>{{socket.addEventListener('open',res,{{once:true}});socket.addEventListener('error',()=>rej(new Error('Admin socket failed')),{{once:true}});}});}}const requestId=`admin-${{Date.now()}}-${{Math.random().toString(36).slice(2)}}`;const timer=setTimeout(()=>{{const p=pending.get(requestId);if(p){{pending.delete(requestId);p.reject(new Error('No reply from the admin server after 150s. Check the lane and try again.'));}}}},150000);const guard=fn=>value=>{{clearTimeout(timer);fn(value);}};pending.set(requestId,{{resolve:guard(resolve),reject:guard(reject)}});socket.send(JSON.stringify({{type:'webui_request',request_id:requestId,action,payload}}));}}catch(e){{reject(e);}}}});window.nanobotAdminRequest=request;const fields=()=>({{apiBase:$('apiBase').value,apiKey:$('apiKey').value,model:$('model').value}});fetch('/api/admin/provider-settings',{{cache:'no-store'}}).then(r=>r.json()).then(v=>{{$('apiBase').value=v.apiBase||'';$('model').value=v.model||'';}}).catch(e=>status(e.message,false));$('loadModels').onclick=async()=>{{status('Loading models...');try{{const v=await request('admin.provider.models',fields());const list=$('modelList');list.replaceChildren(...(v.models||[]).map(id=>{{const o=document.createElement('option');o.value=id;return o}}));status(`Loaded ${{v.count||0}} model(s). Choose one and save.`);}}catch(e){{status(e.message,false);}}}};$('testProvider').onclick=async()=>{{status('Testing provider...');try{{const v=await request('admin.provider.test',fields());status(`Provider test passed. Response: ${{v.response||'(empty)'}}`);}}catch(e){{status(e.message,false);}}}};$('saveProvider').onclick=async()=>{{status('Saving settings...');try{{const v=await request('admin.provider.save',fields());$('apiKey').value='';status(`Saved. Active model: ${{v.model||$('model').value}}`);}}catch(e){{status(e.message,false);}}}};const adminAction=async(kind,extra={{}})=>{{const userId=$('supabaseUserId').value.trim();if(kind!=='announcement'&&!userId){{status('Select or enter a user ID first.',false);return;}}status('Working...');try{{const v=await request('admin.supabase.action',{{kind,userId,...extra}});if(kind==='announcement'){{status(`Announcement delivered to ${{v.sent||0}}/${{v.total||0}} Telegram chat(s); failed: ${{v.failed||0}}.`);}}else{{status(`Completed: ${{v.action||kind}}`);}}$('refreshSupabase').click();}}catch(e){{status(e.message,false);}}}};$('refreshSupabase').onclick=async()=>{{status('Loading Supabase users...');try{{const r=await fetch('/api/admin/supabase/users',{{cache:'no-store'}});if(!r.ok)throw new Error(`Database users request failed: ${{r.status}}`);const v=await r.json();const rows=v.users||[];$('supabaseRows').replaceChildren(...rows.map(u=>{{const tr=document.createElement('tr');tr.dataset.id=String(u.id||'');const tg=(u.telegram_accounts||[]).map(a=>`@${{a.username||''}} (${{a.telegram_user_id||''}})`).join(', ');tr.innerHTML=`<td>${{String(u.id||'')}}</td><td>${{String(u.name||'')}}<br><span class='hint'>${{String(u.email||'')}}</span></td><td>${{String(u.role||'')}}</td><td>${{String(u.status||'')}}</td><td>${{String(u.total_credits||0)}}</td><td>${{fmtWAT(u.last_seen_at)}}</td><td>${{String(u.questions_count??0)}}</td><td>${{tg||'—'}}</td>`;tr.onclick=()=>{{$('supabaseUserId').value=String(u.id||'');document.querySelectorAll('#supabaseRows tr').forEach(x=>x.style.outline='');tr.style.outline='2px solid #60a5fa';}};return tr}}));status(`Loaded ${{rows.length}} Supabase user(s). Click a row to select it.`);}}catch(e){{status(e.message,false);}}}};$('grantCredits').onclick=()=>adminAction('grant',{{amount:Number($('grantAmount').value||0)}});$('blockUser').onclick=()=>adminAction('block',{{blocked:$('blockState').checked}});$('deleteUser').onclick=()=>{{if(confirm('Delete the selected Supabase user and their Auth account? This cannot be undone.'))void adminAction('delete')}};$('sendAnnouncement').onclick=()=>adminAction('announcement',{{title:$('announcementTitle').value,message:$('announcementMessage').value}});$('loadPayments').onclick=async()=>{{status('Loading payment claims...');try{{const r=await fetch('/api/admin/supabase/payments',{{cache:'no-store'}});if(!r.ok)throw new Error(`Payment claims request failed: ${{r.status}}`);const v=await r.json();$('paymentRows').textContent=JSON.stringify(v.payments||[],null,2);status(`Loaded ${{(v.payments||[]).length}} payment claim(s).`);}}catch(e){{status(e.message,false);}}}};$('loadQuestions').onclick=async()=>{{status('Loading Telegram question history...');try{{const r=await fetch('/api/admin/supabase/questions',{{cache:'no-store'}});if(!r.ok)throw new Error(`Question history request failed: ${{r.status}}`);const v=await r.json();$('questionRows').textContent=JSON.stringify(v.questions||[],null,2);status(`Loaded ${{(v.questions||[]).length}} Telegram question(s).`);}}catch(e){{status(e.message,false);}}}};$('loadWebuiQuestions').onclick=async()=>{{status('Loading WebUI question history...');try{{const r=await fetch('/api/admin/supabase/webui-questions',{{cache:'no-store'}});if(!r.ok)throw new Error(`WebUI question history request failed: ${{r.status}}`);const v=await r.json();$('webuiQuestionRows').textContent=JSON.stringify((v.questions||[]).map(q=>({{user:q.user_name||q.user_id||'?',email:q.user_email||'',type:q.category||'',question:(q.message||'').slice(0,300),at:q.created_at}})),null,2);status(`Loaded ${{(v.questions||[]).length}} WebUI question(s).`);}}catch(e){{status(e.message,false);}}}};$('loadApkUsers').onclick=async()=>{{status('Loading APK users...');try{{const r=await fetch('/api/admin/supabase/apk-users',{{cache:'no-store'}});if(!r.ok)throw new Error(`APK users request failed: ${{r.status}}`);const v=await r.json();const rows=v.users||[];const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));$('apkRows').replaceChildren(...rows.map(u=>{{const tr=document.createElement('tr');const td=html=>{{const c=document.createElement('td');c.innerHTML=html;return c}};const qs=(u.questions||[]).slice(0,5).map(q=>`<div class='hint'>${{fmtWAT(q.created_at)}} &mdash; [${{esc(q.category||'webui')}}] ${{esc(String(q.message||'').slice(0,220))}}</div>`).join('')||'&mdash;';tr.appendChild(td(`${{esc(u.name||'')}}<br><span class='hint'>${{esc(u.email||'')}}</span>`));tr.appendChild(td(fmtWAT(u.last_seen_at)||'&mdash;'));tr.appendChild(td(String(u.questions_count??0)));tr.appendChild(td(qs));return tr}}));status(`Loaded ${{rows.length}} user(s). Last seen shown in WAT.`);}}catch(e){{status(e.message,false);}}}};void $('refreshSupabase').click();void $('loadQuestions').click();}})();</script></body></html>"""
+    return f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Nanobot Admin</title><style>body{{font-family:system-ui,sans-serif;background:#0b1020;color:#eef2ff;margin:2rem;max-width:1100px}}section{{background:#121a31;border:1px solid #2a3557;border-radius:12px;padding:1.2rem;margin:1rem 0}}table{{border-collapse:collapse;width:100%;background:#121a31}}th,td{{padding:.7rem;border:1px solid #2a3557;text-align:left}}th{{color:#93c5fd}}input,select,textarea{{box-sizing:border-box;width:100%;padding:.65rem;border-radius:7px;border:1px solid #46557e;background:#0b1020;color:#eef2ff;margin:.25rem 0 .7rem}}button{{padding:.65rem .9rem;border:0;border-radius:7px;background:#2563eb;color:white;cursor:pointer;margin:.25rem .4rem .25rem 0}}button.secondary{{background:#334155}}#status{{min-height:1.4rem;color:#a7f3d0;white-space:pre-wrap}}.hint{{color:#aab6d3;font-size:.9rem}}code{{color:#a7f3d0}}@media (max-width:680px){{body{{margin:.5rem;max-width:none}}section{{padding:.75rem;border-radius:8px}}button{{width:100%;margin:.25rem 0}}label{{display:block}}table{{font-size:.78rem;min-width:680px}}#dbqRowsView,#dbqSchemaView{{-webkit-overflow-scrolling:touch}}pre{{font-size:.78rem;max-height:20rem;overflow:auto;white-space:pre-wrap;word-break:break-word}}}}</style></head><body><h1>Nanobot Admin</h1><section><h2>Provider settings</h2><p class='hint'>Update the OpenAI-compatible API base URL, API key, and model ID. The API key is never displayed after saving.</p><label>API base URL<input id='apiBase' type='url' placeholder='https://example.com/v1'></label><label>API key<input id='apiKey' type='password' placeholder='Leave blank to keep the current key'></label><label>Model ID<input id='model' list='modelList' placeholder='gemini-3.1-flash-lite'><datalist id='modelList'></datalist></label><label>Prompt caching<select id='promptCache'><option value=''>not set (use the provider default)</option><option value='auto'>auto &mdash; implicit prefix caching (safe everywhere)</option><option value='markers'>markers &mdash; explicit cache_control breakpoints</option><option value='off'>off &mdash; send nothing cache-related</option></select></label><p class='hint'>A task re-sends the whole conversation on every tool call, so caching the unchanged prefix is the single biggest cost lever on this screen. <strong>auto</strong> adds nothing to the request and simply lets the gateway serve a repeated prefix from its cache. <strong>markers</strong> sends Anthropic-style breakpoints and must be verified first: some proxies accept the field and then silently drop the block it sits on.</p><button id='testCaching' class='secondary'>Test caching</button><pre id='cacheResult' class='hint'>Run Test caching to measure this endpoint's cache behaviour.</pre><button id='loadModels' class='secondary'>Load models</button><button id='testProvider'>Test connection</button><button id='saveProvider'>Save settings</button><p id='status'></p></section>{_provider_pool_section()}{_execution_admin_section()}{_dbq_admin_section()}<section><h2>Supabase users, credits and payments</h2><p class='hint'>This view reads the existing Supabase <code>profiles</code>, <code>telegram_accounts</code>, and <code>payment_claims</code> tables. Credit changes use the database-backed ledger path.</p><button id='refreshSupabase' class='secondary'>Load database users</button><div style='overflow:auto;margin-top:1rem'><table><thead><tr><th>User ID</th><th>Name / email</th><th>Role</th><th>Status</th><th>Credits</th><th>Last seen</th><th>Questions</th><th>Telegram</th></tr></thead><tbody id='supabaseRows'><tr><td colspan='8'>Click Load database users.</td></tr></tbody></table></div><label>Selected user ID<input id='supabaseUserId' placeholder='UUID from the table'></label><label>Grant credits<input id='grantAmount' type='number' min='1' max='1000000' value='1000'></label><label><input id='blockState' type='checkbox'> Block selected user</label><button id='grantCredits'>Grant credits</button><button id='blockUser' class='secondary'>Block / unblock selected user</button><button id='deleteUser' class='secondary'>Delete selected user</button><h3>Announcement</h3><label>Title<input id='announcementTitle' value='Nanobot announcement'></label><label>Message<textarea id='announcementMessage' rows='3' placeholder='Message shown to users'></textarea></label><button id='sendAnnouncement'>Publish announcement</button><h3>Payment claims</h3><button id='loadPayments' class='secondary'>Load payment claims</button><pre id='paymentRows' class='hint'>No payment claims loaded.</pre></section><section><h2>Telegram user questions</h2><p class='hint'>Recent task instructions captured from Telegram. Credentials and token-like values are redacted before storage.</p><button id='loadQuestions' class='secondary'>Load question history</button><pre id='questionRows' class='hint'>No question history loaded.</pre></section><section><h2>WebUI user questions</h2><p class='hint'>Questions asked by users on the WebUI website, with their name/email and the type/category of each question.</p><button id='loadWebuiQuestions' class='secondary'>Load WebUI question history</button><pre id='webuiQuestionRows' class='hint'>No WebUI question history loaded.</pre></section><section><h2>APK users &mdash; last seen &amp; questions</h2><p class='hint'>Mobile (APK) users connect through the same gateway as the WebUI, so their presence lands in the same tables. Last seen is rendered in West Africa Time (WAT, UTC+1). Each question shows its source channel (apk / webui); APK clients tag themselves automatically.</p><button id='loadApkUsers' class='secondary'>Load APK users</button><div style='overflow:auto;margin-top:1rem'><table><thead><tr><th>User</th><th>Last seen (WAT)</th><th>Questions</th><th>Recent questions</th></tr></thead><tbody id='apkRows'><tr><td colspan='4'>Click Load APK users.</td></tr></tbody></table></div></section><section><h2>Telegram users</h2><p>Telegram users recorded: <strong>{len(rows)}</strong></p><table><thead><tr><th>Username</th><th>Name</th><th>Telegram ID</th><th>Last seen</th><th>Messages</th></tr></thead><tbody>{body_rows or '<tr><td colspan="5">No users recorded yet.</td></tr>'}</tbody></table><p class='hint'><code>GET /api/admin/users</code> is available with the same Basic Auth credentials.</p></section><script>(()=>{{const $=id=>document.getElementById(id);const status=(text,ok=true)=>{{$('status').textContent=text;$('status').style.color=ok?'#a7f3d0':'#fca5a5';}};const fmtWAT=(v)=>{{if(!v)return '—';const d=new Date(v);if(isNaN(d.getTime()))return String(v);const w=new Date(d.getTime()+60*60*1000);const p=n=>String(n).padStart(2,'0');return `${{w.getUTCFullYear()}}-${{p(w.getUTCMonth()+1)}}-${{p(w.getUTCDate())}} ${{p(w.getUTCHours())}}:${{p(w.getUTCMinutes())}} WAT`;}};
+let socket=null;const pending=new Map();const request=(action,payload={{}})=>new Promise(async(resolve,reject)=>{{try{{if(!socket||socket.readyState!==1){{const boot=await fetch('/api/admin/ws-bootstrap',{{cache:'no-store'}}).then(r=>r.ok?r.json():Promise.reject(Object.assign(new Error(r.status===401?'Admin session expired':'Admin service unavailable (HTTP '+r.status+'). Retrying...'),{{status:r.status}})));const scheme=location.protocol==='https:'?'wss':'ws';socket=new WebSocket(`${{scheme}}://${{location.host}}${{boot.ws_path}}?token=${{encodeURIComponent(boot.token)}}&client_id=admin`);socket.onmessage=e=>{{const msg=JSON.parse(e.data);if(msg.event==='webui_response'&&pending.has(msg.request_id)){{const p=pending.get(msg.request_id);pending.delete(msg.request_id);msg.ok?p.resolve(msg.result):p.reject(new Error(msg.error?.message||'Admin request failed'));}}}};socket.onclose=()=>{{for(const p of pending.values())p.reject(new Error('The admin socket closed before a reply arrived.'));pending.clear();}};socket.onerror=()=>{{for(const p of pending.values())p.reject(new Error('Admin socket failed'));pending.clear();}};await new Promise((res,rej)=>{{socket.addEventListener('open',res,{{once:true}});socket.addEventListener('error',()=>rej(new Error('Admin socket failed')),{{once:true}});}});}}const requestId=`admin-${{Date.now()}}-${{Math.random().toString(36).slice(2)}}`;const timer=setTimeout(()=>{{const p=pending.get(requestId);if(p){{pending.delete(requestId);p.reject(new Error('No reply from the admin server after 150s. Check the lane and try again.'));}}}},150000);const guard=fn=>value=>{{clearTimeout(timer);fn(value);}};pending.set(requestId,{{resolve:guard(resolve),reject:guard(reject)}});socket.send(JSON.stringify({{type:'webui_request',request_id:requestId,action,payload}}));}}catch(e){{reject(e);}}}});window.nanobotAdminRequest=request;const fields=()=>({{apiBase:$('apiBase').value,apiKey:$('apiKey').value,model:$('model').value,promptCache:$('promptCache').value}});fetch('/api/admin/provider-settings',{{cache:'no-store'}}).then(r=>r.json()).then(v=>{{$('apiBase').value=v.apiBase||'';$('model').value=v.model||'';$('promptCache').value=v.promptCache||'';$('cacheResult').textContent=`Effective mode: ${{v.effectivePromptCache||'auto'}}`;}}).catch(e=>status(e.message,false));$('loadModels').onclick=async()=>{{status('Loading models...');try{{const v=await request('admin.provider.models',fields());const list=$('modelList');list.replaceChildren(...(v.models||[]).map(id=>{{const o=document.createElement('option');o.value=id;return o}}));status(`Loaded ${{v.count||0}} model(s). Choose one and save.`);}}catch(e){{status(e.message,false);}}}};$('testProvider').onclick=async()=>{{status('Testing provider...');try{{const v=await request('admin.provider.test',fields());status(`Provider test passed. Response: ${{v.response||'(empty)'}}`);}}catch(e){{status(e.message,false);}}}};$('testCaching').onclick=async()=>{{status('Probing prompt caching (three requests)...');try{{const v=await request('admin.provider.cache_test',fields());const m=v.markers||{{}};const lines=[`Model: ${{v.model}}`,`Automatic prefix caching: ${{v.auto.cached_tokens}} of ${{v.auto.prompt_tokens}} prompt tokens cached (${{v.auto.hit_pct}}%)`,m.accepted?`Markers accepted. Model received the marked block: ${{m.context_kept?'YES':'NO - the block was dropped'}}. Cached ${{m.cached_tokens}} (${{m.hit_pct}}%)`:`Markers rejected: HTTP ${{m.status||'?'}} ${{String(m.reason||'').slice(0,160)}}`,`Recommended mode: ${{v.recommended}}`,v.detail];$('cacheResult').textContent=lines.join('\n');status('Cache probe finished.');}}catch(e){{status(e.message,false);}}}};$('saveProvider').onclick=async()=>{{status('Saving settings...');try{{const v=await request('admin.provider.save',fields());$('apiKey').value='';status(`Saved. Active model: ${{v.model||$('model').value}}`);}}catch(e){{status(e.message,false);}}}};const adminAction=async(kind,extra={{}})=>{{const userId=$('supabaseUserId').value.trim();if(kind!=='announcement'&&!userId){{status('Select or enter a user ID first.',false);return;}}status('Working...');try{{const v=await request('admin.supabase.action',{{kind,userId,...extra}});if(kind==='announcement'){{status(`Announcement delivered to ${{v.sent||0}}/${{v.total||0}} Telegram chat(s); failed: ${{v.failed||0}}.`);}}else{{status(`Completed: ${{v.action||kind}}`);}}$('refreshSupabase').click();}}catch(e){{status(e.message,false);}}}};$('refreshSupabase').onclick=async()=>{{status('Loading Supabase users...');try{{const r=await fetch('/api/admin/supabase/users',{{cache:'no-store'}});if(!r.ok)throw new Error(`Database users request failed: ${{r.status}}`);const v=await r.json();const rows=v.users||[];$('supabaseRows').replaceChildren(...rows.map(u=>{{const tr=document.createElement('tr');tr.dataset.id=String(u.id||'');const tg=(u.telegram_accounts||[]).map(a=>`@${{a.username||''}} (${{a.telegram_user_id||''}})`).join(', ');tr.innerHTML=`<td>${{String(u.id||'')}}</td><td>${{String(u.name||'')}}<br><span class='hint'>${{String(u.email||'')}}</span></td><td>${{String(u.role||'')}}</td><td>${{String(u.status||'')}}</td><td>${{String(u.total_credits||0)}}</td><td>${{fmtWAT(u.last_seen_at)}}</td><td>${{String(u.questions_count??0)}}</td><td>${{tg||'—'}}</td>`;tr.onclick=()=>{{$('supabaseUserId').value=String(u.id||'');document.querySelectorAll('#supabaseRows tr').forEach(x=>x.style.outline='');tr.style.outline='2px solid #60a5fa';}};return tr}}));status(`Loaded ${{rows.length}} Supabase user(s). Click a row to select it.`);}}catch(e){{status(e.message,false);}}}};$('grantCredits').onclick=()=>adminAction('grant',{{amount:Number($('grantAmount').value||0)}});$('blockUser').onclick=()=>adminAction('block',{{blocked:$('blockState').checked}});$('deleteUser').onclick=()=>{{if(confirm('Delete the selected Supabase user and their Auth account? This cannot be undone.'))void adminAction('delete')}};$('sendAnnouncement').onclick=()=>adminAction('announcement',{{title:$('announcementTitle').value,message:$('announcementMessage').value}});$('loadPayments').onclick=async()=>{{status('Loading payment claims...');try{{const r=await fetch('/api/admin/supabase/payments',{{cache:'no-store'}});if(!r.ok)throw new Error(`Payment claims request failed: ${{r.status}}`);const v=await r.json();$('paymentRows').textContent=JSON.stringify(v.payments||[],null,2);status(`Loaded ${{(v.payments||[]).length}} payment claim(s).`);}}catch(e){{status(e.message,false);}}}};$('loadQuestions').onclick=async()=>{{status('Loading Telegram question history...');try{{const r=await fetch('/api/admin/supabase/questions',{{cache:'no-store'}});if(!r.ok)throw new Error(`Question history request failed: ${{r.status}}`);const v=await r.json();$('questionRows').textContent=JSON.stringify(v.questions||[],null,2);status(`Loaded ${{(v.questions||[]).length}} Telegram question(s).`);}}catch(e){{status(e.message,false);}}}};$('loadWebuiQuestions').onclick=async()=>{{status('Loading WebUI question history...');try{{const r=await fetch('/api/admin/supabase/webui-questions',{{cache:'no-store'}});if(!r.ok)throw new Error(`WebUI question history request failed: ${{r.status}}`);const v=await r.json();$('webuiQuestionRows').textContent=JSON.stringify((v.questions||[]).map(q=>({{user:q.user_name||q.user_id||'?',email:q.user_email||'',type:q.category||'',question:(q.message||'').slice(0,300),at:q.created_at}})),null,2);status(`Loaded ${{(v.questions||[]).length}} WebUI question(s).`);}}catch(e){{status(e.message,false);}}}};$('loadApkUsers').onclick=async()=>{{status('Loading APK users...');try{{const r=await fetch('/api/admin/supabase/apk-users',{{cache:'no-store'}});if(!r.ok)throw new Error(`APK users request failed: ${{r.status}}`);const v=await r.json();const rows=v.users||[];const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));$('apkRows').replaceChildren(...rows.map(u=>{{const tr=document.createElement('tr');const td=html=>{{const c=document.createElement('td');c.innerHTML=html;return c}};const qs=(u.questions||[]).slice(0,5).map(q=>`<div class='hint'>${{fmtWAT(q.created_at)}} &mdash; [${{esc(q.category||'webui')}}] ${{esc(String(q.message||'').slice(0,220))}}</div>`).join('')||'&mdash;';tr.appendChild(td(`${{esc(u.name||'')}}<br><span class='hint'>${{esc(u.email||'')}}</span>`));tr.appendChild(td(fmtWAT(u.last_seen_at)||'&mdash;'));tr.appendChild(td(String(u.questions_count??0)));tr.appendChild(td(qs));return tr}}));status(`Loaded ${{rows.length}} user(s). Last seen shown in WAT.`);}}catch(e){{status(e.message,false);}}}};void $('refreshSupabase').click();void $('loadQuestions').click();}})();</script></body></html>"""
 
 
 def admin_route(
@@ -1310,6 +1481,7 @@ def admin_route(
         "/api/admin/provider-settings",
         "/api/admin/provider-models",
         "/api/admin/provider-test",
+        "/api/admin/provider-cache-test",
         "/api/admin/provider-settings/save",
         "/api/admin/provider-pool",
         "/api/admin/provider-pool/add",
@@ -1531,6 +1703,8 @@ def admin_route(
         return _models_response(payload)
     if path == "/api/admin/provider-test":
         return _test_response(payload)
+    if path == "/api/admin/provider-cache-test":
+        return _cache_test_response(payload)
     if path == "/api/admin/provider-settings/save":
         return _save_response(payload, refresh_runtime_config=refresh_runtime_config)
     if path == "/api/admin/provider-pool":

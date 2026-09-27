@@ -69,14 +69,24 @@ def log_cost_meter(
             served_by = "tool_middleware"
         elif usage.get("replay_cache"):
             served_by = "replay_cache"
+        prompt_tokens = _as_int(usage.get("prompt_tokens"))
+        cached_tokens = _as_int(usage.get("cached_tokens"))
+        # Cache hit rate is the number that explains a surprising prompt total:
+        # a 12-call turn that re-sends a 50k prefix costs 652k prompt tokens
+        # when nothing is cached and a fraction of that when the gateway serves
+        # the prefix from its cache. Without this line the log cannot tell the
+        # two apart, which is how the cost crept up unnoticed.
+        hit_pct = round(cached_tokens * 100.0 / prompt_tokens, 1) if prompt_tokens > 0 else 0.0
         logger.bind(cost=True).info(
             "COST_METER channel={} session={} llm_calls={} served_by={} "
-            "prompt_tokens={} completion_tokens={} stop={}",
+            "prompt_tokens={} cached_tokens={} cache_hit_pct={} completion_tokens={} stop={}",
             channel,
             (session_key or "-")[:40],
             _as_int(charged_steps),
             served_by,
-            _as_int(usage.get("prompt_tokens")),
+            prompt_tokens,
+            cached_tokens,
+            hit_pct,
             _as_int(usage.get("completion_tokens")),
             stop_reason or "-",
         )

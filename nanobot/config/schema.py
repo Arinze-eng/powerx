@@ -219,6 +219,15 @@ class ProviderConfig(Base):
     extra_query: dict[str, str] | None = None  # Extra query params (e.g. api-version for Azure-style gateways)
     proxy: str | None = None  # Explicit HTTP proxy; image downloads trust its DNS and egress
     thinking_style: str | None = None  # Thinking/reasoning style for custom providers
+    # Prompt-cache policy for OpenAI-compatible endpoints:
+    #   "auto"    — implicit prefix caching only; nothing is added to the request
+    #   "markers" — send Anthropic-style cache_control breakpoints (verify first)
+    #   "off"     — send nothing cache-related
+    # None falls back to the environment and then the provider spec.
+    prompt_cache: Literal["auto", "markers", "off"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     # Valid values mirror the keys of _THINKING_STYLE_MAP in
     # nanobot/providers/openai_compat_provider.py. Kept duplicated here to

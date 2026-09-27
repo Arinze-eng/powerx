@@ -227,6 +227,7 @@ _WEBUI_MUTATION_PATHS = {
     "payment.pay_link": "/api/webui/pay-link",
     "admin.provider.models": "/api/admin/provider-models",
     "admin.provider.test": "/api/admin/provider-test",
+    "admin.provider.cache_test": "/api/admin/provider-cache-test",
     "admin.provider.save": "/api/admin/provider-settings/save",
     "admin.provider.pool.list": "/api/admin/provider-pool",
     "admin.provider.pool.add": "/api/admin/provider-pool/add",

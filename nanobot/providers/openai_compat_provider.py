@@ -51,6 +51,13 @@ if TYPE_CHECKING:
     from openai import AsyncOpenAI as AsyncOpenAIType
 
     from nanobot.providers.registry import ProviderSpec
+from nanobot.providers.prompt_cache import (
+    cache_hit_pct,
+    cache_marker_rejection,
+    markers_allowed,
+    resolve_cache_mode,
+    strip_cache_markers,
+)
 
 # Module-level placeholder — set lazily by _ensure_client on first real
 # use, or replaced by tests via ``patch(...)``.  Kept as a plain name so
@@ -622,6 +629,7 @@ class OpenAICompatProvider(LLMProvider):
         api_type: str = "auto",
         extra_query: dict[str, str] | None = None,
         proxy: str | None = None,
+        prompt_cache: str | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
@@ -631,6 +639,14 @@ class OpenAICompatProvider(LLMProvider):
         self._api_type = api_type if spec and spec.name == "openai" else "auto"
         self._extra_query = extra_query or {}
         self._proxy = proxy or None
+        # ``auto`` (implicit prefix caching), ``markers`` (explicit cache_control
+        # breakpoints) or ``off``. Resolved again per request so the env var and
+        # the provider spec still take effect; see nanobot/providers/prompt_cache.py.
+        self._prompt_cache = prompt_cache
+        # Set when an endpoint refuses a marked request. One refusal is enough:
+        # markers stay off for this provider instance so the turn completes
+        # unmarked instead of paying a failed round-trip on every iteration.
+        self._cache_marker_disabled = False
         self._native_compaction_available = True
 
         effective_base = api_base or (spec.default_api_base if spec else None) or None
@@ -766,6 +782,52 @@ class OpenAICompatProvider(LLMProvider):
             for idx in cls._tool_cache_marker_indices(new_tools):
                 new_tools[idx] = {**new_tools[idx], "cache_control": cache_marker}
         return new_messages, new_tools
+
+    def _cache_markers_for(self, model_name: str) -> bool:
+        """Whether this request should carry explicit cache breakpoints."""
+        if self._cache_marker_disabled:
+            return False
+        mode = resolve_cache_mode(configured=self._prompt_cache, spec=self._spec)
+        is_claude = any(
+            str(model_name or "").lower().startswith(k) for k in ("anthropic/", "claude")
+        )
+        return markers_allowed(mode, is_claude=is_claude, spec=self._spec)
+
+    def _note_cache_marker_rejection(self, exc: BaseException) -> None:
+        """Turn markers off for this provider after the gateway refused them."""
+        self._cache_marker_disabled = True
+        logger.warning(
+            "prompt cache: {} refused cache_control markers ({}); retrying unmarked "
+            "and disabling markers for this provider",
+            self._spec.name if self._spec else self.api_base,
+            type(exc).__name__,
+        )
+
+    async def _create_chat_with_cache_fallback(
+        self,
+        client: AsyncOpenAIType,
+        kwargs: dict[str, Any],
+    ) -> Any:
+        """Create a chat completion, retrying once without cache markers.
+
+        Some gateways reject ``cache_control`` outright. Without this the whole
+        turn would fail on a setting an operator turned on to *save* money, so a
+        recognised refusal costs one extra round-trip and then markers stay off.
+        A gateway that silently swallows a marked block cannot be detected here;
+        the admin page's cache test exists for exactly that case.
+        """
+        try:
+            return await client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            stripped, removed = strip_cache_markers(kwargs)
+            if (
+                self._cache_marker_disabled
+                or removed == 0
+                or not cache_marker_rejection(exc)
+            ):
+                raise
+            self._note_cache_marker_rejection(exc)
+            return await client.chat.completions.create(**stripped)
 
     @staticmethod
     def _normalize_tool_call_id(tool_call_id: Any) -> Any:
@@ -1032,18 +1094,15 @@ class OpenAICompatProvider(LLMProvider):
         #      (verified live: ~97% hit / 80% cheaper on Kyma/deepseek-v4-flash).
         #   2. EXPLICIT cache_control breakpoints (Anthropic Claude and proxies that
         #      mirror its format): require cache_control markers on content blocks.
-        # We inject markers for claude models always, whenever the provider spec
-        # advertises supports_prompt_caching AND the operator opts in via
-        # POWERX_FORCE_CACHE_MARKERS, so any OpenAI-compatible endpoint that needs
-        # explicit breakpoints benefits while auto-cachers are unaffected (they
-        # ignore the markers — verified safe against Kyma).
-        _force_markers = os.environ.get("POWERX_FORCE_CACHE_MARKERS", "").strip().lower() in {
-            "1", "true", "yes", "on",
-        }
-        _is_claude = any(
-            model_name.lower().startswith(k) for k in ("anthropic/", "claude")
-        )
-        if (_is_claude and spec and spec.supports_prompt_caching) or _force_markers:
+        # Markers are NOT sent by default any more. A gateway can accept the
+        # field and then drop the whole block it sits on without any error:
+        # measured against the live gemini-proxy, a marked system message
+        # stopped reaching the model (prompt_tokens 4234 -> 14) while the reply
+        # still came back HTTP 200. So the mode is explicit: ``auto`` keeps the
+        # historical Claude-only behaviour, ``markers`` sends breakpoints for an
+        # endpoint verified to take them (admin -> Test caching), and any hard
+        # refusal is retried once without markers by _create_chat_with_cache_fallback.
+        if self._cache_markers_for(model_name):
             messages, tools = self._apply_cache_control(messages, tools)
 
         model_name = self._request_model_name(model_name)
@@ -2123,7 +2182,7 @@ class OpenAICompatProvider(LLMProvider):
             )
             chat_raw = cast(
                 Any,
-                await client.chat.completions.create(**kwargs),
+                await self._create_chat_with_cache_fallback(client, kwargs),
             )
             return self._parse(chat_raw)
         except Exception as e:
@@ -2238,7 +2297,7 @@ class OpenAICompatProvider(LLMProvider):
             kwargs["stream_options"] = {"include_usage": True}
             chat_stream = cast(
                 Any,
-                await client.chat.completions.create(**kwargs),
+                await self._create_chat_with_cache_fallback(client, kwargs),
             )
             chunks: list[Any] = []
             stream_iter: AsyncIterator[Any] = chat_stream.__aiter__()

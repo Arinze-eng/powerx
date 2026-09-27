@@ -246,6 +246,7 @@ def _make_provider_core(
             api_type=p.api_type if p and provider_name == "openai" else "auto",
             extra_query=p.extra_query if p else None,
             proxy=p.proxy if p else None,
+            prompt_cache=getattr(p, "prompt_cache", None) if p else None,
         )
 
     provider.generation = preset.to_generation_settings()
