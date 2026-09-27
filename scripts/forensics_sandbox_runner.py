@@ -46,9 +46,10 @@ import traceback
 from pathlib import Path
 
 #: Must equal FORENSICS_VERSION in nanobot/agent/tools/forensics_sandbox.py. The
-#: sandbox-side bootstrap greps the fetched copy for this exact string, so a stale
-#: cached download is refused instead of silently executing old code.
-FORENSICS_VERSION = "2026-09-27.1"
+#: host-side bootstrap unpacks the payload that carries this file and compares its
+#: own version against the marker the unpack writes, so a box holding an older
+#: runner never runs one.
+FORENSICS_VERSION = "2026-09-27.2"
 
 RESULT_MARKER = "FORENSICS_RESULT "
 

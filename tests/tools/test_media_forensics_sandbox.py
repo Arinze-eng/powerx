@@ -40,12 +40,14 @@ from PIL import Image, ImageDraw
 
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.forensics_sandbox import (
-    _RAW_BASE,
+    _PROVISION_CHUNK,
+    _PROVISION_TAR,
     _ROOT_PRELUDE,
     _WRITE_CHUNK,
     FORENSICS_VERSION,
     ForensicsRelay,
     _build_transfer,
+    _payload_sources,
     _parse_payload,
     bootstrap_command,
     sandbox_tool,
@@ -57,10 +59,10 @@ from nanobot.config.schema import ToolsConfig
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER = REPO_ROOT / "scripts" / "forensics_sandbox_runner.py"
 
-#: Provisioning that found everything it needs. ``WRITE_READY`` is the marker the
-#: command echoes when a previous provision already succeeded.
+#: Provisioning that found everything it needs. ``PAYLOAD_READY`` is what the
+#: ship-payload probe echoes when the box already holds the current payload, and the
+#: version line is what the dependency probe prints.
 _PROVISION_OK = (
-    "READY_ALREADY_EXISTS\n"
     "numpy 2.4.6 pillow 12.3.0\n"
     "tesseract 5.3.0\n"
     "[exit_code=0]"
@@ -69,6 +71,14 @@ _PROVISION_OK = (
 #: Provisioning that could not get the pixels layer installed: no numpy, no Pillow,
 #: so no analysis is possible in this box and the caller must fall back.
 _PROVISION_MISSING = "DEPS_MISSING\ndeps: missing\n[exit_code=0]"
+
+#: The probe the relay makes before uploading the payload. Echoing READY makes
+#: ``_ship_payload`` skip the upload entirely, which is the state after a first
+#: analysis on the same box.
+_PAYLOAD_READY = "FORENSICS_PAYLOAD_READY\n[exit_code=0]"
+
+#: The same probe on a box that has nothing yet.
+_PAYLOAD_STALE = "FORENSICS_PAYLOAD_STALE\n[exit_code=0]"
 
 
 def _load_runner() -> Any:

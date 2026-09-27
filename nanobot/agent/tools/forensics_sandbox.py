@@ -58,6 +58,7 @@ import json
 import os
 import shlex
 import tarfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -68,24 +69,115 @@ from loguru import logger
 #: bootstrap greps the fetched runner for this exact string, so a stale cached
 #: download is refused loudly rather than executed silently. Keep it in step with
 #: ``FORENSICS_VERSION`` in that script.
-FORENSICS_VERSION = "2026-09-27.1"
+#:
+#: Bumped to ``2026-09-27.2`` when provisioning stopped downloading from GitHub:
+#: the version is what tells a box holding the previous, download-based payload
+#: that it must take the new one.
+FORENSICS_VERSION = "2026-09-27.2"
 
-#: The package the sandbox-side runner imports. Fetched file by file, because the
-#: runner needs the real forensics code, not a re-implementation of it.
+#: The package the sandbox-side runner imports, shipped from THIS host's package.
+#:
+#: ``benchmark`` is deliberately absent. It is a model-free, network-free
+#: calibration harness that nothing in the analysis path imports, and it is the
+#: single largest file in the package — shipping it would push a one-file analysis
+#: past the sandbox wrapper's ``write`` ceiling for no benefit.
 _PACKAGE_FILES = (
     "__init__",
     "tamper",
-    "benchmark",
     "document_forensics",
     "image_forensics",
     "verdict",
 )
 
-_REPO = os.getenv("FORENSICS_SCRIPT_REPO", "Arinze-eng/powerx")
-_RAW_BASE = os.getenv(
-    "FORENSICS_SCRIPT_RAW_BASE",
-    "https://raw.githubusercontent.com/Arinze-eng/powerx/main/scripts",
-)
+#: Provisioning payload, built once per process. The runner and the package it
+#: imports are read from THIS host's files, so they can never be two different
+#: revisions and provisioning never touches the network.
+#:
+#: WHY THIS REPLACED A GITHUB FETCH
+#: ---------------------------------
+#: The previous bootstrap resolved ``main`` through ``api.github.com`` and pulled
+#: every file from ``raw.githubusercontent.com``, on every box, on every
+#: provision. That made the whole feature depend on GitHub egress from the
+#: sandbox — and a locked-down sandbox, a VPS behind an allow-list, or an egress
+#: proxy that does not pass GitHub is exactly the environment people run these in.
+#: When it failed, the ``|| true`` on the refresh hid it, the import then failed
+#: with a traceback, and the user saw the tool "not reaching the sandbox" on every
+#: backend at once. Shipping the payload from the host removes the dependency
+#: instead of reporting it better: the only network the sandbox now needs is PyPI
+#: for the wheels and Debian's mirror for Tesseract, both of which the box's own
+#: provisioning already required.
+_payload_lock = threading.Lock()
+_payload_cache: tuple[str, str, int] | None = None
+
+
+def _payload_sources() -> list[tuple[str, Path]]:
+    """The runner and the package files, read from this host's installation.
+
+    Returns ``(arcname, path)`` pairs laid out so the tar extracts straight into
+    ``$PWD/<_HOME>`` — ``bin/forensics_runner.py`` next to ``nanobot/forensics/*``,
+    which is the layout both ``PYTHONPATH`` and the runner's import expect.
+    """
+    package_dir = Path(__file__).resolve().parent.parent.parent / "forensics"
+    sources: list[tuple[str, Path]] = []
+    runner = Path(__file__).resolve().parents[3] / "scripts" / "forensics_sandbox_runner.py"
+    if not runner.is_file():
+        raise RuntimeError(f"the sandbox runner is missing at {runner}")
+    # The arcname is the path the relay INVOKES, not the name on this host: the
+    # script ships as ``forensics_sandbox_runner.py`` but runs as
+    # ``bin/forensics_runner.py`` inside the box. Using the source filename here
+    # extracted the file to a path nothing ever executed, so the payload unpacked
+    # cleanly and the analysis still died on a missing file.
+    sources.append(("bin/forensics_runner.py", runner))
+    for name in _PACKAGE_FILES:
+        module = package_dir / f"{name}.py"
+        if not module.is_file():
+            raise RuntimeError(f"the forensics package is missing {module}")
+        sources.append((f"nanobot/forensics/{name}.py", module))
+    return sources
+
+
+def _provision_payload() -> tuple[str, str, int]:
+    """Build (once) the base64 provisioning tar, its sha256, and its raw size.
+
+    Return order is ``_build_transfer``'s: ``(base64, sha256_hex, raw_bytes)``.
+    """
+    global _payload_cache
+    if _payload_cache is not None:
+        return _payload_cache
+    with _payload_lock:
+        if _payload_cache is None:
+            _payload_cache = _build_transfer(_payload_sources())
+    return _payload_cache
+
+
+#: Unpack the payload that ``_ship_payload`` wrote, after checking its digest.
+#:
+#: Bash rather than Python on purpose: it has to run before anything from the
+#: payload is importable, and ``base64``/``sha256sum``/``tar`` are in every
+#: sandbox image these backends boot. A wrong digest leaves the tree untouched
+#: rather than half-extracted.
+_BOOTSTRAP_TEMPLATE = """\
+_fx_home="$PWD/{home}"
+mkdir -p "$_fx_home/bin" "$_fx_home/nanobot/forensics" "$_fx_home/work"
+if [ ! -f "$PWD/{ready}" ]; then
+  if [ -f "$PWD/{tar}" ]; then
+    if echo "{digest}  $PWD/{tar}" | sha256sum -c - >/dev/null 2>&1; then
+      if tar xf "$PWD/{tar}" -C "$_fx_home"; then
+        chmod +x "$_fx_home/bin/forensics_runner.py" 2>/dev/null
+        rm -f "$PWD/{tar}"
+        touch "$PWD/{ready}"
+      else
+        echo "FORENSICS_PAYLOAD_UNPACK_FAILED" >&2
+      fi
+    else
+      echo "FORENSICS_PAYLOAD_CHECKSUM_FAILED" >&2
+      rm -f "$PWD/{tar}"
+    fi
+  else
+    echo "FORENSICS_PAYLOAD_MISSING" >&2
+  fi
+fi\
+"""
 
 #: Everything lives under one directory we own, so a sandbox that also runs MT5
 #: or the media workshop cannot collide with it.
@@ -131,7 +223,26 @@ _HOME = ".forensics"
 _RUNNER = f"{_HOME}/bin/forensics_runner.py"
 _PKG = f"{_HOME}/nanobot/forensics"
 _WORK = f"{_HOME}/work"
+#: Written by the BOOTSTRAP (after a successful, digest-checked unpack), not by the
+#: wheel install. It therefore means "the runner and its package are on disk",
+#: which is exactly the condition ``_run`` needs before it prefixes a command with
+#: the unpack. The dependency probe has its own marker: the provision command
+#: reports whether numpy/Pillow/Tesseract are present, and ``provision()`` reads
+#: that answer rather than an empty file.
 _READY = f"{_HOME}/ready-{FORENSICS_VERSION}"
+
+#: Unpack target for the provisioning payload (runner + package), one tar under the
+#: work directory. The bootstrap checksums it exactly like a file transfer. Defined
+#: here rather than beside the payload helpers because it is anchored to ``_WORK``,
+#: and a module-level constant that references a later definition is a NameError at
+#: import time.
+_PROVISION_TAR = f"{_WORK}/provision.tar"
+#: The chunks ``_ship_payload`` writes, and the intermediate the decoder fills. Both
+#: names sit outside each other's globs on purpose: an output whose name matched the
+#: ``<chunks>.*`` pattern under ``cat`` would be read back while being written, and
+#: the resulting archive fails its own checksum. See ``_ship_payload``.
+_PROVISION_CHUNK = f"{_WORK}/payload.b64"
+_PROVISION_OUT = f"{_WORK}/payload.decoded"
 
 #: The file the shell prelude looks for. Deliberately single-segment: the ``write``
 #: action creates it before any directory exists, so it must not need a parent
@@ -269,71 +380,20 @@ def _sh(value: Any) -> str:
 
 
 def bootstrap_command() -> str:
-    """Idempotently fetch the runner and the forensics package into the sandbox."""
-    files = " ".join(_PACKAGE_FILES)
+    """Unpack the provisioning payload this host already wrote into the sandbox.
+
+    No network, no download, no revision to resolve: the payload is the host's own
+    runner and package, written by ``_ship_payload`` and verified here by digest
+    before anything is extracted. Idempotent through ``_READY``, so the many
+    commands that make up one analysis pay for it once.
+    """
+    _b64, digest, _size = _provision_payload()
     return _BOOTSTRAP_TEMPLATE.format(
         home=_HOME,
-        runner=_RUNNER,
-        pkg=_PKG,
-        repo=_REPO,
-        raw_base=_RAW_BASE,
-        version=FORENSICS_VERSION,
-        files=files,
+        tar=_PROVISION_TAR,
+        ready=_READY,
+        digest=digest,
     )
-
-
-#: Bootstrap shell. ``{...}`` placeholders are filled by ``bootstrap_command``.
-#:
-#: MEASURED FAILURE (2026-09-21, mt5_sandbox — identical plumbing, identical bug):
-#:
-#: The sandbox's egress path caches ``raw.githubusercontent.com`` responses **by
-#: path**, so ``.../main/scripts/forensics_sandbox_runner.py`` can keep returning a
-#: revision several pushes old. Neither a unique ``?ts=`` query string nor
-#: ``Cache-Control: no-cache`` helped (both were measured). The effect is maximally
-#: confusing: a fix that is on main, covered by tests and verified from the host
-#: still produces the OLD failure live, so the fix looks wrong when it is simply
-#: not running.
-#:
-#: What was measured to work:
-#:   * a commit-pinned raw URL (``/<sha>/scripts/...``) — never cached, because
-#:     that exact URL had never been requested before, and
-#:   * the GitHub API.
-#:
-#: So: resolve ``main`` to a SHA through the API, download the pinned URLs, and
-#: VERIFY the runner carries the ``FORENSICS_VERSION`` this module requires. Only
-#: if that fails do we fall back to the branch URL — and a version mismatch on
-#: every source is reported loudly instead of executing unknown code.
-#: Every path in here is anchored to ``$PWD``, not to a literal root: the prelude in
-#: ``_run`` has already ``cd``-ed to the backend's workspace by the time this runs,
-#: and anchoring means a later command that changes directory cannot silently split
-#: the runner from the package it imports.
-_BOOTSTRAP_TEMPLATE = """\
-export PYTHONPATH="$PWD/{home}"
-mkdir -p "$PWD/{home}/bin" "$PWD/{pkg}" "$PWD/{home}/work"
-_want='{version}'
-_fetch() {{ curl -fsSL --retry 2 "$1" -o "$2" 2>/dev/null && grep -q "FORENSICS_VERSION = [\\"']$_want[\\"']" "$2"; }}
-_sha=$(curl -fsSL 'https://api.github.com/repos/{repo}/commits/main' 2>/dev/null \
-  | python3 -c "import sys,json;print((json.load(sys.stdin) or {{}}).get('sha',''))" 2>/dev/null)
-_ok=''
-for _base in "https://raw.githubusercontent.com/{repo}/$_sha/scripts" "{raw_base}"; do
-  if _fetch "$_base/forensics_sandbox_runner.py" "$PWD/{runner}"; then
-    _ok=1
-    # ``_base`` is always a ``.../<rev>/scripts`` URL, so its parent is the repo
-    # root at the SAME revision — which is what keeps the runner and the package it
-    # imports from ever being two different commits.
-    _src=$(dirname "$_base")
-    for _f in {files}; do
-      curl -fsSL --retry 2 "$_src/nanobot/forensics/$_f.py" -o "$PWD/{pkg}/$_f.py" 2>/dev/null
-    done
-    break
-  fi
-done
-chmod +x "$PWD/{runner}" 2>/dev/null
-if [ -z "$_ok" ]; then
-  echo "WARNING: could not fetch forensics_sandbox_runner.py version $_want (a cached" >&2
-  echo "copy of an older revision may be in use). Retry, or set FORENSICS_SCRIPT_RAW_BASE." >&2
-fi\
-"""
 
 
 def _provision_command() -> str:
@@ -355,9 +415,15 @@ def _provision_command() -> str:
     plain ``pip install`` outright, while an older image with no root refers to a
     ``--user`` install. Novita's image accepted the plain form, which is why the
     single attempt was enough to look correct.
+
+    The unpacked-payload check comes FIRST and its failure is NOT swallowed: a box
+    that has the wheels but not the runner must not be reported as provisioned, or
+    the analysis fails later with an import traceback and the user is told the
+    sandbox "could not be reached" when it was in fact reached and simply had
+    nothing to run.
     """
     return (
-        f'test -f "$PWD/{_READY}" && echo READY_ALREADY_EXISTS || ('
+        f'test -f "$PWD/{_READY}" || {{ echo PAYLOAD_NOT_READY; exit 0; }}; '
         # Python deps first: pure wheels, and the one thing the pixel layer cannot
         # work without. Best-effort at every step — the probe below is what decides.
         "python3 -c 'import numpy, PIL' 2>/dev/null || { "
@@ -372,8 +438,7 @@ def _provision_command() -> str:
         "|| (sudo -n apt-get install -y -qq tesseract-ocr) >/dev/null 2>&1 "
         "|| true; fi; "
         "python3 -c 'import numpy, PIL' 2>/dev/null || { echo DEPS_MISSING; exit 0; }; "
-        f'touch "$PWD/{_READY}"'
-        ")\n"
+        f'touch "$PWD/{_READY}"\n'
         "python3 -c \"import numpy,PIL;print('numpy',numpy.__version__,'pillow',PIL.__version__)\" "
         "2>/dev/null || echo 'deps: missing'; "
         "command -v tesseract >/dev/null 2>&1 && tesseract --version 2>&1 | head -1 "
@@ -399,16 +464,17 @@ def _build_transfer(files: list[tuple[str, Path]]) -> tuple[str, str, int]:
 async def _run(
     sandbox: Any, command: str, timeout: int = _MAX_TIMEOUT, *, bootstrap: bool = True
 ) -> str:
-    """Run one command in the sandbox, refreshing the scripts first.
+    """Run one command in the sandbox, unpacking the payload first.
 
-    The refresh is what lets a fixed runner ship without rebuilding the sandbox, so
-    it is on by default and only turned off for the follow-up reads of a run that
-    already paid for it.
+    The unpack is idempotent (guarded by ``_READY``) and costs one ``test -f`` once
+    the box has it, so it stays on by default and is only turned off for the
+    follow-up reads of a run that already paid for it — and for the commands that
+    write the payload itself, which must not race the unpack.
 
-    Every command — refresh or not — is prefixed with ``_ROOT_PRELUDE``, which
+    Every command — unpack or not — is prefixed with ``_ROOT_PRELUDE``, which
     ``cd``-s to the root the ``write`` action resolves against. Nothing else in this
-    module may assume a cwd: the backends disagree about what one is (Novita sends
-    ``cwd=/workspace``, Runloop sends the command bare).
+    module may assume a cwd: the backends disagree about what one is (Novita runs
+    from ``/root`` with no ``/workspace`` at all, Runloop sends the command bare).
     """
     prefix = _ROOT_PRELUDE
     if bootstrap:
@@ -469,6 +535,7 @@ class ForensicsRelay:
         self.sandbox = sandbox
         self._provisioned = False
         self._marker_written = False
+        self._payload_shipped = False
         self._diagnostics: dict[str, Any] = {}
 
     # -- locating the workspace root ----------------------------------------- #
@@ -498,6 +565,65 @@ class ForensicsRelay:
 
     # -- provisioning -------------------------------------------------------- #
 
+    async def _ship_payload(self) -> str:
+        """Write the provisioning tar into the box. Returns its sha256.
+
+        Separate from ``_ship`` so provisioning runs exactly once per relay and
+        before any analysis, and so the per-analysis transfer below can clear its
+        own subdirectories without destroying this payload.
+
+        Skipped outright when the box already reports the current payload as
+        unpacked: the payload is a fixed ~180 KB and a fresh relay is built for
+        every tool call, so without this check every analysis would re-upload it.
+        The check is the same ``_READY`` file the bootstrap writes, which is keyed
+        to ``FORENSICS_VERSION`` — so bumping the version invalidates every box's
+        payload automatically, and a stale runner can never survive a release.
+        """
+        b64, digest, raw_bytes = _provision_payload()
+        await self._ensure_root_marker()
+        # ``write`` does not create parent directories on every backend, so the
+        # directory the chunks land in is made by a shell command first — and the
+        # ready check rides along with it, keeping this to one round trip in the
+        # common case.
+        probe = await _run(
+            self.sandbox,
+            f'mkdir -p "$PWD/{_HOME}/bin" "$PWD/{_PKG}" "$PWD/{_WORK}" && '
+            f'test -f "$PWD/{_READY}" && echo FORENSICS_PAYLOAD_READY || '
+            "echo FORENSICS_PAYLOAD_STALE",
+            timeout=120,
+            bootstrap=False,
+        )
+        if "FORENSICS_PAYLOAD_READY" in str(probe):
+            self._payload_shipped = True
+            return digest
+        for index in range(0, len(b64), _WRITE_CHUNK):
+            await self.sandbox.execute(
+                action="write",
+                path=f"{_PROVISION_CHUNK}.{index // _WRITE_CHUNK:04d}",
+                content=b64[index : index + _WRITE_CHUNK],
+                timeout=120,
+            )
+        await _run(
+            self.sandbox,
+            # Decode the chunks into the single tar the bootstrap checksums and
+            # unpacks. The chunks are base64 text (``write`` caps its ``content``
+            # and the payload is binary), so the decode happens here.
+            #
+            # The output is deliberately NOT named ``provision.tar.something``:
+            # that would match the ``provision.tar.*`` glob being read in the same
+            # command, so ``cat`` would consume the file it is still writing and
+            # produce a corrupt archive — measured as a ``base64: invalid input``
+            # and a digest mismatch, which the checksum then correctly refused.
+            f'cat "$PWD/{_PROVISION_CHUNK}".* | base64 -d > "$PWD/{_PROVISION_OUT}" && '
+            f'mv "$PWD/{_PROVISION_OUT}" "$PWD/{_PROVISION_TAR}" && '
+            f'rm -f "$PWD/{_PROVISION_CHUNK}".* && '
+            f'echo {raw_bytes} > "$PWD/{_HOME}/payload.bytes"',
+            timeout=180,
+            bootstrap=False,
+        )
+        self._payload_shipped = True
+        return digest
+
     async def provision(self) -> dict[str, Any]:
         """Idempotently make the box able to run the runner.
 
@@ -510,6 +636,10 @@ class ForensicsRelay:
             return self._diagnostics
         try:
             await self._ensure_root_marker()
+            # Payload first, then install: the bootstrap unpacks the payload, the
+            # provision command installs the wheels, and neither depends on the
+            # other's network. Both are needed before an analysis can run.
+            await self._ship_payload()
             rendered = await _run(
                 self.sandbox,
                 _provision_command(),
@@ -525,6 +655,20 @@ class ForensicsRelay:
             # different problem with a different fix.
             self._diagnostics = {"ok": False, "error": "could not locate the sandbox workspace root", "raw": text[-500:]}
             return self._diagnostics
+        # A payload that did not unpack is a distinct, actionable failure: the box
+        # is reachable and the workspace root was found, and the runner simply is
+        # not there. Saying so beats letting the analysis fail on an ImportError
+        # three steps later, which is what used to make this look like the sandbox
+        # being unreachable on every backend.
+        for marker, error in (
+            ("FORENSICS_PAYLOAD_MISSING", "the sandbox has no forensics payload written to it"),
+            ("FORENSICS_PAYLOAD_CHECKSUM_FAILED", "the forensics payload failed its checksum in the sandbox"),
+            ("FORENSICS_PAYLOAD_UNPACK_FAILED", "the forensics payload would not unpack in the sandbox"),
+            ("PAYLOAD_NOT_READY", "the forensics payload was not unpacked into the sandbox"),
+        ):
+            if marker in text:
+                self._diagnostics = {"ok": False, "error": error, "raw": text[-500:]}
+                return self._diagnostics
         self._diagnostics = {
             "ok": "deps: missing" not in text,
             "tesseract": "tesseract: missing" not in text and "tesseract " in text,
@@ -550,9 +694,14 @@ class ForensicsRelay:
         request["version"] = FORENSICS_VERSION
 
         await self._ensure_root_marker()
+        # Only the per-analysis subdirectories are cleared. ``_WORK`` itself holds
+        # the provisioning tar, which the bootstrap unpacks once and a later
+        # analysis must not destroy: wiping the whole directory left a box that had
+        # already paid for provisioning unable to provision again.
         await _run(
             self.sandbox,
-            f'rm -rf "$PWD/{_WORK}" && mkdir -p "$PWD/{_WORK}/chunks" "$PWD/{_WORK}/in"',
+            f'rm -rf "$PWD/{_WORK}/chunks" "$PWD/{_WORK}/in" && '
+            f'mkdir -p "$PWD/{_WORK}/chunks" "$PWD/{_WORK}/in"',
             timeout=120,
             bootstrap=False,
         )
