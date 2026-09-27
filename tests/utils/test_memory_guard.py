@@ -17,21 +17,40 @@ from loguru import logger
 from nanobot.utils import memory_guard
 
 
-def _write_cgroup(root: Path, *, limit: str | None, current: str | None) -> None:
+def _write_cgroup(
+    root: Path,
+    *,
+    limit: str | None,
+    current: str | None,
+    anon: str | None = None,
+    file_cache: str | None = None,
+) -> None:
     root.mkdir(parents=True, exist_ok=True)
     if limit is not None:
         (root / "memory.max").write_text(limit)
     if current is not None:
         (root / "memory.current").write_text(current)
+    if anon is not None or file_cache is not None:
+        # Real layout: one ``key value`` pair per line, bytes.
+        lines = [f"anon {anon if anon is not None else 0}"]
+        if file_cache is not None:
+            lines.append(f"file {file_cache}")
+        lines.append("kernel_stack 1048576")
+        (root / "memory.stat").write_text("\n".join(lines) + "\n")
 
 
 @pytest.fixture
 def cgroup_v2(tmp_path, monkeypatch):
     """Point the guard at a fake cgroup v2 tree and no v1 tree."""
 
-    def _install(limit: str = str(512 * 1024 * 1024), current: str = str(128 * 1024 * 1024)):
+    def _install(
+        limit: str = str(512 * 1024 * 1024),
+        current: str = str(128 * 1024 * 1024),
+        anon: str | None = None,
+        file_cache: str | None = None,
+    ):
         root = tmp_path / "cgroup"
-        _write_cgroup(root, limit=limit, current=current)
+        _write_cgroup(root, limit=limit, current=current, anon=anon, file_cache=file_cache)
         monkeypatch.setattr(memory_guard, "_CGROUP_V2", root)
         monkeypatch.setattr(memory_guard, "_CGROUP_V1", tmp_path / "absent-v1")
         return root
@@ -104,8 +123,14 @@ def test_pressure_grades_at_the_documented_boundaries(used, expected) -> None:
     assert memory_guard.memory_pressure(used, 1000) == expected
 
 
-def test_pressure_without_a_limit_is_unknown() -> None:
+def test_pressure_without_a_limit_is_unknown(tmp_path, monkeypatch) -> None:
+    # Both trees missing: usage is unreadable, which must stay ``unknown``
+    # rather than falling back to something invented.
+    monkeypatch.setattr(memory_guard, "_CGROUP_V2", tmp_path / "no-v2")
+    monkeypatch.setattr(memory_guard, "_CGROUP_V1", tmp_path / "no-v1")
+
     assert memory_guard.memory_pressure(500, None) == "unknown"
+    # No readable usage is not the same as zero usage, and is never guessed.
     assert memory_guard.memory_pressure(None, 1000) == "unknown"
 
 
@@ -157,3 +182,97 @@ def test_log_memory_returns_the_snapshot_used_for_the_line(cgroup_v2) -> None:
     assert snapshot["used_bytes"] == 1000
     assert snapshot["limit_bytes"] == 2000
     assert snapshot["pct"] == 50.0
+
+
+def test_anonymous_memory_is_read_from_memory_stat(cgroup_v2) -> None:
+    """v2 spells the unreclaimable part ``anon``; that is the number graded."""
+    cgroup_v2(limit=str(1000), current=str(950), anon=str(300), file_cache=str(640))
+
+    assert memory_guard.container_memory_anonymous_bytes() == 300
+
+
+def test_cgroup_v1_names_anonymous_memory_rss(tmp_path, monkeypatch) -> None:
+    """v1 has no ``anon``: the same quantity is ``rss`` in its memory.stat."""
+    v1 = tmp_path / "memory"
+    v1.mkdir()
+    (v1 / "memory.limit_in_bytes").write_text(str(512 * 1024 * 1024))
+    (v1 / "memory.usage_in_bytes").write_text(str(400 * 1024 * 1024))
+    (v1 / "memory.stat").write_text("cache 314572800\nrss 104857600\n")
+    monkeypatch.setattr(memory_guard, "_CGROUP_V2", tmp_path / "absent-v2")
+    monkeypatch.setattr(memory_guard, "_CGROUP_V1", v1)
+
+    assert memory_guard.container_memory_anonymous_bytes() == 104857600
+    assert memory_guard.memory_pressure() == "ok"
+
+
+def test_reclaimable_cache_does_not_grade_as_critical(cgroup_v2) -> None:
+    """The live false alarm: 488 MB charged against a 488 MB limit, mostly cache.
+
+    Grading the raw charge reported ``pressure=critical pct=100.0`` on an idle
+    gateway whose anonymous memory was a quarter of the limit. Page cache is
+    reclaimable, so it must not be read as a process about to be killed.
+    """
+    cgroup_v2(limit="1000", current="1000", anon="250", file_cache="700")
+
+    snapshot = memory_guard.memory_snapshot()
+
+    assert snapshot["pressure"] == "ok"
+    assert snapshot["used_bytes"] == 250
+    assert snapshot["pct"] == 25.0
+    assert snapshot["cgroup_used_bytes"] == 1000
+    assert snapshot["reclaimable_bytes"] == 750
+
+
+def test_a_real_heap_climb_still_grades_critical(cgroup_v2) -> None:
+    """Reclaimable-aware grading must not hide the kill it exists to predict."""
+    cgroup_v2(limit="1000", current="960", anon="940", file_cache="20")
+
+    snapshot = memory_guard.memory_snapshot()
+
+    assert snapshot["pressure"] == "critical"
+    assert snapshot["anonymous_bytes"] == 940
+    assert snapshot["reclaimable_bytes"] == 20
+
+
+def test_grading_falls_back_to_the_raw_charge_without_memory_stat(cgroup_v2) -> None:
+    """No memory.stat means no reclaimable figure — never invent headroom."""
+    cgroup_v2(limit="1000", current="950")
+
+    assert memory_guard.container_memory_anonymous_bytes() is None
+    snapshot = memory_guard.memory_snapshot()
+    assert snapshot["used_bytes"] == 950
+    assert snapshot["anonymous_bytes"] is None
+    assert snapshot["reclaimable_bytes"] is None
+    assert snapshot["pressure"] == "critical"
+
+
+def test_unparsable_memory_stat_is_ignored_not_fatal(tmp_path, monkeypatch) -> None:
+    """A kernel that changes the table must degrade, not raise."""
+    root = tmp_path / "cgroup"
+    _write_cgroup(root, limit="1000", current="500")
+    (root / "memory.stat").write_text("this is not a memory.stat\nanon not-a-number\n")
+    monkeypatch.setattr(memory_guard, "_CGROUP_V2", root)
+    monkeypatch.setattr(memory_guard, "_CGROUP_V1", tmp_path / "absent-v1")
+
+    assert memory_guard.container_memory_anonymous_bytes() is None
+    assert memory_guard.memory_snapshot()["used_bytes"] == 500
+
+
+def test_log_memory_line_separates_heap_from_cache(cgroup_v2) -> None:
+    """The line must let a reader tell a heap climb from cache pressure."""
+    cgroup_v2(limit=str(488 * 1024 * 1024), current=str(488 * 1024 * 1024),
+              anon=str(250 * 1024 * 1024), file_cache=str(230 * 1024 * 1024))
+    captured: list[str] = []
+    sink_id = logger.add(lambda message: captured.append(str(message)), level="INFO")
+
+    try:
+        memory_guard.log_memory("gateway_start", version="9.9.9")
+    finally:
+        logger.remove(sink_id)
+
+    line = "\n".join(captured)
+    assert "pressure=ok" in line
+    assert "used_mb=250.0" in line
+    assert "cgroup_mb=488.0" in line
+    assert "rss_mb=" in line
+    assert "version=9.9.9" in line

@@ -19,6 +19,17 @@ from inside the process:
 * :func:`memory_pressure` grades usage so callers can warn, trim caches, or
   refuse heavy work before the kernel decides for them.
 
+Grading is deliberately *reclaimable-aware*. ``memory.current`` charges page
+cache along with everything else, but the kernel reclaims clean cache under
+pressure instead of killing the cgroup — so a container holding a small heap
+next to a large read cache is idle, not doomed. Grading the raw charge is what
+made a healthy idle gateway log ``pressure=critical pct=100.0``: 488 MB "used"
+against a 488 MB limit, of which 243 MB was this process's own RSS and the rest
+was cache. :func:`container_memory_anonymous_bytes` therefore reports the
+``anon`` figure from ``memory.stat`` (the memory that cannot be handed back)
+and that is what pressure is graded on; the raw cgroup charge is still reported
+alongside it as ``cgroup_mb`` so a real anon climb stays visible.
+
 Reading is best-effort and never raises: telemetry must not be a new way to
 fail a turn.
 """
@@ -33,6 +44,7 @@ from loguru import logger
 __all__ = [
     "MEMORY_CRITICAL_RATIO",
     "MEMORY_WARN_RATIO",
+    "container_memory_anonymous_bytes",
     "container_memory_limit_bytes",
     "container_memory_used_bytes",
     "log_memory",
@@ -81,10 +93,12 @@ def container_memory_limit_bytes() -> int | None:
 
 
 def container_memory_used_bytes() -> int | None:
-    """Return the cgroup's current memory usage, or ``None`` when unavailable.
+    """Return the cgroup's current memory charge, or ``None`` when unavailable.
 
-    This is the whole cgroup (all processes in the container), which is what the
-    kernel compares against the limit — so it is the number that decides a kill.
+    This is the whole cgroup (all processes in the container) *including* page
+    cache, which is what the kernel charges against ``memory.max``. It is the
+    raw number, not the one pressure is graded on: see
+    :func:`container_memory_anonymous_bytes`.
     """
     for candidate in (
         _CGROUP_V2 / "memory.current",           # cgroup v2
@@ -94,6 +108,63 @@ def container_memory_used_bytes() -> int | None:
         if value is not None:
             return value
     return None
+
+
+def _parse_memory_stat(text: str) -> dict[str, int]:
+    """Parse a cgroup ``memory.stat`` table into ``{key: bytes}``.
+
+    Two whitespace-separated columns, one key per line. Anything unexpected is
+    skipped rather than raised: a diagnostic readout must not be able to fail a
+    turn, and a kernel that adds a column later must not silence the whole line.
+    """
+    values: dict[str, int] = {}
+    for line in str(text or "").splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        try:
+            values[fields[0]] = int(fields[1])
+        except ValueError:
+            continue
+    return values
+
+
+def container_memory_anonymous_bytes() -> int | None:
+    """Return the cgroup's anonymous memory in bytes, or ``None`` when unknown.
+
+    Anonymous memory is heap, stacks and process-private mappings: the part the
+    kernel cannot simply hand back, so it is the part that actually decides an
+    OOM kill. Everything else in ``memory.current`` — page cache above all — is
+    reclaimable and is released under pressure instead of killing the container.
+
+    cgroup v2 names this ``anon``; v1 names the same quantity ``rss``.
+    """
+    for stat_path in (
+        _CGROUP_V2 / "memory.stat",   # cgroup v2: anon
+        _CGROUP_V1 / "memory.stat",   # cgroup v1: rss
+    ):
+        try:
+            text = stat_path.read_text()
+        except OSError:
+            continue
+        values = _parse_memory_stat(text)
+        for key in ("anon", "rss"):
+            if key in values:
+                return values[key]
+    return None
+
+
+def _graded_memory_bytes() -> int | None:
+    """The number pressure is graded on: anonymous memory when it is readable.
+
+    Falling back to the raw charge keeps the guard honest on a kernel that does
+    not expose ``memory.stat`` — it never invents headroom, it just stops
+    treating reclaimable cache as though it were a live process.
+    """
+    anonymous = container_memory_anonymous_bytes()
+    if anonymous is not None:
+        return anonymous
+    return container_memory_used_bytes()
 
 
 def process_rss_bytes() -> int:
@@ -114,9 +185,14 @@ def process_rss_bytes() -> int:
 
 
 def memory_pressure(used: int | None = None, limit: int | None = None) -> str:
-    """Grade memory usage as ``ok``, ``warn``, ``critical`` or ``unknown``."""
+    """Grade memory usage as ``ok``, ``warn``, ``critical`` or ``unknown``.
+
+    ``used`` defaults to anonymous memory, so reclaimable page cache cannot
+    grade a healthy container as critical (see the module docstring). Pass an
+    explicit ``used`` to grade a raw number instead.
+    """
     if used is None:
-        used = container_memory_used_bytes()
+        used = _graded_memory_bytes()
     if limit is None:
         limit = container_memory_limit_bytes()
     if not limit or used is None:
@@ -130,13 +206,24 @@ def memory_pressure(used: int | None = None, limit: int | None = None) -> str:
 
 
 def memory_snapshot() -> dict[str, Any]:
-    """Return a JSON-ready view of container and process memory."""
+    """Return a JSON-ready view of container and process memory.
+
+    ``used_bytes``/``used_mb``/``pct`` describe the anonymous memory that
+    pressure is graded on. ``cgroup_used_bytes`` is the raw charge including
+    reclaimable cache, and ``reclaimable_bytes`` is the difference between the
+    two — the headroom the kernel can take back before it starts killing.
+    """
     limit = container_memory_limit_bytes()
-    used = container_memory_used_bytes()
-    cgroup_used = used
+    charge = container_memory_used_bytes()
+    anonymous = container_memory_anonymous_bytes()
+    used = anonymous if anonymous is not None else charge
+    cgroup_used = charge
     if used is None:
         used = process_rss_bytes()
     ratio = (used / limit) if (limit and used) else None
+    reclaimable = None
+    if charge is not None and anonymous is not None:
+        reclaimable = max(charge - anonymous, 0)
     return {
         "used_bytes": used,
         "limit_bytes": limit,
@@ -144,6 +231,9 @@ def memory_snapshot() -> dict[str, Any]:
         "limit_mb": round(limit / _MB, 1) if limit else None,
         "pct": round(ratio * 100, 1) if ratio is not None else None,
         "cgroup_used_bytes": cgroup_used,
+        "cgroup_used_mb": round(cgroup_used / _MB, 1) if cgroup_used else 0.0,
+        "anonymous_bytes": anonymous,
+        "reclaimable_bytes": reclaimable,
         "rss_bytes": process_rss_bytes(),
         "rss_mb": round(process_rss_bytes() / _MB, 1),
         "pressure": memory_pressure(used, limit),
@@ -155,11 +245,14 @@ def log_memory(tag: str, **extra: Any) -> dict[str, Any]:
 
     Grep ``MEMORY`` in the service logs to reconstruct the usage curve, and match
     the last line before a silent container restart against the plan's limit.
+    ``used_mb`` is anonymous memory (what is graded); ``cgroup_mb`` is the raw
+    cgroup charge, so the two together say whether a high reading was heap or
+    reclaimable cache.
     """
     snapshot = memory_snapshot()
     fields = " ".join(f"{key}={value}" for key, value in extra.items())
     message = (
-        "MEMORY tag={} pressure={} pct={} used_mb={} limit_mb={} rss_mb={}{}"
+        "MEMORY tag={} pressure={} pct={} used_mb={} limit_mb={} rss_mb={} cgroup_mb={}{}"
     ).format(
         tag,
         snapshot["pressure"],
@@ -167,6 +260,7 @@ def log_memory(tag: str, **extra: Any) -> dict[str, Any]:
         snapshot["used_mb"],
         snapshot["limit_mb"],
         snapshot["rss_mb"],
+        snapshot["cgroup_used_mb"],
         (" " + fields) if fields else "",
     )
     try:
