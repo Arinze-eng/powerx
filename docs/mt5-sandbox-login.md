@@ -265,3 +265,98 @@ Wine 10 is the supported configuration and MT5 installs faster under it.
   that hits the cap looks like a rotation/failover problem when it is only a
   quota. Terminate finished sessions (`sandbox-id.close()`), or the next install
   has nowhere to land.
+
+# Tenki, part two — the 5 GB disk is what "still spending time" actually is
+
+Measured 2026-09-27 on the **deployment's own** Tenki sandbox, not a test box:
+`px-websocket-9196044d-1610-4137-981-e4f057d821`, 2 vCPU / 4096 MB /
+**disk_size_gb=5**, read out of its `install.status`, `dpkg` state and logs.
+
+The URL fix above is necessary but was not sufficient. With the correct
+`ubuntu/dists/noble` tree the WineHQ packages were **fetched and unpacked** — and
+then the disk ran out.
+
+## What the box actually looked like
+
+```
+df -h /                       4.9G size, 4.4G used, 200M avail, 96%
+dpkg -l | grep wine           iU  wine-stable           10.0.0.0~noble-1
+                              iU  wine-stable-i386:i386 10.0.0.0~noble-1
+                              iU  winehq-stable         10.0.0.0~noble-1
+ls /opt/wine-stable/bin       function_grep.pl msidb msiexec regedit wine ...   <- no wine64
+find / -name terminal64.exe   (nothing)
+mt5setup.attempt2.log         /usr/bin/wine: 1: Syntax error: "(" unexpected
+```
+
+`iU` is the whole story: the packages were **unpacked but never configured**, so
+the wine64 binary does not exist and `/usr/bin/wine` is a symlink into a
+half-installed tree. The prefix is at `$HOME/.wine-mt5`; the install root is
+`$HOME/.mt5`. The base image already uses 3.6 GB of `/usr`, leaving ~1.5 GB free
+on a 5 GB disk — about a third of what the install needs.
+
+## The cost, from the installer's own log
+
+```
+[+25s]   WineHQ repo: ubuntu/dists/noble          <- the URL fix works
+[+29s]   pinning Wine 10.0.0.0~noble-1
+[+1m38s] WARN: WineHQ install failed — falling back to the distro wine
+[+1m38s] WARN: wine is present but does not execute on this kernel
+[+1m52s] running the silent MT5 install (several minutes) ...
+[+6m53s] retrying the MT5 install (attempt 2/3) ...
+[+11m54s] retrying the MT5 install (attempt 3/3) ...
+install.status: mt5|retrying the MT5 install (attempt 3/3) ...
+```
+
+Three attempts, five minutes each, no terminal — **on every session**, because a
+new websocket session gets a fresh 5 GB sandbox with an empty disk. That is the
+"MT5 takes forever on Tenki" report, and it is a disk budget problem wearing a
+wine costume.
+
+For reference, the same install on a **20 GB** Tenki box completes in **+1m45s**
+(the table above). The only difference is the disk.
+
+## Fix
+
+The installer needs roughly:
+
+| component | size |
+|---|---|
+| WineHQ 10 (amd64 + i386 + the GL/Vulkan recommends) | ~1.1 GB |
+| Wine-Gecko msi (MT5's web installer needs it) | 54 MB |
+| the wine prefix at `$HOME/.wine-mt5` | ~1.6 GB |
+| the MT5 terminal + broker build | ~1.2 GB |
+| **total** | **~4.5 GB** |
+
+so `scripts/install_mt5_sandbox.sh` now runs a **disk preflight** next to its
+memory preflight: `MT5_MIN_DISK_MB` (default **6144**), measured with
+`df -Pk "$MT5_ROOT"`. Below it the install writes
+`install.status = failed|insufficient disk: ...`, prints a JSON `{"ok": false,
+"fix": "raise the sandbox disk to >= 10 GB (Tenki: NANOBOT_TENKI_DISK_SIZE_GB=20)"}`
+and exits **8**. A doomed install reported in one second beats a plausible one
+reported in twelve minutes.
+
+And a wine that is present but **cannot execute** is now terminal: `status failed`
++ JSON + exit **9**, instead of logging a WARN and spending the next ten minutes
+on Xvfb, winbindd, the prefix and three MT5 attempts that cannot work. Every step
+after that point is a wine invocation.
+
+## What to set on the deployment
+
+```
+NANOBOT_TENKI_DISK_SIZE_GB=20     # was 5; Tenki's floor is 5 and 5 is not enough
+```
+
+`NANOBOT_TENKI_MAX_DURATION_SECONDS` (this deployment: 2000) does not have to
+cover the install: the box **pauses** at the TTL rather than dying
+(`pause_expires_at` seven days out), and the sandbox name is derived from the
+websocket session key (`px-websocket-<session>`), so the same session reuses the
+same disk and pays the install once. A *new* session is a new sandbox and pays it
+again — which is why the disk has to be right rather than merely large enough to
+scrape through.
+
+`MT5_GENERIC_INSTALLER=1` is set on this deployment but is **not** the cause
+here: `.install.target` on the box read
+`https://download.mql5.com/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe`,
+i.e. the Exness broker build the CLI defaults to, not the generic MetaQuotes one.
+`mt5_cli` pops that variable once a broker build is selected
+(`cmd_install`, `MT5_GENERIC_INSTALLER`).

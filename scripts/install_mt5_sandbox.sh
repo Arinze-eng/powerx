@@ -337,6 +337,66 @@ if [ -r /proc/meminfo ]; then
   status bootstrap "sandbox memory: ${AVAILABLE_MB} MB (>= ${MIN_MEMORY_MB} MB required)"
 fi
 
+# Disk is the OTHER sizing trap, and on Tenki it is the one that actually bites.
+#
+# MEASURED 2026-09-27 in a live Tenki sandbox (the deployment's own, 2 vCPU /
+# 4 GB / **5 GB disk**), read straight out of its ``install.status`` and
+# ``dpkg`` state:
+#
+#   df -h /            -> 4.9G size, 4.4G used, 200M avail, 96%   <-- 200 MB left
+#   dpkg -l wine-stable -> iU  wine-stable 10.0.0.0~noble-1   (unpacked, NOT configured)
+#                         iU  wine-stable-i386:i386 10.0.0.0~noble-1
+#                         iU  winehq-stable 10.0.0.0~noble-1
+#   /opt/wine-stable/bin/wine64 -> No such file or directory
+#   find / -name terminal64.exe -> (nothing)
+#
+# The WineHQ repo resolved correctly and the packages were FETCHED (apt unpacked
+# the whole wine + mesa/GL stack for both architectures); the disk simply ran out
+# mid-install, so dpkg never got to ``configure``. That leaves the ``iU`` state
+# above: no wine64 binary, ``/usr/bin/wine`` a symlink into the half-installed
+# tree, and every attempt to run it dying as
+#
+#   /usr/bin/wine: 1: Syntax error: "(" unexpected      (mt5setup.attempt2.log)
+#
+# The script then logged "wine is present but does not execute on this kernel"
+# and carried on into three 5-minute silent MT5 install attempts that could not
+# possibly succeed -- +1m52s, +6m53s, +11m54s, ending on
+# ``mt5|retrying the MT5 install (attempt 3/3)`` with no terminal64.exe. That is
+# the "MT5 takes forever on Tenki" report: ~12 minutes burned, per session, with
+# a 5 GB disk that could never have held the install.
+#
+# The space the install genuinely needs, measured rather than guessed:
+#   WineHQ 10 (amd64 + i386 + the GL/Vulkan recommends)  ~1.1 GB
+#   Wine-Gecko msi (needed by MT5's web installer)        54 MB
+#   the wine prefix at $HOME/.wine-mt5                    ~1.6 GB
+#   the MT5 terminal + broker build                       ~1.2 GB
+#   ------------------------------------------------------------------
+#   total                                                 ~4.5 GB, so 6 GB to be safe
+#
+# A 5 GB disk (the Tenki default this deployment was running with) holds about
+# 1.5 GB free after the base image, i.e. a third of what is required. Refuse up
+# front and name the knob, exactly as the memory check above does: a doomed
+# install reported in one second beats a plausible one reported in twelve
+# minutes, and the JSON is what makes the message actionable to the agent.
+MIN_DISK_MB="${MT5_MIN_DISK_MB:-6144}"
+if command -v df >/dev/null 2>&1; then
+  AVAILABLE_DISK_MB=$(df -Pk "${MT5_ROOT}" 2>/dev/null | awk 'NR==2 {print int($4/1024)}')
+  if [ -n "${AVAILABLE_DISK_MB}" ] && [ "${AVAILABLE_DISK_MB}" -lt "${MIN_DISK_MB}" ]; then
+    log "FATAL: sandbox has ${AVAILABLE_DISK_MB} MB of disk free but MT5 needs >= ${MIN_DISK_MB} MB."
+    log "WineHQ + Wine-Gecko + the wine prefix + the MT5 terminal do not fit, so dpkg"
+    log "will exhaust the disk mid-install (leaving wine unpacked but unconfigured,"
+    log "i.e. no wine64) and the MT5 install will retry for minutes with no terminal."
+    log "Fix: raise the sandbox disk. On Tenki set NANOBOT_TENKI_DISK_SIZE_GB=20 (its"
+    log "floor is 5 and 5 is not enough); on Novita use a sized template, and on any"
+    log "other backend give the box >= 10 GB, then retry."
+    status failed "insufficient disk: ${AVAILABLE_DISK_MB} MB free, >= ${MIN_DISK_MB} MB required"
+    printf '{"ok": false, "error": "insufficient disk: %s MB free, %s MB required", "fix": "raise the sandbox disk to >= 10 GB (Tenki: NANOBOT_TENKI_DISK_SIZE_GB=20)"}\n' \
+      "${AVAILABLE_DISK_MB}" "${MIN_DISK_MB}"
+    exit 8
+  fi
+  status bootstrap "sandbox disk: ${AVAILABLE_DISK_MB} MB free (>= ${MIN_DISK_MB} MB required)"
+fi
+
 # Passwordless sudo keeps the script working on the sized Novita templates,
 # which run as uid 1000 while the stock base image runs as root.
 SUDO=""
@@ -640,7 +700,32 @@ if [ -z "${WINE_BIN}" ]; then
     log "FATAL: wine is not available after install"
     exit 3
   fi
-  log "WARN: ${WINE_BIN} is present but does not execute on this kernel"
+  # Name the binary so the doctor report still shows something, then STOP.
+  #
+  # MEASURED 2026-09-27 (Tenki, 5 GB disk): this used to be a WARN and the script
+  # carried on regardless -- Xvfb, winbindd, "initialising wine prefix", Wine-Gecko,
+  # then three 5-minute silent MT5 attempts (+1m52s -> +6m53s -> +11m54s) that all
+  # ended in ``mt5setup.attempt2.log`` reading
+  #   /usr/bin/wine: 1: Syntax error: "(" unexpected
+  # Nothing downstream of a non-executing ``wine`` can work: every step in the rest
+  # of this installer is a wine invocation. The old WARN described a *different*
+  # case (distro wine 9 runs, but is too old for the bridge), where ``_wine_works``
+  # returns TRUE and this block is never reached.
+  #
+  # So the failure is terminal and cheap to report: a broken launcher is knowable
+  # in seconds, and the twelve minutes the install used to spend discovering it are
+  # pure loss -- on Tenki it happened again on every new session, because every
+  # session starts a fresh sandbox.
+  log "FATAL: ${WINE_BIN} is present but does not execute on this kernel"
+  log "A wine that cannot run cannot install MT5 or host the bridge, so the install"
+  log "stops here rather than burning minutes on attempts that cannot succeed."
+  log "Usual cause on a small sandbox: the disk filled while WineHQ was unpacking,"
+  log "leaving wine-stable 'iU' (unpacked, unconfigured) with no wine64 binary."
+  log "Check 'df -h /' and 'dpkg -l | grep wine'; raise the sandbox disk and retry."
+  status failed "wine is present but does not execute on this kernel (${WINE_BIN})"
+  printf '{"ok": false, "error": "wine is present but does not execute on this kernel (%s)", "fix": "the disk probably filled during the WineHQ unpack - raise the sandbox disk to >= 10 GB (Tenki: NANOBOT_TENKI_DISK_SIZE_GB=20) and retry"}\n' \
+    "${WINE_BIN}"
+  exit 9
 fi
 if [ "${WINE_BIN}" != "wine" ]; then
   log "using ${WINE_BIN} (the 'wine' launcher does not run here)"

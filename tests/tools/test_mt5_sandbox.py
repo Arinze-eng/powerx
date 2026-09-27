@@ -249,6 +249,52 @@ def test_wine_version_comparison_triggers_reinstall_outside_the_10_series():
     assert 'if [ "${WINE_MAJOR:-0}" -lt 9 ] || [ "${WINE_MAJOR:-0}" -ge 11 ]' in script
 
 
+def test_the_installer_refuses_a_disk_too_small_for_the_install():
+    """A 5 GB sandbox must be refused up front, not discovered after 12 minutes.
+
+    MEASURED 2026-09-27 in the deployment's own Tenki sandbox (5 GB disk):
+    WineHQ unpacked until the disk hit 96% (200 MB free), so ``dpkg`` never
+    configured the wine packages -- they sat at ``iU`` with
+    ``/opt/wine-stable/bin/wine64`` simply absent. The installer then burned
+    three 5-minute silent MT5 attempts (+1m52s -> +6m53s -> +11m54s) and produced
+    no terminal at all. A 5 GB disk holds ~1.5 GB free after the base image, and
+    the install needs ~4.5 GB (WineHQ + Gecko + prefix + terminal), so the check
+    has to happen before any of that time is spent.
+    """
+    script = (Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh").read_text()
+
+    # The check exists, is overridable, and reads real free space.
+    assert "MT5_MIN_DISK_MB" in script
+    assert 'df -Pk "${MT5_ROOT}"' in script
+    # It fails the install rather than warning through it, with a distinct code.
+    assert "insufficient disk:" in script
+    assert "exit 8" in script
+    # And it names the knob that actually fixes it on the backend that bit.
+    assert "NANOBOT_TENKI_DISK_SIZE_GB=20" in script
+    # Same shape as the memory preflight it sits next to.
+    assert "status failed \"insufficient disk:" in script
+
+
+def test_a_wine_that_cannot_execute_stops_the_install_instead_of_retrying():
+    """Wine present but non-executing is terminal, not a WARN to continue past.
+
+    MEASURED 2026-09-27 (Tenki): the script logged
+    "wine is present but does not execute on this kernel" and carried on into
+    Xvfb, winbindd, the prefix and the MT5 attempts. Every one of those steps is
+    a wine invocation, so all of them were doomed; ``mt5setup.attempt2.log``
+    ended up reading ``/usr/bin/wine: 1: Syntax error: "(" unexpected``. Twelve
+    minutes per session, on every session. The old WARN described the different
+    case of a working-but-too-old distro wine, which never reaches this branch.
+    """
+    script = (Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh").read_text()
+
+    assert "FATAL: ${WINE_BIN} is present but does not execute on this kernel" in script
+    assert "status failed \"wine is present but does not execute on this kernel" in script
+    assert "exit 9" in script
+    # The doomed WARN must not survive anywhere.
+    assert 'log "WARN: ${WINE_BIN} is present but does not execute' not in script
+
+
 def test_start_command_seeds_login_and_portable_mode():
     cmd = build_cli_command(
         "start", {"login": 1111291280, "password": "pw", "server": "Forex Hedged USD"}
