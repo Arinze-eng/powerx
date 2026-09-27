@@ -1939,6 +1939,49 @@ If you want to always use the local conversion, you can force it using:
 |--------|------|---------|-------------|
 | `useJinaReader` | boolean | `true` | If true, Jina Reader will be preferred over the local conversion |
 
+## Media Forensics and the Detection API
+
+`media_forensics` asks a hosted detection API before it reads pixels, because the
+local engine cannot see a *generated* image or a re-rendered document — that class
+leaves no editing history for the pixel scans to find. When the API cannot answer
+(no key, no network, plan gap), the local engine runs as the fallback and the
+report names the blind spot.
+
+```json
+{
+  "tools": {
+    "mediaForensics": {
+      "baseUrl": "https://sightova.com",
+      "apiKeys": ["sk_live_key_one", "sk_live_key_two"],
+      "keyStrategy": "round_robin",
+      "detectionApi": true,
+      "detectionKinds": ["ai", "document"],
+      "timeoutSeconds": 60
+    }
+  }
+}
+```
+
+Keys can also come from the environment instead, which is how most deployments
+supply them — `SIGHTOVA_API_KEYS` (comma- or newline-separated) or the singular
+`SIGHTOVA_API_KEY`. A configured `apiKeys` list is authoritative and is not mixed
+with the environment, so rotation order stays predictable.
+
+| Field | Description |
+|-------|-------------|
+| `baseUrl` | Where to ask. Sightova's host by default; point at the RapidAPI gateway or a mirror with the same `/api/v1/detect/*` contract. |
+| `apiKeys` | One or more bearer keys. When a key is out of plan or quota it is retired and the next serves the request, so one dry key does not force the local fallback. |
+| `apiKey` | Single-key form, kept for compatibility. Merged with `apiKeys` if both are set, so adding a second key cannot silently drop the first. |
+| `keyStrategy` | `round_robin` (default) spreads requests evenly and keeps the order reproducible; `random` spreads the starting point when key budgets are unequal. |
+| `detectionApi` | Master switch. `false` forces the local engine, and the report states that the generated class was not checked. |
+| `detectionKinds` | Which detectors to run, in order. `ai` catches generated images; `document` catches tampered documents and is not covered by every plan. Drop it to save a request on a refusal. |
+| `timeoutSeconds` | Per-request timeout. |
+
+Two behaviours worth knowing: a **plan refusal is remembered per endpoint**, so a
+key that cannot run `document` keeps serving `ai`; and a **rate limit only parks
+the key for a cooldown**, because throttling is temporary. Keys are masked
+(`sk_0e7...b2b2`) in every report and log line.
+
 ## Image Generation
 
 Image generation is configured under `tools.imageGeneration` and uses credentials from the selected provider's `providers.<name>` block.

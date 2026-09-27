@@ -149,6 +149,44 @@ and they must never be quoted at a user as evidence:
 A generated receipt has no editing history to find at all. Layout and arithmetic
 checks are what catch that class, and they are heuristics, not proofs.
 
+## The hosted detection API runs first (Sightova)
+
+For `action="analyze"` the tool asks a hosted detection API **before** it reads
+pixels, and it is the only check in the package that can see a **generated** image
+or a convincingly re-rendered document — a file with no editing history for the
+pixel scans to find. If the API answers, its reading leads the report and can set
+the band on its own (`detector_flagged_synthetic` at probability ≥ 0.85, well
+above the local engine's opinion of the same file).
+
+The local engine still runs underneath, because it measures different classes
+(clone stamps, arithmetic, reconciliation, C2PA) — the two are shown side by
+side, not one replacing the other.
+
+**When the API cannot answer, the local engine is the fallback, and the report
+says so out loud.** That is deliberate: a silently-fallen-back report reads clean
+on exactly the class the API was added to catch. Relay the limitation — do not
+present a clean local result as if the generated class had been checked.
+
+**Keys rotate.** The key that comes up is used; if it is out of plan or quota it
+is retired and the next one serves the request, rather than dropping the run to
+the fallback. Throttled keys cool down and return. A plan refusal on
+`document-tampering` is remembered *per endpoint only* — the same key keeps
+working for `ai`, which is usually the case, since entitlement is per endpoint.
+
+- **Several keys** go in `tools.media_forensics.api_keys` (a list), or the
+  `SIGHTOVA_API_KEYS` env var (comma- or newline-separated). A single key works
+  in `api_key` or `SIGHTOVA_API_KEY`; list and single-key are merged.
+- `key_strategy` is `round_robin` (default, even spread and reproducible) or
+  `random` (spread the starting point when key budgets are unequal).
+- `detection_kinds` defaults to `["ai", "document"]`. Drop `document` if the plan
+  does not cover it, to avoid spending a request on a refusal. Or pass
+  `detection="off"` per call to stay local, and say so in your answer.
+- Keys are never printed in full anywhere — only as `sk_0e7...b2b2`.
+
+The API returns a probability, not a fact. A *low* reading is not proof of
+authenticity: detectors of this class have false negatives. The package says so
+in its limits, and so should you.
+
 ## Timestamps
 
 `action="timestamps"` answers "when was this taken" from EXIF (`DateTimeOriginal`

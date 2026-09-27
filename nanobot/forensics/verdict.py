@@ -44,7 +44,20 @@ _FAMILIES = {
     "layout",
     "arithmetic",
     "reconciliation",
+    "detection",
 }
+
+#: The hosted detection API's probability, at or above which the finding is
+#: treated as strong rather than suggestive. A detector's own operating point,
+#: not a coin flip: below this the reading is still reported and still weighs,
+#: it just does not carry the band on its own.
+_DETECTION_STRONG = 0.85
+
+#: And the point below which the file is called un-flagged by the detector. A
+#: hosted "real" reading is worth something but is not proof — detectors have
+#: false negatives on the generated class they exist to catch — so it carries
+#: the same weak authenticity weight as a matching issuer record, never more.
+_DETECTION_FLAG = 0.5
 
 #: A recent high-quality re-save wipes most compression history, so the pixel
 #: signals deserve less weight when the file says that is what happened.
@@ -70,8 +83,20 @@ def _add(
     )
 
 
-def collect_signals(forensics: dict[str, Any], document: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Turn the raw measurements into a flat, weighted list of evidence."""
+def collect_signals(
+    forensics: dict[str, Any],
+    document: dict[str, Any] | None,
+    detection: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Turn the raw measurements into a flat, weighted list of evidence.
+
+    ``detection`` is the hosted API's reading (see
+    :mod:`nanobot.forensics.sightova`). It is the only family here that can speak
+    to a *generated* file, which has no editing history for the pixel scans to
+    find, so a strong reading is allowed to reach the editing bands on its own.
+    A reading the API could not produce contributes nothing and is named in the
+    limits instead.
+    """
     signals: list[dict[str, Any]] = []
     metadata = forensics.get("metadata") or {}
     ela = forensics.get("ela") or {}
@@ -102,6 +127,89 @@ def collect_signals(forensics: dict[str, Any], document: dict[str, Any] | None) 
             "No C2PA manifest. Almost no camera or receipt app writes one yet, so this "
             "distinguishes nothing.",
         )
+
+    # ---- hosted detection API: the only family that sees a generated file ----
+    # The pixel scans below find an edit's *history*; a well-made generated image
+    # or a re-rendered receipt has none, so they read clean and the local engine
+    # can never flag it. A hosted detector is asked the other question — is this
+    # synthetic? — and that reading is what this block contributes. It runs
+    # first when configured, and its absence is reported rather than silent.
+    detections = list((detection or {}).get("detections") or [])
+    for entry in detections:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind") or "ai")
+        probability = entry.get("probability")
+        label = str(entry.get("detection_type") or kind)
+        if isinstance(probability, (int, float)) and not isinstance(probability, bool):
+            value = float(probability)
+            verdict_text = entry.get("verdict")
+            suffix = f" Verdict: {verdict_text}." if verdict_text else ""
+            if value >= _DETECTION_STRONG:
+                _add(
+                    signals,
+                    "detection",
+                    f"detection_{kind}_flagged",
+                    "edit_signal",
+                    5.0,
+                    f"The hosted detection API ({label}) put the probability this file is "
+                    f"synthetic or tampered at {value:.2f}. That is a direct measurement of the "
+                    f"generated class the local pixel scans cannot see, though it is still a "
+                    f"model's opinion rather than proof.{suffix}",
+                )
+            elif value > _DETECTION_FLAG:
+                _add(
+                    signals,
+                    "detection",
+                    f"detection_{kind}_elevated",
+                    "edit_signal",
+                    2.0,
+                    f"The hosted detection API ({label}) put the probability this file is "
+                    f"synthetic or tampered at {value:.2f} — above its clean baseline, below "
+                    f"the point where it would flag it. Reportable, not a finding.{suffix}",
+                )
+            else:
+                _add(
+                    signals,
+                    "detection",
+                    f"detection_{kind}_clear",
+                    "authenticity_signal",
+                    -1.5,
+                    f"The hosted detection API ({label}) put the probability this file is "
+                    f"synthetic or tampered at {value:.2f}. This is a real check, unlike the "
+                    f"pixel scans, but a detector reading low is not proof: false negatives on "
+                    f"the generated class exist.{suffix}",
+                )
+        elif entry.get("flagged") is True:
+            _add(
+                signals,
+                "detection",
+                f"detection_{kind}_flagged",
+                "edit_signal",
+                5.0,
+                f"The hosted detection API ({label}) flagged this file as synthetic or "
+                f"tampered (no probability reported)." + suffix,
+            )
+        elif entry.get("flagged") is False:
+            _add(
+                signals,
+                "detection",
+                f"detection_{kind}_clear",
+                "authenticity_signal",
+                -1.5,
+                f"The hosted detection API ({label}) did not flag this file. A real check, "
+                f"but not proof of authenticity." + suffix,
+            )
+        else:
+            _add(
+                signals,
+                "detection",
+                f"detection_{kind}_inconclusive",
+                "no_signal",
+                0.0,
+                f"The hosted detection API ({label}) answered, but the response carried no "
+                f"probability this package recognises, so it contributed nothing.",
+            )
 
     # ---- container and metadata ---------------------------------------------
     if metadata.get("editor_software_detected"):
@@ -257,9 +365,18 @@ def collect_signals(forensics: dict[str, Any], document: dict[str, Any] | None) 
     return signals
 
 
-def score(forensics: dict[str, Any], document: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Aggregate signals into a band, a confidence, and an explicit list of limits."""
-    signals = collect_signals(forensics, document)
+def score(
+    forensics: dict[str, Any],
+    document: dict[str, Any] | None = None,
+    detection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Aggregate signals into a band, a confidence, and an explicit list of limits.
+
+    ``detection`` is the hosted API's normalised reading; when it flagged the
+    file strongly the band is set from it directly, because that is a direct
+    measurement rather than an inference from editing history.
+    """
+    signals = collect_signals(forensics, document, detection)
     positive = sum(s["weight"] for s in signals if s["direction"] == "edit_signal")
     negative = sum(s["weight"] for s in signals if s["direction"] == "authenticity_signal")
     total = positive + negative
@@ -275,8 +392,22 @@ def score(forensics: dict[str, Any], document: dict[str, Any] | None = None) -> 
             break
 
     # A mismatch against the issuer's record outranks everything pixels can say,
-    # and a validated credential outranks every edit signal.
+    # and a validated credential outranks every edit signal. A *strong* hosted
+    # detection is in that class for a different reason: it is a direct reading
+    # of the generated class, so no amount of clean pixel history should be able
+    # to talk it down.
     decisive = None
+    strong_detection = next(
+        (
+            entry
+            for entry in ((detection or {}).get("detections") or [])
+            if isinstance(entry, dict)
+            and isinstance(entry.get("probability"), (int, float))
+            and not isinstance(entry.get("probability"), bool)
+            and float(entry["probability"]) >= _DETECTION_STRONG
+        ),
+        None,
+    )
     if reconciliation.get("mismatches"):
         band = "contradicts_issuer_record"
         decisive = "issuer_record_mismatch"
@@ -290,6 +421,16 @@ def score(forensics: dict[str, Any], document: dict[str, Any] | None = None) -> 
         reason = (
             "A signed C2PA credential validates and no edit signal fired. This is the "
             "only positive finding in the package that is worth relying on."
+        )
+    elif strong_detection is not None:
+        kind = str(strong_detection.get("kind") or "ai")
+        band = "detector_flagged_synthetic"
+        decisive = f"detection_{kind}_flagged"
+        reason = (
+            f"The hosted detection API put the probability this file is synthetic or "
+            f"tampered at {float(strong_detection['probability']):.2f}. That is a direct "
+            "measurement of the generated class, which leaves no editing history for the "
+            "pixel scans to find — so this band is set from the detector, not from them."
         )
 
     families = {s["family"] for s in signals if s["direction"] == "edit_signal" and s["weight"] > 0}
@@ -339,6 +480,29 @@ def score(forensics: dict[str, Any], document: dict[str, Any] | None = None) -> 
             "The c2pa package is not installed, so signed provenance was not read. "
             "Install c2pa to enable the one reliable positive signal."
         )
+    if detection is None:
+        limits.append(
+            "The hosted detection API was not consulted, so the generated class — a "
+            "synthetic image or a convincingly re-rendered document, which has no "
+            "editing history to find — was not checked at all."
+        )
+    elif not detection.get("available"):
+        reasons = "; ".join(
+            f"{item.get('kind')}: {item.get('reason')}"
+            for item in (detection.get("unavailable") or [])
+            if isinstance(item, dict)
+        )
+        limits.append(
+            "The hosted detection API could not be reached, so only the local pixel and "
+            "layout checks ran — and those cannot see a generated file. "
+            + (f"Reason: {reasons}." if reasons else "")
+        )
+    else:
+        limits.append(
+            "A low reading from the hosted detection API is not proof of authenticity. "
+            "Detectors of this class have false negatives, and the probability is a "
+            "model's opinion, not a signed fact."
+        )
 
     return {
         "band": band,
@@ -351,6 +515,7 @@ def score(forensics: dict[str, Any], document: dict[str, Any] | None = None) -> 
         "decisive_signal": decisive,
         "families": sorted(families),
         "signals": signals,
+        "detection": detection,
         "cannot_prove_genuine": True,
         "limits": limits,
     }
@@ -363,6 +528,7 @@ def render_report(
     document: dict[str, Any] | None,
     verdict: dict[str, Any],
     artifacts: dict[str, str] | None = None,
+    detection: dict[str, Any] | None = None,
 ) -> str:
     """Render the whole analysis as the markdown block the model reads back."""
     lines: list[str] = []
@@ -373,6 +539,7 @@ def render_report(
     noise = forensics.get("noise") or {}
     copy_move = forensics.get("copy_move") or {}
     provenance = forensics.get("provenance") or {}
+    detection = detection if detection is not None else verdict.get("detection")
 
     add(f"# Forensic analysis — {path}")
     add("")
@@ -384,6 +551,53 @@ def render_report(
         f"authenticity signals {verdict['negative_score']})")
     add(f"- Confidence basis: {verdict['confidence_basis']}")
     add("- **This output cannot prove anything genuine.** See *What this does not say*.")
+    add("")
+
+    add("## Hosted detection API (tried first)")
+    add("")
+    if detection is None:
+        add("- Not consulted for this run.")
+    elif detection.get("available"):
+        add("- Asked before the local pixel checks, because it is the only check here that "
+            "can see a *generated* file — one with no editing history to find.")
+        add("")
+        add("| detection | probability synthetic/tampered | verdict | endpoint | time |")
+        add("|---|---|---|---|---|")
+        for entry in detection.get("detections") or []:
+            probability = entry.get("probability")
+            shown = f"{float(probability):.2f}" if isinstance(probability, (int, float)) else "n/a"
+            add(
+                f"| {entry.get('kind')} | {shown} | {entry.get('verdict') or '—'} | "
+                f"{entry.get('endpoint') or '—'} | "
+                f"{entry.get('processing_time_ms')} ms |"
+            )
+        for entry in detection.get("unavailable") or []:
+            add(f"| {entry.get('kind')} (unavailable) | — | — | — | {entry.get('reason')} |")
+        keys = detection.get("keys") or {}
+        if keys.get("total"):
+            add("")
+            add(
+                f"- Keys configured: {keys.get('total')}; usable now: {keys.get('available')}; "
+                f"rotation: {keys.get('strategy')}."
+            )
+            for item in keys.get("retired") or []:
+                add(f"  - retired {item.get('key')}: {item.get('reason')}")
+            for kind, blocked in (keys.get("plan_blocked") or {}).items():
+                for item in blocked:
+                    add(
+                        f"  - {item.get('key')} has no plan for the '{kind}' endpoint "
+                        f"(still used for others): {item.get('reason')}"
+                    )
+            for item in keys.get("cooling_down") or []:
+                add(
+                    f"  - {item.get('key')} rate-limited, retrying in "
+                    f"{item.get('seconds_remaining')}s"
+                )
+    else:
+        add("- **The API did not answer**, so this run falls back to the local checks "
+            "below — which cannot see a generated file. Reason(s):")
+        for entry in detection.get("unavailable") or []:
+            add(f"  - {entry.get('kind')}: {entry.get('reason')}")
     add("")
 
     add("## When the image says it was taken")

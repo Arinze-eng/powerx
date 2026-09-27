@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from nanobot.agent.tools.filesystem import FileToolsConfig
     from nanobot.agent.tools.human_browser import HumanBrowserToolConfig
     from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
+    from nanobot.agent.tools.media_forensics import MediaForensicsToolConfig
     from nanobot.agent.tools.self import MyToolConfig
     from nanobot.agent.tools.shell import ExecToolConfig
     from nanobot.agent.tools.web import WebToolsConfig
@@ -642,6 +643,11 @@ class ToolsConfig(Base):
             "nanobot.agent.tools.captcha", "CaptchaSolverToolConfig"
         ),
     )
+    media_forensics: "MediaForensicsToolConfig" = Field(
+        default_factory=lambda: _lazy_default(
+            "nanobot.agent.tools.media_forensics", "MediaForensicsToolConfig"
+        ),
+    )
     max_session_messages_per_minute: int = Field(default=6, ge=1)
     restrict_to_workspace: bool = False  # policy intent: keep tool access inside workspace when possible
     webui_allow_local_service_access: bool = Field(
@@ -928,6 +934,7 @@ def _resolve_tool_config_refs() -> None:
     from nanobot.agent.tools.filesystem import FileToolsConfig
     from nanobot.agent.tools.human_browser import HumanBrowserToolConfig
     from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
+    from nanobot.agent.tools.media_forensics import MediaForensicsToolConfig
     from nanobot.agent.tools.self import MyToolConfig
     from nanobot.agent.tools.shell import ExecToolConfig
     from nanobot.agent.tools.web import WebFetchConfig, WebSearchConfig, WebToolsConfig
@@ -945,6 +952,7 @@ def _resolve_tool_config_refs() -> None:
     mod.BrowserToolsConfig = BrowserToolsConfig  # type: ignore[attr-defined]
     mod.HumanBrowserToolConfig = HumanBrowserToolConfig  # type: ignore[attr-defined]
     mod.CaptchaSolverToolConfig = CaptchaSolverToolConfig  # type: ignore[attr-defined]
+    mod.MediaForensicsToolConfig = MediaForensicsToolConfig  # type: ignore[attr-defined]
 
     ToolsConfig.model_rebuild()
     Config.model_rebuild()

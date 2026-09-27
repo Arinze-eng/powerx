@@ -26,11 +26,17 @@ from nanobot.forensics.image_forensics import (
     analyse_image,
     provenance_check,
 )
+from nanobot.forensics.sightova import (
+    SightovaClient,
+    resolve_api_key,
+    run_detections,
+)
 from nanobot.forensics.verdict import collect_signals, render_report, score
 
 __all__ = [
     "ImageForensics",
     "Region",
+    "SightovaClient",
     "analyse_document",
     "analyse_image",
     "collect_signals",
@@ -41,5 +47,7 @@ __all__ = [
     "provenance_check",
     "reconcile",
     "render_report",
+    "resolve_api_key",
+    "run_detections",
     "score",
 ]

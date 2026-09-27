@@ -16,9 +16,43 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from pydantic import Field
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext
+from nanobot.config_base import Base
+
+
+class MediaForensicsToolConfig(Base):
+    """Configuration for media forensics and its hosted detection API.
+
+    The API is **on by default when a key resolves**: it is the only check in
+    the package that can see a generated file, so silently skipping it would
+    leave the tool's weakest blind spot in place. Set ``detection_api=false``
+    to stay offline; the local engine then runs alone and the report says so.
+    """
+
+    #: Where to ask. Sightova's host by default; point at the RapidAPI gateway or
+    #: a mirror with the same ``/api/v1/detect/*`` contract.
+    base_url: str = "https://sightova.com"
+    #: One or more bearer keys. A list rotates: when a key is out of plan or quota
+    #: it is retired and the next serves the request, so one dry key does not
+    #: force the local fallback. A single string is accepted too, split on commas
+    #: or newlines. Leave empty to read SIGHTOVA_API_KEYS / SIGHTOVA_API_KEY.
+    api_keys: list[str] = Field(default_factory=list, repr=False)
+    #: Kept for a single-key deployment and folded into ``api_keys`` on load.
+    api_key: str = Field(default="", repr=False)
+    #: "round_robin" spreads requests evenly and keeps the order reportable;
+    #: "random" spreads the starting point when key budgets are unequal.
+    key_strategy: str = "round_robin"
+    #: Master switch. False forces the local engine; the report then states that
+    #: the generated class was not checked.
+    detection_api: bool = True
+    #: Endpoints to consult, in order. "ai" is the generator detector and is
+    #: always worth one request; "document" is the tampering detector, which some
+    #: plans do not cover — it is attempted and its refusal recorded.
+    detection_kinds: list[str] = Field(default_factory=lambda: ["ai", "document"])
+    timeout_seconds: float = 60.0
 
 _ACTIONS = ("analyze", "timestamps", "ela", "localize", "compare", "timeline")
 
@@ -96,6 +130,26 @@ _SCHEMA = {
                 "OCR work moves."
             ),
         },
+        "detection": {
+            "type": "string",
+            "enum": ["auto", "off"],
+            "description": (
+                "Whether to consult the hosted detection API. 'auto' (default) asks it first "
+                "for action='analyze' when a key is configured — it is the only check here "
+                "that can see a *generated* image or document, which has no editing history "
+                "for the local pixel scans to find. 'off' skips it and uses the local engine "
+                "alone, and the report then says the generated class was not checked."
+            ),
+        },
+        "detection_kinds": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Which API detectors to run, in order. Defaults to the configured set "
+                "('ai' for generated images, 'document' for tampered documents). Each is "
+                "one API scan; drop one to save budget when only that class matters."
+            ),
+        },
     },
     "required": ["action"],
 }
@@ -126,7 +180,15 @@ class MediaForensicsTool(Tool):
             "only check that can actually settle authenticity. "
             "It never reports 'genuine': it returns weighted signals, a band, and the limits "
             "of those signals. Say so when relaying a result, and never present a clean "
-            "report as proof. Use action='timestamps' for just the capture date."
+            "report as proof. Use action='timestamps' for just the capture date. "
+            "For action='analyze' a hosted detection API is consulted FIRST when a key is "
+            "configured: it is the only check here that can see a generated (synthetic) "
+            "image or a convincingly re-rendered document, which leaves no editing history "
+            "for the local pixel scans to find. If the API cannot answer — no key, no "
+            "network, or a plan that does not cover the endpoint — the local engine runs as "
+            "the fallback and the report states the blind spot explicitly. Several API keys "
+            "may be configured; they are rotated, and a key that is out of plan or quota is "
+            "retired in favour of the next rather than dropping the run to the fallback."
         )
 
     def __init__(self, ctx: ToolContext | None = None) -> None:
@@ -137,11 +199,50 @@ class MediaForensicsTool(Tool):
         #: Set when a sandbox run was attempted, so the report can say where the
         #: pixels were read. None means this host read them.
         self._sandbox_note: str | None = None
+        #: The hosted detection reading, set by execute() before _run(). None
+        #: means the API was not in play, which the report states as a limit.
+        self._detection: dict[str, Any] | None = None
+        #: Sightova client settings, from the tool config or its defaults.
+        self._api_keys: list[str] = []
+        self._api_base_url: str = "https://sightova.com"
+        self._api_enabled: bool = True
+        self._api_kinds: tuple[str, ...] = ("ai", "document")
+        self._api_timeout: float = 60.0
+        self._api_strategy: str = "round_robin"
+        #: Built lazily on the first analyze call, then held so key retirements
+        #: survive across files in the same session.
+        self._rotator: Any | None = None
 
     @classmethod
     def create(cls, ctx: ToolContext) -> "MediaForensicsTool":
-        """Carry the tool context so the sandbox tool can be resolved later."""
-        return cls(ctx)
+        """Carry the tool context, and the detection-API settings, into the tool."""
+        from nanobot.forensics.sightova import _split_keys, resolve_api_keys
+
+        cfg = getattr(ctx.config, "media_forensics", None)
+        instance = cls(ctx)
+        if cfg is None:
+            instance._api_keys = resolve_api_keys(None)
+            return instance
+
+        # ``api_keys`` is the list form; ``api_key`` is the single-key legacy
+        # field. Both are folded together, list first, so an operator who added a
+        # second key without clearing the first gets both rather than losing one.
+        configured = _split_keys(getattr(cfg, "api_keys", None)) + _split_keys(
+            getattr(cfg, "api_key", None)
+        )
+        instance._api_base_url = str(getattr(cfg, "base_url", "") or "https://sightova.com")
+        instance._api_enabled = bool(getattr(cfg, "detection_api", True))
+        instance._api_keys = resolve_api_keys(configured)
+        kinds = tuple(
+            str(k).strip().lower()
+            for k in (getattr(cfg, "detection_kinds", None) or [])
+            if str(k).strip()
+        )
+        if kinds:
+            instance._api_kinds = kinds
+        instance._api_timeout = float(getattr(cfg, "timeout_seconds", 60.0) or 60.0)
+        instance._api_strategy = str(getattr(cfg, "key_strategy", "round_robin") or "round_robin")
+        return instance
 
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
@@ -190,6 +291,14 @@ class MediaForensicsTool(Tool):
     async def execute(self, **kwargs: Any) -> Any:
         try:
             action = str(kwargs.get("action") or "").strip().lower()
+            self._detection = None
+            # The hosted detection API is tried FIRST, for the one action where a
+            # verdict is produced. It is the only check in the package that can
+            # see a generated file, and the local engine's fallback cannot. A
+            # refusal or a network failure is recorded, never fatal: the run
+            # continues on the local checks and the report says so.
+            if action == "analyze":
+                await self._detect(kwargs)
             precomputed = await self._prefetch(kwargs, action)
             if precomputed is False:
                 # The reason, when the relay learned one, is included: "no sandbox
@@ -208,6 +317,80 @@ class MediaForensicsTool(Tool):
         except Exception as exc:
             logger.exception("media_forensics tool failed")
             return ToolResult.error(f"{type(exc).__name__}: {exc}")
+
+    # -- hosted detection API --------------------------------------------------
+
+    async def _detect(self, kwargs: dict[str, Any]) -> None:
+        """Ask the hosted detection API about the file before the local checks.
+
+        Best-effort and never raising: any failure leaves ``self._detection`` as
+        a dict with ``available=False`` and the reason, so the verdict layer can
+        name the blind spot instead of pretending the file was checked. The API
+        result is what the report leads with; the local pixel work below still
+        runs, because it measures different classes and the two are shown side by
+        side rather than one replacing the other.
+        """
+        mode = str(kwargs.get("detection") or "auto").strip().lower()
+        if mode in ("off", "false", "skip", "no"):
+            self._detection = {
+                "available": False,
+                "detections": [],
+                "unavailable": [{"kind": "all", "reason": "detection API skipped by request"}],
+            }
+            return
+
+        raw_path = str(kwargs.get("path") or "").strip()
+        if not raw_path:
+            self._detection = None
+            return
+        try:
+            path = self._resolve(raw_path, self._workspace())
+        except ValueError:
+            # A bad path is _run()'s error to report, with its own wording.
+            self._detection = None
+            return
+
+        if not self._api_enabled:
+            self._detection = {
+                "available": False,
+                "detections": [],
+                "unavailable": [
+                    {"kind": "all", "reason": "detection_api is disabled in the tool config"}
+                ],
+                "keys": {"total": len(self._api_keys), "available": 0, "strategy": self._api_strategy},
+            }
+            return
+
+        from nanobot.forensics.sightova import KeyRotator, resolve_api_keys, run_detections
+
+        keys = resolve_api_keys(self._api_keys)
+        if not keys:
+            self._detection = {
+                "available": False,
+                "detections": [],
+                "unavailable": [{"kind": "all", "reason": "no Sightova API key is configured"}],
+                "keys": {"total": 0, "available": 0, "strategy": self._api_strategy},
+            }
+            return
+
+        kinds = self._api_kinds
+        requested = kwargs.get("detection_kinds")
+        if isinstance(requested, list) and requested:
+            kinds = tuple(str(k).strip().lower() for k in requested if str(k).strip())
+
+        # One rotator per tool instance, so a key retired while analysing one file
+        # stays retired for the next file in the same session instead of being
+        # re-asked and re-refused on every call.
+        if self._rotator is None:
+            self._rotator = KeyRotator(keys, strategy=self._api_strategy)
+
+        self._detection = await run_detections(
+            path,
+            base_url=self._api_base_url or "https://sightova.com",
+            kinds=kinds,
+            timeout_seconds=self._api_timeout,
+            rotator=self._rotator,
+        )
 
     # -- sandbox relay ---------------------------------------------------------
 
@@ -466,7 +649,7 @@ class MediaForensicsTool(Tool):
         if doc_enabled:
             document = self._document_analysis(path, kwargs, precomputed)
 
-        verdict = score(forensics, document)
+        verdict = score(forensics, document, self._detection)
 
         ela_target = out_dir / f"{stem}-ela.png"
         try:
@@ -488,6 +671,7 @@ class MediaForensicsTool(Tool):
                 "path": str(path),
                 "forensics": {k: v for k, v in forensics.items() if k != "ela"},
                 "document": document,
+                "detection": self._detection,
                 "verdict": verdict,
                 "artifacts": artifacts,
                 "sandbox": self._sandbox_note,
@@ -504,6 +688,7 @@ class MediaForensicsTool(Tool):
             document=document,
             verdict=verdict,
             artifacts=artifacts,
+            detection=self._detection,
         )
         return ToolResult(report)
 
