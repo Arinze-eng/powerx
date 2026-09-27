@@ -182,3 +182,26 @@ it("says why the pane is unusable when the server address is missing", async () 
   expect(screen.getByTestId("api-platform-generate")).toBeDisabled();
   expect(screen.queryByTestId("api-platform-fresh-key")).toBeNull();
 });
+
+it("copies through the synchronous path so a phone WebView still gets the key", async () => {
+  // The legacy path must run with the user gesture still active: awaiting the
+  // Clipboard API first spends it, and that is the copy that silently failed on
+  // a mobile WebView. Here the async API rejects and the sync path must win.
+  const execCommand = vi.fn().mockReturnValue(true);
+  vi.stubGlobal(
+    "navigator",
+    { ...navigator, clipboard: { writeText: vi.fn().mockRejectedValue(new Error("denied")) } },
+  );
+  Object.defineProperty(document, "execCommand", {
+    configurable: true,
+    writable: true,
+    value: execCommand,
+  });
+
+  await generateKey();
+  await userEvent.click(screen.getByTestId("api-platform-copy-key"));
+
+  await waitFor(() => expect(screen.getByText("Copied")).toBeTruthy());
+  expect(execCommand).toHaveBeenCalledWith("copy");
+  expect(screen.queryByTestId("api-platform-copy-hint")).toBeNull();
+});

@@ -211,7 +211,9 @@ export function ApiPlatformSettings() {
                   data-testid="api-platform-fresh-key"
                   // Wrapped rather than truncated, and marked select-all: a key
                   // the user cannot see the end of is a key they cannot type out
-                  // when the clipboard is unavailable.
+                  // when the clipboard is unavailable. A tap selects the whole key
+                  // so the phone's own Copy action has something to act on.
+                  onClick={selectFreshKey}
                   className="min-w-0 flex-1 select-all break-all rounded-control bg-settings-surface px-3 py-2 font-mono text-[12px] leading-5 text-foreground"
                 >
                   {freshKey}
@@ -242,7 +244,7 @@ export function ApiPlatformSettings() {
                 >
                   {tx(
                     "settings.apiPlatform.copyFailed",
-                    "Your browser blocked the clipboard. The key is selected above — press Ctrl/Cmd-C (or long-press) to copy it before you leave this page.",
+                    "Your browser blocked the clipboard. The key is selected above — copy it from there before you leave this page (Ctrl/Cmd-C, or long-press and choose Copy).",
                   )}
                 </p>
               ) : null}
