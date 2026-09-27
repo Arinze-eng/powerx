@@ -61,10 +61,14 @@ def test_resolve_api_keys_falls_back_to_single_key_env(monkeypatch):
 
 
 def test_mask_never_reveals_a_usable_key():
-    key = "sk_0e7e29b9a1e1eb9c36f12277fe65c1c84d1825663b3676c861c94e57b99eb2b2"
+    # A syntactically real-shaped but inert key: the point of the test is that no
+    # usable prefix/suffix combination survives masking, and pasting a live key
+    # into a test file puts it in git history forever.
+    key = "sk_" + "a" * 59
     masked = _mask(key)
     assert key not in masked
-    assert masked.startswith("sk_0e7") and masked.endswith("b2b2")
+    assert masked.startswith("sk_aaa") and masked.endswith("aaaa")
+    assert len(masked) < len(key)
 
 
 def test_rotator_round_robin_visits_each_key_in_order():
