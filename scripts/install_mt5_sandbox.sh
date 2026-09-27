@@ -401,16 +401,48 @@ install_winehq() {
   $SUDO wget -q -O /etc/apt/keyrings/winehq-archive.key \
       https://dl.winehq.org/wine-builds/winehq.key >/dev/null 2>&1 || return 1
 
-  # Pick the sources file matching this distro's codename.
-  local codename="bookworm"
+  # Pick the sources file matching BOTH this distro's codename and its family.
+  #
+  # MEASURED 2026-09-27 in a Tenki sandbox (Ubuntu 24.04.5, codename "noble"):
+  # this URL was built with the DEBIAN path --
+  #   dl.winehq.org/wine-builds/debian/dists/noble/winehq-noble.sources -> 404
+  # because WineHQ publishes its Ubuntu builds in a separate tree. wget's stderr
+  # went to /dev/null, so the miss was invisible: install_winehq returned 1 at
+  # +23s and the install quietly fell through to Ubuntu's packaged wine 9.0.
+  # That is the whole Tenki difference. The same script on a Debian box
+  # (bookworm/trixie) hits the debian tree, installs WineHQ 10 in one pass, and
+  # then MT5 installs AND logs in -- which is exactly why MT5+wine behaved
+  # everywhere except Tenki: not the sandbox, the installer's URL.
+  local codename="bookworm" flavour="debian" id_like=""
   if [ -r /etc/os-release ]; then
     # shellcheck disable=SC1091
     . /etc/os-release
     codename="${VERSION_CODENAME:-bookworm}"
+    id_like="${ID:-} ${ID_LIKE:-}"
   fi
-  $SUDO wget -q -NP /etc/apt/sources.list.d/ \
-      "https://dl.winehq.org/wine-builds/debian/dists/${codename}/winehq-${codename}.sources" \
-      >/dev/null 2>&1 || return 1
+  case "${id_like}" in
+    *ubuntu*) flavour="ubuntu" ;;
+  esac
+
+  # Try this distro's own tree first, then the other one. A distro that reports
+  # itself as Debian-like yet publishes under the Ubuntu tree still installs, and
+  # a codename that exists in neither is now REPORTED rather than assumed.
+  local _other="debian" _src_ok="" _f
+  [ "${flavour}" = "debian" ] && _other="ubuntu"
+  for _f in "${flavour}" "${_other}"; do
+    $SUDO wget -q -NP /etc/apt/sources.list.d/ \
+        "https://dl.winehq.org/wine-builds/${_f}/dists/${codename}/winehq-${codename}.sources" \
+        >/dev/null 2>&1 || true
+    if [ -s "/etc/apt/sources.list.d/winehq-${codename}.sources" ]; then
+      _src_ok="${_f}"
+      break
+    fi
+  done
+  if [ -z "${_src_ok}" ]; then
+    log "WARN: no WineHQ sources file for ${codename} (tried ${flavour}/${codename} and ${_other}/${codename})"
+    return 1
+  fi
+  log "WineHQ repo: ${_src_ok}/dists/${codename}"
 
   export DEBIAN_FRONTEND=noninteractive
   # FORCED, not cached: the WineHQ sources file was just added, so its index does
@@ -534,7 +566,16 @@ if [ "${WINE_MAJOR:-0}" -lt 9 ] || [ "${WINE_MAJOR:-0}" -ge 11 ]; then
   else
     status wine "wine ${WINE_MAJOR} is unusable for MT5; installing WineHQ 10 ..."
   fi
-  install_winehq || log "WARN: WineHQ install failed"
+  if ! install_winehq; then
+    # Say what this costs, not just that it happened. A silent WARN here is how
+    # the Tenki failure hid for a whole session: MT5 still installs on the
+    # distro Wine, so the only outward sign was an install that "took forever"
+    # and a bridge that never imported.
+    log "WARN: WineHQ install failed — falling back to the distro wine"
+    log "WARN: below Wine 10 the MT5 terminal can install but the MetaTrader5"
+    log "WARN: bridge is unsupported: expect very slow bridge/pip steps and"
+    log "WARN: bridge_imports_in_wine=false, so login and trading will fail."
+  fi
   # apt may have swapped the binaries; re-read the version so the prefix rebuild
   # below (and the doctor report) sees the version actually in place.
   WINE_MAJOR=$(wine_major)
