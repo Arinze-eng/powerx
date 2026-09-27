@@ -1412,7 +1412,7 @@ class AgentLoop:
         sandbox_image_request = (
             _uses_sandbox_image_ocr(channel)
             and (
-                (metadata or {}).get("telegram_images_execution_backend") in {"novita", "vps", "upstash", "daytona", "runloop", "vercel"}
+                (metadata or {}).get("telegram_images_execution_backend") in {"novita", "vps", "upstash", "daytona", "runloop", "tenki", "vercel"}
                 or LLMProvider._contains_image_content(initial_messages)
                 or (
                     provider_state is not None
@@ -2375,7 +2375,7 @@ class AgentLoop:
         sandbox_image_ocr_turn = (
             ctx.kind is TurnKind.USER
             and _uses_sandbox_image_ocr(ctx.msg.channel)
-            and ctx.msg.metadata.get("telegram_images_execution_backend") in {"novita", "vps", "upstash", "daytona", "runloop", "vercel"}
+            and ctx.msg.metadata.get("telegram_images_execution_backend") in {"novita", "vps", "upstash", "daytona", "runloop", "tenki", "vercel"}
         )
         if sandbox_image_ocr_turn:
             # OCR-only channel image turns must not resume provider state from

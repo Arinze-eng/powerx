@@ -54,6 +54,7 @@ def apply_render_execution_env(config: Any) -> Any:
     upstash = getattr(execution, "upstash", None)
     daytona = getattr(execution, "daytona", None)
     runloop = getattr(execution, "runloop", None)
+    tenki = getattr(execution, "tenki", None)
     vercel = getattr(execution, "vercel", None)
     # Credential-only overlay: env never changes which backend is selected.
     if (_env("NANOBOT_EXECUTION_BACKEND") or "").lower() not in {
@@ -62,6 +63,7 @@ def apply_render_execution_env(config: Any) -> Any:
         "upstash",
         "daytona",
         "runloop",
+        "tenki",
         "vercel",
     }:
         return config
@@ -189,6 +191,29 @@ def apply_render_execution_env(config: Any) -> Any:
         if keep_alive is not None and keep_alive >= 60 and int(getattr(runloop, "keep_alive_seconds", 3600) or 3600) == 3600:
             runloop.keep_alive_seconds = keep_alive
         _fill(runloop, "fetch_allow_hosts", _env("NANOBOT_RUNLOOP_FETCH_ALLOW_HOSTS"))
+    # Tenki Sandbox overlay (used when the deployment selects the Tenki backend).
+    # Same credential-only, fill-blanks rule as every other provider: an
+    # admin-saved key/endpoint wins, env restores what is missing.
+    if tenki is not None:
+        _fill(tenki, "api_key", _env("NANOBOT_TENKI_API_KEY") or _env("TENKI_API_KEY"))
+        _fill(tenki, "api_url", _env("NANOBOT_TENKI_API_URL"))
+        _fill(tenki, "snapshot_id", _env("NANOBOT_TENKI_SNAPSHOT_ID"))
+        _fill(tenki, "image", _env("NANOBOT_TENKI_IMAGE"))
+        cpu_cores = _positive_int(_env("NANOBOT_TENKI_CPU_CORES"), maximum=128)
+        if cpu_cores is not None and int(getattr(tenki, "cpu_cores", 2) or 2) == 2:
+            tenki.cpu_cores = cpu_cores
+        memory_mb = _positive_int(_env("NANOBOT_TENKI_MEMORY_MB"), maximum=524_288)
+        if memory_mb is not None and memory_mb % 2 == 0 and int(getattr(tenki, "memory_mb", 4096) or 4096) == 4096:
+            tenki.memory_mb = memory_mb
+        disk_gb = _positive_int(_env("NANOBOT_TENKI_DISK_SIZE_GB"), maximum=100)
+        if disk_gb is not None and disk_gb >= 5 and int(getattr(tenki, "disk_size_gb", 0) or 0) == 0:
+            tenki.disk_size_gb = disk_gb
+        # Session TTL (seconds). Defaults to one hour; an admin-saved value wins.
+        ttl = _positive_int(_env("NANOBOT_TENKI_MAX_DURATION_SECONDS"), maximum=604_800)
+        if ttl is not None and ttl >= 60 and int(getattr(tenki, "max_duration_seconds", 3600) or 3600) == 3600:
+            tenki.max_duration_seconds = ttl
+        _fill(tenki, "tag", _env("NANOBOT_TENKI_TAG"))
+        _fill(tenki, "fetch_allow_hosts", _env("NANOBOT_TENKI_FETCH_ALLOW_HOSTS"))
     # Vercel Sandbox overlay (used when the deployment selects the Vercel
     # backend). Same credential-only, fill-blanks rule as every other provider:
     # an admin-saved token/endpoint wins, env restores what is missing.

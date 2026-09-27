@@ -3,8 +3,9 @@
 Why this exists
 ---------------
 The agent runs shell/exec tools inside a **remote execution sandbox** (Novita
-``/workspace``, Daytona ``/home/daytona``, Runloop ``/home/user``, Upstash
-``/workspace/home``, or the configurable VPS directory). Host-side tools such as
+``/workspace``, Daytona ``/home/daytona``, Runloop ``/home/user``, Tenki
+``/home/tenki``, Upstash ``/workspace/home``, or the configurable VPS
+directory). Host-side tools such as
 ``build_artifact`` and ``web_dev``, however, only see the **host workspace**
 (``ctx.workspace`` / ``~/.nanobot/workspace``).
 
@@ -25,7 +26,7 @@ Strategy (works across every backend)
    ``.git`` and build output do not bloat the transfer).
 2. Fetch that one archive to the host:
    * backends implementing ``async download(remote, local)`` (vps / upstash /
-     daytona / runloop) download it directly;
+     daytona / runloop / tenki) download it directly;
    * the native Novita SDK path reads it via ``files.read`` in bounded base64
      chunks (the SDK's read returns text, so binary payloads are base64-wrapped).
 3. Extract locally and return the staged path.
@@ -374,6 +375,13 @@ def _build_backend(
         )
 
         return RunloopExecutionBackend(backend_config, devbox_name=runloop_devbox_name(key))
+    if backend_name == "tenki" and backend_config is not None:
+        from nanobot.agent.tools.tenki_backend import (
+            TenkiExecutionBackend,
+            tenki_sandbox_name,
+        )
+
+        return TenkiExecutionBackend(backend_config, sandbox_name=tenki_sandbox_name(key))
     if backend_name == "vercel" and backend_config is not None:
         from nanobot.agent.tools.vercel_backend import (
             VercelExecutionBackend,
@@ -529,6 +537,7 @@ async def sandbox_workspace_root() -> str | None:
     from nanobot.agent.tools import (  # noqa: PLC2701
         daytona_backend,
         runloop_backend,
+        tenki_backend,
         upstash_backend,
         vercel_backend,
     )
@@ -536,6 +545,7 @@ async def sandbox_workspace_root() -> str | None:
     mapping = {
         "daytona": daytona_backend.WORKSPACE,
         "runloop": runloop_backend.WORKSPACE,
+        "tenki": tenki_backend.WORKSPACE,
         "upstash": upstash_backend.WORKSPACE,
         "vercel": vercel_backend.WORKSPACE,
     }

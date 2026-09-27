@@ -27,6 +27,11 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.agent.tools.upstash_backend import UpstashError, UpstashExecutionBackend
 from nanobot.agent.tools.runloop_backend import RunloopError, RunloopExecutionBackend, runloop_devbox_name
+from nanobot.agent.tools.tenki_backend import (
+    TenkiError,
+    TenkiExecutionBackend,
+    tenki_sandbox_name,
+)
 from nanobot.agent.tools.vercel_backend import VercelError, VercelExecutionBackend, vercel_sandbox_name
 from nanobot.agent.tools.vps_backend import VPSExecutionBackend
 from nanobot.config.paths import get_data_dir, get_workspace_path
@@ -64,6 +69,11 @@ _DAYTONA_SNAPSHOT_BUDGET = 150
 _DAYTONA_RELEASE_RESET_BUDGET = 90
 _RUNLOOP_KEEP_ALIVE_BUDGET = 60
 _RUNLOOP_RELEASE_RESET_BUDGET = 90
+# Tenki sessions land in seconds and their control plane is a persistent gRPC
+# channel, so both task-end hooks stay short: a wedged call must never delay the
+# finished task's reply.
+_TENKI_KEEP_ALIVE_BUDGET = 45
+_TENKI_RELEASE_RESET_BUDGET = 90
 # Vercel Sandbox bills by active CPU only, so the win from stopping a finished
 # task's sandbox is smaller than for the always-on backends — the budgets stay
 # short so a wedged stop can never delay the finished task's reply.
@@ -607,6 +617,38 @@ class _VercelSandboxStore(_SandboxStore):
 
 _VERCEL_STORE = _VercelSandboxStore()
 
+
+class _TenkiSessionStore(_SandboxStore):
+    """Disk-indexed session → Tenki session id map (no in-process handles needed)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        path = os.getenv("NANOBOT_DATA_DIR", "").strip()
+        base = Path(path).expanduser() if path else Path.home() / ".nanobot"
+        # Point the inherited persistence at a dedicated index file.
+        self._index_path = base / "tenki_sessions.json"
+        try:
+            raw = json.loads(self._index_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self._ids = {str(k): str(v) for k, v in raw.items() if v}
+        except (OSError, ValueError):
+            pass
+
+    def set_id(self, key: str, session_id: str) -> None:
+        """Persist a session → Tenki session id mapping without a live handle."""
+        with self._lock:
+            self._ids[key] = str(session_id)
+            try:
+                self._index_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self._index_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(self._ids, indent=2), encoding="utf-8")
+                tmp.replace(self._index_path)
+            except OSError:
+                logger.warning("Could not persist Tenki session index")
+
+
+_TENKI_STORE = _TenkiSessionStore()
+
 # Alias cache for dynamically built Novita templates (desired alias → usable alias).
 _TEMPLATE_CACHE: dict[str, str] = {}
 _TEMPLATE_BUILD_LOCK = threading.Lock()
@@ -746,6 +788,8 @@ class NovitaSandboxTool(Tool):
             return bool(getattr(execution.daytona, "api_key", "").strip())
         if backend == "runloop":
             return bool(getattr(execution.runloop, "api_key", "").strip())
+        if backend == "tenki":
+            return bool(getattr(execution.tenki, "api_key", "").strip())
         if backend == "vercel":
             return bool(getattr(execution.vercel, "token", "").strip())
         return bool(os.getenv("NOVITA_API_KEY", "").strip()) and Novita is not None
@@ -767,6 +811,8 @@ class NovitaSandboxTool(Tool):
             return "daytona", getattr(execution, "daytona", None)
         if backend == "runloop":
             return "runloop", getattr(execution, "runloop", None)
+        if backend == "tenki":
+            return "tenki", getattr(execution, "tenki", None)
         if backend == "vercel":
             return "vercel", getattr(execution, "vercel", None)
         return "novita", None
@@ -1133,6 +1179,115 @@ class NovitaSandboxTool(Tool):
                         timeout=30,
                     )
 
+    async def _analyze_telegram_images_tenki(
+        self,
+        image_paths: list[tuple[Path, bytes]],
+        *,
+        config: Any,
+        session_key: str,
+        _retry_on_failure: bool = True,
+    ) -> str:
+        """Tesseract OCR for Telegram images inside a Tenki Sandbox.
+
+        Mirrors the Daytona/Runloop path: installs (tesseract + Pillow) are allowed
+        inside the VM, Tesseract gets the same generous 90s timeout, and a failure
+        retries once against a fresh session before degrading gracefully.
+        """
+        backend = TenkiExecutionBackend(
+            config, sandbox_name=tenki_sandbox_name(session_key or "telegram")
+        )
+        # Reuse the persisted session id (if any) so the backend reattaches to
+        # that exact VM instead of re-resolving it by name on each OCR run.
+        stored_id = _TENKI_STORE.sandbox_id(session_key or "telegram")
+        if stored_id:
+            backend.last_session_id = stored_id
+        root = backend.workspace
+        ocr_dir = f"{root}/.nanobot"
+        remote_paths: list[str] = []
+        manifest_path = f"{ocr_dir}/telegram_image_manifest.json"
+        script_path = f"{ocr_dir}/telegram_image_ocr.py"
+        session_reset = False
+        try:
+            await backend.run(
+                f"mkdir -p {shlex.quote(ocr_dir)} {shlex.quote(f'{root}/telegram-images')}",
+                timeout=60,
+            )
+            # Tesseract is optional: the OCR script degrades to Pillow-based
+            # extraction when it is present but tesseract is not, so we must NOT
+            # hard-fail just because the binary could not be installed. Install
+            # attempts are made best-effort and per-package-group so one missing
+            # name (e.g. tesseract-ocr-eng on Alpine) does not abort the whole
+            # install the way a single combined "apt/apk add a b c" would.
+            probe = await backend.run(
+                "if command -v tesseract >/dev/null 2>&1; then printf READY; else printf MISSING; fi",
+                timeout=30,
+            )
+            if "READY" not in probe:
+                await _install_tesseract_resilient(backend)
+                probe = await backend.run(
+                    "if command -v tesseract >/dev/null 2>&1; then printf READY; else printf MISSING; fi",
+                    timeout=30,
+                )
+                if "READY" not in probe:
+                    logger.warning(
+                        "Tenki Sandbox: tesseract unavailable after install attempts; "
+                        "falling back to Pillow-only image analysis"
+                    )
+            await backend.write(script_path, _TELEGRAM_IMAGE_SCRIPT)
+            for path, raw in image_paths:
+                suffix = path.suffix.lower() if path.suffix else ".img"
+                remote_path = f"{root}/telegram-images/{uuid4().hex}{suffix}"
+                remote_paths.append(remote_path)
+                await backend.write_bytes(remote_path, raw)
+            await backend.write(manifest_path, json.dumps(remote_paths))
+            output = await backend.run(
+                "env NANOBOT_OCR_ALLOW_INSTALL=1 NANOBOT_OCR_ALLOW_PILLOW_INSTALL=1 "
+                "NANOBOT_OCR_TIMEOUT_SECONDS=90 "
+                f"python3 {shlex.quote(script_path)} {shlex.quote(manifest_path)}",
+                timeout=180,
+            )
+            stdout = output.split("\n[stderr]", 1)[0].strip()
+            parsed: Any | None = None
+            try:
+                parsed = json.loads(stdout)
+            except (TypeError, ValueError):
+                for line in reversed(stdout.splitlines()):
+                    candidate = line.strip()
+                    if not candidate.startswith("{"):
+                        continue
+                    try:
+                        parsed = json.loads(candidate)
+                        break
+                    except ValueError:
+                        continue
+            if not isinstance(parsed, dict) or not str(parsed.get("content") or "").strip():
+                logger.warning("Tenki Sandbox returned no usable Tesseract OCR result")
+                return "[Tenki Sandbox Tesseract OCR returned no readable result.]"
+            return str(parsed["content"]).strip()[:_MAX_IMAGE_ANALYSIS_RESULT_CHARS]
+        except Exception as exc:
+            logger.warning("Tenki Sandbox Tesseract OCR failed: {}", type(exc).__name__)
+            if _retry_on_failure:
+                session_reset = True
+                session_id = _TENKI_STORE.sandbox_id(session_key or "telegram")
+                with suppress(Exception):
+                    await backend.reset(session_id)
+                _TENKI_STORE.remove(session_key or "telegram")
+                return await self._analyze_telegram_images_tenki(
+                    image_paths,
+                    config=config,
+                    session_key=session_key,
+                    _retry_on_failure=False,
+                )
+            return "[Tenki Sandbox Tesseract OCR failed.]"
+        finally:
+            if remote_paths and not session_reset:
+                with suppress(Exception):
+                    await backend.run(
+                        "rm -f " + " ".join(shlex.quote(path) for path in remote_paths)
+                        + f" {shlex.quote(manifest_path)} {shlex.quote(script_path)}",
+                        timeout=30,
+                    )
+
     async def _analyze_telegram_images_upstash(
         self,
         image_paths: list[tuple[Path, bytes]],
@@ -1383,6 +1538,26 @@ class NovitaSandboxTool(Tool):
                 return "[No readable Telegram images were available to the Runloop Devbox.]"
             return await self._analyze_telegram_images_runloop(
                 runloop_images, config=backend_config, session_key=session_key
+            )
+        if selected_backend == "tenki":
+            if backend_config is None or not str(backend_config.api_key or "").strip():
+                return "[Tenki execution is selected but no API key is configured.]"
+            tenki_images: list[tuple[Path, bytes]] = []
+            for raw_path in image_paths[:_MAX_TELEGRAM_IMAGE_COUNT]:
+                path = Path(raw_path).expanduser().resolve()
+                try:
+                    raw = path.read_bytes()
+                except OSError:
+                    continue
+                if not raw or len(raw) > _MAX_TELEGRAM_IMAGE_BYTES:
+                    continue
+                mime = detect_image_mime(raw) or mimetypes.guess_type(str(path))[0]
+                if mime and mime.startswith("image/"):
+                    tenki_images.append((path, raw))
+            if not tenki_images:
+                return "[No readable Telegram images were available to the Tenki Sandbox.]"
+            return await self._analyze_telegram_images_tenki(
+                tenki_images, config=backend_config, session_key=session_key
             )
         if selected_backend == "daytona":
             if backend_config is None or not str(backend_config.api_key or "").strip():
@@ -2129,6 +2304,15 @@ class NovitaSandboxTool(Tool):
             backend.last_devbox_id = stored_id
         return backend
 
+    def _tenki_backend(self, config: Any, key: str) -> TenkiExecutionBackend:
+        backend = TenkiExecutionBackend(config, sandbox_name=tenki_sandbox_name(key))
+        # Seed the persisted session id (if any) so the backend reattaches to
+        # that exact VM instead of re-resolving it by name on each operation.
+        stored_id = _TENKI_STORE.sandbox_id(key)
+        if stored_id:
+            backend.last_session_id = stored_id
+        return backend
+
     def _vercel_backend(self, config: Any, key: str) -> VercelExecutionBackend:
         backend = VercelExecutionBackend(config, sandbox_name=vercel_sandbox_name(key))
         # Seed the persisted sandbox id (if any) so ensure_sandbox verifies that
@@ -2204,6 +2388,34 @@ class NovitaSandboxTool(Tool):
                         backend.reset(devbox_id), timeout=_RUNLOOP_RELEASE_RESET_BUDGET
                     )
                 _RUNLOOP_STORE.remove(key)
+                return
+            if selected_backend == "tenki" and backend_config is not None:
+                key = session_key or _session_key()
+                session_id = _TENKI_STORE.sandbox_id(key)
+                if not session_id:
+                    return
+                backend = self._tenki_backend(backend_config, key)
+                if getattr(backend, "persist_workspace", True):
+                    # "Perfect sandbox" persistence: a finished task must not
+                    # wipe the user's workspace. Renew the session deadline so
+                    # the VM survives until the next task (and across agent
+                    # restarts), then leave its disk intact. Tenki's own max
+                    # duration remains the final backstop if no work arrives.
+                    async def _bg_tenki_keep_alive() -> None:
+                        try:
+                            await asyncio.wait_for(
+                                backend.keep_alive(session_id), timeout=_TENKI_KEEP_ALIVE_BUDGET
+                            )
+                        except Exception:
+                            logger.debug("Background Tenki keep-alive failed", exc_info=True)
+
+                    asyncio.get_running_loop().create_task(_bg_tenki_keep_alive())
+                    return
+                with suppress(Exception):
+                    await asyncio.wait_for(
+                        backend.reset(session_id), timeout=_TENKI_RELEASE_RESET_BUDGET
+                    )
+                _TENKI_STORE.remove(key)
                 return
             if selected_backend != "upstash" or backend_config is None:
                 if selected_backend == "vercel" and backend_config is not None:
@@ -2784,6 +2996,190 @@ class NovitaSandboxTool(Tool):
             logger.exception("Runloop Devbox operation failed")
             return ToolResult.error(f"Runloop Devbox error: {type(exc).__name__}: {str(exc)[:500]}")
 
+    async def _execute_tenki(
+        self, action: str, kwargs: dict[str, Any], config: Any, session_key: str
+    ) -> ToolResult | str:
+        """Run the shared sandbox action contract on a Tenki Sandbox."""
+        budget = self._tenki_action_budget(action, kwargs)
+        try:
+            return await asyncio.wait_for(
+                self._execute_tenki_inner(action, kwargs, config, session_key), timeout=budget
+            )
+        except asyncio.TimeoutError:
+            return ToolResult.error(
+                "The Tenki Sandbox operation did not finish in time. Wait a moment, then "
+                "either retry the same step or reset the sandbox first."
+            )
+
+    @staticmethod
+    def _tenki_action_budget(action: str, kwargs: dict[str, Any]) -> int:
+        # Hard watchdog: whatever the underlying slow path (cold VM, image pull,
+        # provisioning), the AI's turn must never block indefinitely.
+        # ``run``/``install``/``fetch_url`` track the caller's own timeout plus
+        # margin; fixed budgets cover the rest. A Tenki VM lands in seconds, so
+        # the fixed budgets stay close to the Vercel ones.
+        if action in {"run", "install", "fetch_url"}:
+            try:
+                requested = int(kwargs.get("timeout") or 0)
+            except (TypeError, ValueError):
+                requested = 0
+            default = 600 if action == "install" else 150
+            return max(300, min(max(requested, default), _MAX_TIMEOUT)) + 180
+        return {
+            "reset": 120,
+            "read": 240,
+            "write": 300,
+            "upload": 420,
+            "list": 180,
+            "download_url": 480,
+            "apk_toolchain": 900,
+            "apk_decompile": 780,
+            "apk_build": 780,
+        }.get(action, 300)
+
+    async def _execute_tenki_inner(
+        self, action: str, kwargs: dict[str, Any], config: Any, session_key: str
+    ) -> ToolResult | str:
+        key = session_key or "unknown"
+        backend = self._tenki_backend(config, key)
+        try:
+            if action == "reset":
+                # Terminate the user's VM immediately; a fresh one is created on
+                # the next operation. The stored id is cleared even if the remote
+                # call fails, so nothing lingers.
+                session_id = _TENKI_STORE.sandbox_id(key)
+                with suppress(Exception):
+                    await backend.reset(session_id)
+                _TENKI_STORE.remove(key)
+                return "Tenki Sandbox reset. A new session will be created for the next operation."
+            if action not in {"run", "read", "write", "upload", "fetch_url", "install", "list", "download_url",
+                              "apk_toolchain", "apk_decompile", "apk_build"}:
+                return ToolResult.error("Unknown sandbox action")
+            async with _TENKI_STORE.lock_for(key):
+                if action == "apk_toolchain":
+                    return await self._apk_toolchain(backend)
+                if action == "apk_decompile":
+                    return await self._apk_decompile(backend, kwargs)
+                if action == "apk_build":
+                    return await self._apk_build(backend, kwargs)
+                if action == "run":
+                    command = str(kwargs.get("command") or "").strip()
+                    if not command:
+                        return ToolResult.error("command is required")
+                    timeout = max(1, min(int(kwargs.get("timeout") or 120), _MAX_TIMEOUT))
+                    # Seed once per session, then source the credential file so
+                    # git/gh/curl authenticate (the VM does not inherit the
+                    # backend environment).
+                    if not getattr(backend, "_nb_creds_seeded", False):
+                        await self._seed_git_credentials(backend, backend.workspace)
+                        backend._nb_creds_seeded = True
+                    output = await backend.run(_git_creds_source_for(backend.workspace) + command, timeout=timeout)
+                    if getattr(backend, "last_session_id", ""):
+                        _TENKI_STORE.set_id(key, backend.last_session_id)
+                    return output
+                if action == "install":
+                    raw_packages = str(kwargs.get("packages") or "").strip()
+                    packages = [part for part in re.split(r"[\s,]+", raw_packages) if part]
+                    timeout = max(30, min(int(kwargs.get("timeout") or 600), _MAX_TIMEOUT))
+                    result = await backend.install_packages(packages, timeout=timeout)
+                    return f"Tenki Sandbox package installation result:\n{result}"
+                if action == "read":
+                    return await backend.read(str(kwargs.get("path") or ""))
+                if action == "write":
+                    content = str(kwargs.get("content") or "")
+                    if len(content) > _MAX_CONTENT_CHARS:
+                        return ToolResult.error(
+                            f"content exceeds {_MAX_CONTENT_CHARS} characters. Do NOT retry with the same payload: "
+                            "instead split the file into sequential write ops (first op writes the head, "
+                            'then {"action":"run","command":"cat >> \\"<path>\\" << \'PX_EOF\'\\n...\\nPX_EOF"} '
+                            "appends each following chunk; use a unique heredoc marker)."
+                        )
+                    path = str(kwargs.get("path") or "")
+                    await backend.write(path, content)
+                    if getattr(backend, "last_session_id", ""):
+                        _TENKI_STORE.set_id(key, backend.last_session_id)
+                    return f"Wrote {len(content)} characters to {path} in the Tenki workspace."
+                if action == "upload":
+                    source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
+                    if not self._local_attachment_allowed(source):
+                        return ToolResult.error("source must be inside the nanobot media/data directory")
+                    if not source.is_file():
+                        return ToolResult.error("source file does not exist")
+                    if source.stat().st_size > _MAX_UPLOAD_BYTES:
+                        return ToolResult.error("source file exceeds 200 MiB")
+                    path = str(kwargs.get("path") or "")
+                    await backend.write_bytes(path, await asyncio.to_thread(source.read_bytes))
+                    if getattr(backend, "last_session_id", ""):
+                        _TENKI_STORE.set_id(key, backend.last_session_id)
+                    return f"Uploaded {source.name} to {path} in the Tenki workspace."
+                if action == "fetch_url":
+                    url = str(kwargs.get("url") or "").strip()
+                    if not url:
+                        return ToolResult.error("url is required for fetch_url")
+                    parsed = urlparse(url)
+                    if is_gofile_url(url):
+                        try:
+                            resolved = await resolve_gofile_download(url, timeout_seconds=int(kwargs.get("timeout") or 150))
+                        except GoFileError as exc:
+                            return ToolResult.error(f"could not resolve gofile.io link: {exc}")
+                        item = resolved[0]
+                        real_name = re.sub(r"[^A-Za-z0-9._-]", "_", str(item.get("name") or "gofile_file")) or "gofile_file"
+                        try:
+                            data = await request_file(item, timeout_seconds=int(kwargs.get("timeout") or 150))
+                        except GoFileError as exc:
+                            return ToolResult.error(f"could not download gofile.io file: {exc}")
+                        dest = str(kwargs.get("path") or "").strip() or f"{real_name}"
+                        await backend.write_bytes(dest, data)
+                        if getattr(backend, "last_session_id", ""):
+                            _TENKI_STORE.set_id(key, backend.last_session_id)
+                        return f"Fetched remote file to {dest} in the Tenki workspace. Use action=read or run commands to analyze it."
+                    if parsed.scheme != "https" or parsed.netloc != "onlyfiles.com":
+                        return ToolResult.error("url must be an HTTPS onlyfiles.com or gofile.io URL")
+                    dest_path = str(kwargs.get("path") or "").strip()
+                    fetched = await backend.fetch_url(url, dest_path, timeout=int(kwargs.get("timeout") or 150))
+                    if getattr(backend, "last_session_id", ""):
+                        _TENKI_STORE.set_id(key, backend.last_session_id)
+                    return f"Fetched remote file to {fetched} in the Tenki workspace. Use action=read or run commands to analyze it."
+                if action == "list":
+                    return await backend.list(str(kwargs.get("path") or ""))
+                if action == "download_url":
+                    path = str(kwargs.get("path") or "")
+                    destination = self._artifact_destination(path)
+                    downloaded = await backend.download(path, destination)
+                    if getattr(backend, "last_session_id", ""):
+                        _TENKI_STORE.set_id(key, backend.last_session_id)
+                    try:
+                        shared = await upload_shared_artifact(downloaded)
+                    except (FileShareError, OnlyFilesError) as exc:
+                        return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
+                    host_label = shared.get("host", "onlyfiles")
+                    direct = shared.get("download_url") or shared["url"]
+                    fallback = shared.get("page_url") or shared["url"]
+                    return (
+                        f"Downloaded remote artifact to local path: {downloaded}\n"
+                        f"Direct-download link ({host_label}) - tap opens the download immediately:\n"
+                        f"{direct}\n"
+                        f"Permanent page link (fallback if the direct link ever stops working):\n"
+                        f"{fallback}\n"
+                        "Give the user this link and do NOT paste the file contents into "
+                        "your reply. The file may also be attached directly via the "
+                        "message tool's media parameter when direct attachment delivery "
+                        "is available. Prefer a single clear download link over dumping "
+                        "raw text."
+                    )
+            return ToolResult.error("Unknown sandbox action")
+        except SandboxBusyError:
+            return ToolResult.error(
+                "A previous Tenki Sandbox operation for this session is still running and did not finish in time. "
+                "Wait a moment, then either retry the same step or reset the sandbox first."
+            )
+        except TenkiError as exc:
+            logger.warning("Tenki Sandbox operation failed: {}", str(exc)[:300])
+            return ToolResult.error(f"Tenki Sandbox error: {str(exc)[:500]}")
+        except Exception as exc:
+            logger.exception("Tenki Sandbox operation failed")
+            return ToolResult.error(f"Tenki Sandbox error: {type(exc).__name__}: {str(exc)[:500]}")
+
     @staticmethod
     def _upstash_action_budget(action: str, kwargs: dict[str, Any]) -> int:
         # Hard watchdog: whatever the underlying slow path (cold box, snapshot
@@ -3103,6 +3499,12 @@ class NovitaSandboxTool(Tool):
             ctx = current_request_context()
             session_key = (ctx.session_key or f"{ctx.channel}:{ctx.chat_id}") if ctx is not None else _session_key()
             return await self._execute_runloop(action, kwargs, backend_config, session_key)
+        if selected_backend == "tenki":
+            if backend_config is None or not str(backend_config.api_key or "").strip():
+                return ToolResult.error("Tenki execution is selected but no API key is configured")
+            ctx = current_request_context()
+            session_key = (ctx.session_key or f"{ctx.channel}:{ctx.chat_id}") if ctx is not None else _session_key()
+            return await self._execute_tenki(action, kwargs, backend_config, session_key)
         if selected_backend == "vercel":
             if backend_config is None or not str(backend_config.token or "").strip():
                 return ToolResult.error("Vercel execution is selected but no token is configured")

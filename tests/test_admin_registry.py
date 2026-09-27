@@ -571,3 +571,224 @@ def test_apk_user_activity_groups_questions_per_user(monkeypatch) -> None:
     assert len(users) == 1
     assert users[0]["questions"][0]["message"] == "hi"
     assert users[0]["questions"][0]["category"] == "apk"
+
+
+def test_execution_admin_section_offers_the_tenki_backend(monkeypatch) -> None:
+    """Tenki must be selectable in the admin panel, with its own settings form."""
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    response = admin_registry.admin_route(_request(), "/admin")
+    assert response is not None
+    body = bytes(response.body).decode()
+    # The option an administrator actually picks from.
+    assert "<option value='tenki'>Tenki Sandbox</option>" in body
+    # Every setting the backend reads.
+    for element in (
+        "tenkiApiKey",
+        "tenkiApiUrl",
+        "tenkiSnapshotId",
+        "tenkiImage",
+        "tenkiCpuCores",
+        "tenkiMemoryMb",
+        "tenkiDiskSizeGb",
+        "tenkiMaxDurationSeconds",
+        "tenkiTag",
+        "tenkiFetchAllowHosts",
+        "tenkiPersistWorkspace",
+        "tenkiKeyState",
+    ):
+        assert element in body, element
+    # The one-hour TTL default and the workspace RAM ceiling must be stated.
+    assert "one hour" in body
+    assert "4096 MB is the ceiling" in body
+    # The default TTL is prefilled as one hour (3600 seconds).
+    assert "placeholder='3600'" in body
+
+
+def test_admin_can_select_the_tenki_backend_and_round_trip_its_settings(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.json"
+    source = Path(__file__).parents[1] / "render-config.json"
+    config_path.write_text(source.read_text(), encoding="utf-8")
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.delenv("NANOBOT_TENKI_API_KEY", raising=False)
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+    refreshed = []
+
+    request = _request("/api/admin/execution-settings")
+    request._nanobot_webui_mutation_payload = {
+        "backend": "tenki",
+        "tenkiApiKey": "tk_live_admin_key",
+        "tenkiApiUrl": "https://api.tenki.cloud",
+        "tenkiCpuCores": 4,
+        "tenkiMemoryMb": 2048,
+        "tenkiDiskSizeGb": 25,
+        "tenkiMaxDurationSeconds": 7200,
+        "tenkiTag": "powerx",
+        "tenkiFetchAllowHosts": "gofile.io,onlyfiles.com",
+        "tenkiPersistWorkspace": True,
+    }
+    response = admin_registry.admin_route(
+        request,
+        "/api/admin/execution-settings",
+        refresh_runtime_config=lambda: refreshed.append(True),
+    )
+    assert response is not None
+    assert response.status_code == 200
+    assert refreshed == [True]
+
+    # The secret must never come back over the wire.
+    body = bytes(response.body).decode()
+    assert "tk_live_admin_key" not in body
+    payload = json.loads(body)
+    assert payload["backend"] == "tenki"
+    tenki = payload["tenki"]
+    assert tenki["apiKeyConfigured"] is True
+    assert tenki["cpu_cores"] == 4
+    assert tenki["memory_mb"] == 2048
+    assert tenki["disk_size_gb"] == 25
+    assert tenki["max_duration_seconds"] == 7200  # configurable TTL, not hardcoded
+    assert tenki["tag"] == "powerx"
+    assert tenki["fetch_allow_hosts"] == "gofile.io,onlyfiles.com"
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["execution"]["backend"] == "tenki"
+    # The config serialises with camelCase aliases.
+    saved_tenki = saved["execution"]["tenki"]
+    assert saved_tenki["apiKey"] == "tk_live_admin_key"
+    assert saved_tenki["maxDurationSeconds"] == 7200
+    assert saved_tenki["memoryMb"] == 2048
+    assert saved_tenki["diskSizeGb"] == 25
+
+    # A blank key on the next save keeps the stored one.
+    blank = _request("/api/admin/execution-settings")
+    blank._nanobot_webui_mutation_payload = {"backend": "tenki", "tenkiApiKey": ""}
+    retained = admin_registry.admin_route(blank, "/api/admin/execution-settings")
+    assert retained is not None
+    assert retained.status_code == 200
+    resaved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert resaved["execution"]["tenki"]["apiKey"] == "tk_live_admin_key"
+
+    settings = admin_registry.admin_route(
+        _request("/api/admin/execution-settings"),
+        "/api/admin/execution-settings",
+    )
+    assert settings is not None
+    assert settings.status_code == 200
+    assert '"backend": "tenki"' in bytes(settings.body).decode()
+
+
+def test_tenki_save_defaults_to_a_one_hour_ttl_and_rejects_bad_values(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.json"
+    source = Path(__file__).parents[1] / "render-config.json"
+    config_path.write_text(source.read_text(), encoding="utf-8")
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+
+    # Selecting Tenki with no sizing fields keeps the documented defaults:
+    # a one-hour TTL and 4096 MB (the workspace quota ceiling).
+    select = _request("/api/admin/execution-settings")
+    select._nanobot_webui_mutation_payload = {"backend": "tenki"}
+    response = admin_registry.admin_route(select, "/api/admin/execution-settings")
+    assert response is not None
+    assert response.status_code == 200
+    tenki = json.loads(bytes(response.body).decode())["tenki"]
+    assert tenki["max_duration_seconds"] == 3600
+    assert tenki["memory_mb"] == 4096
+    assert tenki["cpu_cores"] == 2
+
+    for bad in (
+        {"backend": "tenki", "tenkiApiKey": "sk_wrong_prefix"},
+        {"backend": "tenki", "tenkiMemoryMb": 4097},  # odd megabyte count
+        {"backend": "tenki", "tenkiMaxDurationSeconds": 30},  # below the floor
+        {"backend": "tenki", "tenkiCpuCores": 0},
+        {"backend": "tenki", "tenkiDiskSizeGb": 3},
+        {"backend": "tenki", "tenkiTag": "Not A Tag!"},
+    ):
+        request = _request("/api/admin/execution-settings")
+        request._nanobot_webui_mutation_payload = bad
+        rejected = admin_registry.admin_route(request, "/api/admin/execution-settings")
+        assert rejected is not None, bad
+        assert rejected.status_code == 400, bad
+
+
+def test_execution_test_accepts_the_tenki_backend(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    source = Path(__file__).parents[1] / "render-config.json"
+    config_path.write_text(source.read_text(), encoding="utf-8")
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+
+    from nanobot.agent.tools import tenki_backend
+
+    seen: dict[str, object] = {}
+
+    class _FakeTenkiBackend:
+        def __init__(self, config, *, sandbox_name=""):
+            seen["sandbox_name"] = sandbox_name
+            seen["memory_mb"] = config.memory_mb
+            seen["max_duration_seconds"] = config.max_duration_seconds
+
+        async def test_connection(self):
+            seen["called"] = True
+            return {
+                "ok": True,
+                "backend": "tenki",
+                "session_id": "01a0e0fa-dead-beef",
+                "state": "RUNNING",
+                "platform": "Linux px-connection-test 6.18.29 x86_64",
+                "memory_mb": 4096,
+            }
+
+    monkeypatch.setattr(tenki_backend, "is_sdk_available", lambda: True)
+    monkeypatch.setattr(tenki_backend, "TenkiExecutionBackend", _FakeTenkiBackend)
+
+    # Save a key first: the test path refuses to dial without one.
+    save = _request("/api/admin/execution-settings")
+    save._nanobot_webui_mutation_payload = {
+        "backend": "tenki",
+        "tenkiApiKey": "tk_live_admin_key",
+        "tenkiMemoryMb": 4096,
+        "tenkiMaxDurationSeconds": 3600,
+    }
+    assert admin_registry.admin_route(save, "/api/admin/execution-settings").status_code == 200
+
+    request = _request("/api/admin/execution-test")
+    request._nanobot_webui_mutation_payload = {"backend": "tenki"}
+    response = admin_registry.admin_route(request, "/api/admin/execution-test")
+
+    assert response is not None
+    assert response.status_code == 200
+    body = bytes(response.body).decode()
+    assert '"backend": "tenki"' in body
+    assert '"state": "RUNNING"' in body
+    assert "01a0e0fa-dead-beef" in body
+    assert seen["called"] is True
+    assert seen["sandbox_name"] == "powerx-connection-test"
+    assert seen["max_duration_seconds"] == 3600
+
+
+def test_execution_test_reports_a_missing_tenki_sdk(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    source = Path(__file__).parents[1] / "render-config.json"
+    config_path.write_text(source.read_text(), encoding="utf-8")
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+
+    from nanobot.agent.tools import tenki_backend
+
+    monkeypatch.setattr(tenki_backend, "is_sdk_available", lambda: False)
+
+    save = _request("/api/admin/execution-settings")
+    save._nanobot_webui_mutation_payload = {"backend": "tenki", "tenkiApiKey": "tk_live_admin_key"}
+    assert admin_registry.admin_route(save, "/api/admin/execution-settings").status_code == 200
+
+    request = _request("/api/admin/execution-test")
+    request._nanobot_webui_mutation_payload = {"backend": "tenki"}
+    response = admin_registry.admin_route(request, "/api/admin/execution-test")
+
+    assert response is not None
+    assert response.status_code == 400
+    assert "pip install tenki" in bytes(response.body).decode()

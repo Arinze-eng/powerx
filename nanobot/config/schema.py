@@ -498,6 +498,48 @@ class RunloopExecutionConfig(Base):
     persist_workspace: bool = True
 
 
+class TenkiExecutionConfig(Base):
+    """Administrator-configured Tenki Sandbox target for sandbox-backed execution.
+
+    Tenki Sandbox provides disposable full Linux VMs (Ubuntu, passwordless
+    ``sudo``, ``apt``, ``python3``) driven through Tenki's gRPC Python SDK.
+
+    Two numbers matter operationally and both are administrator-configurable:
+
+    * ``max_duration_seconds`` is the session TTL. It defaults to one hour, and
+      Tenki's own deadline reaps the VM if explicit cleanup is ever missed.
+    * ``memory_mb`` defaults to 4096 because the *workspace quota* caps it: a
+      create asking for 8192 fails server-side with ``InvalidStateError:
+      requested resources exceed workspace limits: memory_mb required 8192
+      allowed 4096``. Raise the workspace quota before raising this default.
+    """
+
+    api_key: str = Field(default="", repr=False)
+    api_url: str = "https://api.tenki.cloud"
+    # A session's base disk comes from exactly one source: an operator snapshot
+    # (exact baselined state) wins over a plain registry base image, and when
+    # both are blank Tenki's default base image is used (it already ships
+    # Python, Node, git and apt).
+    snapshot_id: str = ""
+    image: str = ""
+    cpu_cores: int = Field(default=2, ge=1, le=128)
+    memory_mb: int = Field(default=4096, ge=128, le=524_288)
+    # 0 means "let Tenki pick the source's default disk" (5 GB for a plain
+    # create); otherwise 5-100 GB.
+    disk_size_gb: int = Field(default=0, ge=0, le=100)
+    # Session TTL in seconds. One hour by default.
+    max_duration_seconds: int = Field(default=3600, ge=60, le=604_800)
+    # Tag Tenki sessions are created with; also the filter used to re-find a
+    # session by name after a restart.
+    tag: str = "powerx"
+    fetch_allow_hosts: str = ""
+    # "Perfect sandbox" persistence: keep the VM (and every file written to it)
+    # alive across finished tasks, agent restarts, and platform redeploys. A
+    # finished task renews the deadline instead of terminating the session, so
+    # the next operation reattaches to the same disk.
+    persist_workspace: bool = True
+
+
 class VercelExecutionConfig(Base):
     """Administrator-configured Vercel Sandbox target for sandbox-backed execution.
 
@@ -543,7 +585,9 @@ class NovitaTemplateConfig(Base):
 class ExecutionBackendConfig(Base):
     """Select the remote execution provider used by sandbox-compatible tasks."""
 
-    backend: Literal["novita", "vps", "upstash", "daytona", "runloop", "vercel"] = "novita"
+    backend: Literal[
+        "novita", "vps", "upstash", "daytona", "runloop", "tenki", "vercel"
+    ] = "novita"
     # Who picked ``backend``. This is recorded instead of inferred from which
     # credentials happen to sit on disk, so an administrator's explicit choice
     # can never be silently reverted by a durable deployment environment value.
@@ -555,6 +599,7 @@ class ExecutionBackendConfig(Base):
     upstash: UpstashExecutionConfig = Field(default_factory=UpstashExecutionConfig)
     daytona: DaytonaExecutionConfig = Field(default_factory=DaytonaExecutionConfig)
     runloop: RunloopExecutionConfig = Field(default_factory=RunloopExecutionConfig)
+    tenki: TenkiExecutionConfig = Field(default_factory=TenkiExecutionConfig)
     vercel: VercelExecutionConfig = Field(default_factory=VercelExecutionConfig)
     novita_template: NovitaTemplateConfig = Field(default_factory=NovitaTemplateConfig)
 

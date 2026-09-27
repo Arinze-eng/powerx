@@ -303,6 +303,7 @@ class ContextBuilder:
             upstash = getattr(execution, "upstash", None) if execution else None
             daytona = getattr(execution, "daytona", None) if execution else None
             runloop = getattr(execution, "runloop", None) if execution else None
+            tenki = getattr(execution, "tenki", None) if execution else None
             if backend == "vps":
                 if not (vps and str(getattr(vps, "host", "")).strip()):
                     return ""  # no usable backend — don't mislead the model
@@ -319,11 +320,27 @@ class ContextBuilder:
                 if not (runloop and str(getattr(runloop, "api_key", "")).strip()):
                     return ""
                 sandbox_dir = "/home/user"
+            elif backend == "tenki":
+                if not (tenki and str(getattr(tenki, "api_key", "")).strip()):
+                    return ""
+                sandbox_dir = "/home/tenki"
+            elif backend == "vercel":
+                vercel = getattr(execution, "vercel", None) if execution else None
+                if not (vercel and str(getattr(vercel, "token", "")).strip()):
+                    return ""
+                sandbox_dir = "/vercel/sandbox"
             else:
                 if not os.getenv("NOVITA_API_KEY", "").strip():
                     return ""
                 sandbox_dir = "/workspace"
-            backend_labels = {"vps": "Linux VPS over SSH", "upstash": "Upstash Box", "daytona": "Daytona Sandbox", "runloop": "Runloop Devbox"}
+            backend_labels = {
+                "vps": "Linux VPS over SSH",
+                "upstash": "Upstash Box",
+                "daytona": "Daytona Sandbox",
+                "runloop": "Runloop Devbox",
+                "tenki": "Tenki Sandbox",
+                "vercel": "Vercel Sandbox",
+            }
             return render_template(
                 "agent/sandbox_workspace.md",
                 sandbox_backend=backend_labels.get(backend, "Novita Sandbox"),
