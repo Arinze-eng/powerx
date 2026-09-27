@@ -12,6 +12,7 @@ export type SettingsSectionKey =
   | "automations"
   | "skills"
   | "runtime"
+  | "api"
   | "advanced";
 
 export type PendingRestartSection = "runtime" | "browser" | "image";

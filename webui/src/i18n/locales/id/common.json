@@ -87,6 +87,7 @@
       "ariaLabel": "Bagian pengaturan"
     },
     "nav": {
+      "api": "API",
       "general": "Umum",
       "byok": "BYOK",
       "overview": "Ikhtisar",

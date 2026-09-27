@@ -87,6 +87,7 @@
       "ariaLabel": "设置分区"
     },
     "nav": {
+      "api": "API",
       "general": "通用",
       "byok": "BYOK",
       "overview": "概览",

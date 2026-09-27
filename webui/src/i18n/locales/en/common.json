@@ -87,6 +87,7 @@
       "ariaLabel": "Settings sections"
     },
     "nav": {
+      "api": "API",
       "general": "General",
       "byok": "BYOK",
       "overview": "Overview",

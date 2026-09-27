@@ -87,6 +87,7 @@
       "ariaLabel": "Secciones de ajustes"
     },
     "nav": {
+      "api": "API",
       "general": "General",
       "byok": "BYOK",
       "overview": "Resumen",

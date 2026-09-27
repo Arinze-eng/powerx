@@ -817,6 +817,52 @@ export interface ApiServicePayload {
   last_action?: "started" | "stopped" | string;
 }
 
+/**
+ * The OpenAI-compatible API platform, as the Telegram bot already exposes it
+ * behind /apikey. `created.key` carries the plaintext key and is present on the
+ * create response only — the server stores a hash, so it can never be read back.
+ */
+export interface ApiPlatformModel {
+  id: string;
+  object: string;
+  created: number;
+  owned_by: string;
+}
+
+export interface ApiPlatformKey {
+  id?: string | null;
+  name: string;
+  prefix: string;
+  active: boolean;
+  requests: number;
+  last_used_at?: string | null;
+  created_at?: string | null;
+}
+
+export interface ApiPlatformPayload {
+  enabled: boolean;
+  configured: boolean;
+  signed_in: boolean;
+  base_url: string;
+  endpoint: string;
+  models: ApiPlatformModel[];
+  keys: ApiPlatformKey[];
+  max_keys: number;
+  docs: {
+    chat_completions: string;
+    models: string;
+    api_docs: string;
+  };
+  notice?: string;
+  created?: {
+    key: string;
+    name: string;
+    id?: string | null;
+    prefix: string;
+  };
+  revoked?: number;
+}
+
 export interface AppPackageRef {
   manager: string;
   name?: string;

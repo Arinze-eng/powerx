@@ -1,4 +1,5 @@
 import type {
+  ApiPlatformPayload,
   ApiServicePayload,
   AutomationsPayload,
   AutomationUpdatePayload,
@@ -570,6 +571,34 @@ export async function stopApiService(
   transport: WebUIMutationTransport,
 ): Promise<ApiServicePayload> {
   return mutation<ApiServicePayload>(transport, "settings.api_service.stop");
+}
+
+/**
+ * Base URL, models and API keys for the signed-in account. The same store the
+ * Telegram bot's /apikey writes to, so keys are interchangeable between the two.
+ */
+export async function fetchApiPlatform(
+  token: string,
+  base: string = "",
+): Promise<ApiPlatformPayload> {
+  return request<ApiPlatformPayload>(`${base}/api/settings/api-platform`, token);
+}
+
+export async function createApiPlatformKey(
+  transport: WebUIMutationTransport,
+  values: { name?: string } = {},
+): Promise<ApiPlatformPayload> {
+  return mutation<ApiPlatformPayload>(
+    transport,
+    "settings.api_platform.create",
+    values.name ? { name: values.name } : {},
+  );
+}
+
+export async function revokeApiPlatformKeys(
+  transport: WebUIMutationTransport,
+): Promise<ApiPlatformPayload> {
+  return mutation<ApiPlatformPayload>(transport, "settings.api_platform.revoke");
 }
 
 export async function enableNanobotFeature(

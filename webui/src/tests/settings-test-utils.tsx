@@ -132,6 +132,7 @@ export function renderSettingsView(
       | "channels"
       | "automations"
       | "advanced"
+      | "api"
       | "models"
       | "image"
       | "browser"

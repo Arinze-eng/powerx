@@ -23,6 +23,7 @@ from nanobot.webui import settings_contracts as contracts
 from nanobot.webui import settings_models as model_domain
 from nanobot.webui import settings_system as system_domain
 from nanobot.webui.cli_apps_api import cli_apps_action, cli_apps_payload
+from nanobot.webui.http_utils import case_insensitive_header
 from nanobot.webui.http_utils import http_response as _http_response
 from nanobot.webui.http_utils import is_local_browser_request as _is_local_browser_request
 from nanobot.webui.mcp_oauth_api import McpOAuthManager
@@ -73,6 +74,34 @@ _CHANNEL_CONNECT_ACTIONS = frozenset({"start", "poll", "cancel"})
 _MCP_OAUTH_CALLBACK_URL_MAX_BYTES = 8 * 1024
 _MCP_RELOAD_TIMEOUT_SECONDS = 15.0
 _query_first = contracts.query_first
+
+
+def _request_origin(request: WsRequest) -> str:
+    """The origin the client reached us on, for deriving the public API address.
+
+    On the single-process deployment the gateway serves the WebUI and ``/v1/*``
+    from one host, so the address the browser already used is the answer. The
+    value is header-supplied, which is fine: it is only ever used to *display* a
+    base URL back to the person who typed it, never to authenticate or route.
+    """
+    headers = getattr(request, "headers", {}) or {}
+
+    def header(name: str) -> str:
+        return case_insensitive_header(headers, name).strip()
+
+    forwarded = header("x-forwarded-host") or header("host")
+    if not forwarded:
+        return ""
+    forwarded = forwarded.split(",")[0].strip()
+    if not forwarded:
+        return ""
+    proto = header("x-forwarded-proto").split(",")[0].strip().lower()
+    if proto not in {"http", "https"}:
+        proto = "https"
+    # A localhost dev server is not a public API address, so it is not offered.
+    if forwarded.split(":")[0] in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
+        return ""
+    return f"{proto}://{forwarded}"
 
 
 def _channel_connect_route(path: str) -> tuple[str, str] | None:
@@ -127,6 +156,15 @@ _CAPABILITY_ROUTES = {
     "/api/settings/network-safety/update": "network-update",
 }
 
+#: The OpenAI-compatible API platform, which the Telegram bot has had behind
+#: /apikey since before the web app existed. These are the same operations for a
+#: signed-in web session.
+_API_PLATFORM_ROUTES = {
+    "/api/settings/api-platform": "status",
+    "/api/settings/api-platform/create": "create",
+    "/api/settings/api-platform/revoke": "revoke",
+}
+
 _SYSTEM_ROUTES = {
     "/api/settings/cli-apps": "cli-list",
     "/api/settings/cli-apps/install": "cli-install",
@@ -150,6 +188,8 @@ _SYSTEM_ROUTES = {
 }
 
 _SETTINGS_MUTATION_PATHS = frozenset({
+    "/api/settings/api-platform/create",
+    "/api/settings/api-platform/revoke",
     "/api/settings/update",
     "/api/settings/model-configurations/create",
     "/api/settings/model-configurations/update",
@@ -313,7 +353,9 @@ class WebUISettingsRouter:
                 }
             ),
         )
-        if domain == "models":
+        if domain == "api-platform":
+            result = await self._handle_api_platform(action, request)
+        elif domain == "models":
             result = await self._models.handle(
                 action,
                 domain_request,
@@ -350,6 +392,8 @@ class WebUISettingsRouter:
             return "models", action
         if action := _CAPABILITY_ROUTES.get(path):
             return "capabilities", action
+        if action := _API_PLATFORM_ROUTES.get(path):
+            return "api-platform", action
         if action := _SYSTEM_ROUTES.get(path):
             return "system", action
         if _channel_connect_route(path) is not None:
@@ -440,6 +484,44 @@ class WebUISettingsRouter:
 
     def _handle_settings_usage(self) -> Response:
         return self._json_response(self.settings.read(settings_usage_payload))
+
+    async def _handle_api_platform(
+        self,
+        action: str,
+        request: WsRequest,
+    ) -> SettingsRouteResult:
+        """Base URL, models and this account's API keys, for the web settings pane."""
+        from nanobot.webui.api_platform_api import (
+            PlatformError,
+            platform_action,
+            platform_payload,
+        )
+
+        try:
+            # The gateway hands this router the Supabase identity resolver under
+            # the name of its first consumer; it is the signed-in user either way.
+            user_id = self._youtube_user(request)
+            origin = _request_origin(request)
+            if action == "status":
+                return SettingsRouteResult.success(
+                    await platform_payload(user_id, origin=origin)
+                )
+            payload = _mutation_payload(request) or {}
+            result = await platform_action(
+                action,
+                agentx_user_id=user_id,
+                payload=payload,
+                origin=origin,
+            )
+            return SettingsRouteResult.success(result)
+        except PlatformError as exc:
+            # A limit or a missing sign-in is the user's business, not a 500.
+            return SettingsRouteResult.failure(400, str(exc))
+        except Exception as exc:  # noqa: BLE001 - the pane must never 500 the settings page
+            log = getattr(self, "logger", None)
+            if log is not None:
+                log.warning("api platform action {} failed: {}", action, str(exc)[:300])
+            return SettingsRouteResult.failure(502, "Could not reach the API platform.")
 
     def _model_operations(self) -> model_domain.ModelSettingsOperations:
         return model_domain.ModelSettingsOperations(

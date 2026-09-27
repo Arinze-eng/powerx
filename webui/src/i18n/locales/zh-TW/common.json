@@ -87,6 +87,7 @@
       "ariaLabel": "設定區段"
     },
     "nav": {
+      "api": "API",
       "general": "一般",
       "byok": "BYOK",
       "overview": "概覽",

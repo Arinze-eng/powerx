@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cancelMcpOAuth,
   configureChannel,
+  createApiPlatformKey,
   completeMcpOAuth,
   completeProviderOAuth,
   createModelConfiguration,
@@ -13,6 +14,7 @@ import {
   fetchFilePreview,
   fetchFilePreviewAvailability,
   fetchAutomations,
+  fetchApiPlatform,
   fetchApiService,
   fetchCliApps,
   fetchInstalledCliApps,
@@ -38,6 +40,7 @@ import {
   migrateModelConfigurations,
   disableNanobotFeature,
   enableNanobotFeature,
+  revokeApiPlatformKeys,
   runAutomationAction,
   runCliAppAction,
   runMcpPresetAction,
@@ -873,6 +876,54 @@ describe("webui API helpers", () => {
     await stopApiService(mutationTransport);
     expect(requestMutation).toHaveBeenLastCalledWith(
       "settings.api_service.stop",
+      {},
+      20_000,
+    );
+  });
+
+  it("reads and mutates the API platform from the web app", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        enabled: true,
+        configured: true,
+        signed_in: true,
+        base_url: "https://api.example.com",
+        endpoint: "https://api.example.com/v1",
+        models: [{ id: "powerx-1", object: "model", created: 0, owned_by: "powerx" }],
+        keys: [],
+        max_keys: 10,
+        docs: { chat_completions: "", models: "", api_docs: "" },
+      }),
+    } as Response);
+
+    await expect(fetchApiPlatform("tok")).resolves.toMatchObject({
+      base_url: "https://api.example.com",
+      max_keys: 10,
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/api-platform",
+      expect.objectContaining({ headers: { Authorization: "Bearer tok" } }),
+    );
+
+    await createApiPlatformKey(mutationTransport, { name: "laptop" });
+    expect(requestMutation).toHaveBeenLastCalledWith(
+      "settings.api_platform.create",
+      { name: "laptop" },
+      20_000,
+    );
+
+    // No name means no field at all, so the server applies its own default.
+    await createApiPlatformKey(mutationTransport);
+    expect(requestMutation).toHaveBeenLastCalledWith(
+      "settings.api_platform.create",
+      {},
+      20_000,
+    );
+
+    await revokeApiPlatformKeys(mutationTransport);
+    expect(requestMutation).toHaveBeenLastCalledWith(
+      "settings.api_platform.revoke",
       {},
       20_000,
     );

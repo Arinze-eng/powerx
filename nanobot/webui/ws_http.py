@@ -184,6 +184,10 @@ _WEBUI_MUTATION_PATHS = {
     "settings.web_search.update": "/api/settings/web-search/update",
     "settings.api_service.start": "/api/settings/api-service/start",
     "settings.api_service.stop": "/api/settings/api-service/stop",
+    # The OpenAI-compatible API platform: generate a key, revoke the account's
+    # keys. The read side is a plain GET at /api/settings/api-platform.
+    "settings.api_platform.create": "/api/settings/api-platform/create",
+    "settings.api_platform.revoke": "/api/settings/api-platform/revoke",
     "settings.image_generation.update": "/api/settings/image-generation/update",
     "settings.transcription.update": "/api/settings/transcription/update",
     "settings.network_safety.update": "/api/settings/network-safety/update",

@@ -87,6 +87,7 @@
       "ariaLabel": "Mục cài đặt"
     },
     "nav": {
+      "api": "API",
       "general": "Chung",
       "byok": "BYOK",
       "overview": "Tổng quan",

@@ -1,6 +1,7 @@
 import { ChevronLeft, Loader2 } from "lucide-react";
 
 import { SkillsCatalogSettings } from "@/components/settings/SkillsCatalogSettings";
+import { ApiPlatformSettings } from "@/components/settings/api/ApiPlatformSettings";
 import { ImageGenerationSettings } from "@/components/settings/capabilities/ImageGenerationSettings";
 import { AdvancedSettings } from "@/components/settings/capabilities/SecuritySettings";
 import { TranscriptionSettings } from "@/components/settings/capabilities/TranscriptionSettings";
@@ -497,6 +498,8 @@ export function SettingsPage({
             onInstallCapability={(name) => void installCapabilities([name])}
           />
         );
+      case "api":
+        return <ApiPlatformSettings />;
       case "advanced":
         return (
           <AdvancedSettings
