@@ -41,6 +41,7 @@ from PIL import Image, ImageDraw
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.forensics_sandbox import (
     _RAW_BASE,
+    _ROOT_PRELUDE,
     _WRITE_CHUNK,
     FORENSICS_VERSION,
     ForensicsRelay,
@@ -576,21 +577,204 @@ async def test_the_checksum_is_verified_before_the_tar_is_unpacked(workspace: Pa
     assert len(command) < _MAX_COMMAND_CHARS
 
 
-def test_every_path_it_writes_is_inside_the_sandbox_workspace():
-    """MEASURED LIVE (2026-09-27, through the real sandbox tool).
+def test_every_path_it_writes_is_relative_to_the_backend_root():
+    """MEASURED FAILURE (2026-09-27, live on Runloop).
 
-    ``write``/``read`` resolve a non-absolute path under ``/workspace`` and then
-    refuse anything outside it, and they do NOT expand ``$HOME``: a target of
-    ``$HOME/.forensics/probe.txt`` landed in ``/workspace/$HOME/.forensics/probe.txt``
-    — a directory literally named ``$HOME``. The shell in ``run`` does expand it, so
-    the chunks were written to one place and unpacked from another, and every
-    transfer failed its checksum. ``/workspace`` is the one path both halves agree
-    on, and it is guaranteed to exist: it is the cwd every ``run`` is given.
+    Every path here used to be absolute under ``/workspace``, which is only right on
+    Novita. Runloop's ``write`` resolves against ``/home/user`` and REFUSES a
+    ``/workspace/...`` target with ``path must remain inside /home/user``, so the
+    chunks never landed, provisioning failed, and the caller fell back to reading
+    the pixels on the host — silently, under ``sandbox="auto"``.
+
+    The fix is not a second root constant; it is that no root is named at all. A
+    relative path is joined onto whatever root the live backend declared, so these
+    assertions are what keeps the module backend-agnostic: add an absolute root and
+    this fails instead of a user's analysis quietly moving back to the host.
     """
-    from nanobot.agent.tools.forensics_sandbox import _HOME
+    from nanobot.agent.tools.forensics_sandbox import (
+        _HOME,
+        _PKG,
+        _READY,
+        _ROOT_MARKER,
+        _RUNNER,
+        _WORK,
+    )
 
-    assert _HOME.startswith("/workspace/")
+    for path in (_HOME, _RUNNER, _PKG, _WORK, _READY, _ROOT_MARKER):
+        assert not path.startswith("/"), f"{path!r} names a root instead of living under one"
+    # The marker is looked for with ``$d/$marker``, so a multi-segment value would
+    # need a parent directory the first ``write`` cannot create.
+    assert "/" not in _ROOT_MARKER
+    # ``$HOME`` is a literal directory name to ``write``, not a path — the original
+    # bug — and the bootstrap must not reintroduce it.
     assert "$HOME" not in bootstrap_command()
+    # It IS a legitimate candidate for the shell half, which does expand it.
+    from nanobot.agent.tools.forensics_sandbox import _CANDIDATE_ROOTS
+
+    assert "$HOME" in _CANDIDATE_ROOTS
+
+
+def test_the_candidate_roots_cover_every_backend_this_repo_ships():
+    """The fast path, kept honest against the backends it is fast for.
+
+    The filesystem search below makes a missing entry survivable, but a stale list
+    would silently turn every command into a full walk of the box. Reading the
+    constants out of the backends themselves — rather than restating them here — is
+    what makes this fail when a backend is added, which is exactly when it should.
+    """
+    from nanobot.agent.tools import daytona_backend, runloop_backend, tenki_backend, upstash_backend, vercel_backend
+    from nanobot.agent.tools.forensics_sandbox import _CANDIDATE_ROOTS
+    from nanobot.agent.tools.novita_sandbox import _WORKSPACE
+
+    declared = {
+        "novita": _WORKSPACE,
+        "runloop": runloop_backend.WORKSPACE,
+        "daytona": daytona_backend.WORKSPACE,
+        "tenki": tenki_backend.WORKSPACE,
+        "upstash": upstash_backend.WORKSPACE,
+        "vercel": vercel_backend.WORKSPACE,
+    }
+    for backend, root in declared.items():
+        assert root in _CANDIDATE_ROOTS, f"{backend}'s declared root {root} is not tried first"
+
+
+def _run_prelude(env: dict[str, str]) -> Any:
+    """Run the real shell prelude and hand back the process.
+
+    The caller renames the breadcrumb through ``FORENSICS_ROOT_MARKER``. That is what
+    keeps these tests off a breadcrumb a real run left on this machine — they are left
+    behind by design — and it is the only way the negative test below can be certain
+    there is nothing to find.
+    """
+    import shutil
+    import subprocess
+
+    from nanobot.agent.tools.forensics_sandbox import _ROOT_PRELUDE
+
+    if shutil.which("bash") is None:  # pragma: no cover - the sandbox image has bash
+        pytest.skip("no bash to run the prelude with")
+
+    return subprocess.run(  # noqa: S603 - fixed argv, no shell interpolation
+        ["bash", "-c", f"{_ROOT_PRELUDE} pwd"],
+        cwd="/",
+        env={"PATH": "/usr/bin:/bin", **env},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+async def test_nothing_absolute_reaches_the_sandbox_on_the_wire(workspace: Path):
+    """The property the Runloop failure violated, asserted on what is actually sent.
+
+    A whole live analysis is run against a scripted box and every call it made is
+    inspected: no absolute path is written, no command is anchored anywhere but
+    ``$PWD``, and the breadcrumb that lets the shell agree with ``write`` is written
+    before the first command that depends on it.
+    """
+    from nanobot.agent.tools.forensics_sandbox import _ROOT_MARKER, _ROOT_PRELUDE
+
+    target = _jpeg(workspace / "receipt.jpg")
+    sandbox = _ScriptedSandbox(analyse=_runner_payload([target]))
+    tool = MediaForensicsTool.create(_ctx({"novita_sandbox": sandbox}))
+    await tool.execute(action="analyze", path="receipt.jpg", document=False)
+
+    for call in sandbox.calls:
+        path = str(call.get("path") or "")
+        if call.get("action") in {"write", "read"}:
+            assert path and not path.startswith("/"), f"{path!r} names a root; Runloop refuses it"
+
+    commands = sandbox.run_commands
+    assert commands, "the box was never asked to run anything"
+    for command in commands:
+        assert command.startswith(_ROOT_PRELUDE), "a command that does not resolve the root first"
+        # The prelude names candidate roots on purpose; the body — everything that
+        # actually touches the transfer — must not.
+        body = command[len(_ROOT_PRELUDE) :]
+        assert "/workspace" not in body, "an absolute Novita root leaked into a command"
+        assert "$HOME" not in body, "the shell must be told the root, not left to guess it"
+        assert "$PWD/" in body, "a command that is not anchored to the resolved root"
+    # The marker travels relative and comes first: it is the only thing the shell can
+    # find the root by, since it is the only file the write action has put anywhere.
+    assert str(sandbox.calls[0].get("path")) == _ROOT_MARKER
+    assert sandbox.calls[0].get("action") == "write"
+
+
+@pytest.mark.asyncio
+async def test_a_root_that_cannot_be_found_is_named_rather_than_guessed(workspace: Path):
+    """A box whose workspace root the prelude cannot locate must not be analysed in.
+
+    Reported like any other provisioning failure, with the reason carried through to
+    the caller's note — because "the sandbox ran nothing" is not an actionable
+    message and the user is the one who has to act on it.
+    """
+    from nanobot.agent.tools.forensics_sandbox import _ROOT_UNRESOLVED
+
+    target = _jpeg(workspace / "receipt.jpg")
+    sandbox = _ScriptedSandbox(provision=f"{_ROOT_UNRESOLVED}\n[exit_code=1]")
+    relay = ForensicsRelay(sandbox)
+    diagnostics = await relay.provision()
+    assert diagnostics["ok"] is False
+    assert "workspace root" in str(diagnostics["error"])
+    with pytest.raises(RuntimeError, match="workspace root"):
+        await relay.analyse([("receipt.jpg", target)], document=False)
+
+
+def test_the_shell_prelude_finds_a_root_that_no_candidate_lists(tmp_path: Path):
+    """The VPS case: ``workspace_dir`` is whatever the deployment says.
+
+    Nothing can enumerate it, so the prelude falls back to a bounded filesystem
+    search. This runs the real shell, because the fallback is shell — and a unit
+    test of the string would have missed both bugs it was written past (a ``%/*``
+    applied to an already-stripped path, and ``find -xdev`` skipping a workspace on
+    its own mount, which is what a tmpfs workspace looks like).
+    """
+    from nanobot.agent.tools.forensics_sandbox import _ROOT_MARKER_ENV
+
+    marker = ".forensics_root_under_test"
+    root = tmp_path / "srv" / "powerx-workspace"
+    root.mkdir(parents=True)
+    (root / marker).write_text("forensics\n")
+
+    # HOME points at nothing and the cwd is ``/``, so neither fast candidate can
+    # match and the search is the only thing that can produce the right answer.
+    result = _run_prelude({"HOME": str(tmp_path / "empty-home"), _ROOT_MARKER_ENV: marker})
+    assert result.stdout.strip() == str(root)
+
+
+def test_the_prelude_refuses_loudly_when_it_cannot_find_the_root(tmp_path: Path):
+    """A missing root must not become an analysis in some other directory.
+
+    Exiting non-zero with a marker on stdout is what lets the relay name the failure
+    instead of reporting an empty result it cannot explain.
+    """
+    from nanobot.agent.tools.forensics_sandbox import _ROOT_MARKER_ENV, _ROOT_UNRESOLVED
+
+    result = _run_prelude(
+        {
+            "HOME": str(tmp_path / "nothing-here"),
+            _ROOT_MARKER_ENV: ".forensics_root_never_written",
+        }
+    )
+    assert result.returncode != 0
+    assert _ROOT_UNRESOLVED in result.stdout
+
+
+def test_the_breadcrumb_name_is_the_one_the_shell_is_told(monkeypatch: pytest.MonkeyPatch):
+    """Both halves read one override, which is what keeps them pointed at one file.
+
+    Reading it at import time would let a deployment set the variable and still get
+    the default on one side of the transfer — the same class of split the Runloop bug
+    was.
+    """
+    from nanobot.agent.tools.forensics_sandbox import _ROOT_MARKER_ENV, marker_name
+
+    assert marker_name() == ".forensics_root"
+    monkeypatch.setenv(_ROOT_MARKER_ENV, "  custom.breadcrumb  ")
+    assert marker_name() == "custom.breadcrumb"
+    monkeypatch.setenv(_ROOT_MARKER_ENV, "   ")
+    assert marker_name() == ".forensics_root"
 
 
 @pytest.mark.asyncio
@@ -600,7 +784,10 @@ async def test_every_call_refreshes_the_scripts_so_a_fix_ships_without_a_rebuild
     tool = MediaForensicsTool.create(_ctx({"novita_sandbox": sandbox}))
     await tool.execute(action="analyze", path="receipt.jpg", document=False)
     analysis = [c for c in sandbox.run_commands if "request.json" in c][-1]
-    assert analysis.startswith("export PYTHONPATH=")
+    # After the root prelude, and only after it: the bootstrap installs by relative
+    # path, so it would install into the wrong directory without the ``cd`` first.
+    assert analysis.startswith(_ROOT_PRELUDE)
+    assert 'export PYTHONPATH="$PWD/.forensics"' in analysis[len(_ROOT_PRELUDE) :]
     assert "forensics_sandbox_runner.py" in analysis.split("request.json")[0]
 
 

@@ -38,8 +38,10 @@ split across several ``write`` calls with one decode at the end. The tar's
 sha256 travels in the request and is checked before anything is unpacked, so a
 truncated transfer fails loudly instead of being analysed as if it were whole.
 
-Everything it writes goes under ``/workspace`` and never under ``$HOME`` — see the
-note on ``_HOME`` below, which is the one thing a live run had to teach.
+Everything it writes goes under one directory inside the sandbox's own workspace
+root — never under a hardcoded ``/workspace`` and never under a literal ``$HOME``.
+See the note on ``_HOME`` below: the first is wrong on every backend but Novita,
+and the second is not a path at all to the ``write`` action.
 
 The result comes back on stdout, but the runner also writes it to a file: a
 sandbox command can be cut short by the provider's own timeout, and the result
@@ -89,22 +91,137 @@ _RAW_BASE = os.getenv(
 #: or the media workshop cannot collide with it.
 #:
 #: MEASURED LIVE (2026-09-27, through the real ``novita_sandbox`` tool, not the raw
-#: SDK): this directory CANNOT be ``$HOME/.forensics``. The tool's ``write`` and
-#: ``read`` actions resolve a path with ``_safe_path``, which joins anything not
-#: already absolute onto ``/workspace`` and then REFUSES a path outside it — and it
-#: does not expand ``$HOME``. A write to ``$HOME/.forensics/probe.txt`` silently
-#: landed in ``/workspace/$HOME/.forensics/probe.txt``: a directory literally named
-#: ``$HOME``. The shell in ``run`` does expand it, so the chunks were written to one
-#: place while the unpack looked in another — caught by the transfer checksum, which
-#: is exactly what it is for, but a hard failure for every analysis.
+#: SDK): ``write``/``read`` resolve a path with ``_safe_path``, which joins anything
+#: not already absolute onto the backend's own workspace root and then REFUSES a path
+#: outside it — and it does not expand ``$HOME``. A write to ``$HOME/.forensics/
+#: probe.txt`` silently landed in ``/workspace/$HOME/.forensics/probe.txt``: a
+#: directory literally named ``$HOME``. The shell in ``run`` does expand it, so the
+#: chunks were written to one place while the unpack looked in another — caught by
+#: the transfer checksum, which is exactly what it is for, but a hard failure for
+#: every analysis.
 #:
-#: ``/workspace`` is the one path both halves agree on, and it is guaranteed to
-#: exist: it is the working directory every ``run`` command is given.
-_HOME = "/workspace/.forensics"
+#: MEASURED FAILURE (2026-09-27, on Runloop): every path here used to be absolute
+#: under ``/workspace``, which is only correct on Novita. Each backend owns a
+#: different root — ``/home/user`` on Runloop, ``/home/daytona`` on Daytona,
+#: ``/home/tenki`` on Tenki, ``/vercel/sandbox`` on Vercel, ``/workspace/home`` on
+#: Upstash, ``/workspace`` on Novita, and whatever ``workspace_dir`` says on a VPS.
+#: A ``/workspace/...`` target on Runloop raises ``path must remain inside
+#: /home/user`` from the *write* action, so the transfer never landed, provisioning
+#: failed, and ``sandbox="auto"`` quietly fell back to the host while
+#: ``sandbox="require"`` refused outright. This relay was the last consumer of the
+#: sandbox that hardcoded a root; everything else already reads
+#: ``backend.workspace``.
+#:
+#: So nothing here names a root at all:
+#:
+#:   * the ``write``/``read`` actions get RELATIVE paths, which every backend joins
+#:     onto its own root — no branch has to know which backend is live, and a
+#:     backend added later inherits the behaviour for free; and
+#:   * the shell half is given no cwd contract to rely on (Runloop's ``run`` posts a
+#:     bare ``{"command": ...}``; Novita sends ``cwd=/workspace``), so every command
+#:     opens with the ``_ROOT_PRELUDE``, which finds the root by looking for the one
+#:     file only ``write`` could have put there and then ``cd``s into it. That file
+#:     is ``_ROOT_MARKER``, written relative at the top of ``provision()``. The root
+#:     is therefore *derived from* the write action instead of assumed about it,
+#:     which is what makes the two halves structurally unable to disagree — the bug
+#:     this comment block is here to stop coming back.
+#:
+#: These stay relative; ``$PWD`` anchors them once the prelude has run.
+_HOME = ".forensics"
 _RUNNER = f"{_HOME}/bin/forensics_runner.py"
 _PKG = f"{_HOME}/nanobot/forensics"
 _WORK = f"{_HOME}/work"
 _READY = f"{_HOME}/ready-{FORENSICS_VERSION}"
+
+#: The file the shell prelude looks for. Deliberately single-segment: the ``write``
+#: action creates it before any directory exists, so it must not need a parent
+#: directory created first. It is left behind (a dozen bytes) because every later
+#: command needs it again and provisioning runs more than once per box.
+#:
+#: ``FORENSICS_ROOT_MARKER`` overrides the name for both halves at once — the shell
+#: prelude reads it, and so does ``_ensure_root_marker``. That is what lets the tests
+#: probe the search without a real breadcrumb elsewhere on the machine being found
+#: first, and it gives a deployment the option of a less generic filename.
+_ROOT_MARKER = ".forensics_root"
+
+#: Environment variable that renames the breadcrumb for both halves at once.
+_ROOT_MARKER_ENV = "FORENSICS_ROOT_MARKER"
+
+#: Printed by the prelude when it cannot find the root. The relay looks for it, so
+#: the failure is named rather than surfacing as an unparseable empty result.
+_ROOT_UNRESOLVED = "FORENSICS_ROOT_UNRESOLVED"
+
+#: Roots to try before falling back to a filesystem search, cheapest first. The
+#: shell's own cwd and ``$HOME`` are correct on most backends; the rest are each
+#: backend's declared constant. A wrong guess costs one ``test -f``.
+_CANDIDATE_ROOTS = (
+    "$PWD",
+    "$HOME",
+    "/workspace",
+    "/home/user",
+    "/home/daytona",
+    "/home/tenki",
+    "/vercel/sandbox",
+    "/workspace/home",
+    "/root",
+    "/app",
+)
+
+#: Where to look when no candidate matched, one level in from the filesystem root.
+#: A VPS root is whatever ``workspace_dir`` says, so it cannot be enumerated — but it
+#: is still under one of these. Searching a handful of parents beats searching ``/``:
+#: MEASURED on a developer machine, a whole-filesystem walk eight levels deep costs
+#: 6.3 s while this sweep costs 0.1 s, and this runs on every command until the
+#: common case is hit.
+_ROOT_SEARCH_PARENTS = ("/home", "/workspace", "/srv", "/opt", "/data", "/mnt", "/app", "/var", "/tmp", "/root")
+
+#: How far under a search parent to look. Deep enough for ``/home/<user>/<project>/
+#: <workspace>``, shallow enough that the sweep stays a fraction of a second.
+_ROOT_SEARCH_DEPTH = 6
+
+#: ``cd`` into the directory the ``write`` action resolves against, or fail loudly.
+#:
+#: The candidate list keeps the common case at a handful of ``test -f`` calls, which
+#: is what the built-in backends need. The sweep is the fallback that makes the
+#: module correct on a deployment nobody anticipated, and it is the reason a new
+#: backend never has to be taught about this file.
+#:
+#: On failure it prints ``_ROOT_UNRESOLVED`` and exits non-zero, so the relay can
+#: name the failure instead of running the bootstrap in an arbitrary directory and
+#: reporting "no output" — which is what a backend it did not anticipate used to
+#: get.
+_ROOT_PRELUDE = (
+    # Unquoted on purpose, so the default applies when the variable is unset. A
+    # marker filename containing whitespace would break the ``-name`` test, which is
+    # the one thing this override is documented not to be for.
+    f"_fxm=${{{_ROOT_MARKER_ENV}:-{_ROOT_MARKER}}}; "
+    "_fx=''; "
+    + "for _d in " + " ".join(_CANDIDATE_ROOTS) + "; do "
+    + 'if [ -f "$_d/$_fxm" ]; then _fx="$_d"; break; fi; done; '
+    + "if [ -z \"$_fx\" ]; then "
+    + "for _p in " + " ".join(_ROOT_SEARCH_PARENTS) + "; do "
+    + '[ -d "$_p" ] || continue; '
+    # The find prints the marker's own path, so its directory is what is wanted.
+    #
+    # Deliberately NOT ``-xdev``: a workspace can live on its own mount, and a
+    # container's ``/tmp`` is a tmpfs, so ``-xdev`` was measured to skip a marker two
+    # directories away.
+    + f'_f=$(find "$_p" -maxdepth {_ROOT_SEARCH_DEPTH} -type f '
+    + '-name "$_fxm" 2>/dev/null | head -1); '
+    + '[ -n "$_f" ] && { _fx=${_f%/*}; break; }; done; fi; '
+    + "case \"$_fx\" in /*) ;; *) _fx=''; esac; "
+    + f'if [ -z "$_fx" ]; then echo {_ROOT_UNRESOLVED}; exit 1; fi; '
+    + f'cd "$_fx" 2>/dev/null || {{ echo {_ROOT_UNRESOLVED}; exit 1; }}; '
+)
+
+
+def marker_name() -> str:
+    """The breadcrumb's filename, honouring ``FORENSICS_ROOT_MARKER``.
+
+    Read at call time, not at import, so the name the shell is told is always the
+    name that is written — including under a test that sets it after import.
+    """
+    return os.getenv(_ROOT_MARKER_ENV, "").strip() or _ROOT_MARKER
 
 #: One sandbox command is capped at 900 s by ``novita_sandbox``; nothing here may
 #: ask for more.
@@ -186,28 +303,32 @@ def bootstrap_command() -> str:
 #: VERIFY the runner carries the ``FORENSICS_VERSION`` this module requires. Only
 #: if that fails do we fall back to the branch URL — and a version mismatch on
 #: every source is reported loudly instead of executing unknown code.
+#: Every path in here is anchored to ``$PWD``, not to a literal root: the prelude in
+#: ``_run`` has already ``cd``-ed to the backend's workspace by the time this runs,
+#: and anchoring means a later command that changes directory cannot silently split
+#: the runner from the package it imports.
 _BOOTSTRAP_TEMPLATE = """\
-export PYTHONPATH={home}
-mkdir -p {home}/bin {pkg} {home}/work
+export PYTHONPATH="$PWD/{home}"
+mkdir -p "$PWD/{home}/bin" "$PWD/{pkg}" "$PWD/{home}/work"
 _want='{version}'
 _fetch() {{ curl -fsSL --retry 2 "$1" -o "$2" 2>/dev/null && grep -q "FORENSICS_VERSION = [\\"']$_want[\\"']" "$2"; }}
 _sha=$(curl -fsSL 'https://api.github.com/repos/{repo}/commits/main' 2>/dev/null \
   | python3 -c "import sys,json;print((json.load(sys.stdin) or {{}}).get('sha',''))" 2>/dev/null)
 _ok=''
 for _base in "https://raw.githubusercontent.com/{repo}/$_sha/scripts" "{raw_base}"; do
-  if _fetch "$_base/forensics_sandbox_runner.py" {runner}; then
+  if _fetch "$_base/forensics_sandbox_runner.py" "$PWD/{runner}"; then
     _ok=1
     # ``_base`` is always a ``.../<rev>/scripts`` URL, so its parent is the repo
     # root at the SAME revision — which is what keeps the runner and the package it
     # imports from ever being two different commits.
     _src=$(dirname "$_base")
     for _f in {files}; do
-      curl -fsSL --retry 2 "$_src/nanobot/forensics/$_f.py" -o "{pkg}/$_f.py" 2>/dev/null
+      curl -fsSL --retry 2 "$_src/nanobot/forensics/$_f.py" -o "$PWD/{pkg}/$_f.py" 2>/dev/null
     done
     break
   fi
 done
-chmod +x {runner} 2>/dev/null
+chmod +x "$PWD/{runner}" 2>/dev/null
 if [ -z "$_ok" ]; then
   echo "WARNING: could not fetch forensics_sandbox_runner.py version $_want (a cached" >&2
   echo "copy of an older revision may be in use). Retry, or set FORENSICS_SCRIPT_RAW_BASE." >&2
@@ -228,21 +349,30 @@ def _provision_command() -> str:
     missing, which is a much better outcome than refusing to analyse the image. It
     also needs root, and a box without passwordless sudo is a normal box, not a
     broken one.
+
+    The wheels are tried three ways for the same cross-backend reason: a modern
+    Debian/Ubuntu image is a PEP 668 "externally managed" environment and refuses a
+    plain ``pip install`` outright, while an older image with no root refers to a
+    ``--user`` install. Novita's image accepted the plain form, which is why the
+    single attempt was enough to look correct.
     """
     return (
-        f"test -f {_READY} && echo READY_ALREADY_EXISTS || ("
+        f'test -f "$PWD/{_READY}" && echo READY_ALREADY_EXISTS || ('
         # Python deps first: pure wheels, and the one thing the pixel layer cannot
-        # work without.
-        "python3 -c 'import numpy, PIL' 2>/dev/null || "
-        "python3 -m pip install --no-input --disable-pip-version-check -q numpy pillow "
-        "2>&1 | tail -2; "
+        # work without. Best-effort at every step — the probe below is what decides.
+        "python3 -c 'import numpy, PIL' 2>/dev/null || { "
+        "for _flags in '' '--break-system-packages' '--break-system-packages --user'; do "
+        "python3 -m pip install --no-input --disable-pip-version-check -q "
+        "$_flags numpy pillow >/dev/null 2>&1 || true; "
+        "python3 -c 'import numpy, PIL' 2>/dev/null && break; "
+        "done; }; "
         "if ! command -v tesseract >/dev/null 2>&1; then "
         "(sudo -n apt-get update -qq && sudo -n apt-get install -y -qq "
         "tesseract-ocr tesseract-ocr-eng) >/dev/null 2>&1 "
         "|| (sudo -n apt-get install -y -qq tesseract-ocr) >/dev/null 2>&1 "
         "|| true; fi; "
         "python3 -c 'import numpy, PIL' 2>/dev/null || { echo DEPS_MISSING; exit 0; }; "
-        f"touch {_READY}"
+        f'touch "$PWD/{_READY}"'
         ")\n"
         "python3 -c \"import numpy,PIL;print('numpy',numpy.__version__,'pillow',PIL.__version__)\" "
         "2>/dev/null || echo 'deps: missing'; "
@@ -274,8 +404,15 @@ async def _run(
     The refresh is what lets a fixed runner ship without rebuilding the sandbox, so
     it is on by default and only turned off for the follow-up reads of a run that
     already paid for it.
+
+    Every command — refresh or not — is prefixed with ``_ROOT_PRELUDE``, which
+    ``cd``-s to the root the ``write`` action resolves against. Nothing else in this
+    module may assume a cwd: the backends disagree about what one is (Novita sends
+    ``cwd=/workspace``, Runloop sends the command bare).
     """
-    prefix = f"{bootstrap_command()} >/dev/null 2>&1 || true; " if bootstrap else ""
+    prefix = _ROOT_PRELUDE
+    if bootstrap:
+        prefix += f"{bootstrap_command()} >/dev/null 2>&1 || true; "
     return str(await sandbox.execute(action="run", command=f"{prefix}{command}", timeout=timeout))
 
 
@@ -331,7 +468,33 @@ class ForensicsRelay:
     def __init__(self, sandbox: Any) -> None:
         self.sandbox = sandbox
         self._provisioned = False
+        self._marker_written = False
         self._diagnostics: dict[str, Any] = {}
+
+    # -- locating the workspace root ----------------------------------------- #
+
+    async def _ensure_root_marker(self) -> None:
+        """Drop the breadcrumb the shell prelude finds the workspace root by.
+
+        The path is RELATIVE, so ``_safe_path`` joins it onto whichever root this
+        deployment's backend declared — ``/workspace`` on Novita, ``/home/user`` on
+        Runloop, ``/home/daytona`` on Daytona, and so on. Single-segment on purpose:
+        it is the first thing written, and some backends do not create a parent
+        directory on ``write``, so it must not need one.
+
+        This is the one file that makes the two halves of a transfer agree. It is
+        written by the same action the chunks are written by, so the root the shell
+        unpacks in cannot be a different root from the one the chunks landed in.
+        """
+        if self._marker_written:
+            return
+        await self.sandbox.execute(
+            action="write",
+            path=marker_name(),
+            content=f"forensics {FORENSICS_VERSION}\n",
+            timeout=60,
+        )
+        self._marker_written = True
 
     # -- provisioning -------------------------------------------------------- #
 
@@ -346,6 +509,7 @@ class ForensicsRelay:
         if self._provisioned:
             return self._diagnostics
         try:
+            await self._ensure_root_marker()
             rendered = await _run(
                 self.sandbox,
                 _provision_command(),
@@ -355,6 +519,12 @@ class ForensicsRelay:
             self._diagnostics = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             return self._diagnostics
         text = rendered or ""
+        if _ROOT_UNRESOLVED in text:
+            # Named rather than falling through to "deps: missing": the box is fine
+            # and the workspace root is not where this module looked, which is a
+            # different problem with a different fix.
+            self._diagnostics = {"ok": False, "error": "could not locate the sandbox workspace root", "raw": text[-500:]}
+            return self._diagnostics
         self._diagnostics = {
             "ok": "deps: missing" not in text,
             "tesseract": "tesseract: missing" not in text and "tesseract " in text,
@@ -366,16 +536,23 @@ class ForensicsRelay:
     # -- transfer ------------------------------------------------------------ #
 
     async def _ship(self, files: list[tuple[str, Path]], request: dict[str, Any]) -> str:
-        """Write the tar chunks and the request JSON into the box. Returns the sha256."""
+        """Write the tar chunks and the request JSON into the box. Returns the sha256.
+
+        Every ``path`` here is relative, which is the whole point: ``_safe_path``
+        joins it onto the backend's own root, so the same call is correct on Novita,
+        Runloop, Daytona, Tenki, Vercel, Upstash and a VPS with a configured
+        ``workspace_dir`` — and a backend added later needs no change here.
+        """
         b64, digest, raw_bytes = _build_transfer(files)
         request = dict(request)
         request["transfer_sha256"] = digest
         request["transfer_bytes"] = raw_bytes
         request["version"] = FORENSICS_VERSION
 
+        await self._ensure_root_marker()
         await _run(
             self.sandbox,
-            f"rm -rf {_WORK} && mkdir -p {_WORK}/chunks {_WORK}/in",
+            f'rm -rf "$PWD/{_WORK}" && mkdir -p "$PWD/{_WORK}/chunks" "$PWD/{_WORK}/in"',
             timeout=120,
             bootstrap=False,
         )
@@ -418,9 +595,12 @@ class ForensicsRelay:
 
         diagnostics = await self.provision()
         if not diagnostics.get("ok"):
+            # ``error`` before ``raw``: a named cause ("could not locate the sandbox
+            # workspace root") is what the user acts on, and the raw tail is only
+            # interesting when there is no name for what happened.
             raise RuntimeError(
                 "the sandbox could not be provisioned for forensics "
-                f"({diagnostics.get('raw') or diagnostics.get('error') or 'reason unknown'})"
+                f"({diagnostics.get('error') or diagnostics.get('raw') or 'reason unknown'})"
             )
 
         request = {
@@ -429,6 +609,10 @@ class ForensicsRelay:
             "expected_date": expected_date,
             "expected_reference": expected_reference,
             "with_provenance": bool(with_provenance),
+            # Relative, and correct that way: the runner is invoked from the
+            # workspace root by the command below, and the host has no way to know
+            # what that root is (it differs per backend). An absolute path here is
+            # the bug this module used to have.
             "files": [{"id": name, "path": f"{_WORK}/in/{name}"} for name, _ in files],
         }
         digest = await self._ship(files, request)
@@ -441,12 +625,16 @@ class ForensicsRelay:
             # Checksum first: unpacking before the check would let a truncated
             # transfer be analysed as if it were the whole file, which is exactly
             # the kind of wrong answer this package exists to refuse.
-            f"cat {_WORK}/chunks/*.b64 | base64 -d > {_WORK}/batch.tar && "
-            f"echo '{digest}  {_WORK}/batch.tar' | sha256sum -c - >/dev/null 2>&1 || "
+            f'cat "$PWD/{_WORK}"/chunks/*.b64 | base64 -d > "$PWD/{_WORK}/batch.tar" && '
+            # Double-quoted so ``$PWD`` expands: ``sha256sum -c`` compares the
+            # digest line against the path it is given, so the two must match
+            # character for character.
+            f'echo "{digest}  $PWD/{_WORK}/batch.tar" | sha256sum -c - >/dev/null 2>&1 || '
             "{ " + checksum_fail + " }; "
-            f"tar xf {_WORK}/batch.tar -C {_WORK}/in && "
-            f"PYTHONPATH={_HOME} python3 {_RUNNER} {_WORK}/request.json {_WORK}/result.json; "
-            f"cat {_WORK}/result.json"
+            f'tar xf "$PWD/{_WORK}/batch.tar" -C "$PWD/{_WORK}/in" && '
+            f'PYTHONPATH="$PWD/{_HOME}" python3 "$PWD/{_RUNNER}" '
+            f'"{_WORK}/request.json" "$PWD/{_WORK}/result.json"; '
+            f'cat "$PWD/{_WORK}/result.json"'
         )
         started = time.time()
         try:
@@ -487,7 +675,7 @@ class ForensicsRelay:
         try:
             rendered = await _run(
                 self.sandbox,
-                f"wc -c < {_WORK}/result.json; sha256sum {_WORK}/result.json",
+                f'wc -c < "$PWD/{_WORK}/result.json"; sha256sum "$PWD/{_WORK}/result.json"',
                 timeout=120,
                 bootstrap=False,
             )
