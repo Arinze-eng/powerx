@@ -85,6 +85,17 @@ _SCHEMA = {
             "type": "boolean",
             "description": "Return the raw structured result instead of the markdown report.",
         },
+        "sandbox": {
+            "type": "string",
+            "enum": ["auto", "off", "require"],
+            "description": (
+                "Where to read the pixels. 'auto' (default) uses the execution sandbox when one "
+                "is configured and falls back to this host otherwise; 'off' always analyses "
+                "here; 'require' refuses rather than analysing here. The verdict, the wording "
+                "and the artifacts are produced the same way either way — only the pixel and "
+                "OCR work moves."
+            ),
+        },
     },
     "required": ["action"],
 }
@@ -117,6 +128,20 @@ class MediaForensicsTool(Tool):
             "of those signals. Say so when relaying a result, and never present a clean "
             "report as proof. Use action='timestamps' for just the capture date."
         )
+
+    def __init__(self, ctx: ToolContext | None = None) -> None:
+        # Retained so the sandbox tool can be resolved at execute() time: the
+        # registry is not populated while the tool classes are being loaded, so a
+        # lookup in ``create`` would always come back empty.
+        self._ctx: ToolContext | None = ctx
+        #: Set when a sandbox run was attempted, so the report can say where the
+        #: pixels were read. None means this host read them.
+        self._sandbox_note: str | None = None
+
+    @classmethod
+    def create(cls, ctx: ToolContext) -> "MediaForensicsTool":
+        """Carry the tool context so the sandbox tool can be resolved later."""
+        return cls(ctx)
 
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
@@ -164,20 +189,191 @@ class MediaForensicsTool(Tool):
 
     async def execute(self, **kwargs: Any) -> Any:
         try:
-            return self._run(kwargs)
+            action = str(kwargs.get("action") or "").strip().lower()
+            precomputed = await self._prefetch(kwargs, action)
+            if precomputed is False:
+                # The reason, when the relay learned one, is included: "no sandbox
+                # could do it" is not actionable on its own, and the difference
+                # between "none is configured" and "the one that is would not come
+                # up" is the difference between changing a config and retrying.
+                reason = f" {self._sandbox_note}." if self._sandbox_note else ""
+                return ToolResult.error(
+                    "sandbox='require' was asked for, but no execution sandbox could analyse "
+                    f"these files.{reason} Nothing was analysed on this host, and nothing is "
+                    "wrong with the file: either no sandbox is configured, or the sandbox could "
+                    "not be provisioned. Retry with sandbox='auto' to run the analysis here."
+                )
+            result = self._run(kwargs, precomputed=precomputed or None)
+            return self._with_sandbox_note(result, kwargs)
         except Exception as exc:
             logger.exception("media_forensics tool failed")
             return ToolResult.error(f"{type(exc).__name__}: {exc}")
 
+    # -- sandbox relay ---------------------------------------------------------
+
+    def _targets(self, kwargs: dict[str, Any], action: str, workspace: Path) -> list[Path]:
+        """The files whose pixels this action needs, resolved and checked.
+
+        Deliberately the same set the host path would read, so a sandbox run and a
+        host run analyse the same files and nothing is silently skipped. ``compare``
+        is absent because its diff is pure Pillow and cheap; ``timeline`` names
+        several files and wants only their tags.
+        """
+        if action == "compare":
+            return []
+        raws: list[str] = []
+        if action == "timeline":
+            raws = [str(p) for p in (kwargs.get("paths") or []) if str(p).strip()]
+        elif str(kwargs.get("path") or "").strip():
+            raws = [str(kwargs["path"])]
+        resolved: list[Path] = []
+        for raw in raws:
+            try:
+                resolved.append(self._resolve(raw, workspace))
+            except ValueError:
+                # A bad path is the action's error to report, with its own wording,
+                # and it must not become a sandbox failure. It is simply not shipped.
+                continue
+        return resolved
+
+    async def _prefetch(
+        self, kwargs: dict[str, Any], action: str
+    ) -> dict[str, dict[str, Any]] | None | bool:
+        """Analyse the targets in the sandbox and return ``{path: analysis}``.
+
+        Returns ``None`` when the sandbox is not in play at all, and ``False`` only
+        when ``sandbox='require'`` was asked for and no sandbox could serve it — the
+        one case where the caller must refuse rather than quietly analyse here.
+        """
+        mode = str(kwargs.get("sandbox") or "auto").strip().lower()
+        if mode == "off" or action not in _ACTIONS:
+            return None
+        if not self._ctx:
+            return False if mode == "require" else None
+
+        from nanobot.agent.tools.forensics_sandbox import ForensicsRelay, sandbox_tool
+
+        sandbox = sandbox_tool(self._ctx)
+        if sandbox is None:
+            return False if mode == "require" else None
+
+        workspace = self._workspace()
+        targets = self._targets(kwargs, action, workspace)
+        if not targets:
+            return None
+        # `timestamps` and `timeline` want the container tags only; `ela` and
+        # `localize` are decisions about pixels. Neither needs the OCR layer, and OCR
+        # is the slow half of a scan. `analyze` is the one action that defaults it on.
+        wants_document = bool(kwargs.get("document")) or (
+            action == "analyze" and kwargs.get("document") is not False
+        )
+
+        relay = ForensicsRelay(sandbox)
+        try:
+            payload = await relay.analyse(
+                [(path.name, path) for path in targets],
+                document=wants_document,
+                expected_amount=kwargs.get("expected_amount"),
+                expected_date=kwargs.get("expected_date"),
+                expected_reference=kwargs.get("expected_reference"),
+                with_provenance=action != "timeline",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The sandbox is an optimisation, not a dependency. A sandbox that is
+            # cold, wedged or offline must cost a little latency, never the answer:
+            # the host path is still right here and still correct.
+            logger.warning("media_forensics: sandbox analysis unavailable ({}), using host", exc)
+            self._sandbox_note = f"sandbox unavailable ({exc})"
+            return False if mode == "require" else None
+
+        by_name = payload.get("files") or {}
+        out: dict[str, dict[str, Any]] = {}
+        for path in targets:
+            entry = by_name.get(path.name)
+            if not isinstance(entry, dict) or entry.get("error"):
+                continue
+            forensics = entry.get("forensics")
+            if not isinstance(forensics, dict):
+                continue
+            out[str(path)] = {
+                "forensics": forensics,
+                "document": entry.get("document"),
+                "seconds": entry.get("seconds"),
+            }
+        if not out:
+            self._sandbox_note = "the sandbox returned no usable analysis"
+            return False if mode == "require" else None
+        self._sandbox_note = (
+            f"pixels read in the sandbox ({payload.get('sandbox_id') or 'backend'}, "
+            f"peak {payload.get('peak_rss_mb')} MB, {payload.get('sandbox_seconds')}s)"
+        )
+        return out
+
+    def _with_sandbox_note(self, result: ToolResult, kwargs: dict[str, Any]) -> ToolResult:
+        """Say where the pixels were read, when a sandbox read them.
+
+        Appended to the rendered output rather than woven into the report, so that a
+        sandbox run and a host run still say the SAME thing about the file: this line
+        is provenance, not a finding, and it must not be readable as one. Skipped for
+        JSON output, where the note travels as a field of its own, and skipped on an
+        error, where the error already explains itself.
+        """
+        if not self._sandbox_note or result.is_error or kwargs.get("json_output"):
+            return result
+        return ToolResult(
+            str(result).rstrip("\n")
+            + f"\n\n_Where the pixels were read: {self._sandbox_note}._\n"
+        )
+
+    def _analysis(
+        self,
+        path: Path,
+        precomputed: dict[str, dict[str, Any]] | None,
+        *,
+        with_provenance: bool = True,
+    ) -> dict[str, Any]:
+        """The raw analysis for one file — from the sandbox if it is there, else here."""
+        if precomputed:
+            entry = precomputed.get(str(path))
+            if entry and isinstance(entry.get("forensics"), dict):
+                return entry["forensics"]
+        from nanobot.forensics import analyse_image
+
+        return analyse_image(path, with_provenance=with_provenance).as_dict()
+
+    def _document_analysis(
+        self,
+        path: Path,
+        kwargs: dict[str, Any],
+        precomputed: dict[str, dict[str, Any]] | None,
+    ) -> dict[str, Any] | None:
+        """The OCR/layout layer for one file, from whichever machine read it.
+
+        A sandbox that returned ``None`` for the text layer is reported as an absent
+        layer rather than silently re-run here: re-running would double the OCR cost
+        this whole path exists to avoid, and the report already says when the text
+        layer is missing.
+        """
+        if precomputed:
+            entry = precomputed.get(str(path))
+            if entry:
+                document = entry.get("document")
+                return document if isinstance(document, dict) else None
+        from nanobot.forensics import analyse_document
+
+        return analyse_document(
+            path,
+            expected_amount=kwargs.get("expected_amount"),
+            expected_date=kwargs.get("expected_date"),
+            expected_reference=kwargs.get("expected_reference"),
+        )
+
     # -- actions ---------------------------------------------------------------
 
-    def _run(self, kwargs: dict[str, Any]) -> ToolResult:
-        from nanobot.forensics import (
-            analyse_document,
-            analyse_image,
-            render_report,
-            score,
-        )
+    def _run(
+        self, kwargs: dict[str, Any], precomputed: dict[str, dict[str, Any]] | None = None
+    ) -> ToolResult:
+        from nanobot.forensics import render_report, score
         from nanobot.forensics.document_forensics import crop_region, ela_image, heatmap_overlay
 
         action = str(kwargs.get("action") or "").strip().lower()
@@ -196,7 +392,7 @@ class MediaForensicsTool(Tool):
             doc_enabled = action == "analyze"
 
         if action == "timeline":
-            return self._timeline(kwargs, workspace)
+            return self._timeline(kwargs, workspace, precomputed)
 
         raw_path = str(kwargs.get("path") or "").strip()
         if not raw_path:
@@ -206,7 +402,7 @@ class MediaForensicsTool(Tool):
         if action == "compare":
             return self._compare(kwargs, workspace, path)
 
-        forensics = analyse_image(path).as_dict()
+        forensics = self._analysis(path, precomputed)
 
         if action == "timestamps":
             return self._timestamps(path, forensics)
@@ -268,12 +464,7 @@ class MediaForensicsTool(Tool):
 
         document = None
         if doc_enabled:
-            document = analyse_document(
-                path,
-                expected_amount=kwargs.get("expected_amount"),
-                expected_date=kwargs.get("expected_date"),
-                expected_reference=kwargs.get("expected_reference"),
-            )
+            document = self._document_analysis(path, kwargs, precomputed)
 
         verdict = score(forensics, document)
 
@@ -299,6 +490,7 @@ class MediaForensicsTool(Tool):
                 "document": document,
                 "verdict": verdict,
                 "artifacts": artifacts,
+                "sandbox": self._sandbox_note,
             }
             payload["forensics"]["ela"] = {
                 k: v for k, v in (forensics.get("ela") or {}).items()
@@ -417,9 +609,12 @@ class MediaForensicsTool(Tool):
         lines.append("")
         return ToolResult("\n".join(lines))
 
-    def _timeline(self, kwargs: dict[str, Any], workspace: Path) -> ToolResult:
-        from nanobot.forensics import analyse_image
-
+    def _timeline(
+        self,
+        kwargs: dict[str, Any],
+        workspace: Path,
+        precomputed: dict[str, dict[str, Any]] | None = None,
+    ) -> ToolResult:
         raw_paths = kwargs.get("paths") or []
         if not isinstance(raw_paths, list) or len(raw_paths) < 2:
             return ToolResult.error("action='timeline' needs at least two paths")
@@ -430,7 +625,7 @@ class MediaForensicsTool(Tool):
             except ValueError as exc:
                 rows.append({"path": str(raw), "error": str(exc)})
                 continue
-            forensics = analyse_image(candidate, with_provenance=False).as_dict()
+            forensics = self._analysis(candidate, precomputed, with_provenance=False)
             metadata = forensics.get("metadata") or {}
             rows.append(
                 {
