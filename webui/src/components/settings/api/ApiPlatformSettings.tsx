@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Check,
   Copy,
@@ -55,7 +55,9 @@ export function ApiPlatformSettings() {
   const [keyName, setKeyName] = useState("");
   const [freshKey, setFreshKey] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  const [copyFailed, setCopyFailed] = useState<string | null>(null);
   const [confirmRevoke, setConfirmRevoke] = useState(false);
+  const freshKeyRef = useRef<HTMLElement | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -73,16 +75,46 @@ export function ApiPlatformSettings() {
     void load();
   }, [load]);
 
+  /** Put the whole key in the selection, so Ctrl/Cmd-C works when the button cannot. */
+  const selectFreshKey = useCallback(() => {
+    try {
+      const node = freshKeyRef.current;
+      const selection = window.getSelection?.();
+      if (!node || !selection) return;
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } catch {
+      // Selection is a courtesy; the key stays on screen either way.
+    }
+  }, []);
+
+  /**
+   * Copy a value, and say so either way.
+   *
+   * The failure branch matters more than the success one here: the generated key
+   * is shown exactly once, so a clipboard write that silently does nothing — an
+   * insecure context, a WebView that rejects the Clipboard API, a denied
+   * permission — would cost the user the key for good, with the button looking
+   * like it worked. A failure now selects the key and asks for a manual copy.
+   */
   const copy = useCallback(
     async (label: string, value: string) => {
       if (!value) return;
       const ok = await copyTextToClipboard(value);
-      if (ok) {
-        setCopied(label);
-        window.setTimeout(() => setCopied((current) => (current === label ? null : current)), 1600);
-      }
+      setCopied(ok ? label : null);
+      setCopyFailed(ok ? null : label);
+      if (!ok && label === "fresh") selectFreshKey();
+      window.setTimeout(
+        () => {
+          setCopied((current) => (current === label ? null : current));
+          setCopyFailed((current) => (current === label ? null : current));
+        },
+        ok ? 1600 : 8000,
+      );
     },
-    [],
+    [selectFreshKey],
   );
 
   const runCreate = useCallback(async () => {
@@ -173,10 +205,14 @@ export function ApiPlatformSettings() {
                   "This is the only time it is shown. The server keeps a hash, so it cannot be looked up again.",
                 )}
               </p>
-              <div className="mt-2 flex items-center gap-2">
+              <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-start">
                 <code
+                  ref={freshKeyRef}
                   data-testid="api-platform-fresh-key"
-                  className="min-w-0 flex-1 truncate rounded-control bg-settings-surface px-3 py-2 font-mono text-[12px] text-foreground"
+                  // Wrapped rather than truncated, and marked select-all: a key
+                  // the user cannot see the end of is a key they cannot type out
+                  // when the clipboard is unavailable.
+                  className="min-w-0 flex-1 select-all break-all rounded-control bg-settings-surface px-3 py-2 font-mono text-[12px] leading-5 text-foreground"
                 >
                   {freshKey}
                 </code>
@@ -184,6 +220,9 @@ export function ApiPlatformSettings() {
                   type="button"
                   variant="secondary"
                   size="sm"
+                  data-testid="api-platform-copy-key"
+                  className="shrink-0"
+                  aria-label={tx("settings.apiPlatform.copyKey", "Copy key")}
                   onClick={() => void copy("fresh", freshKey)}
                 >
                   {copied === "fresh" ? (
@@ -191,9 +230,22 @@ export function ApiPlatformSettings() {
                   ) : (
                     <Copy className="h-3.5 w-3.5" aria-hidden />
                   )}
-                  {tx("settings.apiPlatform.copy", "Copy")}
+                  {copied === "fresh"
+                    ? tx("settings.apiPlatform.copied", "Copied")
+                    : tx("settings.apiPlatform.copy", "Copy")}
                 </Button>
               </div>
+              {copyFailed === "fresh" ? (
+                <p
+                  data-testid="api-platform-copy-hint"
+                  className="mt-2 text-[12px] leading-5 text-destructive"
+                >
+                  {tx(
+                    "settings.apiPlatform.copyFailed",
+                    "Your browser blocked the clipboard. The key is selected above — press Ctrl/Cmd-C (or long-press) to copy it before you leave this page.",
+                  )}
+                </p>
+              ) : null}
             </div>
           </div>
         </div>

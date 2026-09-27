@@ -117,6 +117,48 @@ it("confirms before revoking every key on the account", async () => {
   });
 });
 
+async function generateKey() {
+  renderPane();
+  await waitFor(() => expect(screen.getByTestId("api-platform-generate")).toBeEnabled());
+  requestMutationMock.mockResolvedValueOnce(
+    platformPayload({
+      created: { key: "px_livekeyvalue", name: "laptop", id: "k2", prefix: "px_livekey" },
+    }),
+  );
+  await userEvent.click(screen.getByTestId("api-platform-generate"));
+  await waitFor(() =>
+    expect(screen.getByTestId("api-platform-fresh-key")).toHaveTextContent("px_livekeyvalue"),
+  );
+}
+
+it("copies the generated key on request", async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+
+  await generateKey();
+  await userEvent.click(screen.getByTestId("api-platform-copy-key"));
+
+  await waitFor(() => expect(writeText).toHaveBeenCalledWith("px_livekeyvalue"));
+  expect(screen.getByText("Copied")).toBeTruthy();
+});
+
+it("hands the key over by hand when the clipboard is blocked", async () => {
+  // The key is shown once, so a clipboard that refuses must not be the end of it:
+  // the panel says so and leaves the key selected for a manual copy.
+  vi.stubGlobal("navigator", {
+    ...navigator,
+    clipboard: { writeText: vi.fn().mockRejectedValue(new Error("denied")) },
+  });
+
+  await generateKey();
+  await userEvent.click(screen.getByTestId("api-platform-copy-key"));
+
+  await waitFor(() => expect(screen.getByTestId("api-platform-copy-hint")).toBeTruthy());
+  expect(screen.getByTestId("api-platform-copy-hint")).toHaveTextContent("Ctrl/Cmd-C");
+  // Still on screen, still whole.
+  expect(screen.getByTestId("api-platform-fresh-key")).toHaveTextContent("px_livekeyvalue");
+});
+
 it("says why the pane is unusable when the server address is missing", async () => {
   vi.mocked(fetch).mockResolvedValueOnce({
     ok: true,
