@@ -192,3 +192,76 @@ per-error `file(line,col) : error NNN: message` — good enough for an LLM fix l
 
 Data tree used by the installer (portable mode):
 `$WINE_PREFIX/drive_c/users/user/AppData/Roaming/MetaQuotes/Terminal/Common/MQL5`
+---
+
+# Tenki (Ubuntu 24.04) — the WineHQ URL was built for Debian
+
+Measured 2026-09-27 in a live Tenki session (`px-mt5-trace-live`, 2 vCPU / 3887 MB
+/ 20 GB, Ubuntu 24.04.5, kernel 6.18.29, unprivileged `tenki` uid 1000 with
+passwordless sudo).
+
+## Symptom
+
+"MT5 installs forever on Tenki and never logs in", while the same script is
+fine on every other sandbox. The installer's own log shows it:
+
+```
+[mt5-install] [+23s] installing WineHQ stable 10 (required by the MT5 installer) ...
+[mt5-install] [+23s] WARN: WineHQ install failed
+[mt5-install] [+23s] installing distro wine ...
+```
+
+## Root cause
+
+`install_winehq()` built the sources-file URL with the **Debian** path:
+
+```
+https://dl.winehq.org/wine-builds/debian/dists/noble/winehq-noble.sources -> 404
+```
+
+`VERSION_CODENAME` on this box is `noble`, and WineHQ publishes its Ubuntu
+builds in a **separate tree** — `wine-builds/ubuntu/dists/noble/...`. The Debian
+tree has `bookworm`/`trixie`/`bullseye`/`sid`, never `noble`, so the fetch 404'd.
+Because `wget`'s stderr was discarded, the miss was invisible: the function
+returned 1 in 23 s and the install fell through to Ubuntu's packaged
+**wine 9.0** (`wine-9.0 (Ubuntu 9.0~repack-4build3)`).
+
+That is the entire Tenki difference. On a Debian box (the other backends'
+images) the same code hits `debian/dists/bookworm` and installs WineHQ 10 in one
+pass — which is why MT5+wine was perfect everywhere except Tenki. It was never
+the sandbox, it was the installer's URL.
+
+## Fix
+
+`install_winehq()` now picks the tree from `/etc/os-release` (`ID`/`ID_LIKE`:
+`ubuntu` vs `debian`), falls back to the other tree once, and **reports** a
+codename that exists in neither instead of assuming one. The call site logs what
+the fallback costs, because a bare `WARN` is what kept this hidden all session.
+
+Verified on the box, SHA-pinned script, fresh session:
+
+| step | measured |
+|---|---|
+| `ubuntu/dists/noble/winehq-noble.sources` | 200 (was 404) |
+| WineHQ 10 install from that tree | 150 s → `wine-10.0` |
+| full install, `--server Deriv-Demo`, Wine 10 | **+1m45s**, `installed_broker: deriv`, `bridge_imports_in_wine: true` |
+| `start --login 41261482 --server Deriv-Demo` | terminal ready in 10 s, `ipc_ready: true` |
+| `account` | `balance 10484.25 USD`, `Deriv-Demo`, `Deriv.com Limited`, `trade_allowed: true` |
+
+For comparison, the same install on the distro Wine 9 fallback was +2m23s cold
+(Exness build) and 59 s warm (Deriv), and the bridge did import — but the pinned
+Wine 10 is the supported configuration and MT5 installs faster under it.
+
+## Two Tenki quirks worth knowing
+
+* **No IA32 on this kernel.** After WineHQ installs, `/usr/bin/wine` (a 32-bit
+  ELF) fails with `cannot execute binary file: Exec format error`, and the i386
+  postinst scripts print the same error. The script's `_wine_works` probe already
+  handles it — the log reads `using wine64 (the 'wine' launcher does not run
+  here)` and everything downstream is 64-bit, which is sufficient (the terminal,
+  the embeddable Windows Python and the `MetaTrader5` wheels are all x86-64).
+* **The workspace caps active sessions at five** (`max_concurrent_jobs: 5`).
+  MT5 testing accumulates sessions fast (`px-mt5-*`, `px-rot-c`), and a create
+  that hits the cap looks like a rotation/failover problem when it is only a
+  quota. Terminate finished sessions (`sandbox-id.close()`), or the next install
+  has nowhere to land.
