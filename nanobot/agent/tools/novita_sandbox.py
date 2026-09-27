@@ -659,8 +659,17 @@ class _TenkiSessionStore(_SandboxStore):
         except (OSError, ValueError):
             raw = None
         if isinstance(raw, dict):
-            if "sessions" in raw or "lanes" in raw or "cursor" in raw:
-                sessions = raw.get("sessions") or {}
+            # ``ids``/``templates`` is the shape the inherited ``set``/``remove``
+            # write. It is recognised here so a file an older build left in that
+            # form still reloads as sessions instead of being mistaken for the
+            # legacy flat map and scrambled.
+            if (
+                "sessions" in raw
+                or "lanes" in raw
+                or "cursor" in raw
+                or ("ids" in raw and "templates" in raw)
+            ):
+                sessions = raw.get("sessions") or raw.get("ids") or {}
                 if isinstance(sessions, dict):
                     self._ids = {str(k): str(v) for k, v in sessions.items() if v}
                 lanes = raw.get("lanes") or {}
@@ -706,6 +715,23 @@ class _TenkiSessionStore(_SandboxStore):
         """Persist a session → Tenki session id mapping without a live handle."""
         with self._lock:
             self._ids[key] = str(session_id)
+            self._save()
+
+    def remove(self, key: str) -> None:
+        """Drop a session entirely: its handle, its id, and its lane pin.
+
+        Overridden because the inherited version persists the Novita-shaped
+        payload, which the loader above would have to mistake for a legacy map —
+        losing every session id, lane, cursor and cooldown in the file. Dropping
+        the lane matters as much as dropping the id: a session that was reset
+        must not leave a stale pin behind that drags every later session back to
+        a workspace it no longer occupies.
+        """
+        with self._lock:
+            self._handles.pop(key, None)
+            self._ids.pop(key, None)
+            self._templates.pop(key, None)
+            self._lanes.pop(key, None)
             self._save()
 
     # ------------------------------------------------- key rotation (lanes)
