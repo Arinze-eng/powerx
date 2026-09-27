@@ -468,7 +468,12 @@ class ForensicsRelay:
         if payload.get("ok") is False:
             raise RuntimeError(str(payload.get("error") or "the sandbox run failed"))
         payload["sandbox_seconds"] = round(time.time() - started, 3)
-        payload["sandbox_id"] = getattr(self.sandbox, "sandbox_id", None)
+        # Usually the sandbox *tool* from the registry rather than a box handle, so
+        # the honest identifier is its backend name ("novita_sandbox"). A direct box
+        # handle, when one is passed, has an id and gets named by that instead.
+        payload["sandbox_id"] = getattr(self.sandbox, "sandbox_id", None) or getattr(
+            self.sandbox, "name", None
+        )
         return payload
 
     async def _read_result_file(self) -> dict[str, Any] | None:
