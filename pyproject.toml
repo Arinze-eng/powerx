@@ -59,6 +59,11 @@ dependencies = [
     "python-docx>=1.1.0,<2.0.0",
     "openpyxl>=3.1.0,<4.0.0",
     "python-pptx>=1.0.0,<2.0.0",
+    # media_forensics reads EXIF/XMP and does its error-level and noise maths with
+    # these two directly rather than relying on them arriving via matplotlib, and
+    # the OCR path shells out to the tesseract binary when one is installed.
+    "pillow>=10.0.0",
+    "numpy>=1.26.0",
     # nanobot.utils.gitstore imports dulwich.porcelain at runtime for memory/Dream
     # workspace version control. It was never declared, so GitStore silently failed
     # in built images and the memory/Dream/git-store suites all errored.
