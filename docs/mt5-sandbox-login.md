@@ -346,6 +346,32 @@ after that point is a wine invocation.
 NANOBOT_TENKI_DISK_SIZE_GB=20     # was 5; Tenki's floor is 5 and 5 is not enough
 ```
 
+Setting it is only half the fix. A sandbox is sized at **create** time and Tenki
+cannot grow one afterwards: `AsyncSandbox.update` carries name/tags/sticky/TTL and
+nothing else, only *volumes* can be resized, and the SDK's own out-of-space advice
+is "recreate the sandbox with a larger disk_size_gb". So every `px-websocket-*`
+box born while the setting was 5 GB keeps 5 GB for its whole life, and the
+preflight above rejects it on every install, forever — which is why raising the
+env alone changed nothing for the sessions that already existed.
+
+`TenkiExecutionBackend._ensure_session` now compares the session it resolved
+against the configured size and, when the session's disk is **smaller**,
+terminates it and builds the replacement at the new size. Measured live
+2026-09-27: a session seeded at 5 GB came back at 20 GB on the next operation,
+the installer then finished in it in **+3m34s** with `{"ok": true, "stage":
+"done"}`, `terminal64.exe` present, `bridge 5.0.6231` importing inside the prefix
+and **12.4 GB still free**. Nothing has to be deleted by hand: a raised setting
+reaches existing sessions on their next use.
+
+Two boundaries keep the rebuild from firing on a working box: an unknown size on
+either side (0 means "provider default") is never read as too small, and
+termination must **succeed** before the replacement is created, because sessions
+are resolved by their deterministic name — leaving the old VM alive would put two
+VMs under one name and the next operation could attach to the still-undersized
+one. The rebuilt session also drops its lane pin: its files went with it, and
+keeping the pin would strand the rebuild behind that workspace's own
+five-session quota.
+
 `NANOBOT_TENKI_MAX_DURATION_SECONDS` (this deployment: 2000) does not have to
 cover the install: the box **pauses** at the TTL rather than dying
 (`pause_expires_at` seven days out), and the sandbox name is derived from the
