@@ -74,6 +74,7 @@ from nanobot.utils.helpers import (
     strip_think,
 )
 from nanobot.utils.llm_runtime import LLMRuntime
+from nanobot.utils.memory_guard import log_memory
 from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
@@ -880,6 +881,18 @@ class AgentRunner:
             )
 
         for iteration in range(spec.max_iterations):
+            # The container is killed by the kernel when it crosses its cgroup
+            # memory limit, with no exception and no shutdown line, so a turn
+            # that dies this way leaves nothing behind but a restart. Record
+            # usage around every model request: the last line before a silent
+            # restart names the turn that hit the ceiling, and the gap between
+            # these two lines is what one request costs on top of the baseline.
+            log_memory(
+                "model_iteration_start",
+                iteration=iteration,
+                messages=len(messages),
+                session=(spec.session_key or "-")[:40],
+            )
             if spec.strip_image_content_before_provider:
                 # Injections and recovery/finalization messages are appended
                 # between iterations, so scrub again immediately before model
@@ -925,6 +938,11 @@ class AgentRunner:
                 context,
                 conversation_state=conversation_state,
                 provider_context=provider_context,
+            )
+            log_memory(
+                "model_iteration_end",
+                iteration=iteration,
+                session=(spec.session_key or "-")[:40],
             )
             conversation_state.observe_response(response, messages)
             context.response = response
