@@ -77,6 +77,27 @@ class PersistedPromptContextResolver:
         return channel, scope.project_path
 
 
+def _tenki_keys_configured(config: Any) -> bool:
+    """True when Tenki has a usable key, in EITHER stored form.
+
+    Rotation is configured with the plural ``api_keys`` list, which leaves the
+    legacy single ``api_key`` empty on purpose: the backend resolves the list and
+    never reads the singular field. Testing only ``api_key`` therefore reported a
+    correctly-configured rotation deployment as unconfigured and returned "" --
+    which drops the whole sandbox orientation section, MT5/Wine playbook and all.
+
+    Mirrors ``nanobot.agent.tools.novita_sandbox._tenki_key_configured`` on
+    purpose. That helper lives in a heavy tool module this prompt builder must
+    not import at module scope (the enclosing block swallows ImportError and
+    would then blank the section for EVERY backend, not just Tenki).
+    """
+    if config is None:
+        return False
+    if [key for key in (getattr(config, "api_keys", None) or []) if str(key).strip()]:
+        return True
+    return bool(str(getattr(config, "api_key", "") or "").strip())
+
+
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
@@ -321,7 +342,7 @@ class ContextBuilder:
                     return ""
                 sandbox_dir = "/home/user"
             elif backend == "tenki":
-                if not (tenki and str(getattr(tenki, "api_key", "")).strip()):
+                if not _tenki_keys_configured(tenki):
                     return ""
                 sandbox_dir = "/home/tenki"
             elif backend == "vercel":
