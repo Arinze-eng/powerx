@@ -46,6 +46,11 @@ _DUPLICATE_PENALTY = 1.8
 _ARITHMETIC_PENALTY = 4.0
 _DRIFT_PENALTY = 2.2
 
+#: Findings that are reported but deliberately carry no weight, because the
+#: harness measured them firing on untouched receipts at the same rate as on
+#: edited ones. See the note in :func:`analyse_document` for the table.
+_REPORT_ONLY_FINDINGS = ("font_geometry", "line_spacing")
+
 
 @dataclass
 class TextLine:
@@ -576,6 +581,31 @@ def analyse_document(
                     ),
                     "weight": _ARITHMETIC_PENALTY,
                 }
+            )
+
+    # Two of the four content checks are demoted to measurements, by measurement.
+    #
+    # ``line_spacing`` fires at the same rate on clean and forged files. The
+    # reason is visible in the data: a rendered receipt has a blank separator
+    # before its reference and date block, so an untouched page already has one
+    # gap that does not match the document's rhythm — the same shape a spliced
+    # line produces. Over 12 files per class it flagged 5/12 clean and 5/12
+    # forged, which is a coin toss, and it was the single largest source of false
+    # positives in the whole pipeline. ``font_geometry`` flagged 2/12 clean and
+    # 0/12 of the forgeries it was checked against.
+    #
+    # ``arithmetic`` is kept and is the point of this layer: it flagged 0/12 clean
+    # and 12/12 of all three amount-replacement classes, because replacing the
+    # printed total without also rewriting the subtotal and tax leaves the page
+    # unable to add up. The pixel layer cannot see that class at all.
+    for finding in out["findings"]:
+        if finding.get("signal") in _REPORT_ONLY_FINDINGS:
+            finding["weight"] = 0.0
+            finding["direction"] = "no_signal"
+            finding["detail"] = (
+                str(finding.get("detail") or "")
+                + " — reported, not scored: this check fired on untouched receipts at "
+                "the same rate as on edited ones, so it is not evidence either way."
             )
 
     out["reconciliation"] = reconcile(

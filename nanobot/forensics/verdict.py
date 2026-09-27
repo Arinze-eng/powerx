@@ -12,12 +12,26 @@ from __future__ import annotations
 
 from typing import Any
 
-#: Score bands. Order matters; the first threshold a score reaches wins.
+#: Score bands, as a multiple of one fired tamper scan (weight 2.0 each). Order
+#: matters; the first threshold a score reaches wins.
+#:
+#: ``no_visible_tampering`` requires a score strictly below one scan. That is
+#: deliberate and it is the calibration the harness forced: with the earlier
+#: bands, **20 of 20 clean receipts were flagged**, because two weak metadata
+#: signals (a JPEG with no EXIF, which is what every chat app produces) added up
+#: past a 0.001 threshold. A band that a clean page can leave by accident is not
+#: a band. Metadata and container hints now carry less than one scan's weight and
+#: they are named in the report without moving the band.
 _BANDS: tuple[tuple[float, str, str], ...] = (
-    (7.0, "strong_signs_of_editing", "Multiple independent signals point at editing."),
-    (3.0, "signs_of_editing", "Several signals point at editing or re-save."),
-    (0.001, "weak_signals", "Some signals fired, each weak on its own."),
-    (0.0, "no_visible_tampering", "No signal this analysis can see fired."),
+    (8.0, "strong_signs_of_editing", "Four or more independent measurements point at editing."),
+    (4.0, "signs_of_editing", "Independent measurements agree that part of this file has a different history."),
+    # 1.5, not 2.0: two weak metadata signals that agree — an editor is named in
+    # the file *and* the EXIF was written after the capture date — total 1.8 and
+    # should reach this band, while either alone (1.0 or 0.8) must not. The
+    # measured clean maximum over the harness corpus is 0.5, so this is still a
+    # band a genuine receipt cannot leave by accident.
+    (1.5, "weak_signals", "One strong or two weak measurements fired, with nothing independent to corroborate them."),
+    (0.0, "no_visible_tampering", "No measurement beat the clean baseline it was calibrated against."),
 )
 
 #: Families that count as independent evidence, for a confidence estimate.
@@ -92,7 +106,7 @@ def collect_signals(forensics: dict[str, Any], document: dict[str, Any] | None) 
     # ---- container and metadata ---------------------------------------------
     if metadata.get("editor_software_detected"):
         _add(
-            signals, "metadata", "editor_software_named", "edit_signal", 1.2,
+            signals, "metadata", "editor_software_named", "edit_signal", 1.0,
             f"Metadata names editing software: {metadata.get('software')!r}. Records that "
             "an editor wrote the file, not what it changed.",
         )
@@ -110,7 +124,7 @@ def collect_signals(forensics: dict[str, Any], document: dict[str, Any] | None) 
         )
     if metadata.get("metadata_stripped"):
         _add(
-            signals, "metadata", "metadata_absent", "edit_signal", 0.6,
+            signals, "metadata", "metadata_absent", "edit_signal", 0.5,
             "A JPEG/TIFF with no EXIF at all: a screenshot, a chat-app re-save, or a "
             "deliberate scrub. Indistinguishable from each other.",
         )
@@ -126,11 +140,19 @@ def collect_signals(forensics: dict[str, Any], document: dict[str, Any] | None) 
             "at high quality leaves little history, so the pixel signals below are damped.",
         )
     if jpeg.get("is_jpeg") and jpeg.get("standard_luma_table") is False:
+        # Measured and demoted. This used to be an edit signal at 0.9, and it fired
+        # on 100% of the clean receipts in the harness — including every file the
+        # standard encoder wrote itself, because the reference table it compared
+        # against is not the one modern encoders emit. A signal that is true of
+        # every file carries no information about any file, so it is now reported
+        # as context: it tells the reader the file went through a non-textbook
+        # encoder, which is worth knowing and is not evidence of an edit.
         _add(
-            signals, "compression", "non_standard_quantisation_table", "edit_signal",
-            0.9 * damp,
-            "The luminance quantisation table is not a textbook IJG table, which happens "
-            "with a re-encode through a different encoder or a non-standard tool chain.",
+            signals, "compression", "non_standard_quantisation_table", "no_signal", 0.0,
+            f"Quantisation table is not a textbook IJG table at quality "
+            f"{jpeg.get('quality')} (fit residual {jpeg.get('luma_table_error')}). Reported "
+            "as context: it fired on every clean file in the calibration corpus, so it "
+            "separates nothing and carries no weight.",
         )
     if not jpeg.get("is_jpeg"):
         _add(
@@ -166,26 +188,53 @@ def collect_signals(forensics: dict[str, Any], document: dict[str, Any] | None) 
         )
 
     # ---- duplication ---------------------------------------------------------
-    # Regions are only produced when the strict duplication gate in
-    # image_forensics passes, so their presence is the signal.
+    # **This used to be an edit_signal. It was demoted to a measurement by the
+    # harness, not by taste.** In a 200-file corpus (20 clean, 180 forged) the
+    # legacy gradient-hash pair count ran to a clean maximum of 230 against a
+    # forged 90th percentile of 220: a rendered page repeats its own typography,
+    # and a pasted region repeats it in exactly the same way, so the count is the
+    # same distribution on both classes. At the old threshold of five pairs it
+    # flagged 7 of 20 *clean* receipts and was the sole cause of every false
+    # positive in the run. The same measurement on a DCT-based matcher separates
+    # no better (clean share of the winning displacement 0.198 versus 0.241 for
+    # forged). Both are reported below and neither is scored.
     dupes = copy_move.get("duplicate_pairs") or 0
-    if regions:
+    blocks = int((forensics or {}).get("copy_move_blocks", {}).get("duplicate_pairs") or 0)
+    if dupes or blocks:
         _add(
-            signals, "duplication", "repeated_content_blocks", "edit_signal",
-            min(3.0, 0.5 * dupes) * damp,
-            f"{dupes} pairs of non-uniform blocks repeat across the frame, past the gate "
-            "for what repeated UI rows or a watermark would produce. Worth looking at the "
-            "flagged boxes.",
+            signals, "duplication", "repeated_content_blocks", "no_signal", 0.0,
+            f"{dupes} repeated non-uniform blocks by gradient hash and {blocks} by DCT "
+            "feature matching. Reported, deliberately not scored: on rendered pages both "
+            "counts are indistinguishable between clean and forged files, so neither is "
+            "evidence. Repeated blocks are normal in a table of identical digits.",
         )
+
+    # ---- gated pixel scans ---------------------------------------------------
+    # Each scan contributes weight only after it has beaten the baseline a clean
+    # page produced in the harness. A fired scan is one measurement; the band
+    # needs several, because every one of them is individually weak (measured
+    # per-scan catch rates at these gates: block_grid 0.13, resample 0.22,
+    # sharpness 0.05, ghost 0.01). What they are for is never firing on a clean
+    # page, and pointing a human at the right rectangle when they do fire.
+    from nanobot.forensics.tamper import tamper_signals
+
+    signals.extend(tamper_signals(forensics))
 
     # ---- document layer ------------------------------------------------------
     for finding in (document or {}).get("findings", []):
+        # A finding carries its own direction. Two of them are measurements that
+        # were demoted because the harness caught them firing on clean files as
+        # often as on edited ones; treating them as accusations here would undo
+        # that in one line.
+        direction = str(finding.get("direction") or "edit_signal")
         _add(
             signals,
             "layout" if finding.get("signal") != "arithmetic" else "arithmetic",
             finding.get("signal", "document_finding"),
-            "edit_signal",
-            float(finding.get("weight") or 1.0),
+            direction,
+            float(finding.get("weight") or 0.0)
+            if direction == "no_signal"
+            else float(finding.get("weight") or 1.0),
             str(finding.get("detail") or ""),
         )
 
@@ -260,10 +309,21 @@ def score(forensics: dict[str, Any], document: dict[str, Any] | None = None) -> 
     limits = [
         "This cannot prove an image or document is genuine. Nothing observable in a file "
         "can, and a wrong 'genuine' on a receipt is the expensive mistake.",
+        "The pixel layer was measured over a 200-file corpus and only sees one class: a "
+        "clone stamp, 20 of 20, because a copied region carries its own 8x8 grid. A "
+        "replaced total, a resized patch or a shifted line was caught 0 times out of 160. "
+        "A clean pixel result is not a clearance on those.",
+        "On the same corpus the reconciliation check (subtotal + tax versus the printed "
+        "total) caught 36 of 36 amount-replacement forgeries with 0 false positives on 12 "
+        "clean receipts, at every compression quality tested. That is the check that "
+        "carries a receipt, and it needs OCR to read the total.",
         "Error-level, noise and compression signals are destroyed by one re-encode, a "
         "screenshot, or a print-and-scan round trip. Their absence proves nothing.",
         "A generated receipt rendered convincingly has no editing history to find at all. "
         "Layout and arithmetic checks are what catch that class, and they are heuristics.",
+        "Two content checks, line spacing and font geometry, were measured firing on "
+        "untouched receipts at the same rate as on edited ones and are reported without "
+        "being scored. Do not present them as evidence.",
         "Metadata is written by whoever authored the file and can be forged as easily as "
         "the pixels.",
         "The only checks strong enough to act on are a validated C2PA credential and a "

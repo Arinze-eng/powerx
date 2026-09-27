@@ -21,6 +21,19 @@ from typing import Any
 
 import numpy as np
 
+from nanobot.forensics.tamper import (
+    _decimate as _decimate_for_scan,
+    block_copy_move,
+    block_structure_scan,
+    jpeg_ghost,
+    resample_scan,
+    scan_scale,
+    sharpness_scan,
+    summarise,
+    tamper_regions,
+    wavelet_noise_map,
+)
+
 # Toolbar software that rewrites a picture. A match is a strong hint the file
 # passed through an editor; it is NOT evidence that anything was altered, because
 # cropping and colour work are edits too, and because metadata can be stripped.
@@ -135,6 +148,12 @@ class ImageForensics:
     noise: dict[str, Any] = field(default_factory=dict)
     jpeg: dict[str, Any] = field(default_factory=dict)
     copy_move: dict[str, Any] = field(default_factory=dict)
+    block_grid: dict[str, Any] = field(default_factory=dict)
+    jpeg_ghost: dict[str, Any] = field(default_factory=dict)
+    resample: dict[str, Any] = field(default_factory=dict)
+    wavelet_noise: dict[str, Any] = field(default_factory=dict)
+    sharpness: dict[str, Any] = field(default_factory=dict)
+    copy_move_blocks: dict[str, Any] = field(default_factory=dict)
     regions: list[Region] = field(default_factory=list)
     provenance: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
@@ -152,6 +171,12 @@ class ImageForensics:
             "noise": self.noise,
             "jpeg": self.jpeg,
             "copy_move": self.copy_move,
+            "block_grid": self.block_grid,
+            "jpeg_ghost": self.jpeg_ghost,
+            "resample": self.resample,
+            "wavelet_noise": self.wavelet_noise,
+            "sharpness": self.sharpness,
+            "copy_move_blocks": self.copy_move_blocks,
             "regions": [r.as_dict() for r in self.regions],
             "provenance": self.provenance,
             "notes": self.notes,
@@ -701,7 +726,51 @@ def analyse_image(path: Path, *, with_provenance: bool = True) -> ImageForensics
         result.jpeg = jpeg_analysis(img)
         gray = np.asarray(img.convert("L"), dtype=np.float32)
         result.copy_move = copy_move_analysis(gray)
-        result.regions = duplicate_regions(result.copy_move, gray)
+        # ``duplicate_regions`` is deliberately **not** used to seed the region
+        # list any more. Its gate was measured against a clean corpus and failed:
+        # a 20-receipt run produced up to 230 duplicated-block pairs on files
+        # nothing had touched, and every false positive in that run came from
+        # here. The measurements are still reported in ``copy_move`` and
+        # ``copy_move_blocks``; what they no longer do is draw boxes.
+        result.regions = []
+
+        # The tamper detectors run on a decimated copy: all of them read
+        # structure at the 8..64 pixel scale, so a 12 MP phone photo costs
+        # minutes at full resolution and separates no better. Regions are scaled
+        # back to original coordinates by tamper_regions.
+        factor, _ = scan_scale(result.width, result.height)
+        small = _decimate_for_scan(gray, factor)
+        result.block_grid = block_structure_scan(small)
+        result.jpeg_ghost = jpeg_ghost(img)
+        result.resample = resample_scan(small)
+        result.sharpness = sharpness_scan(small)
+        result.wavelet_noise = wavelet_noise_map(small)
+        result.copy_move_blocks = block_copy_move(small)
+
+        fused = tamper_regions(
+            grid=result.block_grid,
+            ghost=result.jpeg_ghost,
+            resample=result.resample,
+            noise=result.wavelet_noise,
+            sharpness=result.sharpness,
+            scale=factor,
+        )
+        for region in fused:
+            result.regions.append(
+                Region(
+                    x=int(region["x"]),
+                    y=int(region["y"]),
+                    width=int(region["width"]),
+                    height=int(region["height"]),
+                    score=float(region["score"]),
+                    reason=str(region["reason"]),
+                )
+            )
+        for name in ("block_grid", "jpeg_ghost", "resample", "wavelet_noise",
+                     "sharpness", "copy_move_blocks"):
+            value = getattr(result, name)
+            if value:
+                setattr(result, name, summarise(name, value))
 
         if result.metadata.get("metadata_stripped"):
             result.notes.append(

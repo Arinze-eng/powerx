@@ -40,7 +40,7 @@ bank's or merchant's own record rather than against pixels. Push for it.
 | `analyze` | The default. Image + document checks + verdict + artifact paths |
 | `timestamps` | Just "when was this taken?" — capture time, device, GPS, software |
 | `ela` | Write the amplified error-level map so a human can look at it |
-| `localize` | Repeated-content blocks, plus the ELA map |
+| `localize` | The one pixel localization that measures: a cloned block, plus the ELA map |
 | `compare` | Two versions of the same file — **a diff is exact, use it** |
 | `timeline` | Order several files by capture time |
 
@@ -63,26 +63,88 @@ out loud which band you got and that it is evidence, not proof.
 
 ## What actually works, and what does not
 
-Verified by measurement in this repo, not assumed:
+**Every number below was produced by `python -m nanobot.forensics.benchmark` over a
+rendered corpus — 20 clean receipts and 180 forgeries, verified on three seeds
+(7, 11, 23). Do not replace them with adjectives.** Re-run the harness rather than
+guessing if you change a gate.
 
-- **Reconciliation against the issuer's record** — the only check strong enough to
-  act on. One mismatch is decisive; a match is *not* proof the image is unedited.
-- **A valid C2PA manifest** (`pip install c2pa`) — signed provenance, the only
-  trustworthy positive signal. Its absence proves nothing, because almost no camera
-  or receipt app writes one yet.
-- **Document geometry** (OCR word boxes) — font-height outliers, broken line
-  spacing, a repeated reference number, and **total ≠ subtotal + tax**. This is what
-  scales a "photoshop the amount" forgery, and it has no pixels to hide behind.
-- **`compare` on two files** — exact, and the right answer when a second version
-  exists.
-- **Error-level analysis** — a *picture for a human to look at*, never a score. It
-  was measured here: on a text-dense receipt the tile-mean error peaks at 1.43 clean
-  versus 1.61 with a patch spliced in, so text edges carry more error than a paste
-  does. Any threshold that fires on the paste also fires on the text.
-- **Noise / sharpness maps** — the same story: they mostly measure how much of the
-  page is blank versus text.
-- **Everything above is destroyed by one re-encode**, a screenshot, or a
-  print-and-scan round trip. Absence of signals proves nothing.
+### False positives, first
+
+Across all three seeds, **0 of 60 clean receipts** were put outside the clean band.
+That is the property to protect: one wrong accusation on a genuine receipt costs
+more than a miss. If you touch a threshold, check this number first.
+
+### The document layer, by forgery class
+
+| class | files | total read by OCR | page fails to add up | verdict leaves clean band |
+|---|---|---|---|---|
+| clean | 12 | 12 | 0 (0%) | 0 (0%) |
+| `replaced_amount` | 12 | 12 | 12 (**100%**) | 12 (100%) |
+| `replaced_amount_same_quality` | 12 | 12 | 12 (**100%**) | 12 (100%) |
+| `replaced_amount_low_quality` | 12 | 12 | 12 (**100%**) | 12 (100%) |
+
+**This is the headline result of the whole feature.** A forged total is caught by
+reconciliation — `subtotal + tax ≠ total` — at 100% with no false positives, at every
+compression quality tested, including the case where the patch was saved at the same
+quality as the page. That is the fraud class that matters on a receipt, and it is the
+one class the pixel layer provably cannot see.
+
+### The pixel layer, by forgery class
+
+| forgery | caught | by |
+|---|---|---|
+| `cloned_block` (copy-stamp) | **20 / 20, all three seeds** | `block_grid` |
+| `replaced_amount`, `_same_quality`, `_low_quality` | 0 / 60 | nothing |
+| `patched_foreign_jpeg`, `_lossless` | 0 / 40 | nothing |
+| `resized_patch`, `shifted_line`, `patched_from_other` | 0 / 60 | nothing |
+
+Per-scan separation, seed 7, 200 files:
+
+| scan | AUC | clean p50 / max | forged p50 / max |
+|---|---|---|---|
+| `block_grid` | 0.71 | 24.0 / 30.0 | 24.0 / 36.0 |
+| `ela_max` | 0.69 | 11.0 / 22.0 | 13.0 / 19.0 |
+| `sharpness` | 0.61 | 31.1 / 42.0 | 32.2 / 54.0 |
+| `ghost` | 0.55 | 0.0 / 30.0 | 0.0 / 36.0 |
+| `resample` | 0.54 | 0.0 / 0.0 | 0.0 / 4.0 |
+| `noise` (wavelet) | 0.50 | 0.0 / 0.0 | 0.0 / 0.0 |
+
+Read that honestly: **only a clone stamp is visible to pixels**, because a copied
+region carries its own 8×8 block grid, which does not line up with the page's even
+after a re-save. Everything else is re-encoded from scratch by the editing app and
+leaves the pixel statistics the same as an untouched receipt. A scan whose AUC is at
+or below 0.55 is reported in the result and deliberately not scored — `noise` is a
+constant, and `resample`'s clean maximum moved from 0.0 to 0.752 between corpora,
+which is a fitted number rather than a measured one.
+
+**So a clean verdict on a re-encoded forgery is not a clearance.** The pixel layer
+says nothing about the class you are most likely looking at.
+
+### Demoted on measurement, and why
+
+These ran, were measured, and were removed from the score. They are still printed,
+and they must never be quoted at a user as evidence:
+
+| check | why it was demoted |
+|---|---|
+| `line_spacing` | fired on 5/12 clean **and** 5/12 of the shifted-line forgeries. A rendered receipt has a blank separator before its reference block, which reads as one irregular baseline gap on an untouched page. It was the largest source of false positives in the pipeline. |
+| `font_geometry` | 2/12 clean, 0/12 of the forgeries it was checked against. |
+| `non_standard_quantisation_table` | fired on 100% of clean receipts: it compares against an IJG table that modern encoders do not emit. |
+| `repeated_content_blocks` | legacy and DCT block-hash duplication both scored at chance. The gradient-hash count reached 230 on a *clean* page against a forged 90th percentile of 220. Repeated digits in a table look exactly like a clone. |
+
+### What to rely on, in order
+
+1. **Reconciliation against the issuer's record** (`expected_amount`, `expected_date`,
+   `expected_reference`) — decisive when it mismatches; a match is *not* proof.
+2. **`subtotal + tax ≠ total`** — 100% on the class measured, 0% false positives.
+3. **A valid C2PA manifest** (`pip install c2pa`) — the only trustworthy positive
+   signal. Its absence proves nothing.
+4. **`compare` on two files** — an exact diff, and the right answer when a second
+   version exists.
+5. **`cloned_block` localization** — the one thing pixels can establish here.
+6. **Error-level and noise maps** — a *picture for a human to look at*, never a
+   score. On a text-dense receipt the tile-mean error peaks at 1.43 clean versus 1.61
+   with a patch spliced in: text edges carry more error than the paste does.
 
 A generated receipt has no editing history to find at all. Layout and arithmetic
 checks are what catch that class, and they are heuristics, not proofs.
