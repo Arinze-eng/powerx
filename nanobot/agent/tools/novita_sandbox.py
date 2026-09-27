@@ -883,6 +883,23 @@ async def _install_tesseract_resilient(backend: Any) -> bool:
     return False
 
 
+def _tenki_key_configured(config: Any | None) -> bool:
+    """True when Tenki has a usable key, in EITHER stored form.
+
+    Rotation is configured with the plural ``api_keys`` list, which leaves the
+    legacy single ``api_key`` empty on purpose: the backend resolves the list and
+    never reads the singular field. Checking only ``api_key`` therefore refused a
+    deployment whose keys were configured correctly as rotation lanes, and made
+    ``enabled`` decline to offer the tool at all. The admin Test button has always
+    accepted either form, which is what let the two disagree.
+    """
+    if config is None:
+        return False
+    if [key for key in (getattr(config, "api_keys", None) or []) if str(key).strip()]:
+        return True
+    return bool(str(getattr(config, "api_key", "") or "").strip())
+
+
 @tool_parameters(
     tool_parameters_schema(
         required=["action"],
@@ -937,7 +954,7 @@ class NovitaSandboxTool(Tool):
         if backend == "runloop":
             return bool(getattr(execution.runloop, "api_key", "").strip())
         if backend == "tenki":
-            return bool(getattr(execution.tenki, "api_key", "").strip())
+            return _tenki_key_configured(getattr(execution, "tenki", None))
         if backend == "vercel":
             return bool(getattr(execution.vercel, "token", "").strip())
         return bool(os.getenv("NOVITA_API_KEY", "").strip()) and Novita is not None
@@ -1688,7 +1705,7 @@ class NovitaSandboxTool(Tool):
                 runloop_images, config=backend_config, session_key=session_key
             )
         if selected_backend == "tenki":
-            if backend_config is None or not str(backend_config.api_key or "").strip():
+            if not _tenki_key_configured(backend_config):
                 return "[Tenki execution is selected but no API key is configured.]"
             tenki_images: list[tuple[Path, bytes]] = []
             for raw_path in image_paths[:_MAX_TELEGRAM_IMAGE_COUNT]:
@@ -3661,7 +3678,7 @@ class NovitaSandboxTool(Tool):
             session_key = (ctx.session_key or f"{ctx.channel}:{ctx.chat_id}") if ctx is not None else _session_key()
             return await self._execute_runloop(action, kwargs, backend_config, session_key)
         if selected_backend == "tenki":
-            if backend_config is None or not str(backend_config.api_key or "").strip():
+            if not _tenki_key_configured(backend_config):
                 return ToolResult.error("Tenki execution is selected but no API key is configured")
             ctx = current_request_context()
             session_key = (ctx.session_key or f"{ctx.channel}:{ctx.chat_id}") if ctx is not None else _session_key()
