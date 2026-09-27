@@ -20,6 +20,7 @@ the suite never needs a real Tenki account.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import datetime as dt
 from typing import Any
@@ -35,6 +36,7 @@ from nanobot.agent.tools.tenki_backend import (
     TenkiExecutionBackend,
     TenkiFileNotFoundError,
     TenkiRotationState,
+    _parse_df_kb,
     is_sdk_available,
     parse_tenki_api_keys,
     tenki_sandbox_name,
@@ -148,6 +150,7 @@ class _FakeSandbox:
         self.wait_calls: list[float | None] = []
         self.shell_handler: Any = None
         self.ready_error: Exception | None = None
+        self.close_error: Exception | None = None
 
     @property
     def state(self) -> str:
@@ -170,6 +173,8 @@ class _FakeSandbox:
         self.extended.append(seconds)
 
     async def close(self) -> None:
+        if self.close_error is not None:
+            raise self.close_error
         self.closed = True
         self.info.state = "TERMINATED"
 
@@ -532,6 +537,159 @@ def test_ready_reports_terminal_state_loudly() -> None:
     with pytest.raises(TenkiError) as err:
         asyncio.run(_backend()._ready(failed))
     assert "terminal state" in str(err.value)
+
+
+# ------------------------------------------------- disk size reconciliation
+#
+# Reported live: sessions created before the disk setting was raised came up
+# ``disk=5`` and stayed that way, so every MT5 + Wine install in them ran out of
+# space (the installer's preflight then refused with "not enough disk"). Tenki
+# sizes a session's disk at create time and cannot grow it afterwards, so the
+# only way to honour a raised setting is to rebuild the session.
+
+
+def test_an_undersized_session_is_rebuilt_at_the_configured_size() -> None:
+    stale = _FakeSandbox(id="sbx_stale", name="px-test-abc123", disk_size_gb=5)
+    created: list[dict[str, Any]] = []
+
+    async def handler(op: str, payload: dict[str, Any]) -> Any:
+        if op == "list":
+            return [stale]
+        if op == "create":
+            created.append(payload)
+            return _FakeSandbox(id="sbx_resized", name="px-test-abc123", disk_size_gb=20)
+        raise AssertionError(op)
+
+    _install(handler)
+    backend = _backend(disk_size_gb=20)
+    asyncio.run(backend.run("df -h"))
+
+    assert stale.closed is True
+    assert [call["disk_size_gb"] for call in created] == [20]
+    assert backend.last_session_id == "sbx_resized"
+
+
+@pytest.mark.parametrize("current", [20, 25, 100])
+def test_a_session_at_or_above_the_configured_size_is_reused(current: int) -> None:
+    """Only a genuinely smaller disk is rebuilt — never a bigger one."""
+    sandbox = _FakeSandbox(id="sbx_ok", name="px-test-abc123", disk_size_gb=current)
+
+    async def handler(op: str, payload: dict[str, Any]) -> Any:
+        if op == "list":
+            return [sandbox]
+        raise AssertionError(f"{op} should not be called")
+
+    _install(handler)
+    backend = _backend(disk_size_gb=20)
+    asyncio.run(backend.run("echo hi"))
+
+    assert sandbox.closed is False
+    assert sandbox.shells  # the command ran on the existing VM
+    assert backend.last_session_id == "sbx_ok"
+
+
+@pytest.mark.parametrize(
+    ("configured", "reported"),
+    [
+        (0, 5),  # 0 means "provider default", so no session can be "too small"
+        (20, 0),  # a size the API does not report must not read as "too small"
+    ],
+)
+def test_a_session_is_never_rebuilt_without_something_to_compare(
+    configured: int, reported: int
+) -> None:
+    """An unknown on either side must never destroy a working VM."""
+    sandbox = _FakeSandbox(id="sbx_ok", name="px-test-abc123", disk_size_gb=reported)
+
+    async def handler(op: str, payload: dict[str, Any]) -> Any:
+        if op == "list":
+            return [sandbox]
+        raise AssertionError(f"{op} should not be called")
+
+    _install(handler)
+    backend = _backend(disk_size_gb=configured)
+    asyncio.run(backend.run("echo hi"))
+
+    assert sandbox.closed is False
+    assert backend.last_session_id == "sbx_ok"
+
+
+def test_a_rebuild_that_cannot_terminate_reports_the_reason() -> None:
+    """Name-identity makes a half-done rebuild worse than none at all."""
+    stale = _FakeSandbox(id="sbx_stale", name="px-test-abc123", disk_size_gb=5)
+    stale.close_error = RuntimeError("terminate refused")
+
+    async def handler(op: str, payload: dict[str, Any]) -> Any:
+        if op == "list":
+            return [stale]
+        raise AssertionError(f"{op} should not be called")
+
+    _install(handler)
+    with pytest.raises(TenkiError) as err:
+        asyncio.run(_backend(disk_size_gb=20).run("echo hi"))
+    message = str(err.value)
+    assert "5 GB" in message and "20 GB" in message
+    assert "terminate refused" in message
+
+
+def test_a_rebuilt_session_is_free_to_rotate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The old VM's files are gone, so staying on its lane buys nothing.
+
+    Keeping the pin would also strand the rebuild behind that workspace's own
+    session quota, which is exactly the wall a rebuild is meant to get past.
+    """
+    keys, workspaces = _lane_env(monkeypatch)
+    stale = _FakeSandbox(id="sbx-stale", name="px-session-one", disk_size_gb=5)
+    workspaces[1].sessions[stale.id] = stale
+    workspaces[1].active = 1
+    pinned: list[int] = []
+    backend = _lane_backend(
+        keys,
+        name="px-session-one",
+        rotation=TenkiRotationState(),
+        pinned=pinned.append,
+        disk_size_gb=20,
+    )
+    asyncio.run(backend.run("df -h"))
+
+    assert stale.closed is True
+    # It was found in lane 1 and rebuilt in lane 0: the stale pin did not
+    # survive the session it belonged to.
+    assert [workspace.created for workspace in workspaces] == [1, 0]
+    # Lane 1 is reported when the stale VM is adopted (and again, as lane 0,
+    # once the rebuild lands) — the last word is what the caller persists.
+    assert pinned[-1] == 0
+    assert backend.lane_index == 0
+
+
+def test_an_undersized_rebuild_does_not_happen_at_task_end() -> None:
+    """keep_alive/reset must never create a VM, rebuild or not."""
+    stale = _FakeSandbox(id="sbx_stale", name="px-test-abc123", disk_size_gb=5)
+
+    async def handler(op: str, payload: dict[str, Any]) -> Any:
+        if op == "list":
+            return [stale]
+        raise AssertionError(f"{op} should not be called")
+
+    _install(handler)
+    backend = _backend(disk_size_gb=20)
+    asyncio.run(backend.keep_alive())
+
+    assert stale.closed is False
+    assert stale.extended == [3600]
+
+
+def test_parse_df_kb_reads_the_posix_column_order() -> None:
+    text = (
+        "Filesystem     1024-blocks     Used Available Capacity Mounted on\n"
+        "/dev/vda1        20971520 10485760   9437184      53% /\n"
+    )
+    assert _parse_df_kb(text) == {"total_mb": 20480, "free_mb": 9216}
+
+
+@pytest.mark.parametrize("text", ["", "df: /nope: No such file or directory\n", "no columns"])
+def test_parse_df_kb_declines_junk(text: str) -> None:
+    assert _parse_df_kb(text) == {}
 
 
 # ------------------------------------------------------- task-end lifecycle

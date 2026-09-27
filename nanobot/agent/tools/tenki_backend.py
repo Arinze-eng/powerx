@@ -610,6 +610,67 @@ class TenkiExecutionBackend:
     def _usable(self, sandbox: Any) -> bool:
         return self._state(sandbox) not in _DEAD_STATES
 
+    @staticmethod
+    def _disk_gb(sandbox: Any) -> int:
+        """The disk size this session was CREATED with, or 0 when unreported."""
+        try:
+            info = sandbox.info
+        except Exception:  # noqa: BLE001
+            return 0
+        try:
+            return int(getattr(info, "disk_size_gb", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _undersized(self, sandbox: Any) -> bool:
+        """Whether this VM's disk is smaller than this deployment now asks for.
+
+        Reports False whenever either size is unknown, so an SDK that omits
+        ``disk_size_gb`` can never cause a working VM to be torn down.
+
+        Tenki fixes a session's disk at create time — ``AsyncSandbox.update``
+        carries name/tags/sticky/TTL and nothing else, and only *volumes* can be
+        resized — so a session born before the setting was raised stays at the
+        old size for the whole of its life. Measured live: every session created
+        while the setting was unset came up ``disk=5``, which is below the ~6 GiB
+        an MT5 + Wine install needs, and every later install in those sessions
+        died on a full disk (the installer's own preflight is what surfaced it).
+        """
+        if not self.disk_size_gb:
+            return False
+        current = self._disk_gb(sandbox)
+        return bool(current) and current < self.disk_size_gb
+
+    async def _reclaim_undersized(self, sandbox: Any) -> None:
+        """Terminate a VM provisioned below the configured disk size.
+
+        Recreating is the only way to pick the new size up, and the old VM's
+        files are already unusable — a full 5 GiB disk holds a half-installed
+        Wine, not work worth preserving.
+
+        Termination must SUCCEED before the caller creates a replacement: a
+        session is resolved by its deterministic name, so leaving the undersized
+        VM alive would put two VMs under one name and the next operation could
+        attach to the old, still-too-small one all over again.
+        """
+        session_id = str(getattr(sandbox, "id", self.sandbox_name))
+        logger.warning(
+            "recreating Tenki session {}: it was created with a {} GB disk but {} GB "
+            "is now configured, and Tenki cannot grow an existing session's disk",
+            session_id,
+            self._disk_gb(sandbox),
+            self.disk_size_gb,
+        )
+        try:
+            await sandbox.close()
+        except Exception as exc:  # noqa: BLE001
+            raise TenkiError(
+                f"Tenki session {session_id} has a {self._disk_gb(sandbox)} GB disk but "
+                f"{self.disk_size_gb} GB is configured, and it could not be terminated "
+                f"to be replaced at the new size: {_detail(exc)}"
+            ) from None
+        self.last_session_id = ""
+
     async def _ready(self, sandbox: Any, *, timeout: float = 240) -> Any:
         """Block until the session is ``RUNNING`` (a fresh VM can take a while)."""
         if self._state(sandbox) == "RUNNING":
@@ -738,10 +799,21 @@ class TenkiExecutionBackend:
 
         Unpinned: adopt the session wherever it already lives, otherwise this is
         a brand-new session and a lane is chosen round-robin.
+
+        A session that exists but was created with less disk than is configured
+        now is terminated and rebuilt rather than attached to: Tenki cannot
+        resize a session, so reusing it would fail every heavy install for as
+        long as it lives. Because that VM's files are discarded with it, its
+        lane pin is dropped too and the replacement rotates like any new session.
         """
         sandbox, client = await self._attach_only()
         if sandbox is not None and client is not None:
-            return sandbox, client
+            if not self._undersized(sandbox):
+                return sandbox, client
+            await self._reclaim_undersized(sandbox)
+            with suppress(Exception):
+                await client.close()
+            self.lane_index = None
         if self.lane_index is not None:
             return await self._create_in_lane(self.lane_index)
         return await self._create_with_rotation()
@@ -1101,9 +1173,31 @@ class TenkiExecutionBackend:
         )
         return await self.run(command, timeout=min(timeout, _MAX_TIMEOUT))
 
+    async def _disk_report(self, sandbox: Any) -> dict[str, Any]:
+        """Live free space inside the session, for the admin Test button.
+
+        Provisioned size alone does not tell an operator whether an install will
+        fit — a correctly sized session can still be full — so this reads the
+        filesystem the workspace actually sits on. Best effort: a session that
+        cannot answer must not fail the connection test.
+        """
+        report: dict[str, Any] = {"disk_size_gb": self._disk_gb(sandbox)}
+        try:
+            result = await sandbox.shell(
+                f"df -Pk {shlex.quote(self.workspace)}", timeout=60
+            )
+        except Exception as exc:  # noqa: BLE001
+            report["disk_error"] = _detail(exc)
+            return report
+        report.update(_parse_df_kb(getattr(result, "stdout_text", "")))
+        if "total_mb" not in report:
+            report["disk_error"] = "df produced no parsable line"
+        return report
+
     async def test_connection(self) -> dict[str, Any]:
         async with self._session() as sandbox:
             result = await sandbox.shell("uname -a", timeout=90)
+            disk = await self._disk_report(sandbox)
             info = getattr(sandbox, "info", None)
             timeout_at = getattr(info, "timeout_at", None)
             session_id = str(sandbox.id)
@@ -1116,6 +1210,9 @@ class TenkiExecutionBackend:
             "state": state,
             "cpu_cores": getattr(info, "cpu_cores", None),
             "memory_mb": getattr(info, "memory_mb", None),
+            # Live headroom next to the provisioned size: "20 GB configured" is
+            # not the same claim as "20 GB free where the install will land".
+            **disk,
             # ``SandboxInfo`` exposes the deadline, not the configured TTL, so the
             # landing TTL is verified through ``timeout_at``.
             "timeout_at": timeout_at.isoformat() if hasattr(timeout_at, "isoformat") else str(timeout_at or ""),
@@ -1153,6 +1250,28 @@ def _detail(exc: BaseException) -> str:
 
 def _strip_trailers(text: str) -> str:
     return re.sub(r"\n\[(?:stderr|exit_code)=\d+\]\s*$", "", text).strip()
+
+
+def _parse_df_kb(text: str) -> dict[str, int]:
+    """Pull total/free megabytes out of ``df -Pk`` output.
+
+    POSIX ``-P`` fixes the column order to ``Filesystem 1024-blocks Used
+    Available Capacity Mounted-on``, so the fields are positional. The LAST
+    parsable line wins, which is also the correct answer when ``df`` prints its
+    header. Anything unexpected yields ``{}``: this is a diagnostic readout, and
+    a filesystem the parser has never seen must not fail the Test button.
+    """
+    for line in reversed(str(text or "").splitlines()):
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        try:
+            total_kb = int(fields[1])
+            free_kb = int(fields[3])
+        except ValueError:
+            continue
+        return {"total_mb": total_kb // 1024, "free_mb": free_kb // 1024}
+    return {}
 
 
 __all__ = [
