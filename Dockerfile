@@ -84,6 +84,12 @@ COPY scripts/backfill_chat_owners.py scripts/
 # listed here — the first deploy of print_cron_store.py silently produced no
 # audit line for exactly this reason.
 COPY scripts/print_cron_store.py scripts/
+# The third instance of the same trap. media_forensics asks a configured sandbox
+# to read the pixels; the relay ships this file to the sandbox and runs it there,
+# so without this line every sandboxed analysis fell back to the host with
+# "the sandbox runner is missing at /app/scripts/forensics_sandbox_runner.py" —
+# silently, because the fallback is designed to be graceful.
+COPY scripts/forensics_sandbox_runner.py scripts/
 COPY --from=webui-builder /app/nanobot/web/dist/ nanobot/web/dist/
 RUN NANOBOT_SKIP_WEBUI_BUILD=1 uv pip install --python "$VIRTUAL_ENV/bin/python" --no-cache .
 
