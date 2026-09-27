@@ -29,13 +29,17 @@ import pytest
 from nanobot.agent.tools import tenki_backend
 from nanobot.agent.tools.tenki_backend import (
     DEFAULT_API_URL,
+    MAX_API_KEYS,
     WORKSPACE,
     TenkiError,
     TenkiExecutionBackend,
     TenkiFileNotFoundError,
+    TenkiRotationState,
     is_sdk_available,
+    parse_tenki_api_keys,
     tenki_sandbox_name,
     validate_tenki_api_key,
+    validate_tenki_api_keys,
     validate_tenki_api_url,
     validate_tenki_cpu_cores,
     validate_tenki_disk_size_gb,
@@ -989,3 +993,402 @@ def test_missing_sdk_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(TenkiError) as err:
         asyncio.run(_backend().run("true"))
     assert "SDK is not installed" in str(err.value)
+
+
+# ------------------------------------------------- API key rotation (lanes)
+#
+# Each ``tk_`` key authenticates into its OWN Tenki workspace and every
+# workspace carries its own session quota (measured live at five active
+# sessions), so several keys are extra *capacity*. The invariants below are what
+# keep that capacity from costing correctness: a session that already exists is
+# pinned to the workspace holding its disk, only a brand-new session rotates,
+# and only a failure that says "this lane cannot serve us" is allowed to move.
+
+
+class _LaneWorkspace:
+    """One fake Tenki workspace: its own sessions, so lanes stay distinct."""
+
+    def __init__(self, workspace_id: str, *, limit: int = 5) -> None:
+        self.workspace_id = workspace_id
+        self.limit = limit
+        self.active = 0
+        self.sessions: dict[str, Any] = {}
+        self.created = 0
+        self.fail: str | None = None
+
+
+class _FakeWorkspaceEntry:
+    def __init__(self, workspace_id: str) -> None:
+        self.id = workspace_id
+        self.name = "My Workspace"
+
+
+class _FakeIdentity:
+    """Stand-in for ``Identity`` returned by ``who_am_i()``."""
+
+    def __init__(self, workspace_id: str) -> None:
+        self.owner_id = workspace_id
+        self.owner_type = "WORKSPACE"
+        self.workspaces = (_FakeWorkspaceEntry(workspace_id),)
+
+
+class _FakeUsage:
+    """Stand-in for one ``WorkspaceUsageLimit`` from ``get_usage()``."""
+
+    def __init__(self, key: str, current: int = 0, maximum: int = 5) -> None:
+        self.key = key
+        self.label = key
+        self.unit = "count"
+        self.current = current
+        self.max = maximum
+
+
+class _LaneClient:
+    """AsyncClient stand-in that answers from the workspace its key unlocks.
+
+    The whole point of a lane is that one key cannot see another key's
+    workspace, so the fake enforces exactly that: a client only ever returns its
+    own lane's sessions. That is what makes "a session was adopted in lane 1"
+    and "a second VM was built in lane 0" distinguishable in a test.
+    """
+
+    registry: dict[str, _LaneWorkspace] = {}
+    calls: list[tuple[str, str]] = []
+    # Every client ever built, so a test can assert when one gets closed: a
+    # sandbox handle is only usable while the client that produced it is alive.
+    instances: list["_LaneClient"] = []
+
+    def __init__(self, *, auth_token: str = "", base_url: str = "", **_: Any) -> None:
+        self.auth_token = auth_token
+        self.base_url = base_url
+        self.closed = False
+        self.workspace = _LaneClient.registry[auth_token]
+        _LaneClient.instances.append(self)
+
+    async def who_am_i(self) -> Any:
+        return _FakeIdentity(self.workspace.workspace_id)
+
+    async def get_usage(self) -> Any:
+        return [_FakeUsage("max_concurrent_jobs", self.workspace.active, self.workspace.limit)]
+
+    async def create(self, **kwargs: Any) -> Any:
+        _LaneClient.calls.append((self.auth_token, "create"))
+        if self.workspace.fail:
+            raise RuntimeError(self.workspace.fail)
+        self.workspace.created += 1
+        self.workspace.active += 1
+        sandbox = _FakeSandbox(
+            id=f"sbx-{self.workspace.workspace_id}-{self.workspace.created}",
+            # ``_find_session`` reattaches by the sandbox's own ``name``, so the
+            # fake must carry it exactly as the real SDK object does.
+            name=str(kwargs.get("name") or ""),
+        )
+        self.workspace.sessions[sandbox.id] = sandbox
+        return sandbox
+
+    async def get(self, session_id: str) -> Any:
+        _LaneClient.calls.append((self.auth_token, "get"))
+        return self.workspace.sessions.get(session_id)
+
+    async def list(self, **kwargs: Any) -> Any:
+        _LaneClient.calls.append((self.auth_token, "list"))
+        return list(self.workspace.sessions.values())
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _lane_env(
+    monkeypatch: pytest.MonkeyPatch, count: int = 2
+) -> tuple[list[str], list[_LaneWorkspace]]:
+    """Independent fake workspaces behind their own keys."""
+    keys = [f"tk_lane_{chr(ord('a') + index)}" for index in range(count)]
+    workspaces = [_LaneWorkspace(f"ws-{index}") for index in range(count)]
+    _LaneClient.registry = dict(zip(keys, workspaces))
+    _LaneClient.calls = []
+    _LaneClient.instances = []
+    monkeypatch.setattr(tenki_backend, "_load_async_client", lambda: _LaneClient)
+    return keys, workspaces
+
+
+def _lane_backend(
+    keys: list[str],
+    *,
+    name: str = "px-test-abc123",
+    rotation: Any = None,
+    lane_index: int | None = None,
+    pinned: Any = None,
+    **config_overrides: Any,
+) -> TenkiExecutionBackend:
+    return TenkiExecutionBackend(
+        _Config(api_keys=list(keys), **config_overrides),
+        sandbox_name=name,
+        lane_index=lane_index,
+        rotation=rotation,
+        on_lane_pinned=pinned,
+    )
+
+
+def test_parse_api_keys_splits_dedupes_and_keeps_order() -> None:
+    assert parse_tenki_api_keys("tk_a,tk_b") == ["tk_a", "tk_b"]
+    assert parse_tenki_api_keys("  tk_a ; tk_b \n tk_c  ") == ["tk_a", "tk_b", "tk_c"]
+    assert parse_tenki_api_keys('"tk_a",tk_b') == ["tk_a", "tk_b"]
+    assert parse_tenki_api_keys(["tk_a", "tk_a", "tk_b"]) == ["tk_a", "tk_b"]
+    assert parse_tenki_api_keys(None) == []
+    assert parse_tenki_api_keys("") == []
+
+
+def test_validate_api_keys_enforces_the_lane_cap_and_key_shape() -> None:
+    assert validate_tenki_api_keys("tk_a, tk_b") == ["tk_a", "tk_b"]
+    with pytest.raises(ValueError):
+        validate_tenki_api_keys(",".join(f"tk_{i}" for i in range(MAX_API_KEYS + 1)))
+    with pytest.raises(ValueError):
+        validate_tenki_api_keys("tk_a,not_a_key")
+
+
+def test_rotation_walks_lanes_in_order_then_steps_over_parked_ones() -> None:
+    state = TenkiRotationState()
+    assert [state.next_lane(3) for _ in range(6)] == [0, 1, 2, 0, 1, 2]
+    state.park(1)
+    assert state.parked() == {1}
+    assert [state.next_lane(3) for _ in range(4)] == [0, 2, 2, 0]
+    state.clear()
+    assert state.parked() == set()
+
+
+def test_parking_every_lane_still_offers_them_all() -> None:
+    state = TenkiRotationState()
+    for lane in range(3):
+        state.park(lane)
+    # A stale cooldown must never become "no lane was tried at all".
+    assert sorted({state.next_lane(3) for _ in range(3)}) == [0, 1, 2]
+
+
+def test_plural_keys_win_over_the_legacy_single_key() -> None:
+    backend = _lane_backend(["tk_lane_a", "tk_lane_b"], api_key="tk_legacy")
+    assert backend.api_keys == ["tk_lane_a", "tk_lane_b"]
+    # Anything reading the singular attribute still sees a usable primary.
+    assert backend.api_key == "tk_lane_a"
+
+
+def test_a_single_key_is_a_one_lane_rotation() -> None:
+    backend = _backend(api_key="tk_only")
+    assert backend.api_keys == ["tk_only"]
+    assert backend.lane_index is None
+
+
+def test_new_sessions_are_created_on_successive_lanes(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    keys, workspaces = _lane_env(monkeypatch)
+    rotation = TenkiRotationState()
+    pinned: list[int] = []
+    first = _lane_backend(keys, name="px-session-one", rotation=rotation, pinned=pinned.append)
+    asyncio.run(first.describe())
+    second = _lane_backend(keys, name="px-session-two", rotation=rotation)
+    asyncio.run(second.describe())
+    assert (first.lane_index, second.lane_index) == (0, 1)
+    # One VM per lane: rotation really did buy a second workspace.
+    assert [workspace.created for workspace in workspaces] == [1, 1]
+    # The lane was reported so the caller can persist it.
+    assert pinned == [0]
+
+
+def test_a_new_backend_adopts_the_lane_that_holds_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    keys, workspaces = _lane_env(monkeypatch)
+    rotation = TenkiRotationState()
+    first = _lane_backend(keys, name="px-session-one", rotation=rotation)
+    asyncio.run(first.describe())
+    assert first.lane_index == 0
+    # The next process has no recorded lane and a cursor that would hand out
+    # lane 1 — it must still find the session in lane 0 rather than build a
+    # second, empty VM somewhere the user's files are not.
+    second = _lane_backend(keys, name="px-session-one", rotation=rotation)
+    asyncio.run(second.describe())
+    assert second.lane_index == 0
+    assert [workspace.created for workspace in workspaces] == [1, 0]
+
+
+def test_a_pinned_session_never_rotates(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    keys, workspaces = _lane_env(monkeypatch)
+    backend = _lane_backend(
+        keys, name="px-session-one", lane_index=1, rotation=TenkiRotationState()
+    )
+    asyncio.run(backend.describe())
+    assert backend.lane_index == 1
+    assert [workspace.created for workspace in workspaces] == [0, 1]
+    # A later operation resolves in lane 1 again instead of looking wider.
+    asyncio.run(backend.run("true"))
+    assert [workspace.created for workspace in workspaces] == [0, 1]
+    assert keys[0] not in [key for key, op in _LaneClient.calls if op == "create"]
+
+
+def test_a_full_lane_rotates_to_the_next_one_and_parks_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    keys, workspaces = _lane_env(monkeypatch)
+    workspaces[0].fail = (
+        "requested resources exceed workspace limits: "
+        "max_concurrent_jobs required 1 allowed 5"
+    )
+    rotation = TenkiRotationState()
+    backend = _lane_backend(keys, name="px-session-one", rotation=rotation)
+    asyncio.run(backend.describe())
+    assert backend.lane_index == 1
+    assert [workspace.created for workspace in workspaces] == [0, 1]
+    assert rotation.parked() == {0}
+    # A later new session does not go straight back to the lane that refused us.
+    later = _lane_backend(keys, name="px-session-two", rotation=rotation)
+    asyncio.run(later.describe())
+    assert later.lane_index == 1
+
+
+def test_a_rejected_key_parks_that_lane(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    keys, workspaces = _lane_env(monkeypatch)
+    workspaces[0].fail = "unauthenticated: invalid api key"
+    rotation = TenkiRotationState()
+    backend = _lane_backend(keys, name="px-session-one", rotation=rotation)
+    asyncio.run(backend.describe())
+    assert backend.lane_index == 1
+    assert rotation.parked() == {0}
+
+
+def test_a_broken_request_does_not_rotate(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    keys, workspaces = _lane_env(monkeypatch)
+    workspaces[0].fail = "could not resolve the base image manifest"
+    backend = _lane_backend(keys, name="px-session-one", rotation=TenkiRotationState())
+    with pytest.raises(TenkiError) as err:
+        asyncio.run(backend.describe())
+    assert "base image manifest" in str(err.value)
+    # Cycling keys would have hidden a real bug behind a retry that happened to
+    # be less picky, so no other lane may have been touched.
+    assert [workspace.created for workspace in workspaces] == [0, 0]
+    assert [key for key, op in _LaneClient.calls if op == "create"] == [keys[0]]
+
+
+def test_a_pinned_lane_reports_a_full_workspace_instead_of_moving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    keys, workspaces = _lane_env(monkeypatch)
+    workspaces[1].fail = "workspace limit reached: max_concurrent_jobs"
+    backend = _lane_backend(keys, name="px-session-one", lane_index=1)
+    with pytest.raises(TenkiError) as err:
+        asyncio.run(backend.describe())
+    assert "pinned" in str(err.value)
+    # Moving the session to lane 0 would have lost every file written so far.
+    assert [workspace.created for workspace in workspaces] == [0, 0]
+
+
+def test_when_every_lane_refuses_the_last_reason_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    keys, workspaces = _lane_env(monkeypatch)
+    for workspace in workspaces:
+        workspace.fail = "workspace limit reached"
+    backend = _lane_backend(keys, name="px-session-one", rotation=TenkiRotationState())
+    with pytest.raises(TenkiError) as err:
+        asyncio.run(backend.describe())
+    assert "no Tenki lane could accept a new session" in str(err.value)
+    assert "tried 2 of 2" in str(err.value)
+
+
+def test_describe_lanes_reports_each_workspace_and_its_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    keys, workspaces = _lane_env(monkeypatch)
+    workspaces[1].active = 3
+    rows = asyncio.run(_lane_backend(keys).describe_lanes())
+    assert [row["lane"] for row in rows] == [0, 1]
+    assert [row["workspace_id"] for row in rows] == ["ws-0", "ws-1"]
+    assert [row["active_sessions"] for row in rows] == [0, 3]
+    assert [row["session_limit"] for row in rows] == [5, 5]
+
+
+def test_one_unusable_lane_does_not_hide_the_others(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    keys, _ = _lane_env(monkeypatch)
+    _LaneClient.registry.pop(keys[1])
+    rows = asyncio.run(_lane_backend(keys).describe_lanes())
+    assert [row["lane"] for row in rows] == [0, 1]
+    assert rows[0]["workspace_id"] == "ws-0"
+    assert "error" in rows[1]
+
+
+def test_describe_reports_the_lane_the_session_lives_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    keys, _ = _lane_env(monkeypatch)
+    info = asyncio.run(_lane_backend(keys, name="px-session-one").describe())
+    assert info["lane_index"] == 0
+    assert info["lane_count"] == 2
+    assert info["workspace_id"] == "ws-0"
+
+
+def test_an_operation_keeps_its_owning_client_open_until_the_body_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the lane rewrite closed the client before the body ran.
+
+    A sandbox handle is only usable while the client that produced it is alive,
+    so closing early made every real write fail with "Channel is closed." The
+    fake sandbox cannot reproduce that — its methods need no channel — but the
+    ownership rule can be asserted directly: the client that resolved the
+    session must still be OPEN while the operation body runs, and closed once
+    the operation is over.
+    """
+    import asyncio
+
+    keys, _ = _lane_env(monkeypatch)
+    backend = _lane_backend(keys, name="px-session-one", rotation=TenkiRotationState())
+
+    async def operation() -> tuple[bool, bool]:
+        async with backend._session() as sandbox:
+            open_under_body = [
+                client for client in _LaneClient.instances if not client.closed
+            ]
+            assert open_under_body, "the operation body ran with no open client"
+            await sandbox.fs.write_text("/home/tenki/probe.txt", "written under the body")
+        return bool(open_under_body), all(c.closed for c in _LaneClient.instances)
+
+    held_open, closed_after = asyncio.run(operation())
+    assert held_open
+    assert closed_after
+
+
+def test_reset_closes_the_client_it_attached_with(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    keys, workspaces = _lane_env(monkeypatch)
+    backend = _lane_backend(keys, name="px-session-one", rotation=TenkiRotationState())
+    asyncio.run(backend.describe())
+    session_id = backend.last_session_id
+    assert session_id
+
+    _LaneClient.instances = []
+    asyncio.run(backend.reset(session_id))
+
+    assert backend.last_session_id == ""
+    assert workspaces[0].sessions[session_id].closed
+    assert _LaneClient.instances, "reset never built a client"
+    assert all(client.closed for client in _LaneClient.instances)

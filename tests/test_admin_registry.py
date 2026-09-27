@@ -595,11 +595,16 @@ def test_execution_admin_section_offers_the_tenki_backend(monkeypatch) -> None:
         "tenkiFetchAllowHosts",
         "tenkiPersistWorkspace",
         "tenkiKeyState",
+        "tenkiApiKeys",
     ):
         assert element in body, element
     # The one-hour TTL default and the workspace RAM ceiling must be stated.
     assert "one hour" in body
     assert "4096 MB is the ceiling" in body
+    # Rotation must be explained where an administrator can read it, and the
+    # reason a live session cannot move between keys has to be on the page.
+    assert "Each Tenki API key belongs to its own workspace" in body
+    assert "stays pinned to the workspace holding its files" in body
     # The default TTL is prefilled as one hour (3600 seconds).
     assert "placeholder='3600'" in body
 
@@ -740,7 +745,14 @@ def test_execution_test_accepts_the_tenki_backend(monkeypatch, tmp_path: Path) -
                 "state": "RUNNING",
                 "platform": "Linux px-connection-test 6.18.29 x86_64",
                 "memory_mb": 4096,
+                "lane_index": 0,
+                "lane_count": 1,
             }
+
+        async def describe_lanes(self):
+            # The test endpoint reports every configured lane, so the fake has
+            # to expose the same surface the real backend does.
+            return [{"lane": 0, "workspace_id": "ws-only", "active_sessions": 0, "session_limit": 5}]
 
     monkeypatch.setattr(tenki_backend, "is_sdk_available", lambda: True)
     monkeypatch.setattr(tenki_backend, "TenkiExecutionBackend", _FakeTenkiBackend)
@@ -768,6 +780,10 @@ def test_execution_test_accepts_the_tenki_backend(monkeypatch, tmp_path: Path) -
     assert seen["called"] is True
     assert seen["sandbox_name"] == "powerx-connection-test"
     assert seen["max_duration_seconds"] == 3600
+    # A one-lane backend still reports its lane, so the panel reads the same
+    # whether or not rotation is configured.
+    assert '"lane_count": 1' in body
+    assert '"workspace_id": "ws-only"' in body
 
 
 def test_execution_test_reports_a_missing_tenki_sdk(monkeypatch, tmp_path: Path) -> None:
@@ -792,3 +808,167 @@ def test_execution_test_reports_a_missing_tenki_sdk(monkeypatch, tmp_path: Path)
     assert response is not None
     assert response.status_code == 400
     assert "pip install tenki" in bytes(response.body).decode()
+
+
+def test_tenki_lane_keys_round_trip_but_only_the_count_comes_back(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Several keys are capacity, so saving them must work — and stay secret."""
+    config_path = tmp_path / "config.json"
+    source = Path(__file__).parents[1] / "render-config.json"
+    config_path.write_text(source.read_text(), encoding="utf-8")
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.delenv("NANOBOT_TENKI_API_KEY", raising=False)
+    monkeypatch.delenv("NANOBOT_TENKI_API_KEYS", raising=False)
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+
+    keys = ["tk_lane_alpha", "tk_lane_beta", "tk_lane_gamma"]
+    request = _request("/api/admin/execution-settings")
+    request._nanobot_webui_mutation_payload = {
+        "backend": "tenki",
+        # One per line, as the admin textarea sends it.
+        "tenkiApiKeys": "\n".join(keys),
+    }
+    response = admin_registry.admin_route(request, "/api/admin/execution-settings")
+    assert response is not None
+    assert response.status_code == 200
+
+    body = bytes(response.body).decode()
+    for key in keys:
+        assert key not in body, key
+    assert json.loads(body)["tenki"]["apiKeysConfigured"] == 3
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["execution"]["tenki"]["apiKeys"] == keys
+
+    # A blank list on the next save keeps the stored lanes, exactly as the
+    # single-key field already behaves.
+    blank = _request("/api/admin/execution-settings")
+    blank._nanobot_webui_mutation_payload = {"backend": "tenki", "tenkiApiKeys": ""}
+    retained = admin_registry.admin_route(blank, "/api/admin/execution-settings")
+    assert retained is not None
+    assert retained.status_code == 200
+    assert json.loads(bytes(retained.body).decode())["tenki"]["apiKeysConfigured"] == 3
+    assert (
+        json.loads(config_path.read_text(encoding="utf-8"))["execution"]["tenki"]["apiKeys"]
+        == keys
+    )
+
+    # A sent value replaces the whole list: lanes are positional and a live
+    # session is pinned to its lane, so lanes are never merged behind the
+    # administrator's back.
+    replaced = _request("/api/admin/execution-settings")
+    replaced._nanobot_webui_mutation_payload = {
+        "backend": "tenki",
+        "tenkiApiKeys": "tk_lane_alpha, tk_lane_delta",
+    }
+    response = admin_registry.admin_route(replaced, "/api/admin/execution-settings")
+    assert response is not None
+    assert response.status_code == 200
+    assert json.loads(bytes(response.body).decode())["tenki"]["apiKeysConfigured"] == 2
+    assert (
+        json.loads(config_path.read_text(encoding="utf-8"))["execution"]["tenki"]["apiKeys"]
+        == ["tk_lane_alpha", "tk_lane_delta"]
+    )
+
+
+def test_tenki_connection_test_reports_every_lane(monkeypatch, tmp_path: Path) -> None:
+    """The Test button must show which workspace each key lands in."""
+    from nanobot.agent.tools import tenki_backend as tenki_backend_module
+    from nanobot.agent.tools.tenki_backend import TenkiExecutionBackend
+
+    config_path = tmp_path / "config.json"
+    source = Path(__file__).parents[1] / "render-config.json"
+    config_path.write_text(source.read_text(), encoding="utf-8")
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.delenv("NANOBOT_TENKI_API_KEY", raising=False)
+    monkeypatch.delenv("NANOBOT_TENKI_API_KEYS", raising=False)
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+    # The SDK is not needed to prove the route wires the lanes through.
+    monkeypatch.setattr(tenki_backend_module, "is_sdk_available", lambda: True)
+
+    seen: dict[str, object] = {}
+
+    async def fake_test_connection(self) -> dict[str, object]:
+        seen["api_keys"] = list(self.api_keys)
+        return {
+            "ok": True,
+            "backend": "tenki",
+            "session_id": "sbx_live_1",
+            "state": "RUNNING",
+            "platform": "Linux",
+            "lane_index": 1,
+            "lane_count": 2,
+            "workspace_id": "ws-1",
+            "active_sessions": 0,
+            "session_limit": 5,
+        }
+
+    async def fake_describe_lanes(self) -> list[dict[str, object]]:
+        return [
+            {"lane": 0, "workspace_id": "ws-0", "active_sessions": 2, "session_limit": 5},
+            {"lane": 1, "workspace_id": "ws-1", "active_sessions": 0, "session_limit": 5},
+        ]
+
+    monkeypatch.setattr(TenkiExecutionBackend, "test_connection", fake_test_connection)
+    monkeypatch.setattr(TenkiExecutionBackend, "describe_lanes", fake_describe_lanes)
+
+    request = _request("/api/admin/execution-test")
+    request._nanobot_webui_mutation_payload = {
+        "backend": "tenki",
+        "tenkiApiKeys": "tk_lane_alpha, tk_lane_beta",
+    }
+    response = admin_registry.admin_route(request, "/api/admin/execution-test")
+    assert response is not None
+    assert response.status_code == 200
+
+    body = bytes(response.body).decode()
+    assert seen["api_keys"] == ["tk_lane_alpha", "tk_lane_beta"]
+    payload = json.loads(body)
+    assert payload["lane_index"] == 1
+    assert payload["lane_count"] == 2
+    assert [row["lane"] for row in payload["lanes"]] == [0, 1]
+    assert [row["workspace_id"] for row in payload["lanes"]] == ["ws-0", "ws-1"]
+    assert [row["active_sessions"] for row in payload["lanes"]] == [2, 0]
+    # Still no secrets on the wire.
+    assert "tk_lane_alpha" not in body
+    assert "tk_lane_beta" not in body
+
+
+def test_tenki_connection_test_accepts_lane_keys_without_a_single_key(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Lane keys alone must be enough; the single key is only a fallback."""
+    from nanobot.agent.tools import tenki_backend as tenki_backend_module
+    from nanobot.agent.tools.tenki_backend import TenkiExecutionBackend
+
+    config_path = tmp_path / "config.json"
+    source = Path(__file__).parents[1] / "render-config.json"
+    config_path.write_text(source.read_text(), encoding="utf-8")
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.delenv("NANOBOT_TENKI_API_KEY", raising=False)
+    monkeypatch.delenv("NANOBOT_TENKI_API_KEYS", raising=False)
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+    monkeypatch.setattr(tenki_backend_module, "is_sdk_available", lambda: True)
+
+    async def fake_test_connection(self) -> dict[str, object]:
+        return {"ok": True, "backend": "tenki", "lane_index": 0, "lane_count": 1}
+
+    monkeypatch.setattr(TenkiExecutionBackend, "test_connection", fake_test_connection)
+
+    request = _request("/api/admin/execution-test")
+    request._nanobot_webui_mutation_payload = {
+        "backend": "tenki",
+        "tenkiApiKeys": "tk_lane_alpha",
+    }
+    response = admin_registry.admin_route(request, "/api/admin/execution-test")
+    assert response is not None
+    assert response.status_code == 200
+    assert json.loads(bytes(response.body).decode())["ok"] is True
+
+    # No key at all is still refused, with the message that says so.
+    empty = _request("/api/admin/execution-test")
+    empty._nanobot_webui_mutation_payload = {"backend": "tenki", "tenkiApiKeys": ""}
+    refused = admin_registry.admin_route(empty, "/api/admin/execution-test")
+    assert refused is not None
+    assert refused.status_code == 400

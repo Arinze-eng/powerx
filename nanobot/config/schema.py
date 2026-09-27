@@ -515,6 +515,15 @@ class TenkiExecutionConfig(Base):
     """
 
     api_key: str = Field(default="", repr=False)
+    # Ordered rotation lane keys. Each ``tk_`` key authenticates into its OWN
+    # Tenki workspace, and every workspace carries an independent quota —
+    # measured live at five active sessions — so extra keys are extra *capacity*,
+    # not just failover. New sessions are round-robined across the lanes; a
+    # session that already exists stays pinned to the workspace holding its
+    # disk, because Tenki names a session identically in every workspace and
+    # rotating a live one would silently create a fresh VM with none of the
+    # user's files. Empty means "one lane, from ``api_key`` above".
+    api_keys: list[str] = Field(default_factory=list, repr=False)
     api_url: str = "https://api.tenki.cloud"
     # A session's base disk comes from exactly one source: an operator snapshot
     # (exact baselined state) wins over a plain registry base image, and when

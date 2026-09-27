@@ -38,6 +38,7 @@ import hashlib
 import posixpath
 import re
 import shlex
+import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator
@@ -70,6 +71,82 @@ _MIN_MEMORY_MB = 128
 _MAX_MEMORY_MB = 524_288
 _MIN_DISK_GB = 5
 _MAX_DISK_GB = 100
+
+# How many API keys (lanes) may be configured. Each key authenticates into its
+# own Tenki workspace, and every workspace carries its own independent quota —
+# measured live at ``max_concurrent_jobs = 5`` active sessions — so lanes are a
+# capacity dial, not just a failover list.
+MAX_API_KEYS = 20
+
+# Failures that mean "this lane's key/workspace cannot serve us", as opposed to
+# "this particular request was bad". Only the former may rotate to another lane:
+# rotating away from a bad CPU/RAM pair or an invalid snapshot id would hide a
+# real configuration bug behind a working-looking retry.
+_LANE_FATAL_MARKERS = (
+    "exceed workspace limits",
+    "workspace limit",
+    "max_concurrent",
+    "too many active",
+    "no active workers",
+    "vm limit exceeded",
+    "quota",
+    "insufficient credit",
+    "out of credit",
+    "billing",
+    "suspended",
+    "unauthorized",
+    "unauthenticated",
+    "permission denied",
+    "forbidden",
+    "invalid api key",
+    "invalid token",
+    "authentication",
+    "api key",
+)
+
+
+def _is_lane_fatal(detail: str) -> bool:
+    """True when *detail* says the lane itself is unusable, not the request.
+
+    Deliberately conservative: an unrecognised failure is treated as fatal to
+    the *request* (it is re-raised as-is) rather than cycling every key, so a
+    genuine bug surfaces as itself instead of as "all lanes failed".
+    """
+    lowered = detail.lower()
+    return any(marker in lowered for marker in _LANE_FATAL_MARKERS)
+
+
+def _identity_workspace_id(identity: Any) -> str:
+    """The workspace a lane's key authenticates into, as a plain id string.
+
+    Read from ``who_am_i()``. This is the evidence that two keys are genuinely
+    two workspaces with two independent quotas rather than one workspace counted
+    twice, so it is worth the round trip.
+    """
+    direct = str(getattr(identity, "owner_id", "") or "")
+    if direct:
+        return direct
+    for entry in getattr(identity, "workspaces", None) or ():
+        candidate = str(getattr(entry, "id", "") or "")
+        if candidate:
+            return candidate
+    return ""
+
+
+def _usage_limit(usage: Any, key: str) -> dict[str, int] | None:
+    """Pull one ``WorkspaceUsageLimit`` out of ``get_usage()`` by its key."""
+    entries = usage if isinstance(usage, (list, tuple)) else [usage]
+    for entry in entries:
+        if str(getattr(entry, "key", "") or "") != key:
+            continue
+        values: dict[str, int] = {}
+        for field in ("current", "max"):
+            try:
+                values[field] = int(getattr(entry, field))
+            except (TypeError, ValueError):
+                continue
+        return values or None
+    return None
 
 # States from which a session can still be used. Anything else means the VM is
 # gone and must be recreated (Tenki has no resume-from-terminated path).
@@ -146,6 +223,79 @@ def validate_tenki_api_key(raw: str) -> str:
     if not value.startswith("tk_"):
         raise ValueError("Tenki API key must start with tk_")
     return value
+
+
+def parse_tenki_api_keys(raw: Any) -> list[str]:
+    """Split configured keys into ordered, de-duplicated lanes.
+
+    Accepts a list/tuple or a single string separated by commas, semicolons,
+    newlines or spaces, so an operator can paste keys into one deployment
+    variable in whatever shape is convenient. Order is preserved because lane
+    order is what the round-robin cursor walks; duplicates are dropped so a
+    repeated key cannot masquerade as extra capacity.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        parts = [str(item or "") for item in raw]
+    else:
+        parts = re.split(r"[,;\s]+", str(raw or ""))
+    keys: list[str] = []
+    for part in parts:
+        candidate = part.strip().strip("\"'").strip()
+        if candidate and candidate not in keys:
+            keys.append(candidate)
+    return keys
+
+
+def validate_tenki_api_keys(raw: Any) -> list[str]:
+    """Validate every lane key, preserving order and dropping duplicates."""
+    keys = parse_tenki_api_keys(raw)
+    if len(keys) > MAX_API_KEYS:
+        raise ValueError(f"Tenki supports at most {MAX_API_KEYS} API keys")
+    for key in keys:
+        validate_tenki_api_key(key)
+    return keys
+
+
+class TenkiRotationState:
+    """In-memory default for the round-robin cursor and parked lanes.
+
+    The sandbox tool injects a disk-backed implementation so rotation survives a
+    restart; this one exists so the backend is usable (and testable) on its own.
+    """
+
+    def __init__(self) -> None:
+        self._cursor = 0
+        self._parked: dict[int, float] = {}
+
+    def next_lane(self, count: int, *, skip: set[int] | None = None) -> int:
+        """Return the next lane to try for a NEW session, advancing the cursor.
+
+        Parked lanes are moved to the back rather than removed: when every lane
+        is parked the rotation still returns a full order, because a stale
+        cooldown must never become "no lane was tried at all".
+        """
+        if count <= 0:
+            return 0
+        skip = set(skip or set()) | set(self._parked)
+        start = self._cursor % count
+        self._cursor = (self._cursor + 1) % count
+        order = [(start + i) % count for i in range(count)]
+        healthy = [lane for lane in order if lane not in skip]
+        return (healthy + order)[0]
+
+    def park(self, lane: int, *, seconds: float = 900.0) -> None:
+        """Stop offering *lane* first for a while after it failed on us."""
+        self._parked[int(lane)] = time.monotonic() + float(seconds)
+
+    def parked(self) -> set[int]:
+        now = time.monotonic()
+        self._parked = {lane: until for lane, until in self._parked.items() if until > now}
+        return set(self._parked)
+
+    def clear(self) -> None:
+        self._parked.clear()
 
 
 def validate_tenki_api_url(raw: str) -> str:
@@ -288,10 +438,36 @@ def _looks_like_missing_file(detail: str) -> bool:
 class TenkiExecutionBackend:
     """Async client implementing the shared sandbox contract against Tenki."""
 
-    def __init__(self, config: Any, *, sandbox_name: str = "powerx-session") -> None:
+    def __init__(
+        self,
+        config: Any,
+        *,
+        sandbox_name: str = "powerx-session",
+        lane_index: int | None = None,
+        rotation: Any | None = None,
+        on_lane_pinned: Any | None = None,
+    ) -> None:
         self.config = config
         self.api_url = validate_tenki_api_url(str(getattr(config, "api_url", "") or ""))
-        self.api_key = validate_tenki_api_key(str(getattr(config, "api_key", "") or ""))
+        # Lane list. The plural setting wins; the legacy single key stays as a
+        # fallback so a config saved before rotation existed keeps working.
+        lanes = validate_tenki_api_keys(getattr(config, "api_keys", None) or "")
+        if not lanes:
+            legacy = validate_tenki_api_key(str(getattr(config, "api_key", "") or ""))
+            lanes = [legacy] if legacy else []
+        self.api_keys = lanes
+        # The first lane is the primary, so anything reading ``api_key`` sees the
+        # value it always did.
+        self.api_key = lanes[0] if lanes else ""
+        # Lane this backend works against. ``None`` means "not decided yet": a
+        # brand-new session is assigned one by round-robin, while an existing
+        # session is PINNED to the lane its disk actually lives in.
+        self.lane_index = lane_index if lane_index is None else int(lane_index)
+        self.rotation = rotation if rotation is not None else TenkiRotationState()
+        # Called with a lane number the moment a session is created or adopted,
+        # so the caller can persist it and pin the next backend instance to the
+        # workspace that actually holds that session's disk.
+        self.on_lane_pinned = on_lane_pinned
         self.image = validate_tenki_image(str(getattr(config, "image", "") or ""))
         self.snapshot_id = validate_tenki_snapshot_id(
             str(getattr(config, "snapshot_id", "") or "")
@@ -334,14 +510,94 @@ class TenkiExecutionBackend:
 
     # ------------------------------------------------------------- lifecycle
 
-    def _new_client(self) -> Any:
-        client_cls = _load_async_client()
-        if not self.api_key:
+    def _lane_count(self) -> int:
+        return len(self.api_keys)
+
+    def _new_client(self, lane: int | None = None) -> Any:
+        """Build a client for *lane* (default: this backend's lane).
+
+        Each lane is a different API key authenticating into a different Tenki
+        workspace, so a client is always bound to exactly one workspace.
+        """
+        if not self.api_keys:
             raise TenkiError("Tenki API key is not configured")
+        index = self.lane_index if lane is None else int(lane)
+        if index is None or not 0 <= index < len(self.api_keys):
+            index = 0
+        client_cls = _load_async_client()
         try:
-            return client_cls(auth_token=self.api_key, base_url=self.api_url)
+            return client_cls(auth_token=self.api_keys[index], base_url=self.api_url)
         except Exception as exc:  # noqa: BLE001 - SDK raises its own error types
             raise TenkiError(f"could not create the Tenki client: {_detail(exc)}") from None
+
+    # ------------------------------------------------------------ lane choice
+
+    def _pin(self, lane: int) -> None:
+        """Record the lane this session lives in, and tell the store about it.
+
+        A session's disk exists in exactly one workspace, so once a lane is
+        known every later operation must go there: rotating a live session would
+        look for its files in a workspace that has never seen them.
+        """
+        index = max(0, int(lane))
+        self.lane_index = index
+        if self.api_keys and index < len(self.api_keys):
+            self.api_key = self.api_keys[index]
+        notify = self.on_lane_pinned
+        if notify is not None:
+            with suppress(Exception):
+                notify(index)
+
+    def _pick_lane(self, skip: set[int] | None = None) -> int:
+        """Choose the lane for a brand-new session (round-robin, parked last)."""
+        count = self._lane_count()
+        if count <= 1:
+            return 0
+        return int(self.rotation.next_lane(count, skip=skip))
+
+    def _park_lane(self, lane: int, reason: str) -> None:
+        """Stop offering *lane* first for a while after it failed on us."""
+        with suppress(Exception):
+            self.rotation.park(int(lane))
+        logger.warning("Tenki lane {} parked after a lane-fatal failure: {}", lane, reason)
+
+    async def _lane_facts(self, lane: int) -> dict[str, Any]:
+        """Workspace identity and remaining session headroom for one lane.
+
+        Both calls are best effort: the admin Test button must still show the
+        lanes it could read rather than failing whole.
+        """
+        facts: dict[str, Any] = {}
+        client = self._new_client(lane)
+        try:
+            with suppress(Exception):
+                facts["workspace_id"] = _identity_workspace_id(await client.who_am_i())
+            with suppress(Exception):
+                limit = _usage_limit(await client.get_usage(), "max_concurrent_jobs")
+                if limit is not None:
+                    facts["active_sessions"] = limit.get("current")
+                    facts["session_limit"] = limit.get("max")
+            return facts
+        finally:
+            with suppress(Exception):
+                await client.close()
+
+    async def describe_lanes(self) -> list[dict[str, Any]]:
+        """One row per configured lane: which workspace, and how full it is.
+
+        This is the evidence that rotation spreads load over *distinct*
+        workspaces: a repeated key would report the same workspace id twice and
+        buy no extra capacity however many times it were listed.
+        """
+        rows: list[dict[str, Any]] = []
+        for lane in range(self._lane_count()):
+            row: dict[str, Any] = {"lane": lane}
+            try:
+                row.update(await self._lane_facts(lane))
+            except Exception as exc:  # noqa: BLE001 - one bad key must not hide the rest
+                row["error"] = _detail(exc)
+            rows.append(row)
+        return rows
 
     @staticmethod
     def _state(sandbox: Any) -> str:
@@ -388,28 +644,21 @@ class TenkiExecutionBackend:
                     return item
         return None
 
-    async def _attach_only(self, client: Any, session_id: str | None = None) -> Any | None:
-        """Resolve an ALREADY EXISTING session without ever creating one.
+    async def _resolve_in_lane(
+        self, client: Any, session_id: str | None = None
+    ) -> Any | None:
+        """Resolve an ALREADY EXISTING session inside ONE lane's workspace.
 
-        Task-end lifecycle hooks (keep-alive, reset) must never spin up a fresh
-        VM just to touch it, so they resolve rather than ensure.
+        Never creates. The client is bound to a single workspace, so a miss here
+        means the session is not in this lane — not that it needs making.
         """
         target = session_id or self.last_session_id
         if target:
-            with suppress(Exception):
-                sandbox = await client.get(target)
-                if sandbox is not None and self._usable(sandbox):
-                    return sandbox
-        return await self._find_session(client)
-
-    async def _ensure_session(self, client: Any) -> Any:
-        """Get or create this session's Tenki Sandbox."""
-        if self.last_session_id:
             sandbox: Any | None = None
             try:
-                sandbox = await client.get(self.last_session_id)
+                sandbox = await client.get(target)
             except Exception as exc:  # noqa: BLE001 - a stale id is expected
-                logger.debug("Tenki get({}) failed: {}", self.last_session_id, _detail(exc))
+                logger.debug("Tenki get({}) failed: {}", target, _detail(exc))
             if sandbox is not None and self._usable(sandbox):
                 await self._ready(sandbox, timeout=180)
                 self.last_session_id = str(sandbox.id)
@@ -417,25 +666,160 @@ class TenkiExecutionBackend:
             self.last_session_id = ""
 
         existing = await self._find_session(client)
-        if existing is not None:
-            try:
-                await self._ready(existing, timeout=180)
-                self.last_session_id = str(existing.id)
-                return existing
-            except TenkiError:
-                # A pre-existing VM that will not come up would fail every
-                # operation forever; terminate it so a fresh one is created
-                # instead of leaving the session wedged.
-                logger.warning(
-                    "reclaiming stuck Tenki session {} that did not become ready",
-                    getattr(existing, "id", self.sandbox_name),
-                )
-                with suppress(Exception):
-                    await existing.close()
+        if existing is None:
+            return None
+        try:
+            await self._ready(existing, timeout=180)
+        except TenkiError:
+            # A pre-existing VM that will not come up would fail every operation
+            # forever; terminate it so a fresh one is created instead of leaving
+            # the session wedged.
+            logger.warning(
+                "reclaiming stuck Tenki session {} that did not become ready",
+                getattr(existing, "id", self.sandbox_name),
+            )
+            with suppress(Exception):
+                await existing.close()
+            return None
+        self.last_session_id = str(existing.id)
+        return existing
 
-        sandbox = await self._create_session(client)
+    async def _attach_only(
+        self, session_id: str | None = None
+    ) -> tuple[Any | None, Any | None]:
+        """Resolve an ALREADY EXISTING session without ever creating one.
+
+        Task-end lifecycle hooks (keep-alive, reset) must never spin up a fresh
+        VM just to touch it, so they resolve rather than ensure. A pinned
+        backend looks only in its own lane; an unpinned one searches every lane
+        and pins whichever one holds the session, because the VM's disk exists
+        in exactly one workspace and adopting it elsewhere would silently lose
+        the files written earlier.
+
+        Returns ``(sandbox, client)``. The client that holds the session is
+        handed back STILL OPEN, because a sandbox handle is only usable while
+        the client that produced it is alive; the caller closes it when the
+        operation is over. Every client that found nothing is closed here.
+        """
+        if not self._lane_count():
+            return None, None
+        lanes = (
+            [self.lane_index]
+            if self.lane_index is not None
+            else list(range(self._lane_count()))
+        )
+        for lane in lanes:
+            client = self._new_client(int(lane))
+            found: Any | None = None
+            try:
+                found = await self._resolve_in_lane(client, session_id)
+            except Exception as exc:  # noqa: BLE001 - a dead lane is not fatal here
+                logger.debug("Tenki lane {} could not be searched: {}", lane, _detail(exc))
+                found = None
+            if found is not None:
+                self.last_session_id = str(found.id)
+                if self.lane_index is None:
+                    self._pin(int(lane))
+                return found, client
+            with suppress(Exception):
+                await client.close()
+        return None, None
+
+    async def _ensure_session(self) -> tuple[Any, Any]:
+        """Get or create this session's Tenki Sandbox, pinned or rotating.
+
+        Returns ``(sandbox, client)`` with the client LEFT OPEN: the sandbox
+        handle is only usable while the client that produced it is alive, so the
+        caller owns closing it once the operation has finished.
+
+        Pinned (``lane_index`` set): resolve inside that one workspace and, at
+        worst, recreate there. Rotation is never consulted — a recreated VM must
+        land back in the workspace that holds the session's disk.
+
+        Unpinned: adopt the session wherever it already lives, otherwise this is
+        a brand-new session and a lane is chosen round-robin.
+        """
+        sandbox, client = await self._attach_only()
+        if sandbox is not None and client is not None:
+            return sandbox, client
+        if self.lane_index is not None:
+            return await self._create_in_lane(self.lane_index)
+        return await self._create_with_rotation()
+
+    async def _create_in_lane(self, lane: int) -> tuple[Any, Any]:
+        """Create this session's VM in *lane*, its pinned workspace.
+
+        Returns the VM with its client still open, for the caller to close.
+        """
+        client = self._new_client(lane)
+        try:
+            sandbox = await self._create_session(client)
+        except TenkiError as exc:
+            with suppress(Exception):
+                await client.close()
+            detail = str(exc)
+            if _is_lane_fatal(detail):
+                raise TenkiError(
+                    f"Tenki lane {lane} cannot create this session's VM ({detail}). "
+                    "The session is pinned to that workspace because its files "
+                    "live there, so it will not be recreated elsewhere — free a "
+                    "session on that workspace, or reset the session to start a "
+                    "new one on another lane."
+                ) from None
+            raise
+        except BaseException:
+            with suppress(Exception):
+                await client.close()
+            raise
         self.last_session_id = str(sandbox.id)
-        return sandbox
+        self._pin(lane)
+        return sandbox, client
+
+    async def _create_with_rotation(self) -> tuple[Any, Any]:
+        """Create a brand-new session, round-robining lanes until one accepts it.
+
+        Every attempt runs on a fresh client built from that lane's own key, so
+        a failure in one workspace cannot poison the next. Only a lane-fatal
+        failure rotates: a bad CPU/RAM combination or a rejected snapshot id is
+        re-raised as itself, because cycling the keys would hide a real
+        configuration bug behind a retry that happens to be less picky.
+
+        Returns the VM with the winning lane's client still open.
+        """
+        count = self._lane_count()
+        if not count:
+            raise TenkiError("Tenki API key is not configured")
+        tried: set[int] = set()
+        skip: set[int] = set()
+        last = ""
+        for _ in range(count):
+            lane = self._pick_lane(skip)
+            if lane in tried:
+                break
+            tried.add(lane)
+            client = self._new_client(lane)
+            try:
+                sandbox = await self._create_session(client)
+            except TenkiError as exc:
+                with suppress(Exception):
+                    await client.close()
+                last = str(exc)
+                if not _is_lane_fatal(last):
+                    raise
+                self._park_lane(lane, last)
+                skip.add(lane)
+                continue
+            except BaseException:
+                with suppress(Exception):
+                    await client.close()
+                raise
+            self.last_session_id = str(sandbox.id)
+            self._pin(lane)
+            return sandbox, client
+        raise TenkiError(
+            f"no Tenki lane could accept a new session (tried {len(tried)} of "
+            f"{count}): {last}"
+        )
 
     async def _create_session(self, client: Any) -> Any:
         kwargs: dict[str, Any] = {
@@ -474,10 +858,17 @@ class TenkiExecutionBackend:
     @asynccontextmanager
     async def _session(self) -> AsyncIterator[Any]:
         """One operation = one SDK client, so the gRPC channel always matches
-        the running event loop and a wedged channel can never be reused."""
-        client = self._new_client()
+        the running event loop and a wedged channel can never be reused.
+
+        Which lane that client is built for is decided inside
+        ``_ensure_session``: a pinned session is resolved in its own workspace,
+        while a brand-new one rotates. That call hands back the OPEN client that
+        owns the session, and this is where it is closed — the sandbox stays
+        usable for exactly as long as its channel is.
+        """
+        sandbox, client = await self._ensure_session()
         try:
-            yield await self._ensure_session(client)
+            yield sandbox
         finally:
             with suppress(Exception):
                 await client.close()
@@ -486,7 +877,7 @@ class TenkiExecutionBackend:
         """Return live session facts (used by the admin Test button and tests)."""
         async with self._session() as sandbox:
             info = getattr(sandbox, "info", None)
-            return {
+            facts: dict[str, Any] = {
                 "session_id": str(sandbox.id),
                 "name": str(getattr(info, "name", "") or ""),
                 "state": self._state(sandbox),
@@ -495,7 +886,15 @@ class TenkiExecutionBackend:
                 "disk_size_gb": getattr(info, "disk_size_gb", None),
                 "timeout_at": getattr(info, "timeout_at", None),
                 "workspace": self.workspace,
+                # Which lane this session actually lives in. With one key it is
+                # always 0; with several it is the one round-robin assigned.
+                "lane_index": self.lane_index,
+                "lane_count": self._lane_count(),
             }
+        lane = self.lane_index if self.lane_index is not None else 0
+        with suppress(Exception):
+            facts.update(await self._lane_facts(lane))
+        return facts
 
     async def keep_alive(self, session_id: str | None = None) -> None:
         """Push the session deadline out by one full TTL window.
@@ -504,11 +903,10 @@ class TenkiExecutionBackend:
         spinning up a fresh session would be pure waste. A missing or already
         dead session is a silent no-op.
         """
-        client = self._new_client()
+        sandbox, client = await self._attach_only(session_id)
+        if sandbox is None or client is None:
+            return
         try:
-            sandbox = await self._attach_only(client, session_id)
-            if sandbox is None:
-                return
             await sandbox.extend(self.max_duration_seconds)
             self.last_session_id = str(sandbox.id)
         finally:
@@ -710,7 +1108,7 @@ class TenkiExecutionBackend:
             timeout_at = getattr(info, "timeout_at", None)
             session_id = str(sandbox.id)
             state = self._state(sandbox)
-        return {
+        payload: dict[str, Any] = {
             "ok": int(getattr(result, "exit_code", 0) or 0) == 0,
             "backend": "tenki",
             "session_id": session_id,
@@ -721,16 +1119,23 @@ class TenkiExecutionBackend:
             # ``SandboxInfo`` exposes the deadline, not the configured TTL, so the
             # landing TTL is verified through ``timeout_at``.
             "timeout_at": timeout_at.isoformat() if hasattr(timeout_at, "isoformat") else str(timeout_at or ""),
+            "lane_index": self.lane_index,
+            "lane_count": self._lane_count(),
         }
+        # Which workspace served this test and how much session headroom its
+        # quota has left — the numbers that show rotation is buying capacity.
+        lane = self.lane_index if self.lane_index is not None else 0
+        with suppress(Exception):
+            payload.update(await self._lane_facts(lane))
+        return payload
 
     async def reset(self, session_id: str | None = None) -> None:
         """Terminate the session permanently (explicit wipe / persistence opt-out).
 
         Only an existing VM is terminated — reset must never create one.
         """
-        client = self._new_client()
+        sandbox, client = await self._attach_only(session_id)
         try:
-            sandbox = await self._attach_only(client, session_id)
             if sandbox is not None:
                 with suppress(Exception):
                     await sandbox.close()
@@ -759,7 +1164,11 @@ __all__ = [
     "TenkiFileNotFoundError",
     "is_sdk_available",
     "tenki_sandbox_name",
+    "MAX_API_KEYS",
+    "TenkiRotationState",
+    "parse_tenki_api_keys",
     "validate_tenki_api_key",
+    "validate_tenki_api_keys",
     "validate_tenki_api_url",
     "validate_tenki_cpu_cores",
     "validate_tenki_disk_size_gb",

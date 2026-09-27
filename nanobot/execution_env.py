@@ -196,6 +196,19 @@ def apply_render_execution_env(config: Any) -> Any:
     # admin-saved key/endpoint wins, env restores what is missing.
     if tenki is not None:
         _fill(tenki, "api_key", _env("NANOBOT_TENKI_API_KEY") or _env("TENKI_API_KEY"))
+        # Rotation lanes. The plural variable wins over the single key above:
+        # several keys mean several workspaces, each with its own session quota,
+        # which is the whole point of rotating. Malformed values are ignored
+        # like every other optional setting here, leaving the saved config in
+        # place rather than failing the load.
+        lane_keys = _env("NANOBOT_TENKI_API_KEYS")
+        if lane_keys and not list(getattr(tenki, "api_keys", None) or []):
+            from nanobot.agent.tools.tenki_backend import validate_tenki_api_keys
+
+            try:
+                tenki.api_keys = validate_tenki_api_keys(lane_keys)
+            except ValueError:
+                pass
         _fill(tenki, "api_url", _env("NANOBOT_TENKI_API_URL"))
         _fill(tenki, "snapshot_id", _env("NANOBOT_TENKI_SNAPSHOT_ID"))
         _fill(tenki, "image", _env("NANOBOT_TENKI_IMAGE"))

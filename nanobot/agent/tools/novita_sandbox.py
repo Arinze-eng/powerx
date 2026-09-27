@@ -8,6 +8,7 @@ import posixpath
 import re
 import shlex
 import threading
+import time
 from contextlib import suppress
 from datetime import timedelta
 from pathlib import Path
@@ -619,7 +620,30 @@ _VERCEL_STORE = _VercelSandboxStore()
 
 
 class _TenkiSessionStore(_SandboxStore):
-    """Disk-indexed session → Tenki session id map (no in-process handles needed)."""
+    """Session → Tenki session id map on disk, plus the key-rotation state.
+
+    The lane each session lives in is stored beside its session id because the
+    two must agree: rotating is only safe for a session whose workspace is
+    known, and a session whose lane was forgotten would be looked for in a
+    workspace that has never seen its files. The round-robin cursor and any
+    parked lanes live here too, so a restart resumes the same order instead of
+    stampeding one workspace again.
+
+    This class is also the rotation implementation the backend is handed: it
+    satisfies the same ``next_lane`` / ``park`` / ``parked`` / ``clear``
+    interface as ``TenkiRotationState`` (the in-memory default), with absolute
+    epoch deadlines instead of monotonic offsets because the process that reads
+    the state back is not the one that wrote it.
+
+    The file is written in one shape (``sessions`` / ``lanes`` / ``cursor`` /
+    ``parked``) and read back in either that shape or the older flat
+    session → id map, so an existing deployment upgrades on first write.
+    """
+
+    #: Cooldown for a lane that failed in a way saying "this workspace cannot
+    #: serve us" — quota exhausted, key rejected. Short enough that a workspace
+    #: which frees up is retried soon; long enough to stop hammering it.
+    PARK_SECONDS = 900.0
 
     def __init__(self) -> None:
         super().__init__()
@@ -627,24 +651,122 @@ class _TenkiSessionStore(_SandboxStore):
         base = Path(path).expanduser() if path else Path.home() / ".nanobot"
         # Point the inherited persistence at a dedicated index file.
         self._index_path = base / "tenki_sessions.json"
+        self._lanes: dict[str, int] = {}
+        self._cursor = 0
+        self._parked: dict[int, float] = {}
         try:
             raw = json.loads(self._index_path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                self._ids = {str(k): str(v) for k, v in raw.items() if v}
         except (OSError, ValueError):
-            pass
+            raw = None
+        if isinstance(raw, dict):
+            if "sessions" in raw or "lanes" in raw or "cursor" in raw:
+                sessions = raw.get("sessions") or {}
+                if isinstance(sessions, dict):
+                    self._ids = {str(k): str(v) for k, v in sessions.items() if v}
+                lanes = raw.get("lanes") or {}
+                if isinstance(lanes, dict):
+                    for session_key, lane in lanes.items():
+                        try:
+                            self._lanes[str(session_key)] = int(lane)
+                        except (TypeError, ValueError):
+                            continue
+                try:
+                    self._cursor = int(raw.get("cursor") or 0)
+                except (TypeError, ValueError):
+                    self._cursor = 0
+                parked = raw.get("parked") or {}
+                if isinstance(parked, dict):
+                    for lane, until in parked.items():
+                        try:
+                            self._parked[int(lane)] = float(until)
+                        except (TypeError, ValueError):
+                            continue
+            else:
+                # Legacy format: the file WAS the flat session → id map. Keep the
+                # sessions and rebuild under the new schema on the next write.
+                self._ids = {str(k): str(v) for k, v in raw.items() if v}
+
+    def _save(self) -> None:
+        """Write the whole state atomically. The caller holds ``self._lock``."""
+        try:
+            self._index_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._index_path.with_suffix(".tmp")
+            payload = {
+                "sessions": self._ids,
+                "lanes": dict(self._lanes),
+                "cursor": self._cursor,
+                "parked": {str(lane): until for lane, until in self._parked.items()},
+            }
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.replace(self._index_path)
+        except OSError:
+            logger.warning("Could not persist Tenki session index")
 
     def set_id(self, key: str, session_id: str) -> None:
         """Persist a session → Tenki session id mapping without a live handle."""
         with self._lock:
             self._ids[key] = str(session_id)
-            try:
-                self._index_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = self._index_path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(self._ids, indent=2), encoding="utf-8")
-                tmp.replace(self._index_path)
-            except OSError:
-                logger.warning("Could not persist Tenki session index")
+            self._save()
+
+    # ------------------------------------------------- key rotation (lanes)
+
+    def lane(self, key: str) -> int | None:
+        """The lane a session's VM lives in, or ``None`` when it has none yet."""
+        with self._lock:
+            lane = self._lanes.get(key)
+        return lane if isinstance(lane, int) and lane >= 0 else None
+
+    def set_lane(self, key: str, lane: int) -> None:
+        """Pin a session to the lane its workspace was created in."""
+        with self._lock:
+            self._lanes[key] = int(lane)
+            self._save()
+
+    def forget(self, key: str) -> None:
+        """Drop a session's lane pin so its next session picks a fresh one."""
+        with self._lock:
+            self._lanes.pop(key, None)
+            self._save()
+
+    def _expire_parked(self) -> None:
+        now = time.time()
+        self._parked = {lane: until for lane, until in self._parked.items() if until > now}
+
+    def next_lane(self, count: int, *, skip: set[int] | None = None) -> int:
+        """Round-robin the next lane for a NEW session, parked lanes last.
+
+        Mirrors ``TenkiRotationState.next_lane`` deliberately: when every lane
+        is parked a full order is still returned, because a stale cooldown must
+        never become "no lane was tried at all".
+        """
+        with self._lock:
+            self._expire_parked()
+            if count <= 1:
+                return 0
+            blocked = set(skip or set()) | set(self._parked)
+            start = self._cursor % count
+            self._cursor = (self._cursor + 1) % count
+            order = [(start + i) % count for i in range(count)]
+            healthy = [lane for lane in order if lane not in blocked]
+            lane = (healthy + order)[0]
+            self._save()
+            return lane
+
+    def park(self, lane: int, *, seconds: float = PARK_SECONDS) -> None:
+        """Stop offering *lane* first for a while after it failed on us."""
+        with self._lock:
+            self._parked[int(lane)] = time.time() + float(seconds)
+            self._save()
+
+    def parked(self) -> set[int]:
+        with self._lock:
+            self._expire_parked()
+            return set(self._parked)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._parked.clear()
+            self._save()
 
 
 _TENKI_STORE = _TenkiSessionStore()
@@ -2305,7 +2427,20 @@ class NovitaSandboxTool(Tool):
         return backend
 
     def _tenki_backend(self, config: Any, key: str) -> TenkiExecutionBackend:
-        backend = TenkiExecutionBackend(config, sandbox_name=tenki_sandbox_name(key))
+        backend = TenkiExecutionBackend(
+            config,
+            sandbox_name=tenki_sandbox_name(key),
+            # The lane this session's disk lives in, recorded when its VM was
+            # first created. Seeding it PINS every later operation to that
+            # workspace: Tenki gives a session the same name in every workspace,
+            # so rotating a live session would look for its files somewhere they
+            # have never been and silently build a fresh, empty VM instead.
+            lane_index=_TENKI_STORE.lane(key),
+            # A brand-new session has no lane yet, so the round-robin picks one
+            # from the persisted cursor (and records the choice back).
+            rotation=_TENKI_STORE,
+            on_lane_pinned=lambda lane, _key=key: _TENKI_STORE.set_lane(_key, lane),
+        )
         # Seed the persisted session id (if any) so the backend reattaches to
         # that exact VM instead of re-resolving it by name on each operation.
         stored_id = _TENKI_STORE.sandbox_id(key)
