@@ -64,6 +64,15 @@ dependencies = [
     # in built images and the memory/Dream/git-store suites all errored.
     "dulwich>=0.21.0,<1.0.0",
     "novita-sandbox>=2.1.0,<3.0.0",
+    # Tenki is a selectable execution backend. Its control plane is raw gRPC, so the
+    # backend drives the vendor's own Python SDK (import name ``tenki_sandbox``)
+    # rather than re-implementing the protobuf framing. The import is lazy, which
+    # keeps the tool module importable without it -- and which also means an image
+    # missing it fails at runtime, in the admin panel and in the sandbox tool, with
+    # "The Tenki SDK is not installed". Declared as a core dependency rather than an
+    # extra because the Render image builds without NANOBOT_EXTRAS and would
+    # otherwise ship without it.
+    "tenki>=1.3.0,<2.0.0",
     # pydoll drives Chromium over CDP for the human_browser tool. The agent image
     # ships no browser, so that tool attaches to an existing Chrome rather than
     # launching one.
