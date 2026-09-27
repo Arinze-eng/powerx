@@ -30,6 +30,7 @@ import importlib.util
 import io
 import json
 import tarfile
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -41,6 +42,7 @@ from PIL import Image, ImageDraw
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.forensics_sandbox import (
     _PROVISION_CHUNK,
+    _PROVISION_OUT,
     _PROVISION_TAR,
     _ROOT_PRELUDE,
     _WRITE_CHUNK,
@@ -49,6 +51,7 @@ from nanobot.agent.tools.forensics_sandbox import (
     _build_transfer,
     _payload_sources,
     _parse_payload,
+    _provision_payload,
     bootstrap_command,
     sandbox_tool,
 )
@@ -154,11 +157,15 @@ class _ScriptedSandbox:
         *,
         analyse: str | None = None,
         provision: str | None = None,
+        payload: str | None = None,
         read: str | None = None,
         fail_on_run: Exception | None = None,
     ) -> None:
         self.analyse = analyse
         self.provision = _PROVISION_OK if provision is None else provision
+        # Stale by default: that is the state of a real box on first use, and it is
+        # the branch that exercises the payload upload.
+        self.payload = _PAYLOAD_STALE if payload is None else payload
         self.read = read
         self.fail_on_run = fail_on_run
         self.calls: list[dict[str, Any]] = []
@@ -181,6 +188,10 @@ class _ScriptedSandbox:
         if "wc -c" in command:
             size = len(self.read or "")
             return f"{size} 0000000000000000000000000000000000000000\n[exit_code=0]"
+        # The payload probe is answered before anything is uploaded, so it has to be
+        # matched ahead of the dependency probe: both commands test for numpy.
+        if "FORENSICS_PAYLOAD_STALE" in command or "FORENSICS_PAYLOAD_READY" in command:
+            return self.payload
         if "import numpy, PIL" in command:
             return self.provision
         return "[exit_code=0]"
@@ -262,49 +273,90 @@ def test_resolver_finds_the_configured_sandbox():
 
 
 # --------------------------------------------------------------------------- #
-# the bootstrap: pinned, version-checked, branch URL only as a fallback
+# ---- the bootstrap: shipped by the host, digest-checked, no egress ----
 # --------------------------------------------------------------------------- #
-def test_bootstrap_pins_a_commit_before_the_cached_branch_url():
+def test_provisioning_needs_no_network_egress_from_the_sandbox():
+    """The regression this whole module exists to stop.
+
+    Provisioning used to resolve ``main`` through ``api.github.com`` and curl every
+    file from ``raw.githubusercontent.com``. Any sandbox or VPS without GitHub
+    egress failed that fetch, the ``|| true`` hid it, and the analysis died on an
+    ImportError — which reached the user as "media forensics never reaches the
+    sandbox", on every backend at once. Nothing in the bootstrap may touch a
+    network today: the payload is shipped by the host.
+    """
     command = bootstrap_command()
-    pinned = 'https://raw.githubusercontent.com/Arinze-eng/powerx/$_sha/scripts'
-    assert pinned in command
-    # The branch URL is cache-prone (measured: cached by path, so a fix on main can
-    # keep producing the old failure live). It may only be the fallback.
-    assert command.index(pinned) < command.index(_RAW_BASE)
+    for forbidden in ("curl", "wget", "github", "http://", "https://", "api."):
+        assert forbidden not in command, f"the bootstrap is back to fetching over {forbidden}"
 
 
-def test_bootstrap_verifies_the_version_marker_before_running_anything():
+def test_bootstrap_verifies_the_payload_digest_before_unpacking_anything():
+    """A corrupt or half-written payload must be refused, not executed.
+
+    The chunks arrive as base64 text over ``write`` and are decoded in the box; a
+    transfer that lost a chunk would otherwise unpack into a package with a missing
+    module and fail later with a confusing traceback.
+    """
     command = bootstrap_command()
-    assert FORENSICS_VERSION in command
-    # A fetch only counts as successful if the fetched runner carries our version,
-    # so a stale cached copy is refused rather than executed.
-    assert 'grep -q "FORENSICS_VERSION' in command
+    assert "sha256sum -c -" in command
+    assert FORENSICS_VERSION in command  # the _READY marker is keyed to the version
+    # Every failure mode is named on stderr, so a provision that does not land can
+    # be reported as a cause rather than as an empty result.
+    for marker in ("FORENSICS_PAYLOAD_MISSING", "FORENSICS_PAYLOAD_CHECKSUM_FAILED",
+                   "FORENSICS_PAYLOAD_UNPACK_FAILED"):
+        assert marker in command
 
 
-def test_bootstrap_fetches_the_runner_and_the_package_it_imports():
-    command = bootstrap_command()
-    assert "$_base/forensics_sandbox_runner.py" in command
-    assert "$_src/nanobot/forensics/$_f.py" in command
-    loop = command[command.index("for _f in") : command.index("for _f in") + 120]
-    for name in ("__init__", "tamper", "benchmark", "document_forensics", "image_forensics", "verdict"):
-        assert name in loop
-    # The package is fetched from the SAME revision as the runner: a runner and its
-    # imports from two different commits is the one mismatch that cannot be tested
-    # for at runtime.
-    assert 'dirname "$_base"' in command
+def test_payload_ships_the_runner_and_the_package_it_imports():
+    """The archive must contain exactly what the runner imports, at the right paths.
+
+    Measured failure: the runner is committed as ``forensics_sandbox_runner.py`` but
+    the relay INVOKES ``bin/forensics_runner.py``. Archiving the source filename
+    unpacked cleanly to a path nothing executed, so the analysis still died on a
+    missing file — which is why the arcnames, not just the names, are asserted here.
+    """
+    arcnames = [name for name, path in _payload_sources()]
+    assert "bin/forensics_runner.py" in arcnames
+    for name in ("__init__", "tamper", "document_forensics", "image_forensics", "verdict"):
+        assert f"nanobot/forensics/{name}.py" in arcnames
+    # Nothing in the analysis path imports the calibration harness, and it is the
+    # largest file in the package; shipping it would cost a whole extra upload
+    # round trip per analysis for no benefit.
+    assert not any("benchmark" in name for name in arcnames)
+    for _name, path in _payload_sources():
+        assert path.is_file(), f"{path} is in the payload but not on disk"
+
+
+def test_payload_decodes_to_a_name_outside_its_own_glob():
+    """A self-consuming ``cat``: measured, and it corrupts the archive.
+
+    The decode used to write ``provision.tar.bin`` while reading ``provision.tar.*``
+    — and that glob matches the output file, so ``cat`` consumed the archive it was
+    still writing. The result failed its own checksum on every box.
+    """
+    assert not _PROVISION_OUT.startswith(_PROVISION_CHUNK)
+    assert not _PROVISION_OUT.startswith(f"{_PROVISION_TAR}.")
+    # The decoded tar must not match the chunk glob either.
+    assert not Path(_PROVISION_TAR).name.startswith(Path(_PROVISION_CHUNK).name)
+
+
+def test_payload_is_built_once_and_is_a_real_tar():
+    b64, digest, raw = _provision_payload()
+    assert _provision_payload()[:2] == (b64, digest)  # cached, not rebuilt
+    import base64 as _b64mod
+
+    tar = tarfile.open(fileobj=io.BytesIO(_b64mod.b64decode(b64)))
+    assert sorted(tar.getnames()) == sorted(name for name, _ in _payload_sources())
+    assert hashlib.sha256(_b64mod.b64decode(b64)).hexdigest() == digest
+    assert raw == len(_b64mod.b64decode(b64))
 
 
 def test_runner_is_a_real_committed_script():
-    assert RUNNER.is_file(), "the bootstrap curls this path; it must exist on main"
+    assert RUNNER.is_file(), "the host ships this file into the sandbox; it must exist"
 
 
 def test_the_version_marker_matches_between_the_tool_and_the_runner():
     assert _load_runner().FORENSICS_VERSION == FORENSICS_VERSION
-
-
-def test_bootstrap_failure_is_loud_and_names_the_override():
-    command = bootstrap_command()
-    assert "WARNING" in command and "FORENSICS_SCRIPT_RAW_BASE" in command
 
 
 # --------------------------------------------------------------------------- #
@@ -742,7 +794,12 @@ def test_the_shell_prelude_finds_a_root_that_no_candidate_lists(tmp_path: Path):
     """
     from nanobot.agent.tools.forensics_sandbox import _ROOT_MARKER_ENV
 
-    marker = ".forensics_root_under_test"
+    # Unique per invocation. The prelude's fallback searches /tmp (one of the
+    # declared root parents), and pytest retains the last few tmp_path trees, so a
+    # fixed marker name here is matched by a PREVIOUS run's leftover directory
+    # before it is matched by this one — the assertion then fails by reporting an
+    # older, equally valid root. Randomising the name makes the test hermetic.
+    marker = f".forensics_root_under_test_{uuid.uuid4().hex}"
     root = tmp_path / "srv" / "powerx-workspace"
     root.mkdir(parents=True)
     (root / marker).write_text("forensics\n")
@@ -788,7 +845,7 @@ def test_the_breadcrumb_name_is_the_one_the_shell_is_told(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_every_call_refreshes_the_scripts_so_a_fix_ships_without_a_rebuild(workspace: Path):
+async def test_every_call_carries_the_payload_unpack_so_a_fix_ships_without_a_rebuild(workspace: Path):
     target = _jpeg(workspace / "receipt.jpg")
     sandbox = _ScriptedSandbox(analyse=_runner_payload([target]))
     tool = MediaForensicsTool.create(_ctx({"novita_sandbox": sandbox}))
@@ -797,8 +854,8 @@ async def test_every_call_refreshes_the_scripts_so_a_fix_ships_without_a_rebuild
     # After the root prelude, and only after it: the bootstrap installs by relative
     # path, so it would install into the wrong directory without the ``cd`` first.
     assert analysis.startswith(_ROOT_PRELUDE)
-    assert 'export PYTHONPATH="$PWD/.forensics"' in analysis[len(_ROOT_PRELUDE) :]
-    assert "forensics_sandbox_runner.py" in analysis.split("request.json")[0]
+    assert 'mkdir -p "$_fx_home/bin"' in analysis[len(_ROOT_PRELUDE) :]
+    assert "bin/forensics_runner.py" in analysis.split("request.json")[0]
 
 
 @pytest.mark.asyncio

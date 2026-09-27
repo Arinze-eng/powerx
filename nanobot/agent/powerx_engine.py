@@ -11,8 +11,25 @@ import time
 from typing import Any
 from loguru import logger
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://mitrbmjxriqvfacaefvg.supabase.co")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1pdHJibWp4cmlxdmZhY2FlZnZnIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4ODAxNjU5NCwiZXhwIjoyMTAzNTkyNTk0fQ.FPNfQFK_097lJvXLI717sWxyjVV2Gt_wARxG1K0Mkx4")
+#: Connection settings come from the environment ONLY.
+#:
+#: A service-role key used to be the fallback default here, which meant it was
+#: committed to a public repository: anyone who could read the repo could read this
+#: line, and a service-role key bypasses row-level security entirely. There is no
+#: default now, and none should ever be added back — a deployment that has not set
+#: this variable must fail loudly at the call site rather than quietly authenticate
+#: with a credential that is printed in a source file.
+#:
+#: If this key is still live, ROTATE IT in the Supabase dashboard: it has been in
+#: this repository's git history, and rewriting history does not un-leak a secret
+#: that has already been fetched.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+
+
+def supabase_configured() -> bool:
+    """True when both Supabase settings came from the environment."""
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
 class PowerXEngine:
     """Core capabilities manager for Manus-style agent features."""

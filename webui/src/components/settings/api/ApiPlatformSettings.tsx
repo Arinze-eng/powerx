@@ -56,8 +56,15 @@ export function ApiPlatformSettings() {
   const [freshKey, setFreshKey] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
   const [copyFailed, setCopyFailed] = useState<string | null>(null);
+  /**
+   * Whether the clipboard write fired by itself when the key landed. Drives the
+   * "Copied" label so the button agrees with what already happened rather than
+   * inviting a second, redundant tap.
+   */
+  const [autoCopied, setAutoCopied] = useState<boolean | null>(null);
   const [confirmRevoke, setConfirmRevoke] = useState(false);
   const freshKeyRef = useRef<HTMLElement | null>(null);
+  const freshPanelRef = useRef<HTMLDivElement | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -99,6 +106,46 @@ export function ApiPlatformSettings() {
    * permission — would cost the user the key for good, with the button looking
    * like it worked. A failure now selects the key and asks for a manual copy.
    */
+  /**
+   * Bring the one-time key to the user, and try to put it on the clipboard.
+   *
+   * Two separate problems, both seen on phones:
+   *
+   * 1. The panel renders ABOVE the key list, so after tapping Generate the key
+   *    appears off-screen and the user never sees it. The key is shown exactly
+   *    once and only its hash is stored, so missing it is permanent — the only
+   *    recovery is revoking and generating again.
+   * 2. Requiring a second tap on Copy is one tap too many, and the browser will
+   *    not let us copy from an effect anyway (the user activation has been spent
+   *    by the time the response arrives). So the attempt is made, and when it is
+   *    refused the panel says so and selects the text instead — never a silent
+   *    no-op that looks like it worked.
+   */
+  useEffect(() => {
+    if (!freshKey) return;
+    freshPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    let cancelled = false;
+    void (async () => {
+      const ok = await copyTextToClipboard(freshKey);
+      if (cancelled) return;
+      setAutoCopied(ok);
+      if (!ok) {
+        try {
+          freshKeyRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+        } catch {
+          // Older engines reject the options form; the panel is on screen anyway.
+        }
+        selectFreshKey();
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // selectFreshKey is stable; depending on freshKey only is the point: this runs
+    // once per generated key, not once per render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [freshKey]);
+
   const copy = useCallback(
     async (label: string, value: string) => {
       if (!value) return;
@@ -126,6 +173,7 @@ export function ApiPlatformSettings() {
       });
       setPayload(next);
       setFreshKey(next.created?.key ?? null);
+      setAutoCopied(null);
       setKeyName("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -192,7 +240,11 @@ export function ApiPlatformSettings() {
       ) : null}
 
       {freshKey ? (
-        <div className="rounded-panel border border-emerald-500/30 bg-emerald-500/5 p-4">
+        <div
+          ref={freshPanelRef}
+          data-testid="api-platform-fresh-panel"
+          className="rounded-panel border border-emerald-500/30 bg-emerald-500/5 p-4"
+        >
           <div className="flex items-start gap-2">
             <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-300" aria-hidden />
             <div className="min-w-0 flex-1">
@@ -227,16 +279,27 @@ export function ApiPlatformSettings() {
                   aria-label={tx("settings.apiPlatform.copyKey", "Copy key")}
                   onClick={() => void copy("fresh", freshKey)}
                 >
-                  {copied === "fresh" ? (
+                  {copied === "fresh" || autoCopied === true ? (
                     <Check className="h-3.5 w-3.5" aria-hidden />
                   ) : (
                     <Copy className="h-3.5 w-3.5" aria-hidden />
                   )}
-                  {copied === "fresh"
+                  {copied === "fresh" || autoCopied === true
                     ? tx("settings.apiPlatform.copied", "Copied")
                     : tx("settings.apiPlatform.copy", "Copy")}
                 </Button>
               </div>
+              {autoCopied === true ? (
+                <p
+                  data-testid="api-platform-auto-copied"
+                  className="mt-2 text-[12px] leading-5 text-emerald-700 dark:text-emerald-300"
+                >
+                  {tx(
+                    "settings.apiPlatform.autoCopied",
+                    "Copied to your clipboard automatically. Store it now — it will not be shown again.",
+                  )}
+                </p>
+              ) : null}
               {copyFailed === "fresh" ? (
                 <p
                   data-testid="api-platform-copy-hint"
