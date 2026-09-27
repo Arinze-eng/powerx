@@ -342,9 +342,25 @@ after that point is a wine invocation.
 
 ## What to set on the deployment
 
+Two places hold this number and only one of them is authoritative.
+
 ```
 NANOBOT_TENKI_DISK_SIZE_GB=20     # was 5; Tenki's floor is 5 and 5 is not enough
 ```
+
+The **persisted** `~/.nanobot/config.json` — the admin panel's Execution → Tenki
+disk field — wins over the environment. `apply_render_execution_env` is
+credential-only by design and fills blanks, so its guards only assign while the
+saved value is absent or zero; a deployment that has already saved a disk size
+ignores the env var for the rest of that config's life. Measured live
+2026-09-27: the runtime env read `NANOBOT_TENKI_DISK_SIZE_GB=20` while
+`GET /api/admin/execution-settings` reported `disk_size_gb: 5`
+(`backendSource: admin`), and every `px-websocket-*` session was created at 5 GB
+with ~1.5 GB free. Raising the env var alone therefore changed nothing: the value
+that sizes a session is the saved one, and on this deployment it was still 5.
+The same shadowing applies to the rotation lanes — the env lists six keys, the
+saved config holds two, and a live `Test connection` reports `lane_count: 2` —
+so the setting has to be written where it is read, not only to the env.
 
 Setting it is only half the fix. A sandbox is sized at **create** time and Tenki
 cannot grow one afterwards: `AsyncSandbox.update` carries name/tags/sticky/TTL and
@@ -352,16 +368,21 @@ nothing else, only *volumes* can be resized, and the SDK's own out-of-space advi
 is "recreate the sandbox with a larger disk_size_gb". So every `px-websocket-*`
 box born while the setting was 5 GB keeps 5 GB for its whole life, and the
 preflight above rejects it on every install, forever — which is why raising the
-env alone changed nothing for the sessions that already existed.
+setting alone changed nothing for the sessions that already existed.
 
 `TenkiExecutionBackend._ensure_session` now compares the session it resolved
 against the configured size and, when the session's disk is **smaller**,
 terminates it and builds the replacement at the new size. Measured live
-2026-09-27: a session seeded at 5 GB came back at 20 GB on the next operation,
-the installer then finished in it in **+3m34s** with `{"ok": true, "stage":
-"done"}`, `terminal64.exe` present, `bridge 5.0.6231` importing inside the prefix
-and **12.4 GB still free**. Nothing has to be deleted by hand: a raised setting
-reaches existing sessions on their next use.
+2026-09-27 in the deployed container, with the saved size raised to 20 GB: the
+`powerx-connection-test` session went from `disk_size_gb: 5` (`total_mb: 4955`,
+`free_mb: 2087`) to `disk_size_gb: 20` (`total_mb: 20067`, `free_mb: 16566`)
+under the *same* session name — a different session id, so it was rebuilt rather
+than resized. Earlier, in the same code path, a session seeded at 5 GB came back
+at 20 GB on the next operation and the installer then finished in it in
+**+3m34s** with `{"ok": true, "stage": "done"}`, `terminal64.exe` present,
+`bridge 5.0.6231` importing inside the prefix and **12.4 GB still free**. Nothing
+has to be deleted by hand: a raised setting reaches existing sessions on their
+next use.
 
 Two boundaries keep the rebuild from firing on a working box: an unknown size on
 either side (0 means "provider default") is never read as too small, and
