@@ -27,6 +27,7 @@ from agent.runner_helpers import make_run_spec
 from nanobot.agent.runner import AgentRunner
 from nanobot.agent.shape_router import (
     prefer_library_workflow,
+    prefer_project_workflow,
     steer_message_for,
     classify_task_shape,
     plan_preference_message,
@@ -57,10 +58,60 @@ class TestClassifyMultiStep:
             "read the csv, clean the rows and then write a summary report",
             "scan all python files for bugs",
             "loop over the rows and normalise the dates",
+            # Phase 6: nouns and markers that used to fall through, so these
+            # asks were walked one call per item.
+            "batch 100 questions at once",
+            "answer these 250 prompts",
+            "build all the frontend pages for the quiz",
+            "fix every failing endpoint",
+            "add a test for each of the routes",
+            "generate the 40 pages in one go",
+            "process all 120 rows at once",
         ],
     )
     def test_multi_step_shapes(self, text: str) -> None:
         assert classify_task_shape(text) == "multi_step", text
+
+
+class TestClassifyProjectWork:
+    """Whole-project asks steer by milestone, not by page/route/test."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "build a full stack quiz app with frontend, backend and tests",
+            "build all the frontend pages and hook up the api",
+            "create a dashboard with auth and a database schema",
+            "implement the backend api endpoints and the admin screens",
+        ],
+    )
+    def test_project_shapes_are_multi_step(self, text: str) -> None:
+        assert classify_task_shape(text) == "multi_step", text
+        assert prefer_project_workflow(text), text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "build me a landing page",
+            "create a website",
+            "what is a full stack app",
+            "why is the dashboard empty",
+        ],
+    )
+    def test_single_milestone_or_question_is_not_a_project(self, text: str) -> None:
+        # One deliverable, or a question about one: Re-Act keeps it.
+        assert not prefer_project_workflow(text), text
+
+    def test_project_hint_keeps_the_escape_hatch_and_stays_cheap(self) -> None:
+        hint = steer_message_for(
+            "build a full stack quiz app with frontend, backend and tests"
+        )
+        assert hint["role"] == "user"
+        assert len(hint["content"]) < 1_600
+        assert "run_plan" in hint["content"]
+        assert "escape" in hint["content"].lower()
+        # The one thing it must say out loud: one test pass, at the end.
+        assert "test pass" in hint["content"]
 
 
 class TestClassifyLibraryWork:
