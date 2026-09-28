@@ -61,6 +61,36 @@ exact moment. A pin whose lane has left the pool is dropped rather than honoured
 would rather have the spread than the cache. With no conversation bound — a cron
 job, a bare script — rotation is what you get either way.
 
+## The system prompt was in front of the conversation
+
+A cache matches the longest common *leading* prefix, and the system message sits
+in front of every message of the conversation. Two bands in that message describe
+recency **state** rather than instruction — the durable artifact index and the
+recent-history journal — and both change while a conversation is running: an
+artifact link arrives when something is delivered, a journal entry lands during
+consolidation. Either one changing re-billed the entire conversation behind it on
+the next turn, for a difference of a few lines, and did it worst on exactly the
+long conversations where the bill is largest.
+
+`build_system_prompt_parts()` now returns the prompt in two halves — what
+instructs, and the state bands — and `build_messages()` puts the stable half in
+the system message and appends the state half to the **tail** of the current
+turn's message, next to the runtime-context blocks that already went there. The
+system message and every frozen message then form one byte-identical prefix from
+turn to turn.
+
+Measured with the real builder: a 120-exchange conversation with one new journal
+entry between two consecutive turns went from a **38681/205630 char cacheable
+prefix (18.8%)** to **121555/206248 (58.9%)**. Before, only the system prompt
+itself was cacheable and the rest of the conversation was re-billed in full; now
+the whole unchanged conversation is, and the uncached slack is just the newest
+exchange. `build_system_prompt()` still returns the whole prompt joined, so
+nothing else on the wire changed.
+
+The archived-context summary stays in the stable half on purpose: compaction
+rewrites the older messages, so the prefix is already broken at that moment and
+nothing is gained by moving it.
+
 ## Configuration
 
 Set it per provider in the **admin page** (`/admin` → *Provider settings* →
