@@ -647,6 +647,11 @@ class OpenAICompatProvider(LLMProvider):
         # markers stay off for this provider instance so the turn completes
         # unmarked instead of paying a failed round-trip on every iteration.
         self._cache_marker_disabled = False
+        # Set when an endpoint refuses ``prompt_cache_key``. Deliberately NOT the
+        # same flag as the marker one: a lane can refuse one cache field and take
+        # the other, and conflating them turned "this gateway has no routing key"
+        # into "every later request on this lane fails with HTTP 400".
+        self._routing_key_disabled = False
         self._native_compaction_available = True
 
         effective_base = api_base or (spec.default_api_base if spec else None) or None
@@ -803,6 +808,24 @@ class OpenAICompatProvider(LLMProvider):
             type(exc).__name__,
         )
 
+    def _note_routing_key_rejection(self, exc: BaseException) -> None:
+        """Stop sending ``prompt_cache_key`` once a gateway has refused the field.
+
+        One refusal is enough for the life of this provider instance: without
+        this the field went out again on the next request, was refused again,
+        and - because the retry gate also looked at the marker flag - the 400
+        was surfaced instead of retried. A pooled lane is long-lived, so
+        remembering it here costs exactly one extra round-trip per lane.
+        """
+        self._routing_key_disabled = True
+        logger.warning(
+            "prompt cache: {} refused prompt_cache_key ({}: {}); retrying without "
+            "it and disabling the routing key for this provider",
+            self._spec.name if self._spec else self.api_base,
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+
     async def _create_chat_with_cache_fallback(
         self,
         client: AsyncOpenAIType,
@@ -820,13 +843,18 @@ class OpenAICompatProvider(LLMProvider):
             return await client.chat.completions.create(**kwargs)
         except Exception as exc:
             stripped, removed = strip_cache_markers(kwargs)
-            if (
-                self._cache_marker_disabled
-                or removed == 0
-                or not cache_marker_rejection(exc)
-            ):
+            # ``removed`` is the only real gate. The old check also raised
+            # whenever markers had been disabled earlier for this provider -
+            # which is the pool's steady state, because the first refusal
+            # switched markers off: from then on every request on that lane
+            # surfaced the 400 to the user instead of retrying without it.
+            if removed == 0 or not cache_marker_rejection(exc):
                 raise
-            self._note_cache_marker_rejection(exc)
+            text = f"{exc}".lower()
+            if "prompt_cache_key" in text or "prompt cache key" in text:
+                self._note_routing_key_rejection(exc)
+            if "cache_control" in text or "cache control" in text:
+                self._note_cache_marker_rejection(exc)
             return await client.chat.completions.create(**stripped)
 
     @staticmethod
@@ -1124,7 +1152,7 @@ class OpenAICompatProvider(LLMProvider):
                 model_name,
             ),
         }
-        if cache_key is not None:
+        if cache_key is not None and not getattr(self, "_routing_key_disabled", False):
             kwargs["prompt_cache_key"] = cache_key
 
         # GPT-5 and reasoning models (o1/o3/o4) reject temperature when

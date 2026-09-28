@@ -325,6 +325,95 @@ def test_a_refused_routing_key_is_retried_without_it() -> None:
     assert "prompt_cache_key" not in completions.calls[1]
 
 
+class _ValidationKeyRefusingCompletions:
+    """The live mode of failure: a hard 400 naming the field.
+
+    Measured against the pooled gateways (Novita-style validation), the body is
+    ``{'message': 'Validation: Unsupported parameter(s): prompt_cache_key'}``.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if "prompt_cache_key" in kwargs:
+            raise _FakeBadRequest(
+                "Validation: Unsupported parameter(s): prompt_cache_key"
+            )
+        return {"ok": True}
+
+
+def test_a_refused_routing_key_is_retried_even_when_markers_are_off() -> None:
+    """Regression: the pool's steady state used to make this fatal.
+
+    The first refusal switched cache markers off for the provider. The retry
+    gate then also looked at that marker flag, so every later request on the
+    lane surfaced the 400 to the user instead of retrying without the field.
+    """
+    provider = _provider(_Spec(name="custom"))
+    provider._cache_marker_disabled = True
+    completions = _ValidationKeyRefusingCompletions()
+    client = type("_KeyClient", (), {"chat": type("_Chat", (), {"completions": completions})()})()
+
+    result = asyncio.run(
+        provider._create_chat_with_cache_fallback(
+            client,
+            {"messages": [{"role": "user", "content": "hi"}], "prompt_cache_key": "abc"},
+        )
+    )
+
+    assert result == {"ok": True}
+    assert len(completions.calls) == 2
+    assert "prompt_cache_key" in completions.calls[0]
+    assert "prompt_cache_key" not in completions.calls[1]
+
+
+def test_a_refused_routing_key_is_not_sent_again_on_this_provider() -> None:
+    """One refusal is remembered, so the extra round-trip is paid once per lane."""
+    from nanobot.agent.tools.context import RequestContext, request_context
+
+    provider = _provider(_Spec(name="custom"))
+    provider.default_model = "qwen3.7-flash"
+
+    def build() -> dict:
+        return provider._build_kwargs(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            model=None,
+            max_tokens=16,
+            temperature=0.0,
+            reasoning_effort=None,
+            tool_choice=None,
+        )
+
+    def in_session() -> dict:
+        with request_context(
+            RequestContext(channel="websocket", chat_id="c", session_key="websocket:lane")
+        ):
+            return build()
+
+    assert "prompt_cache_key" in in_session()
+
+    provider._note_routing_key_rejection(
+        _FakeBadRequest("Validation: Unsupported parameter(s): prompt_cache_key")
+    )
+
+    kwargs = in_session()
+    assert "prompt_cache_key" not in kwargs
+    # Only the routing key is dropped: the conversation still batches normally.
+    assert kwargs["messages"][0]["content"] == "hi"
+
+
+def test_a_marker_refusal_does_not_disable_the_routing_key() -> None:
+    """The two cache fields are independent: one refusal must not kill both."""
+    provider = _provider(_Spec(name="custom"))
+    provider._note_cache_marker_rejection(_FakeBadRequest("unsupported: cache_control"))
+
+    assert provider._cache_marker_disabled is True
+    assert getattr(provider, "_routing_key_disabled", False) is False
+
+
 def test_the_provider_sends_one_routing_key_per_conversation() -> None:
     from nanobot.agent.tools.context import RequestContext, request_context
 
