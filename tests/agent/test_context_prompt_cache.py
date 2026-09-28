@@ -444,3 +444,80 @@ def test_customized_memory_md_is_injected(tmp_path, monkeypatch) -> None:
     assert "# Memory\n\n## Long-term Memory" in prompt
     assert "User prefers dark mode" in prompt
     assert calls == 1
+
+
+def _long_history(turns: int) -> list[dict]:
+    rows: list[dict] = []
+    for index in range(turns):
+        rows.append({"role": "user", "content": f"question {index}"})
+        rows.append({"role": "assistant", "content": f"answer {index}"})
+    return rows
+
+
+def test_the_state_bands_are_not_in_the_system_message(tmp_path) -> None:
+    """Recency state belongs at the tail, not in front of the whole conversation.
+
+    A prompt cache matches the longest common leading prefix and the system
+    message sits in front of every message, so a band that changes between turns
+    inside the system message invalidates the entire conversation behind it and
+    re-bills it in full. That was the real shape of "it pushes the entire
+    conversation every time and nothing is cached".
+    """
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+    builder.memory.append_history("an unprocessed journal entry", session_key="websocket:demo")
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="hello",
+        channel="websocket",
+        session_key="websocket:demo",
+    )
+
+    system = messages[0]["content"]
+    assert messages[0]["role"] == "system"
+    assert "# Recent History" not in system
+    assert "# Recent History" in messages[-1]["content"]
+    # The whole prompt is still delivered, just not in front of the conversation.
+    assert "an unprocessed journal entry" in messages[-1]["content"]
+
+
+def test_a_conversation_keeps_one_byte_identical_prefix_across_turns(tmp_path) -> None:
+    """The system message must not change when only recency state moved on."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+    builder.memory.append_history("first: something happened", session_key="websocket:demo")
+
+    history = _long_history(40)
+    first = builder.build_messages(
+        history=history,
+        current_message="question 40",
+        channel="websocket",
+        session_key="websocket:demo",
+    )
+    # The journal grows between the two turns, exactly as it does on a long chat
+    # that has just been compacted.
+    builder.memory.append_history("second: a compaction summary landed", session_key="websocket:demo")
+    frozen = history + first[1:] + [{"role": "assistant", "content": "answer 40"}]
+    second = builder.build_messages(
+        history=frozen,
+        current_message="question 41",
+        channel="websocket",
+        session_key="websocket:demo",
+    )
+
+    assert first[0]["content"] == second[0]["content"], "the system message is the cache prefix"
+
+    def serialize(messages: list[dict]) -> str:
+        import json
+
+        return json.dumps(messages, ensure_ascii=False)
+
+    left, right = serialize(first), serialize(second)
+    common = 0
+    for left_char, right_char in zip(left, right):
+        if left_char != right_char:
+            break
+        common += 1
+    # The unchanged conversation is the cached prefix; only the newest turn is new.
+    assert common / len(right) > 0.9, f"only {common}/{len(right)} chars were cacheable"

@@ -17,6 +17,10 @@ RUNTIME_CONTEXT_MESSAGE_META = "runtime_context"
 RUNTIME_CONTEXT_INPUT_META = "_runtime_context_blocks"
 RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 RUNTIME_CONTEXT_END = "[/Runtime Context]"
+#: Source tag for the recency-state half of the system prompt, which the context
+#: builder appends to the tail of the current message instead of the system
+#: message so the system prompt stays a byte-identical cache prefix.
+PROMPT_STATE_SOURCE = "prompt_state"
 WEBUI_QUOTE_METADATA = "_webui_quote"
 WEBUI_QUOTE_SOURCE = "webui_quote"
 MAX_WEBUI_QUOTE_CHARS = 4_000

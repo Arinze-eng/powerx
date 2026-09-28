@@ -22,6 +22,7 @@ from nanobot.bus.events import (
     InboundMessage,
 )
 from nanobot.runtime_context import (
+    PROMPT_STATE_SOURCE,
     RUNTIME_CONTEXT_END,
     RUNTIME_CONTEXT_MESSAGE_META,
     RUNTIME_CONTEXT_TAG,
@@ -129,8 +130,51 @@ class ContextBuilder:
         unified_session: bool = False,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        stable, volatile = self.build_system_prompt_parts(
+            channel=channel,
+            session_summary=session_summary,
+            workspace=workspace,
+            include_memory=include_memory,
+            include_memory_recent_history=include_memory_recent_history,
+            session_key=session_key,
+            unified_session=unified_session,
+        )
+        return "\n\n---\n\n".join(part for part in (stable, volatile) if part)
+
+    def build_system_prompt_parts(
+        self,
+        *,
+        channel: str | None = None,
+        session_summary: SessionSummary | None = None,
+        workspace: Path | None = None,
+        include_memory: bool = True,
+        include_memory_recent_history: bool = True,
+        session_key: str | None = None,
+        unified_session: bool = False,
+    ) -> tuple[str, str]:
+        """Split the system prompt into a stable half and a *recency state* half.
+
+        A prompt cache matches the longest common leading prefix of the request,
+        and the system message sits in front of the entire conversation. So a
+        single changed byte in a band that only describes *state* — the artifact
+        index after a delivery, the recent-history journal after an entry lands —
+        invalidated the whole conversation behind it and re-billed every message
+        of it in full, on the next turn, for a change that is a few lines long.
+
+        The archived-context summary deliberately stays in the stable half:
+        compaction rewrites the older messages, so the prefix is broken at that
+        moment whatever this does, and there is nothing to gain by moving it.
+
+        Instructions stay in the returned *stable* half, which is byte-identical
+        for a whole conversation as long as the workspace and the enabled skills
+        do not change. The bands that describe state go in the *volatile* half,
+        which :meth:`build_messages` appends to the tail of the current message —
+        after the conversation, where a change costs only the tail. This method
+        returns both joined for callers that want the whole prompt as one string.
+        """
         root = workspace or self.workspace
         parts = [self._get_identity(channel=channel, workspace=root)]
+        volatile: list[str] = []
 
         bootstrap = self._load_bootstrap_files(root)
         if bootstrap:
@@ -175,7 +219,7 @@ class ContextBuilder:
         # build because it lost the file.
         durable_artifacts = self._build_durable_artifacts_section()
         if durable_artifacts:
-            parts.append(durable_artifacts)
+            volatile.append(durable_artifacts)
 
         active_skills = self.skills.get_always_skills()
         if active_skills:
@@ -211,16 +255,19 @@ class ContextBuilder:
                         history_text,
                         self._MAX_HISTORY_TOKENS,
                     )
-                    parts.append("# Recent History\n\n" + history_text)
+                    volatile.append("# Recent History\n\n" + history_text)
 
         if session_summary:
+            # Stays in the stable half on purpose: compaction rewrites the older
+            # messages, so the prefix is broken at that moment whatever this does,
+            # and moving it would only make the summary look like user content.
             parts.append(
                 "[Archived Context Summary]\n\n"
                 f"Previous conversation summary (last active {session_summary['last_active']}):\n"
                 f"{session_summary['text']}"
             )
 
-        return "\n\n---\n\n".join(parts)
+        return "\n\n---\n\n".join(parts), "\n\n---\n\n".join(volatile)
 
     @staticmethod
     def _without_duplicate_session_summary(
@@ -448,28 +495,41 @@ class ContextBuilder:
         session_key: str | None = None,
         unified_session: bool = False,
     ) -> list[dict[str, Any]]:
-        """Build the complete message list for an LLM call."""
+        """Build the complete message list for an LLM call.
+
+        The system message carries only the *stable* half of the prompt and the
+        recency-state half is appended to the tail of the current message, so the
+        system message plus the whole conversation is one byte-identical prefix
+        from turn to turn and the upstream can serve it from its cache. See
+        :meth:`build_system_prompt_parts` for why that split is what the cache
+        needs.
+        """
         root = workspace or self.workspace
+        stable_prompt, volatile_state = self.build_system_prompt_parts(
+            channel=channel,
+            session_summary=session_summary,
+            workspace=root,
+            include_memory=include_memory,
+            include_memory_recent_history=include_memory_recent_history,
+            session_key=session_key,
+            unified_session=unified_session,
+        )
         messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": self.build_system_prompt(
-                    channel=channel,
-                    session_summary=session_summary,
-                    workspace=root,
-                    include_memory=include_memory,
-                    include_memory_recent_history=include_memory_recent_history,
-                    session_key=session_key,
-                    unified_session=unified_session,
-                ),
-            },
+            {"role": "system", "content": stable_prompt},
             *history,
         ]
+        blocks = list(runtime_context_blocks or ())
+        if volatile_state:
+            # Placed after the provider's own blocks so the provider's context
+            # stays closest to the user's words.
+            blocks.append(
+                RuntimeContextBlock(source=PROMPT_STATE_SOURCE, content=volatile_state)
+            )
         current = self.build_current_message(
             current_message,
             media=media,
             current_role=current_role,
-            runtime_context_blocks=runtime_context_blocks,
+            runtime_context_blocks=blocks,
         )
         if messages[-1].get("role") == current_role:
             last = dict(messages[-1])
