@@ -163,9 +163,10 @@ verified from the outside is measured by the admin cache test instead.
 **Admin → Provider settings → Test caching** sends the same large prefix four
 times and reports:
 
-* how many prompt tokens the second request had cached (`auto` hits),
+* how many prompt tokens the re-warm had cached (`auto` hits),
 * whether the endpoint accepted a marked request,
-* whether the model actually *received* the marked block (the recital check),
+* whether the model actually *received* the marked block (the recital check,
+  read **against the unmarked reply** as its baseline — see below),
 * whether the endpoint accepted `prompt_cache_key`, on the same body production
   sends it on,
 * whether the usage block carries a cache field **at all** — an endpoint that
@@ -175,6 +176,10 @@ times and reports:
   listed together, not just the first one that applies: the endpoint in use here
   accepts markers, drops the block, and reports no cache, and all three belong
   in the answer.
+
+The two automatic-caching calls send the **same prefix and a different trailing
+question**. They used to be byte-identical, which quietly measured the wrong
+thing on a gateway that caches whole responses — see the xkiro note below.
 
 Run against the live `gemini-proxy.codebanana.app`: `cacheReported: false`,
 markers "accepted" while `prompt_tokens` fell `4195 → 13` (the block really was
@@ -209,3 +214,58 @@ this the log printed `cache_hit_pct=0.0` on a gateway that never reported a
 cache field — an operator would read "nothing is cached" where the truth is
 "nothing is *measurable here*". Zero from a gateway that answers is still
 printed as zero; only a missing usage block is called unreported.
+
+## Measured: xkiro (`api.xkiro.com/v1`)
+
+Automatic prefix caching works here, is **reported**, and needs no
+`prompt_cache_key`. With `qwen/qwen3.8-omni-flash:free` and a ~5.6k-token system
+prefix, three consecutive calls whose bodies differ only in the trailing
+question:
+
+```
+call 1 (cold prefix)          prompt=5616  prompt_tokens_details: absent
+call 2 (same prefix, new ask) prompt=5616  cached_tokens=5376  (95.7%)
+call 3 (keyless, same prefix) prompt=5320  cached_tokens=3584  (67.4%)
+```
+
+So `auto` is the right mode for it, and the provider parses the hit: on the
+streamed path the runner's usage came back `cached_tokens=3584`, and
+`COST_METER` printed `cache_hit_pct=67.4` for the warm turn and `0.0` for the
+cold one.
+
+Three things were learned the hard way, and all three are now guarded by tests:
+
+**1. This gateway caches whole *responses*, and a replayed body carries the cold
+usage block.** Send a byte-identical body twice and the second answer comes back
+with the same completion id and the same usage as the first — the pre-warm,
+uncached one. The probe used to measure its `auto` hits from exactly that pair,
+so on this endpoint it reported "no cache field at all, so a hit cannot be
+confirmed from here" about a gateway that reports a 95.7% hit on the very next
+distinct request — and, worse, went on to recommend `markers` on the strength of
+a keyed call whose body could not be replayed. The fix is one line of intent:
+the re-warm varies only the tail question, so the prefix stays byte-identical
+while the body cannot be answered from a cache.
+
+**2. A model that refuses to repeat a token is not a gateway that dropped a
+block.** The recital check reads the code back out of the marked block, and
+`qwen3.8-omni-flash` declines to repeat it at all — on the unmarked request too
+(`I cannot provide internal system codes`). Judging markers by the marked reply
+alone therefore emitted the probe's loudest line, "Do NOT use markers on this
+endpoint", about an endpoint whose markers were fine. The unmarked reply is now
+the baseline: markers are only blamed when the unmarked request recited the code
+and the marked one did not. When neither recites, the verdict says the check was
+inconclusive rather than accusing, and falls back to the one signal that does not
+depend on the model's willingness — a *collapsed* `prompt_tokens` (the
+gemini-proxy signature, `4234 → 14`), which means the request itself lost the
+block.
+
+**3. A cold call omits `prompt_tokens_details` entirely, and the log prints that
+as `0.0`.** Call 1 above reported `prompt_tokens=5616` with no cache field, and
+`COST_METER` printed `cache_hit_pct=0.0` for it. The `unreported` rule from
+`de8f534` only fires when `prompt_tokens` is also missing, so it does not cover
+this case: the gateway answered, and the cache breakdown is simply absent. The
+normalised usage dict cannot tell "no field" from "field = 0" — by design,
+asserted in `test_extract_usage_cached_tokens_zero_should_not_be_included` — so
+the meter has no way to distinguish them without a change to that shape. This is
+left as a known gap rather than papered over: read a `0.0` on a *cold* turn as
+"nothing to cache yet", not as a measurement.

@@ -1086,3 +1086,227 @@ def test_cache_probe_measures_markers_and_says_what_it_cannot_see(monkeypatch) -
     assert reported["cacheReported"] is True
     assert reported["auto"]["cached_tokens"] == 0
     assert "billed in full" in reported["detail"]
+
+
+
+def _xkiro_cache_semantics_client(
+    *,
+    recites: bool = False,
+    marked_recites: bool | None = None,
+    marked_prompt_tokens: int = 0,
+):
+    """A probe client that answers like the measured xkiro gateway.
+
+    Three behaviours, all measured live on ``qwen/qwen3.8-omni-flash:free``:
+
+    * A **byte-identical body** is answered from a whole-response replay - same
+      completion id, same usage block - and the usage it carries is the
+      *pre-warm, uncached* one. Asking the same bytes twice therefore measures
+      the replay, not the cache. This is why the probe's two automatic-caching
+      calls had to stop being identical.
+    * The prefix is cached **automatically**, with no ``prompt_cache_key``: the
+      second *distinct* request over the same prefix reported
+      ``cached_tokens: 5376`` of 5616 (95.7%).
+    * The model **declines to repeat the vault code**, marked or not.
+    """
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._body
+
+    seen: dict[str, dict] = {}
+    warm_prefixes: set[str] = set()
+
+    class FakeClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def post(self, _url: str, *, headers: dict, json: dict):
+            _SENT.append(json)
+            body_key = _dumps(json)
+            # A replayed body comes straight back out of the response cache.
+            if body_key in seen:
+                return FakeResponse(seen[body_key])
+
+            messages = json.get("messages") or []
+            dumped = _dumps(messages)
+            marked = "cache_control" in dumped
+            found = _SECRET.search(dumped)
+            system = _dumps([m for m in messages if m.get("role") == "system"])
+            prompt_tokens = (
+                marked_prompt_tokens
+                if (marked and marked_prompt_tokens)
+                else 5616
+            )
+            usage: dict = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 4,
+            }
+            if system in warm_prefixes:
+                usage["prompt_tokens_details"] = {"cached_tokens": 5376}
+            warm_prefixes.add(system)
+
+            recites_here = recites if marked_recites is None else (
+                marked_recites if marked else recites
+            )
+            answer = (
+                found.group(0)
+                if found and recites_here
+                else "I cannot provide internal system codes or sensitive configuration."
+            )
+            payload = {
+                "id": f"chatcmpl-{len(seen)}",
+                "choices": [{"message": {"content": answer}}],
+                "usage": usage,
+            }
+            seen[body_key] = payload
+            return FakeResponse(payload)
+
+    return FakeClient
+
+
+def _probe_against(monkeypatch, factory) -> dict:
+    monkeypatch.setattr(
+        admin_registry,
+        "_credentials",
+        lambda _payload: (
+            "https://api.xkiro.com/v1",
+            "qwen/qwen3.8-omni-flash:free",
+            "test-key",
+        ),
+    )
+    monkeypatch.setattr(admin_registry.httpx, "Client", factory)
+    _SENT.clear()
+    return json.loads(bytes(admin_registry._cache_test_response({}).body).decode())
+
+
+def test_a_replayed_body_would_have_hidden_the_cache(monkeypatch) -> None:
+    """The measurement the fix rests on: identical bytes measure the replay.
+
+    Guarded here because the whole probe design depends on it - if a gateway
+    answered an identical re-send freshly, the two identical ``auto`` calls would
+    have been fine and there would be nothing to fix.
+    """
+    _probe_against(monkeypatch, _xkiro_cache_semantics_client())
+    from nanobot.admin_registry import _cache_probe_call
+
+    plain = [{"role": "system", "content": "PREFIX-BYTES"}]
+    with httpx.Client() as client:
+        first = _cache_probe_call(client, "https://api.xkiro.com/v1", "k", "m", plain)
+        second = _cache_probe_call(client, "https://api.xkiro.com/v1", "k", "m", plain)
+        third = _cache_probe_call(
+            client,
+            "https://api.xkiro.com/v1",
+            "k",
+            "m",
+            [{"role": "system", "content": "PREFIX-BYTES"}, {"role": "user", "content": "x"}],
+        )
+
+    assert first["reported"] is False
+    assert second["reported"] is False, "an identical body must be answered from the replay"
+    assert third["reported"] is True, "a distinct body over the same prefix must report the hit"
+    assert third["cached_tokens"] == 5376
+
+
+def test_cache_probe_measures_the_cache_its_re_warm_could_not_see(monkeypatch) -> None:
+    """The re-warm must be a fresh request, so an automatic cache is measured.
+
+    Measured live on xkiro: with both automatic calls byte-identical the probe
+    reported "reported no cache field at all, so a hit cannot be confirmed from
+    here" about a gateway that reports cached_tokens 5376 of 5616 on the very
+    next distinct request. Varying only the tail question is what makes the
+    re-warm a measurement instead of a replay.
+    """
+    body = _probe_against(monkeypatch, _xkiro_cache_semantics_client())
+
+    auto_bodies = [b for b in _SENT if "cache_control" not in _dumps(b)]
+    assert len(auto_bodies) >= 2
+    assert _dumps(auto_bodies[0]) != _dumps(auto_bodies[1]), (
+        "the two automatic-caching calls must not be identical, or the gateway "
+        "answers the second from its response cache"
+    )
+    assert auto_bodies[0]["messages"][0] == auto_bodies[1]["messages"][0], (
+        "the cached prefix itself must stay byte-identical"
+    )
+
+    assert body["auto"]["cached_tokens"] == 5376
+    assert body["auto"]["hit_pct"] == 95.7
+    assert body["cacheReported"] is True
+    assert body["cacheMeasured"] is True
+    assert "Automatic prefix caching is working" in body["detail"]
+    assert "reported no cache field" not in body["detail"]
+    # And the specific false verdict the identical re-send produced: the re-warm
+    # replayed the cold answer, while the keyed call - whose body differs, and so
+    # cannot be replayed - reported the hit. That reads as "this endpoint only
+    # caches when asked", which was wrong about a gateway that caches on its own.
+    assert "needs prompt_cache_key" not in body["detail"]
+    assert body["recommended"] == "auto"
+
+
+def test_cache_probe_does_not_blame_markers_for_a_refused_recital(monkeypatch) -> None:
+    """A model that will not repeat the code is not a gateway that dropped it.
+
+    The recital is the only check that catches a *silently* swallowed block, but
+    it needs a baseline: a refusal answers the same way as a discard. Measured
+    live on xkiro, the model refused on the unmarked request too, so the probe
+    used to emit its loudest line - "Do NOT use markers on this endpoint" - about
+    a gateway whose markers were fine.
+    """
+    body = _probe_against(monkeypatch, _xkiro_cache_semantics_client())
+
+    assert body["secretEchoed"] is False
+    assert body["markers"]["context_kept"] is False
+
+    assert "Do NOT use markers" not in body["detail"]
+    assert "declined to repeat the code on the unmarked request too" in body["detail"]
+
+
+def test_cache_probe_still_catches_a_dropped_block_when_the_model_will_not_recite(
+    monkeypatch,
+) -> None:
+    """The prompt collapsing is model-independent, so markers are still caught.
+
+    This is the signature the gemini-proxy showed: prompt_tokens 4234 -> 14 on
+    the marked request. When the recital proves nothing, that collapse is what
+    distinguishes a discarded block from a polite refusal.
+    """
+    body = _probe_against(
+        monkeypatch,
+        _xkiro_cache_semantics_client(recites=False, marked_prompt_tokens=14),
+    )
+
+    assert body["markers"]["prompt_tokens"] == 14
+    assert "Do NOT use markers on this endpoint" in body["detail"]
+
+
+def test_cache_probe_still_accuses_markers_when_the_baseline_recites(monkeypatch) -> None:
+    """The baseline must not be allowed to excuse a block that really was dropped.
+
+    Unmarked recites, marked does not: the same ask answered differently, so the
+    only thing that changed is the marker. This is the gemini-proxy case and it
+    must keep failing.
+    """
+    body = _probe_against(
+        monkeypatch,
+        _xkiro_cache_semantics_client(recites=True, marked_recites=False),
+    )
+
+    assert body["secretEchoed"] is True, "the unmarked request recited, so the baseline holds"
+    assert body["markers"]["context_kept"] is False
+    assert "Do NOT use markers on this endpoint" in body["detail"]
+    assert "declined to repeat the code" not in body["detail"]
