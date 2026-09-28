@@ -434,18 +434,36 @@ APT_OPTS=(
   "-o" "DPkg::Lock::Timeout=${APT_LOCK_TIMEOUT_S}"
 )
 
-_apt_lock_fd=""
-apt_lock() {
-  # Held for the life of the script, so every apt call in it is serialised
-  # against every other writer on this sandbox. Missing flock is not fatal: the
-  # APT_OPTS timeouts still apply.
-  if [ -n "${_apt_lock_fd}" ]; then
-    return 0
+#: Run ONE apt command under the shared lock, and hold the lock only for it.
+#:
+#: ``--close`` is the load-bearing part, and it is a measured correction. A first
+#: cut took the lock by opening a descriptor for the life of the script; every
+#: long-lived process the install started then inherited that descriptor -- Xvfb,
+#: ``matchbox-window-manager``, ``wineserver``, and the terminals under Wine
+#: (``metaeditor64.exe``, ``terminal64.exe``) -- so the lock stayed held after the
+#: installer had exited. Measured live on Tenki 2026-09-28: the Live-screen pump
+#: sat in ``flock -w 900`` against a holder that was nothing but a running Xvfb,
+#: which is a 15-minute delay for the display tools the panel needs. ``--close``
+#: runs the command with no lock descriptor in it, so nothing can inherit it.
+#:
+#: Missing flock is not fatal: the APT_OPTS timeouts still apply, and the command
+#: still runs. A wait that times out exits non-zero WITHOUT running the command,
+#: which is the safe direction -- the caller sees the failure instead of two apt
+#: transactions running at once.
+apt_locked() {
+  if command -v flock >/dev/null 2>&1; then
+    # Probe first so a lock that is held by something that will never release it
+    # (a process left behind by an older revision, say) cannot add fifteen
+    # minutes to an install: the call falls back to apt's own lock timeouts,
+    # which still refuse to run two dpkg transactions at once.
+    if flock -w "${APT_LOCK_TIMEOUT_S}" --close "${APT_LOCK_PATH}" true; then
+      flock -w "${APT_LOCK_TIMEOUT_S}" --close "${APT_LOCK_PATH}" "$@"
+      return $?
+    fi
+    log "WARN: the shared apt lock was not free after ${APT_LOCK_TIMEOUT_S}s;"
+    log "WARN: running this apt call under apt own lock timeouts instead"
   fi
-  command -v flock >/dev/null 2>&1 || return 0
-  exec 8>"${APT_LOCK_PATH}" 2>/dev/null || return 0
-  flock -w "${APT_LOCK_TIMEOUT_S}" 8 2>/dev/null || true
-  _apt_lock_fd=8
+  "$@"
 }
 
 #: Refresh the apt indexes AT MOST ONCE per install.
@@ -472,16 +490,14 @@ apt_refresh() {
     return 0
   fi
   _APT_REFRESHED=1
-  apt_lock
-  $SUDO apt-get "${APT_OPTS[@]}" update -qq >/dev/null 2>&1
+  apt_locked $SUDO apt-get "${APT_OPTS[@]}" update -qq >/dev/null 2>&1
 }
 
 apt_install() {
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
-    apt_lock
     apt_refresh || true
-    $SUDO apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends "$@" >/dev/null 2>&1
+    apt_locked $SUDO apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends "$@" >/dev/null 2>&1
     return $?
   fi
   return 1
@@ -511,8 +527,7 @@ apt_install_display() {
   else
     log "WARN: package install failed; retrying with --fix-missing (a transaction"
     log "WARN: that lost its downloads is the usual cause on a fresh sandbox)"
-    apt_lock
-    $SUDO apt-get "${APT_OPTS[@]}" --fix-missing install -y -qq \
+    apt_locked $SUDO apt-get "${APT_OPTS[@]}" --fix-missing install -y -qq \
       --no-install-recommends "${want[@]}" >/dev/null 2>&1 || true
   fi
   missing=()
@@ -625,8 +640,7 @@ install_winehq() {
   # measured collision produced — one transaction wins the dpkg frontend lock and
   # the other dies with "Could not get lock /var/lib/dpkg/lock-frontend", leaving
   # Xvfb unconfigured right when MT5 + Wine needs a display. Serialise instead.
-  apt_lock
-  if $SUDO apt-get "${APT_OPTS[@]}" install -y -qq --allow-downgrades --install-recommends \
+  if apt_locked $SUDO apt-get "${APT_OPTS[@]}" install -y -qq --allow-downgrades --install-recommends \
       "winehq-stable=${pin}" "wine-stable=${pin}" \
       "wine-stable-amd64=${pin}" "wine-stable-i386=${pin}" >/dev/null 2>&1; then
     return 0
@@ -634,8 +648,7 @@ install_winehq() {
   # Fall back to the metapackage alone (some distros do not ship the split
   # packages), then give up rather than silently installing Wine 11 — which
   # would reintroduce exactly the anti-debug failure this function prevents.
-  apt_lock
-  $SUDO apt-get "${APT_OPTS[@]}" install -y -qq --allow-downgrades --install-recommends \
+  apt_locked $SUDO apt-get "${APT_OPTS[@]}" install -y -qq --allow-downgrades --install-recommends \
       "winehq-stable=${pin}" >/dev/null 2>&1 && return 0
   return 1
 }

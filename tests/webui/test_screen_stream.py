@@ -896,14 +896,39 @@ def test_the_provisioning_body_takes_the_apt_lock() -> None:
 
     body = module._PROVISION_BODY  # noqa: SLF001 - the invariant under test
 
-    # A shared lock every apt writer on the sandbox takes, with the whole wait
-    # bounded so a poll thread cannot be pinned forever.
+    # A shared lock every apt writer on the sandbox takes, and it is taken per
+    # apt transaction with ``--close`` so that NEITHER the command NOR anything
+    # it starts inherits a descriptor holding the lock.
+    #
+    # MEASURED CORRECTION (2026-09-28, Tenki, after the first cut of this shipped):
+    # the first cut opened the descriptor for the body's lifetime, and the body
+    # was still holding it when it started Xvfb -- so Xvfb, matchbox, wineserver
+    # and eventually metaeditor64.exe all held the lock. A later ``flock -w 900``
+    # then waited 4 minutes and counting against a holder that was nothing but a
+    # running Xvfb, with ``import`` still missing: no frame, for fifteen minutes.
     assert module.APT_LOCK_PATH in body
-    assert f"flock -w {module.APT_LOCK_TIMEOUT_S} 9" in body
+    assert "--close" in body
+    assert f"WAIT={module.APT_LOCK_WAIT_S}" in body
+    assert f"flock -w $WAIT --close $LOCK" in body
+    assert "exec 9>" not in body, "the body must open no descriptor it could hand on"
+    # The lock is PROBED first: a holder that will never release it must not be
+    # able to stall the panel forever, so a busy lock falls back to apt's own
+    # lock timeouts rather than queueing the install behind it.
+    assert f"flock -w $WAIT --close $LOCK true" in body
+    assert "shared-apt-lock-busy-using-apt-timeouts" in body
+    # The wait is bounded well below apt's own patience, because a queued poll
+    # must not become a fifteen-minute block; later polls retry instead.
+    assert module.APT_LOCK_WAIT_S < module.APT_LOCK_TIMEOUT_S
     # And apt's own patience as well: the lock file only helps while both sides
     # are updated copies of this repo, these help regardless.
     assert f"APT::Lock::Timeout={module.APT_LOCK_TIMEOUT_S}" in body
     assert f"DPkg::Lock::Timeout={module.APT_LOCK_TIMEOUT_S}" in body
+    # Every attempt re-checks the tools first, so an install the MetaTrader
+    # installer completed while we queued ends the loop instead of apt running
+    # for nothing; and only the first attempt refreshes the indexes, because a
+    # later one has just waited on that installer's apt.
+    assert body.count("command -v import >/dev/null 2>&1 || need=1") == 1
+    assert '[ "$n" = 1 ] && $LK $APT $OPTS update -qq' in body
     # A single lost transaction is not a verdict on the sandbox, so the install
     # is retried -- including with --fix-missing, which is what repairs the
     # half-unpacked archive list a lost transaction leaves behind.
@@ -958,9 +983,10 @@ def test_the_provision_call_outlasts_the_apt_lock_wait(monkeypatch) -> None:
 
     # capture, then provisioning.
     assert len(timeouts) == 2
-    assert timeouts[1] > module.APT_LOCK_TIMEOUT_S, (
-        "the provisioning call must outlast a legal lock wait, not the install"
-    )
+    # The body detaches, so this is a ceiling on a hang -- it must outlast the
+    # body's own bounded lock wait, and must NOT be sized for the install.
+    assert timeouts[1] >= module.APT_LOCK_WAIT_S + 60
+    assert timeouts[1] < module.APT_LOCK_TIMEOUT_S
 
 
 def test_the_retry_window_spans_a_metatrader_install() -> None:

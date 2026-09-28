@@ -320,16 +320,29 @@ def test_the_installer_serialises_apt_against_the_live_screen_provisioner():
     """
     script = (Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh").read_text()
 
-    # The shared lock, the same path the Live-screen provisioner takes.
+    # The shared lock, the same path the Live-screen provisioner takes, taken per
+    # apt transaction through ``--close`` so no descriptor is handed to the
+    # command or to anything it starts.
+    #
+    # MEASURED CORRECTION (Tenki, 2026-09-28): the first cut held the descriptor
+    # for the life of the script, and Xvfb, matchbox, wineserver and
+    # metaeditor64.exe all inherited it and kept the lock after this installer
+    # exited. The Live-screen pump then waited on a lock held by a running Xvfb.
     assert 'APT_LOCK_PATH="/tmp/powerx-apt.lock"' in script
-    assert 'flock -w "${APT_LOCK_TIMEOUT_S}" 8' in script
-    # Every apt call is both locked and given apt's own patience -- no bare call
-    # may survive, because a bare one is exactly what lost the transaction.
-    assert script.count("$SUDO apt-get") == script.count('$SUDO apt-get "${APT_OPTS[@]}"')
-    assert script.count("apt_lock\n") >= 5
+    assert 'flock -w "${APT_LOCK_TIMEOUT_S}" --close "${APT_LOCK_PATH}" "$@"' in script
+    assert "exec 8>" not in script, "no descriptor may be held past one apt call"
+    # The lock is probed first, so a holder that will never release it cannot add
+    # fifteen minutes to the install; the call then falls back to apt's own lock
+    # timeouts rather than running nothing at all.
+    assert 'flock -w "${APT_LOCK_TIMEOUT_S}" --close "${APT_LOCK_PATH}" true' in script
+    assert "the shared apt lock was not free after" in script
+    # Every apt call goes through the locked wrapper -- a bare one is exactly
+    # what lost the transaction.
+    assert script.count("$SUDO apt-get") == script.count("apt_locked $SUDO apt-get")
+    assert script.count("apt_locked $SUDO apt-get") == 5
     assert "APT::Lock::Timeout=" in script and "DPkg::Lock::Timeout=" in script
     # The Wine install is the transaction that ran inside the collision window.
-    assert 'apt_lock\n  if $SUDO apt-get "${APT_OPTS[@]}" install -y -qq --allow-downgrades' in script
+    assert 'apt_locked $SUDO apt-get "${APT_OPTS[@]}" install -y -qq --allow-downgrades' in script
     # The display tools are installed *and verified* before Xvfb is started, by
     # name, so a silently lost install says so instead of leaving a black panel.
     assert "apt_install_display xvfb import || true" in script

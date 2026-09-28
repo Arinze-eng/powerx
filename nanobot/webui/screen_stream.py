@@ -136,6 +136,11 @@ PROVISIONING_MESSAGE = (
     "is still running, because it uses the same package manager."
 )
 
+#: Ceiling on the sandbox call that starts the install. The body detaches and the
+#: call returns as soon as it has, so this only bounds a hang -- it is not a
+#: budget for the install, which is re-checked by later polls instead.
+PROVISION_CALL_TIMEOUT_S = 300
+
 PROVISION_FAILED_MESSAGE = (
     "This sandbox could not be given a desktop: the capture tools could not be "
     "installed in it. The panel needs ImageMagick (import) or ffmpeg and a running "
@@ -172,10 +177,27 @@ _SIZE_RE = re.compile(r"^[0-9]{3,4}x[0-9]{3,4}$")
 #: the pump never provisions there and there is only ever one apt run.
 APT_LOCK_PATH = "/tmp/powerx-apt.lock"
 
-#: apt's own patience. If both writers take the lock *and* pass these, a second
-#: run waits for the first instead of failing on it -- belt and braces, because
-#: the lock file only helps while both sides are updated copies of this repo.
+#: apt's own patience, passed to every apt call the body makes. If both writers
+#: take the lock *and* pass these, a second run waits for the first instead of
+#: failing on it -- belt and braces, because the lock file only helps while both
+#: sides are updated copies of this repo.
 APT_LOCK_TIMEOUT_S = 900
+
+#: How long the provisioning body waits for the *MetaTrader installer's* apt
+#: before giving up and letting the next poll try again.
+#:
+#: Bounded, not generous, and that is a measured correction: a first cut of this
+#: waited the full :data:`APT_LOCK_TIMEOUT_S`. The installer took the lock and
+#: then KEPT it, because it held the file descriptor for the life of the script
+#: and every long-lived process it started -- Xvfb, ``matchbox-window-manager``,
+#: ``wineserver``, ``terminal64.exe`` -- inherited that descriptor and went on
+#: holding the lock after the installer exited. Measured live on Tenki: a
+#: ``flock -w 900 9`` in the body sat waiting 4 minutes and counting against a
+#: holder that was nothing but a running Xvfb, so the panel showed no frame at
+#: all while ``import`` was missing. Both sides now take the lock per apt
+#: transaction with ``flock --close``, which no child can inherit, and the body
+#: never waits longer than this.
+APT_LOCK_WAIT_S = 120
 
 #: The provisioning body. Detached with its own log, and written without a single
 #: apostrophe so it can be wrapped in ``sh -c '...'``: the display and geometry
@@ -202,33 +224,45 @@ APT_LOCK_TIMEOUT_S = 900
 #: * ``Xvfb`` is matched as ``"Xvfb $D"`` -- after expansion, e.g. ``Xvfb :99`` --
 #:   which the body does not contain literally (the body writes ``Xvfb "$D"``), so
 #:   that check is genuinely about the running server;
-#: * apt is serialised. The body takes :data:`APT_LOCK_PATH` and passes apt's own
-#:   lock timeouts, so a MetaTrader install running its own apt makes this one
-#:   *wait* instead of the two colliding -- see that constant for the failure it
-#:   was measured causing. The install is also retried inside the body, because a
-#:   single lost transaction is not a verdict on the sandbox;
+#: * apt is serialised, and only for as long as an apt transaction lasts. Each
+#:   apt call is run through ``flock --close`` on :data:`APT_LOCK_PATH`, which
+#:   holds the lock while the command runs and hands no descriptor to it or to
+#:   anything it starts -- see :data:`APT_LOCK_WAIT_S` for the leak that measured
+#:   cost. The lock is probed first and never queued on for longer than that: a
+#:   holder that will never release it (a process left by an older revision, say)
+#:   must not be able to stall the panel, so the body falls back to running apt
+#:   under apt's own lock timeouts and says so in the log. Waiting is bounded, and only the first attempt refreshes the apt
+#:   indexes: a later attempt is a poll that has just queued behind the
+#:   MetaTrader installer's apt, which needs an install and not another refresh.
+#:   The tools are re-checked at the top of every attempt, so an install the
+#:   MetaTrader installer completed while we waited ends the loop;
+
 #: * the install is skipped entirely when the tools are already there, so a
 #:   sandbox whose desktop merely had not been started yet is never given an apt
 #:   run for nothing.
 _PROVISION_BODY = (
     'set -u; D="$PX_DISPLAY"; '
-    'LOCK="' + APT_LOCK_PATH + '"; '
-    "if command -v flock >/dev/null 2>&1; then exec 9>\"$LOCK\"; flock -w " + str(APT_LOCK_TIMEOUT_S) + " 9; fi; "
+    'LOCK="' + APT_LOCK_PATH + '"; WAIT=' + str(APT_LOCK_WAIT_S) + '; '
     'OPTS="-o APT::Lock::Timeout=' + str(APT_LOCK_TIMEOUT_S) + ' -o DPkg::Lock::Timeout=' + str(APT_LOCK_TIMEOUT_S) + '"; '
     'PKGS="xvfb imagemagick x11-apps matchbox-window-manager xterm"; '
-    'need=""; '
-    "command -v Xvfb >/dev/null 2>&1 || need=1; "
-    "command -v import >/dev/null 2>&1 || need=1; "
-    'if [ -n "$need" ] && command -v apt-get >/dev/null 2>&1; then '
+    'n=0; '
+    'while [ "$n" -lt 4 ]; do n=$((n + 1)); '
+    'need=0; command -v Xvfb >/dev/null 2>&1 || need=1; '
+    'command -v import >/dev/null 2>&1 || need=1; '
+    '[ "$need" = 0 ] && break; '
+    'if command -v apt-get >/dev/null 2>&1; then '
     'if [ "$(id -u)" = 0 ]; then APT="apt-get"; '
     "elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then "
     'APT="sudo -n env DEBIAN_FRONTEND=noninteractive apt-get"; else APT=""; fi; '
-    'if [ -n "$APT" ]; then n=0; '
-    'while [ "$n" -lt 4 ]; do n=$((n + 1)); echo "desktop install attempt $n"; '
-    "$APT $OPTS update -qq; "
-    "$APT $OPTS install -y -qq --no-install-recommends $PKGS && break; "
-    "$APT $OPTS --fix-missing install -y -qq --no-install-recommends $PKGS && break; "
-    "sleep 20; done; fi; fi; "
+    'if [ -n "$APT" ]; then echo "desktop install attempt $n"; '
+    'LK=""; if command -v flock >/dev/null 2>&1; then '
+    'if flock -w $WAIT --close $LOCK true; then LK="flock -w $WAIT --close $LOCK"; '
+    'else echo shared-apt-lock-busy-using-apt-timeouts; fi; fi; '
+    '[ "$n" = 1 ] && $LK $APT $OPTS update -qq; '
+    "$LK $APT $OPTS install -y -qq --no-install-recommends $PKGS; "
+    "command -v import >/dev/null 2>&1 || "
+    "$LK $APT $OPTS --fix-missing install -y -qq --no-install-recommends imagemagick; "
+    "fi; fi; sleep 10; done; "
     'command -v Xvfb >/dev/null 2>&1 || { echo no-Xvfb-available; exit 4; }; '
     'if ! pgrep -f "Xvfb $D" >/dev/null 2>&1; then '
     'nohup Xvfb "$D" -screen 0 "$PX_SIZE"x24 >>"$PX_LOG" 2>&1 & fi; '
@@ -531,7 +565,7 @@ class SandboxScreenSource:
         # hang, not on the install.
         ok, output = await run_remote(
             desktop_provision_command(self.display, out_dir, self.size),
-            timeout=APT_LOCK_TIMEOUT_S + 60,
+            timeout=PROVISION_CALL_TIMEOUT_S,
             executor=executor,
         )
         if not ok:
