@@ -220,9 +220,16 @@ Read that literally. It means **provisioning is missing**, so:
 * **Never** treat it as a code error — do not edit the source to "make it compile".
 * **Never** conclude MQL5 cannot be compiled in the sandbox.
 * **Never** hand the uncompiled `.mq5` back to the user asking them to compile it.
+* **Never** tell the user to run `mt5_cli.py install`, and never hand them an
+  install command to paste. A **missing bridge** — not just a missing chain —
+  arrives as this same `not_installed` refusal, and the tool provisions it. The
+  raw CLI text names a command meant for a human to run; repeating that text back
+  as an instruction is the exact reply this rule forbids. `install` is your call
+  to make, never theirs.
 * Run `install`, poll `status` to `stage="done"`, then retry `compile`.
 
-A `not_installed` refusal is the *only* result that requires zero edits. Every
+A `not_installed` refusal — a missing chain, *or* a bridge that will not import —
+is the *only* result that requires zero edits. Every
 other `ok: false` (real `errors[...]` from MetaEditor) is a genuine source error —
 fix that, and compile again.
 

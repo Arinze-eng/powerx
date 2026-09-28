@@ -836,11 +836,29 @@ def require_bridge():  # noqa: ANN201
                 "MT5_UNDER_WINE=1.",
                 code=2,
             )
+        # THE INSTALLATION RULE applies to a missing bridge too. This branch used
+        # to hand back "MetaTrader5 bridge is not installed. Run: mt5_cli.py
+        # install" -- a sentence addressed to a HUMAN -- and because the payload
+        # carried no ``stage`` the tool did not recognise it as a not-installed
+        # refusal, so it passed the text straight through and the model relayed it
+        # to the user as an instruction ("Please run `mt5_cli.py install`"). A
+        # missing bridge is not a user problem: the sandbox installs it, exactly
+        # as ``require_installed_chain`` already arranges for a missing chain. The
+        # same ``stage="not_installed"`` contract is what makes the tool
+        # auto-provision instead of surfacing this at all.
+        info = installed_chain()
+        missing = info["missing"] or ["bridge"]
         return None, fail(
-            "MetaTrader5 bridge is not installed. Run: mt5_cli.py install (the "
-            "bridge requires the Windows python inside the Wine prefix because "
-            "MetaTrader5 only publishes win_amd64 wheels).",
-            code=2,
+            "The MetaTrader5 bridge is not importable inside this sandbox, so no "
+            f"bridge call can run yet. Missing: {', '.join(missing)}. Do NOT ask "
+            "the user to install it or run anything: the sandbox provisions itself "
+            "-- run action='install', then poll action='status' until "
+            "stage='done', then retry.",
+            code=5,
+            stage="not_installed",
+            missing=missing,
+            next="mt5_sandbox(action='install') then poll action='status' until stage='done'",
+            chain=info,
         )
     if not mt5.initialize():
         return None, fail(
