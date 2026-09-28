@@ -2,10 +2,23 @@
 
 The admin-managed provider pool (:mod:`nanobot.provider_pool`) holds up to 40
 lanes, each with its own base URL, API key and model. This wrapper spreads
-requests across the enabled lanes round-robin and, when a lane answers with a
+requests across the enabled lanes and, when a lane answers with a
 rate-limit / overload / server / connection / timeout error, retries the next
 lane before surfacing a failure. That is what stops a single key from
 rate-limiting the whole agent.
+
+The spread is per **conversation**, not per request. A prompt cache lives on one
+upstream account and is keyed on the exact leading bytes of the request, so
+rotating every request onto the next lane handed each turn of a conversation to
+a lane that had never seen its prefix: a 9k-token prefix that the upstream would
+have served 99% from cache was re-read in full, every turn, forever. A
+conversation therefore keeps the lane it started on while that lane is healthy;
+only a lane failure moves it, and it moves to the lane that actually answered,
+so the cache follows the conversation. A brand new conversation still takes the
+next lane in turn, so load still spreads across distinct conversations.
+
+``PROVIDER_POOL_STICKY=0`` restores the old per-request rotation for anyone who
+would rather have the spread than the cache.
 """
 
 # pyright: reportIncompatibleMethodOverride=false, reportIncompatibleVariableOverride=false
@@ -115,6 +128,65 @@ DEFAULT_LANE_COOLDOWN_S = 60.0
 DEFAULT_LANE_PARK_S = 900.0
 LANE_COOLDOWN_ENV = "PROVIDER_POOL_LANE_COOLDOWN_S"
 LANE_PARK_ENV = "PROVIDER_POOL_LANE_PARK_S"
+
+# Whether a conversation keeps the lane it started on, and for how many
+# conversations that is remembered.
+#
+# This is the difference between paying full price for every tool call and
+# paying the cached rate for it. Measured on this repo's own pool: with the
+# rotation in place a 12-call turn cost 652,199 prompt tokens with NOTHING
+# cached, because lane A's cached prefix is invisible to lane B and no two
+# consecutive calls of one conversation ever reached the same lane.
+DEFAULT_STICKY_LANES = True
+STICKY_ENV = "PROVIDER_POOL_STICKY"
+MAX_AFFINITY_SESSIONS = 512
+
+# Process-wide, not per instance, and deliberately so: the provider snapshot is
+# rebuilt whenever the configured lanes change, and a conversation that has been
+# talking to lane 3 must keep talking to lane 3 across that rebuild or the cache
+# it paid to build is thrown away.
+_AFFINITY_LOCK = threading.Lock()
+_AFFINITY: dict[tuple[str, str], str] = {}
+_AFFINITY_CURSOR: dict[str, int] = {}
+
+
+def sticky_lanes_enabled() -> bool:
+    """Whether a conversation is pinned to one lane. ``=0`` restores rotation."""
+    raw = os.environ.get(STICKY_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_STICKY_LANES
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def reset_lane_affinity() -> None:
+    """Forget every pinned conversation. For tests and a hard pool reload."""
+    with _AFFINITY_LOCK:
+        _AFFINITY.clear()
+        _AFFINITY_CURSOR.clear()
+
+
+def lane_affinity_snapshot() -> dict[str, str]:
+    """The pinned ``session_key -> lane id`` mapping, for diagnostics."""
+    with _AFFINITY_LOCK:
+        return {session: lane for (_pool, session), lane in _AFFINITY.items()}
+
+
+def _bound_session_key() -> str | None:
+    """The conversation this call belongs to, when the agent loop has bound one.
+
+    The loop binds a ``RequestContext`` for the whole turn and LLM calls happen
+    inside it, so the pool reads the same session key the rest of the agent uses.
+    Imported lazily: the provider layer must not drag the tool layer in at import
+    time, and a caller that never binds a context simply keeps the rotation.
+    """
+    try:
+        from nanobot.agent.tools.context import current_request_session_key
+    except Exception:
+        return None
+    try:
+        return current_request_session_key()
+    except Exception:
+        return None
 
 # Error kinds/statuses that mean "this lane is unusable", not "this request is".
 _TERMINAL_LANE_KINDS = frozenset(
@@ -247,20 +319,99 @@ class PoolProvider(LLMProvider):
         with self._lock:
             self._parked_until[lane_id] = time.monotonic() + window
 
-    def _order(self) -> list[tuple[dict[str, Any], LLMProvider]]:
-        """Return the lanes starting at the rotating cursor (round-robin).
+    def _pool_key(self) -> str:
+        """Identity of this lane set, so a pin follows a rebuilt provider."""
+        return "|".join(self._lane_id(entry) for entry, _ in self._lanes)
 
-        Lanes parked by a recent failure are moved to the back of the rotation
-        so a dead lane cannot keep taking the first attempt of every request.
-        When every lane is parked the full order is returned anyway: a stale
-        cooldown must never turn into "no lane was tried at all".
+    @staticmethod
+    def _current_session() -> str | None:
+        key = _bound_session_key()
+        return (key or "").strip() or None
+
+    def _pin(self, session_key: str) -> str | None:
+        """The lane *session_key* is pinned to, claiming one when it has none.
+
+        A conversation that has never been seen takes the next lane of the
+        rotation and moves the rotation on, so two conversations do not pile
+        onto one lane. A pin whose lane has left the pool is dropped rather than
+        honoured, otherwise it would pin the conversation to nothing.
+        """
+        if not sticky_lanes_enabled():
+            return None
+        lane_ids = [self._lane_id(entry) for entry, _ in self._lanes]
+        if not lane_ids or not all(lane_ids):
+            return None
+        pool = self._pool_key()
+        with _AFFINITY_LOCK:
+            pinned = _AFFINITY.get((pool, session_key))
+            if pinned in lane_ids:
+                return pinned
+            _AFFINITY.pop((pool, session_key), None)
+            start = _AFFINITY_CURSOR.get(pool, 0) % len(lane_ids)
+            _AFFINITY_CURSOR[pool] = (start + 1) % len(lane_ids)
+            pinned = lane_ids[start]
+            _AFFINITY[(pool, session_key)] = pinned
+            while len(_AFFINITY) > MAX_AFFINITY_SESSIONS:
+                _AFFINITY.pop(next(iter(_AFFINITY)))
+            return pinned
+
+    def _remember(self, session_key: str | None, entry: dict[str, Any]) -> None:
+        """Move a conversation's pin onto the lane that just answered it.
+
+        The pinned lane can be parked by a failure and the request served by
+        another lane; the conversation has now built its prefix there, so that is
+        where the next turn has to go for the cache to be of any use.
+        """
+        if session_key is None or not sticky_lanes_enabled():
+            return
+        lane_id = self._lane_id(entry)
+        if not lane_id:
+            return
+        with _AFFINITY_LOCK:
+            _AFFINITY[(self._pool_key(), session_key)] = lane_id
+
+    def _forget(self, session_key: str | None) -> None:
+        """Drop a pin whose whole pool just failed, so the next turn re-picks."""
+        if session_key is None:
+            return
+        with _AFFINITY_LOCK:
+            _AFFINITY.pop((self._pool_key(), session_key), None)
+
+    def _order(self) -> list[tuple[dict[str, Any], LLMProvider]]:
+        """Return the lanes to try, this conversation's lane first.
+
+        With a conversation bound, its pinned lane is tried first for every turn
+        of that conversation — that is what lets the upstream serve the unchanged
+        prefix from its cache instead of re-reading the whole conversation at
+        full price. With no conversation bound (a cron job, a bare script) the
+        historical round-robin is kept, one lane per call.
+
+        Failover is unchanged: the pin only decides who is *first*. Lanes parked
+        by a recent failure move to the back — pinned or not — so a dead lane is
+        skipped within the same request, and when every lane is parked the full
+        order is returned anyway: a stale cooldown must never turn into "no lane
+        was tried at all".
         """
         if not self._lanes:
             return []
+        session_key = self._current_session()
+        pinned = self._pin(session_key) if session_key is not None else None
         with self._lock:
-            start = self._cursor % len(self._lanes)
-            self._cursor = (self._cursor + 1) % len(self._lanes)
-            ordered = self._lanes[start:] + self._lanes[:start]
+            if pinned is None:
+                start = self._cursor % len(self._lanes)
+                self._cursor = (self._cursor + 1) % len(self._lanes)
+                ordered = self._lanes[start:] + self._lanes[:start]
+            else:
+                first = [
+                    lane for lane in self._lanes if self._lane_id(lane[0]) == pinned
+                ]
+                rest = [
+                    lane for lane in self._lanes if self._lane_id(lane[0]) != pinned
+                ]
+                if rest:
+                    start = self._cursor % len(rest)
+                    rest = rest[start:] + rest[:start]
+                ordered = first + rest
             healthy = [lane for lane in ordered if not self._is_parked(lane[0])]
         return healthy + [lane for lane in ordered if lane not in healthy]
 
@@ -320,6 +471,7 @@ class PoolProvider(LLMProvider):
     ) -> LLMResponse:
         first_failure: LLMResponse | None = None
         transient: LLMResponse | None = None
+        session_key = self._current_session()
         for entry, provider in self._order():
             response = await self._call_lane(
                 lambda p=provider, e=entry: p.chat(
@@ -334,12 +486,14 @@ class PoolProvider(LLMProvider):
                 entry,
             )
             if not self._should_failover(response):
+                self._remember(session_key, entry)
                 return response
             self._park(entry, response)
             if first_failure is None:
                 first_failure = response
             if transient is None and not self._is_terminal_failure(response):
                 transient = response
+        self._forget(session_key)
         return self._best_failure(first_failure, transient)
 
     async def chat_stream(
@@ -358,6 +512,7 @@ class PoolProvider(LLMProvider):
         first_failure: LLMResponse | None = None
         transient: LLMResponse | None = None
         streamed = False
+        session_key = self._current_session()
 
         async def _track(delta: str) -> None:
             nonlocal streamed
@@ -383,12 +538,14 @@ class PoolProvider(LLMProvider):
             )
             # Never rotate after output has reached the user: a retry would duplicate it.
             if streamed or not self._should_failover(response):
+                self._remember(session_key, entry)
                 return response
             self._park(entry, response)
             if first_failure is None:
                 first_failure = response
             if transient is None and not self._is_terminal_failure(response):
                 transient = response
+        self._forget(session_key)
         return self._best_failure(first_failure, transient)
 
     def get_default_model(self) -> str:

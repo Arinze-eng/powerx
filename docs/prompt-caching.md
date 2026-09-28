@@ -33,6 +33,34 @@ logged a warning. A *rejected* request is at least loud; a *swallowed* one is
 not, which is why markers are opt-in per provider and verified with a recital
 before anyone relies on them.
 
+## The pool was throwing the cache away
+
+Neither mechanism survives a pool that rotates **per request**. A cache lives on
+one upstream account and is keyed on the exact leading bytes of the request, and
+the admin pool holds up to 40 lanes across different base URLs and keys — so
+turn 1 on lane A, turn 2 on lane B, turn 3 on lane C meant every lane was handed
+a prefix it had never seen. Lane B cannot answer with lane A's cached copy, so
+the 99% hit above is unreachable unless the same conversation keeps reaching the
+same lane.
+
+`PoolProvider` is therefore **sticky per conversation**. A conversation keeps the
+lane it started on; a lane failure moves it, and it moves to the lane that
+actually answered, so the cache follows the conversation rather than the pool.
+A brand-new conversation still takes the next lane in turn, so load still
+spreads — the rotation moved from per-request to per-conversation. Failover is
+untouched: the pin only decides who is tried *first*, lanes parked by a recent
+failure still go to the back, and when every lane is parked the full order is
+returned anyway.
+
+The pin is process-wide and keyed on the lane set, not held on the provider
+instance, because the provider snapshot is rebuilt whenever the configured lanes
+change and a pin that died with the instance would throw the cache away at that
+exact moment. A pin whose lane has left the pool is dropped rather than honoured.
+
+`PROVIDER_POOL_STICKY=0` restores the old per-request rotation, for anyone who
+would rather have the spread than the cache. With no conversation bound — a cron
+job, a bare script — rotation is what you get either way.
+
 ## Configuration
 
 Set it per provider in the **admin page** (`/admin` → *Provider settings* →

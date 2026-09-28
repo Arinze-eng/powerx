@@ -12,8 +12,14 @@ from typing import Any
 
 import pytest
 
+from nanobot.agent.tools.context import RequestContext, request_context
 from nanobot.providers.base import LLMResponse
-from nanobot.providers.pool_provider import PoolProvider
+from nanobot.providers.pool_provider import (
+    PoolProvider,
+    lane_affinity_snapshot,
+    reset_lane_affinity,
+    sticky_lanes_enabled,
+)
 
 
 class _FakeProvider:
@@ -409,3 +415,155 @@ def test_parking_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     pool = _provider(dead, live)
     assert asyncio.run(pool.chat(_MESSAGES)).content == "live-answer"
     assert pool._is_parked(dead[0]) is False, "parking disabled keeps the lane in rotation"
+
+
+# --------------------------------------------------------------------------
+# Lane affinity: a conversation keeps its lane so the upstream's prompt cache
+# can hit. Rotating every *request* onto the next lane handed every turn of a
+# conversation to a lane that had never seen its prefix, so a 9k-token prefix
+# the upstream would have served 99% from cache was re-read in full, every
+# turn, forever. These tests pin the contract that fixes that.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clean_lane_affinity():
+    """Module-level pins must not leak between tests."""
+    reset_lane_affinity()
+    yield
+    reset_lane_affinity()
+
+
+def _turn(session_key: str):
+    return request_context(
+        RequestContext(channel="test", chat_id="test-chat", session_key=session_key)
+    )
+
+
+def _chat_in(session_key: str, pool: PoolProvider) -> LLMResponse:
+    async def _run() -> LLMResponse:
+        with _turn(session_key):
+            return await pool.chat(_MESSAGES)
+
+    return asyncio.run(_run())
+
+
+def test_a_conversation_keeps_its_lane_for_every_turn() -> None:
+    a, b, c = _lane("a"), _lane("b"), _lane("c")
+    pool = _provider(a, b, c)
+
+    assert _chat_in("s1", pool).content == "a-ok"
+    assert _chat_in("s1", pool).content == "a-ok"
+    assert _chat_in("s1", pool).content == "a-ok"
+
+    assert (a[1].calls, b[1].calls, c[1].calls) == (3, 0, 0)
+
+
+def test_distinct_conversations_still_spread_across_the_lanes() -> None:
+    # The pool still exists to stop one key rate-limiting the whole agent, so
+    # pinning must not funnel every conversation onto the first lane.
+    a, b, c = _lane("a"), _lane("b"), _lane("c")
+    pool = _provider(a, b, c)
+
+    assert _chat_in("s1", pool).content == "a-ok"
+    assert _chat_in("s2", pool).content == "b-ok"
+    assert _chat_in("s3", pool).content == "c-ok"
+    # ...and back to the lanes they were pinned to, not the next ones.
+    assert _chat_in("s1", pool).content == "a-ok"
+    assert _chat_in("s2", pool).content == "b-ok"
+
+
+def test_without_a_bound_conversation_the_rotation_is_unchanged() -> None:
+    # A cron job or a bare script has no conversation to cache against, so the
+    # historical round-robin is what it gets.
+    a, b, c = _lane("a"), _lane("b"), _lane("c")
+    pool = _provider(a, b, c)
+
+    assert asyncio.run(pool.chat(_MESSAGES)).content == "a-ok"
+    assert asyncio.run(pool.chat(_MESSAGES)).content == "b-ok"
+    assert asyncio.run(pool.chat(_MESSAGES)).content == "c-ok"
+
+
+def test_a_failed_lane_moves_the_conversation_and_it_stays_moved() -> None:
+    # Lane "a" answers once and is then rate-limited forever. The conversation
+    # must move to "b" *and keep* "b" once "a" comes back: "b" is the lane that
+    # now holds the conversation's cached prefix.
+    a = _lane("a", [LLMResponse(content="a-ok"), LLMResponse(content=None, error_kind="rate_limit")])
+    b = _lane("b")
+    pool = _provider(a, b)
+
+    assert _chat_in("s1", pool).content == "a-ok"
+    assert _chat_in("s1", pool).content == "b-ok"
+
+    pool._parked_until.clear()  # "a" is healthy again as far as parking knows.
+    assert _chat_in("s1", pool).content == "b-ok"
+    assert a[1].calls == 2, "the recovered lane must not steal the conversation back"
+    assert b[1].calls == 2
+
+
+def test_a_terminal_lane_failure_moves_the_conversation_too() -> None:
+    dead = _lane("dead", [LLMResponse(content=None, error_status_code=401)])
+    live = _lane("live")
+    pool = _provider(dead, live)
+
+    assert _chat_in("s1", pool).content == "live-ok"
+    assert _chat_in("s1", pool).content == "live-ok"
+    assert dead[1].calls == 1
+
+
+def test_the_pin_survives_a_rebuilt_pool() -> None:
+    # The provider snapshot is rebuilt whenever the configured lanes change; a
+    # pin that died with the instance would throw the cache away at that moment.
+    first = _provider(_lane("a"), _lane("b"), _lane("c"))
+    assert _chat_in("s1", first).content == "a-ok"
+    assert lane_affinity_snapshot() == {"s1": "a"}
+
+    rebuilt = _provider(_lane("a"), _lane("b"), _lane("c"))
+    assert lane_affinity_snapshot() == {"s1": "a"}, "the pin outlived the instance"
+    assert _chat_in("s1", rebuilt).content == "a-ok"
+    assert _chat_in("s1", rebuilt).content == "a-ok"
+    assert _chat_in("s2", rebuilt).content == "b-ok"
+
+
+def test_a_lane_that_leaves_the_pool_loses_its_pins() -> None:
+    three = _provider(_lane("a"), _lane("b"), _lane("c"))
+    assert _chat_in("s1", three).content == "a-ok"
+
+    # "a" is deleted from the admin pool. The stale pin must not be honoured.
+    two = _provider(_lane("b"), _lane("c"))
+    assert _chat_in("s1", two).content == "b-ok"
+
+
+def test_a_pinned_lane_that_is_already_parked_is_skipped_first() -> None:
+    a = _lane("a", [LLMResponse(content=None, error_kind="rate_limit")])
+    b = _lane("b")
+    pool = _provider(a, b)
+    pool._park(a[0], LLMResponse(content=None, error_kind="rate_limit"))
+
+    assert _chat_in("s1", pool).content == "b-ok"
+    assert a[1].calls == 0, "a parked lane is not retried just because it is pinned"
+
+
+def test_sticky_lanes_can_be_switched_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PROVIDER_POOL_STICKY", "0")
+    a, b, c = _lane("a"), _lane("b"), _lane("c")
+    pool = _provider(a, b, c)
+
+    assert _chat_in("s1", pool).content == "a-ok"
+    assert _chat_in("s1", pool).content == "b-ok", "=0 restores the per-request rotation"
+
+
+def test_the_sticky_default_is_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PROVIDER_POOL_STICKY", raising=False)
+    assert sticky_lanes_enabled() is True
+
+
+def test_a_pool_with_an_unidentifiable_lane_falls_back_to_rotation() -> None:
+    # Pins are keyed on lane id. A lane without one cannot be pinned safely, so
+    # the pool must rotate rather than pin every conversation to "".
+    nameless = ({"model": "m"}, _FakeProvider("nameless"))
+    a, b = _lane("a"), _lane("b")
+    pool = _provider(nameless, a, b)
+
+    seen = [_chat_in(f"s{index}", pool).content for index in range(3)]
+    assert seen == ["nameless-ok", "a-ok", "b-ok"]
