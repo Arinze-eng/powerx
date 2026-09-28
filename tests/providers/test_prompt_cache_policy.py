@@ -30,6 +30,12 @@ class _Spec:
     def __init__(self, name: str = "custom", caching: bool = False) -> None:
         self.name = name
         self.supports_prompt_caching = caching
+        # The rest of what a request builder reads off a spec, kept minimal so
+        # a test can drive _build_kwargs without a real provider registry entry.
+        self.model_overrides: tuple = ()
+        self.strip_model_prefix = False
+        self.strip_model_prefixes: tuple = ()
+        self.supports_max_completion_tokens = False
 
 
 class _FakeBadRequest(Exception):
@@ -87,6 +93,15 @@ def test_markers_allowed_only_for_an_explicit_choice_or_claude():
 
 def test_rejection_detected_for_a_refusal_that_names_cache_control():
     assert cache_marker_rejection(_FakeBadRequest("unsupported parameter: cache_control")) is True
+
+
+def test_rejection_detected_for_a_refusal_that_names_the_routing_key():
+    assert (
+        cache_marker_rejection(
+            _FakeBadRequest("Unrecognized request argument supplied: prompt_cache_key")
+        )
+        is True
+    )
 
 
 def test_rejection_is_not_claimed_for_unrelated_errors():
@@ -152,6 +167,8 @@ def _provider(spec: _Spec, configured: str | None = None):
     provider._spec = spec
     provider._prompt_cache = configured
     provider._cache_marker_disabled = False
+    provider._extra_body = None
+    provider._effective_base = "https://example.test/v1"
     provider.api_base = "https://example.test/v1"
     return provider
 
@@ -221,3 +238,143 @@ def test_no_retry_when_there_were_no_markers_to_strip():
             )
         )
     assert len(client.chat.completions.calls) == 1
+
+
+# --------------------------------------------------------------------------
+# prompt_cache_key: the only cache mechanism that works on an endpoint which
+# reports nothing back. Verified live against the configured gemini-proxy:
+# accepted with the model still receiving the system prompt.
+# --------------------------------------------------------------------------
+
+
+def test_a_conversation_key_is_stable_and_bounded() -> None:
+    from nanobot.providers.prompt_cache import conversation_cache_key
+
+    first = conversation_cache_key("websocket:user-42")
+    assert first == conversation_cache_key("websocket:user-42")
+    assert first is not None and len(first) == 32
+    assert first != conversation_cache_key("websocket:user-43")
+    assert conversation_cache_key("   ") is None
+    assert conversation_cache_key("") is None
+
+
+def test_a_conversation_key_needs_a_bound_conversation() -> None:
+    from nanobot.providers.prompt_cache import conversation_cache_key
+
+    assert conversation_cache_key() is None
+
+
+def test_a_conversation_key_follows_the_bound_session() -> None:
+    from nanobot.agent.tools.context import RequestContext, request_context
+    from nanobot.providers.prompt_cache import conversation_cache_key
+
+    with request_context(
+        RequestContext(channel="websocket", chat_id="c", session_key="websocket:bound")
+    ):
+        assert conversation_cache_key() == conversation_cache_key("websocket:bound")
+
+
+def test_every_cache_field_is_stripped_on_a_retry() -> None:
+    from nanobot.providers.prompt_cache import strip_cache_markers
+
+    kwargs = {
+        "model": "m",
+        "prompt_cache_key": "abc",
+        "messages": [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}],
+            }
+        ],
+    }
+    stripped, removed = strip_cache_markers(kwargs)
+    assert "prompt_cache_key" not in stripped
+    assert removed == 2
+
+
+class _KeyRefusingCompletions:
+    """A gateway strict enough to 400 on an unknown field."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if "prompt_cache_key" in kwargs:
+            raise _FakeBadRequest(
+                "Unrecognized request argument supplied: prompt_cache_key"
+            )
+        return {"ok": True}
+
+
+def test_a_refused_routing_key_is_retried_without_it() -> None:
+    provider = _provider(_Spec(name="custom"))
+    completions = _KeyRefusingCompletions()
+    client = type("_KeyClient", (), {"chat": type("_Chat", (), {"completions": completions})()})()
+
+    result = asyncio.run(
+        provider._create_chat_with_cache_fallback(
+            client,
+            {"messages": [{"role": "user", "content": "hi"}], "prompt_cache_key": "abc"},
+        )
+    )
+
+    assert result == {"ok": True}
+    assert len(completions.calls) == 2
+    assert "prompt_cache_key" in completions.calls[0]
+    assert "prompt_cache_key" not in completions.calls[1]
+
+
+def test_the_provider_sends_one_routing_key_per_conversation() -> None:
+    from nanobot.agent.tools.context import RequestContext, request_context
+
+    provider = _provider(_Spec(name="custom"))
+    provider.default_model = "qwen3.7-flash"
+
+    def build() -> dict:
+        return provider._build_kwargs(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            model=None,
+            max_tokens=16,
+            temperature=0.0,
+            reasoning_effort=None,
+            tool_choice=None,
+        )
+
+    # Nothing bound: no conversation to key a cache on, so no field at all.
+    assert "prompt_cache_key" not in build()
+
+    def in_session(session_key: str) -> dict:
+        with request_context(
+            RequestContext(channel="websocket", chat_id="c", session_key=session_key)
+        ):
+            return build()
+
+    first = in_session("websocket:one")
+    assert first["prompt_cache_key"]
+
+    # The key is per conversation, not per turn: the retry and the next turn
+    # both land on the node already holding this conversation's prefix.
+    assert in_session("websocket:one")["prompt_cache_key"] == first["prompt_cache_key"]
+    assert in_session("websocket:two")["prompt_cache_key"] != first["prompt_cache_key"]
+
+
+def test_off_sends_no_routing_key() -> None:
+    from nanobot.agent.tools.context import RequestContext, request_context
+
+    provider = _provider(_Spec(name="custom"), configured="off")
+    provider.default_model = "qwen3.7-flash"
+    with request_context(
+        RequestContext(channel="websocket", chat_id="c", session_key="websocket:one")
+    ):
+        kwargs = provider._build_kwargs(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            model=None,
+            max_tokens=16,
+            temperature=0.0,
+            reasoning_effort=None,
+            tool_choice=None,
+        )
+    assert "prompt_cache_key" not in kwargs

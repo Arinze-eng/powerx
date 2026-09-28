@@ -8,7 +8,7 @@ times. That is the shape of the bill whether or not anything is cached, so the
 only way to know what you actually paid for is to record how much of each
 prompt the gateway served from its cache.
 
-## Two mechanisms, not one
+## Three mechanisms, not one
 
 | mode | what it does | when it is safe |
 | --- | --- | --- |
@@ -16,7 +16,10 @@ prompt the gateway served from its cache.
 | `markers` | Adds Anthropic-style `cache_control: {"type": "ephemeral"}` breakpoints to the system message, the second-to-last message and the tail of the tool list. | Only on an endpoint verified to accept them. |
 | `off` | Sends nothing cache-related, including no markers for Claude. | When you want the request byte-identical to an uncached one. |
 
-Both mechanisms were probed live before this was written.
+In every mode except `off` the request also carries `prompt_cache_key`, which is
+not a cache format at all — see [the routing key](#the-routing-key-which-node-holds-the-prefix).
+
+All three were probed live before this was written.
 
 **Automatic prefix caching works and is reported.** Against `kymaapi.com`
 (`qwen3.7-flash`), the same ~9k-token prefix sent twice returned
@@ -60,6 +63,46 @@ exact moment. A pin whose lane has left the pool is dropped rather than honoured
 `PROVIDER_POOL_STICKY=0` restores the old per-request rotation, for anyone who
 would rather have the spread than the cache. With no conversation bound — a cron
 job, a bare script — rotation is what you get either way.
+
+## The routing key: which node holds the prefix
+
+Prefix caching is per machine. A gateway that runs several replicas behind one
+URL matches a prefix only on the replica that already served it, so a
+conversation that lands on a different node each turn has the same problem as a
+pool that rotates each turn — every node sees a cold prefix, and a gateway that
+reports no cache field gives you no way to tell.
+
+OpenAI solves this with `prompt_cache_key`: the client names the conversation,
+the gateway keeps it on the node that holds its prefix. nanobot now sends it on
+every request except in `off`, derived from the same session key the agent loop
+binds for the turn, hashed to 32 hex characters (`conversation_cache_key`). The
+same session therefore produces the same key for the life of the conversation —
+turn 2 and the retry of turn 2 both land where turn 1 did — while an unbound
+caller (a cron job, a bare script) sends nothing, which is correct because it
+has no conversation to keep together.
+
+This is the only lever that exists against a gateway that reports nothing. What
+is measured and what is not, on the endpoint currently configured
+(`gemini-proxy.codebanana.app`, `gemini-3.1-flash-lite`):
+
+* **Measured:** the field is *accepted*, on the real request body built by the
+  provider's own `_build_kwargs` — HTTP 200, stable across two turns of one
+  conversation, absent under `off`, absent with no bound conversation, 32 chars,
+  and the model still recites a fact that exists only in the system prompt.
+* **Not measured:** a hit rate. The endpoint's usage block is
+  `{"prompt_tokens": ..., "completion_tokens": ..., "total_tokens": ...}` and
+  nothing else — it reports no `cached_tokens` at all, so a hit on it cannot be
+  observed from outside. Unknown fields are accepted there too (an invented one
+  also returned 200), so the field is not being rejected; whether the proxy
+  routes on it is **unproven on this endpoint**, and this page will not claim a
+  saving it has not seen. On an endpoint that does report cache usage — the Kyma
+  measurement above, or **Test caching** on any gateway that returns
+  `cached_tokens` — the hit rate is visible and is the number to trust.
+
+Sending it costs one bounded string on the wire, so it is on by default: a
+gateway that ignores the field is unaffected. If a gateway *refuses* it, the
+refusal is recognised and the call is retried once without any cache field at
+all, the same path that makes `markers` survivable.
 
 ## The system prompt was in front of the conversation
 
@@ -107,10 +150,13 @@ Set it per provider in the **admin page** (`/admin` → *Provider settings* →
 models on a spec that advertises prompt caching, and nothing is sent for plain
 OpenAI-compatible endpoints.
 
-A hard refusal is survivable: if an endpoint rejects a marked request with a
-`cache_control` error, the call is retried once with the markers stripped and
-they stay off for that provider instance. The turn completes unmarked instead of
-failing on a setting that was turned on to save money.
+A hard refusal is survivable: if an endpoint rejects a request naming
+`cache_control` *or* `prompt_cache_key`, the call is retried once with every
+cache field stripped and the markers stay off for that provider instance. The
+turn completes uncached instead of failing on a setting that was turned on to
+save money. Only a *loud* refusal can be caught this way; the gemini-proxy
+rejects nothing and reports nothing, which is why a setting that cannot be
+verified from the outside is measured by the admin cache test instead.
 
 ## Measuring it
 

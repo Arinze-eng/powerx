@@ -33,6 +33,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from nanobot.providers.base import GenerationSettings, LLMProvider, LLMResponse
+from nanobot.providers.prompt_cache import bound_session_key
 
 # Error kinds that mean "try another lane" rather than "fail the request".
 #
@@ -174,19 +175,10 @@ def lane_affinity_snapshot() -> dict[str, str]:
 def _bound_session_key() -> str | None:
     """The conversation this call belongs to, when the agent loop has bound one.
 
-    The loop binds a ``RequestContext`` for the whole turn and LLM calls happen
-    inside it, so the pool reads the same session key the rest of the agent uses.
-    Imported lazily: the provider layer must not drag the tool layer in at import
-    time, and a caller that never binds a context simply keeps the rotation.
+    The same session key the rest of the agent uses, so the lane a conversation
+    is pinned to and the routing key it sends are two views of one identity.
     """
-    try:
-        from nanobot.agent.tools.context import current_request_session_key
-    except Exception:
-        return None
-    try:
-        return current_request_session_key()
-    except Exception:
-        return None
+    return bound_session_key()
 
 # Error kinds/statuses that mean "this lane is unusable", not "this request is".
 _TERMINAL_LANE_KINDS = frozenset(

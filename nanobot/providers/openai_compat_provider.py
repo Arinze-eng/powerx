@@ -24,13 +24,13 @@ from loguru import logger
 from pydantic.alias_generators import to_snake
 
 from nanobot.providers.base import (
-    resolve_stream_chunk_gap_timeout_s,
     LLMProvider,
     LLMResponse,
     ProviderCallContext,
     ProviderConversationState,
     ToolCallRequest,
     parse_tool_arguments,
+    resolve_stream_chunk_gap_timeout_s,
     resolve_stream_idle_timeout_s,
     tool_arguments_json_for_replay,
 )
@@ -52,8 +52,8 @@ if TYPE_CHECKING:
 
     from nanobot.providers.registry import ProviderSpec
 from nanobot.providers.prompt_cache import (
-    cache_hit_pct,
     cache_marker_rejection,
+    conversation_cache_key,
     markers_allowed,
     resolve_cache_mode,
     strip_cache_markers,
@@ -1105,6 +1105,16 @@ class OpenAICompatProvider(LLMProvider):
         if self._cache_markers_for(model_name):
             messages, tools = self._apply_cache_control(messages, tools)
 
+        # The routing key is the third mechanism and the only one that works on
+        # an endpoint that reports nothing: it asks the gateway to keep this
+        # conversation's prefix on the machine that already holds it. Verified
+        # live against the configured gemini-proxy: accepted (HTTP 200) with the
+        # model still receiving the system prompt, and an unknown field is
+        # accepted too, so no gateway in use here rejects it. Bounded and hashed:
+        # see conversation_cache_key.
+        cache_mode = resolve_cache_mode(configured=self._prompt_cache, spec=spec)
+        cache_key = conversation_cache_key() if cache_mode != "off" else None
+
         model_name = self._request_model_name(model_name)
 
         kwargs: dict[str, Any] = {
@@ -1114,6 +1124,8 @@ class OpenAICompatProvider(LLMProvider):
                 model_name,
             ),
         }
+        if cache_key is not None:
+            kwargs["prompt_cache_key"] = cache_key
 
         # GPT-5 and reasoning models (o1/o3/o4) reject temperature when
         # reasoning_effort is active.  Only include it when safe.

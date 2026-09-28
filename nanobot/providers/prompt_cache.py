@@ -24,6 +24,16 @@ they are not interchangeable:
 
 ``off``
     Send nothing cache-related, including no markers for Claude.
+
+In every other mode the provider additionally sends ``prompt_cache_key``. That
+is not a cache format: it is a request for the gateway to route this
+conversation to the node that already holds its prefix, which is what stops a
+load-balanced gateway from serving every turn from a cold machine. OpenAI routes
+on it and a gateway that ignores the field is unaffected, so it is sent by
+default; it is also the only lever that exists on a gateway reporting no cache
+usage at all. Measured against the configured gemini-proxy: accepted (HTTP 200)
+with the system prompt still reaching the model, and no cache field reported
+back, so its routing effect *there* is unproven rather than zero.
 """
 
 from __future__ import annotations
@@ -115,7 +125,13 @@ def markers_allowed(
 
 
 def cache_marker_rejection(exc: BaseException) -> bool:
-    """Return True when a failed request failed *because of* cache markers.
+    """Return True when a failed request failed *because of* a cache field.
+
+    Covers both additions this module can make to a request: the explicit
+    breakpoints (``cache_control``) and the routing key (``prompt_cache_key``).
+    Either is a field an unverified gateway is entitled to refuse, and
+    :func:`strip_cache_markers` removes both, so one retry makes both refusals
+    survivable and a cache setting can never fail a turn.
 
     Only a loud refusal is detectable here. A gateway that swallows a marked
     block and answers normally cannot be caught at this layer, which is why
@@ -132,7 +148,13 @@ def cache_marker_rejection(exc: BaseException) -> bool:
     if code and code not in (400, 404, 415, 422):
         return False
     text = f"{exc}".lower()
-    if "cache_control" not in text and "cache control" not in text:
+    named = (
+        "cache_control" in text
+        or "cache control" in text
+        or "prompt_cache_key" in text
+        or "prompt cache key" in text
+    )
+    if not named:
         return False
     return "400" in text or "invalid" in text or "unsupported" in text or "unknown" in text or bool(code)
 
@@ -181,7 +203,49 @@ def strip_cache_markers(kwargs: dict[str, Any]) -> tuple[dict[str, Any], int]:
             new_tools.append(tool)
         new_kwargs["tools"] = new_tools
 
+    # The routing key is a cache field too: a gateway that refused the
+    # breakpoints gets a retry with nothing cache-related on it at all.
+    if new_kwargs.pop("prompt_cache_key", None) is not None:
+        removed += 1
+
     return new_kwargs, removed
+
+
+def bound_session_key() -> str | None:
+    """The conversation this LLM call belongs to, when the loop has bound one.
+
+    Imported lazily on purpose: the provider layer must not pull the tool layer
+    in at import time, and a caller that never binds a context simply has no
+    conversation to key a cache on.
+    """
+    try:
+        from nanobot.agent.tools.context import current_request_session_key
+    except Exception:  # noqa: BLE001 - a missing context layer only costs the key
+        return None
+    try:
+        return current_request_session_key()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def conversation_cache_key(session_key: str | None = None) -> str | None:
+    """A stable, bounded routing key for one conversation's prompt cache.
+
+    Sent as ``prompt_cache_key``. Gateways that route on it (OpenAI does) keep a
+    conversation on the machine that already holds its prefix, which is the
+    difference between a repeat request matching the cache and missing it; a
+    gateway that ignores the field is unaffected, so sending it costs nothing.
+    The session key is hashed because the field is bounded and a session key is
+    not: 32 hex characters, deterministic for the life of the conversation and
+    useless to anyone reading a gateway's logs.
+    """
+    import hashlib
+
+    key = (session_key if session_key is not None else bound_session_key()) or ""
+    key = key.strip()
+    if not key:
+        return None
+    return hashlib.sha256(key.encode("utf-8", "replace")).hexdigest()[:32]
 
 
 def cache_hit_pct(prompt_tokens: int, cached_tokens: int) -> float:
