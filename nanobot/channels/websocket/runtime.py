@@ -94,6 +94,7 @@ from nanobot.webui.metadata import (
 )
 from nanobot.webui.screen_stream import (
     DEFAULT_INTERVAL_S as SCREEN_DEFAULT_INTERVAL_S,
+    ErrorSink,
     FrameSink,
     ScreenStreamManager,
 )
@@ -472,6 +473,10 @@ class WebSocketChannel(BaseChannel):
         # leaving a pump writing frames into a dead transport.
         self._screens = ScreenStreamManager()
         self._conn_screens: dict[ServerConnection, dict[str, FrameSink]] = {}
+        # "Why nothing is arriving" sinks, kept per connection for the same reason
+        # as the frame sinks: a sandbox with no desktop to capture emits no frame
+        # to carry the explanation, so the stream's diagnostic travels separately.
+        self._conn_screen_errors: dict[ServerConnection, dict[str, ErrorSink]] = {}
 
     # -- Live screen --------------------------------------------------------
 
@@ -501,12 +506,19 @@ class WebSocketChannel(BaseChannel):
         except (TypeError, ValueError):
             interval_s = SCREEN_DEFAULT_INTERVAL_S
 
+        errors = self._conn_screen_errors.setdefault(connection, {})
+        error_sink = errors.get(chat_id)
+        if error_sink is None:
+            error_sink = self._make_screen_error_sink(connection, chat_id)
+            errors[chat_id] = error_sink
+
         stream = await self._screens.subscribe(
             chat_id,
             sink,
             display=_clean_display(envelope.get("display")),
             interval_s=interval_s,
             session_key=self._screen_session_key(chat_id),
+            error_sink=error_sink,
         )
         await self._send_event(
             connection,
@@ -530,6 +542,9 @@ class WebSocketChannel(BaseChannel):
         sink = self._conn_screens.get(connection, {}).pop(chat_id, None)
         if sink is not None:
             await self._screens.unsubscribe(chat_id, sink)
+        error_sink = self._conn_screen_errors.get(connection, {}).pop(chat_id, None)
+        if error_sink is not None:
+            await self._screens.remove_error_sink(chat_id, error_sink)
         await self._send_event(connection, "screen_unsubscribed", chat_id=chat_id)
 
     def _screen_chat_id(
@@ -568,11 +583,30 @@ class WebSocketChannel(BaseChannel):
 
         return sink
 
+    def _make_screen_error_sink(
+        self, connection: ServerConnection, chat_id: str
+    ) -> ErrorSink:
+        """Build the callable the stream uses to explain an empty panel.
+
+        Same lifecycle as the frame sink: the detail is sent on the connection that
+        opened the panel, and the reason is the sandbox's, not the connection's.
+        """
+
+        async def sink(detail: str) -> None:
+            await self._send_event(
+                connection, "screen_error", chat_id=chat_id, detail=detail
+            )
+
+        return sink
+
     async def _release_screen_sinks(self, connection: ServerConnection) -> None:
         """Detach every screen sink owned by a connection."""
         sinks = self._conn_screens.pop(connection, {})
         for chat_id, sink in sinks.items():
             await self._screens.unsubscribe(chat_id, sink)
+        errors = self._conn_screen_errors.pop(connection, {})
+        for chat_id, error_sink in errors.items():
+            await self._screens.remove_error_sink(chat_id, error_sink)
 
     # -- Subscription bookkeeping -------------------------------------------
 

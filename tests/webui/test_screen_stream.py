@@ -9,6 +9,7 @@ separately against a live terminal.
 from __future__ import annotations
 
 import asyncio
+import shlex
 import base64
 import json
 from pathlib import Path
@@ -26,6 +27,7 @@ from nanobot.webui.screen_stream import (
     ScreenFrame,
     ScreenStream,
     ScreenStreamManager,
+    desktop_provision_command,
     image_size,
 )
 
@@ -724,3 +726,239 @@ async def test_local_source_reports_a_diagnostic_on_a_missing_display() -> None:
 
     assert data is None
     assert await source.diagnostic()
+
+
+# ---------------------------------------------------------------------------
+# Desktop provisioning: a bare sandbox has no display to capture
+#
+# Tenki sessions are stock Ubuntu with no Xvfb, no ImageMagick and no window
+# manager (measured 2026-09-28), so the panel had nothing to show. The fix is to
+# notice *that* failure specifically and install a desktop; these tests pin the
+# detection, the once-only behaviour, the cap, and the shell the install uses.
+# ---------------------------------------------------------------------------
+
+
+def _bare_sandbox_source(monkeypatch, module, *, capture_failure: str | None = None):
+    """A SandboxScreenSource whose sandbox is scripted to fail the capture."""
+    calls: list[str] = []
+    marker_failure = capture_failure or module.NO_CAPTURER_MARKER + ":99"
+
+    async def fake_run(command, *, timeout=120, executor=None):
+        calls.append(command)
+        if command.startswith("set -u;") or "mkdir -p" in command and "import -window" in command:
+            if marker_failure:
+                return False, marker_failure
+            return True, "4096"
+        return True, "provisioning-started"
+
+    async def fake_root(session_key=None):
+        return "/home/tenki"
+
+    async def fake_fetch(remote_path, *, max_bytes=0, executor=None):
+        return b"\x89PNG\r\n\x1a\n" + b"0" * 32
+
+    monkeypatch.setattr(module, "run_remote", fake_run)
+    monkeypatch.setattr(module, "remote_workspace_root", fake_root)
+    monkeypatch.setattr(module, "fetch_remote_file", fake_fetch)
+
+    source = module.SandboxScreenSource(display=":99", size="1920x1080")
+    source._executor = RemoteExecutor(name="tenki", backend=object())  # noqa: SLF001
+    return source, calls
+
+
+def _provision_calls(calls: list[str]) -> list[str]:
+    return [c for c in calls if "PX_DISPLAY=" in c]
+
+
+def test_a_bare_sandbox_is_given_a_desktop(monkeypatch) -> None:
+    from nanobot.webui import screen_stream as module
+
+    source, calls = _bare_sandbox_source(monkeypatch, module)
+
+    assert asyncio.run(source.capture()) is None
+
+    started = _provision_calls(calls)
+    assert len(started) == 1, "the install must be started exactly once per attempt"
+    assert "PX_DISPLAY=:99" in started[0]
+    assert "PX_SIZE=1920x1080" in started[0]
+    # The panel is told what is happening; a blank rectangle for a minute reads
+    # as a fault, which is the whole reason this message exists.
+    assert source.last_error == module.PROVISIONING_MESSAGE
+
+
+def test_the_install_is_not_restarted_while_it_runs(monkeypatch) -> None:
+    """A poll every second must not launch a second apt inside the first."""
+    from nanobot.webui import screen_stream as module
+
+    source, calls = _bare_sandbox_source(monkeypatch, module)
+
+    asyncio.run(source.capture())
+    asyncio.run(source.capture())
+    asyncio.run(source.capture())
+
+    assert len(_provision_calls(calls)) == 1
+    assert source.last_error == module.PROVISIONING_MESSAGE
+
+
+def test_the_install_stops_being_retried_and_says_so(monkeypatch) -> None:
+    from nanobot.webui import screen_stream as module
+
+    source, calls = _bare_sandbox_source(monkeypatch, module)
+
+    for attempt in range(module.PROVISION_MAX_ATTEMPTS):
+        # Clear the in-flight window so each poll counts as a fresh attempt.
+        source._provision_at = None  # noqa: SLF001 - the seam under test
+        asyncio.run(source.capture())
+
+    source._provision_at = None  # noqa: SLF001
+    asyncio.run(source.capture())
+
+    attempts = len(_provision_calls(calls))
+    assert attempts == module.PROVISION_MAX_ATTEMPTS
+    assert source.last_error == module.PROVISION_FAILED_MESSAGE
+
+
+def test_an_unrelated_capture_failure_does_not_install_anything(monkeypatch) -> None:
+    """Only "no capturer" means a bare image; anything else is a real fault."""
+    from nanobot.webui import screen_stream as module
+
+    source, calls = _bare_sandbox_source(
+        monkeypatch, module, capture_failure="capture command failed: display busy"
+    )
+
+    assert asyncio.run(source.capture()) is None
+
+    assert _provision_calls(calls) == []
+    assert source.last_error == "capture command failed: display busy"
+
+
+@pytest.mark.parametrize(
+    "hostile", ["", "   ", ":99; rm -rf /", ":99$(id)", "localhost:99", ":", None, 42]
+)
+def test_provisioning_refuses_a_display_that_is_not_one(hostile) -> None:
+    """The display reaches a shell as the sandbox user, with sudo available."""
+    command = desktop_provision_command(hostile, "/home/tenki/.powerx-screen")
+
+    assert "PX_DISPLAY=:99 " in command
+    assert "rm -rf" not in command
+    assert "$(id)" not in command
+    assert "localhost" not in command
+
+
+@pytest.mark.parametrize("hostile", ["", "1920x1080; rm -rf /", "$(id)", "1920"])
+def test_provisioning_refuses_a_geometry_that_is_not_one(hostile) -> None:
+    command = desktop_provision_command(":99", "/home/tenki/.powerx-screen", hostile)
+
+    assert "PX_SIZE=1920x1080" in command
+    assert "rm -rf" not in command
+
+
+def test_the_provisioning_body_survives_sh_c_wrapping() -> None:
+    """The body is spliced into ``sh -c '<body>'``, so it cannot contain a quote.
+
+    An apostrophe anywhere in it would close the wrapper and hand the rest of the
+    install to the sandbox as a second command -- checked as an invariant rather
+    than trusted, because the body is edited by hand.
+    """
+    from nanobot.webui import screen_stream as module
+
+    body = module._PROVISION_BODY  # noqa: SLF001 - the invariant under test
+    assert "'" not in body
+
+    command = desktop_provision_command(":99", "/home/tenki/.powerx-screen", "1280x1024")
+    # The wrapped body must round-trip as exactly one argument, or the install
+    # would run truncated.
+    assert body in shlex.split(command)
+
+
+def test_the_window_manager_check_cannot_match_its_own_shell() -> None:
+    """Both halves of this were live bugs; neither may come back.
+
+    ``pgrep -f matchbox-window-manager`` matched the shell *running the body*,
+    because that shell's command line contains the pattern -- so the check
+    decided a window manager was already up and never started one. The pattern is
+    ``-x`` (process name) and truncated to 15 characters because that is where the
+    kernel truncates it. And ``pgrep ... || cmd &`` backgrounds the whole and-or
+    list, racing the script past the start, so every backgrounded start is wrapped
+    in ``if``.
+    """
+    from nanobot.webui import screen_stream as module
+
+    body = module._PROVISION_BODY  # noqa: SLF001 - the invariant under test
+    assert "pgrep -x matchbox-window >/dev/null 2>&1" in body
+    assert "pgrep -f matchbox-window-manager" not in body
+    assert "if ! pgrep -x matchbox-window >/dev/null 2>&1; then" in body
+    assert "if ! pgrep -f \"Xvfb $D\" >/dev/null 2>&1; then" in body
+
+
+# ---------------------------------------------------------------------------
+# Error sinks: an empty panel has to say why
+# ---------------------------------------------------------------------------
+
+
+class ErrorSinkRecorder:
+    def __init__(self) -> None:
+        self.details: list[str] = []
+
+    async def __call__(self, detail: str) -> None:
+        self.details.append(detail)
+
+
+async def test_a_failing_stream_explains_itself_to_the_error_sink() -> None:
+    """No frame means no explanation, so the diagnostic travels on its own event."""
+    source = FakeSource([None, None, None])
+    stream = ScreenStream("err1", source, interval_s=_FAST, keepalive_s=60.0)
+    errors = ErrorSinkRecorder()
+    await stream.add_error_sink(errors)
+
+    await stream.subscribe(Sink())
+    await _settle(stream, _WINDOW)
+
+    assert errors.details, "an empty panel must be told why it is empty"
+    assert errors.details[0] == "fake source ran out of frames"
+    # Repeated identical diagnostics are dropped: the pump re-diagnoses on every
+    # backoff and the operator does not need the same sentence once a second.
+    assert len(set(errors.details)) == 1
+    await stream.stop()
+
+
+async def test_the_error_sink_is_told_immediately_when_one_is_added_late() -> None:
+    source = FakeSource([None, None])
+    stream = ScreenStream("err2", source, interval_s=_FAST, keepalive_s=60.0)
+    await stream.subscribe(Sink())
+    await _settle(stream, _WINDOW)
+    assert stream.error is not None
+
+    errors = ErrorSinkRecorder()
+    await stream.add_error_sink(errors)
+
+    assert errors.details == [stream.error]
+    await stream.stop()
+
+
+async def test_a_removed_error_sink_is_not_told_again() -> None:
+    source = FakeSource([None, None])
+    stream = ScreenStream("err3", source, interval_s=_FAST, keepalive_s=60.0)
+    errors = ErrorSinkRecorder()
+    await stream.add_error_sink(errors)
+    await stream.remove_error_sink(errors)
+
+    await stream.subscribe(Sink())
+    await _settle(stream, _WINDOW)
+
+    assert errors.details == []
+    await stream.stop()
+
+
+async def test_recording_frames_does_not_notify_error_sinks() -> None:
+    """Recovery is carried by the frame itself, not by a second event."""
+    source = FakeSource([_png(fill=1), _png(fill=2)])
+    stream = ScreenStream("err4", source, interval_s=_FAST, keepalive_s=60.0)
+    errors = ErrorSinkRecorder()
+    await stream.add_error_sink(errors)
+
+    await stream.subscribe(Sink())
+    await _settle(stream, _WINDOW)
+
+    assert errors.details == []
+    await stream.stop()

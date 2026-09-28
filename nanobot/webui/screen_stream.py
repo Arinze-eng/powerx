@@ -55,6 +55,7 @@ import asyncio
 import base64
 import contextlib
 import os
+import re
 import shlex
 import time
 from dataclasses import dataclass
@@ -100,6 +101,147 @@ REMOTE_FRAME = "frame.png"
 #: A frame is tens of KB. The bound separates "too big" from "transfer failed".
 MAX_FRAME_BYTES = 6 * 1024 * 1024
 
+#: The capture script's own refusal text, emitted (exit 3) when the display it was
+#: told to capture has no X server or no capturer on it.
+#:
+#: This is the signal that the sandbox image is *bare* -- a Tenki session is stock
+#: Ubuntu with no Xvfb, no ImageMagick and no window manager (measured
+#: 2026-09-28: every one of those `MISSING`) -- as opposed to a sandbox whose
+#: desktop exists but is unreachable. Only the first case is worth fixing by
+#: provisioning, which is what makes this string load-bearing rather than a
+#: convenience: provisioning a reachable display's sandbox would be a surprise
+#: install, and not provisioning a bare one leaves an empty panel forever.
+NO_CAPTURER_MARKER = "no capturer on DISPLAY="
+
+#: Below this many seconds between provisioning attempts, a poll that still finds
+#: no capturer is reported as "still starting" instead of re-running the install.
+#: ``apt-get update`` plus the install measured 38 s against a live Tenki session,
+#: so anything much shorter would start a second apt run inside the first.
+PROVISION_RETRY_S = 45.0
+
+#: Give up after this many attempts and say so, rather than installing forever.
+PROVISION_MAX_ATTEMPTS = 3
+
+#: Shown while the desktop is being installed. Deliberately says what is happening
+#: and roughly how long, because the panel is otherwise a blank rectangle for a
+#: minute and "no frames yet" reads as a fault.
+PROVISIONING_MESSAGE = (
+    "This sandbox has no desktop yet, so there is nothing to capture. Installing "
+    "Xvfb and the screen-capture tools inside it now; frames start as soon as it "
+    "comes up (about a minute)."
+)
+
+PROVISION_FAILED_MESSAGE = (
+    "This sandbox could not be given a desktop: the capture tools could not be "
+    "installed in it. The panel needs ImageMagick (import) or ffmpeg and a running "
+    "X display; see desktop.log in the sandbox for what the install said."
+)
+
+#: Only an X display spec may be interpolated into the provisioning shell. The
+#: capture script relies on the display having been validated upstream
+#: (``runtime._clean_display``); this repeats the check because the value here
+#: reaches a shell that runs as the sandbox user, with ``sudo`` available.
+_DISPLAY_SPEC_RE = re.compile(r"^:[0-9]{1,3}(\.[0-9]{1,2})?$")
+
+#: Xvfb geometry is taken from the same ``WxH`` spec the ffmpeg fallback uses, so
+#: the two paths capture the same rectangle instead of disagreeing about it.
+_SIZE_RE = re.compile(r"^[0-9]{3,4}x[0-9]{3,4}$")
+
+#: The provisioning body. Detached with its own log, and written without a single
+#: apostrophe so it can be wrapped in ``sh -c '...'``: the display and geometry
+#: arrive through ``PX_DISPLAY`` / ``PX_SIZE`` and every path through a variable,
+#: so nothing inside needs quoting.
+#:
+#: Three things here are load-bearing, and each was wrong on a live run first:
+#:
+#: * every background start is wrapped in ``if``. ``pgrep ... || cmd &`` does not
+#:   mean "start cmd in the background if it is missing" -- ``&`` binds the whole
+#:   and-or list, so the *check* was backgrounded and the script raced past the
+#:   start it was supposed to wait for. The window manager never came up that way
+#:   while Xvfb did, purely because a ``sleep`` happened to follow one of them;
+#:
+#: * the window manager is matched with ``pgrep -x matchbox-window``, never with
+#:   ``pgrep -f matchbox-window-manager``. ``-f`` matches the full command line,
+#:   and the command line of the shell *running this body* contains that literal
+#:   string -- so the check matched its own shell, decided a window manager was
+#:   already up, and never started one. ``-x`` matches the process name instead,
+#:   which cannot contain this script. It is ``matchbox-window`` and not the full
+#:   name because the kernel truncates the process name to 15 characters, so the
+#:   longer pattern would match nothing at all;
+#: * ``Xvfb`` is matched as ``"Xvfb $D"`` -- after expansion, e.g. ``Xvfb :99`` --
+#:   which the body does not contain literally (the body writes ``Xvfb "$D"``), so
+#:   that check is genuinely about the running server.
+_PROVISION_BODY = (
+    'set -u; D="$PX_DISPLAY"; need=""; '
+    "command -v Xvfb >/dev/null 2>&1 || need=1; "
+    "command -v import >/dev/null 2>&1 || need=1; "
+    'if [ -n "$need" ] && command -v apt-get >/dev/null 2>&1; then '
+    'if [ "$(id -u)" = 0 ]; then APT="apt-get"; '
+    "elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then "
+    'APT="sudo -n env DEBIAN_FRONTEND=noninteractive apt-get"; else APT=""; fi; '
+    'if [ -n "$APT" ]; then echo installing the desktop stack; '
+    "$APT update -qq; "
+    "$APT install -y -qq xvfb imagemagick x11-apps matchbox-window-manager xterm; "
+    "fi; fi; "
+    'command -v Xvfb >/dev/null 2>&1 || { echo no-Xvfb-available; exit 4; }; '
+    'if ! pgrep -f "Xvfb $D" >/dev/null 2>&1; then '
+    'nohup Xvfb "$D" -screen 0 "$PX_SIZE"x24 >>"$PX_LOG" 2>&1 & fi; '
+    "sleep 2; "
+    'pgrep -f "Xvfb $D" >/dev/null 2>&1 || { echo Xvfb-did-not-start; exit 5; }; '
+    "if ! pgrep -x matchbox-window >/dev/null 2>&1; then "
+    'DISPLAY="$D" nohup matchbox-window-manager -use_titlebar no >>"$PX_LOG" 2>&1 & fi; '
+    "if command -v xterm >/dev/null 2>&1; then "
+    "if ! pgrep -x xterm >/dev/null 2>&1; then "
+    'DISPLAY="$D" nohup xterm -fa Monospace -fs 11 -geometry 100x28+0+0 '
+    '>>"$PX_LOG" 2>&1 & fi; fi; '
+    "sleep 1; mkdir -p \"$PX_DIR\"; "
+    'printf "wm="; pgrep -x matchbox-window | head -1; '
+    'printf "xvfb="; pgrep -f "Xvfb $D" | head -1; echo; '
+    'DISPLAY="$D" import -window root "$PX_DIR/frame.png" >/dev/null 2>&1 && '
+    "echo desktop-ready || echo desktop-up"
+)
+
+
+def desktop_provision_command(
+    display: str, out_dir: str, size: str = DEFAULT_SIZE
+) -> str:
+    """Shell that gives a bare sandbox a capturable desktop, detached.
+
+    Detached on purpose: the install measured **38 s** inside a live Tenki
+    session, and holding the capture pump's command open that long would freeze
+    the panel it is trying to fill. The pump polls instead -- the same contract
+    ``install_mt5_sandbox.sh`` and ``install_engineering_draw.sh`` use, which is
+    also why this installs the display stack those scripts install (Xvfb, a window
+    manager with a window on it, and ImageMagick's ``import``).
+
+    A window manager and an ``xterm`` are started as well as Xvfb: a bare Xvfb
+    serves a black root window, and a black rectangle is indistinguishable from a
+    broken panel. The ``xterm`` gives the operator something to look at, and any
+    GUI the agent starts afterwards appears on the same display.
+
+    ``display`` and ``size`` are re-validated rather than trusted: both reach a
+    shell, and the sandbox user has ``sudo``.
+    """
+    spec = display.strip() if isinstance(display, str) else ""
+    if not _DISPLAY_SPEC_RE.match(spec):
+        spec = DEFAULT_DISPLAY
+    geometry = size.strip() if isinstance(size, str) else ""
+    if not _SIZE_RE.match(geometry):
+        geometry = DEFAULT_SIZE
+    quoted_dir = shlex.quote(out_dir)
+    quoted_log = shlex.quote(f"{out_dir.rstrip('/')}/desktop.log")
+    # The display and geometry are spliced unquoted into an ``env`` argument list.
+    # Both are now known to be a bare ``:99`` / ``1920x1080`` and cannot carry a
+    # metacharacter, which is what makes that safe; a path cannot make that claim
+    # and so goes through ``shlex.quote``.
+    return (
+        f"mkdir -p {quoted_dir} && "
+        f"nohup env PX_DISPLAY={spec} PX_SIZE={geometry} "
+        f"PX_LOG={quoted_log} PX_DIR={quoted_dir} "
+        f"sh -c {shlex.quote(_PROVISION_BODY)} >> {quoted_log} 2>&1 & "
+        "echo provisioning-started"
+    )
+
 #: How long to wait before retrying after a failed capture, so a sandbox that is
 #: down does not turn into a hot loop hammering it.
 ERROR_BACKOFF_S = 3.0
@@ -108,6 +250,11 @@ _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 #: What the gateway calls to hand one frame to one subscriber.
 FrameSink = Callable[..., Awaitable[None]]
+
+#: What the gateway calls with a human-readable reason when a stream has nothing to
+#: show. A cleared error (``None`` -- frames are arriving again) is not sent,
+#: because the frame itself carries the recovery.
+ErrorSink = Callable[[str], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -230,6 +377,11 @@ class SandboxScreenSource:
         self.location = "sandbox"
         self._frame_path: str | None = None
         self.last_error: str | None = None
+        # Provisioning bookkeeping. ``_provision_attempts`` is capped so a sandbox
+        # that cannot take the install is reported honestly once instead of being
+        # retried forever, and ``_provision_at`` spaces attempts out.
+        self._provision_attempts = 0
+        self._provision_at: float | None = None
 
     async def _resolve(self) -> RemoteExecutor:
         """Resolve (and cache) the sandbox handle, re-resolving when it drops."""
@@ -289,6 +441,43 @@ class SandboxScreenSource:
         """Nothing to decide: this source always captures in the sandbox."""
         return None
 
+    async def _provision_desktop(self, executor: RemoteExecutor, out: str) -> None:
+        """Give a bare sandbox an X desktop, and report it while that happens.
+
+        Only called when the capture script refused for *want of a capturer*
+        (:data:`NO_CAPTURER_MARKER`) -- see that constant for why the distinction
+        between "no desktop" and "desktop unreachable" matters.
+
+        The install is started detached and returns immediately, so the pump keeps
+        polling and picks up the frame on the first capture after Xvfb is up. Until
+        then ``last_error`` says what is going on, which the panel shows: without
+        that the operator sees an empty rectangle with no explanation for a minute.
+        """
+        now = time.monotonic()
+        if self._provision_attempts >= PROVISION_MAX_ATTEMPTS:
+            self.last_error = PROVISION_FAILED_MESSAGE
+            return
+        if self._provision_at is not None and now - self._provision_at < PROVISION_RETRY_S:
+            # An install is already in flight. Re-running apt now would only
+            # contend with it, so report progress and let the next poll decide.
+            self.last_error = PROVISIONING_MESSAGE
+            return
+        self._provision_attempts += 1
+        self._provision_at = now
+        self.last_error = PROVISIONING_MESSAGE
+        out_dir = out.rsplit("/", 1)[0] if "/" in out else out
+        ok, output = await run_remote(
+            desktop_provision_command(self.display, out_dir, self.size),
+            timeout=60,
+            executor=executor,
+        )
+        if not ok:
+            logger.debug(
+                "screen_stream: could not start desktop provisioning on {}: {}",
+                self.display,
+                (output or "").strip()[-200:],
+            )
+
     async def capture(self) -> bytes | None:
         """Capture one frame, or ``None`` when the sandbox cannot produce it."""
         executor = await self._resolve()
@@ -301,7 +490,11 @@ class SandboxScreenSource:
             return None
         ok, output = await run_remote(self._script(out), timeout=60, executor=executor)
         if not ok:
-            self.last_error = (output or "").strip()[-300:] or "capture command failed"
+            text = (output or "").strip()
+            if NO_CAPTURER_MARKER in text:
+                await self._provision_desktop(executor, out)
+                return None
+            self.last_error = text[-300:] or "capture command failed"
             return None
         data = await fetch_remote_file(out, max_bytes=MAX_FRAME_BYTES, executor=executor)
         if not data:
@@ -482,6 +675,7 @@ class ScreenStream:
         self.interval_s = min(MAX_INTERVAL_S, max(MIN_INTERVAL_S, float(interval_s)))
         self.keepalive_s = max(self.interval_s, float(keepalive_s))
         self._subscribers: set[FrameSink] = set()
+        self._error_sinks: set[ErrorSink] = set()
         self._task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
         self._last_pushed: ScreenFrame | None = None
@@ -507,6 +701,40 @@ class ScreenStream:
             # A new subscriber must not stare at an empty panel until the screen
             # next changes — an idle terminal can be static for minutes.
             await self._emit(sink, self._last_pushed, replay=True)
+
+    async def add_error_sink(self, sink: ErrorSink) -> None:
+        """Attach a sink for "why nothing is arriving" messages."""
+        self._error_sinks.add(sink)
+        if self.error is not None:
+            # A panel opened while the stream is already failing should say so now
+            # rather than after the next failed poll.
+            with contextlib.suppress(Exception):
+                await sink(self.error)
+
+    async def remove_error_sink(self, sink: ErrorSink) -> None:
+        self._error_sinks.discard(sink)
+
+    async def _publish_error(self, text: str | None) -> None:
+        """Tell error sinks why nothing is arriving, when that changes.
+
+        The pump's failure path emits no frame, so the reason has to travel on its
+        own event: without it the panel is an empty rectangle, which is
+        indistinguishable from a broken panel. Repeated identical diagnostics are
+        dropped, because the pump re-diagnoses on every backoff and the operator
+        does not need the same sentence once a second.
+        """
+        if text == self.error:
+            return
+        self.error = text
+        if text is None:
+            # Recovery is carried by the frame that resumes the stream.
+            return
+        for sink in tuple(self._error_sinks):
+            try:
+                await sink(text)
+            except Exception as exc:  # noqa: BLE001 - a dead subscriber is expected
+                logger.debug("screen_stream: dropping error sink for {}: {}", self.key, exc)
+                self._error_sinks.discard(sink)
 
     async def unsubscribe(self, sink: FrameSink) -> None:
         async with self._lock:
@@ -546,7 +774,7 @@ class ScreenStream:
                 started = time.monotonic()
                 data = await self.source.capture()
                 if data is None:
-                    self.error = await self.source.diagnostic()
+                    await self._publish_error(await self.source.diagnostic())
                     await asyncio.sleep(ERROR_BACKOFF_S)
                     continue
 
@@ -576,6 +804,8 @@ class ScreenStream:
                     )
                     self._last_pushed = frame
                     self._last_push_at = now
+                    # Clears ``error`` for readers of the stream's own state; the
+                    # sinks are not told, because the frame is the notification.
                     self.error = None
                     await self._fanout(frame)
 
@@ -628,12 +858,16 @@ class ScreenStreamManager:
         display: str | None = None,
         interval_s: float | None = None,
         session_key: str | None = None,
+        error_sink: ErrorSink | None = None,
     ) -> ScreenStream:
         """Attach *sink* to the session's stream, creating the stream if needed.
 
         *session_key* is the sandbox this stream captures, and is only consulted
         when the stream is created: one stream per key means every later
         subscriber joins the sandbox the first one named.
+
+        *error_sink* is attached as well when given, so the subscriber learns why
+        the stream is empty instead of waiting on an image that is not coming.
         """
         async with self._lock:
             stream = self._streams.get(key)
@@ -652,7 +886,21 @@ class ScreenStreamManager:
                     await source.resolve()
                 self._streams[key] = stream
         await stream.subscribe(sink)
+        if error_sink is not None:
+            await stream.add_error_sink(error_sink)
         return stream
+
+    async def add_error_sink(self, key: str, sink: ErrorSink) -> None:
+        """Register an error sink on an existing stream, if it still exists."""
+        stream = self._streams.get(key)
+        if stream is not None:
+            await stream.add_error_sink(sink)
+
+    async def remove_error_sink(self, key: str, sink: ErrorSink) -> None:
+        """Detach an error sink; a stream that has already gone is not an error."""
+        stream = self._streams.get(key)
+        if stream is not None:
+            await stream.remove_error_sink(sink)
 
     async def unsubscribe(self, key: str, sink: FrameSink) -> None:
         async with self._lock:
