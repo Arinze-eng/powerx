@@ -295,6 +295,51 @@ def test_a_wine_that_cannot_execute_stops_the_install_instead_of_retrying():
     assert 'log "WARN: ${WINE_BIN} is present but does not execute' not in script
 
 
+def test_the_installer_serialises_apt_against_the_live_screen_provisioner():
+    """Every apt call must take the shared lock, or the two writers destroy each other.
+
+    MEASURED FAILURE (2026-09-28, live Tenki session, MT5 + Live screen at once):
+    while this installer ran its own ``apt-get install xvfb winbind ...``, the
+    Live-screen provisioner found no capturer and started a second apt run. The
+    installer's transaction then failed with
+
+      dpkg: error processing archive /tmp/apt-dpkg-install-XXXXXX/81-xvfb_....deb
+            (--unpack): cannot access archive ...: No such file or directory
+
+    for the last sixteen packages, so **xvfb was never installed**. The installer
+    swallowed it via ``apt_install ... || true`` and carried on with no display,
+    and the provisioner answered ``E: Could not get lock
+    /var/lib/dpkg/lock-frontend``. Both sides are now locked on
+    ``/tmp/powerx-apt.lock`` (the same path the provisioner uses) and pass apt's
+    own lock timeouts, so one waits for the other instead of colliding.
+
+    The window-manager check is pinned here too: ``pgrep -x
+    matchbox-window-manager`` matches nothing because the kernel truncates process
+    names to 15 characters, so a second window manager was started on :99 on every
+    install.
+    """
+    script = (Path(__file__).resolve().parents[2] / "scripts" / "install_mt5_sandbox.sh").read_text()
+
+    # The shared lock, the same path the Live-screen provisioner takes.
+    assert 'APT_LOCK_PATH="/tmp/powerx-apt.lock"' in script
+    assert 'flock -w "${APT_LOCK_TIMEOUT_S}" 8' in script
+    # Every apt call is both locked and given apt's own patience -- no bare call
+    # may survive, because a bare one is exactly what lost the transaction.
+    assert script.count("$SUDO apt-get") == script.count('$SUDO apt-get "${APT_OPTS[@]}"')
+    assert script.count("apt_lock\n") >= 5
+    assert "APT::Lock::Timeout=" in script and "DPkg::Lock::Timeout=" in script
+    # The Wine install is the transaction that ran inside the collision window.
+    assert 'apt_lock\n  if $SUDO apt-get "${APT_OPTS[@]}" install -y -qq --allow-downgrades' in script
+    # The display tools are installed *and verified* before Xvfb is started, by
+    # name, so a silently lost install says so instead of leaving a black panel.
+    assert "apt_install_display xvfb import || true" in script
+    assert "display tools ready" in script
+
+    # Kernel truncates to 15 characters: the full name matches nothing.
+    assert "pgrep -x matchbox-window-manager" not in script
+    assert "pgrep -x matchbox-window >/dev/null 2>&1" in script
+
+
 def test_start_command_seeds_login_and_portable_mode():
     cmd = build_cli_command(
         "start", {"login": 1111291280, "password": "pw", "server": "Forex Hedged USD"}

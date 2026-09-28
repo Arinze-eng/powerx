@@ -745,7 +745,12 @@ def _bare_sandbox_source(monkeypatch, module, *, capture_failure: str | None = N
 
     async def fake_run(command, *, timeout=120, executor=None):
         calls.append(command)
-        if command.startswith("set -u;") or "mkdir -p" in command and "import -window" in command:
+        # The capture script is the one that echoes the marker; the provisioning
+        # command only *contains* that text nowhere -- but it does contain
+        # ``import -window`` inside its detached body, so dispatching on that
+        # would read the installer as a capture and the install would never be
+        # seen as started.
+        if module.NO_CAPTURER_MARKER in command:
             if marker_failure:
                 return False, marker_failure
             return True, "4096"
@@ -869,6 +874,108 @@ def test_the_provisioning_body_survives_sh_c_wrapping() -> None:
     # The wrapped body must round-trip as exactly one argument, or the install
     # would run truncated.
     assert body in shlex.split(command)
+
+
+def test_the_provisioning_body_takes_the_apt_lock() -> None:
+    """Both writers of apt on one sandbox must serialise, or both lose.
+
+    MEASURED FAILURE (2026-09-28, live Tenki session, MT5 + Live screen together):
+    ``install_mt5_sandbox.sh`` was running its own ``apt-get install xvfb ...``
+    when the pump, finding no capturer, started a second apt. The installer's
+    transaction then died with
+
+      dpkg: error processing archive ....deb (--unpack):
+            cannot access archive ....deb: No such file or directory
+
+    for the last sixteen packages -- xvfb among them -- and the pump's install
+    answered ``E: Could not get lock /var/lib/dpkg/lock-frontend``. Net result:
+    no display, so no frames, which is exactly the bug this provisioning exists
+    to fix. Novita never showed it because that image already ships Xvfb.
+    """
+    from nanobot.webui import screen_stream as module
+
+    body = module._PROVISION_BODY  # noqa: SLF001 - the invariant under test
+
+    # A shared lock every apt writer on the sandbox takes, with the whole wait
+    # bounded so a poll thread cannot be pinned forever.
+    assert module.APT_LOCK_PATH in body
+    assert f"flock -w {module.APT_LOCK_TIMEOUT_S} 9" in body
+    # And apt's own patience as well: the lock file only helps while both sides
+    # are updated copies of this repo, these help regardless.
+    assert f"APT::Lock::Timeout={module.APT_LOCK_TIMEOUT_S}" in body
+    assert f"DPkg::Lock::Timeout={module.APT_LOCK_TIMEOUT_S}" in body
+    # A single lost transaction is not a verdict on the sandbox, so the install
+    # is retried -- including with --fix-missing, which is what repairs the
+    # half-unpacked archive list a lost transaction leaves behind.
+    assert "while [ \"$n\" -lt 4 ]" in body
+    assert "--fix-missing install" in body
+    # The lock is only worth taking where flock exists; without it the install
+    # still runs rather than skipping itself into a desktop-less sandbox.
+    assert "command -v flock" in body
+
+
+def test_the_install_is_detached_into_its_own_session() -> None:
+    """On Tenki a backgrounded install still blocks the caller's shell call.
+
+    MEASURED (2026-09-28): the detached install took 72 s of wall clock on the
+    caller even though it backgrounds its work, because the sandbox's ``shell``
+    call does not return until the process group does. ``setsid`` plus
+    ``< /dev/null`` gives it its own session with no controlling terminal, so it
+    survives the caller's timeout -- and the caller's timeout is raised to match
+    the longest the lock wait can legally take rather than the install itself.
+    """
+    from nanobot.webui import screen_stream as module
+
+    command = desktop_provision_command(":99", "/home/tenki/.powerx-screen")
+
+    assert "setsid nohup" in command
+    assert "< /dev/null &" in command
+    # A sandbox without setsid must still get the install, not a syntax error.
+    assert "else nohup" in command
+    assert command.rstrip().endswith("echo provisioning-started")
+
+
+def test_the_provision_call_outlasts_the_apt_lock_wait(monkeypatch) -> None:
+    """The caller's ceiling must not land on an install that is merely queueing."""
+    from nanobot.webui import screen_stream as module
+
+    timeouts: list[float] = []
+
+    async def fake_run(command, *, timeout=120, executor=None):
+        timeouts.append(timeout)
+        return False, module.NO_CAPTURER_MARKER + ":99"
+
+    async def fake_root(session_key=None):
+        return "/home/tenki"
+
+    monkeypatch.setattr(module, "run_remote", fake_run)
+    monkeypatch.setattr(module, "remote_workspace_root", fake_root)
+
+    source = module.SandboxScreenSource(display=":99", size="1920x1080")
+    source._executor = RemoteExecutor(name="tenki", backend=object())  # noqa: SLF001
+
+    assert asyncio.run(source.capture()) is None
+
+    # capture, then provisioning.
+    assert len(timeouts) == 2
+    assert timeouts[1] > module.APT_LOCK_TIMEOUT_S, (
+        "the provisioning call must outlast a legal lock wait, not the install"
+    )
+
+
+def test_the_retry_window_spans_a_metatrader_install() -> None:
+    """One apt writer finishes, then the other: the wait cannot be 45 s.
+
+    A WineHQ install that holds apt measured 2 m 21 s on a live Tenki session
+    (2026-09-28), and while it holds apt the pump's own install is only queueing.
+    Re-running the install every 45 s would stack a third attempt on top of two
+    that have not had a turn yet, so the window and the attempt budget are sized
+    to outlast an installer.
+    """
+    from nanobot.webui import screen_stream as module
+
+    assert module.PROVISION_RETRY_S >= 90.0
+    assert module.PROVISION_MAX_ATTEMPTS * module.PROVISION_RETRY_S >= 360.0
 
 
 def test_the_window_manager_check_cannot_match_its_own_shell() -> None:

@@ -116,11 +116,15 @@ NO_CAPTURER_MARKER = "no capturer on DISPLAY="
 #: Below this many seconds between provisioning attempts, a poll that still finds
 #: no capturer is reported as "still starting" instead of re-running the install.
 #: ``apt-get update`` plus the install measured 38 s against a live Tenki session,
-#: so anything much shorter would start a second apt run inside the first.
-PROVISION_RETRY_S = 45.0
+#: but on a session where ``install_mt5_sandbox.sh`` is running it waits on that
+#: installer's own apt (``DPkg::Lock::Timeout``, up to 900 s), so the window has to
+#: span a full WineHQ install -- measured 2 m 21 s on 2026-09-28.
+PROVISION_RETRY_S = 90.0
 
 #: Give up after this many attempts and say so, rather than installing forever.
-PROVISION_MAX_ATTEMPTS = 3
+#: Sized so the whole window comfortably outlasts an installer that is holding
+#: apt: 5 attempts, 90 s apart, is over six minutes of trying.
+PROVISION_MAX_ATTEMPTS = 5
 
 #: Shown while the desktop is being installed. Deliberately says what is happening
 #: and roughly how long, because the panel is otherwise a blank rectangle for a
@@ -128,7 +132,8 @@ PROVISION_MAX_ATTEMPTS = 3
 PROVISIONING_MESSAGE = (
     "This sandbox has no desktop yet, so there is nothing to capture. Installing "
     "Xvfb and the screen-capture tools inside it now; frames start as soon as it "
-    "comes up (about a minute)."
+    "comes up. This takes about a minute, and longer while a MetaTrader install "
+    "is still running, because it uses the same package manager."
 )
 
 PROVISION_FAILED_MESSAGE = (
@@ -147,12 +152,38 @@ _DISPLAY_SPEC_RE = re.compile(r"^:[0-9]{1,3}(\.[0-9]{1,2})?$")
 #: the two paths capture the same rectangle instead of disagreeing about it.
 _SIZE_RE = re.compile(r"^[0-9]{3,4}x[0-9]{3,4}$")
 
+#: The one apt lock every writer of apt on a sandbox takes before it runs.
+#:
+#: MEASURED 2026-09-28, live Tenki session, MT5 + Live screen together: the two
+#: apt runs on one fresh sandbox destroy each other. ``install_mt5_sandbox.sh``
+#: had started its own ``apt-get install xvfb winbind ...`` and the pump, finding
+#: no capturer, started a second one -- and the installer's dpkg then failed with
+#:
+#:   dpkg: error processing archive /tmp/apt-dpkg-install-XXXXXX/81-xvfb_....deb
+#:         (--unpack): cannot access archive ...: No such file or directory
+#:
+#: for the last sixteen packages of its transaction, so **xvfb was never
+#: installed**, the installer swallowed the failure with ``|| true`` and carried
+#: on with no display, and the pump's own install answered ``E: Could not get
+#: lock /var/lib/dpkg/lock-frontend``. Net effect: an empty Live screen forever,
+#: which is exactly the bug this provisioning exists to fix.
+#:
+#: This is why Novita never showed it: that image ships Xvfb and ImageMagick, so
+#: the pump never provisions there and there is only ever one apt run.
+APT_LOCK_PATH = "/tmp/powerx-apt.lock"
+
+#: apt's own patience. If both writers take the lock *and* pass these, a second
+#: run waits for the first instead of failing on it -- belt and braces, because
+#: the lock file only helps while both sides are updated copies of this repo.
+APT_LOCK_TIMEOUT_S = 900
+
 #: The provisioning body. Detached with its own log, and written without a single
 #: apostrophe so it can be wrapped in ``sh -c '...'``: the display and geometry
 #: arrive through ``PX_DISPLAY`` / ``PX_SIZE`` and every path through a variable,
 #: so nothing inside needs quoting.
 #:
-#: Three things here are load-bearing, and each was wrong on a live run first:
+#: Five things here are load-bearing, and each was measured wrong on a live run
+#: first:
 #:
 #: * every background start is wrapped in ``if``. ``pgrep ... || cmd &`` does not
 #:   mean "start cmd in the background if it is missing" -- ``&`` binds the whole
@@ -170,19 +201,34 @@ _SIZE_RE = re.compile(r"^[0-9]{3,4}x[0-9]{3,4}$")
 #:   longer pattern would match nothing at all;
 #: * ``Xvfb`` is matched as ``"Xvfb $D"`` -- after expansion, e.g. ``Xvfb :99`` --
 #:   which the body does not contain literally (the body writes ``Xvfb "$D"``), so
-#:   that check is genuinely about the running server.
+#:   that check is genuinely about the running server;
+#: * apt is serialised. The body takes :data:`APT_LOCK_PATH` and passes apt's own
+#:   lock timeouts, so a MetaTrader install running its own apt makes this one
+#:   *wait* instead of the two colliding -- see that constant for the failure it
+#:   was measured causing. The install is also retried inside the body, because a
+#:   single lost transaction is not a verdict on the sandbox;
+#: * the install is skipped entirely when the tools are already there, so a
+#:   sandbox whose desktop merely had not been started yet is never given an apt
+#:   run for nothing.
 _PROVISION_BODY = (
-    'set -u; D="$PX_DISPLAY"; need=""; '
+    'set -u; D="$PX_DISPLAY"; '
+    'LOCK="' + APT_LOCK_PATH + '"; '
+    "if command -v flock >/dev/null 2>&1; then exec 9>\"$LOCK\"; flock -w " + str(APT_LOCK_TIMEOUT_S) + " 9; fi; "
+    'OPTS="-o APT::Lock::Timeout=' + str(APT_LOCK_TIMEOUT_S) + ' -o DPkg::Lock::Timeout=' + str(APT_LOCK_TIMEOUT_S) + '"; '
+    'PKGS="xvfb imagemagick x11-apps matchbox-window-manager xterm"; '
+    'need=""; '
     "command -v Xvfb >/dev/null 2>&1 || need=1; "
     "command -v import >/dev/null 2>&1 || need=1; "
     'if [ -n "$need" ] && command -v apt-get >/dev/null 2>&1; then '
     'if [ "$(id -u)" = 0 ]; then APT="apt-get"; '
     "elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then "
     'APT="sudo -n env DEBIAN_FRONTEND=noninteractive apt-get"; else APT=""; fi; '
-    'if [ -n "$APT" ]; then echo installing the desktop stack; '
-    "$APT update -qq; "
-    "$APT install -y -qq xvfb imagemagick x11-apps matchbox-window-manager xterm; "
-    "fi; fi; "
+    'if [ -n "$APT" ]; then n=0; '
+    'while [ "$n" -lt 4 ]; do n=$((n + 1)); echo "desktop install attempt $n"; '
+    "$APT $OPTS update -qq; "
+    "$APT $OPTS install -y -qq --no-install-recommends $PKGS && break; "
+    "$APT $OPTS --fix-missing install -y -qq --no-install-recommends $PKGS && break; "
+    "sleep 20; done; fi; fi; "
     'command -v Xvfb >/dev/null 2>&1 || { echo no-Xvfb-available; exit 4; }; '
     'if ! pgrep -f "Xvfb $D" >/dev/null 2>&1; then '
     'nohup Xvfb "$D" -screen 0 "$PX_SIZE"x24 >>"$PX_LOG" 2>&1 & fi; '
@@ -214,6 +260,14 @@ def desktop_provision_command(
     also why this installs the display stack those scripts install (Xvfb, a window
     manager with a window on it, and ImageMagick's ``import``).
 
+    ``setsid`` where it exists, because on Tenki the sandbox's own ``shell`` call
+    does not return until the process group does: the detached install measured
+    **72 s** of wall clock on the caller even though it backgrounds its work. That
+    is an own session with no controlling terminal (``< /dev/null`` as well), so
+    the installer cannot be reaped by the caller's timeout -- and the caller's
+    timeout is raised in :meth:`SandboxScreenSource._provision_desktop` to match
+    the longest the lock wait can legally take.
+
     A window manager and an ``xterm`` are started as well as Xvfb: a bare Xvfb
     serves a black root window, and a black rectangle is indistinguishable from a
     broken panel. The ``xterm`` gives the operator something to look at, and any
@@ -234,11 +288,16 @@ def desktop_provision_command(
     # Both are now known to be a bare ``:99`` / ``1920x1080`` and cannot carry a
     # metacharacter, which is what makes that safe; a path cannot make that claim
     # and so goes through ``shlex.quote``.
+    launch = (
+        f"env PX_DISPLAY={spec} PX_SIZE={geometry} "
+        f"PX_LOG={quoted_log} PX_DIR={quoted_dir} "
+        f"sh -c {shlex.quote(_PROVISION_BODY)}"
+    )
     return (
         f"mkdir -p {quoted_dir} && "
-        f"nohup env PX_DISPLAY={spec} PX_SIZE={geometry} "
-        f"PX_LOG={quoted_log} PX_DIR={quoted_dir} "
-        f"sh -c {shlex.quote(_PROVISION_BODY)} >> {quoted_log} 2>&1 & "
+        "if command -v setsid >/dev/null 2>&1; then "
+        f"setsid nohup {launch} >> {quoted_log} 2>&1 < /dev/null & "
+        f"else nohup {launch} >> {quoted_log} 2>&1 < /dev/null & fi; "
         "echo provisioning-started"
     )
 
@@ -466,9 +525,13 @@ class SandboxScreenSource:
         self._provision_at = now
         self.last_error = PROVISIONING_MESSAGE
         out_dir = out.rsplit("/", 1)[0] if "/" in out else out
+        # The caller must outlast the body own lock wait, or the timeout would
+        # land on an install that is simply queueing behind the MT5 installer.
+        # The body returns as soon as it has detached, so this is a ceiling on a
+        # hang, not on the install.
         ok, output = await run_remote(
             desktop_provision_command(self.display, out_dir, self.size),
-            timeout=60,
+            timeout=APT_LOCK_TIMEOUT_S + 60,
             executor=executor,
         )
         if not ok:

@@ -406,6 +406,48 @@ if ! is_root; then
   fi
 fi
 
+#: The one apt lock every writer of apt on a sandbox takes before it runs.
+#:
+#: MEASURED 2026-09-28, live Tenki session, MT5 + Live screen together: this
+#: script's own ``apt_install xvfb winbind ...`` and the Live screen pump's
+#: provisioning apt ran at the same time on a fresh sandbox, and each destroyed
+#: the other. This script's dpkg failed with
+#:
+#:   dpkg: error processing archive /tmp/apt-dpkg-install-XXXXXX/81-xvfb_....deb
+#:         (--unpack): cannot access archive ...: No such file or directory
+#:
+#: for the last sixteen packages of the transaction -- so **xvfb was never
+#: installed** -- and ``apt_install`` swallowed that with ``|| true``, after which
+#: this install carried on with no display (its own log said "WARN: Xvfb
+#: missing") and the pump's install answered "Could not get lock
+#: /var/lib/dpkg/lock-frontend". The visible result was an empty Live screen for
+#: the whole session, which is what the pump's provisioning exists to prevent.
+APT_LOCK_PATH="/tmp/powerx-apt.lock"
+APT_LOCK_TIMEOUT_S=900
+
+#: What makes the installer and the pump queue behind each other instead of
+#: colliding. The lock file is the contract; the timeouts are what make apt itself
+#: wait rather than answer "Could not get lock" when something else (an older
+#: revision, or an apt the agent runs by hand) holds it.
+APT_OPTS=(
+  "-o" "APT::Lock::Timeout=${APT_LOCK_TIMEOUT_S}"
+  "-o" "DPkg::Lock::Timeout=${APT_LOCK_TIMEOUT_S}"
+)
+
+_apt_lock_fd=""
+apt_lock() {
+  # Held for the life of the script, so every apt call in it is serialised
+  # against every other writer on this sandbox. Missing flock is not fatal: the
+  # APT_OPTS timeouts still apply.
+  if [ -n "${_apt_lock_fd}" ]; then
+    return 0
+  fi
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 8>"${APT_LOCK_PATH}" 2>/dev/null || return 0
+  flock -w "${APT_LOCK_TIMEOUT_S}" 8 2>/dev/null || true
+  _apt_lock_fd=8
+}
+
 #: Refresh the apt indexes AT MOST ONCE per install.
 #
 # MEASURED 2026-09-24: a fresh install calls ``apt_install`` four times -- the
@@ -430,17 +472,61 @@ apt_refresh() {
     return 0
   fi
   _APT_REFRESHED=1
-  $SUDO apt-get update -qq >/dev/null 2>&1
+  apt_lock
+  $SUDO apt-get "${APT_OPTS[@]}" update -qq >/dev/null 2>&1
 }
 
 apt_install() {
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
+    apt_lock
     apt_refresh || true
-    $SUDO apt-get install -y -qq --no-install-recommends "$@" >/dev/null 2>&1
+    $SUDO apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends "$@" >/dev/null 2>&1
     return $?
   fi
   return 1
+}
+
+#: Install what a *display* needs, and do not pretend it worked.
+#:
+#: The bare-Tenki failure was not that xvfb was absent from the list -- it is in
+#: the base list below -- but that the apt transaction carrying it failed for a
+#: reason nothing checked, and the install then ran to completion with no display.
+#: So this verifies after the fact, retries once with ``--fix-missing`` (a
+#: transaction that lost its downloaded archives is exactly what that repairs),
+#: and reports the outcome in the log. ``Xvfb`` is what the Live screen panel
+#: captures and what the terminal draws to; ``import`` is what captures it.
+apt_install_display() {
+  local want=("$@")
+  local missing=() p
+  for p in "${want[@]}"; do
+    command -v "${p}" >/dev/null 2>&1 || missing+=("${p}")
+  done
+  if [ "${#missing[@]}" -eq 0 ]; then
+    return 0
+  fi
+  log "display tools missing (${missing[*]}); installing them"
+  if apt_install "${want[@]}"; then
+    :
+  else
+    log "WARN: package install failed; retrying with --fix-missing (a transaction"
+    log "WARN: that lost its downloads is the usual cause on a fresh sandbox)"
+    apt_lock
+    $SUDO apt-get "${APT_OPTS[@]}" --fix-missing install -y -qq \
+      --no-install-recommends "${want[@]}" >/dev/null 2>&1 || true
+  fi
+  missing=()
+  for p in "${want[@]}"; do
+    command -v "${p}" >/dev/null 2>&1 || missing+=("${p}")
+  done
+  if [ "${#missing[@]}" -ne 0 ]; then
+    log "WARN: still missing after install: ${missing[*]}"
+    log "WARN: the Live screen panel needs a running X display and ImageMagick"
+    log "WARN: import or ffmpeg; see /var/log/apt/term.log in the sandbox"
+    return 1
+  fi
+  log "display tools ready: ${want[*]}"
+  return 0
 }
 
 # --------------------------------------------------------------------------- #
@@ -534,7 +620,13 @@ install_winehq() {
   # metapackage leaves wine-stable/amd64/i386 at 11.0, so `wine --version` still
   # reports 11.0 and MT5's anti-debug check still fires. Verified in the sandbox:
   # the 4-package form downgrades cleanly and reports wine-10.0.
-  if $SUDO apt-get install -y -qq --allow-downgrades --install-recommends \
+  # LOCKED, like every other apt call here. The Live-screen provisioner runs its
+  # own apt in parallel with this installer; a bare apt-get here is what the
+  # measured collision produced — one transaction wins the dpkg frontend lock and
+  # the other dies with "Could not get lock /var/lib/dpkg/lock-frontend", leaving
+  # Xvfb unconfigured right when MT5 + Wine needs a display. Serialise instead.
+  apt_lock
+  if $SUDO apt-get "${APT_OPTS[@]}" install -y -qq --allow-downgrades --install-recommends \
       "winehq-stable=${pin}" "wine-stable=${pin}" \
       "wine-stable-amd64=${pin}" "wine-stable-i386=${pin}" >/dev/null 2>&1; then
     return 0
@@ -542,7 +634,8 @@ install_winehq() {
   # Fall back to the metapackage alone (some distros do not ship the split
   # packages), then give up rather than silently installing Wine 11 — which
   # would reintroduce exactly the anti-debug failure this function prevents.
-  $SUDO apt-get install -y -qq --allow-downgrades --install-recommends \
+  apt_lock
+  $SUDO apt-get "${APT_OPTS[@]}" install -y -qq --allow-downgrades --install-recommends \
       "winehq-stable=${pin}" >/dev/null 2>&1 && return 0
   return 1
 }
@@ -734,6 +827,19 @@ fi
 # --------------------------------------------------------------------------- #
 # 2. Headless display
 # --------------------------------------------------------------------------- #
+# Xvfb is already in the base package list, but "it is in the list" is not the
+# same claim as "the command exists". MEASURED 2026-09-28 on a fresh Tenki
+# session: that whole transaction failed (dpkg could not read the archives it had
+# downloaded -- see APT_LOCK_PATH) and this step, finding Xvfb absent, only
+# logged a WARN. The install then finished with NO DISPLAY at all: the terminal
+# drew nowhere, and the Live screen panel captured nothing for the life of the
+# session. A display is a requirement of this installer, not a nicety, so it is
+# installed and then *verified* before anything is built on top of it.
+#
+# ``import`` is checked alongside it because that is what the Live screen pump
+# captures with; a display without a capturer is the same empty panel from the
+# operator side.
+apt_install_display xvfb import || true
 if command -v Xvfb >/dev/null 2>&1; then
   if ! pgrep -f "Xvfb :${DISPLAY_NUM}" >/dev/null 2>&1; then
     status display "starting Xvfb on :${DISPLAY_NUM}"
@@ -742,7 +848,8 @@ if command -v Xvfb >/dev/null 2>&1; then
   fi
   export DISPLAY=":${DISPLAY_NUM}"
 else
-  log "WARN: Xvfb missing; MT5 may fail to start without a display"
+  log "WARN: Xvfb missing after install; MT5 cannot draw and the Live screen"
+  log "WARN: panel will stay empty. Check /var/log/apt/term.log in the sandbox."
 fi
 
 # --------------------------------------------------------------------------- #
@@ -814,7 +921,13 @@ export WINEDLLOVERRIDES="mscoree,mshtml="
 # Xvfb alone provides no window manager. Without one, Wine's dialogs are not
 # properly mapped/adopted by the X server, and MT5's installer windows can hang
 # unmapped. A tiny WM makes the display behave like a real desktop.
-if ! pgrep -x matchbox-window-manager >/dev/null 2>&1; then
+# ``pgrep -x`` matches the process NAME, which the kernel truncates to 15
+# characters -- so the real process name is ``matchbox-window`` and the full
+# ``matchbox-window-manager`` (22 characters) matches nothing, ever. MEASURED
+# 2026-09-28: with the long name this check never once saw the window manager the
+# Live screen pump had already started, so a second one was launched on :99 on
+# every install. The pump carries the same note for the same reason.
+if ! pgrep -x matchbox-window >/dev/null 2>&1; then
   apt_install matchbox-window-manager >/dev/null 2>&1 || true
   if command -v matchbox-window-manager >/dev/null 2>&1; then
     status display "starting a window manager on :${DISPLAY_NUM}"
