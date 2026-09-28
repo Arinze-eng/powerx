@@ -345,7 +345,15 @@ def test_the_installer_serialises_apt_against_the_live_screen_provisioner():
     assert 'apt_locked $SUDO apt-get "${APT_OPTS[@]}" install -y -qq --allow-downgrades' in script
     # The display tools are installed *and verified* before Xvfb is started, by
     # name, so a silently lost install says so instead of leaving a black panel.
-    assert "apt_install_display xvfb import || true" in script
+    # The probe is the command, not the package name. MEASURED on Tenki
+    # (2026-09-28): the xvfb package ships Xvfb and xvfb-run and no lowercase
+    # xvfb, so probing "xvfb" reported the display missing on every install --
+    # an extra apt transaction, and a WARN that the Live screen panel would not
+    # work on a display that was up and capturing.
+    assert "apt_install_display xvfb:Xvfb imagemagick:import || true" in script
+    assert 'pkgs+=("${spec%%:*}")' in script
+    assert 'probe="${spec#*:}"' in script
+    assert script.count('command -v "${probe}"') == 2, "probe before and after"
     assert "display tools ready" in script
 
     # Kernel truncates to 15 characters: the full name matches nothing.

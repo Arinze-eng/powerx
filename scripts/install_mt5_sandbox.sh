@@ -513,26 +513,39 @@ apt_install() {
 #: and reports the outcome in the log. ``Xvfb`` is what the Live screen panel
 #: captures and what the terminal draws to; ``import`` is what captures it.
 apt_install_display() {
+  # Each argument is a ``package:probe`` pair: the Debian package that carries a
+  # tool, and the *command* that proves it arrived. The two differ -- the ``xvfb``
+  # package ships ``Xvfb`` and ``xvfb-run`` and no lowercase ``xvfb`` at all --
+  # and this used to check the package name as a command (MEASURED on Tenki,
+  # 2026-09-28: ``command -v xvfb`` -> MISSING while ``command -v Xvfb`` ->
+  # /usr/bin/Xvfb). So the check reported the display missing on *every* install,
+  # spent an extra apt transaction on it, and then warned that the Live screen
+  # panel would not work on a session whose display was up and capturing. A
+  # probe without a colon is used as its own command, so a plain package name
+  # still means what it always did.
   local want=("$@")
-  local missing=() p
-  for p in "${want[@]}"; do
-    command -v "${p}" >/dev/null 2>&1 || missing+=("${p}")
+  local pkgs=() missing=() spec probe
+  for spec in "${want[@]}"; do
+    pkgs+=("${spec%%:*}")
+    probe="${spec#*:}"
+    command -v "${probe}" >/dev/null 2>&1 || missing+=("${probe}")
   done
   if [ "${#missing[@]}" -eq 0 ]; then
     return 0
   fi
   log "display tools missing (${missing[*]}); installing them"
-  if apt_install "${want[@]}"; then
+  if apt_install "${pkgs[@]}"; then
     :
   else
     log "WARN: package install failed; retrying with --fix-missing (a transaction"
     log "WARN: that lost its downloads is the usual cause on a fresh sandbox)"
     apt_locked $SUDO apt-get "${APT_OPTS[@]}" --fix-missing install -y -qq \
-      --no-install-recommends "${want[@]}" >/dev/null 2>&1 || true
+      --no-install-recommends "${pkgs[@]}" >/dev/null 2>&1 || true
   fi
   missing=()
-  for p in "${want[@]}"; do
-    command -v "${p}" >/dev/null 2>&1 || missing+=("${p}")
+  for spec in "${want[@]}"; do
+    probe="${spec#*:}"
+    command -v "${probe}" >/dev/null 2>&1 || missing+=("${probe}")
   done
   if [ "${#missing[@]}" -ne 0 ]; then
     log "WARN: still missing after install: ${missing[*]}"
@@ -851,8 +864,10 @@ fi
 #
 # ``import`` is checked alongside it because that is what the Live screen pump
 # captures with; a display without a capturer is the same empty panel from the
-# operator side.
-apt_install_display xvfb import || true
+# operator side. The probe is the command and the package is named separately,
+# because ``xvfb`` is a package name and ``Xvfb`` is the command; see
+# ``apt_install_display`` for what checking the wrong one cost.
+apt_install_display xvfb:Xvfb imagemagick:import || true
 if command -v Xvfb >/dev/null 2>&1; then
   if ! pgrep -f "Xvfb :${DISPLAY_NUM}" >/dev/null 2>&1; then
     status display "starting Xvfb on :${DISPLAY_NUM}"
