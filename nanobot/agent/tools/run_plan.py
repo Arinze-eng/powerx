@@ -149,8 +149,9 @@ class RunPlanTool(Tool):
         except PlanProgramError as exc:
             logger.info("run_plan aborted, falling back to model: {}", exc)
             return ToolResult.error(
-                f"Plan could not complete: {exc}. Continue with normal step-by-step "
-                "tool calls."
+                f"Plan could not complete: {exc}. Resubmit the remaining work as ONE "
+                "corrected run_plan call. Fall back to individual calls only if the "
+                "plan itself, not the job, is what is too large."
             )
         except Exception as exc:  # pragma: no cover - unexpected runtime fault
             logger.exception("run_plan crashed unexpectedly")

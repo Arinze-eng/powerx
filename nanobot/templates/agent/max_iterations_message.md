@@ -1,1 +1,1 @@
-I reached the maximum number of tool call iterations ({{ max_iterations }}) without completing the task. You can try breaking the task into smaller steps.
+I reached the maximum number of tool call iterations ({{ max_iterations }}) without completing the task. The work was too finely divided: it burned a call per step. Rerun it in big calls — state the whole plan, then do each milestone in one `run_plan` call (a `foreach` step covers every repeated item), and run the full test pass once at the end.

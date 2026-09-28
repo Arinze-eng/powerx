@@ -426,7 +426,10 @@ async def test_loop_max_iterations_message_stays_stable(tmp_path):
 
     assert final_content == (
         "I reached the maximum number of tool call iterations (2) "
-        "without completing the task. You can try breaking the task into smaller steps."
+        "without completing the task. The work was too finely divided: it burned a call per step. "
+        "Rerun it in big calls — state the whole plan, then do each milestone in one "
+        "`run_plan` call (a `foreach` step covers every repeated item), and run the full test "
+        "pass once at the end."
     )
 
 
@@ -452,7 +455,10 @@ async def test_loop_goal_turn_uses_standard_iteration_budget(tmp_path):
     assert loop.provider.chat_with_retry.await_args_list[-1].kwargs["tools"] is None
     assert final_content == (
         "I reached the maximum number of tool call iterations (2) "
-        "without completing the task. You can try breaking the task into smaller steps."
+        "without completing the task. The work was too finely divided: it burned a call per step. "
+        "Rerun it in big calls — state the whole plan, then do each milestone in one "
+        "`run_plan` call (a `foreach` step covers every repeated item), and run the full test "
+        "pass once at the end."
     )
 
 

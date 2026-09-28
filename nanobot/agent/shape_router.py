@@ -46,33 +46,79 @@ import re
 _MAX_TEXT_CHARS = 400
 _MIN_TEXT_CHARS = 8
 
+#: Nouns that name a countable set of items. Every set/loop regex below is
+#: built from this one list, so widening the vocabulary is a one-line change.
+#: The extras (questions, pages, prompts, endpoints, ...) come from real asks
+#: that fell through: "batch 100 questions at once", "build all the frontend
+#: pages", "fix every failing endpoint".
+_ITEM_NOUNS = (
+    r"files?|rows?|records?|entries|items|modules?|tests?|folders?|"
+    r"directories|packages?|functions?|classes?|branches|commits?|assets?|"
+    r"images?|lines?|questions?|prompts?|pages?|screens?|routes?|endpoints|"
+    r"fields?|columns?|tables?|components?|features?|examples?|cases?|"
+    r"samples?|queries|users?|accounts?|messages?|emails?|tickets?|issues?|"
+    r"tasks?|steps?|slides?|charts?|sheets?|reports?|diagrams?|files"
+)
+
 # Explicit, unambiguous iteration markers. These name a loop in the user's own
 # words, which is the strongest available signal that the work is batch-shaped.
 _LOOP_RE = re.compile(
     r"\b(?:for\s+each|for\s+every|each\s+of\s+(?:the|these|those|my)|"
-    r"every\s+(?:file|one|item|entry|row|record|module|test|folder|"
-    r"directory|package|function|class|branch|commit|asset)|"
+    r"every\s+(?:[a-z]+\s+)?(?:file|one|item|entry|row|record|module|test|"
+    r"folder|directory|package|function|class|branch|commit|asset|page|"
+    r"question|route|endpoint|table|component)|"
     r"all\s+(?:of\s+)?(?:(?:the|these|those|my)\s+)?(?:[\w.\-]+\s+)?"
-    r"(?:files?|rows?|records?|entries|items|modules?|tests?|folders?|"
-    r"directories|packages?|functions?|classes?|branches|commits?|assets?)\b|"
-    r"(?:batch|bulk)\s+(?:process|update|rename|convert|apply|edit)|"
+    r"(?:" + _ITEM_NOUNS + r")\b|"
+    r"(?:batch|bulk)\s+(?:process|update|rename|convert|apply|edit|\w+)|"
     r"loop\s+over|iterate\s+over|across\s+all)\b",
     re.IGNORECASE,
 )
 
-# A counted set of items: "these 12 files", "the 30 tests", "5 modules".
+# A counted set of items: "these 12 files", "the 30 tests", "5 modules",
+# "100 questions".
 _COUNTED_SET_RE = re.compile(
     r"\b(?:the|these|those|my|all)?\s*\d{2,}\s+"
-    r"(?:files?|rows?|records?|entries|items|modules?|tests?|folders?|"
-    r"directories|packages?|functions?|classes?|lines?|assets?|images?)\b",
+    r"(?:" + _ITEM_NOUNS + r")\b",
     re.IGNORECASE,
 )
 # Small explicit counts only count when paired with a distributing determiner,
 # because "2 files" alone is often a single read.
 _SMALL_COUNTED_SET_RE = re.compile(
     r"\b(?:these|those|each\s+of\s+the|all\s+of\s+the)\s+\d{1,2}\s+"
-    r"(?:files?|rows?|records?|entries|items|modules?|tests?|folders?|"
-    r"directories|packages?|functions?|classes?|assets?|images?)\b",
+    r"(?:" + _ITEM_NOUNS + r")\b",
+    re.IGNORECASE,
+)
+
+# Bulk markers: the user asked for the whole set in one pass, without naming a
+# loop. "batch 100 questions at once", "do it all in one go".
+_BULK_MARKER_RE = re.compile(
+    r"\b(?:at\s+once|in\s+one\s+(?:go|shot|pass|call|batch)|"
+    r"all\s+at\s+once|in\s+a\s+single\s+(?:call|pass|batch|response)|"
+    r"in\s+(?:one|a\s+single)\s+run)\b",
+    re.IGNORECASE,
+)
+
+# A whole-PROJECT ask: several subsystems delivered together (frontend + backend
+# + database + tests, or a whole app/game/quiz). The user named the destination,
+# not the steps, so the model chooses its own milestones -- and left alone it
+# picks one call per page/route/test. Shape: 2-4 milestones, one call each.
+_PROJECT_NOUNS = (
+    r"app|application|website|site|web\s+app|webapp|platform|dashboard|"
+    r"portal|game|quiz|clone|backend|front\s*end|api|service|system|"
+    r"saas|mvp|monorepo|full[-\s]?stack"
+)
+_PROJECT_RE = re.compile(
+    r"\b(?:build|create|implement|develop|scaffold|write|make|set\s+up|"
+    r"ship|add)\b[^.?!]{0,80}?\b(?:" + _PROJECT_NOUNS + r")\b",
+    re.IGNORECASE,
+)
+# A project is only routed when it really has more than one milestone: the ask
+# mentions several parts of the stack, or names a deliverable set.
+_PROJECT_PART_RE = re.compile(
+    r"\b(?:front\s*end|back\s*end|api|database|db|schema|migration|auth|"
+    r"login|signup|payment|admin|dashboard|models?|routes?|endpoints?|pages?|"
+    r"screens?|components?|tests?|deploy|docker|ci|seed|"
+    r"landing\s+page|home\s+page|settings)\b",
     re.IGNORECASE,
 )
 
@@ -212,6 +258,31 @@ _LIBRARY_STEER_MESSAGE = (
     "at it; fix anything broken or overflowing before handing it over."
 )
 
+#: Project-shaped steering. Same discipline as the batch hint, but the unit of
+#: work is a MILESTONE rather than an item: state the plan, then spend one call
+#: per milestone instead of one call per page/route/test.
+_PROJECT_STEER_MESSAGE = (
+    "[Routing hint — task shape: whole project, several milestones]\n"
+    "The user asked for a working deliverable, not steps. Left alone this turns "
+    "into one model call per page, per route and per test. Do not do that.\n"
+    "- FIRST, decide the whole plan in a single call: name 2-4 MILESTONES "
+    "(e.g. 1 scaffold + data model, 2 backend/API, 3 frontend screens, "
+    "4 tests + run). Write the file list for each.\n"
+    "- Then spend ONE call per milestone carrying that milestone's entire "
+    "change: ONE `apply_patch` with every file of the milestone, or ONE "
+    "`run_plan` when the milestone has dependant steps. A 3-milestone project "
+    "costs about four calls in total, not forty.\n"
+    "- An implementation that repeats the same edit across many items (every "
+    "page, every route, every test) belongs in ONE `run_plan` with a `foreach` "
+    "step -- zero extra model calls per item.\n"
+    "- Install everything you will need in ONE command, up front. Never one "
+    "`pip install` or one `apt-get install` per package.\n"
+    "- Verify ONCE per milestone, plus ONE full test pass at the very end. Do "
+    "not run the suite after every file, and do not write a test per file.\n"
+    "- Escape hatch: if you genuinely cannot know the next step until you have "
+    "seen the previous result, ignore this hint and use ordinary tool calls."
+)
+
 #: The steering message. Short on purpose: it is injected on every multi-step
 #: turn, so every wasted token here is paid on every call of that turn. It also
 #: preserves the Re-Act escape hatch explicitly -- the plan path must never
@@ -276,9 +347,21 @@ def classify_task_shape(text: str | None) -> str:
     if _LIBRARY_TASK_RE.search(normalized):
         if _TOOLING_VERB_RE.search(normalized) or _ARTEFACT_COUNT_RE.search(normalized):
             return "multi_step"
+    # A whole-project ask (build the app/site/quiz) whose steps the model has to
+    # choose for itself: route it only when the ask really spans more than one
+    # milestone, so a one-line "build me a landing page" still runs Re-Act.
+    if _PROJECT_RE.search(normalized):
+        if len(set(m.group(0).lower() for m in _PROJECT_PART_RE.finditer(normalized))) >= 2:
+            return "multi_step"
+        if len(_PROJECT_PART_RE.findall(normalized)) >= 2:
+            return "multi_step"
     # Three-plus glued actions is a program regardless of the words used.
     if _ACTION_GLUE_RE.search(normalized):
         if len(_ACTION_VERB_RE.findall(normalized)) >= 3:
+            return "multi_step"
+    # The user asked for the whole set in one pass, in their own words.
+    if _BULK_MARKER_RE.search(normalized):
+        if _ACTION_VERB_RE.search(normalized) or _COUNTED_SET_RE.search(normalized):
             return "multi_step"
     if _SINGLE_ACTION_RE.search(normalized):
         return "single"
@@ -349,8 +432,22 @@ def _looks_like_read_request(text: str) -> bool:
     )
 
 
+def prefer_project_workflow(text: str | None) -> bool:
+    """True when the ask is a multi-milestone project rather than a batch job."""
+    raw = re.sub(r"\s+", " ", text or "").strip()
+    if not (_MIN_TEXT_CHARS <= len(raw) <= _MAX_TEXT_CHARS):
+        return False
+    if _EXPLORATORY_RE.search(raw):
+        return False
+    if not _PROJECT_RE.search(raw):
+        return False
+    return len(_PROJECT_PART_RE.findall(raw)) >= 2
+
+
 def steer_message_for(text: str | None) -> dict[str, str]:
     """Pick the right steering hint for this task's shape."""
     if prefer_library_workflow(text):
         return {"role": "user", "content": _LIBRARY_STEER_MESSAGE}
+    if prefer_project_workflow(text):
+        return {"role": "user", "content": _PROJECT_STEER_MESSAGE}
     return plan_preference_message()

@@ -262,6 +262,49 @@ SHAPES: dict[str, str] = {
 
 PREVIOUS_MULTI_STEP = "for each of these 12 files, append a license header"
 
+#: Phase-6 shapes: real asks that fell THROUGH the old router (classified
+#: ``single``) and so still cost one call per item / per page. Measured with the
+#: same two stubs as Phase 1, so the only variable is the widened classifier.
+SHAPES_V6: dict[str, str] = {
+    "counted_set": "batch 100 questions at once",
+    "pages": "build all the frontend pages for the quiz",
+    "project": "build a full stack quiz app with frontend, backend and tests",
+}
+
+
+async def measure_v6() -> None:
+    """Phase 6: does the widened router steer the asks that used to fall through?"""
+    from nanobot.agent.shape_router import classify_task_shape, should_steer_to_plan
+
+    print("\n" + "=" * 78)
+    print("PHASE 6 — asks the old router let through (one call per item/page)")
+    print("=" * 78)
+    print("\n--- CLASSIFIER DECISION (free: regex only, zero provider calls) ---")
+    for shape, text in SHAPES_V6.items():
+        print(f"{shape:12s} -> {classify_task_shape(text):11s} | {text}")
+
+    print("\n--- ROUTER GATE (plan tool registered) ---")
+    for shape, text in SHAPES_V6.items():
+        steered = should_steer_to_plan(
+            text, plan_tool_available=True, code_tool_available=True
+        )
+        print(f"{shape:12s} -> should_steer_to_plan={steered}")
+
+    print("\n--- BEFORE vs AFTER, same stubs as Phase 1 ---")
+    for shape, text in SHAPES_V6.items():
+        before = await measure(text, UnsteeredModel(), with_plan=True, steer=False)
+        after = await measure(text, SteeredModel(), with_plan=True, steer=True)
+        saved = (
+            before["llm_calls"] - after["llm_calls"]
+            if before["llm_calls"] is not None and after["llm_calls"] is not None
+            else None
+        )
+        print(
+            f"{shape:12s} before={before['llm_calls']:>3} calls "
+            f"(steered={before['steered']}) | after={after['llm_calls']:>3} calls "
+            f"(steered={after['steered']}) | saved={saved}"
+        )
+
 
 async def measure(
     text: str, provider: ProviderBase, *, with_plan: bool, steer: bool
@@ -293,8 +336,12 @@ async def measure(
 
 async def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stub", default="model", choices=["model", "counter", "live"])
+    parser.add_argument("--stub", default="model", choices=["model", "counter", "live", "v6"])
     args = parser.parse_args()
+
+    if args.stub == "v6":
+        await measure_v6()
+        return 0
 
     if args.stub == "counter":
         print("== single-call floor (all turns) ==")

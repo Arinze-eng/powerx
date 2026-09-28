@@ -147,6 +147,63 @@ Pre-existing suite (`tests/agent/test_deterministic_router.py`,
 `test_task_router.py`, `test_plan_program.py`): **53 passed**, unchanged by this
 work.
 
+## Phase 6 — Big calls by default (contract + wider shapes)
+
+Phases 1-5 built the machinery; this phase removes the counter-pressure.
+
+### 6a. The contract said the opposite
+
+The always-injected tool contract was nudging the model toward exactly the cost
+profile this document is about: *"choose the next smallest useful action"* and
+*"after each meaningful change, verify"*. That is a per-step policy, so the
+expensive behaviour was being *asked for* on every single turn — the router only
+fires on recognised shapes and did nothing for "build all the frontend pages".
+
+Changes:
+
+* `nanobot/templates/agent/tool_contract.md` — new section **"Big calls, not
+  many small ones"** (decide the whole plan first; one call per milestone;
+  never a call per item; `run_plan` `foreach` for repeats; the full test pass
+  runs ONCE at the end; `apply_patch` carries multi-file changes). The
+  per-step instruction is replaced by *"complete one whole milestone per
+  call"*.
+* `nanobot/templates/agent/max_iterations_message.md` — no longer advises
+  "break the task into smaller steps" (which guarantees another burn loop); it
+  now advises resubmitting as ONE corrected `run_plan`.
+* `nanobot/agent/tools/run_plan.py` — two user-facing error strings that told
+  the model to fall back to step-by-step calls now tell it to resubmit the same
+  job as two or three large calls.
+
+### 6b. Widened shape router
+
+The classifier was too narrow: it only fired on the user's own loop/chain words
+and on a short noun list. Measured with `python -m tests.agent.measure_llm_calls
+--stub v6` (same stub pair as Phase 1, so the only variable is the classifier):
+
+| ask | old classifier | old cost | new classifier | new cost |
+|---|---|---|---|---|
+| `batch 100 questions at once` | `single` (no hint) | 14 calls | `multi_step` | 2 calls |
+| `build all the frontend pages for the quiz` | `single` (no hint) | 14 calls | `multi_step` | 2 calls |
+| `build a full stack quiz app with frontend, backend and tests` | `single` (no hint) | 14 calls | `multi_step` | 2 calls |
+| `check on what you just found` (control) | `exploratory` | unchanged | `exploratory` | unchanged |
+
+* `_ITEM_NOUNS` — one shared noun list behind every set regex, widened with
+  `questions`, `pages`, `prompts`, `routes`, `endpoints`, `fields`, `columns`,
+  `tables`, `components`, `features`, `samples`, `queries`, `users` and the
+  pre-existing file/row/test vocabulary.
+* `_BULK_MARKER_RE` — "at once", "in one go", "in a single call": the user asked
+  for one pass without naming a loop. Requires an action verb or a counted set
+  alongside it, so a stray "at once" cannot steer a conversational turn.
+* `_PROJECT_RE` / `_PROJECT_PART_RE` + `_PROJECT_STEER_MESSAGE` — a whole-project
+  ask ("build the app / site / quiz") is steered by **milestone**, not by item:
+  2-4 milestones, one call each, one combined install up front, verify once per
+  milestone and run the full suite ONCE at the end. It only fires when the ask
+  names at least two parts of the stack (frontend + backend, pages + tests), so
+  "build me a landing page" still runs Re-Act untouched.
+
+Note the new cost is **2 calls, not 1**: the stub spends one call to lay out the
+plan and one to execute it. The saving is in the per-item calls that disappear.
+
 ## Honest limits
 
 * The Phase-1 numbers come from a stub model that is deliberately hint-aware, so
@@ -160,6 +217,12 @@ work.
   turns are provably untouched.
 * No dead optimizer module (`api_optimizer`, `agent_planner`, `memoize`,
   `reflection`, `tool_router`) was imported into the hot path.
+* Phase 6's table is a classifier measurement, not a live-model measurement: the
+  stubs are hint-aware by construction, so they show what the steering layer
+  does, not how a particular frontier model responds to it. It also measures
+  the *route taken*, and a real project still costs more than 2 calls — the
+  claim is "one call per milestone instead of one call per page", not "2 calls
+  per project".
 
 ## Rollback
 

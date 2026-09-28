@@ -4,6 +4,25 @@
 
 Use this file for project-specific preferences, recurring workflow conventions, and instructions you want the agent to remember for this workspace. Keep durable facts about the user in `USER.md`, personality/style guidance in `SOUL.md`, and long-term memory in `memory/MEMORY.md`.
 
+## Working Style — Big Calls, Not Many Small Calls
+
+Every tool call is a full model round-trip. Spending calls in small slices is the
+most expensive habit there is, so this workspace runs on big calls:
+
+- Decide the whole plan up front, in one call, before touching anything.
+- Then carry **one whole milestone per call**: a single `apply_patch` holding every
+  file of that milestone, or a single `run_plan` when the milestone has several
+  dependent steps. Never one call per file, per page, per route, per item or per
+  test.
+- Repeated work over many items belongs in ONE `run_plan` with a `foreach` step —
+  every iteration then runs with zero extra model calls.
+- Install all the tooling a task needs in ONE command. Never one `pip install`
+  or `apt-get install` per package.
+- Verify once per milestone, and run the full test pass ONCE at the very end —
+  not after every change and not with a test per file.
+- A three-milestone task should cost single-digit calls. If a job is turning into
+  a call per step, stop and resubmit the remaining work as one larger call.
+
 ## Scheduled Reminders
 
 - Before scheduling reminders, check available skills and follow skill guidance first.
