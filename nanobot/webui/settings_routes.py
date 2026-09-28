@@ -336,9 +336,9 @@ class WebUISettingsRouter:
         if not self._authorized(request):
             return self._unauthorized()
         if route == ("root", "settings"):
-            return self._handle_settings()
+            return self._handle_settings(request)
         if route == ("root", "usage"):
-            return self._handle_settings_usage()
+            return self._handle_settings_usage(request)
 
         domain, action = route
         domain_request = self._domain_request(

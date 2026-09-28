@@ -162,6 +162,7 @@ def settings_payload(
     restart_required_sections: list[str] | None = None,
     apply_state: dict[str, Any] | None = None,
     config_path: Path | None = None,
+    user_id: str | None = "",
 ) -> dict[str, Any]:
     config = _load_settings_config(config_path)
     payload: dict[str, Any] = {
@@ -177,6 +178,7 @@ def settings_payload(
             config,
             config_path=_settings_config_path(config_path),
             version=__version__,
+            user_id=user_id,
         ),
         "requires_restart": requires_restart,
     }

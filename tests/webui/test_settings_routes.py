@@ -486,3 +486,45 @@ async def test_version_check_route_enforces_auth_and_bounds_failures(
     assert failed.status_code == 500
     assert json.loads(failed.body) == {"error": "version check failed"}
     assert "upstream secret body" not in failed.body.decode()
+
+
+@pytest.mark.asyncio
+async def test_root_settings_routes_answer_and_resolve_the_signed_in_user(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``/api/settings`` and ``/api/settings/usage`` must answer, never 500.
+
+    Both handlers take the request so they can read the signed-in user for the
+    per-user cost meter. When that argument was added the two call sites were
+    left behind, so every load of Settings raised TypeError out of ``dispatch``
+    and the pane showed "Internal server error" -- and no test dispatched either
+    root route, so the suite stayed green while the page was down.
+
+    The resolver is counted so the ``request`` argument is proven to reach the
+    handler, not merely tolerated by it: a handler that ignored the request
+    would satisfy a status-only assertion and still ship an unmetered meter.
+    """
+    from nanobot.webui import token_usage, user_cost
+
+    monkeypatch.setattr(user_cost, "get_webui_dir", lambda: tmp_path / "webui")
+    monkeypatch.setattr(token_usage, "get_webui_dir", lambda: tmp_path / "webui")
+
+    resolved: list[object] = []
+
+    def resolve_user(request: object) -> str:
+        resolved.append(request)
+        return "user-123"
+
+    router = _router(config_path=tmp_path / "config.json")
+    router._youtube_user_id = resolve_user
+
+    for path in ("/api/settings", "/api/settings/usage"):
+        request = SimpleNamespace(path=path, headers=Headers())
+        response = await router.dispatch(None, request, path)
+
+        assert response is not None, path
+        assert response.status_code == 200, (path, response.body[:200])
+        assert resolved[-1] is request
+
+    assert len(resolved) == 2
