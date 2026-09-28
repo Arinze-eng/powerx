@@ -16,6 +16,7 @@ from nanobot.agent.hooks import (
     create_api_credit_hook,
     create_file_edit_activity_hook,
     create_supabase_credit_hook,
+    create_user_cost_meter_hook,
 )
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.mcp import MCPProvider
@@ -444,7 +445,12 @@ def _run_gateway(
         provider_signature=provider_snapshot.signature,
         hooks=[TokenUsageHook(timezone_name=config.agents.defaults.timezone)],
         local_trigger_store=trigger_store,
-        hook_factories=[create_file_edit_activity_hook, create_supabase_credit_hook, create_api_credit_hook],
+        hook_factories=[
+            create_file_edit_activity_hook,
+            create_supabase_credit_hook,
+            create_api_credit_hook,
+            create_user_cost_meter_hook,
+        ],
         tool_registry=tools,
     )
     def _schedule_webui_background(awaitable: Awaitable[None]) -> None:

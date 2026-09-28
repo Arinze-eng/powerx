@@ -1456,6 +1456,7 @@ class AgentLoop:
                 attributes=dict(request_ctx.attributes),
                 session_key=active_session_key,
                 workspace=effective_scope.project_path,
+                timezone_name=self.context.timezone or "UTC",
                 tool_hint_max_length=self.tool_hint_max_length,
                 on_iteration=lambda iteration: setattr(self, "_current_iteration", iteration),
                 registered_hook_factories=self._hook_factories,

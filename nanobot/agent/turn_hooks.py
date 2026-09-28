@@ -31,6 +31,7 @@ class AgentTurnHookSpec:
     metadata: dict[str, Any] | None = None
     session_key: str | None = None
     workspace: Path | None = None
+    timezone_name: str = "UTC"
     tool_hint_max_length: int = 40
     on_iteration: Callable[[int], None] | None = None
     registered_hook_factories: list[AgentTurnHookFactory] = field(default_factory=list)
@@ -65,6 +66,7 @@ def build_agent_turn_hook(spec: AgentTurnHookSpec) -> AgentHook:
         metadata=dict(spec.metadata or {}),
         attributes=dict(spec.attributes or {}),
         ephemeral=spec.ephemeral,
+        timezone_name=spec.timezone_name,
     )
     hook_chain: list[AgentHook] = [progress_hook]
 

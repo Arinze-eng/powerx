@@ -1506,6 +1506,46 @@ def test_settings_usage_payload_returns_lightweight_token_usage(
     assert "agent" not in payload
 
 
+def test_the_usage_payload_carries_the_requesting_users_own_cost_meter(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The meter rides in the usage object so it refreshes on the overview's timer.
+
+    A sibling top-level key would sit at its first-read value for as long as the
+    page stayed open, because the overview refreshes ``usage`` as a unit every
+    five seconds.
+    """
+    config_path = tmp_path / "config.json"
+    config = Config()
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+    monkeypatch.setattr(
+        "nanobot.webui.user_cost.get_webui_dir", lambda: tmp_path / "webui"
+    )
+
+    from nanobot.webui.user_cost import record_user_cost
+
+    record_user_cost(
+        "user-AAA",
+        {"turns": 1, "api_calls": 2, "commands": 30, "pages": 1, "files": 4, "steps": 40},
+        scope="webui",
+    )
+    record_user_cost("user-BBB", {"turns": 1, "api_calls": 99}, scope="webui")
+
+    mine = settings_usage_payload(user_id="user-AAA")["meter"]
+    theirs = settings_usage_payload(user_id="user-BBB")["meter"]
+    nobody = settings_usage_payload()["meter"]
+
+    assert mine["totals"]["api_calls"] == 2
+    assert mine["totals"]["commands"] == 30
+    assert mine["efficiency"]["commands_per_api_call"] == 15.0
+    # Read by key: another user's 99 calls cannot appear here at any point.
+    assert theirs["totals"]["commands"] == 0
+    assert nobody["metered"] is False
+    assert nobody["totals"]["api_calls"] == 0
+
+
 def test_update_network_safety_settings_writes_local_service_flag(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

@@ -568,6 +568,15 @@ export interface ProviderOAuthPending {
 export type ProviderOAuthLoginResult = SettingsPayload | ProviderOAuthAuthorizationRequired;
 export type ProviderOAuthCompletionResult = SettingsPayload | ProviderOAuthPending;
 
+export interface UserCostCounters {
+  turns: number;
+  api_calls: number;
+  commands: number;
+  pages: number;
+  files: number;
+  steps: number;
+}
+
 export interface SettingsPayload {
   surface?: RuntimeSurface;
   runtime_surface?: RuntimeSurface;
@@ -767,6 +776,39 @@ export interface SettingsPayload {
     active_days_30d: number;
     requests_30d: number;
     updated_at?: string | null;
+    /**
+     * The signed-in user's own cost meter.
+     *
+     * Deliberately not the same store as the token rows above: those are
+     * workspace-wide and carry a `source`, this is read by user id. `metered`
+     * is false when the server had no identity to read — an empty meter and a
+     * meter reading zero are different facts and only one of them is true for
+     * a caller we could not name.
+     */
+    meter?: {
+      metered: boolean;
+      days: Array<{
+        date: string;
+        turns: number;
+        api_calls: number;
+        commands: number;
+        pages: number;
+        files: number;
+        steps: number;
+      }>;
+      today: UserCostCounters;
+      totals: UserCostCounters;
+      window: UserCostCounters;
+      window_days: number;
+      scopes: Record<string, UserCostCounters>;
+      efficiency: {
+        /** Commands per model call, or null when nothing hit the model. */
+        commands_per_api_call: number | null;
+        local_steps_per_api_call: number | null;
+      };
+      first_seen?: string | null;
+      updated_at?: string | null;
+    };
   };
   advanced: {
     restrict_to_workspace: boolean;

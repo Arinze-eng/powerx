@@ -50,6 +50,7 @@ from nanobot import optional_features as feature_support  # noqa: E402
 from nanobot.agent.hooks import (  # noqa: E402
     create_api_credit_hook,
     create_file_edit_activity_hook,
+    create_user_cost_meter_hook,
 )
 from nanobot.agent.loop import AgentLoop  # noqa: E402
 from nanobot.agent.tools.mcp import MCPProvider  # noqa: E402
@@ -363,7 +364,11 @@ def serve(
             runtime_config, bus,
             session_manager=session_manager,
             image_generation_provider_configs=image_gen_provider_configs(runtime_config),
-            hook_factories=[create_file_edit_activity_hook, create_api_credit_hook],
+            hook_factories=[
+                create_file_edit_activity_hook,
+                create_api_credit_hook,
+                create_user_cost_meter_hook,
+            ],
             tool_registry=tools,
         )
     except ValueError as exc:

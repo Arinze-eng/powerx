@@ -571,6 +571,23 @@
         "system": "System"
       }
     },
+    "costMeter": {
+      "title": "Your usage",
+      "unmetered": "Cost metering starts when this account is signed in.",
+      "apiCalls": "API calls",
+      "apiCallsHint": "Requests that reached the configured model. Everything else here is local work done between them.",
+      "commands": "Commands",
+      "commandsHint": "Shell, sandbox and hosted-runner steps the agent executed.",
+      "pages": "Pages",
+      "pagesHint": "Pages the agent opened or fetched.",
+      "files": "Files",
+      "filesHint": "Files created or modified, counted once each.",
+      "todayCount": "+{{count}} today",
+      "stepsCaption": "{{steps}} steps · {{turns}} turns",
+      "efficiency": "{{ratio}} commands per API call — the higher this is, the less of your spend went to the model.",
+      "noCalls": "No model call has been made for this account yet.",
+      "window": "Last {{days}} days: {{calls}} API calls, {{commands}} commands, {{pages}} pages, {{files}} files."
+    },
     "providers": {
       "title": "Model providers",
       "searchPlaceholder": "Search providers",

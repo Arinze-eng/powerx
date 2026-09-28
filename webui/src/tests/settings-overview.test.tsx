@@ -239,3 +239,98 @@ describe("Settings overview and appearance", () => {
     expect(screen.getByLabelText("2026-06-03: 1.5K tokens, 2 requests")).toBeInTheDocument();
   });
 });
+
+describe("Settings overview cost meter", () => {
+  installSettingsViewTestHooks();
+
+  const counters = {
+    turns: 12,
+    api_calls: 22,
+    commands: 1980,
+    pages: 14,
+    files: 9,
+    steps: 2100,
+  };
+
+  it("shows the signed-in user their own api calls, commands, pages and files", () => {
+    const basePayload = settingsPayload();
+    const payload: SettingsPayload = {
+      ...basePayload,
+      usage: {
+        days: [],
+        total_tokens: 0,
+        total_tokens_30d: 0,
+        total_tokens_365d: 0,
+        peak_day_tokens: 0,
+        current_streak_days: 0,
+        longest_streak_days: 0,
+        active_days_30d: 0,
+        requests_30d: 0,
+        updated_at: null,
+        meter: {
+          metered: true,
+          days: [],
+          today: { ...counters, commands: 40 },
+          totals: counters,
+          window: { ...counters, api_calls: 22, commands: 1980 },
+          window_days: 30,
+          scopes: { webui: counters },
+          efficiency: { commands_per_api_call: 90, local_steps_per_api_call: 91.05 },
+          first_seen: "2026-06-01T00:00:00Z",
+          updated_at: "2026-06-03T00:00:00Z",
+        },
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+
+    renderSettingsView({ initialSection: "overview", initialSettings: payload });
+
+    expect(screen.getByText("Your usage")).toBeInTheDocument();
+    expect(screen.getByText("API calls")).toBeInTheDocument();
+    expect(screen.getByText("Commands")).toBeInTheDocument();
+    expect(screen.getByText("Pages")).toBeInTheDocument();
+    expect(screen.getByText("Files")).toBeInTheDocument();
+    // 1980 commands against 22 API calls is the ratio the meter exists to show.
+    expect(screen.getByText(/90 commands per API call/)).toBeInTheDocument();
+    expect(screen.getByText("+40 today")).toBeInTheDocument();
+  });
+
+  it("says metering has not started rather than reporting a spend of zero", () => {
+    const basePayload = settingsPayload();
+    const payload: SettingsPayload = {
+      ...basePayload,
+      usage: {
+        days: [],
+        total_tokens: 0,
+        total_tokens_30d: 0,
+        total_tokens_365d: 0,
+        peak_day_tokens: 0,
+        current_streak_days: 0,
+        longest_streak_days: 0,
+        active_days_30d: 0,
+        requests_30d: 0,
+        updated_at: null,
+        meter: {
+          metered: false,
+          days: [],
+          today: { ...counters, turns: 0, api_calls: 0, commands: 0, pages: 0, files: 0, steps: 0 },
+          totals: { ...counters, turns: 0, api_calls: 0, commands: 0, pages: 0, files: 0, steps: 0 },
+          window: { ...counters, turns: 0, api_calls: 0, commands: 0, pages: 0, files: 0, steps: 0 },
+          window_days: 30,
+          scopes: {},
+          efficiency: { commands_per_api_call: null, local_steps_per_api_call: null },
+          first_seen: null,
+          updated_at: null,
+        },
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+
+    renderSettingsView({ initialSection: "overview", initialSettings: payload });
+
+    expect(
+      screen.getByText("Cost metering starts when this account is signed in."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Your usage")).not.toBeInTheDocument();
+  });
+});

@@ -60,6 +60,11 @@ class AgentTurnHookContext:
     metadata: dict[str, Any] = field(default_factory=dict)
     ephemeral: bool = False
     attributes: dict[str, Any] = field(default_factory=dict)
+    #: The configured zone a turn's day-bucketed facts belong to. Carried here so
+    #: a hook that records something "per day" buckets it in the same zone the
+    #: user's own clock and the WebUI's calendar use, instead of silently
+    #: defaulting to UTC and disagreeing with the surface beside it.
+    timezone_name: str = "UTC"
 
 
 class AgentHook:

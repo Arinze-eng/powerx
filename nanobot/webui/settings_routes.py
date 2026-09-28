@@ -471,19 +471,43 @@ class WebUISettingsRouter:
                 )
         return self._json_response(payload)
 
-    def _handle_settings(self) -> Response:
+    def _request_user_id(self, request: WsRequest) -> str:
+        """The signed-in Supabase user for *request*, or ``""``.
+
+        Reuses the identity resolver the gateway already hands this router (it
+        arrives under the name of its first consumer, the YouTube pane) rather
+        than adding a second one: one request, one identity, one place it can
+        come from. An empty answer is a real answer here — the cost meter reads
+        by that key, so an unidentified caller gets an empty meter and never
+        another user's numbers.
+        """
+        if self._youtube_user_id is None:
+            return ""
+        try:
+            return (self._youtube_user_id(request) or "").strip()
+        except Exception:  # noqa: BLE001 - an unidentified caller is not a 500
+            self.logger.warning("could not resolve the settings user", exc_info=True)
+            return ""
+
+    def _handle_settings(self, request: WsRequest) -> Response:
         return self._json_response(
             self._with_restart_state(
                 self.settings.read(
                     settings_payload,
                     surface=self._runtime_surface,
                     runtime_capability_overrides=self._runtime_capabilities,
+                    user_id=self._request_user_id(request),
                 )
             )
         )
 
-    def _handle_settings_usage(self) -> Response:
-        return self._json_response(self.settings.read(settings_usage_payload))
+    def _handle_settings_usage(self, request: WsRequest) -> Response:
+        return self._json_response(
+            self.settings.read(
+                settings_usage_payload,
+                user_id=self._request_user_id(request),
+            )
+        )
 
     async def _handle_api_platform(
         self,

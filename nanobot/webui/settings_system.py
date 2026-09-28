@@ -32,6 +32,7 @@ from nanobot.webui.settings_contracts import (
     query_first_alias,
 )
 from nanobot.webui.token_usage import token_usage_payload
+from nanobot.webui.user_cost import user_cost_payload
 
 if TYPE_CHECKING:
     from nanobot.webui.settings_services import WebUISettingsServices
@@ -93,11 +94,31 @@ def docs_payload(version: str) -> dict[str, Any]:
     }
 
 
+def usage_payload(config: Config, *, user_id: str | None = "") -> dict[str, Any]:
+    """Token usage for the deployment, plus the requesting user's own cost meter.
+
+    One object rather than two fields because the WebUI refreshes usage on a
+    timer as a unit: a sibling key would sit at its first-read value for as long
+    as the page stayed open, and a cost meter that is five minutes stale is a
+    meter nobody trusts. The two halves differ in scope and both say so — the
+    token rows are workspace-wide and carry a ``source``, the meter is read by
+    user id and answers ``metered: false`` rather than a row of zeros when there
+    was no identity to read.
+    """
+    payload = token_usage_payload(timezone_name=config.agents.defaults.timezone)
+    payload["meter"] = user_cost_payload(
+        user_id,
+        timezone_name=config.agents.defaults.timezone,
+    )
+    return payload
+
+
 def system_settings_payload(
     config: Config,
     *,
     config_path: Path,
     version: str,
+    user_id: str | None = "",
 ) -> SystemSettingsPayload:
     defaults = config.agents.defaults
     exec_config = config.tools.exec
@@ -121,7 +142,7 @@ def system_settings_payload(
             },
             "unified_session": defaults.unified_session,
         },
-        "usage": token_usage_payload(timezone_name=defaults.timezone),
+        "usage": usage_payload(config, user_id=user_id),
         "advanced": {
             "restrict_to_workspace": config.tools.restrict_to_workspace,
             "workspace_sandbox": sandbox_status.as_dict(),
@@ -137,9 +158,9 @@ def system_settings_payload(
     }
 
 
-def settings_usage_payload(config: Config) -> dict[str, Any]:
-    """Return the lightweight token usage slice for Overview refreshes."""
-    return token_usage_payload(timezone_name=config.agents.defaults.timezone)
+def settings_usage_payload(config: Config, *, user_id: str | None = "") -> dict[str, Any]:
+    """Return the lightweight usage slice for Overview refreshes."""
+    return usage_payload(config, user_id=user_id)
 
 
 def update_agent_system_settings(config: Config, query: QueryParams) -> tuple[bool, bool]:

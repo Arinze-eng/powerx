@@ -25,6 +25,7 @@ import {
 import { TokenUsageHeatmap } from "@/components/settings/TokenUsageHeatmap";
 import { ToggleButton } from "@/components/settings/ToggleButton";
 import { ProfileSettings } from "@/components/settings/overview/ProfileSettings";
+import { UserCostMeter } from "@/components/settings/overview/UserCostMeter";
 import { Button } from "@/components/ui/button";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { useLogoFallback } from "@/hooks/useLogoFallback";
@@ -115,8 +116,9 @@ export function OverviewSettings({
     <div className="space-y-7">
       <ProfileSettings />
 
-      <section className="rounded-panel bg-settings-surface px-4 py-4 sm:px-5">
+      <section className="space-y-4 rounded-panel bg-settings-surface px-4 py-4 sm:px-5">
         <TokenUsageHeatmap usage={settings.usage} timeZone={settings.agent.timezone} />
+        <UserCostMeter usage={settings.usage} />
       </section>
 
       <section>
