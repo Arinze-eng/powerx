@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -972,3 +973,116 @@ def test_tenki_connection_test_accepts_lane_keys_without_a_single_key(
     refused = admin_registry.admin_route(empty, "/api/admin/execution-test")
     assert refused is not None
     assert refused.status_code == 400
+
+
+
+_SENT: list[dict] = []
+_SECRET = re.compile(r"ZULU-[0-9A-F]{6}-7719")
+
+
+def _dumps(value) -> str:
+    """Dump without the module: ``post``'s ``json=`` kwarg shadows it."""
+    from json import dumps
+
+    return dumps(value)
+
+
+def _probe_client_factory(usages: list[dict], *, drop_marked: bool = True):
+    """A probe client that answers like the measured gemini-proxy.
+
+    It recites the secret it was given *unless* the request carried
+    ``cache_control`` markers, which is exactly what that gateway does: accept
+    the field, drop the block it sits on, and still answer HTTP 200.
+    """
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._body
+
+    class FakeClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def post(self, _url: str, *, headers: dict, json: dict):
+            _SENT.append(json)
+            dumped = _dumps(json.get("messages") or [])
+            marked = "cache_control" in dumped
+            found = _SECRET.search(dumped)
+            answer = "no idea" if (marked and drop_marked) else (found.group(0) if found else "no idea")
+            return FakeResponse(
+                {
+                    "choices": [{"message": {"content": answer}}],
+                    "usage": usages[min(len(_SENT) - 1, len(usages) - 1)],
+                }
+            )
+
+    return FakeClient
+
+
+def test_cache_probe_measures_markers_and_says_what_it_cannot_see(monkeypatch) -> None:
+    """A gateway that reports no cache field is not the same as one reporting zero."""
+    from nanobot.providers.prompt_cache import conversation_cache_key
+
+    probe_key = conversation_cache_key("admin-cache-probe")
+    silent = {"prompt_tokens": 4100, "completion_tokens": 4, "total_tokens": 4104}
+    reporting = {
+        "prompt_tokens": 4100,
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
+
+    monkeypatch.setattr(
+        admin_registry,
+        "_credentials",
+        lambda _payload: ("https://gateway.example.test/v1", "model-a", "test-key"),
+    )
+
+    # 1. An endpoint that says nothing about caching.
+    _SENT.clear()
+    monkeypatch.setattr(
+        admin_registry.httpx, "Client", _probe_client_factory([silent] * 4)
+    )
+    body = json.loads(bytes(admin_registry._cache_test_response({}).body).decode())
+
+    # The routing key rides the probe's keyed call and nothing else, which is how
+    # an operator learns whether their gateway tolerates the field every real
+    # call will carry.
+    assert [probe.get("prompt_cache_key") for probe in _SENT] == [
+        None,
+        None,
+        probe_key,
+        None,
+    ]
+    assert body["routingKey"]["accepted"] is True
+    assert body["cacheReported"] is False
+    assert body["recommended"] == "auto"
+    # All three findings, not just the first one an if/elif reaches.
+    assert "Do NOT use markers on this endpoint" in body["detail"]
+    assert "reported no cache field" in body["detail"]
+    assert "prompt_cache_key" in body["detail"]
+    assert "billed in full" not in body["detail"]
+
+    # 2. An endpoint that reports cache usage and reported nothing served.
+    _SENT.clear()
+    monkeypatch.setattr(
+        admin_registry.httpx, "Client", _probe_client_factory([reporting] * 4)
+    )
+    reported = json.loads(bytes(admin_registry._cache_test_response({}).body).decode())
+
+    assert reported["cacheReported"] is True
+    assert reported["auto"]["cached_tokens"] == 0
+    assert "billed in full" in reported["detail"]

@@ -160,13 +160,25 @@ verified from the outside is measured by the admin cache test instead.
 
 ## Measuring it
 
-**Admin → Provider settings → Test caching** sends the same large prefix three
+**Admin → Provider settings → Test caching** sends the same large prefix four
 times and reports:
 
 * how many prompt tokens the second request had cached (`auto` hits),
 * whether the endpoint accepted a marked request,
 * whether the model actually *received* the marked block (the recital check),
-* the recommended mode, and a warning when markers are unsafe.
+* whether the endpoint accepted `prompt_cache_key`, on the same body production
+  sends it on,
+* whether the usage block carries a cache field **at all** — an endpoint that
+  reports nothing is not the same as one reporting zero, and the probe says
+  which it is instead of claiming a full-price repeat it cannot see,
+* the recommended mode, and a warning when markers are unsafe. Findings are
+  listed together, not just the first one that applies: the endpoint in use here
+  accepts markers, drops the block, and reports no cache, and all three belong
+  in the answer.
+
+Run against the live `gemini-proxy.codebanana.app`: `cacheReported: false`,
+markers "accepted" while `prompt_tokens` fell `4195 → 13` (the block really was
+dropped), `routingKey.accepted: true`, recommended `auto`.
 
 **In the logs**, every turn now emits the hit rate:
 
