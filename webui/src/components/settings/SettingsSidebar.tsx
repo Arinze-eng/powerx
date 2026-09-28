@@ -11,7 +11,6 @@ import {
   MessageCircle,
   Mic,
   Palette,
-  ShieldCheck,
   SlidersHorizontal,
   type LucideIcon,
 } from "lucide-react";
@@ -41,7 +40,9 @@ const SETTINGS_NAV_ITEMS: Array<{ key: SettingsSectionKey; icon: LucideIcon; fal
   { key: "browser", icon: Globe2, fallback: "Web" },
   { key: "channels", icon: MessageCircle, fallback: "Channels" },
   // "System" (runtime) intentionally hidden from the settings navigation.
-  { key: "advanced", icon: ShieldCheck, fallback: "Security" },
+  // "Security" ("advanced") is intentionally hidden from it as well: the panel
+  // still renders for a deep link to #/settings?section=advanced, it is simply
+  // no longer offered in this list.
 ];
 
 export function standaloneSectionTitle(section: SettingsSectionKey): string {

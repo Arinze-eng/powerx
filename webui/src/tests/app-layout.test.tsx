@@ -2501,7 +2501,7 @@ describe("App layout", () => {
     expect(within(settingsNav).queryByRole("button", { name: "Files" })).not.toBeInTheDocument();
     expect(within(settingsNav).getByRole("button", { name: "Web" })).toBeInTheDocument();
     expect(within(settingsNav).queryByRole("button", { name: "Apps" })).not.toBeInTheDocument();
-    expect(within(settingsNav).getByRole("button", { name: "Security" })).toBeInTheDocument();
+    expect(within(settingsNav).queryByRole("button", { name: "Security" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
     fireEvent.pointerDown(within(settingsNav).getByRole("button", { name: "Settings: Overview" }));
     fireEvent.click(await screen.findByRole("menuitem", { name: "Appearance" }));
