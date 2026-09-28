@@ -76,7 +76,23 @@ def log_cost_meter(
         # when nothing is cached and a fraction of that when the gateway serves
         # the prefix from its cache. Without this line the log cannot tell the
         # two apart, which is how the cost crept up unnoticed.
-        hit_pct = round(cached_tokens * 100.0 / prompt_tokens, 1) if prompt_tokens > 0 else 0.0
+        # An LLM turn reporting zero prompt tokens is a turn whose gateway
+        # reported no usage at all, not a turn that paid nothing: measured on the
+        # configured gemini-proxy, which omits the usage block on a streamed
+        # response even with stream_options.include_usage set. Printing 0.0%
+        # there reads as "nothing was cached" when the truth is "nothing was
+        # reported", which is precisely the confusion this line exists to end.
+        unreported = served_by == "llm" and prompt_tokens == 0
+        if unreported:
+            prompt_field: Any = "unreported"
+            cached_field: Any = "unreported"
+            hit_field: Any = "unreported"
+        else:
+            prompt_field = prompt_tokens
+            cached_field = cached_tokens
+            hit_field = (
+                round(cached_tokens * 100.0 / prompt_tokens, 1) if prompt_tokens > 0 else 0.0
+            )
         logger.bind(cost=True).info(
             "COST_METER channel={} session={} llm_calls={} served_by={} "
             "prompt_tokens={} cached_tokens={} cache_hit_pct={} completion_tokens={} stop={}",
@@ -84,9 +100,9 @@ def log_cost_meter(
             (session_key or "-")[:40],
             _as_int(charged_steps),
             served_by,
-            prompt_tokens,
-            cached_tokens,
-            hit_pct,
+            prompt_field,
+            cached_field,
+            hit_field,
             _as_int(usage.get("completion_tokens")),
             stop_reason or "-",
         )

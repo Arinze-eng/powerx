@@ -193,3 +193,19 @@ usage (`prompt_tokens_details.cached_tokens`, top-level `cached_tokens`, or
 Moonshot/StepFun and any gateway that reports a cache field. A turn whose
 `cache_hit_pct` is `0.0` while `prompt_tokens` is in the hundreds of thousands is
 paying full price for a conversation that is not changing between tool calls.
+
+**And when the gateway reports nothing, the meter now says `unreported` instead
+of `0.0`:**
+
+```
+COST_METER channel=websocket session=... llm_calls=6 served_by=llm   prompt_tokens=unreported cached_tokens=unreported cache_hit_pct=unreported   completion_tokens=unreported stop=completed
+```
+
+That distinction was earned: make a streamed request to the configured
+gemini-proxy **with** `stream_options.include_usage` and the response ends at
+`data: [DONE]` with no usage chunk at all (verified live; the same request
+non-streamed reports `prompt_tokens` normally). Real turns stream, so without
+this the log printed `cache_hit_pct=0.0` on a gateway that never reported a
+cache field — an operator would read "nothing is cached" where the truth is
+"nothing is *measurable here*". Zero from a gateway that answers is still
+printed as zero; only a missing usage block is called unreported.

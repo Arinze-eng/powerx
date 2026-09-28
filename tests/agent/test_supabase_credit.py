@@ -221,6 +221,39 @@ class TestCostMeter:
                 remove()
             assert f"served_by={expected}" in "\n".join(captured), marker
 
+    def test_a_gateway_that_reports_no_usage_says_so(self, monkeypatch) -> None:
+        """Zero reported is not zero cached: the meter must not conflate them."""
+        captured, remove = _capture_cost_lines(monkeypatch)
+        try:
+            supabase_credit.log_cost_meter(
+                channel="websocket",
+                session_key="web:1",
+                charged_steps=4,
+                usage={"completion_tokens": 0},
+                stop_reason="completed",
+            )
+        finally:
+            remove()
+        line = "\n".join(captured)
+        assert "prompt_tokens=unreported" in line
+        assert "cached_tokens=unreported" in line
+        assert "cache_hit_pct=unreported" in line
+
+    def test_a_turn_with_no_llm_call_still_reports_zero(self, monkeypatch) -> None:
+        captured, remove = _capture_cost_lines(monkeypatch)
+        try:
+            supabase_credit.log_cost_meter(
+                channel="telegram",
+                session_key="tg:1",
+                charged_steps=0,
+                usage={"plan_replayed": 1},
+                stop_reason="completed",
+            )
+        finally:
+            remove()
+        line = "\n".join(captured)
+        assert "cache_hit_pct=0.0" in line
+
     def test_meter_never_raises_on_bad_input(self, monkeypatch) -> None:
         captured, remove = _capture_cost_lines(monkeypatch)
         try:
