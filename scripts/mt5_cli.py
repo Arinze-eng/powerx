@@ -45,6 +45,8 @@ Notes
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import math
 import os
@@ -8981,6 +8983,100 @@ def _localize_wine_path(raw: str) -> Path:
     return WINE_PREFIX / f"drive_{drive}" / rest
 
 
+#: Top-level switches that may legally appear BEFORE the subcommand. Both are
+#: store-true, so each occupies exactly one token and carries no value.
+_GLOBAL_FLAGS = frozenset({"--text", "-h", "--help"})
+
+
+def _action_of(argv: list[str]) -> str | None:
+    """The subcommand in ``argv``, skipping the global flags that may precede it.
+
+    THE BUG THIS REMOVES (measured 2026-09-29, live Freestyle sandbox, Wine 10 +
+    MT5 build 6231): the re-exec used ``argv[0]`` as the action. ``--text`` is a
+    top-level flag, so ``mt5_cli.py --text login --login …`` -- which argparse
+    accepts happily, and which reads as the natural way to ask for human output --
+    arrived as ``argv[0] == '--text'``. That is not in ``_BRIDGE_ACTIONS``, so the
+    re-exec was skipped, the action ran on the *Linux* python, and the caller got
+
+        mt5_cli.py must run inside Wine to reach the MT5 bridge. It should
+        re-exec automatically; run it via mt5_cli.py (not directly) or set
+        MT5_UNDER_WINE=1.
+
+    Every clause of that message is wrong or useless: the re-exec does not happen
+    "automatically", the caller *is* running it via mt5_cli.py, and setting
+    ``MT5_UNDER_WINE=1`` on Linux only skips the guard so the bridge import then
+    fails for real. It reads as a broken install -- which is how a pure dispatch
+    bug gets reported as "MT5 installation is failing on Freestyle".
+
+    Only the KNOWN global switches are skipped, never any token starting with
+    ``-``: a future global flag that takes a value would otherwise hand its VALUE
+    to this function as the action, which is the same class of silent misdispatch.
+    """
+    for token in argv:
+        if token in _GLOBAL_FLAGS:
+            continue
+        return token
+    return None
+
+
+def _argv_flag(argv: list[str], name: str) -> str | None:
+    """``--name``'s value in ``argv``, in either ``--name value`` or ``--name=value`` form."""
+    for index, token in enumerate(argv):
+        if token == name and index + 1 < len(argv):
+            return argv[index + 1]
+        if token.startswith(name + "="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def _bootstrap_credentialed_terminal(argv: list[str]) -> None:
+    """Bring up a terminal launched with ``/config:`` before a ``login`` re-exec.
+
+    THE BUG THIS REMOVES (measured 2026-09-29, live Freestyle sandbox, Wine 10 +
+    MT5 build 6231): ``login`` was offered as the way to supply credentials -- by
+    this CLI's own hint from a credential-less ``start``, which says "Pass
+    login/password/server to action='start' (or use action='login')" -- but
+    ``cmd_login`` only does ``mt5.initialize()`` + ``mt5.login()``, and both need
+    a terminal that is *already up and already carrying the account*. A terminal
+    booted without ``/config:`` holds no account, so ``initialize()`` cannot
+    complete the IPC handshake and dies on the ~240 s IPC timeout with "Run start
+    first." A caller who then did exactly that -- a BARE ``start`` -- got another
+    account-less terminal and looped, while the terminal log showed the real
+    tell: startup lines but not one ``Network`` line.
+
+    The launch has to happen HERE, on the Linux side, and not inside
+    ``cmd_login``: ``login`` is a bridge action, so ``cmd_login`` executes under
+    Wine, and a Wine process cannot launch wine (the same constraint that keeps
+    ``guard`` out of ``_BRIDGE_ACTIONS``).
+
+    ``cmd_start`` already owns every part of this -- writing both ini files,
+    stopping an interloper terminal from another broker, launching with
+    ``/config:``, and waiting for an account -- so it is reused rather than
+    reimplemented. Its payload is swallowed: this runs on the way to returning a
+    single JSON object, and two objects concatenated on one stdout is precisely
+    the unparseable answer this file exists to prevent.
+    """
+    login = _argv_flag(argv, "--login")
+    password = _argv_flag(argv, "--password")
+    server = _argv_flag(argv, "--server")
+    if not (login and password and server):
+        return
+    terminal = find_terminal(prefer_key=(broker_for_server(server) or {}).get("key"))
+    if terminal is None:
+        return
+    if _terminal_has_credentials(terminal):
+        # Already launched with our credentials. If it is also live there is
+        # nothing to do; if it is not, fall through and let cmd_start restart it.
+        probe = _bridge_probe(timeout=20)
+        if probe and probe.get("ok") and probe.get("account"):
+            return
+    start_args = argparse.Namespace(
+        wait=90, login=login, password=password, server=server, portable=False
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_start(start_args)
+
+
 def _reexec_under_wine(argv: list[str]) -> int | None:
     """Run a bridge action inside Wine and return the child's exit code.
 
@@ -8999,12 +9095,19 @@ def _reexec_under_wine(argv: list[str]) -> int | None:
     """
     if under_wine() or not argv:
         return None
-    action = argv[0]
+    action = _action_of(argv)
     if action not in _BRIDGE_ACTIONS:
         return None
     winpy = win_python()
     if winpy is None:
         return None
+
+    # A ``login`` needs a terminal that already carries the account; make sure
+    # one is up before handing the call to Wine (see the function's docstring).
+    # Deliberately before the temp-file dance so a failed launch still returns
+    # through cmd_login and reports the real reason.
+    if action == "login":
+        _bootstrap_credentialed_terminal(argv)
 
     drive_c = WINE_PREFIX / "drive_c"
     # ONE SANDBOX PER INVOCATION. These paths used to be fixed
