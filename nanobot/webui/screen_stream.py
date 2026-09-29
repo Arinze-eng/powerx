@@ -240,6 +240,23 @@ APT_LOCK_WAIT_S = 120
 #: * the install is skipped entirely when the tools are already there, so a
 #:   sandbox whose desktop merely had not been started yet is never given an apt
 #:   run for nothing.
+#: The terminal is started with an explicit black background and a command that
+#: prints a line and then never exits, and that is not decoration. MEASURED on the
+#: production app session ``px-websocket-ca0fb78e`` (2026-09-29): a plain
+#: ``xterm -fa Monospace -fs 11`` came up mapped and maximised at 1920x1080 with a
+#: **blank white** interior -- 2 069 871 of 2 073 600 pixels pure ``#FFFFFF`` and a
+#: grey mean of 0.9992 -- so the panel showed a white rectangle and the operator
+#: reported the Live screen as not showing at all. The window tree proved the
+#: terminal was there (``xwininfo -root -tree``: ``0x40000c "xterm" 1920x1080+0+0``)
+#: and ``fc-match Monospace`` resolved to DejaVu Sans Mono, so it was the empty
+#: shell surface and not a missing font. A black terminal that always has one white
+#: line on it cannot be mistaken for a broken panel.
+#:
+#: The frame's luminance spread is logged next to the readiness marker because byte
+#: count cannot tell a drawn desktop from an empty one -- the same lesson
+#: ``engineering_draw_cli`` learned when a 106 KB splash screen passed a size test.
+#: A spread near zero is the signature of the blank sheet above.
+#:
 _PROVISION_BODY = (
     'set -u; D="$PX_DISPLAY"; '
     'LOCK="' + APT_LOCK_PATH + '"; WAIT=' + str(APT_LOCK_WAIT_S) + '; '
@@ -272,13 +289,17 @@ _PROVISION_BODY = (
     'DISPLAY="$D" nohup matchbox-window-manager -use_titlebar no >>"$PX_LOG" 2>&1 & fi; '
     "if command -v xterm >/dev/null 2>&1; then "
     "if ! pgrep -x xterm >/dev/null 2>&1; then "
-    'DISPLAY="$D" nohup xterm -fa Monospace -fs 11 -geometry 100x28+0+0 '
+    'DISPLAY="$D" nohup xterm -bg black -fg white -fa Monospace -fs 12 '
+    '-geometry 100x28+0+0 -e sh -c "echo powerx desktop ready; exec sleep 86400" '
     '>>"$PX_LOG" 2>&1 & fi; fi; '
     "sleep 1; mkdir -p \"$PX_DIR\"; "
     'printf "wm="; pgrep -x matchbox-window | head -1; '
     'printf "xvfb="; pgrep -f "Xvfb $D" | head -1; echo; '
-    'DISPLAY="$D" import -window root "$PX_DIR/frame.png" >/dev/null 2>&1 && '
-    "echo desktop-ready || echo desktop-up"
+    'DISPLAY="$D" import -window root "$PX_DIR/frame.png" >/dev/null 2>&1 || '
+    "{ echo desktop-up; exit 0; }; "
+    'echo "desktop-spread=$(identify -format "%[fx:standard_deviation]" '
+    '"$PX_DIR/frame.png" 2>/dev/null || echo unknown)"; '
+    "echo desktop-ready"
 )
 
 

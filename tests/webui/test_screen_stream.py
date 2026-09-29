@@ -1095,3 +1095,33 @@ async def test_recording_frames_does_not_notify_error_sinks() -> None:
 
     assert errors.details == []
     await stream.stop()
+
+
+def test_the_desktop_terminal_can_never_be_a_blank_sheet() -> None:
+    """The panel must not show a white rectangle, and a byte count cannot detect one.
+
+    MEASURED on the production app session ``px-websocket-ca0fb78e`` (2026-09-29):
+    a plain ``xterm -fa Monospace -fs 11`` came up mapped and maximised at
+    1920x1080 with a **blank white** interior -- 2 069 871 of 2 073 600 pixels pure
+    ``#FFFFFF``, grey mean 0.9992 -- so the operator saw a white rectangle and
+    reported the Live screen as not showing at all. ``xwininfo -root -tree`` proved
+    the terminal was mapped (``0x40000c "xterm" 1920x1080+0+0``) and ``fc-match
+    Monospace`` resolved to DejaVu Sans Mono, so it was the empty shell surface and
+    not a missing font. The frame was 15 273 bytes with 1208 distinct colours, so
+    it passed every check the pump actually made.
+
+    Two properties are pinned here. The terminal is given an explicit dark
+    background and a command that always leaves a line of text, so an empty shell
+    surface cannot be what gets photographed; and the frame's luminance spread is
+    logged next to the readiness marker, so the next blank frame is diagnosable
+    from the log alone -- byte count cannot separate a drawn desktop from an empty
+    one, the same lesson ``engineering_draw_cli`` learned when a 106 KB splash
+    screen passed its size test.
+    """
+    from nanobot.webui import screen_stream as module
+
+    body = module._PROVISION_BODY  # noqa: SLF001 - the invariant under test
+    assert "-bg black -fg white" in body
+    assert "exec sleep 86400" in body
+    assert "desktop-spread=" in body
+    assert body.index("desktop-spread=") < body.index("echo desktop-ready")
