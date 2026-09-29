@@ -249,8 +249,15 @@ APT_LOCK_WAIT_S = 120
 #: reported the Live screen as not showing at all. The window tree proved the
 #: terminal was there (``xwininfo -root -tree``: ``0x40000c "xterm" 1920x1080+0+0``)
 #: and ``fc-match Monospace`` resolved to DejaVu Sans Mono, so it was the empty
-#: shell surface and not a missing font. A black terminal that always has one white
-#: line on it cannot be mistaken for a broken panel.
+#: shell surface and not a missing font.
+#:
+#: A black terminal carrying a single static line turned out not to be enough
+#: either: MEASURED on a fresh sandbox (2026-09-29, ``px-screen-verify2``) the frame
+#: was then 2 072 086 black pixels to 205 white, so the panel showed a near-black
+#: sheet with one speck of text -- still not a screen the operator could read as
+#: working. The terminal therefore prints a UTC timestamp every five seconds, which
+#: gives the panel visible motion and makes a frozen or disconnected stream obvious
+#: at a glance instead of indistinguishable from a blank one.
 #:
 #: The frame's luminance spread is logged next to the readiness marker because byte
 #: count cannot tell a drawn desktop from an empty one -- the same lesson
@@ -289,8 +296,9 @@ _PROVISION_BODY = (
     'DISPLAY="$D" nohup matchbox-window-manager -use_titlebar no >>"$PX_LOG" 2>&1 & fi; '
     "if command -v xterm >/dev/null 2>&1; then "
     "if ! pgrep -x xterm >/dev/null 2>&1; then "
-    'DISPLAY="$D" nohup xterm -bg black -fg white -fa Monospace -fs 12 '
-    '-geometry 100x28+0+0 -e sh -c "echo powerx desktop ready; exec sleep 86400" '
+    'DISPLAY="$D" nohup xterm -bg black -fg white -fa Monospace -fs 14 '
+    '-geometry 100x28+0+0 -e sh -c "echo powerx desktop ready; '
+    'while :; do date -u; sleep 5; done" '
     '>>"$PX_LOG" 2>&1 & fi; fi; '
     "sleep 1; mkdir -p \"$PX_DIR\"; "
     'printf "wm="; pgrep -x matchbox-window | head -1; '

@@ -1122,6 +1122,9 @@ def test_the_desktop_terminal_can_never_be_a_blank_sheet() -> None:
 
     body = module._PROVISION_BODY  # noqa: SLF001 - the invariant under test
     assert "-bg black -fg white" in body
-    assert "exec sleep 86400" in body
+    # A single static line was measured to be no better than the white sheet it
+    # replaced (2 072 086 black pixels to 205 white on px-screen-verify2), so the
+    # terminal must keep printing: a UTC stamp every five seconds.
+    assert "while :; do date -u; sleep 5; done" in body
     assert "desktop-spread=" in body
     assert body.index("desktop-spread=") < body.index("echo desktop-ready")
