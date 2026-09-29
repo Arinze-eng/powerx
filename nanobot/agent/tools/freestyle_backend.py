@@ -763,7 +763,14 @@ class FreestyleExecutionBackend:
             text += f"\n[stderr]\n{stderr}"
         if payload.get("timedOut"):
             text += "\n[timed_out=true]"
-        if code is not None and int(code) != 0:
+        if code is not None:
+            # The marker is the ONLY way a caller can tell success from failure:
+            # ``run`` never raises for a non-zero exit, and
+            # ``workspace_bridge._exit_code`` reads the trailing marker to decide
+            # whether a command succeeded. Emitting it only on failure made every
+            # successful command look like a failure to the bridge, which is what
+            # stopped the live-screen pump from ever fetching a frame. This is the
+            # same contract ``vps_backend._output`` has always had.
             text += f"\n[exit_code={code}]"
         return _truncate(text) or "(no output)"
 

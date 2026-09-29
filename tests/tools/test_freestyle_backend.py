@@ -370,7 +370,12 @@ def test_run_rejects_a_bad_command() -> None:
 
 
 def test_exec_render_surfaces_stderr_exit_code_and_timeout() -> None:
-    assert FreestyleExecutionBackend._render({"stdout": "ok", "stderr": "", "statusCode": 0}) == "ok"
+    # The exit marker is emitted for success too, not just for failure: it is how
+    # ``workspace_bridge`` tells a command that worked from one that did not.
+    assert (
+        FreestyleExecutionBackend._render({"stdout": "ok", "stderr": "", "statusCode": 0})
+        == "ok\n[exit_code=0]"
+    )
     assert "[exit_code=3]" in FreestyleExecutionBackend._render(
         {"stdout": "", "stderr": "boom", "statusCode": 3}
     )
@@ -378,6 +383,24 @@ def test_exec_render_surfaces_stderr_exit_code_and_timeout() -> None:
         {"stdout": "", "stderr": "late", "statusCode": 124, "timedOut": True}
     )
     assert FreestyleExecutionBackend._render({}) == "(no output)"
+
+
+def test_successful_run_is_readable_by_the_workspace_bridge() -> None:
+    """A successful command must look successful to ``workspace_bridge``.
+
+    The live-screen pump decides "capture worked" from
+    ``workspace_bridge.run_remote``, which reads the trailing exit marker off the
+    backend's rendered output. While the marker was failure-only every capture
+    read as a failure and no frame was ever fetched out of the VM.
+    """
+    from nanobot.agent.tools.workspace_bridge import _exit_code
+
+    assert _exit_code(FreestyleExecutionBackend._render({"stdout": "42", "statusCode": 0})) == 0
+    assert _exit_code(FreestyleExecutionBackend._render({"stdout": "", "statusCode": 7})) == 7
+    # A frame written to the workspace prints its byte count; the marker must
+    # survive the 16k tail truncation.
+    big = FreestyleExecutionBackend._render({"stdout": "x" * 40_000 + "\n170620", "statusCode": 0})
+    assert _exit_code(big) == 0
 
 
 # ------------------------------------------------------------------ file plane
