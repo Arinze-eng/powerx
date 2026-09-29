@@ -31,6 +31,7 @@ defect was caught. These tests drive the REAL method with a fake HTTP plane.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import re
@@ -44,6 +45,7 @@ import pytest
 from nanobot.agent.tools.freestyle_backend import FreestyleExecutionBackend
 from nanobot.agent.tools.novita_sandbox import (
     NovitaSandboxTool,
+    _clean_install_package_names,
     _git_creds_source_for,
 )
 
@@ -238,3 +240,143 @@ def test_only_one_freestyle_session_store_is_defined() -> None:
     source = Path("nanobot/agent/tools/novita_sandbox.py").read_text(encoding="utf-8")
     assert len(re.findall(r"^class _FreestyleSessionStore\b", source, re.M)) == 1
     assert len(re.findall(r"^_FREESTYLE_STORE = _FreestyleSessionStore\(\)$", source, re.M)) == 1
+
+
+# --------------------------------------------------------------------------
+# action=install read only ``packages``, so a call shaped like ``run`` died.
+#
+# The deployed instance's Northflank log shows the exact failure:
+#
+#   Tool call: novita_sandbox({"action": "install", "command": "nmap"})
+#   File "/app/nanobot/agent/tools/novita_sandbox.py", line 3696,
+#     in _execute_freestyle_inner
+#       result = await backend.install_packages(packages, timeout=timeout)
+#                   ...  └ []
+#   ValueError: no valid package names supplied
+#   ERROR | - | Freestyle VM operation failed
+#
+# ``packages`` was empty because the packages rode in on ``command`` — the key
+# ``run`` takes — and every backend raises ValueError for an empty list. The
+# exception left the tool as an opaque "VM operation failed", so the task's
+# package install could never succeed.
+# --------------------------------------------------------------------------
+
+
+def _vm_ran(recorder: _Recorder, needle: str) -> bool:
+    """``run`` records several execs (script, code, log, cleanup)."""
+    return any(needle in command for command in recorder.commands)
+
+
+def test_install_reads_packages_from_the_run_style_command_argument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact shipped call shape: {"action": "install", "command": "nmap"}."""
+    tool, recorder = _freestyle_tool(monkeypatch)
+
+    result = asyncio.run(tool.execute(action="install", command="nmap"))
+
+    assert "no valid package names" not in str(result), result
+    assert "installation result" in str(result), result
+    assert _vm_ran(recorder, "install -y -qq nmap"), recorder.commands
+
+
+def test_install_unwraps_a_whole_apt_line_sent_as_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Models paste the command they would have run, not bare names."""
+    tool, recorder = _freestyle_tool(monkeypatch)
+
+    asyncio.run(
+        tool.execute(
+            action="install",
+            command="sudo apt-get update && sudo apt-get install -y nmap curl",
+        )
+    )
+
+    # The tool rebuilt the line from the package names alone.
+    assert _vm_ran(recorder, "install -y -qq nmap curl"), recorder.commands
+
+
+def test_clean_install_package_names_keeps_names_and_drops_command_traffic() -> None:
+    assert _clean_install_package_names("nmap curl") == ["nmap", "curl"]
+    assert _clean_install_package_names("nmap,curl") == ["nmap", "curl"]
+    assert _clean_install_package_names(["nmap", "curl jq"]) == ["nmap", "curl", "jq"]
+    assert _clean_install_package_names("sudo apt-get install -y nmap") == ["nmap"]
+    assert _clean_install_package_names("DEBIAN_FRONTEND=noninteractive nmap") == ["nmap"]
+    assert _clean_install_package_names("libc6-dev python3-pip g++") == [
+        "libc6-dev",
+        "python3-pip",
+        "g++",
+    ]
+    assert _clean_install_package_names("") == []
+    assert _clean_install_package_names(None) == []
+    assert _clean_install_package_names("&& || ; |") == []
+    # A shell metacharacter-laden payload must not smuggle an operator through.
+    assert _clean_install_package_names("nmap && curl") == ["nmap", "curl"]
+    assert _clean_install_package_names("nmap;rm -rf /") == ["nmap", "rm"]
+
+
+def test_install_without_any_package_names_returns_a_usable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Never raise: tell the model which argument it should have used."""
+    tool, recorder = _freestyle_tool(monkeypatch)
+
+    result = asyncio.run(tool.execute(action="install"))
+
+    assert getattr(result, "is_error", False), repr(result)
+    assert "packages" in str(result)
+    assert "command" in str(result)
+    assert not recorder.commands, "an empty install still touched the VM"
+
+
+def test_a_declared_packages_argument_still_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool, recorder = _freestyle_tool(monkeypatch)
+
+    asyncio.run(tool.execute(action="install", packages="jq,ripgrep"))
+
+    assert _vm_ran(recorder, "install -y -qq jq ripgrep"), recorder.commands
+
+
+def test_the_live_tool_schema_exposes_packages() -> None:
+    """The schema the MODEL sees has to offer ``packages``, or install is uncallable.
+
+    ``@tool_parameters`` rebinds ``cls.parameters`` after the class body runs, so
+    a parameter declared only in the class-body dict never reaches a provider.
+    ``packages`` was missing from the live schema, which left ``action=install``
+    with no legal way to name a package: the model sent the one key it had
+    (``command``), the handler read only ``packages``, and the install died with
+    "no valid package names supplied" — the failure in the Northflank log.
+    """
+    props = NovitaSandboxTool().parameters["properties"]
+
+    assert "packages" in props, sorted(props)
+    assert "install" in props["command"]["description"]
+    assert "install" in props["packages"]["description"]
+
+
+def test_the_shadowed_parameters_dict_mirrors_the_live_schema() -> None:
+    """One schema in two places: keep the decorator and the dead property in step."""
+    live = set(NovitaSandboxTool().parameters["properties"])
+    source = Path("nanobot/agent/tools/novita_sandbox.py").read_text(encoding="utf-8")
+
+    declared: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.ClassDef) and node.name == "NovitaSandboxTool"):
+            continue
+        for item in node.body:
+            if not (isinstance(item, ast.FunctionDef) and item.name == "parameters"):
+                continue
+            for sub in ast.walk(item):
+                if not isinstance(sub, ast.Dict):
+                    continue
+                keys = [k.value for k in sub.keys if isinstance(k, ast.Constant)]
+                if "properties" not in keys:
+                    continue
+                props = sub.values[keys.index("properties")]
+                declared = {k.value for k in props.keys if isinstance(k, ast.Constant)}
+
+    assert declared, "the class-body parameters dict was not found"
+    assert declared == live, f"only in one copy: {declared ^ live}"

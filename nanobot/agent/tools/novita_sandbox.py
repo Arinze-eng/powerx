@@ -959,6 +959,81 @@ def _tenki_key_configured(config: Any | None) -> bool:
     return bool(str(getattr(config, "api_key", "") or "").strip())
 
 
+#: Tokens that turn up in an ``install`` payload but are never package names.
+#: A model that reaches for ``action=install`` habitually sends the packages
+#: under ``command`` (the key ``run`` takes), and often sends a whole
+#: ``sudo apt-get install -y nmap`` line rather than a bare name, so both the
+#: key and the contents have to be read leniently.
+_INSTALL_NOISE_TOKENS = frozenset(
+    {
+        "sudo", "apt", "apt-get", "aptitude", "apk", "dnf", "yum", "zypper",
+        "pacman", "install", "add", "update", "upgrade", "reinstall", "sh",
+        "bash", "-c", "&&", "||", ";", "|", "&", ">", ">>", "<", "export",
+        "env", "command", "which", "run", "yes",
+        "-y", "--yes", "-q", "-qq", "--no-cache", "--no-install-recommends",
+    }
+)
+
+_PACKAGE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9+_.:@~=-]{0,127}")
+
+#: Package names never contain shell punctuation, so splitting on it recovers
+#: the names from a pasted one-liner ("nmap;rm -rf /", "nmap&&curl") instead of
+#: discarding the token wholesale.
+_PACKAGE_SPLIT_RE = re.compile(r"[\s,;|&<>()]+")
+
+#: Returned instead of raising when an ``install`` call carries no usable
+#: package names. The model has to be told which argument to use; the
+#: ``ValueError`` the backends raise for an empty list only produced an
+#: opaque "VM operation failed".
+_INSTALL_NEEDS_PACKAGES = (
+    'The install action needs the package names in the "packages" argument, for '
+    'example {"action": "install", "packages": "nmap curl"}. "command" belongs to '
+    "action=run. Do not repeat the same payload unchanged: send packages, or fold "
+    "the install into a run command."
+)
+
+
+def _clean_install_package_names(raw: Any) -> list[str]:
+    """Reduce whatever the model sent to plausible distro package names."""
+    if isinstance(raw, (list, tuple, set)):
+        text = " ".join(str(item) for item in raw)
+    else:
+        text = str(raw or "")
+    tokens = _PACKAGE_SPLIT_RE.split(text)
+    names: list[str] = []
+    for token in tokens:
+        token = token.strip().strip("'\"")
+        if not token or token.startswith("-"):
+            continue
+        if token.lower() in _INSTALL_NOISE_TOKENS:
+            continue
+        if re.fullmatch(r"[A-Z_][A-Z0-9_]*=.*", token):  # DEBIAN_FRONTEND=noninteractive
+            continue
+        if not _PACKAGE_NAME_RE.fullmatch(token):
+            continue
+        if token not in names:
+            names.append(token)
+    return names
+
+
+def _install_packages_from_kwargs(kwargs: dict[str, Any]) -> list[str]:
+    """Package names for ``action=install``, read from ``packages`` or ``command``.
+
+    MEASURED FAILURE (2026-09-29, from this deployment's Northflank log): the
+    model called ``novita_sandbox({"action": "install", "command": "nmap"})``.
+    Only ``packages`` was read, so the list arrived empty, the backend's
+    ``install_packages`` raised ``ValueError: no valid package names supplied``,
+    and the exception escaped this method to the generic tool handler. The model
+    was shown "Freestyle VM operation failed" plus a traceback instead of an
+    explanation, the tool call failed, and the task could not continue. Accept
+    either key so a call shaped like ``run`` still does what it plainly means.
+    """
+    names = _clean_install_package_names(kwargs.get("packages"))
+    if names:
+        return names
+    return _clean_install_package_names(kwargs.get("command"))
+
+
 @tool_parameters(
     tool_parameters_schema(
         required=["action"],
@@ -968,7 +1043,14 @@ def _tenki_key_configured(config: Any | None) -> bool:
             enum=["run", "read", "write", "upload", "fetch_url", "install", "list", "download_url",
                   "apk_toolchain", "apk_decompile", "apk_build", "reset"],
         ),
-        command=StringSchema("Command to run inside the remote sandbox"),
+        command=StringSchema(
+            "The shell command to execute, for action=run. action=install ignores it — "
+            "put the package names in packages there."
+        ),
+        packages=StringSchema(
+            "Required for action=install: bare distro package names, space- or "
+            'comma-separated, e.g. "nmap curl jq". Not a shell command.'
+        ),
         path=StringSchema("Sandbox path, relative paths resolve under /workspace"),
         url=StringSchema("Remote HTTPS URL to fetch into the sandbox (onlyfiles.com or gofile.io)"),
         content=StringSchema("Text content for write"),
@@ -1083,9 +1165,12 @@ class NovitaSandboxTool(Tool):
             "before running or reading the uploaded file remotely. In VPS mode, upload "
             "the local file through onlyfiles.com, then fetch it into the VPS workspace with "
             "curl before using the staged path. If a required Linux command is missing "
-            "in VPS mode, use action=install with a space-separated list of distro package "
-            "names; installation is noninteractive and uses root or already-configured "
-            "passwordless sudo. Never add repositories, remove packages, or put a sudo "
+            "(nmap, ffmpeg, a compiler, ...), use action=install and put the distro "
+            "package names in the packages argument — space- or comma-separated, bare "
+            "names such as \"nmap curl jq\". action=install reads packages, NOT command "
+            "(command is the key action=run takes); installation is noninteractive and "
+            "uses root or already-configured passwordless sudo. Never add repositories, "
+            "remove packages, or put a sudo "
             "password in a command. When a finished file should be returned to the user, "
             "ALWAYS call download_url with its remote workspace path; this downloads the "
             "artifact and publishes a public link automatically — files under ~50 MB go to "
@@ -1098,12 +1183,22 @@ class NovitaSandboxTool(Tool):
 
     @property
     def parameters(self) -> dict[str, Any]:
+        """SHADOWED — this is not the schema the model is given.
+
+        ``@tool_parameters`` runs after the class body and rebinds
+        ``cls.parameters``, so this property never executes; only the
+        ``tool_parameters_schema(...)`` call above reaches a provider. It was
+        the reason ``packages`` was missing from the live schema for months
+        while appearing to be declared here: a parameter added only to this
+        dict changes nothing. Kept as a mirror of the live schema so the two do
+        not disagree; edit the decorator first.
+        """
         return {
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["run", "read", "write", "upload", "fetch_url", "install", "list", "download_url", "apk_toolchain", "apk_decompile", "apk_build", "reset"]},
-                "command": {"type": "string"},
-                "packages": {"type": "string", "description": "Space-separated Linux distro package names to install in VPS mode."},
+                "command": {"type": "string", "description": "The shell command to execute, for action=run. action=install ignores it — use packages there."},
+                "packages": {"type": "string", "description": "Required for action=install: bare distro package names, space- or comma-separated (e.g. \"nmap curl jq\"). Not a shell command."},
                 "path": {"type": "string"},
                 "url": {"type": "string", "description": "Remote HTTPS URL to fetch into the sandbox (onlyfiles.com or gofile.io)."},
                 "content": {"type": "string"},
@@ -2542,8 +2637,9 @@ class NovitaSandboxTool(Tool):
                     backend._nb_creds_seeded = True
                 return await backend.run(_git_creds_source_for(root) + command, timeout=timeout, cwd=root)
             if action == "install":
-                raw_packages = str(kwargs.get("packages") or "").strip()
-                packages = [part for part in re.split(r"[\s,]+", raw_packages) if part]
+                packages = _install_packages_from_kwargs(kwargs)
+                if not packages:
+                    return ToolResult.error(_INSTALL_NEEDS_PACKAGES)
                 timeout = max(30, min(int(kwargs.get("timeout") or 600), _MAX_TIMEOUT))
                 result = await backend.install_packages(packages, timeout=timeout)
                 return f"VPS package installation result:\n{result}"
@@ -2949,8 +3045,9 @@ class NovitaSandboxTool(Tool):
                         _DAYTONA_STORE.set_id(key, backend.last_sandbox_id)
                     return output
                 if action == "install":
-                    raw_packages = str(kwargs.get("packages") or "").strip()
-                    packages = [part for part in re.split(r"[\s,]+", raw_packages) if part]
+                    packages = _install_packages_from_kwargs(kwargs)
+                    if not packages:
+                        return ToolResult.error(_INSTALL_NEEDS_PACKAGES)
                     timeout = max(30, min(int(kwargs.get("timeout") or 600), _MAX_TIMEOUT))
                     result = await backend.install_packages(packages, timeout=timeout)
                     return f"Daytona sandbox package installation result:\n{result}"
@@ -3148,8 +3245,9 @@ class NovitaSandboxTool(Tool):
                         _VERCEL_STORE.set_id(key, backend.last_sandbox_id)
                     return output
                 if action == "install":
-                    raw_packages = str(kwargs.get("packages") or "").strip()
-                    packages = [part for part in re.split(r"[\s,]+", raw_packages) if part]
+                    packages = _install_packages_from_kwargs(kwargs)
+                    if not packages:
+                        return ToolResult.error(_INSTALL_NEEDS_PACKAGES)
                     timeout = max(30, min(int(kwargs.get("timeout") or 600), _MAX_TIMEOUT))
                     result = await backend.install_packages(packages, timeout=timeout)
                     if getattr(backend, "last_sandbox_id", ""):
@@ -3312,8 +3410,9 @@ class NovitaSandboxTool(Tool):
                         _RUNLOOP_STORE.set_id(key, backend.last_devbox_id)
                     return output
                 if action == "install":
-                    raw_packages = str(kwargs.get("packages") or "").strip()
-                    packages = [part for part in re.split(r"[\s,]+", raw_packages) if part]
+                    packages = _install_packages_from_kwargs(kwargs)
+                    if not packages:
+                        return ToolResult.error(_INSTALL_NEEDS_PACKAGES)
                     timeout = max(30, min(int(kwargs.get("timeout") or 600), _MAX_TIMEOUT))
                     result = await backend.install_packages(packages, timeout=timeout)
                     return f"Runloop Devbox package installation result:\n{result}"
@@ -3496,8 +3595,9 @@ class NovitaSandboxTool(Tool):
                         _TENKI_STORE.set_id(key, backend.last_session_id)
                     return output
                 if action == "install":
-                    raw_packages = str(kwargs.get("packages") or "").strip()
-                    packages = [part for part in re.split(r"[\s,]+", raw_packages) if part]
+                    packages = _install_packages_from_kwargs(kwargs)
+                    if not packages:
+                        return ToolResult.error(_INSTALL_NEEDS_PACKAGES)
                     timeout = max(30, min(int(kwargs.get("timeout") or 600), _MAX_TIMEOUT))
                     result = await backend.install_packages(packages, timeout=timeout)
                     return f"Tenki Sandbox package installation result:\n{result}"
@@ -3690,8 +3790,9 @@ class NovitaSandboxTool(Tool):
                         _FREESTYLE_STORE.set_id(key, backend.last_session_id)
                     return output
                 if action == "install":
-                    raw_packages = str(kwargs.get("packages") or "").strip()
-                    packages = [part for part in re.split(r"[\s,]+", raw_packages) if part]
+                    packages = _install_packages_from_kwargs(kwargs)
+                    if not packages:
+                        return ToolResult.error(_INSTALL_NEEDS_PACKAGES)
                     timeout = max(30, min(int(kwargs.get("timeout") or 600), _MAX_TIMEOUT))
                     result = await backend.install_packages(packages, timeout=timeout)
                     return f"Freestyle VM package installation result:\n{result}"
@@ -3994,8 +4095,9 @@ class NovitaSandboxTool(Tool):
                         _UPSTASH_STORE.set_id(key, backend.last_box_id)
                     return output
                 if action == "install":
-                    raw_packages = str(kwargs.get("packages") or "").strip()
-                    packages = [part for part in re.split(r"[\s,]+", raw_packages) if part]
+                    packages = _install_packages_from_kwargs(kwargs)
+                    if not packages:
+                        return ToolResult.error(_INSTALL_NEEDS_PACKAGES)
                     timeout = max(30, min(int(kwargs.get("timeout") or 600), _MAX_TIMEOUT))
                     result = await backend.install_packages(packages, timeout=timeout)
                     return f"Upstash Box package installation result:\n{result}"
