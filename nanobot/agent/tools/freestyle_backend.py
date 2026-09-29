@@ -229,6 +229,28 @@ def validate_freestyle_max_duration_seconds(raw: Any) -> int:
     return value
 
 
+def validate_freestyle_idle_pause_seconds(raw: Any) -> int:
+    """Idle auto-pause window in seconds, as the provider's ``idleTimeoutSeconds``.
+
+    ``-1`` is accepted and means "never pause for idleness" — the provider's own
+    sentinel, and the only way to turn the feature off. ``0`` is rejected rather
+    than passed through: the provider would read it as "pause immediately", so a
+    zero that arrived from an empty form field would look like a working setting
+    while freezing the VM out from under the agent.
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("Freestyle idle pause must be a whole number of seconds") from None
+    if value == -1:
+        return -1
+    if not 1 <= value <= 86_400:
+        raise ValueError(
+            "Freestyle idle pause must be between 1 and 86400 seconds, or -1 to disable it"
+        )
+    return value
+
+
 def validate_freestyle_tag(raw: str) -> str:
     value = str(raw or "").strip() or "powerx"
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,60}", value):
@@ -390,6 +412,13 @@ class FreestyleExecutionBackend:
         self.max_duration_seconds = validate_freestyle_max_duration_seconds(
             getattr(config, "max_duration_seconds", 3600) or 3600
         )
+        # Provider-side idle auto-pause. Sent on create (``idleTimeoutSeconds``)
+        # and re-appliable to a live VM by ``set_idle_pause``. An unset field
+        # keeps the configured default rather than the provider's "never": the
+        # whole point is that an idle sandbox stops holding a machine.
+        self.idle_pause_seconds = validate_freestyle_idle_pause_seconds(
+            getattr(config, "idle_pause_seconds", 300)
+        )
         self.tag = validate_freestyle_tag(str(getattr(config, "tag", "") or "powerx"))
         self.fetch_allow_hosts = validate_freestyle_fetch_allow_hosts(
             str(getattr(config, "fetch_allow_hosts", "") or "")
@@ -532,6 +561,45 @@ class FreestyleExecutionBackend:
                 return dict(item)
         return None
 
+    async def _locate_vm(
+        self, session_id: str | None = None
+    ) -> tuple[int, dict[str, Any] | None]:
+        """Find the session's VM without ever creating one: ``(lane, vm)``.
+
+        Addressed by id across every configured lane when the id is known (every
+        request carries one key, so the owning account is not implied by the
+        pin), otherwise swept by slug — pinned lane first, then the rest. A VM's
+        disk lives in exactly one account and a DELETE/PAUSE is only honoured
+        there, so the sweep is what makes a session whose lane pin was lost
+        still findable. Mirrors ``reset``; never creates.
+        """
+        lane = self.lane_index
+        if session_id:
+            for candidate in range(max(1, self._lane_count())):
+                try:
+                    fetched = await self._request(
+                        "GET",
+                        f"/v5/vms/{session_id}",
+                        lane=lane if lane is not None else candidate,
+                    )
+                except FreestyleError:
+                    continue
+                vm = dict(fetched or {})
+                if vm and not await self._state_is_dead(vm):
+                    return (lane if lane is not None else candidate), vm
+        candidates: list[int] = [int(lane)] if lane is not None else []
+        candidates += [
+            index for index in range(max(1, self._lane_count())) if index not in candidates
+        ]
+        for candidate in candidates:
+            try:
+                found = await self._find_vm(candidate)
+            except FreestyleError:
+                continue
+            if found is not None and not await self._state_is_dead(found):
+                return candidate, found
+        return (int(lane) if lane is not None else 0), None
+
     async def _state_is_dead(self, vm: dict[str, Any]) -> bool:
         return str(vm.get("state") or "").lower() in _DEAD_STATES
 
@@ -582,6 +650,11 @@ class FreestyleExecutionBackend:
             # Never delete an *unused* VM on us: persistence is what lets the
             # next task reattach to the same disk. Reset is what destroys it.
             "autoDeleteSeconds": -1,
+            # The provider's own idle auto-pause. A VM that has gone this long
+            # without network activity freezes itself, keeping disk AND memory,
+            # so an abandoned sandbox stops holding a machine while the next
+            # operation still resumes the very same VM. -1 disables it.
+            "idleTimeoutSeconds": int(self.idle_pause_seconds),
         }
         if self.snapshot_id:
             body["snapshotId"] = self.snapshot_id
@@ -1011,6 +1084,53 @@ class FreestyleExecutionBackend:
         except FreestyleError as exc:  # noqa: BLE001 - best effort by contract
             logger.warning("could not keep the Freestyle VM alive: {}", _detail(exc))
 
+    async def pause(self, session_id: str | None = None) -> bool:
+        """Freeze the session's VM now, keeping its memory for a later start.
+
+        The provider pauses an idle VM by itself (``idleTimeoutSeconds``); this
+        is the explicit form, for a caller that knows the work is over and does
+        not want to wait out the idle window. Only an existing VM is paused —
+        like ``reset``, this must never create one. Returns whether a VM was
+        actually paused.
+        """
+        lane, vm = await self._locate_vm(session_id)
+        if vm is None:
+            return False
+        if str(vm.get("state") or "").lower() == "paused":
+            return True
+        try:
+            await self._request("POST", f"/v5/vms/{vm['id']}/pause", lane=lane, timeout=120)
+        except FreestyleError as exc:  # noqa: BLE001 - best effort by contract
+            logger.warning("could not pause the Freestyle VM: {}", _detail(exc))
+            return False
+        return True
+
+    async def set_idle_pause(self, seconds: int, session_id: str | None = None) -> bool:
+        """Change a *live* VM's idle auto-pause window.
+
+        ``idleTimeoutSeconds`` is fixed at create time, so an existing VM needs
+        the ``PATCH`` form to pick up a changed setting; ``-1`` removes the
+        timeout. Best effort: a VM that cannot be reached leaves the window it
+        already has.
+        """
+        window = validate_freestyle_idle_pause_seconds(seconds)
+        lane, vm = await self._locate_vm(session_id)
+        if vm is None:
+            return False
+        try:
+            await self._request(
+                "PATCH",
+                f"/v5/vms/{vm['id']}",
+                lane=lane,
+                json_body={"idleTimeoutSeconds": int(window)},
+                timeout=60,
+            )
+        except FreestyleError as exc:  # noqa: BLE001
+            logger.warning("could not set the Freestyle idle timeout: {}", _detail(exc))
+            return False
+        self.idle_pause_seconds = window
+        return True
+
     async def snapshot_workspace(self, name: str | None = None) -> str:
         """Baseline the VM's current disk/memory as a snapshot, and return its id."""
         vm, lane = await self._ensure_vm()
@@ -1125,6 +1245,15 @@ class FreestyleExecutionBackend:
             "disk_size_gb": resources.get("storage", 0) // 1024 if resources.get("storage") else 0,
             "lane_index": lane,
             "lane_count": self._lane_count(),
+            # The idle window the VM actually carries, so the admin Test line
+            # confirms auto-pause is ARMED rather than merely configured. The
+            # provider reports ``null`` when a VM will never pause for idleness,
+            # which is the -1 the admin form uses for the same thing.
+            "idle_pause_seconds": (
+                validate_freestyle_idle_pause_seconds(vm.get("idleTimeoutSeconds"))
+                if vm.get("idleTimeoutSeconds") is not None
+                else -1
+            ),
         }
         payload.update(_parse_df_kb(str(probe.get("stdout") or "")))
         return payload
@@ -1147,6 +1276,7 @@ __all__ = [
     "validate_freestyle_cpu_cores",
     "validate_freestyle_disk_size_gb",
     "validate_freestyle_fetch_allow_hosts",
+    "validate_freestyle_idle_pause_seconds",
     "validate_freestyle_max_duration_seconds",
     "validate_freestyle_memory_mb",
     "validate_freestyle_snapshot_id",

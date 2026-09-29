@@ -95,7 +95,27 @@ _OCR_DIR = f"{_WORKSPACE}/.nanobot"
 #: (see _write_sandbox_credentials). Keeping them in a file rather than inline on
 #: the command line means the token never lands in tool-call logs or output.
 _GIT_CREDS_PATH = f"{_OCR_DIR}/github-env.sh"
-_GIT_CREDS_SOURCE = f'. {shlex.quote(_GIT_CREDS_PATH)} 2>/dev/null || true; '
+
+
+def _git_creds_guard(path: str) -> str:
+    """A source-prefix that is *safe on a POSIX shell*, not just on bash.
+
+    MEASURED FAILURE (2026-09-29, on a Freestyle VM, reproduced on Debian dash
+    and therefore on any Ubuntu guest whose ``/bin/sh`` is dash): the obvious
+    ``. <path> 2>/dev/null || true`` is FATAL when the file is absent. ``.`` is
+    a POSIX *special* built-in, so a failure in a non-interactive shell exits it
+    immediately — before ``|| true`` can run. The guest then answers rc=2 with
+    no output at all, for every command, including a bare ``pwd && echo hi``.
+    Since the file is only written when a GitHub token is configured, every
+    deployment without one had its sandbox reduce to "the AI's commands return
+    nothing and exit 2". Guarding the source behind ``[ -f ]`` makes a missing
+    file a no-op on dash and bash alike, and the trailing ``|| true`` keeps the
+    prefix from ever deciding the command's own exit status.
+    """
+    return f'[ -f {shlex.quote(path)} ] && . {shlex.quote(path)} 2>/dev/null || true; '
+
+
+_GIT_CREDS_SOURCE = _git_creds_guard(_GIT_CREDS_PATH)
 
 
 def _git_creds_source_for(root: str) -> str:
@@ -105,8 +125,7 @@ def _git_creds_source_for(root: str) -> str:
     /workspace/home, vps configurable), so the source line must be built from
     the root actually in use rather than a single hard-coded path.
     """
-    path = f"{root.rstrip('/')}/.nanobot/github-env.sh"
-    return f'. {shlex.quote(path)} 2>/dev/null || true; '
+    return _git_creds_guard(f"{root.rstrip('/')}/.nanobot/github-env.sh")
 
 #: Env vars that may hold a GitHub token, in precedence order. GITHUB_BUILD_TOKEN
 #: is the operator-provisioned build account the build_artifact tool uses;
@@ -819,21 +838,6 @@ class _FreestyleSessionStore(_TenkiSessionStore):
     ``lane`` / ``set_lane`` / ``clear``), so it is inherited rather than
     reimplemented. The one Freestyle-specific fact is that these pins describe
     *Freestyle accounts*, which must never share Tenki's index file.
-    """
-
-    INDEX_NAME = "freestyle_sessions.json"
-
-
-_FREESTYLE_STORE = _FreestyleSessionStore()
-
-
-class _FreestyleSessionStore(_TenkiSessionStore):
-    """Tenki's session→id / lane-pin store, pointed at its own index file.
-
-    The rotation contract is identical (``next_lane`` / ``park`` / ``parked`` /
-    ``clear`` / ``lane`` / ``set_lane``), so it is inherited rather than
-    reimplemented: the only Freestyle-specific fact is that its pins describe
-    *Freestyle accounts*, which must not share Tenki's file.
     """
 
     INDEX_NAME = "freestyle_sessions.json"
@@ -3594,11 +3598,20 @@ class NovitaSandboxTool(Tool):
             logger.exception("Tenki Sandbox operation failed")
             return ToolResult.error(f"Tenki Sandbox error: {type(exc).__name__}: {str(exc)[:500]}")
 
-    @staticmethod
     async def _execute_freestyle(
         self, action: str, kwargs: dict[str, Any], config: Any, session_key: str
     ) -> ToolResult | str:
-        """Run the shared sandbox action contract on a Freestyle VM."""
+        """Run the shared sandbox action contract on a Freestyle VM.
+
+        NOT a staticmethod: it is dispatched as ``self._execute_freestyle(action,
+        kwargs, config, session_key)`` and uses ``self`` for both the nested
+        ``_execute_freestyle_inner`` call and the action budget. Decorating it
+        bound the first positional argument to ``self`` and left ``session_key``
+        unfilled, so EVERY Freestyle action — run, read, write, list, reset —
+        raised ``TypeError: _execute_freestyle() missing 1 required positional
+        argument: 'session_key'`` before reaching the VM. That is what made the
+        sandbox unusable the moment an administrator selected Freestyle.
+        """
         budget = self._freestyle_action_budget(action, kwargs)
         try:
             return await asyncio.wait_for(
@@ -3697,7 +3710,7 @@ class NovitaSandboxTool(Tool):
                     await backend.write(path, content)
                     if getattr(backend, "last_session_id", ""):
                         _FREESTYLE_STORE.set_id(key, backend.last_session_id)
-                    return f"Wrote {len(content)} characters to {path} in the Tenki workspace."
+                    return f"Wrote {len(content)} characters to {path} in the Freestyle VM."
                 if action == "upload":
                     source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
                     if not self._local_attachment_allowed(source):
@@ -3710,7 +3723,7 @@ class NovitaSandboxTool(Tool):
                     await backend.write_bytes(path, await asyncio.to_thread(source.read_bytes))
                     if getattr(backend, "last_session_id", ""):
                         _FREESTYLE_STORE.set_id(key, backend.last_session_id)
-                    return f"Uploaded {source.name} to {path} in the Tenki workspace."
+                    return f"Uploaded {source.name} to {path} in the Freestyle VM."
                 if action == "fetch_url":
                     url = str(kwargs.get("url") or "").strip()
                     if not url:
@@ -3731,14 +3744,14 @@ class NovitaSandboxTool(Tool):
                         await backend.write_bytes(dest, data)
                         if getattr(backend, "last_session_id", ""):
                             _FREESTYLE_STORE.set_id(key, backend.last_session_id)
-                        return f"Fetched remote file to {dest} in the Tenki workspace. Use action=read or run commands to analyze it."
+                        return f"Fetched remote file to {dest} in the Freestyle VM. Use action=read or run commands to analyze it."
                     if parsed.scheme != "https" or parsed.netloc != "onlyfiles.com":
                         return ToolResult.error("url must be an HTTPS onlyfiles.com or gofile.io URL")
                     dest_path = str(kwargs.get("path") or "").strip()
                     fetched = await backend.fetch_url(url, dest_path, timeout=int(kwargs.get("timeout") or 150))
                     if getattr(backend, "last_session_id", ""):
                         _FREESTYLE_STORE.set_id(key, backend.last_session_id)
-                    return f"Fetched remote file to {fetched} in the Tenki workspace. Use action=read or run commands to analyze it."
+                    return f"Fetched remote file to {fetched} in the Freestyle VM. Use action=read or run commands to analyze it."
                 if action == "list":
                     return await backend.list(str(kwargs.get("path") or ""))
                 if action == "download_url":

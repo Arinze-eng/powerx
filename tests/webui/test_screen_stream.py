@@ -447,6 +447,77 @@ def test_sandbox_source_forwards_the_session_key_to_resolution(monkeypatch) -> N
     assert captured == ["websocket:abc"]
 
 
+LS_KEY = "WUjYgZ9kifZmmLqXNTWvfM-JBMG5zrj7x4EsEga6pC1ZievE94SPp9bLVS2BzRmJauV"
+FS_ROOT = "/home/ubuntu/workspace"
+
+
+def _pin_freestyle(monkeypatch):
+    """Select Freestyle as the execution backend, as the admin panel would."""
+    from nanobot.agent.tools import workspace_bridge
+    from nanobot.config.schema import FreestyleExecutionConfig
+
+    config = FreestyleExecutionConfig(api_key=LS_KEY)
+
+    async def fake_selected_backend():
+        return ("freestyle", config)
+
+    monkeypatch.setattr(workspace_bridge, "_selected_backend", fake_selected_backend)
+    return workspace_bridge
+
+
+def test_resolution_offers_freestyle_like_any_other_backend(monkeypatch) -> None:
+    """The live screen has no per-backend allow-list, and must not grow one.
+
+    Selecting Freestyle in the admin panel has to make the panel's Live screen
+    work exactly as it does for Novita or Tenki, so resolution must hand back a
+    usable Freestyle handle rather than "unavailable".
+    """
+    from nanobot.agent.tools.freestyle_backend import FreestyleExecutionBackend
+
+    workspace_bridge = _pin_freestyle(monkeypatch)
+
+    executor = asyncio.run(workspace_bridge.resolve_remote_executor(session_key="websocket:fs"))
+
+    assert executor.available is True
+    assert executor.name == "freestyle"
+    assert isinstance(executor.backend, FreestyleExecutionBackend)
+    # The session key decides WHICH VM the frame comes from.
+    assert executor.backend.sandbox_name == "px-fs-websocket-fs"
+
+
+def test_the_frame_path_lands_inside_the_freestyle_workspace(monkeypatch) -> None:
+    """A frame written anywhere but the VM's workspace could never be fetched."""
+    from nanobot.webui import screen_stream as module
+
+    workspace_bridge = _pin_freestyle(monkeypatch)
+    frames: list[tuple[str, str]] = []
+
+    async def fake_run(command, *, timeout=120, executor=None):
+        frames.append(("run", command))
+        return True, "4096"
+
+    async def fake_fetch(remote_path, *, max_bytes=0, executor=None):
+        frames.append(("fetch", remote_path))
+        return b"\x89PNG\r\n\x1a\n" + b"0" * 32
+
+    # The REAL root resolver runs, so the freestyle mapping is what is proven.
+    monkeypatch.setattr(module, "run_remote", fake_run)
+    monkeypatch.setattr(module, "fetch_remote_file", fake_fetch)
+
+    source = module.SandboxScreenSource(display=":99", session_key="websocket:fs")
+
+    data = asyncio.run(source.capture())
+
+    assert data is not None and data.startswith(b"\x89PNG")
+    assert source.last_error is None
+    assert asyncio.run(workspace_bridge.remote_workspace_root()) == FS_ROOT
+    fetched = [path for kind, path in frames if kind == "fetch"]
+    assert fetched == [f"{FS_ROOT}/.powerx-screen/frame.png"], fetched
+    # The capture is issued INSIDE the VM, through the freestyle handle.
+    script = next(command for kind, command in frames if kind == "run")
+    assert f"{FS_ROOT}/.powerx-screen/frame.png" in script
+
+
 class _StubExecutor:
     def __init__(self, name: str, available: bool) -> None:
         self.name = name

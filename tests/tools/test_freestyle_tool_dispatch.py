@@ -1,0 +1,240 @@
+"""Tool-level regressions for the Freestyle backend: it must actually run.
+
+Two defects shipped together on the commit that added the Freestyle action
+budget, and together they made a Freestyle sandbox completely unusable the
+moment an administrator selected it.
+
+* ``NovitaSandboxTool._execute_freestyle`` carried a stray ``@staticmethod``.
+  The dispatcher calls it as ``self._execute_freestyle(action, kwargs, config,
+  session_key)``, so the decorator bound ``action`` to the function's ``self``
+  parameter and left ``session_key`` unfilled. Every Freestyle action — run,
+  read, write, list, upload, install, fetch_url, reset — raised
+
+      TypeError: NovitaSandboxTool._execute_freestyle() missing 1 required
+      positional argument: 'session_key'
+
+  before it touched a VM, which is exactly the reported "LLM can't use it".
+  ``_execute_tenki`` and every sibling are plain instance methods; only this
+  one carried the decorator.
+
+* The GitHub credentials source-prefix was ``. <file> 2>/dev/null || true``.
+  ``.`` is a POSIX *special* built-in, so on a guest whose ``/bin/sh`` is dash
+  (i.e. a stock Ubuntu Freestyle VM) a missing file exits the shell immediately
+  — before ``|| true`` can run — and the guest answers rc=2 with no output.
+  The file is only written when a GitHub token is configured, so every
+  deployment without one had every command come back empty and failed.
+
+``tests/tools/test_tenki_tool_guards.py`` already had a Freestyle dispatch test,
+but it monkeypatched ``_execute_freestyle`` away, which is precisely why neither
+defect was caught. These tests drive the REAL method with a fake HTTP plane.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import re
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from nanobot.agent.tools.freestyle_backend import FreestyleExecutionBackend
+from nanobot.agent.tools.novita_sandbox import (
+    NovitaSandboxTool,
+    _git_creds_source_for,
+)
+
+SESSIONS = "/home/ubuntu/workspace"
+KEY = "WUjYgZ9kifZmmLqXNTWvfM-JBMG5zrj7x4EsEga6pC1ZievE94SPp9bLVS2BzRmJauV"
+
+
+class _Recorder:
+    """The smallest faithful stand-in for the Freestyle HTTP plane."""
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+        self.vm: dict[str, Any] | None = None
+
+    def install(self, backend: FreestyleExecutionBackend) -> None:
+        async def _request(
+            method: str,
+            path: str,
+            *,
+            lane: int | None = None,
+            json_body: Any | None = None,
+            params: dict[str, Any] | None = None,
+            data: bytes | None = None,
+            expect: tuple[int, ...] = (200, 201, 204),
+            timeout: float = 120,
+            raw: bool = False,
+        ) -> Any:
+            del lane, expect, data, raw
+            if method == "POST" and path == "/v5/vms":
+                self.vm = {
+                    "id": "vm-0-1",
+                    "slug": (json_body or {}).get("slug"),
+                    "state": "running",
+                    "resources": {"cpu": 4, "memory": 8192, "storage": 32768},
+                }
+                return dict(self.vm)
+            if method == "GET" and path == "/v5/vms":
+                slug = (params or {}).get("slug")
+                rows = [] if slug and self.vm is None else ([self.vm] if self.vm else [])
+                rows = [dict(r) for r in rows if r and (slug is None or r["slug"] == slug)]
+                return {"vms": rows, "totalCount": len(rows), "runningCount": len(rows)}
+            if path.endswith("/exec-await"):
+                command = str((json_body or {}).get("command") or "")
+                self.commands.append(command)
+                return {"statusCode": 0, "stdout": f"ran: {command}", "stderr": ""}
+            if method == "GET" and path.startswith("/v5/vms/vm-"):
+                return dict(self.vm or {})
+            return {}
+
+        backend._request = _request  # type: ignore[assignment]
+
+
+def _freestyle_tool(monkeypatch: pytest.MonkeyPatch) -> tuple[NovitaSandboxTool, _Recorder]:
+    execution = SimpleNamespace(
+        backend="freestyle",
+        freestyle=SimpleNamespace(api_key="", api_keys=[KEY]),
+    )
+    monkeypatch.setattr(NovitaSandboxTool, "_execution_config", staticmethod(lambda: execution))
+
+    backend = FreestyleExecutionBackend(
+        SimpleNamespace(
+            api_key="",
+            api_keys=[KEY],
+            memory_mb=8192,
+            cpu_cores=4,
+            disk_size_gb=0,
+            max_duration_seconds=3600,
+            idle_pause_seconds=300,
+            tag="powerx",
+            snapshot_id="",
+            fetch_allow_hosts="",
+            persist_workspace=True,
+        ),
+        sandbox_name="px-fs-dispatch",
+    )
+    recorder = _Recorder()
+    recorder.install(backend)
+    monkeypatch.setattr(
+        NovitaSandboxTool, "_freestyle_backend", lambda self, config, key: backend
+    )
+    # A GitHub token on the test host would make the real seeding path run
+    # mkdir/write against the stub; the source prefix is added either way, which
+    # is the part under test.
+    monkeypatch.setattr(
+        "nanobot.agent.tools.novita_sandbox._git_creds_script", lambda: ""
+    )
+    return NovitaSandboxTool(), recorder
+
+
+def test_the_dispatcher_can_call_execute_freestyle_with_four_arguments() -> None:
+    """The exact shape of the shipped bug, asserted structurally.
+
+    A ``@staticmethod`` here binds the first positional argument to ``self`` and
+    leaves ``session_key`` unfilled, so the call the dispatcher makes raises
+    ``TypeError``. Naming the parameters keeps the failure obvious.
+    """
+    descriptor = inspect.getattr_static(NovitaSandboxTool, "_execute_freestyle")
+    assert inspect.isfunction(descriptor), (
+        "_execute_freestyle must stay an instance method: a staticmethod makes "
+        "every Freestyle action raise TypeError before it reaches the VM"
+    )
+    assert list(inspect.signature(descriptor).parameters)[:5] == [
+        "self",
+        "action",
+        "kwargs",
+        "config",
+        "session_key",
+    ]
+
+
+def test_execute_reaches_the_real_freestyle_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``action=run`` must come back with output, not a TypeError."""
+    tool, recorder = _freestyle_tool(monkeypatch)
+
+    result = asyncio.run(tool.execute(action="run", command="echo hi"))
+
+    assert "echo hi" in str(result), f"the Freestyle dispatch returned {result!r}"
+    assert "ran: " in str(result)
+    assert "TypeError" not in str(result)
+
+
+def test_a_run_command_is_prefixed_by_the_credential_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool, recorder = _freestyle_tool(monkeypatch)
+
+    asyncio.run(tool.execute(action="run", command="pwd && echo hi"))
+
+    assert recorder.commands, "no command reached the VM"
+    assert recorder.commands[-1].startswith("[ -f "), recorder.commands[-1]
+    assert recorder.commands[-1].endswith("pwd && echo hi")
+
+
+def test_write_and_read_reach_the_real_freestyle_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every action went through the same broken call, not just ``run``."""
+    tool, _ = _freestyle_tool(monkeypatch)
+
+    written = asyncio.run(tool.execute(action="write", path="a.txt", content="hello"))
+    assert "in the Freestyle VM" in str(written)
+    assert "Tenki" not in str(written)
+    assert isinstance(asyncio.run(tool.execute(action="read", path="a.txt")), str)
+
+
+def test_the_creds_prefix_cannot_kill_a_posix_shell(tmp_path: Path) -> None:
+    """The measured dash failure: a missing file must be a no-op, not an exit.
+
+    ``sh -c '. /nope 2>/dev/null || true; echo A'`` prints nothing and exits 2
+    on dash, because sourcing is a POSIX special built-in and its failure ends a
+    non-interactive shell on the spot.
+    """
+    missing = str(tmp_path / "workspace")
+    prefix = _git_creds_source_for(missing)
+
+    proc = subprocess.run(
+        ["/bin/sh", "-c", prefix + "echo alive"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "alive"
+
+
+def test_the_creds_prefix_still_sources_a_file_that_exists(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    (root / ".nanobot").mkdir(parents=True)
+    (root / ".nanobot" / "github-env.sh").write_text("export GITHUB_TOKEN=ok\n")
+
+    proc = subprocess.run(
+        ["/bin/sh", "-c", _git_creds_source_for(str(root)) + 'echo "$GITHUB_TOKEN"'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == "ok"
+
+
+def test_only_one_freestyle_session_store_is_defined() -> None:
+    """The class was defined twice; the second silently shadowed the first.
+
+    A duplicate is invisible at runtime — it just replaces the earlier
+    definition — so a source-level guard is the only thing that would catch it
+    coming back.
+    """
+    source = Path("nanobot/agent/tools/novita_sandbox.py").read_text(encoding="utf-8")
+    assert len(re.findall(r"^class _FreestyleSessionStore\b", source, re.M)) == 1
+    assert len(re.findall(r"^_FREESTYLE_STORE = _FreestyleSessionStore\(\)$", source, re.M)) == 1

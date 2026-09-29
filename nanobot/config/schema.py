@@ -579,6 +579,13 @@ class FreestyleExecutionConfig(Base):
       size, verified live against the API (``resources: {cpu: 4, memory: 8192,
       storage: 32768}``). The provider sizes a VM from its source snapshot, so
       this value documents the target rather than resizing a running machine.
+    * ``idle_pause_seconds`` is the provider's own ``idleTimeoutSeconds``: the
+      VM pauses itself once it has had no network activity for that long, which
+      is what stops an abandoned sandbox from holding a machine open. Pausing
+      keeps the disk *and* the memory, so the next operation resumes the same
+      VM exactly. -1 disables the idle pause entirely. Sent at create time, so
+      it applies to the next VM a session builds, and changeable on a live VM
+      with ``PATCH /v5/vms/{id}`` (see ``FreestyleExecutionBackend.set_idle_pause``).
     """
 
     api_key: str = Field(default="", repr=False)
@@ -600,6 +607,13 @@ class FreestyleExecutionConfig(Base):
     # 0 means "let the source snapshot decide" (the stock Ubuntu VM is 32 GB).
     disk_size_gb: int = Field(default=0, ge=0, le=500)
     max_duration_seconds: int = Field(default=3600, ge=60, le=2_592_000)
+    # Provider-side idle auto-pause (``idleTimeoutSeconds``): the VM freezes
+    # itself after this many seconds without network activity, keeping its disk
+    # and memory so the next operation resumes the same machine. Five minutes is
+    # long enough that a slow model turn or a long install never pauses a busy
+    # VM. -1 means "never pause for idleness", which is the provider default and
+    # is deliberately not this deployment's default.
+    idle_pause_seconds: int = Field(default=300, ge=-1, le=86_400)
     tag: str = "powerx"
     fetch_allow_hosts: str = ""
     # Keep the VM (and every file on it) alive across finished tasks, agent

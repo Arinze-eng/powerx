@@ -1362,6 +1362,7 @@ def test_admin_can_select_the_freestyle_backend_and_round_trip_its_settings(
         "freestyleCpuCores": 4,
         "freestyleMemoryMb": 8192,
         "freestyleMaxDurationSeconds": 5400,
+        "freestyleIdlePauseSeconds": 900,
         "freestyleTag": "powerx",
         "freestyleFetchAllowHosts": "gofile.io,onlyfiles.com",
         "freestylePersistWorkspace": True,
@@ -1387,6 +1388,7 @@ def test_admin_can_select_the_freestyle_backend_and_round_trip_its_settings(
     assert freestyle["cpu_cores"] == 4
     assert freestyle["memory_mb"] == 8192
     assert freestyle["max_duration_seconds"] == 5400
+    assert freestyle["idle_pause_seconds"] == 900
     assert freestyle["tag"] == "powerx"
     assert freestyle["fetch_allow_hosts"] == "gofile.io,onlyfiles.com"
 
@@ -1435,11 +1437,18 @@ def test_freestyle_save_defaults_to_eight_gb_and_rejects_bad_values(
     # 8192 MB is the size this backend exists to offer; it must be the default.
     assert saved["memoryMb"] == 8192
     assert saved["cpuCores"] == 4
+    # Auto-pause is on by default: a sandbox that has gone idle must stop
+    # holding a machine without anyone having to configure it.
+    assert saved["idlePauseSeconds"] == 300
 
     for bad in (
         {"freestyleMemoryMb": 4095},  # odd megabytes
         {"freestyleMemoryMb": 256},
         {"freestyleCpuCores": 0},
+        # 0 would read as "pause immediately" to the provider, so an empty form
+        # field must be refused rather than silently freezing the VM.
+        {"freestyleIdlePauseSeconds": 0},
+        {"freestyleIdlePauseSeconds": 86_401},
         {"freestyleMaxDurationSeconds": 30},
         {"freestyleApiUrl": "http://api.freestyle.sh"},
         {"freestyleApiKeys": "not a valid key!!"},
@@ -1502,6 +1511,7 @@ def test_the_test_button_probes_freestyle_with_the_configured_lanes(
         "backend": "freestyle",
         "freestyleApiKeys": f"{lane_a},{lane_b}",
         "freestyleMemoryMb": 8192,
+        "freestyleIdlePauseSeconds": 1200,
     }
     response = admin_registry.admin_route(request, "/api/admin/execution-test")
     assert response is not None
@@ -1515,6 +1525,10 @@ def test_the_test_button_probes_freestyle_with_the_configured_lanes(
     assert [row["lane"] for row in payload["lanes"]] == [0, 1]
     assert seen["sandbox_name"] == "powerx-connection-test"
     assert seen["lanes"] == [lane_a, lane_b]
+    # The probe VM must be created with the window the button was told about,
+    # otherwise Test would report a VM that auto-pauses on a different schedule
+    # from the one a real task gets.
+    assert seen["config"].idle_pause_seconds == 1200
 
 
 def test_the_freestyle_page_does_not_overclaim_what_rotation_buys(monkeypatch) -> None:

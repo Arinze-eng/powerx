@@ -42,6 +42,7 @@ from nanobot.agent.tools.freestyle_backend import (
     validate_freestyle_cpu_cores,
     validate_freestyle_disk_size_gb,
     validate_freestyle_fetch_allow_hosts,
+    validate_freestyle_idle_pause_seconds,
     validate_freestyle_max_duration_seconds,
     validate_freestyle_memory_mb,
     validate_freestyle_snapshot_id,
@@ -108,6 +109,9 @@ class _FakeTransport:
                     "slug": (json_body or {}).get("slug"),
                     "state": "running" if self.running else "starting",
                     "resources": {"cpu": 4, "memory": 8192, "storage": 32768},
+                    # Echoed back the way the provider does, so a test can see
+                    # the idle window the VM actually carries.
+                    "idleTimeoutSeconds": (json_body or {}).get("idleTimeoutSeconds"),
                 }
                 self.vms[lane_index] = vm
                 self.by_id[vm["id"]] = vm
@@ -133,6 +137,16 @@ class _FakeTransport:
             if method == "POST" and path.endswith("/start"):
                 vm_id = path.split("/")[3]
                 self.by_id[vm_id]["state"] = "running"
+                return dict(self.by_id[vm_id])
+            if method == "POST" and path.endswith("/pause"):
+                vm_id = path.split("/")[3]
+                self.by_id[vm_id]["state"] = "paused"
+                self.vms[lane_index]["state"] = "paused"
+                return dict(self.by_id[vm_id])
+            if method == "PATCH" and path.startswith("/v5/vms/vm-"):
+                vm_id = path.rsplit("/", 1)[-1]
+                self.by_id[vm_id].update(dict(json_body or {}))
+                self.vms[lane_index].update(dict(json_body or {}))
                 return dict(self.by_id[vm_id])
             if method == "POST" and path.endswith("/exec-await"):
                 command = (json_body or {}).get("command", "")
@@ -208,6 +222,20 @@ def test_validate_sizing_defaults_to_the_stock_eight_gb_vm() -> None:
         validate_freestyle_cpu_cores(0)
     with pytest.raises(ValueError):
         validate_freestyle_disk_size_gb(501)
+
+
+def test_validate_idle_pause_window() -> None:
+    # -1 is the provider's own "never pause for idleness" sentinel.
+    assert validate_freestyle_idle_pause_seconds(-1) == -1
+    assert validate_freestyle_idle_pause_seconds(1) == 1
+    assert validate_freestyle_idle_pause_seconds(86_400) == 86_400
+    assert FreestyleExecutionConfig().idle_pause_seconds == 300
+    # 0 must never be passed through: the provider reads it as "pause
+    # immediately", so an empty form field would freeze the VM out from under
+    # the agent while looking like the feature was simply off.
+    for bad in (0, -2, 86_401, "x", None):
+        with pytest.raises(ValueError):
+            validate_freestyle_idle_pause_seconds(bad)
 
 
 def test_validate_duration_tag_snapshot_and_fetch_hosts() -> None:
@@ -327,6 +355,28 @@ def test_create_body_carries_the_run_budget_firewall_and_slug() -> None:
     assert body["autoDeleteSeconds"] == -1
     cidrs = {rule["destination"]["cidr"] for rule in body["firewall"]["rules"]}
     assert cidrs == {"0.0.0.0/0", "::/0"}
+
+
+def test_create_body_carries_the_idle_pause_window() -> None:
+    """Auto-pause is armed at create time, on the provider's own field."""
+    default, _ = _backend()
+    asyncio.run(default._ensure_vm())
+    assert default.idle_pause_seconds == 300
+
+    backend, transport = _backend(idle_pause_seconds=900)
+    asyncio.run(backend._ensure_vm())
+    create = next(c for c in transport.calls if c["method"] == "POST" and c["path"] == "/v5/vms")
+    assert create["json"]["idleTimeoutSeconds"] == 900
+    # The provider's run budget is what pauses a VM for good; the idle window
+    # must not be confused with it.
+    assert create["json"]["maxRunTotalSeconds"] == 3600
+
+    never, transport_never = _backend(idle_pause_seconds=-1)
+    asyncio.run(never._ensure_vm())
+    create = next(
+        c for c in transport_never.calls if c["method"] == "POST" and c["path"] == "/v5/vms"
+    )
+    assert create["json"]["idleTimeoutSeconds"] == -1
 
 
 def test_run_short_command_stays_inside_the_sync_ceiling() -> None:
@@ -562,6 +612,78 @@ def test_keep_alive_returns_a_paused_vm_to_running() -> None:
     assert len(creates) == 1
 
 
+def test_pause_freezes_the_vm_and_never_creates_one() -> None:
+    backend, transport = _backend()
+    vm, _ = asyncio.run(backend._ensure_vm())
+    transport.calls.clear()
+
+    assert asyncio.run(backend.pause()) is True
+
+    pauses = [c for c in transport.calls if c["path"].endswith("/pause")]
+    assert [c["path"] for c in pauses] == [f"/v5/vms/{vm['id']}/pause"]
+    creates = [c for c in transport.calls if c["method"] == "POST" and c["path"] == "/v5/vms"]
+    assert not creates, "an explicit pause must never provision a VM"
+
+
+def test_pause_on_an_already_paused_vm_is_a_no_op() -> None:
+    backend, transport = _backend()
+    vm, _ = asyncio.run(backend._ensure_vm())
+    transport.by_id[vm["id"]]["state"] = "paused"
+    transport.calls.clear()
+
+    assert asyncio.run(backend.pause()) is True
+    assert not [c for c in transport.calls if c["path"].endswith("/pause")]
+
+
+def test_pause_reports_false_when_no_vm_exists() -> None:
+    backend, transport = _backend()
+    assert asyncio.run(backend.pause()) is False
+    assert not [c for c in transport.calls if c["method"] == "POST"]
+    # It still looked: a session whose pin was lost must be findable.
+    assert [c for c in transport.calls if c["method"] == "GET"]
+
+
+def test_pause_finds_a_vm_the_session_is_not_pinned_to() -> None:
+    """A rebuilt gateway has no pin; the disk still exists in some account."""
+    backend, transport = _backend(api_keys=[KEY_A, KEY_B])
+    transport.vms[1] = {"id": "vm-1-9", "slug": "px-fs-test", "state": "running"}
+    transport.by_id["vm-1-9"] = transport.vms[1]
+    assert backend.lane_index is None
+
+    assert asyncio.run(backend.pause()) is True
+
+    pauses = [c for c in transport.calls if c["path"].endswith("/pause")]
+    assert [c["path"] for c in pauses] == ["/v5/vms/vm-1-9/pause"]
+    assert pauses[0]["lane"] == 1
+
+
+def test_set_idle_pause_patches_the_live_vm() -> None:
+    """The window is fixed at create time, so a change needs the PATCH form."""
+    backend, transport = _backend()
+    vm, _ = asyncio.run(backend._ensure_vm())
+    transport.calls.clear()
+
+    assert asyncio.run(backend.set_idle_pause(600)) is True
+
+    patches = [c for c in transport.calls if c["method"] == "PATCH"]
+    assert [c["path"] for c in patches] == [f"/v5/vms/{vm['id']}"]
+    assert patches[0]["json"] == {"idleTimeoutSeconds": 600}
+    assert backend.idle_pause_seconds == 600
+    assert transport.by_id[vm["id"]]["idleTimeoutSeconds"] == 600
+
+    # -1 removes the timeout, and the backend remembers that too.
+    assert asyncio.run(backend.set_idle_pause(-1)) is True
+    assert backend.idle_pause_seconds == -1
+
+
+def test_set_idle_pause_on_a_missing_vm_is_false() -> None:
+    backend, transport = _backend()
+    assert asyncio.run(backend.set_idle_pause(600)) is False
+    assert not [c for c in transport.calls if c["method"] == "PATCH"]
+    with pytest.raises(ValueError):
+        asyncio.run(backend.set_idle_pause(0))
+
+
 def test_keep_alive_on_a_dead_vm_is_a_no_op() -> None:
     backend, transport = _backend()
     vm, _ = asyncio.run(backend._ensure_vm())
@@ -639,6 +761,27 @@ def test_test_connection_reports_the_eight_gb_shape_and_the_lane() -> None:
     assert probe["lane_index"] == 0
     assert probe["lane_count"] == 1
     assert probe["total_mb"] == 32084
+
+
+def test_test_connection_reports_the_idle_window_the_vm_carries() -> None:
+    """The Test line must confirm auto-pause is ARMED, not merely configured.
+
+    The provider reports ``null`` for a VM that will never pause for idleness,
+    which is the ``-1`` the admin form uses for the same thing.
+    """
+    backend, transport = _backend(idle_pause_seconds=900)
+
+    async def _exec(command: str, *, lane: int, vm_id: str, timeout: int) -> dict[str, Any]:
+        return {"statusCode": 0, "stdout": "", "stderr": ""}
+
+    backend._exec = _exec  # type: ignore[assignment]
+    assert asyncio.run(backend.test_connection())["idle_pause_seconds"] == 900
+
+    # A VM that carries no timeout reports null, and must read back as -1.
+    vm, lane = asyncio.run(backend._ensure_vm())
+    transport.by_id[vm["id"]]["idleTimeoutSeconds"] = None
+    transport.vms[lane]["idleTimeoutSeconds"] = None
+    assert asyncio.run(backend.test_connection())["idle_pause_seconds"] == -1
 
 
 def test_describe_lanes_lists_every_account_with_its_headroom() -> None:
