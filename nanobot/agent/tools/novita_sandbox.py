@@ -108,11 +108,25 @@ def _git_creds_guard(path: str) -> str:
     no output at all, for every command, including a bare ``pwd && echo hi``.
     Since the file is only written when a GitHub token is configured, every
     deployment without one had its sandbox reduce to "the AI's commands return
-    nothing and exit 2". Guarding the source behind ``[ -f ]`` makes a missing
-    file a no-op on dash and bash alike, and the trailing ``|| true`` keeps the
-    prefix from ever deciding the command's own exit status.
+    nothing and exit 2".
+
+    MEASURED FAILURE #2 (same day, same symptom, opposite cause): ``[ -f ]`` is
+    the WRONG predicate, because a file that EXISTS but cannot be READ kills the
+    shell just as dead. That is exactly what a 0600 file written by another uid
+    is, and it is what the deployed service produced — ``-rw------- root root``
+    inside a workspace owned by ``ubuntu``. ``.`` against an unreadable file
+    aborts a non-interactive dash the same way a missing one does, so every
+    command answered rc=2 with no output and the sandbox was unusable from the
+    moment credentials were seeded. ``[ -r ]`` covers both cases, and ``sh -n``
+    additionally refuses a file whose *contents* are broken (a half-written
+    source would otherwise abort the shell too). The trailing ``|| true`` keeps
+    the prefix from ever deciding the command's own exit status.
+
+    A skipped source is deliberately not an error: the command runs without git
+    credentials, which is strictly better than a sandbox where nothing runs.
     """
-    return f'[ -f {shlex.quote(path)} ] && . {shlex.quote(path)} 2>/dev/null || true; '
+    quoted = shlex.quote(path)
+    return f"[ -r {quoted} ] && sh -n {quoted} 2>/dev/null && . {quoted} 2>/dev/null || true; "
 
 
 _GIT_CREDS_SOURCE = _git_creds_guard(_GIT_CREDS_PATH)
@@ -2735,6 +2749,25 @@ class NovitaSandboxTool(Tool):
         though GITHUB_BUILD_TOKEN is configured on the host. This seeds the same
         credential file the Novita path uses, for backends whose run() cannot
         prefix a source line. Best-effort: a failure must not break the action.
+
+        MEASURED FAILURE (2026-09-29): seeding used to end at ``chmod``, which
+        assumed the file it had just written was the file the shell would read.
+        It was not. A credential file that is unreadable to the workspace user
+        (observed as ``-rw------- root root`` inside an ``ubuntu``-owned
+        workspace) is fatal to the *whole sandbox*: the source-prefix on every
+        command aborts the shell, so the repair command was itself behind the
+        fatal prefix and could never run. The write is therefore followed by a
+        verification, and the permissions are *forced* before anything is
+        assumed:
+
+        * readability is verified (``[ -r ]``), never assumed, so a file that
+          cannot be read is detected on the spot instead of on the next command;
+        * ownership is repaired with one passwordless ``sudo -n chown`` when the
+          guest allows it, and ``chmod 600`` is re-applied after it;
+        * failing that, the file is *removed*. A credential file nobody can read
+          authenticates nothing — it only breaks every command — whereas its
+          absence is a case the guard tolerates by design (git runs
+          unauthenticated, which is strictly better than a dead sandbox).
         """
         script = _git_creds_script()
         if not script:
@@ -2744,7 +2777,22 @@ class NovitaSandboxTool(Tool):
             parent = path.rsplit("/", 1)[0]
             await backend.run(f"mkdir -p {shlex.quote(parent)}", timeout=60)
             await backend.write(path, script)
-            await backend.run(f"chmod 600 {shlex.quote(path)}", timeout=60)
+            quoted = shlex.quote(path)
+            verify = (
+                f"chmod 600 {quoted} 2>/dev/null; "
+                f'if [ ! -r {quoted} ]; then sudo -n chown "$(id -u):$(id -g)" {quoted} 2>/dev/null; fi; '
+                f"chmod 600 {quoted} 2>/dev/null; "
+                f"if [ -r {quoted} ]; then echo nanobot-git-creds-ok; "
+                f"else rm -f {quoted} 2>/dev/null; echo nanobot-git-creds-unreadable; fi"
+            )
+            outcome = await backend.run(verify, timeout=60)
+            if "nanobot-git-creds-ok" not in str(outcome):
+                logger.warning(
+                    "GitHub credentials were not readable in the sandbox; removed {} so "
+                    "commands still run (git will be unauthenticated): {}",
+                    path,
+                    str(outcome)[-200:],
+                )
         except Exception as exc:  # noqa: BLE001 - credentials are best-effort
             logger.warning("could not seed git credentials into backend: {}", exc)
 

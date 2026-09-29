@@ -34,13 +34,16 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import os
 import re
+import stat
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from loguru import logger as loguru_logger
 
 from nanobot.agent.tools.freestyle_backend import FreestyleExecutionBackend
 from nanobot.agent.tools.novita_sandbox import (
@@ -177,7 +180,9 @@ def test_a_run_command_is_prefixed_by_the_credential_source(
     asyncio.run(tool.execute(action="run", command="pwd && echo hi"))
 
     assert recorder.commands, "no command reached the VM"
-    assert recorder.commands[-1].startswith("[ -f "), recorder.commands[-1]
+    # ``[ -r ]``, not ``[ -f ]``: an existing-but-unreadable credential file is
+    # just as fatal to a non-interactive dash as a missing one (see the guard).
+    assert recorder.commands[-1].startswith("[ -r "), recorder.commands[-1]
     assert recorder.commands[-1].endswith("pwd && echo hi")
 
 
@@ -228,6 +233,193 @@ def test_the_creds_prefix_still_sources_a_file_that_exists(tmp_path: Path) -> No
 
     assert proc.returncode == 0
     assert proc.stdout.strip() == "ok"
+
+
+def test_the_creds_guard_asks_for_a_readable_file() -> None:
+    """``[ -f ]`` was the wrong predicate: it asks whether the file is *there*.
+
+    MEASURED FAILURE #2 (2026-09-29): the deployed service left a
+    ``-rw------- root root`` credential file inside an ``ubuntu``-owned
+    workspace. The file existed, so ``[ -f ]`` passed, ``.`` was attempted, and
+    dash aborted the whole non-interactive shell with rc=2 and no output — for
+    every command, including a bare ``pwd``. The source prefix must therefore
+    test *readability* (which also covers absence), must refuse a file whose
+    contents cannot parse, and must never decide the command's own exit status.
+    """
+    prefix = _git_creds_source_for("/workspace")
+
+    assert "[ -r " in prefix, prefix
+    assert "sh -n " in prefix, prefix
+    assert "[ -f " not in prefix, prefix
+    assert prefix.endswith("|| true; "), prefix
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root reads a 0600 file regardless of mode, so the failure cannot be staged",
+)
+def test_the_creds_prefix_survives_an_unreadable_file(tmp_path: Path) -> None:
+    """The exact deployed scenario, staged: the file exists but cannot be read."""
+    root = tmp_path / "workspace"
+    (root / ".nanobot").mkdir(parents=True)
+    creds = root / ".nanobot" / "github-env.sh"
+    creds.write_text("export GITHUB_TOKEN=ok\n")
+    creds.chmod(0o000)
+
+    try:
+        proc = subprocess.run(
+            ["/bin/sh", "-c", _git_creds_source_for(str(root)) + "pwd && echo alive"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        creds.chmod(0o600)
+
+    assert proc.returncode == 0, (proc.returncode, proc.stderr)
+    assert "alive" in proc.stdout, proc.stdout
+
+
+def test_the_creds_prefix_survives_a_corrupt_credential_file(tmp_path: Path) -> None:
+    """A half-written source aborts the shell too, so the guard parses it first."""
+    root = tmp_path / "workspace"
+    (root / ".nanobot").mkdir(parents=True)
+    (root / ".nanobot" / "github-env.sh").write_text("export GITHUB_TOKEN='unclosed\nif [\n")
+
+    proc = subprocess.run(
+        ["/bin/sh", "-c", _git_creds_source_for(str(root)) + "echo alive"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, (proc.returncode, proc.stderr)
+    assert proc.stdout.strip() == "alive"
+
+
+def test_the_creds_prefix_never_decides_the_commands_exit_status(tmp_path: Path) -> None:
+    prefix = _git_creds_source_for(str(tmp_path / "workspace"))
+
+    proc = subprocess.run(
+        ["/bin/sh", "-c", prefix + "exit 7"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 7, (proc.returncode, proc.stdout, proc.stderr)
+
+
+class _SeedBackend:
+    """A backend whose ``run`` really executes, so the seed is really exercised.
+
+    ``write`` is left able to produce an unreadable file on purpose: the
+    deployed writer did exactly that, and the whole bug was that the seeding
+    path trusted it. ``STUBBED`` names the commands the guest refuses (chmod,
+    sudo) so that the file stays unreadable for the whole verify — a test that
+    runs as the file's own owner cannot otherwise reproduce a file that neither
+    ``chmod`` nor ``chown`` can rescue.
+    """
+
+    STUBBED = ("chmod", "sudo")
+
+    def __init__(self, root: Path, *, mode: int = 0o600, stub_unrepairable: bool = False) -> None:
+        root.mkdir(parents=True, exist_ok=True)
+        self.root = root
+        self.mode = mode
+        self.stub_unrepairable = stub_unrepairable
+        self.commands: list[str] = []
+        self.stubdir = root / "stubbin"
+        if stub_unrepairable:
+            self.stubdir.mkdir(parents=True, exist_ok=True)
+            for name in self.STUBBED:
+                stub = self.stubdir / name
+                stub.write_text("#!/bin/sh\nexit 1\n")
+                stub.chmod(0o755)
+
+    async def run(self, command: str, timeout: int | None = None, cwd: str | None = None) -> str:
+        self.commands.append(command)
+        env = {"PATH": f"{self.stubdir}:/usr/bin:/bin", "HOME": str(self.root)}
+        proc = subprocess.run(
+            ["/bin/sh", "-c", command],
+            cwd=str(self.root),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return f"statusCode={proc.returncode}\n{proc.stdout}{proc.stderr}"
+        return proc.stdout
+
+    async def write(self, path: str, content: str) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        target.chmod(self.mode)
+
+
+def _seed(backend: _SeedBackend, root: Path) -> None:
+    # ``_seed_git_credentials`` never touches ``self``, so it can be driven
+    # without building a configured tool (which would load real settings).
+    asyncio.run(NovitaSandboxTool._seed_git_credentials(None, backend, str(root)))
+
+
+def _stub_creds_script(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "nanobot.agent.tools.novita_sandbox._git_creds_script",
+        lambda: "#!/bin/sh\nexport GITHUB_TOKEN=stub\n",
+    )
+
+
+def test_seeding_verifies_that_the_file_it_wrote_is_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_creds_script(monkeypatch)
+    root = tmp_path / "workspace"
+    backend = _SeedBackend(root)
+
+    _seed(backend, root)
+
+    path = root / ".nanobot" / "github-env.sh"
+    assert path.is_file()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    verify = backend.commands[-1]
+    assert "[ -r " in verify
+    assert "sudo -n chown" in verify
+    assert "rm -f " in verify
+
+
+def test_seeding_removes_a_credential_file_nothing_can_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A credential file nobody can read authenticates nothing and kills every
+    command, so the seeder deletes it and says so instead of leaving a trap."""
+    _stub_creds_script(monkeypatch)
+    root = tmp_path / "workspace"
+    backend = _SeedBackend(root, mode=0o000, stub_unrepairable=True)
+
+    warnings: list[str] = []
+    handler = loguru_logger.add(
+        lambda message: warnings.append(message.record["message"]), level="WARNING"
+    )
+    try:
+        _seed(backend, root)
+    finally:
+        loguru_logger.remove(handler)
+
+    path = root / ".nanobot" / "github-env.sh"
+    assert not path.exists(), "an unreadable credential file must not be left behind"
+    assert any("not readable" in message for message in warnings), warnings
+    # and the sandbox still works, which is the entire point
+    proc = subprocess.run(
+        ["/bin/sh", "-c", _git_creds_source_for(str(root)) + "echo alive"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stderr)
+    assert proc.stdout.strip() == "alive"
 
 
 def test_only_one_freestyle_session_store_is_defined() -> None:
