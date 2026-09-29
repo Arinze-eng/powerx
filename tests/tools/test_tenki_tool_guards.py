@@ -163,3 +163,131 @@ def test_telegram_ocr_still_refuses_a_keyless_backend(
     )
 
     assert "no API key is configured" in result
+
+
+# --------------------------------------------------------------- Freestyle
+
+
+FREESTYLE_LANES = [
+    "WUjYgZ9kifZmmLqXNTWvfM-JBMG5zrj7x4EsEga6pC1ZievE94SPp9bLVS2BzRmJauV",
+    "UqRQ3iRHKBwvUFyft7t3u3-36pJ4HnzzivBbwQjXZPkR6CBBSwfzH3UYu3RDqZcd2wJ",
+]
+
+
+def _freestyle_execution(**fields: Any) -> SimpleNamespace:
+    base: dict[str, Any] = {"api_key": "", "api_keys": []}
+    base.update(fields)
+    return SimpleNamespace(backend="freestyle", freestyle=SimpleNamespace(**base))
+
+
+def _pin_freestyle(monkeypatch: pytest.MonkeyPatch, execution: SimpleNamespace) -> None:
+    from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool
+
+    monkeypatch.setattr(NovitaSandboxTool, "_execution_config", staticmethod(lambda: execution))
+
+
+def test_the_freestyle_guard_accepts_either_key_form() -> None:
+    from nanobot.agent.tools.novita_sandbox import _freestyle_key_configured
+
+    assert _freestyle_key_configured(None) is False
+    assert _freestyle_key_configured(SimpleNamespace(api_key="", api_keys=[])) is False
+    assert _freestyle_key_configured(SimpleNamespace(api_key="", api_keys=["  "])) is False
+    assert _freestyle_key_configured(SimpleNamespace(api_key="fs_single", api_keys=[])) is True
+    # Rotation deliberately leaves the legacy single field empty.
+    assert _freestyle_key_configured(SimpleNamespace(api_key="", api_keys=FREESTYLE_LANES)) is True
+
+
+def _stub_freestyle_dispatch(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    ran: list[str] = []
+
+    async def fake(
+        self: Any,
+        action: str,
+        kwargs: dict[str, Any],
+        backend_config: Any,
+        session_key: str,
+    ) -> str:
+        del self, kwargs, backend_config, session_key
+        ran.append(action)
+        return "FREESTYLE RAN"
+
+    from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool
+
+    monkeypatch.setattr(NovitaSandboxTool, "_execute_freestyle", fake)
+    return ran
+
+
+def test_freestyle_is_selectable_and_reaches_its_own_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tool must route ``freestyle`` to the Freestyle backend, not Novita.
+
+    The backend name is what the administrator picks in the panel; if the tool
+    did not recognise it the whole feature would silently fall through to the
+    default provider.
+    """
+    from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool
+
+    _pin_freestyle(monkeypatch, _freestyle_execution(api_keys=FREESTYLE_LANES))
+    ran = _stub_freestyle_dispatch(monkeypatch)
+
+    result = asyncio.run(NovitaSandboxTool().execute(action="run", command="echo hi"))
+
+    assert ran == ["run"], f"the guard refused a configured backend: {result!r}"
+    assert result == "FREESTYLE RAN"
+
+
+def test_freestyle_execute_refuses_a_keyless_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool
+
+    _pin_freestyle(monkeypatch, _freestyle_execution())
+    ran = _stub_freestyle_dispatch(monkeypatch)
+
+    result = asyncio.run(NovitaSandboxTool().execute(action="run", command="echo hi"))
+
+    assert ran == []
+    assert "no API key is configured" in str(result)
+
+
+def test_telegram_ocr_guard_accepts_freestyle_rotation_lanes(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool
+
+    image = tmp_path / "photo.jpg"
+    image.write_bytes(b"telegram-image-bytes")
+    _pin_freestyle(monkeypatch, _freestyle_execution(api_keys=FREESTYLE_LANES))
+
+    async def fake_ocr(self: Any, images: Any, *, config: Any, session_key: str) -> str:
+        del self, images, config, session_key
+        return "FREESTYLE OCR RAN"
+
+    monkeypatch.setattr(NovitaSandboxTool, "_analyze_telegram_images_freestyle", fake_ocr)
+
+    result = asyncio.run(
+        NovitaSandboxTool().analyze_telegram_images(
+            [str(image)], "Read this image", session_key="telegram:fs-lanes"
+        )
+    )
+
+    assert result == "FREESTYLE OCR RAN"
+
+
+def test_telegram_ocr_still_refuses_a_keyless_freestyle_backend(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nanobot.agent.tools.novita_sandbox import NovitaSandboxTool
+
+    image = tmp_path / "photo.jpg"
+    image.write_bytes(b"telegram-image-bytes")
+    _pin_freestyle(monkeypatch, _freestyle_execution())
+
+    result = asyncio.run(
+        NovitaSandboxTool().analyze_telegram_images(
+            [str(image)], "Read this image", session_key="telegram:fs-keyless"
+        )
+    )
+
+    assert "no API key is configured" in result

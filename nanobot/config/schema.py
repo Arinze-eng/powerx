@@ -559,6 +559,54 @@ class TenkiExecutionConfig(Base):
     persist_workspace: bool = True
 
 
+class FreestyleExecutionConfig(Base):
+    """Administrator-configured Freestyle VM target for sandbox-backed execution.
+
+    Freestyle (https://dash.freestyle.sh) boots real Linux VMs — hardware
+    virtualisation, not a container — from an Ubuntu 24.04 image whose stock
+    shape is 4 vCPU, 8192 MB RAM and 32 GB of disk, which is the default this
+    deployment asks for. VMs are addressed by a slug that is unique inside one
+    account and are restored from a snapshot rather than cold-booted, so they
+    come up in about a second and keep their whole disk between tasks.
+
+    Two numbers matter operationally and both are administrator-configurable:
+
+    * ``max_duration_seconds`` is the provider's ``maxRunTotalSeconds``: the
+      total time one VM may ever run. Spending it pauses the VM and every later
+      start is refused, which is the provider's own backstop against a sandbox
+      that never dies. One hour by default.
+    * ``memory_mb`` defaults to 8192 because that is this account's stock VM
+      size, verified live against the API (``resources: {cpu: 4, memory: 8192,
+      storage: 32768}``). The provider sizes a VM from its source snapshot, so
+      this value documents the target rather than resizing a running machine.
+    """
+
+    api_key: str = Field(default="", repr=False)
+    # Ordered rotation lane keys. A key is extra capacity only when it belongs
+    # to a DIFFERENT account: keys on one account see the same VM list and share
+    # one quota. (Measured live for this deployment: the two keys configured are
+    # a single account, so the second added no headroom.) New sessions are
+    # round-robined across the lanes; a session that already exists stays pinned
+    # to the account whose disk holds its files, because a VM slug names the
+    # same machine only inside one account and rotating a live session would
+    # silently create a second, empty VM. Empty means "one lane, from
+    # ``api_key`` above". The admin Test button lists each lane's VM count, so
+    # duplicate-account keys are visible before they are relied on.
+    api_keys: list[str] = Field(default_factory=list, repr=False)
+    api_url: str = "https://api.freestyle.sh"
+    snapshot_id: str = ""
+    cpu_cores: int = Field(default=4, ge=1, le=64)
+    memory_mb: int = Field(default=8192, ge=512, le=65_536)
+    # 0 means "let the source snapshot decide" (the stock Ubuntu VM is 32 GB).
+    disk_size_gb: int = Field(default=0, ge=0, le=500)
+    max_duration_seconds: int = Field(default=3600, ge=60, le=2_592_000)
+    tag: str = "powerx"
+    fetch_allow_hosts: str = ""
+    # Keep the VM (and every file on it) alive across finished tasks, agent
+    # restarts and platform redeploys. Reset is what destroys it.
+    persist_workspace: bool = True
+
+
 class VercelExecutionConfig(Base):
     """Administrator-configured Vercel Sandbox target for sandbox-backed execution.
 
@@ -605,7 +653,7 @@ class ExecutionBackendConfig(Base):
     """Select the remote execution provider used by sandbox-compatible tasks."""
 
     backend: Literal[
-        "novita", "vps", "upstash", "daytona", "runloop", "tenki", "vercel"
+        "novita", "vps", "upstash", "daytona", "runloop", "tenki", "vercel", "freestyle"
     ] = "novita"
     # Who picked ``backend``. This is recorded instead of inferred from which
     # credentials happen to sit on disk, so an administrator's explicit choice
@@ -620,6 +668,7 @@ class ExecutionBackendConfig(Base):
     runloop: RunloopExecutionConfig = Field(default_factory=RunloopExecutionConfig)
     tenki: TenkiExecutionConfig = Field(default_factory=TenkiExecutionConfig)
     vercel: VercelExecutionConfig = Field(default_factory=VercelExecutionConfig)
+    freestyle: FreestyleExecutionConfig = Field(default_factory=FreestyleExecutionConfig)
     novita_template: NovitaTemplateConfig = Field(default_factory=NovitaTemplateConfig)
 
 

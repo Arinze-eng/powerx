@@ -382,6 +382,15 @@ def _build_backend(
         )
 
         return TenkiExecutionBackend(backend_config, sandbox_name=tenki_sandbox_name(key))
+    if backend_name == "freestyle" and backend_config is not None:
+        from nanobot.agent.tools.freestyle_backend import (
+            FreestyleExecutionBackend,
+            freestyle_sandbox_name,
+        )
+
+        return FreestyleExecutionBackend(
+            backend_config, sandbox_name=freestyle_sandbox_name(key)
+        )
     if backend_name == "vercel" and backend_config is not None:
         from nanobot.agent.tools.vercel_backend import (
             VercelExecutionBackend,
@@ -537,6 +546,7 @@ async def sandbox_workspace_root() -> str | None:
     from nanobot.agent.tools import (  # noqa: PLC2701
         daytona_backend,
         runloop_backend,
+        freestyle_backend,
         tenki_backend,
         upstash_backend,
         vercel_backend,
@@ -546,6 +556,7 @@ async def sandbox_workspace_root() -> str | None:
         "daytona": daytona_backend.WORKSPACE,
         "runloop": runloop_backend.WORKSPACE,
         "tenki": tenki_backend.WORKSPACE,
+        "freestyle": freestyle_backend.WORKSPACE,
         "upstash": upstash_backend.WORKSPACE,
         "vercel": vercel_backend.WORKSPACE,
     }

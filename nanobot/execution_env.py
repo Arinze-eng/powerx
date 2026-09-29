@@ -56,6 +56,7 @@ def apply_render_execution_env(config: Any) -> Any:
     runloop = getattr(execution, "runloop", None)
     tenki = getattr(execution, "tenki", None)
     vercel = getattr(execution, "vercel", None)
+    freestyle = getattr(execution, "freestyle", None)
     # Credential-only overlay: env never changes which backend is selected.
     if (_env("NANOBOT_EXECUTION_BACKEND") or "").lower() not in {
         "novita",
@@ -65,6 +66,7 @@ def apply_render_execution_env(config: Any) -> Any:
         "runloop",
         "tenki",
         "vercel",
+        "freestyle",
     }:
         return config
 
@@ -227,6 +229,36 @@ def apply_render_execution_env(config: Any) -> Any:
             tenki.max_duration_seconds = ttl
         _fill(tenki, "tag", _env("NANOBOT_TENKI_TAG"))
         _fill(tenki, "fetch_allow_hosts", _env("NANOBOT_TENKI_FETCH_ALLOW_HOSTS"))
+    # Freestyle VM overlay (used when the deployment selects the Freestyle
+    # backend). Same credential-only, fill-blanks rule as every other provider:
+    # an admin-saved key/endpoint wins, env restores what is missing.
+    if freestyle is not None:
+        _fill(freestyle, "api_key", _env("NANOBOT_FREESTYLE_API_KEY") or _env("FREESTYLE_API_KEY"))
+        # Rotation lanes: the plural variable wins, exactly as it does for Tenki.
+        fs_lane_keys = _env("NANOBOT_FREESTYLE_API_KEYS")
+        if fs_lane_keys and not list(getattr(freestyle, "api_keys", None) or []):
+            from nanobot.agent.tools.freestyle_backend import validate_freestyle_api_keys
+
+            try:
+                freestyle.api_keys = validate_freestyle_api_keys(fs_lane_keys)
+            except ValueError:
+                pass
+        _fill(freestyle, "api_url", _env("NANOBOT_FREESTYLE_API_URL"))
+        _fill(freestyle, "snapshot_id", _env("NANOBOT_FREESTYLE_SNAPSHOT_ID"))
+        fs_cpu = _positive_int(_env("NANOBOT_FREESTYLE_CPU_CORES"), maximum=64)
+        if fs_cpu is not None and int(getattr(freestyle, "cpu_cores", 4) or 4) == 4:
+            freestyle.cpu_cores = fs_cpu
+        fs_memory = _positive_int(_env("NANOBOT_FREESTYLE_MEMORY_MB"), maximum=65_536)
+        if fs_memory is not None and fs_memory % 2 == 0 and int(getattr(freestyle, "memory_mb", 8192) or 8192) == 8192:
+            freestyle.memory_mb = fs_memory
+        fs_disk = _positive_int(_env("NANOBOT_FREESTYLE_DISK_SIZE_GB"), maximum=500)
+        if fs_disk is not None and int(getattr(freestyle, "disk_size_gb", 0) or 0) == 0:
+            freestyle.disk_size_gb = fs_disk
+        fs_ttl = _positive_int(_env("NANOBOT_FREESTYLE_MAX_DURATION_SECONDS"), maximum=2_592_000)
+        if fs_ttl is not None and fs_ttl >= 60 and int(getattr(freestyle, "max_duration_seconds", 3600) or 3600) == 3600:
+            freestyle.max_duration_seconds = fs_ttl
+        _fill(freestyle, "tag", _env("NANOBOT_FREESTYLE_TAG"))
+        _fill(freestyle, "fetch_allow_hosts", _env("NANOBOT_FREESTYLE_FETCH_ALLOW_HOSTS"))
     # Vercel Sandbox overlay (used when the deployment selects the Vercel
     # backend). Same credential-only, fill-blanks rule as every other provider:
     # an admin-saved token/endpoint wins, env restores what is missing.

@@ -195,7 +195,8 @@ fi\
 #: MEASURED FAILURE (2026-09-27, on Runloop): every path here used to be absolute
 #: under ``/workspace``, which is only correct on Novita. Each backend owns a
 #: different root — ``/home/user`` on Runloop, ``/home/daytona`` on Daytona,
-#: ``/home/tenki`` on Tenki, ``/vercel/sandbox`` on Vercel, ``/workspace/home`` on
+#: ``/home/tenki`` on Tenki, ``/home/ubuntu/workspace`` on Freestyle,
+#: ``/vercel/sandbox`` on Vercel, ``/workspace/home`` on
 #: Upstash, ``/workspace`` on Novita, and whatever ``workspace_dir`` says on a VPS.
 #: A ``/workspace/...`` target on Runloop raises ``path must remain inside
 #: /home/user`` from the *write* action, so the transfer never landed, provisioning
@@ -272,6 +273,7 @@ _CANDIDATE_ROOTS = (
     "/home/user",
     "/home/daytona",
     "/home/tenki",
+    "/home/ubuntu/workspace",
     "/vercel/sandbox",
     "/workspace/home",
     "/root",

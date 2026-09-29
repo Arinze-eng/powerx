@@ -142,3 +142,46 @@ def test_a_single_lane_is_always_lane_zero(
 ) -> None:
     store = _store(monkeypatch, tmp_path)
     assert {store.next_lane(1) for _ in range(5)} == {0}
+
+
+# --------------------------------------------------------------- Freestyle
+
+
+def test_freestyle_keeps_its_own_index_beside_tenki(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression guard: the two rotations must never share a cursor or a pin.
+
+    ``_FreestyleSessionStore`` subclasses the Tenki store to inherit the exact
+    persistence semantics, so the index NAME is the only thing keeping a
+    Freestyle lane pin out of the Tenki file. Sharing it would re-point a
+    Freestyle session into whichever Tenki account happened to hold the lane of
+    the same number.
+    """
+    from nanobot.agent.tools.novita_sandbox import _FreestyleSessionStore, _TenkiSessionStore
+
+    monkeypatch.setenv("NANOBOT_DATA_DIR", str(tmp_path))
+    assert _FreestyleSessionStore.INDEX_NAME == "freestyle_sessions.json"
+    assert _TenkiSessionStore.INDEX_NAME == "tenki_sessions.json"
+
+    tenki = _TenkiSessionStore()
+    tenki.set_id("telegram:1", "tenki-sbx")
+    tenki.set_lane("telegram:1", 1)
+
+    freestyle = _FreestyleSessionStore()
+    assert freestyle.sandbox_id("telegram:1") is None
+    freestyle.set_id("telegram:1", "vm-1")
+    freestyle.set_lane("telegram:1", 0)
+    assert freestyle.next_lane(2) == 0
+
+    # Each file keeps only its own lanes and cursor.
+    assert sorted(p.name for p in tmp_path.glob("*_sessions.json")) == [
+        "freestyle_sessions.json",
+        "tenki_sessions.json",
+    ]
+    assert json.loads((tmp_path / "tenki_sessions.json").read_text())["lanes"] == {"telegram:1": 1}
+    assert json.loads((tmp_path / "freestyle_sessions.json").read_text())["lanes"] == {
+        "telegram:1": 0
+    }
+    assert _TenkiSessionStore().lane("telegram:1") == 1
+    assert _FreestyleSessionStore().sandbox_id("telegram:1") == "vm-1"

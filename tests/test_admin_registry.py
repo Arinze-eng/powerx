@@ -1310,3 +1310,222 @@ def test_cache_probe_still_accuses_markers_when_the_baseline_recites(monkeypatch
     assert body["markers"]["context_kept"] is False
     assert "Do NOT use markers on this endpoint" in body["detail"]
     assert "declined to repeat the code" not in body["detail"]
+
+
+def test_execution_admin_section_offers_the_freestyle_backend(monkeypatch) -> None:
+    """Freestyle must be selectable in the admin panel, with its own settings form."""
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    response = admin_registry.admin_route(_request(), "/admin")
+    assert response is not None
+    body = bytes(response.body).decode()
+    assert "<option value='freestyle'>Freestyle VM</option>" in body
+    for element in (
+        "freestyleApiKey",
+        "freestyleApiKeys",
+        "freestyleApiUrl",
+        "freestyleSnapshotId",
+        "freestyleCpuCores",
+        "freestyleMemoryMb",
+        "freestyleDiskSizeGb",
+        "freestyleMaxDurationSeconds",
+        "freestyleTag",
+        "freestyleFetchAllowHosts",
+        "freestylePersistWorkspace",
+        "freestyleKeyState",
+    ):
+        assert element in body, element
+    # The requested size is the provider's stock VM and must be what the form
+    # offers, not something an administrator has to know to type.
+    assert "placeholder='8192'" in body
+    assert "stays pinned to the account holding its disk" in body
+
+
+def test_admin_can_select_the_freestyle_backend_and_round_trip_its_settings(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.json"
+    source = Path(__file__).parents[1] / "render-config.json"
+    config_path.write_text(source.read_text(), encoding="utf-8")
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.delenv("NANOBOT_FREESTYLE_API_KEY", raising=False)
+    monkeypatch.delenv("NANOBOT_FREESTYLE_API_KEYS", raising=False)
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+    refreshed = []
+
+    lane_a = "WUjYgZ9kifZmmLqXNTWvfM-JBMG5zrj7x4EsEga6pC1ZievE94SPp9bLVS2BzRmJauV"
+    lane_b = "UqRQ3iRHKBwvUFyft7t3u3-36pJ4HnzzivBbwQjXZPkR6CBBSwfzH3UYu3RDqZcd2wJ"
+    request = _request("/api/admin/execution-settings")
+    request._nanobot_webui_mutation_payload = {
+        "backend": "freestyle",
+        "freestyleApiKeys": f"{lane_a}\n{lane_b}",
+        "freestyleApiUrl": "https://api.freestyle.sh",
+        "freestyleCpuCores": 4,
+        "freestyleMemoryMb": 8192,
+        "freestyleMaxDurationSeconds": 5400,
+        "freestyleTag": "powerx",
+        "freestyleFetchAllowHosts": "gofile.io,onlyfiles.com",
+        "freestylePersistWorkspace": True,
+    }
+    response = admin_registry.admin_route(
+        request,
+        "/api/admin/execution-settings",
+        refresh_runtime_config=lambda: refreshed.append(True),
+    )
+    assert response is not None
+    assert response.status_code == 200
+    assert refreshed == [True]
+
+    # Secrets never come back over the wire — not the keys, not even a count of
+    # them beyond how many lanes are configured.
+    body = bytes(response.body).decode()
+    assert lane_a not in body
+    assert lane_b not in body
+    payload = json.loads(body)
+    assert payload["backend"] == "freestyle"
+    freestyle = payload["freestyle"]
+    assert freestyle["apiKeysConfigured"] == 2
+    assert freestyle["cpu_cores"] == 4
+    assert freestyle["memory_mb"] == 8192
+    assert freestyle["max_duration_seconds"] == 5400
+    assert freestyle["tag"] == "powerx"
+    assert freestyle["fetch_allow_hosts"] == "gofile.io,onlyfiles.com"
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["execution"]["backend"] == "freestyle"
+    saved_freestyle = saved["execution"]["freestyle"]
+    assert saved_freestyle["apiKeys"] == [lane_a, lane_b]
+    assert saved_freestyle["memoryMb"] == 8192
+    assert saved_freestyle["maxDurationSeconds"] == 5400
+
+    # Blank keeps the saved lanes; a sent list replaces the whole thing.
+    blank = _request("/api/admin/execution-settings")
+    blank._nanobot_webui_mutation_payload = {"backend": "freestyle", "freestyleApiKeys": ""}
+    retained = admin_registry.admin_route(blank, "/api/admin/execution-settings")
+    assert retained is not None
+    assert retained.status_code == 200
+    resaved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert resaved["execution"]["freestyle"]["apiKeys"] == [lane_a, lane_b]
+
+    settings = admin_registry.admin_route(
+        _request("/api/admin/execution-settings"),
+        "/api/admin/execution-settings",
+    )
+    assert settings is not None
+    assert settings.status_code == 200
+    assert '"backend": "freestyle"' in bytes(settings.body).decode()
+
+
+def test_freestyle_save_defaults_to_eight_gb_and_rejects_bad_values(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.json"
+    source = Path(__file__).parents[1] / "render-config.json"
+    config_path.write_text(source.read_text(), encoding="utf-8")
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+
+    # Selecting Freestyle with no key at all is allowed at save time; the tool
+    # reports the missing key when a task actually needs the backend.
+    select = _request("/api/admin/execution-settings")
+    select._nanobot_webui_mutation_payload = {"backend": "freestyle"}
+    response = admin_registry.admin_route(select, "/api/admin/execution-settings")
+    assert response is not None
+    assert response.status_code == 200
+    saved = json.loads(config_path.read_text(encoding="utf-8"))["execution"]["freestyle"]
+    # 8192 MB is the size this backend exists to offer; it must be the default.
+    assert saved["memoryMb"] == 8192
+    assert saved["cpuCores"] == 4
+
+    for bad in (
+        {"freestyleMemoryMb": 4095},  # odd megabytes
+        {"freestyleMemoryMb": 256},
+        {"freestyleCpuCores": 0},
+        {"freestyleMaxDurationSeconds": 30},
+        {"freestyleApiUrl": "http://api.freestyle.sh"},
+        {"freestyleApiKeys": "not a valid key!!"},
+        {"freestyleFetchAllowHosts": "not a host"},
+    ):
+        rejected = _request("/api/admin/execution-settings")
+        rejected._nanobot_webui_mutation_payload = {"backend": "freestyle", **bad}
+        out = admin_registry.admin_route(rejected, "/api/admin/execution-settings")
+        assert out is not None
+        assert out.status_code == 400, bad
+
+
+def test_the_test_button_probes_freestyle_with_the_configured_lanes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.json"
+    source = Path(__file__).parents[1] / "render-config.json"
+    config_path.write_text(source.read_text(), encoding="utf-8")
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+
+    from nanobot.agent.tools import freestyle_backend as fs
+
+    seen: dict[str, object] = {}
+
+    class _FakeBackend:
+        def __init__(self, config, *, sandbox_name: str = "") -> None:
+            seen["config"] = config
+            seen["sandbox_name"] = sandbox_name
+            seen["lanes"] = list(config.api_keys)
+
+        async def test_connection(self) -> dict:
+            return {
+                "ok": True,
+                "session_id": "vm-1",
+                "state": "running",
+                "memory_mb": 8192,
+                "cpu_cores": 4,
+                "lane_index": 0,
+                "lane_count": 2,
+            }
+
+        async def describe_lanes(self) -> list:
+            return [{"lane": 0, "vm_count": 0}, {"lane": 1, "vm_count": 0}]
+
+    monkeypatch.setattr(fs, "FreestyleExecutionBackend", _FakeBackend)
+
+    lane_a = "WUjYgZ9kifZmmLqXNTWvfM-JBMG5zrj7x4EsEga6pC1ZievE94SPp9bLVS2BzRmJauV"
+    lane_b = "UqRQ3iRHKBwvUFyft7t3u3-36pJ4HnzzivBbwQjXZPkR6CBBSwfzH3UYu3RDqZcd2wJ"
+
+    # No key at all: the button must say so rather than probing.
+    missing = _request("/api/admin/execution-test")
+    missing._nanobot_webui_mutation_payload = {"backend": "freestyle", "freestyleApiKeys": ""}
+    refused = admin_registry.admin_route(missing, "/api/admin/execution-test")
+    assert refused is not None
+    assert refused.status_code == 400
+
+    request = _request("/api/admin/execution-test")
+    request._nanobot_webui_mutation_payload = {
+        "backend": "freestyle",
+        "freestyleApiKeys": f"{lane_a},{lane_b}",
+        "freestyleMemoryMb": 8192,
+    }
+    response = admin_registry.admin_route(request, "/api/admin/execution-test")
+    assert response is not None
+    assert response.status_code == 200
+    payload = json.loads(bytes(response.body).decode())
+    assert payload["backend"] == "freestyle"
+    assert payload["ok"] is True
+    assert payload["memory_mb"] == 8192
+    # Both lanes are described, which is the evidence that the keys are
+    # distinct accounts rather than one key repeated.
+    assert [row["lane"] for row in payload["lanes"]] == [0, 1]
+    assert seen["sandbox_name"] == "powerx-connection-test"
+    assert seen["lanes"] == [lane_a, lane_b]
+
+
+def test_the_freestyle_page_does_not_overclaim_what_rotation_buys(monkeypatch) -> None:
+    """Measured live: two keys were ONE account, so rotation added no headroom.
+
+    The page must not promise that every key is a separate account, and it must
+    point at the Test button's per-lane VM count as the way to tell.
+    """
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    response = admin_registry.admin_route(_request(), "/admin")
+    assert response is not None
+    body = bytes(response.body).decode()
+    assert "a key only adds capacity when it belongs to a DIFFERENT account" in body
+    assert "two lanes reporting the same VM count" in body

@@ -99,6 +99,11 @@ def _tenki_keys_configured(config: Any) -> bool:
     return bool(str(getattr(config, "api_key", "") or "").strip())
 
 
+#: Freestyle stores its rotation lanes exactly the way Tenki does, so the shape
+#: test is shared rather than copied.
+_freestyle_keys_configured = _tenki_keys_configured
+
+
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
@@ -372,6 +377,7 @@ class ContextBuilder:
             daytona = getattr(execution, "daytona", None) if execution else None
             runloop = getattr(execution, "runloop", None) if execution else None
             tenki = getattr(execution, "tenki", None) if execution else None
+            freestyle = getattr(execution, "freestyle", None) if execution else None
             if backend == "vps":
                 if not (vps and str(getattr(vps, "host", "")).strip()):
                     return ""  # no usable backend — don't mislead the model
@@ -392,6 +398,10 @@ class ContextBuilder:
                 if not _tenki_keys_configured(tenki):
                     return ""
                 sandbox_dir = "/home/tenki"
+            elif backend == "freestyle":
+                if not _freestyle_keys_configured(freestyle):
+                    return ""
+                sandbox_dir = "/home/ubuntu/workspace"
             elif backend == "vercel":
                 vercel = getattr(execution, "vercel", None) if execution else None
                 if not (vercel and str(getattr(vercel, "token", "")).strip()):
@@ -407,6 +417,7 @@ class ContextBuilder:
                 "daytona": "Daytona Sandbox",
                 "runloop": "Runloop Devbox",
                 "tenki": "Tenki Sandbox",
+                "freestyle": "Freestyle VM",
                 "vercel": "Vercel Sandbox",
             }
             return render_template(
