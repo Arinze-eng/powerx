@@ -1126,5 +1126,8 @@ def test_the_desktop_terminal_can_never_be_a_blank_sheet() -> None:
     # replaced (2 072 086 black pixels to 205 white on px-screen-verify2), so the
     # terminal must keep printing: a UTC stamp every five seconds.
     assert "while :; do date -u; sleep 5; done" in body
+    assert "desktop-mean=" in body
     assert "desktop-spread=" in body
-    assert body.index("desktop-spread=") < body.index("echo desktop-ready")
+    # The mean is the field that caught the white sheet (0.9992 against 0.0011 on
+    # the terminal that replaced it); the spread did not separate them.
+    assert body.index("desktop-mean=") < body.index("echo desktop-ready")

@@ -259,10 +259,12 @@ APT_LOCK_WAIT_S = 120
 #: gives the panel visible motion and makes a frozen or disconnected stream obvious
 #: at a glance instead of indistinguishable from a blank one.
 #:
-#: The frame's luminance spread is logged next to the readiness marker because byte
-#: count cannot tell a drawn desktop from an empty one -- the same lesson
+#: Its luminance mean and spread are logged next to the readiness marker, because a
+#: byte count cannot tell a drawn desktop from an empty one -- the same lesson
 #: ``engineering_draw_cli`` learned when a 106 KB splash screen passed a size test.
-#: A spread near zero is the signature of the blank sheet above.
+#: The **mean** is what caught the case above (0.9992 on the white sheet, against
+#: 0.0011 on the terminal that replaced it); the spread alone would not have, at
+#: 0.0249 and 0.0297 respectively, so both are written down rather than either.
 #:
 _PROVISION_BODY = (
     'set -u; D="$PX_DISPLAY"; '
@@ -305,8 +307,9 @@ _PROVISION_BODY = (
     'printf "xvfb="; pgrep -f "Xvfb $D" | head -1; echo; '
     'DISPLAY="$D" import -window root "$PX_DIR/frame.png" >/dev/null 2>&1 || '
     "{ echo desktop-up; exit 0; }; "
-    'echo "desktop-spread=$(identify -format "%[fx:standard_deviation]" '
-    '"$PX_DIR/frame.png" 2>/dev/null || echo unknown)"; '
+    'echo "desktop-mean=$(identify -format "%[fx:mean]" "$PX_DIR/frame.png" '
+    '2>/dev/null || echo unknown) desktop-spread=$(identify -format '
+    '"%[fx:standard_deviation]" "$PX_DIR/frame.png" 2>/dev/null || echo unknown)"; '
     "echo desktop-ready"
 )
 
