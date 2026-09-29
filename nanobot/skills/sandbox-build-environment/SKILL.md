@@ -3,10 +3,9 @@ name: sandbox-build-environment
 description: >-
   Set up toolchains and install packages in restricted sandboxes where apt-get/sudo fail — user-local
   fallbacks (pip, conda, npm -g to prefix, tarballs, SDKMAN, standalone binaries) plus compiling small
-  local utilities/static Linux binaries. Use whenever an install or build fails due to missing root/apt.
-  NOTE that building distributable APK/EXE/iPA/DEB artifacts from a project's source is NOT done here —
-  that MUST use the `github-actions-build` skill (GitHub Actions runners), since the sandbox lacks
-  Android SDK, Xcode, and Windows toolchains.
+  local utilities/static Linux binaries. Use whenever an install or build fails due to missing root/apt,
+  AND as the fallback recipe when a distributable artifact (APK/deb/EXE) cannot be produced through
+  `github-actions-build` — install the toolchain here and build it in the sandbox rather than refusing.
 metadata: {"nanobot":{"emoji":"🧰","os":["darwin","linux"],"always":false}}
 ---
 
@@ -14,7 +13,8 @@ metadata: {"nanobot":{"emoji":"🧰","os":["darwin","linux"],"always":false}}
 
 Teaches how to get tools installed and builds working when the sandbox has **no sudo**,
 **apt-get is blocked/failing**, or the network/proxy restricts system package managers.
-The same playbook covers building APKs, `.exe`s, and any task that needs installs.
+The same playbook covers building APKs and `.deb`s locally when the cloud builder is not
+an option.
 
 ## Golden rule
 
@@ -88,33 +88,85 @@ uname -m                            # x86_64 vs aarch64 -> pick right asset
 ```
 If `sudo -n true` succeeds, apt may still work (`sudo apt-get update`). Otherwise skip straight to the ladder. Always persist env by appending exports to `~/.bashrc` AND re-exporting in each exec call (exec sessions may not reload rc files).
 
-## ⛔ HARD RULE — NEVER build APK / EXE / iPA / DEB here
+## ✅ Building a distributable artifact in the sandbox — allowed, and often the answer
 
-Building a **shippable Android APK, Windows EXE, iOS/iPad IPA, or .deb** from project source is
-**FORBIDDEN in the sandbox — no exceptions.** This includes:
+Prefer the **`github-actions-build`** skill / `build_artifact` tool first: its runners already
+have the Android SDK, Xcode and Windows toolchains. But when that path is unavailable
+(`GITHUB_BUILD_TOKEN` unset) or its run cannot be made green, you **install the toolchain here
+and build the artifact in the sandbox**. An artifact the user asked for is delivered from
+wherever it can be built — a sandbox-built debug APK is a normal result, not a downgrade.
 
-- Installing JDK / Gradle / Android SDK / Android command-line tools / Flutter / Xcode /
-  CocoaPods / PyInstaller / dpkg toolchains in the sandbox **to build or ship** any of these
-  artifacts.
-- Running `./gradlew`, `gradle`, `flutter build`, `xcodebuild`, `pyinstaller`, `dpkg-deb`, or
-  equivalent in the sandbox to produce a deliverable artifact.
+**Never refuse these builds and never tell the user the sandbox "cannot" build an APK.**
+The default image merely ships without the Android SDK; that is an install step below.
 
-Such artifacts **MUST** go through the **`github-actions-build`** skill / the `build_artifact`
-tool (GitHub Actions runners, which have the real Android SDK / Xcode / Windows toolchains).
-If that tool is unavailable, **refuse** the build and tell the user the operator must configure
-`GITHUB_BUILD_TOKEN` on the backend — never fall back to sandbox building.
+### Android APK — full user-space recipe
 
-This skill stays responsible ONLY for:
-- Installing user-space toolchains/packages to get a local **dev environment** working
-  (e.g. compiling a small Linux utility, running tests locally, installing language managers),
-  and
-- Preparing/scaffolding a project so the user can inspect it **before** it is shipped by
-  GitHub Actions. A local JDK/Flutter install is never a substitute for the shipped artifact.
+Disk first: JDK + SDK + build-tools land around 2.5–3.5 GB, so point the caches at a roomy
+path and check `df -h "$HOME"` before starting.
+
+```bash
+# 0. Budget + base tools
+df -h "$HOME" | tail -1
+command -v unzip curl git >/dev/null || echo "install zip/curl equivalents first"
+
+# 1. JDK 17 (Temurin, no root)
+curl -fL -o /tmp/jdk.tar.gz \
+  "https://api.adoptium.net/v3/binary/latest/17/ga/linux/x64/jdk/hotspot/normal/eclipse"
+mkdir -p "$HOME/.local/jdk" && tar -xzf /tmp/jdk.tar.gz -C "$HOME/.local/jdk" --strip-components=1
+export JAVA_HOME="$HOME/.local/jdk"; export PATH="$JAVA_HOME/bin:$PATH"
+java -version   # verify before continuing
+
+# 2. Android command-line tools + SDK (bump CLT_VERSION when Google rotates the file)
+export ANDROID_SDK_ROOT="$HOME/android-sdk"; export ANDROID_HOME="$ANDROID_SDK_ROOT"
+mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+curl -fL -o /tmp/clt.zip \
+  "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+unzip -q /tmp/clt.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+
+# 3. Licenses + the components a Gradle Android build needs
+export GRADLE_USER_HOME="$HOME/.gradle"
+yes | sdkmanager --licenses >/dev/null 2>&1 || true
+sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+# 4. Gradle if the project has no wrapper (otherwise use ./gradlew)
+#    sdkman:  source "$HOME/.sdkman/bin/sdkman-init.sh" && sdk install gradle 8.7
+curl -fL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.7-bin.zip
+unzip -q /tmp/gradle.zip -d "$HOME/.local"; export PATH="$HOME/.local/gradle-8.7/bin:$PATH"
+
+# 5. Build from the project root (add sdk.dir so Gradle stops hunting for the SDK)
+cd "$HOME/workspace/<project>"
+echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+./gradlew assembleDebug --no-daemon        # no wrapper: gradle assembleDebug --no-daemon
+
+# 6. Hand the user the artifact
+find . -name '*.apk' -newermt '-1 hour' | head
+```
+
+Flutter projects: install the Flutter tarball (`flutter_linux_*stable.tar.xz`, add
+`$HOME/flutter/bin` to PATH, `flutter config --android-sdk "$ANDROID_SDK_ROOT"`,
+`yes | flutter doctor --android-licenses`), then `flutter build apk --debug`.
+
+If a step fails, work **down the ladder** (micromamba for binary deps, a different
+Adoptium/Gradle build, `--offline` from a warm `GRADLE_USER_HOME`) and report the exact
+command and error at the point you truly could not proceed — never "the sandbox has no
+Android SDK" as an end state.
 
 ### Other native/package targets
-Windows `.exe`, iOS `.ipa`, and `.deb` are likewise **GitHub Actions only** (windows-latest,
-macos-latest, ubuntu-latest runners respectively). Static Linux binaries and Go/Rust/C cross-
-compilation for genuinely local, non-deliverable helper use remain fine here.
+
+- **`.deb`** → `dpkg-deb --build --root-owner-group <dir> out.deb`, with `fakeroot` when the
+  tree is not writable. Perfectly doable in-sandbox.
+- **Windows `.exe`** → build with PyInstaller (or MinGW cross-compile) here; the Wine stack the
+  MT5 work already installs is how you *run and verify* it locally.
+- **iOS/iPad `.ipa`** → the sandbox is Linux, so an Xcode build genuinely is not reachable
+  here; this one target needs the `build_artifact` (macos runner) path. Say exactly that — and
+  only that — instead of a blanket refusal.
+- Static Linux binaries and Go/Rust/C cross-compilation for local, non-deliverable helper use
+  remain fine here.
+
+This skill stays responsible for both the local **dev-environment** setup and the
+**sandbox artifact build** described above.
 
 ## Persistence & hygiene
 - Every install goes under `$HOME` or `/tmp` (never `/usr` unless writable).

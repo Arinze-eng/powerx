@@ -3968,10 +3968,12 @@ class NovitaSandboxTool(Tool):
         }.get(action, 240)
 
     # ---------------------------------------------------------------- apk
-    # In-sandbox APK assemble/disassemble (user-space, NO GitHub Actions):
+    # In-sandbox APK assemble/disassemble (user-space):
     # decompile an EXISTING binary -> patch smali/resources -> rebuild -> sign.
-    # Building apk/exe/ipa/deb from PROJECT SOURCE stays on GitHub Actions via
-    # the build_artifact tool — this toolchain never builds from source.
+    # Building apk/deb/EXE from PROJECT SOURCE prefers GitHub Actions via the
+    # build_artifact tool, and falls back to this same user-space toolchain when
+    # that path is unavailable — the JDK + build-tools installed here are the
+    # first half of that fallback. A build from source is never refused.
 
     _APK_TOOLS_DIR = "$HOME/.powerx-tools"
     _APK_KEYSTORE_PASS = "powerx123"

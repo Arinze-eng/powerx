@@ -3,8 +3,15 @@
 Auto-discovered by ToolLoader like the other agent tools. This gives the agent a
 first-class, *invokable* capability to build distributable artifacts — Android
 APK, Windows EXE, iOS/iPad IPA, Linux .deb — or run a test suite, using GitHub
-Actions runners instead of the local sandbox. The sandbox has no Android SDK,
-Xcode, or Windows toolchain, so native/package builds must go through CI.
+Actions runners, which already carry the Android SDK, Xcode and Windows
+toolchains the default sandbox image ships without.
+
+This is the *preferred* path, not the only permitted one. When the tool is
+disabled (no ``GITHUB_BUILD_TOKEN``) or a run cannot be made green, the artifact
+is built in the sandbox instead — install the toolchain there (the
+``sandbox-build-environment`` skill carries the recipe) and run gradle / dpkg-deb
+/ pyinstaller. Refusing the build is never an option, so this tool must never be
+described to the model as the sole route to an artifact.
 
 The whole lifecycle is exposed as actions so the model can drive it step by step
 (or use the one-shot ``build`` convenience action):
@@ -346,9 +353,11 @@ class BuildArtifactTool(Tool):
     def description(self) -> str:
         return (
             "Build distributable artifacts — Android APK, Windows EXE, iOS/iPad IPA, Linux .deb — or run a "
-            "test suite using GitHub Actions runners. Use this INSTEAD of building in the sandbox whenever the "
-            "user asks to compile/package such an artifact from their project source (the sandbox has no Android "
-            "SDK, Xcode, or Windows toolchain). Typical flow: create a throwaway repo, push the project dir, "
+            "test suite using GitHub Actions runners, which already carry the Android SDK, Xcode and Windows "
+            "toolchains. PREFER this when the user asks to compile/package such an artifact from their project "
+            "source — but NEVER refuse the build if this tool is unavailable or its run cannot be made green: "
+            "fall back to installing the toolchain and building in the sandbox (see the sandbox-build-environment "
+            "skill). Typical flow: create a throwaway repo, push the project dir, "
             "add_workflow (apk/exe/ipa/deb/test), trigger, watch until done, download the artifact, then delete "
             "the repo. Or use action='build' for the one-shot create+push+workflow+trigger+watch. Authentication "
             "uses GITHUB_BUILD_TOKEN (dedicated build account). Always delete the repo when finished."
@@ -419,7 +428,14 @@ class BuildArtifactTool(Tool):
     async def execute(self, **kwargs: Any) -> ToolResult | str:
         action = str(kwargs.get("action") or "").strip().lower()
         if not _token():
-            return ToolResult.error(f"{_TOKEN_ENV} is not set; configure it on the backend so the AI can build artifacts.")
+            return ToolResult.error(
+                f"[not_configured] {_TOKEN_ENV} is not set, so the GitHub Actions build path is "
+                "unavailable. This is NOT a reason to refuse the artifact: build it IN THE SANDBOX "
+                "instead — install a user-space JDK + Android cmdline-tools + sdkmanager (the "
+                "sandbox-build-environment skill has the exact ladder) and run `gradle assembleDebug` "
+                "or `dpkg-deb --build` there, then hand the user the artifact. Do NOT tell the user "
+                "the artifact cannot be built and do NOT ask them for a token."
+            )
         try:
             if action == "create":
                 return await asyncio.to_thread(self._create, kwargs)
