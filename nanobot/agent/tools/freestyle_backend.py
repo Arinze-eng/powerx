@@ -1039,11 +1039,29 @@ class FreestyleExecutionBackend:
                     break
                 except FreestyleError:
                     continue
-        if vm is None and lane is not None:
-            try:
-                vm = await self._find_vm(lane)
-            except FreestyleError:
-                vm = None
+        if vm is None:
+            # Sweep every configured lane for this session's slug, pinned lane
+            # first. Searching only the pinned lane made an unpinned session a
+            # silent no-op: nothing was deleted, nothing was logged, and the VM
+            # kept running. ``autoDeleteSeconds`` is -1 by design (persistence is
+            # what lets the next task reattach to the same disk), so a reset that
+            # does not find its VM leaks it until the run budget is spent.
+            candidates: list[int] = [int(lane)] if lane is not None else []
+            candidates += [
+                index
+                for index in range(max(1, self._lane_count()))
+                if index not in candidates
+            ]
+            for candidate in candidates:
+                try:
+                    found = await self._find_vm(candidate)
+                except FreestyleError:
+                    continue
+                if found is not None:
+                    # Delete from the account that actually holds the VM: a
+                    # DELETE is only honoured by the owning account.
+                    vm, lane = found, candidate
+                    break
         if vm is not None:
             try:
                 await self._request(

@@ -114,10 +114,14 @@ class _FakeTransport:
                 return dict(vm)
             if method == "GET" and path == "/v5/vms":
                 slug = (params or {}).get("slug")
+                # Each key is its own account, so a listing must only show that
+                # account's VMs. Returning every lane's VMs made the pin and
+                # sweep paths indistinguishable.
                 rows = [
                     dict(vm)
-                    for vm in self.vms.values()
-                    if slug is None or vm.get("slug") == slug
+                    for owner, vm in self.vms.items()
+                    if (lane is None or owner == lane_index)
+                    and (slug is None or vm.get("slug") == slug)
                 ]
                 return {
                     "vms": rows,
@@ -511,6 +515,40 @@ def test_reset_destroys_only_an_existing_vm() -> None:
     asyncio.run(backend.reset())
     assert [c for c in transport.calls if c["method"] == "DELETE"]
     assert backend.last_session_id == ""
+
+
+def test_reset_destroys_a_vm_the_session_is_not_pinned_to() -> None:
+    """A lane pin is a fast path, not a precondition for tidying up.
+
+    The store can be empty -- a rebuilt gateway, or a session whose id was never
+    persisted -- while the VM is still running. ``autoDeleteSeconds`` is -1, so
+    nothing else will ever collect it: skipping the search left it billing.
+    """
+    backend, transport = _backend(api_keys=[KEY_A, KEY_B])
+    transport.vms[1] = {"id": "vm-1-9", "slug": "px-fs-test", "state": "running"}
+    transport.by_id["vm-1-9"] = transport.vms[1]
+    assert backend.lane_index is None
+
+    asyncio.run(backend.reset())
+
+    deletes = [c for c in transport.calls if c["method"] == "DELETE"]
+    assert [c["path"] for c in deletes] == ["/v5/vms/vm-1-9"]
+    # It is deleted from the account that holds it, not from lane 0.
+    assert deletes[0]["lane"] == 1
+
+
+def test_reset_sweeps_past_a_stale_lane_pin() -> None:
+    """Reordering the keys in the panel moves a session's disk to another lane."""
+    backend, transport = _backend(api_keys=[KEY_A, KEY_B])
+    transport.vms[1] = {"id": "vm-1-9", "slug": "px-fs-test", "state": "running"}
+    transport.by_id["vm-1-9"] = transport.vms[1]
+    backend._pin(0)
+
+    asyncio.run(backend.reset())
+
+    deletes = [c for c in transport.calls if c["method"] == "DELETE"]
+    assert [c["path"] for c in deletes] == ["/v5/vms/vm-1-9"]
+    assert deletes[0]["lane"] == 1
 
 
 def test_keep_alive_returns_a_paused_vm_to_running() -> None:
