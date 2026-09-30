@@ -38,7 +38,7 @@ Measured 2026-09-30 in one session, same revision, same ledger of steps.
 | Guest RAM / cores | 2048 MB / 2 | 1536 MB / 2 (a smaller guest, because the host swaps) |
 | Emulator boot | **~50 s** | **~20 min** |
 | Emulator RSS | ~2.6 GB | ~3.4 GB on a 3.9 GB host |
-| Ledger | 26/27 then 17/17 on the revised scripts | see below |
+| Ledger | 26/27, then 17/17 on the revised scripts | boot → install_apk → launch → `ui` verified; see below |
 
 The ledger is: install → doctor → boot → install an APK (NewPipe) → launch → `ui`
 → tap a node → swipe → keys → type into Settings search → screenshot → push/pull
@@ -48,10 +48,19 @@ node, a 44 KB screenshot, a push/pull round-trip whose file content matched). Th
 single miss in the first pass was the test harness's own attempt to download a
 screenshot to a path outside its workspace, not the tool.
 
-On the 4 GB container the emulator is verified booting to
-`sys.boot_completed=1` under software emulation, and it installs and runs an app
-from that state. It is simply **minutes slower**, which is why the tool never
-pretends a slow host is a broken one.
+On the 4 GB container the same ledger was driven from a real boot state:
+`state` reported `device` with `boot_completed=1` and the device answered
+`ro.build.version.release=11`, `sdk=30`, `abi=x86_64`, `1080x1920 @ 420dpi`; the
+NewPipe APK downloaded and installed (`packages` listed exactly one match with its
+`base.apk`), `launch` returned the focused `org.schabi.newpipe/.MainActivity`, and
+`ui` returned the live hierarchy with bounds and tappable `center` coordinates.
+
+What that same run also shows is the honest limit: with 2 vCPU, 3.9 GB of RAM and
+~160 MB available while TCG runs, the guest itself is starved, and the first
+thing it did after launch was show **"System UI isn't responding"**. The tool is
+working correctly there -- it read that dialog from `ui` like any other screen --
+but a container this small is for verifying that the pipeline works, not for
+driving a real app quickly. Use a VM backend with `/dev/kvm` for that.
 
 ## What a host must provide
 
