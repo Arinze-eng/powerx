@@ -47,7 +47,7 @@ from typing import Any
 #: The tool's bootstrap refuses to run a CLI that does not carry this marker, so a
 #: stale cached copy is detected loudly instead of being debugged as if it were
 #: the new one. Bump BOTH whenever the contract changes.
-CLI_VERSION = "2026-09-30.1"
+CLI_VERSION = "2026-09-30.2"
 
 HOME_DIR = Path(os.environ.get("ANDROID_HOME_DIR", str(Path.home() / ".android_box")))
 SDK = Path(os.environ.get("ANDROID_SDK_ROOT", str(Path.home() / "android-sdk")))
@@ -68,8 +68,35 @@ SERIAL = f"emulator-{EMULATOR_PORT}"
 #: Boot is the one genuinely slow step (a cold Android userspace). Measured on a
 #: Freestyle VM: ~40 s to ``sys.boot_completed``. The ceiling is generous because
 #: a cold snapshot restore on a busy host is slower, not because it should take
-#: this long.
+#: this long. Without KVM it is much slower -- measured on Tenki (no /dev/kvm,
+#: software emulation) the guest answered adb within ~90 s and was still
+#: finishing userspace minutes later -- so the software case gets its own,
+#: longer ceiling and, past it, a "still booting" answer instead of a failure.
 BOOT_TIMEOUT_S = int(os.environ.get("ANDROID_BOOT_TIMEOUT_S", "420"))
+#: Below this the answer is the same either way ("still booting, call state"), and
+#: the tool hands this action a 480 s exec ceiling, so the CLI must return its own
+#: answer before that rather than be killed by it.
+SOFTWARE_BOOT_TIMEOUT_S = int(os.environ.get("ANDROID_SOFTWARE_BOOT_TIMEOUT_S", "240"))
+
+#: Guest memory and CPU count. Measured 2026-09-30: a 4 GB host (3,887 MB visible)
+#: boots Android 11 with a 2,048 MB guest -- 2.3 GB host RSS, ~1.5 GB still
+#: available -- but with very little headroom, so a sub-5 GB box is given 1,536 MB
+#: (the API 30 image's own default) instead. Both are overridable.
+EMULATOR_MEMORY_ENV = "ANDROID_EMULATOR_MEMORY"
+EMULATOR_CORES_ENV = "ANDROID_EMULATOR_CORES"
+
+#: Lines an emulator log carries when it died for a reason the caller can act on.
+#: Matched case-insensitively against the first seconds of the boot log, so a
+#: fatal launch is reported in ~10 s instead of after the whole boot deadline.
+_FATAL_BOOT_MARKERS = (
+    "error while loading shared libraries",
+    "requires hardware acceleration",
+    "cannot open shared object file",
+    "segmentation fault",
+    "panic:",
+    "no space left on device",
+    "avd's cpu architecture",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -159,6 +186,95 @@ def emulator_running() -> bool:
     return found["code"] == 0 and bool(found["out"])
 
 
+def host_memory_mb() -> int:
+    """Total RAM the sandbox has, in MB (0 when it cannot be read)."""
+    try:
+        for line in Path("/proc/meminfo").read_text(errors="replace").splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) // 1024
+    except Exception:  # noqa: BLE001 - reported as "unknown"
+        pass
+    return 0
+
+
+def accel_mode() -> str:
+    """Which ``-accel`` the emulator gets.
+
+    ``on`` when ``/dev/kvm`` exists (a VM backend with nested virtualisation),
+    otherwise ``off``: software emulation. That fallback is the difference
+    between a Tenki container reporting "no such device" and it actually
+    running Android -- measured 2026-09-30, a container with no /dev/kvm booted
+    Android 11 under TCG. It is minutes slower, so it is reported, not hidden.
+    An operator can force either with ``ANDROID_EMULATOR_ACCEL``.
+    """
+    override = os.environ.get("ANDROID_EMULATOR_ACCEL", "").strip().lower()
+    if override in ("on", "off", "auto"):
+        return override
+    return "on" if Path("/dev/kvm").exists() else "off"
+
+
+def guest_memory_mb() -> int:
+    override = os.environ.get(EMULATOR_MEMORY_ENV, "").strip()
+    if override.isdigit():
+        return max(512, min(int(override), 8192))
+    total = host_memory_mb()
+    if total and total < 5120:
+        return 1536
+    return 2048
+
+
+def guest_cores() -> int:
+    override = os.environ.get(EMULATOR_CORES_ENV, "").strip()
+    if override.isdigit():
+        return max(1, min(int(override), 16))
+    cores = os.cpu_count() or 2
+    return max(1, min(cores, 4))
+
+
+def emulator_log_tail(chars: int = 800) -> str:
+    try:
+        data = Path(BOOT_LOG).read_bytes()
+    except Exception:  # noqa: BLE001 - absent log is not an error
+        return ""
+    return data[-chars:].decode("utf-8", "replace")
+
+
+def _fatal_launch_error(log_tail: str) -> str:
+    """The actionable reason a just-launched emulator is dead, or ''.
+
+    MEASURED FAILURE (Tenki, 2026-09-30): a container without the emulator's X11
+    libraries printed ``error while loading shared libraries: libX11.so.6`` and
+    died in under a second, but the caller then waited the full 420 s boot
+    deadline before reporting "did not finish booting" -- which names neither the
+    cause nor the fix. The first seconds of the log are read instead.
+    """
+    lowered = (log_tail or "").lower()
+    for marker in _FATAL_BOOT_MARKERS:
+        if marker in lowered:
+            return marker
+    return ""
+
+
+def _watch_launch(timeout_s: float = 25.0) -> None:
+    """Prove the emulator survived its own startup, or say why it did not.
+
+    Library errors and acceleration refusals are printed immediately and then the
+    process is gone; waiting for adb to time out cannot distinguish that from
+    "Android is slow today".
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        time.sleep(5)
+        tail = emulator_log_tail(2000)
+        reason = _fatal_launch_error(tail)
+        if reason:
+            raise EmulatorBootError(f"the emulator failed to start: {reason}", tail)
+        if not emulator_running():
+            raise EmulatorBootError(
+                "the emulator process exited during startup.", tail
+            )
+
+
 def ensure_booted(timeout_s: int = BOOT_TIMEOUT_S) -> dict[str, Any]:
     """Make sure a booted device exists, booting one if needed.
 
@@ -171,21 +287,27 @@ def ensure_booted(timeout_s: int = BOOT_TIMEOUT_S) -> dict[str, Any]:
     if state["state"] == "device" and state["boot_completed"] == "1":
         return {"booted": True, "waited_s": 0, "already": True}
 
+    accel = accel_mode()
     started = 0.0
     if not emulator_running():
-        # Widened here as well as in the installer: a sandbox that was re-entered
-        # without re-running the installer still needs it, and the emulator
-        # refuses to start at all without it (measured).
-        run("sudo chmod 666 /dev/kvm 2>/dev/null || true", timeout=30)
+        # Widened only when it exists: without /dev/kvm there is nothing to widen,
+        # and the emulator runs on the software fallback instead (accel_mode).
+        if Path("/dev/kvm").exists():
+            run("sudo chmod 666 /dev/kvm 2>/dev/null || true", timeout=30)
         started = time.time()
+        memory = guest_memory_mb()
+        cores = guest_cores()
         cmd = (
             f"nohup {shlex.quote(EMULATOR)} -avd {shlex.quote(AVD_NAME)} "
             f"-no-window -no-audio -no-boot-anim -gpu swiftshader_indirect "
-            f"-no-snapshot -accel on -memory 2048 -cores 2 -port {EMULATOR_PORT} "
+            f"-no-snapshot -no-metrics -accel {accel} "
+            f"-memory {memory} -cores {cores} -port {EMULATOR_PORT} "
             f"> {shlex.quote(str(BOOT_LOG))} 2>&1 & echo started"
         )
         run(cmd, timeout=60)
         run([ADB, "start-server"], timeout=60)
+        # Cheap, and it turns "the emulator never boots" into the real reason.
+        _watch_launch()
 
     deadline = time.time() + timeout_s
     last = ""
@@ -197,10 +319,24 @@ def ensure_booted(timeout_s: int = BOOT_TIMEOUT_S) -> dict[str, Any]:
                 "booted": True,
                 "waited_s": round(time.time() - (started or time.time()), 1),
                 "already": False,
+                "accel": accel,
+                "memory_mb": guest_memory_mb(),
+                "cores": guest_cores(),
             }
         time.sleep(5)
 
-    tail = run(["tail", "-c", "1200", str(BOOT_LOG)], timeout=30)["out"]
+    tail = emulator_log_tail(1200)
+    # Still alive and merely slow is not a failure: on a host without KVM a cold
+    # Android userspace legitimately takes several minutes, and reporting that as
+    # "did not finish booting" makes the agent give up on a working device.
+    if emulator_running() and last in ("device", "offline"):
+        raise EmulatorBootError(
+            f"Android is still booting after {timeout_s}s (adb state: {last!r}"
+            + (f", software emulation: no /dev/kvm" if accel == "off" else "")
+            + "). Call action='state' until it reports boot_completed=1.",
+            tail,
+            soft=True,
+        )
     raise EmulatorBootError(
         f"Android did not finish booting within {timeout_s}s (last adb state: {last!r}).",
         tail,
@@ -208,9 +344,12 @@ def ensure_booted(timeout_s: int = BOOT_TIMEOUT_S) -> dict[str, Any]:
 
 
 class EmulatorBootError(RuntimeError):
-    def __init__(self, message: str, log_tail: str = "") -> None:
+    def __init__(self, message: str, log_tail: str = "", *, soft: bool = False) -> None:
         super().__init__(message)
         self.log_tail = log_tail
+        #: True when the device is simply not ready yet (keep polling), False when
+        #: the launch itself failed (go back to doctor/install).
+        self.soft = soft
 
 
 def focused_window() -> str:
@@ -249,6 +388,79 @@ def _system_image_path() -> Path:
     return SDK.joinpath("system-images", *tail, "system.img")
 
 
+def missing_emulator_libs() -> list[str]:
+    """Shared libraries the emulator binary cannot resolve (empty when fine).
+
+    This is what a bare image fails on first -- measured 2026-09-30 on Tenki:
+    ```
+    emulator: error while loading shared libraries: libX11.so.6
+    ```
+    and with only libX11.so.6 fixed, a real launch segfaulted on
+    ``libX11-xcb.so.1``, which the emulator dlopen()s and ldd therefore cannot
+    see. Both are reported so `doctor` names the fix instead of the symptom.
+    """
+    if not Path(EMULATOR).is_file():
+        return []
+    resolved = run(["ldd", EMULATOR], timeout=40)["out"]
+    found = {line.split("=>")[0].strip() for line in resolved.splitlines()
+             if "not found" in line}
+    # dlopen-only names, checked by hand: not in ldd, fatal at first launch.
+    for name in ("libX11-xcb.so.1", "libpulse.so.0"):
+        if name not in _ldconfig_names():
+            found.add(name)
+    return sorted(found)
+
+
+def _ldconfig_names() -> set[str]:
+    out = run(["ldconfig", "-p"], timeout=40)["out"]
+    return {line.split(" => ")[0].strip() for line in out.splitlines() if " => " in line}
+
+
+def emulator_runtime_report() -> dict[str, Any]:
+    """What the emulator needs from the host, in the form the model can act on."""
+    accel = accel_mode()
+    report: dict[str, Any] = {
+        "mode": accel,
+        "kvm_device": Path("/dev/kvm").exists(),
+        "hardware": accel == "on",
+        "guest_memory_mb": guest_memory_mb(),
+        "guest_cores": guest_cores(),
+        "host_memory_mb": host_memory_mb(),
+    }
+    if accel == "off":
+        report["note"] = (
+            "No /dev/kvm: the emulator runs in software emulation. It works but is "
+            "several minutes slower to boot, so poll action='state' instead of "
+            "retrying action='boot'. A VM backend with nested virtualisation "
+            "(Freestyle) is much faster."
+        )
+    check = run([EMULATOR, "-accel-check"], timeout=40)
+    report["accel_check"] = (check["out"] or check["err"]).strip()[:300]
+    report["display"] = _avd_display()
+    return report
+
+
+def _avd_display() -> str:
+    """The AVD's panel size, read from its config.
+
+    Worth surfacing: avdmanager with no --device creates a 320x640 mdpi AVD, and
+    a 320x640 screen silently changes what an app does. Seeing it here is the
+    difference between "the app is broken" and "the AVD is tiny".
+    """
+    config = AVD_HOME / f"{AVD_NAME}.avd" / "config.ini"
+    if not config.is_file():
+        return ""
+    values = {}
+    for line in config.read_text(errors="replace").splitlines():
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip()
+    width, height = values.get("hw.lcd.width", ""), values.get("hw.lcd.height", "")
+    density = values.get("hw.lcd.density", "")
+    if not (width and height):
+        return ""
+    return f"{width}x{height} @ {density}dpi" if density else f"{width}x{height}"
+
+
 def action_doctor(_: argparse.Namespace) -> int:
     checks = {
         "cli_version": CLI_VERSION,
@@ -266,16 +478,34 @@ def action_doctor(_: argparse.Namespace) -> int:
         "user_in_kvm_group": "kvm" in _groups(),
         "emulator_process": emulator_running(),
         "java": (run(["java", "-version"], timeout=30)["err"] or "").splitlines()[:1],
+        "emulator_missing_libs": missing_emulator_libs(),
     }
+    checks["runtime"] = emulator_runtime_report()
     checks["state"] = device_state()
-    checks["ready"] = bool(checks["adb_present"] and checks["emulator_present"]
-                           and checks["avd_ini_present"] and checks["kvm_device"])
-    checks["installed"] = bool(checks["install_done"])
-    note = (
-        "Ready. Boot with action='boot', then install_apk/launch/shell/ui/screenshot."
-        if checks["ready"] else
-        "Not ready: run the installer (action='install'), then action='status' until it reports done."
+    # libs are part of readiness now: a host that cannot load the emulator binary
+    # is not "ready" no matter how complete the SDK looks on disk.
+    checks["ready"] = bool(
+        checks["adb_present"] and checks["emulator_present"]
+        and checks["avd_ini_present"] and not checks["emulator_missing_libs"]
     )
+    checks["installed"] = bool(checks["install_done"])
+    if checks["emulator_missing_libs"]:
+        note = (
+            "Not ready: the emulator binary cannot load "
+            f"({', '.join(checks['emulator_missing_libs'])}). Run action='install' to "
+            "install its runtime libraries, then action='doctor' again."
+        )
+    elif not (checks["adb_present"] and checks["emulator_present"]):
+        note = ("Not ready: run the installer (action='install'), then action='status' "
+                "until it reports done.")
+    elif checks["runtime"]["hardware"] is False:
+        note = (
+            "Ready, but without /dev/kvm -- the emulator runs in software emulation "
+            "and a boot takes minutes. Poll action='state' while it starts; a VM "
+            "backend with nested virtualisation is several times faster."
+        )
+    else:
+        note = "Ready. Boot with action='boot', then install_apk/launch/shell/ui/screenshot."
     return emit({"ok": True, "action": "doctor", "checks": checks, "note": note})
 
 
@@ -322,11 +552,34 @@ def action_install(args: argparse.Namespace) -> int:
                  "log": str(INSTALL_LOG), "poll_with": "status"})
 
 
+def boot_timeout(args: argparse.Namespace) -> int:
+    """How long to wait for Android, honouring --timeout first.
+
+    Software emulation gets a shorter wait than hardware: the caller is told
+    "still booting" either way, and a 15-minute command is worse than an answer.
+    """
+    if getattr(args, "timeout", 0):
+        return int(args.timeout)
+    return SOFTWARE_BOOT_TIMEOUT_S if accel_mode() == "off" else BOOT_TIMEOUT_S
+
+
 def action_boot(args: argparse.Namespace) -> int:
     try:
-        info = ensure_booted(timeout_s=int(args.timeout or BOOT_TIMEOUT_S))
+        info = ensure_booted(timeout_s=boot_timeout(args))
     except EmulatorBootError as exc:
-        return fail(str(exc), "Check action='doctor' and the emulator log.", log_tail=exc.log_tail)
+        if exc.soft:
+            # Not a failure: a slow host (or software emulation) is mid-boot and
+            # the device is real. The model polls `state` instead of giving up.
+            return emit({
+                "ok": True, "action": "boot", "booting": True,
+                "accel": accel_mode(), "note": str(exc),
+                "log_tail": (exc.log_tail or "")[-600:],
+            })
+        return fail(
+            str(exc),
+            "Run action='doctor'. If it names missing libraries, run action='install'.",
+            log_tail=(exc.log_tail or "")[-800:], accel=accel_mode(),
+        )
     st = device_state()
     props = {}
     for key in ("ro.build.version.release", "ro.build.version.sdk", "ro.product.cpu.abi"):
@@ -346,8 +599,19 @@ def action_stop(_: argparse.Namespace) -> int:
 
 def action_state(_: argparse.Namespace) -> int:
     st = device_state()
-    return emit({"ok": True, "action": "state", "serial": SERIAL,
-                 "emulator_process": emulator_running(), **st})
+    payload: dict[str, Any] = {"ok": True, "action": "state", "serial": SERIAL,
+                               "emulator_process": emulator_running(),
+                               "accel": accel_mode(), **st}
+    if st["state"] != "device" or st["boot_completed"] != "1":
+        # Not booted: the log is the only place that says whether it is coming up
+        # or already dead, and the agent cannot read a file inside the sandbox.
+        payload["emulator_log_tail"] = emulator_log_tail(700)
+        payload["note"] = (
+            "Not booted yet. If the process is running, keep polling; if it is "
+            "gone, run action='doctor' (a missing library or /dev/kvm is the "
+            "usual reason)."
+        )
+    return emit(payload)
 
 
 def action_install_apk(args: argparse.Namespace) -> int:
@@ -361,9 +625,10 @@ def action_install_apk(args: argparse.Namespace) -> int:
             "action='push' to copy one from the sandbox filesystem). Nothing was installed.",
         )
     try:
-        ensure_booted(timeout_s=int(args.timeout or BOOT_TIMEOUT_S))
+        ensure_booted(timeout_s=boot_timeout(args))
     except EmulatorBootError as exc:
-        return fail(str(exc), "Run action='doctor'.", log_tail=exc.log_tail)
+        return fail(str(exc), "Run action='doctor'.", log_tail=exc.log_tail,
+                    booting=exc.soft)
     flags = ["install"]
     if args.reinstall:
         flags.append("-r")
@@ -419,9 +684,10 @@ def action_launch(args: argparse.Namespace) -> int:
     if not pkg:
         return fail("package is required", "Pass --package with the application id.")
     try:
-        ensure_booted(timeout_s=int(args.timeout or BOOT_TIMEOUT_S))
+        ensure_booted(timeout_s=boot_timeout(args))
     except EmulatorBootError as exc:
-        return fail(str(exc), "Run action='doctor'.", log_tail=exc.log_tail)
+        return fail(str(exc), "Run action='doctor'.", log_tail=exc.log_tail,
+                    booting=exc.soft)
 
     # `monkey` resolves the launcher activity for us, which matters because the
     # agent usually has a package name and not an activity class.
@@ -470,9 +736,10 @@ def action_shell(args: argparse.Namespace) -> int:
     if not args.command:
         return fail("command is required", "Pass --command with the shell line to run on the device.")
     try:
-        ensure_booted(timeout_s=int(args.timeout or BOOT_TIMEOUT_S))
+        ensure_booted(timeout_s=boot_timeout(args))
     except EmulatorBootError as exc:
-        return fail(str(exc), "Run action='doctor'.", log_tail=exc.log_tail)
+        return fail(str(exc), "Run action='doctor'.", log_tail=exc.log_tail,
+                    booting=exc.soft)
     res = adb_shell(args.command, timeout=int(args.timeout or 180))
     return emit({
         "ok": res["code"] == 0,
@@ -550,9 +817,10 @@ def action_text(args: argparse.Namespace) -> int:
 
 def action_screenshot(args: argparse.Namespace) -> int:
     try:
-        ensure_booted(timeout_s=int(args.timeout or BOOT_TIMEOUT_S))
+        ensure_booted(timeout_s=boot_timeout(args))
     except EmulatorBootError as exc:
-        return fail(str(exc), "Run action='doctor'.", log_tail=exc.log_tail)
+        return fail(str(exc), "Run action='doctor'.", log_tail=exc.log_tail,
+                    booting=exc.soft)
     out = Path(str(args.out or (HOME_DIR / "shots" / f"screen-{int(time.time())}.png")))
     out.parent.mkdir(parents=True, exist_ok=True)
     # exec-out, not `adb shell screencap >`: the shell form mangles the PNG
@@ -586,9 +854,10 @@ def action_ui(args: argparse.Namespace) -> int:
     pixel coordinates.
     """
     try:
-        ensure_booted(timeout_s=int(args.timeout or BOOT_TIMEOUT_S))
+        ensure_booted(timeout_s=boot_timeout(args))
     except EmulatorBootError as exc:
-        return fail(str(exc), "Run action='doctor'.", log_tail=exc.log_tail)
+        return fail(str(exc), "Run action='doctor'.", log_tail=exc.log_tail,
+                    booting=exc.soft)
 
     remote = "/sdcard/window_dump.xml"
     dump = adb_shell(f"uiautomator dump {remote}", timeout=180)

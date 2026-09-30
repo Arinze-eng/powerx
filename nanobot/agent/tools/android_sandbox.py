@@ -24,6 +24,24 @@ contract here:
 * ``push`` / ``pull`` / ``shell`` -- move files and run anything on the device
 * ``logcat``  -- why an app crashed
 
+WHERE IT RUNS, AND WHAT IT NEEDS FROM THE HOST
+-----------------------------------------------
+Measured 2026-09-30, because it decides whether this tool is usable at all:
+
+* On a **Freestyle VM** (8 GB, /dev/kvm present, nested virtualisation) the whole
+  contract was verified live: install, boot in ~50 s, install_apk "Success",
+  launch, a 11-node ``ui`` dump, a tap on a real node, text, a 44 KB screenshot,
+  push/pull round-trip, logcat, uninstall.
+* On a **Tenki container** (4 GB, no /dev/kvm) the emulator still runs: it falls
+  back to software emulation, which is minutes slower and is what the tool's
+  "still booting" answer is for. That fallback needs the emulator's own runtime
+  libraries installed -- a bare image fails at the very first load with
+  ``error while loading shared libraries: libX11.so.6``, which ``install`` now
+  fixes and ``doctor`` now names.
+
+So: a VM backend with nested virtualisation is the fast path; a container without
+/dev/kvm works but is slow, and ``doctor`` is where that difference is visible.
+
 HOW IT IS INSTALLED
 -------------------
 Same lifecycle as MT5 and FreeCAD: ``install`` starts the installer detached
@@ -62,7 +80,7 @@ _REPO = os.getenv("ANDROID_SANDBOX_REPO", "Arinze-eng/powerx")
 #: MUST equal ``CLI_VERSION`` in ``scripts/android_cli.py``. The bootstrap refuses
 #: to run a CLI that does not carry this marker, so a stale cached copy is
 #: detected rather than silently used. Bump both together.
-_CLI_VERSION = "2026-09-30.1"
+_CLI_VERSION = "2026-09-30.2"
 
 _ANDROID_HOME = "$HOME/.android_box"
 _CLI_PATH = f"{_ANDROID_HOME}/bin/android_cli.py"
@@ -375,9 +393,13 @@ class AndroidSandboxTool(Tool):
             "GUI and nobody touching a screen. The runtime is a windowless, "
             "hardware-accelerated Android emulator driven by adb. SETUP ORDER: call "
             "action='doctor' first; if it reports not ready, run action='install' and "
-            "then poll action='status' YOURSELF until it reports done (it downloads a "
-            "~1.5 GB system image, so it takes minutes -- never tell the user to check "
-            "back), then action='boot'. Actions: doctor (what is installed and whether "
+            "then poll action='status' YOURSELF until it reports done (it downloads the "
+            "SDK, the emulator and a ~3 GB system image -- about 4 GB on disk -- so it "
+            "takes minutes -- never tell the user to check back), then action='boot' "
+            "(if it answers booting=true the device is coming up: poll action='state' "
+            "until boot_completed=1). doctor also reports whether the sandbox has "
+            "/dev/kvm: with it the emulator is fast, without it it runs in software "
+            "emulation and a boot takes minutes. Actions: doctor (what is installed and whether "
             "the device is up), install (one-time setup, detached), status (install "
             "progress), boot (start Android; ~40 s), state (is it up), stop, reset "
             "(clean device; wipe_data=1 for a factory-fresh one), install_apk (apk= a "
