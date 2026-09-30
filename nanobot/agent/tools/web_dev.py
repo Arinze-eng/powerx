@@ -512,7 +512,26 @@ class WebDevTool(Tool):
         )
         return files
 
+    @staticmethod
+    def _project_name(requested: str | None, staged_dir: Path) -> str:
+        """Name to give the Vercel project for a staged copy.
+
+        Prefer the **requested** path's own name: the staged copy keeps it, and
+        even if a backend ever hands back a differently-shaped tree, the staging
+        temp directory's name must never end up as the user's Vercel project.
+        """
+        raw = str(requested or "").strip().rstrip("/")
+        if raw:
+            name = Path(raw).name
+            if name and name not in {".", "..", "/"}:
+                return name
+        name = staged_dir.name
+        if not name or name.startswith("powerx-stage-"):
+            return "powerx-app"
+        return name
+
     def _deploy(self, project: str, yes: bool, timeout: int) -> ToolResult | str:
+        requested = (project or "").strip() or None
         dest, staged, missing = self._with_source(project)
         if dest is None:
             return ToolResult.error(missing or "no project sources found to deploy")
@@ -531,7 +550,11 @@ class WebDevTool(Tool):
             # the agent deploy non-interactive and free of that noise on the very
             # first run as well as on later redeploys. The staged copy keeps the
             # project directory's name, so the link still targets the right project.
-            proj_name = dest.name or "powerx-app"
+            proj_name = (
+                self._project_name(requested, dest)
+                if staged is not None
+                else (dest.name or "powerx-app")
+            )
             _run_cli(["link", "--yes", "--project", proj_name], cwd=dest, timeout=timeout)
             args = ["deploy"]
             if yes:
@@ -554,6 +577,7 @@ class WebDevTool(Tool):
             return ToolResult.error("name (env var name) is required for set_env")
         if environment not in {"production", "preview", "development"}:
             return ToolResult.error(f"unsupported environment: {environment}")
+        requested = (project or "").strip() or None
         dest, staged, missing = self._with_source(project)
         if dest is None:
             return ToolResult.error(missing or "no project sources found for set_env")
@@ -562,7 +586,14 @@ class WebDevTool(Tool):
             # directory to know which project that is — so link the (possibly
             # staged) copy by name first, exactly as deploy does.
             _run_cli(
-                ["link", "--yes", "--project", dest.name or "powerx-app"],
+                [
+                    "link",
+                    "--yes",
+                    "--project",
+                    self._project_name(requested, dest)
+                    if staged is not None
+                    else (dest.name or "powerx-app"),
+                ],
                 cwd=dest,
                 timeout=timeout,
             )

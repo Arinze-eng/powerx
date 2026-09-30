@@ -80,6 +80,16 @@ DEFAULT_MAX_BYTES = 200 * 1024 * 1024
 _CHUNK_CHARS = 4 * 1024 * 1024
 _REMOTE_ARCHIVE = "/tmp/powerx-stage.tar.gz"
 
+#: Transfer archive used by the *backend-driven* staging path. It is deliberately
+#: a **workspace-relative** name: every backend guards its file APIs to the
+#: sandbox workspace root (``_safe_path`` raises ``path must remain inside the
+#: workspace`` for anything outside), so the old hard-coded ``/tmp`` archive
+#: could not be downloaded back at all. ``download`` refused it, staging returned
+#: ``None``, and the user was told web_dev "cannot locate the project sources" no
+#: matter how healthy the sandbox was. ``_REMOTE_ARCHIVE`` above is kept for the
+#: native Novita SDK path, whose ``files.read`` is not path-guarded.
+_STAGE_ARCHIVE_NAME = ".nanobot-stage.tar.gz"
+
 
 def _exclude_flags(excludes: tuple[str, ...]) -> str:
     return " ".join(f"--exclude={shlex.quote(name)}" for name in excludes)
@@ -109,6 +119,58 @@ def _normalise_remote_dir(remote_dir: str | None, root: str) -> str:
     if not raw.startswith("/"):
         return posixpath.normpath(posixpath.join(root, raw))
     return posixpath.normpath(raw)
+
+
+def _remote_archive_path(root: str) -> str:
+    """Absolute in-sandbox path of the transfer archive, inside *root*."""
+    return posixpath.join(str(root or "/").rstrip("/") or "/", _STAGE_ARCHIVE_NAME)
+
+
+def _project_basename(remote_dir: str) -> str:
+    """The directory name a staged copy has to keep.
+
+    Callers that only read the files do not care. Callers that push the project
+    somewhere *named* do: ``web_dev`` links a Vercel project by the staged
+    directory's name, so a staged copy that lost the project's name would create
+    the deployment under the staging temp directory's name instead.
+    """
+    base = posixpath.basename(str(remote_dir or "").rstrip("/"))
+    return base if base not in {"", ".", "..", "/"} else "project"
+
+
+def _archive_command(
+    remote_dir: str,
+    excludes: tuple[str, ...],
+    *,
+    with_size: bool,
+    archive: str = _REMOTE_ARCHIVE,
+) -> str:
+    """Shell command archiving *remote_dir* with its **own name as the prefix**.
+
+    The previous form archived ``.`` from inside the directory, producing members
+    like ``./index.html``. Those extract as loose files directly under the
+    staging directory, so ``StagedProject.path`` was named after the temporary
+    staging directory rather than the project — and every name derived from it
+    (the Vercel project, the env vars hung off it) was wrong.
+
+    Archiving the basename from its parent instead yields ``<name>/…``, which
+    :func:`_extract_archive` recognises as a single top-level directory and
+    returns as the project root, so the project keeps its own name.
+    """
+    base = _project_basename(remote_dir)
+    parent = posixpath.dirname(str(remote_dir or "").rstrip("/")) or "/"
+    # The archive can live *inside* the directory being archived (that is the
+    # case whenever the project root is the workspace root), so it must never be
+    # swept into itself: GNU tar would report "file changed as we read it" and
+    # fail the whole staging command.
+    flags = _exclude_flags((*excludes, _STAGE_ARCHIVE_NAME))
+    command = (
+        f"cd {shlex.quote(parent)} && "
+        f"tar czf {shlex.quote(archive)} {flags} {shlex.quote(base)}"
+    )
+    if with_size:
+        command += f" && wc -c < {shlex.quote(archive)}"
+    return command
 
 
 def _safe_member_name(member: tarfile.TarInfo) -> str | None:
@@ -161,6 +223,23 @@ def _extract_archive(archive: Path, dest_root: Path) -> Path:
     if len(tops) == 1 and tops[0].is_dir():
         return tops[0]
     return dest_root
+
+
+def _extract_into(archive: Path, staging: Path) -> Path:
+    """Extract *archive* into a clean subdirectory of *staging* and return it.
+
+    The archive is downloaded *into* ``staging``, so extracting straight into it
+    left the project sitting next to ``source.tar.gz`` — two entries, which
+    :func:`_extract_archive` reads as "no single top-level directory" and answers
+    with the staging directory itself. That is exactly how a staged project lost
+    its name (``powerx-stage-…`` instead of the project's own), and with it the
+    name every downstream consumer derived — the Vercel project, its env vars,
+    its status lookups. A dedicated ``sources`` subdirectory keeps the archive
+    out of the way so the project root is decided by the project alone.
+    """
+    root = staging / "sources"
+    root.mkdir(parents=True, exist_ok=True)
+    return _extract_archive(archive, root)
 
 
 async def _fetch_via_backend_download(
@@ -435,18 +514,15 @@ async def _stage_remote_backend(
     root = _backend_root(backend_name, backend, backend_config)
 
     remote_dir = _normalise_remote_dir(source_dir, root)
-    tar_cmd = (
-        f"cd {shlex.quote(remote_dir)} && "
-        f"tar czf {shlex.quote(_REMOTE_ARCHIVE)} {_exclude_flags(excludes)} . "
-        f"&& wc -c < {shlex.quote(_REMOTE_ARCHIVE)}"
-    )
+    archive = _remote_archive_path(root)
+    tar_cmd = _archive_command(remote_dir, excludes, with_size=True, archive=archive)
     output = await backend.run(tar_cmd, timeout=600)  # type: ignore[attr-defined]
     if "exit_code=0" not in output and "[exit_code=" in output and "[exit_code=0]" not in output:
         logger.debug("workspace_bridge: remote archive command failed: {}", output[-400:])
         return None
 
     fetched = await _fetch_via_backend_download(
-        backend, _REMOTE_ARCHIVE, local_archive, timeout=600
+        backend, archive, local_archive, timeout=600
     )
     if not fetched:
         return None
@@ -458,8 +534,8 @@ async def _stage_remote_backend(
         )
         return None
 
-    await _cleanup_remote(backend, None)
-    return _extract_archive(local_archive, staging)
+    await _cleanup_remote(backend, archive)
+    return _extract_into(local_archive, staging)
 
 
 async def _stage_novita_native(
@@ -487,10 +563,7 @@ async def _stage_novita_native(
         return None
 
     remote_dir = _normalise_remote_dir(source_dir, _WORKSPACE)
-    tar_cmd = (
-        f"cd {shlex.quote(remote_dir)} && "
-        f"tar czf {shlex.quote(_REMOTE_ARCHIVE)} {_exclude_flags(excludes)} ."
-    )
+    tar_cmd = _archive_command(remote_dir, excludes, with_size=False)
     result = await asyncio.to_thread(sandbox.commands.run, tar_cmd, cwd="/", timeout=600)
     code = getattr(result, "exit_code", 0)
     if code not in (0, None):
@@ -514,7 +587,7 @@ async def _stage_novita_native(
         pass
 
     _ = tool  # retained for symmetry/debugging hooks
-    return _extract_archive(local_archive, staging)
+    return _extract_into(local_archive, staging)
 
 
 def _output_tail(result: object) -> str:
@@ -523,9 +596,11 @@ def _output_tail(result: object) -> str:
     return f"{text}\n{err}"[-400:]
 
 
-async def _cleanup_remote(backend: object, _unused: object | None = None) -> None:
+async def _cleanup_remote(backend: object, archive: str | None = None) -> None:
+    """Delete the transfer archive from the sandbox. Never raises."""
+    target = archive or _REMOTE_ARCHIVE
     try:
-        await backend.run(f"rm -f {shlex.quote(_REMOTE_ARCHIVE)}", timeout=60)  # type: ignore[attr-defined]
+        await backend.run(f"rm -f {shlex.quote(target)}", timeout=60)  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001
         pass
 

@@ -349,3 +349,113 @@ async def test_staging_onto_persistent_disk_is_redirected(
     assert not any(persistent.rglob("*.tar.gz"))
     assert not any(persistent.rglob("powerx-stage-*"))
     result.cleanup()
+
+# ---- the staged copy keeps the project's name ----------------------------
+#
+# ``web_dev`` links a Vercel project by the *staged directory's* name. Archiving
+# ``.`` from inside the project (the original form) produced loose members such
+# as ``./index.html``, so the staged copy was a temp directory named
+# ``powerx-stage-…`` and the deployment — and every env var hung off it — was
+# created under that name instead of the user's project. These pin the fix.
+
+
+def test_archive_command_prefixes_the_project_name(tmp_path: Path) -> None:
+    command = workspace_bridge._archive_command("/home/tenki/myapp", DEFAULT_EXCLUDES, with_size=True)
+    # The archive is built from the *parent*, naming the project itself.
+    assert "cd /home/tenki &&" in command
+    assert command.rstrip().endswith("myapp && wc -c < /tmp/powerx-stage.tar.gz")
+    assert "'index.html'" not in command
+
+
+def test_archive_command_for_the_root_uses_its_basename() -> None:
+    command = workspace_bridge._archive_command("/home/ubuntu/workspace", (), with_size=False)
+    assert "cd /home/ubuntu &&" in command
+    assert command.rstrip().endswith("workspace")
+
+
+def test_project_basename_survives_trailing_slash() -> None:
+    assert workspace_bridge._project_basename("/home/tenki/app/") == "app"
+    assert workspace_bridge._project_basename("/") == "project"
+    assert workspace_bridge._project_basename("") == "project"
+
+
+@pytest.mark.asyncio
+async def test_staged_project_dir_keeps_its_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End to end: the tar a backend receives yields a dir named after the project."""
+    staging_root = tmp_path / "ephemeral"
+    staging_root.mkdir()
+    _patch_persistent_dir(monkeypatch, tmp_path / "persistent")
+
+    captured: dict[str, str] = {}
+
+    class _Backend:
+        # Every real backend sets this (``self.workspace = WORKSPACE``), and the
+        # archive path is derived from it — a root the backend does not guard.
+        workspace = "/home/ubuntu/workspace"
+
+        async def run(self, command: str, *, timeout: int = 0) -> str:
+            captured["tar"] = command
+            # Emulate the real tar: a single top-level directory named after
+            # the project, exactly as ``_archive_command`` asks for.
+            with tarfile.open("/tmp/powerx-stage.tar.gz", "w:gz") as tf:
+                data = b"<html>hi</html>"
+                info = tarfile.TarInfo("myapp/index.html")
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+            return "123\n[exit_code=0]"
+
+        async def download(self, remote: str, local: str) -> None:
+            # Freestyle and Tenki both guard every file API to the workspace
+            # root (``_safe_path``). Staging used to ask for a ``/tmp`` archive,
+            # so this raised, staging returned None, and the user was told
+            # web_dev "cannot locate the project sources" on a healthy sandbox.
+            if not remote.startswith("/home/ubuntu/workspace/"):
+                raise ValueError("path must remain inside the workspace")
+            captured["download"] = remote
+            Path(local).parent.mkdir(parents=True, exist_ok=True)
+            Path(local).write_bytes(Path("/tmp/powerx-stage.tar.gz").read_bytes())
+
+    async def _fake_backend() -> tuple[str, object | None]:
+        return "freestyle", object()
+
+    def _fake_build(name: str, _config: object, _key: str) -> object:
+        return _Backend()
+
+    monkeypatch.setattr(workspace_bridge, "_selected_backend", _fake_backend)
+    monkeypatch.setattr(workspace_bridge, "_build_backend", _fake_build)
+    monkeypatch.setattr(workspace_bridge, "_cleanup_remote", _noop_cleanup)
+
+    staged = await workspace_bridge.stage_from_sandbox("/home/ubuntu/workspace/myapp", staging_root=staging_root)
+    assert staged is not None
+    try:
+        assert staged.path.name == "myapp"
+        assert (staged.path / "index.html").is_file()
+        assert "myapp" in captured["tar"]
+        # The archive stays inside the workspace, so the workspace guard accepts it.
+        assert captured["download"].startswith("/home/ubuntu/workspace/")
+        assert captured["download"].endswith(".nanobot-stage.tar.gz")
+    finally:
+        staged.cleanup()
+
+
+async def _noop_cleanup(_backend: object, _unused: object | None = None) -> None:
+    return None
+
+
+def test_transfer_archive_is_workspace_relative() -> None:
+    """The archive path is inside the workspace root, never ``/tmp``."""
+    archive = workspace_bridge._remote_archive_path("/home/ubuntu/workspace")
+    assert archive == "/home/ubuntu/workspace/.nanobot-stage.tar.gz"
+    assert not archive.startswith("/tmp/")
+
+
+def test_archive_command_excludes_itself() -> None:
+    """A root-level archive must not be swept into the archive it writes."""
+    archive = workspace_bridge._remote_archive_path("/home/tenki")
+    command = workspace_bridge._archive_command(
+        "/home/tenki", DEFAULT_EXCLUDES, with_size=False, archive=archive
+    )
+    assert f"tar czf {archive}" in command
+    assert "--exclude=.nanobot-stage.tar.gz" in command
