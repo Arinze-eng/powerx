@@ -27,6 +27,11 @@ from nanobot.youtube.api import (
     resolve_channel,
 )
 from nanobot.youtube.oauth import get_youtube_oauth_manager
+from nanobot.youtube.repost import (
+    RepostLedger,
+    TikTokRepostError,
+    repost_tiktok,
+)
 
 
 @tool_parameters(
@@ -45,6 +50,8 @@ from nanobot.youtube.oauth import get_youtube_oauth_manager
                     "playlists",
                     "like",
                     "subscribe",
+                    "repost",
+                    "reposts",
                 ],
                 "description": (
                     "The YouTube action to perform. 'my_channel' shows the connected "
@@ -55,7 +62,44 @@ from nanobot.youtube.oauth import get_youtube_oauth_manager
                     "channels (use for 'find videos about X'); 'videos' lists a channel's "
                     "recent videos; 'video' gives details/statistics for one video; "
                     "'comments' reads comments on a video; 'playlists' lists a channel's "
-                    "playlists; 'like' likes a video; 'subscribe' subscribes to a channel."
+                    "playlists; 'like' likes a video; 'subscribe' subscribes to a channel; "
+                    "'repost' downloads a TikTok video and publishes it to the user's "
+                    "YouTube (use for 'repost this TikTok to YouTube', 'post my TikTok "
+                    "videos to YouTube', and any tiktok.com link the user gives); "
+                    "'reposts' lists what has already been reposted."
+                ),
+            },
+            "tiktok_url": {
+                "type": "string",
+                "description": (
+                    "action='repost': the TikTok video link (https://www.tiktok.com/"
+                    "@user/video/<id> or a vm.tiktok.com / tiktok.com/t/ short link)."
+                ),
+            },
+            "title": {
+                "type": "string",
+                "description": (
+                    "action='repost': the YouTube title. Omit to use the TikTok caption "
+                    "(recommended), which is what the creator wrote."
+                ),
+            },
+            "description": {
+                "type": "string",
+                "description": (
+                    "action='repost': the YouTube description. Omit to build it from the "
+                    "TikTok caption plus a credit and the original link."
+                ),
+            },
+            "privacy": {
+                "type": "string",
+                "enum": ["public", "unlisted", "private"],
+                "description": "action='repost': who can see the YouTube video. Defaults to public.",
+            },
+            "force": {
+                "type": "boolean",
+                "description": (
+                    "action='repost': publish even when this TikTok was already reposted "
+                    "before. Off by default, which is what stops duplicate uploads."
                 ),
             },
             "query": {
@@ -108,11 +152,13 @@ class YouTubeTool(Tool):
             "ANY YouTube request: showing the user's own channel, looking up a channel "
             "by handle/URL/id/name and its subscriber or video counts, searching videos "
             "and channels, listing a channel's recent videos or playlists, getting a "
-            "video's details and statistics, reading a video's comments, and write "
-            "actions like liking a video or subscribing to a channel. Actions: "
-            "'my_channel', 'channel', 'search', 'videos', 'video', 'comments', "
-            "'playlists', 'like', 'subscribe'. The user's Google account must be "
-            "connected in Settings first."
+            "video's details and statistics, reading a video's comments, write actions "
+            "like liking a video or subscribing to a channel, and reposting a TikTok "
+            "video to the user's YouTube. Actions: 'my_channel', 'channel', 'search', "
+            "'videos', 'video', 'comments', 'playlists', 'like', 'subscribe', "
+            "'repost' (give tiktok_url), 'reposts'. The user's Google account must be "
+            "connected in Settings first — if it is not, say so and point them at "
+            "Settings instead of trying again."
         )
 
     @classmethod
@@ -194,6 +240,8 @@ class YouTubeTool(Tool):
                 "playlists": self._playlists,
                 "like": self._like,
                 "subscribe": self._subscribe,
+                "repost": self._repost,
+                "reposts": self._reposts,
             }.get(action)
             if handler is None:
                 return ToolResult.error(f"Unknown YouTube action: {action}")
@@ -384,6 +432,71 @@ class YouTubeTool(Tool):
             },
         )
         return ToolResult(f"Subscribed to channel {channel_id}.")
+
+    # -- TikTok -> YouTube reposting ----------------------------------------
+
+    async def _repost(self, access_token: str, kwargs: dict[str, Any]) -> ToolResult:
+        """Download one TikTok video in the sandbox and publish it to YouTube."""
+        url = str(
+            kwargs.get("tiktok_url") or kwargs.get("url") or kwargs.get("query") or ""
+        ).strip()
+        if not url:
+            return ToolResult.error(
+                "Provide the TikTok video link in tiktok_url (e.g. "
+                "https://www.tiktok.com/@user/video/1234567890123456789)."
+            )
+        privacy = str(kwargs.get("privacy") or "public").strip().lower()
+        try:
+            result = await repost_tiktok(
+                access_token=access_token,
+                url=url,
+                title=(str(kwargs.get("title") or "").strip() or None),
+                description=(str(kwargs.get("description") or "").strip() or None),
+                privacy=privacy,
+                force=bool(kwargs.get("force")),
+            )
+        except TikTokRepostError as exc:
+            return ToolResult.error(exc.message)
+
+        if result.get("status") == "already_reposted":
+            return ToolResult(
+                f"Already reposted — nothing was uploaded again.\n"
+                f"  YouTube: {result.get('youtube_url')}\n"
+                f"  TikTok video: {result.get('tiktok_video_id')}\n"
+                f"  First reposted: {result.get('reposted_at')}\n"
+                "Give the user that link. Pass force=true only if they explicitly "
+                "want a second copy."
+            )
+        return ToolResult(
+            f"Reposted to YouTube from TikTok.\n"
+            f"  YouTube URL: {result.get('youtube_url')}\n"
+            f"  Title: {result.get('title')}\n"
+            f"  TikTok video: {result.get('tiktok_video_id')}\n"
+            f"  Privacy: {result.get('privacy')}\n"
+            "Give the user the YouTube link."
+        )
+
+    async def _reposts(self, access_token: str, kwargs: dict[str, Any]) -> ToolResult:
+        """List every TikTok already reposted to this deployment's YouTube."""
+        entries = RepostLedger().all()
+        if not entries:
+            return ToolResult(
+                "No TikToks have been reposted to YouTube yet. Give me a TikTok link "
+                "and I will download it and publish it."
+            )
+        lines = [f"Reposted TikToks ({len(entries)}):"]
+        for tiktok_id, entry in sorted(
+            entries.items(),
+            key=lambda item: str((item[1] or {}).get("reposted_at") or ""),
+            reverse=True,
+        ):
+            data = entry if isinstance(entry, dict) else {}
+            lines.append(
+                f"  - {data.get('title') or '(untitled)'} -> "
+                f"https://youtu.be/{data.get('youtube_video_id')} "
+                f"(TikTok {tiktok_id}, {data.get('reposted_at')}, {data.get('privacy')})"
+            )
+        return ToolResult("\n".join(lines))
 
     # -- formatting ---------------------------------------------------------
 
