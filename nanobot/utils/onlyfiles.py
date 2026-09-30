@@ -112,11 +112,42 @@ def onlyfiles_file_id(url: str) -> str:
 
 
 def gateway_base_url() -> str:
-    """Public base URL of this gateway, used to build permanent links."""
+    """ORIGIN of this gateway — the only base a permanent link may be built on.
+
+    MEASURED FAILURE (2026-09-30, this deployment): the public URL is the
+    deployment's public address and may carry a path — here
+    ``NANOBOT_API_PUBLIC_URL=https://<host>/admin``. The gateway's own routes are
+    mounted at the ORIGIN ROOT (``/f/{file_id}`` is intercepted before the SPA
+    catch-all, and the API answers ``/v1/*`` there too), so a path in the base
+    produced ``https://<host>/admin/f/<id>``, which the SPA answered with its own
+    HTML page and HTTP 200. The link therefore "loaded" but never downloaded the
+    file — reported by the user verbatim as "the link is not working, use
+    onlyfiles" while working in a sandbox.
+
+    Stripping the path is the fix; a base that is not an absolute http(s) URL is
+    skipped rather than propagated into a broken link.
+    """
     for var in ("POWERX_PUBLIC_URL", "NANOBOT_API_PUBLIC_URL", "API_SERVER_URL"):
-        value = (os.environ.get(var) or "").strip().rstrip("/")
-        if value:
-            return value
+        value = (os.environ.get(var) or "").strip()
+        if not value:
+            continue
+        parsed = urlparse(value)
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+    return ""
+
+
+def gateway_download_url(page_url: str) -> str:
+    """The permanent ``<origin>/f/<id>`` download link, or ``""`` without a gateway.
+
+    Kept separate from :func:`permanent_download_url` so callers can tell a link
+    that *downloads and never expires* from the onlyfiles page URL, which is also
+    permanent but serves an HTML viewer instead of the bytes.
+    """
+    base = gateway_base_url()
+    file_id = onlyfiles_file_id(page_url)
+    if base and file_id:
+        return f"{base}/f/{file_id}"
     return ""
 
 
@@ -132,11 +163,7 @@ def permanent_download_url(page_url: str) -> str:
     permanent but serves a viewer, and the raw ``/dl/`` URL downloads but expires
     in ~2h, so neither can be stored. The gateway is both.
     """
-    base = gateway_base_url()
-    file_id = onlyfiles_file_id(page_url)
-    if base and file_id:
-        return f"{base}/f/{file_id}"
-    return page_url
+    return gateway_download_url(page_url) or page_url
 
 
 def _public_url(value: Any) -> str:
@@ -258,10 +285,13 @@ async def upload_bytes(
     # token expires, so a link delivered later must be re-resolved with
     # ``resolve_raw_url``. ``url`` is the permanent link; when a gateway is
     # configured it is the always-downloads form rather than the HTML viewer.
+    # ``gateway_url`` is that same always-downloads form, kept separate so a
+    # caller can tell "permanent download" from "permanent viewer page".
     return {
         "url": permanent_download_url(page_url),
         "page_url": page_url,
         "download_url": await resolve_raw_url(page_url),
+        "gateway_url": gateway_download_url(page_url),
     }
 
 
@@ -417,6 +447,7 @@ async def upload_and_remember(
             "url": permanent_download_url(stored_page) or stored_page,
             "page_url": stored_page,
             "download_url": await resolve_raw_url(stored_page),
+            "gateway_url": gateway_download_url(stored_page),
         }
     result = await upload_path(
         path,

@@ -43,6 +43,10 @@ from nanobot.agent.tools.vps_backend import VPSExecutionBackend
 from nanobot.config.paths import get_data_dir, get_workspace_path
 from nanobot.utils.file_share import (
     FileShareError,
+    artifact_delivery_text,
+)
+from nanobot.utils.file_share import (
+    upload_artifact_bytes as upload_shared_artifact_bytes,
 )
 from nanobot.utils.file_share import (
     upload_artifact_path as upload_shared_artifact,
@@ -1046,6 +1050,39 @@ def _install_packages_from_kwargs(kwargs: dict[str, Any]) -> list[str]:
     if names:
         return names
     return _clean_install_package_names(kwargs.get("command"))
+
+
+async def _publish_signed_artifact(
+    signed_url: str, *, filename: str, timeout: int = 300
+) -> dict[str, Any]:
+    """Fetch a short-lived sandbox download URL and republish it permanently.
+
+    The Novita sandbox's own ``download_url`` is valid for only a few minutes, so
+    it cannot be handed to a user — tapping it later returns nothing. The bytes
+    are pulled here while the signature is still live and pushed to the same
+    artifact hosts every other backend uses (onlyfiles for small files, catbox
+    above the onlyfiles ceiling), which yields the permanent, tap-to-download
+    link the delivery text is written around.
+
+    Raises :class:`FileShareError` when the sandbox refuses the download or no
+    host accepts the bytes, and :class:`OnlyFilesError` from the upload path.
+    """
+    import aiohttp
+
+    if not signed_url:
+        raise FileShareError("sandbox returned no download URL")
+    try:
+        timeout_obj = aiohttp.ClientTimeout(total=max(30, min(int(timeout), 900)))
+        async with aiohttp.ClientSession(timeout=timeout_obj) as session:
+            async with session.get(signed_url, allow_redirects=True) as response:
+                if response.status < 200 or response.status >= 300:
+                    raise FileShareError(f"sandbox download failed with HTTP {response.status}")
+                data = await response.read()
+    except aiohttp.ClientError as exc:
+        raise FileShareError(f"sandbox download request failed: {type(exc).__name__}") from None
+    if not data:
+        raise FileShareError("sandbox returned an empty file")
+    return await upload_shared_artifact_bytes(data, filename=filename)
 
 
 @tool_parameters(
@@ -2698,21 +2735,7 @@ class NovitaSandboxTool(Tool):
                     shared = await upload_shared_artifact(downloaded)
                 except (FileShareError, OnlyFilesError) as exc:
                     return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
-                host_label = shared.get("host", "onlyfiles")
-                direct = shared.get("download_url") or shared["url"]
-                fallback = shared.get("page_url") or shared["url"]
-                return (
-                    f"Downloaded remote artifact to local path: {downloaded}\n"
-                    f"Direct-download link ({host_label}) - tap opens the download immediately:\n"
-                    f"{direct}\n"
-                    f"Permanent page link (fallback if the direct link ever stops working):\n"
-                    f"{fallback}\n"
-                    "Give the user this link and do NOT paste the file contents into "
-                    "your reply. The file may also be attached directly via the "
-                    "message tool's media parameter when direct attachment delivery "
-                    "is available. Prefer a single clear download link over dumping "
-                    "raw text."
-                )
+                return artifact_delivery_text(shared, downloaded)
             return ToolResult.error("Unknown sandbox action")
         except Exception as exc:
             logger.exception("VPS execution operation failed")
@@ -3168,21 +3191,7 @@ class NovitaSandboxTool(Tool):
                         shared = await upload_shared_artifact(downloaded)
                     except (FileShareError, OnlyFilesError) as exc:
                         return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
-                    host_label = shared.get("host", "onlyfiles")
-                    direct = shared.get("download_url") or shared["url"]
-                    fallback = shared.get("page_url") or shared["url"]
-                    return (
-                        f"Downloaded remote artifact to local path: {downloaded}\n"
-                        f"Direct-download link ({host_label}) - tap opens the download immediately:\n"
-                        f"{direct}\n"
-                        f"Permanent page link (fallback if the direct link ever stops working):\n"
-                        f"{fallback}\n"
-                        "Give the user this link and do NOT paste the file contents into "
-                        "your reply. The file may also be attached directly via the "
-                        "message tool's media parameter when direct attachment delivery "
-                        "is available. Prefer a single clear download link over dumping "
-                        "raw text."
-                    )
+                    return artifact_delivery_text(shared, downloaded)
             return ToolResult.error("Unknown sandbox action")
         except SandboxBusyError:
             return ToolResult.error(
@@ -3374,21 +3383,7 @@ class NovitaSandboxTool(Tool):
                         shared = await upload_shared_artifact(downloaded)
                     except (FileShareError, OnlyFilesError) as exc:
                         return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
-                    host_label = shared.get("host", "onlyfiles")
-                    direct = shared.get("download_url") or shared["url"]
-                    fallback = shared.get("page_url") or shared["url"]
-                    return (
-                        f"Downloaded remote artifact to local path: {downloaded}\n"
-                        f"Direct-download link ({host_label}) - tap opens the download immediately:\n"
-                        f"{direct}\n"
-                        f"Permanent page link (fallback if the direct link ever stops working):\n"
-                        f"{fallback}\n"
-                        "Give the user this link and do NOT paste the file contents into "
-                        "your reply. The file may also be attached directly via the "
-                        "message tool's media parameter when direct attachment delivery "
-                        "is available. Prefer a single clear download link over dumping "
-                        "raw text."
-                    )
+                    return artifact_delivery_text(shared, downloaded)
             return ToolResult.error("Unknown sandbox action")
         except SandboxBusyError:
             return ToolResult.error(
@@ -3533,21 +3528,7 @@ class NovitaSandboxTool(Tool):
                         shared = await upload_shared_artifact(downloaded)
                     except (FileShareError, OnlyFilesError) as exc:
                         return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
-                    host_label = shared.get("host", "onlyfiles")
-                    direct = shared.get("download_url") or shared["url"]
-                    fallback = shared.get("page_url") or shared["url"]
-                    return (
-                        f"Downloaded remote artifact to local path: {downloaded}\n"
-                        f"Direct-download link ({host_label}) - tap opens the download immediately:\n"
-                        f"{direct}\n"
-                        f"Permanent page link (fallback if the direct link ever stops working):\n"
-                        f"{fallback}\n"
-                        "Give the user this link and do NOT paste the file contents into "
-                        "your reply. The file may also be attached directly via the "
-                        "message tool's media parameter when direct attachment delivery "
-                        "is available. Prefer a single clear download link over dumping "
-                        "raw text."
-                    )
+                    return artifact_delivery_text(shared, downloaded)
             return ToolResult.error("Unknown sandbox action")
         except SandboxBusyError:
             return ToolResult.error(
@@ -3718,21 +3699,7 @@ class NovitaSandboxTool(Tool):
                         shared = await upload_shared_artifact(downloaded)
                     except (FileShareError, OnlyFilesError) as exc:
                         return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
-                    host_label = shared.get("host", "onlyfiles")
-                    direct = shared.get("download_url") or shared["url"]
-                    fallback = shared.get("page_url") or shared["url"]
-                    return (
-                        f"Downloaded remote artifact to local path: {downloaded}\n"
-                        f"Direct-download link ({host_label}) - tap opens the download immediately:\n"
-                        f"{direct}\n"
-                        f"Permanent page link (fallback if the direct link ever stops working):\n"
-                        f"{fallback}\n"
-                        "Give the user this link and do NOT paste the file contents into "
-                        "your reply. The file may also be attached directly via the "
-                        "message tool's media parameter when direct attachment delivery "
-                        "is available. Prefer a single clear download link over dumping "
-                        "raw text."
-                    )
+                    return artifact_delivery_text(shared, downloaded)
             return ToolResult.error("Unknown sandbox action")
         except SandboxBusyError:
             return ToolResult.error(
@@ -3913,21 +3880,7 @@ class NovitaSandboxTool(Tool):
                         shared = await upload_shared_artifact(downloaded)
                     except (FileShareError, OnlyFilesError) as exc:
                         return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
-                    host_label = shared.get("host", "onlyfiles")
-                    direct = shared.get("download_url") or shared["url"]
-                    fallback = shared.get("page_url") or shared["url"]
-                    return (
-                        f"Downloaded remote artifact to local path: {downloaded}\n"
-                        f"Direct-download link ({host_label}) - tap opens the download immediately:\n"
-                        f"{direct}\n"
-                        f"Permanent page link (fallback if the direct link ever stops working):\n"
-                        f"{fallback}\n"
-                        "Give the user this link and do NOT paste the file contents into "
-                        "your reply. The file may also be attached directly via the "
-                        "message tool's media parameter when direct attachment delivery "
-                        "is available. Prefer a single clear download link over dumping "
-                        "raw text."
-                    )
+                    return artifact_delivery_text(shared, downloaded)
             return ToolResult.error("Unknown sandbox action")
         except SandboxBusyError:
             return ToolResult.error(
@@ -4210,21 +4163,7 @@ class NovitaSandboxTool(Tool):
                         shared = await upload_shared_artifact(downloaded)
                     except (FileShareError, OnlyFilesError) as exc:
                         return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
-                    host_label = shared.get("host", "onlyfiles")
-                    direct = shared.get("download_url") or shared["url"]
-                    fallback = shared.get("page_url") or shared["url"]
-                    return (
-                        f"Downloaded remote artifact to local path: {downloaded}\n"
-                        f"Direct-download link ({host_label}) - tap opens the download immediately:\n"
-                        f"{direct}\n"
-                        f"Permanent page link (fallback if the direct link ever stops working):\n"
-                        f"{fallback}\n"
-                        "Give the user this link and do NOT paste the file contents into "
-                        "your reply. The file may also be attached directly via the "
-                        "message tool's media parameter when direct attachment delivery "
-                        "is available. Prefer a single clear download link over dumping "
-                        "raw text."
-                    )
+                    return artifact_delivery_text(shared, downloaded)
             return ToolResult.error("Unknown sandbox action")
         except SandboxBusyError:
             return ToolResult.error(
@@ -4427,8 +4366,24 @@ class NovitaSandboxTool(Tool):
                         request_timeout=60,
                     )
                     return _output(result)
-                url = await asyncio.to_thread(sandbox.download_url, path, use_signature_expiration=300)
-                return f"Signed download URL (expires in 5 minutes): {url}"
+                signed = await asyncio.to_thread(
+                    sandbox.download_url, path, use_signature_expiration=300
+                )
+                # Publish through onlyfiles instead of handing back the sandbox's
+                # own signed URL. That URL expires in FIVE MINUTES, so a user who
+                # taps it a moment later gets nothing — the same "the link is not
+                # working" report as the missing gateway link. The bytes are
+                # fetched here while the signature is still valid and republished
+                # permanently, which is the contract every other backend already
+                # delivers (and what the user asked for: when the LLM gives files,
+                # it uses onlyfiles).
+                try:
+                    shared = await _publish_signed_artifact(
+                        str(signed), filename=Path(path).name or "artifact.bin"
+                    )
+                except (FileShareError, OnlyFilesError) as exc:
+                    return ToolResult.error(f"Could not publish artifact link: {str(exc)[:200]}")
+                return artifact_delivery_text(shared, path)
         except Exception as exc:
             logger.exception("Novita Sandbox operation failed")
             return ToolResult.error(f"Novita Sandbox error: {type(exc).__name__}: {str(exc)[:500]}")
