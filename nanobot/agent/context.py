@@ -329,15 +329,19 @@ class ContextBuilder:
         lines = [
             "# Durable Artifact Links",
             "",
-            "Links to artifacts delivered earlier. They are permanent and live on the "
-            "persistent disk, so when the user asks for a file again — even after the "
-            "sandbox was recycled or the file was lost — hand back the link below "
-            "instead of rebuilding it from scratch.",
+            "Links to artifacts delivered earlier. They are permanent onlyfiles.com "
+            "links and live on the persistent disk, so when the user asks for a file "
+            "again — even after the sandbox was recycled or the file was lost — hand "
+            "back the link below instead of rebuilding it from scratch. Paste the "
+            "onlyfiles link verbatim: never replace it with a gateway /f/ link, a "
+            "sandbox preview or signed URL, or a raw transfer token.",
             "",
         ]
         for record in records:
             name = str(record.get("name") or "artifact")
-            url = str(record.get("url") or "")
+            # Records written before the onlyfiles-only policy carry the gateway
+            # redirect as ``url``; the permanent page URL is always preferred.
+            url = str(record.get("page_url") or record.get("url") or "")
             if not url:
                 continue
             detail = str(record.get("description") or "").strip()

@@ -24,13 +24,23 @@ return contract the rest of the codebase already expects:
     }
 
 The page URL (``url.full``) is the canonical, PERMANENT public link (uploads use
-``expire=0``), but it serves an HTML viewer — tapping it opens a web page, not a
-download. The raw bytes live under ``/dl/<ts.nonce>/<id>/<file>``, with the
-nonce embedded in the viewer HTML, and that raw token EXPIRES after roughly two
-hours (verified against the live service). So: ``download_url`` is a freshly
-minted raw link that downloads on tap right now, ``url`` is the permanent page
-link to store/share, and :func:`resolve_raw_url` re-mints a raw link at the
-moment of delivery — never persist a raw link.
+``expire=0``) and it is the link the agent hands the user. It serves onlyfiles'
+own file page, which mints a working download control on every view, so it works
+forever and for anyone, from any deployment.
+
+The raw bytes live under ``/dl/<ts.nonce>/<id>/<file>``, with the nonce embedded
+in the viewer HTML. That raw token is short-lived: MEASURED against the live
+service (2026-09-30) every token carries a timestamp exactly 300 s ahead of the
+moment it was minted, and a fresh one is issued per page view. So a raw link is
+useful for a single immediate transfer and worthless after five minutes — never
+store one, never hand one to a user, and re-mint it at the moment of use with
+:func:`resolve_raw_url` when bytes have to move right now.
+
+The gateway redirect ``<origin>/f/<id>`` (:func:`gateway_download_url`) still
+exists for callers that need a forced ``Content-Disposition: attachment``
+response, but it is NOT the delivery link: it points at this deployment's own
+host, which is not a durable public address for the user. Deliver the onlyfiles
+page URL instead.
 """
 
 from __future__ import annotations
@@ -138,11 +148,14 @@ def gateway_base_url() -> str:
 
 
 def gateway_download_url(page_url: str) -> str:
-    """The permanent ``<origin>/f/<id>`` download link, or ``""`` without a gateway.
+    """The ``<origin>/f/<id>`` redirect through THIS deployment, or ``""``.
 
-    Kept separate from :func:`permanent_download_url` so callers can tell a link
-    that *downloads and never expires* from the onlyfiles page URL, which is also
-    permanent but serves an HTML viewer instead of the bytes.
+    This is a forced-download redirect served by the gateway itself, which
+    re-mints an onlyfiles ``/dl/`` token per request and replies with
+    ``Content-Disposition: attachment``. It is offered to tools that need bytes
+    to move without a page view — it is NOT the link to hand a user, because it
+    only resolves while this deployment answers on that host. Delivery uses
+    :func:`permanent_public_url`.
     """
     base = gateway_base_url()
     file_id = onlyfiles_file_id(page_url)
@@ -151,18 +164,22 @@ def gateway_download_url(page_url: str) -> str:
     return ""
 
 
-def permanent_download_url(page_url: str) -> str:
-    """Return a stable link that downloads the bytes instead of opening a page.
+def permanent_public_url(page_url: str) -> str:
+    """The permanent onlyfiles link to hand the user for this upload.
 
-    The policy is configured at the gateway (`/f/<id>` redirects to a
-    freshly-minted raw ``/dl/`` token), so this link never expires. When no
-    gateway is configured the page URL is returned, since it is still the
-    permanent, shareable form.
+    Policy (what the user asked for, verbatim): *"llm should stop using
+    https://<deployment-host>/f/<id> ... it should use onlyfiles"*. The
+    deployment-host redirect works only while this deployment answers on that
+    host, while the onlyfiles page URL for an ``expire=0`` upload (documented at
+    https://onlyfiles.com/api) is permanent, needs nothing from us, and mints a
+    working download on every view.
 
-    This is the fix for "pasting the link opens an HTML viewer": the page URL is
-    permanent but serves a viewer, and the raw ``/dl/`` URL downloads but expires
-    in ~2h, so neither can be stored. The gateway is both.
+    Returns ``page_url`` unchanged when it already is an onlyfiles page URL;
+    otherwise the gateway form when one is configured, else the input, so a
+    caller never ends up with an empty link.
     """
+    if onlyfiles_file_id(page_url):
+        return page_url
     return gateway_download_url(page_url) or page_url
 
 
@@ -193,9 +210,10 @@ def _extract_page_url(payload: dict[str, Any]) -> str:
 async def resolve_raw_url(page_url: str, *, timeout_seconds: int = 15) -> str:
     """Return a raw ``/dl/`` link that serves the file bytes for ``page_url``.
 
-    The ``/dl/`` token is minted per page view and EXPIRES (verified: links minted
-    two hours earlier stop serving bytes), so a raw link must never be stored and
-    handed out later — resolve fresh at the moment of delivery/tap instead.
+    The ``/dl/`` token is minted per page view and lives 300 s (measured: the
+    timestamp embedded in each token is exactly five minutes ahead of the moment
+    it was issued), so a raw link must never be stored or handed out — resolve
+    fresh at the moment bytes actually have to move.
 
     A ``/dl/`` URL is re-resolved through its permanent page form, since an
     expired raw token would otherwise be handed straight back. Returns the input
@@ -281,14 +299,13 @@ async def upload_bytes(
         detail = _extract_error(payload) if isinstance(payload, dict) else None
         raise OnlyFilesError(detail or "onlyfiles did not accept the upload")
     page_url = _extract_page_url(payload)
-    # Mint a raw /dl/ link now so an immediate hand-off downloads on tap. The
-    # token expires, so a link delivered later must be re-resolved with
-    # ``resolve_raw_url``. ``url`` is the permanent link; when a gateway is
-    # configured it is the always-downloads form rather than the HTML viewer.
-    # ``gateway_url`` is that same always-downloads form, kept separate so a
-    # caller can tell "permanent download" from "permanent viewer page".
+    # ``url`` is THE link to hand the user: the permanent onlyfiles page URL.
+    # ``download_url`` is a fresh raw token for an immediate byte transfer (it
+    # dies after 300 s, so a later delivery must re-mint with
+    # ``resolve_raw_url``), and ``gateway_url`` is this deployment's own
+    # redirect, which delivery never uses.
     return {
-        "url": permanent_download_url(page_url),
+        "url": permanent_public_url(page_url),
         "page_url": page_url,
         "download_url": await resolve_raw_url(page_url),
         "gateway_url": gateway_download_url(page_url),
@@ -440,11 +457,11 @@ async def upload_and_remember(
     remembered = memory.lookup(data)
     if remembered:
         logger.info("onlyfiles: reusing stored URL for {}", source.name)
-        # The page URL is permanent but its raw /dl/ token expires, so mint a
-        # fresh download link rather than handing back a stale one.
+        # The page URL is permanent, but its raw /dl/ token dies after 300 s, so
+        # mint a fresh one instead of handing back a stale link.
         stored_page = remembered.get("page_url") or remembered.get("url") or ""
         return {
-            "url": permanent_download_url(stored_page) or stored_page,
+            "url": permanent_public_url(stored_page) or stored_page,
             "page_url": stored_page,
             "download_url": await resolve_raw_url(stored_page),
             "gateway_url": gateway_download_url(stored_page),

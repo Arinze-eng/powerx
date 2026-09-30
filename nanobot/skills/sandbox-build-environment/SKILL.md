@@ -140,9 +140,31 @@ cd "$HOME/workspace/<project>"
 echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 ./gradlew assembleDebug --no-daemon        # no wrapper: gradle assembleDebug --no-daemon
 
-# 6. Hand the user the artifact
+# 6. Hand the user the artifact  ->  see "Delivering the finished file" below
 find . -name '*.apk' -newermt '-1 hour' | head
 ```
+
+### Delivering the finished file — onlyfiles, one link, permanently valid
+
+The build is not the deliverable; the **link** is. Publish it with one call on the
+sandbox tool and hand over exactly what comes back:
+
+```
+{"action":"download_url","path":"<path inside the sandbox workspace>"}   # e.g. app-debug.apk
+```
+
+* The returned link is a permanent **`https://onlyfiles.com/…`** page URL (uploads use
+  `expire=0`; `https://onlyfiles.com/api` is the documented contract) — or
+  `https://files.catbox.moe/…` for files over ~100 MB. Nothing else in the tool result is
+  a link: the internal `/dl/` token lives 300 s and the `<deployment-host>/f/<id>` form
+  only works while that host answers.
+* **Never** hand over a `/f/<id>` link, a sandbox preview or signed URL, a raw transfer
+  token, or a cloud-drive/share link instead. They are dead links for the user and they
+  are what "the link is not working" reports are made of.
+* **Never** deliver a sandbox path as if it were the file — the user cannot read it, and
+  the sandbox is recycled.
+* Deliver once, at the end, plainly naming the artifact and any caveat (a debug-signed APK
+  must be installed after uninstalling the original).
 
 Flutter projects: install the Flutter tarball (`flutter_linux_*stable.tar.xz`, add
 `$HOME/flutter/bin` to PATH, `flutter config --android-sdk "$ANDROID_SDK_ROOT"`,

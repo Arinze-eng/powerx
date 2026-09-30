@@ -41,22 +41,22 @@ class FileShareError(RuntimeError):
 def _normalize_onlyfiles(result: dict[str, str]) -> dict[str, Any]:
     """Map the onlyfiles result onto the uniform share contract.
 
-    ``url`` must be the link a user can **paste and download**, so it prefers the
-    permanent gateway form. The raw ``/dl/`` token expires in ~2h, so it is
-    exposed separately as ``download_url`` for immediate one-off use only. Before
-    this, ``url`` was the expiring raw token and ``page_url`` the HTML viewer —
-    which is why a copied link either opened a web page or stopped working.
+    ``url`` is the link the user is handed, and it is the permanent onlyfiles
+    page URL (``expire=0``, documented at https://onlyfiles.com/api). Two other
+    links exist and neither is offered to the user:
 
-    ``gateway_url`` is the ``<origin>/f/<id>`` form and is EMPTY when no gateway
-    is configured, which is how a delivery can tell a link that downloads and
-    never expires (``url`` here) from a permanent-but-viewer page URL (``url``
-    when there is no gateway). Collapsing the two is what made the old
-    ``download_url`` result hand out an HTML viewer as its "permanent" fallback.
+    * ``download_url`` — a raw ``/dl/`` token that transfers bytes immediately
+      but dies in 300 s (measured), so it is for internal one-off transfers;
+    * ``gateway_url`` — ``<origin>/f/<id>``, a forced-download redirect served by
+      THIS deployment, which only resolves while this deployment answers on that
+      host. The user asked for it to stop being handed out, and it is.
+
+    ``page_url`` stays in the payload so a caller can tell the two apart.
     """
-    permanent = result.get("url") or ""
+    page = result.get("page_url") or result.get("url") or ""
     return {
-        "url": permanent or result.get("download_url") or "",
-        "page_url": result.get("page_url") or permanent,
+        "url": page or result.get("gateway_url") or result.get("download_url") or "",
+        "page_url": page,
         "download_url": result.get("download_url", ""),
         "gateway_url": result.get("gateway_url", ""),
         "host": "onlyfiles",
@@ -78,64 +78,61 @@ def _normalize_catbox(url: str) -> dict[str, Any]:
 def artifact_delivery_text(shared: dict[str, Any], downloaded: Any) -> str:
     """The tool message that hands a published artifact to the user.
 
-    Exactly one link is presented as the link to give the user, and it is always
-    one that stays valid AND downloads on tap:
+    Exactly ONE link is presented, and it is the permanent onlyfiles link (or,
+    for files over the 100 MiB onlyfiles ceiling, catbox's permanent direct URL):
 
-    * catbox returns a permanent direct file URL;
-    * onlyfiles with a gateway configured returns ``<origin>/f/<id>``, which
-      re-mints a raw token per request and forces ``Content-Disposition:
-      attachment``;
-    * onlyfiles with NO gateway has no such link — the page URL is an HTML viewer
-      and the raw token expires in ~2h — so the fresh token is handed out for
-      immediate use and the page URL is named as the permanent fallback.
+    * onlyfiles → ``https://onlyfiles.com/<id>/<name>``, the file's page. It
+      needs nothing from this deployment, never expires, and mints a working
+      download on every view.
+    * catbox → ``https://files.catbox.moe/<id>.<ext>``, permanent and direct.
 
-    Rationale (the bug this replaces): every sandbox backend used to offer the
-    ~2h raw ``/dl/`` token as the *primary* "Direct-download link" and the HTML
-    viewer page as the "Permanent page link (fallback...)". The durable
-    ``/f/<id>`` link was never shown to the model at all, so a user who pasted
-    either one got a web page or a dead link — reported as "the link is not
-    working, use onlyfiles".
+    What is deliberately NOT offered, in this order of importance:
+
+    * ``<origin>/f/<id>`` — the gateway redirect. It resolves only while this
+      deployment answers on that host, so a pasted link outlives the host. The
+      user asked for it to stop being handed out ("llm should stop using
+      https://…/f/<id> … it should use onlyfiles").
+    * the raw ``/dl/`` token — it transfers bytes now and dies after 300 s
+      (measured: each token's embedded timestamp is five minutes ahead of its
+      mint time), so pasting it later yields a dead link.
+
+    Rationale (the bug this replaces): the model copied whichever URL appeared
+    first, so a user got an HTML page, an expiring token, or a deployment-host
+    link instead of a file. One link, permanently valid, from a third party that
+    outlives the sandbox and the deployment.
     """
     host_label = str(shared.get("host") or "onlyfiles")
-    gateway = str(shared.get("gateway_url") or "").strip()
-    raw = str(shared.get("download_url") or "").strip()
     page = str(shared.get("page_url") or "").strip()
     url = str(shared.get("url") or "").strip()
+    raw = str(shared.get("download_url") or "").strip()
+    gateway = str(shared.get("gateway_url") or "").strip()
 
     if host_label == "catbox":
         # One permanent, direct file URL: it downloads and it never expires.
-        primary, fallback, expires = url or raw or page, "", False
-    elif gateway:
-        primary, fallback, expires = gateway, "", False
+        primary = url or raw or page
     else:
-        # No gateway: the page URL is permanent but renders a viewer, so the
-        # fresh raw token is the only link that actually downloads right now.
-        primary = raw or page
-        fallback = page if page and page != primary else ""
-        expires = bool(raw)
+        # The onlyfiles page URL is the permanent, shareable link. Fall back to
+        # the gateway only when no onlyfiles page URL exists at all (a caller
+        # that supplied a bare redirect), and to the raw token last, since it is
+        # the shortest-lived of the three.
+        primary = page or url
+        if not primary or primary == gateway:
+            primary = gateway or raw
+    primary = primary.strip()
 
     lines = [f"Downloaded remote artifact to local path: {downloaded}"]
-    if primary and expires:
-        lines.append(
-            f"Download link ({host_label}) - tap to download now "
-            "(this token expires in about two hours):"
-        )
-        lines.append(primary)
-        if fallback:
-            lines.append(
-                f"Permanent link ({host_label}) - opens the file's page, valid forever:"
-            )
-            lines.append(fallback)
-    elif primary:
-        lines.append(f"Download link ({host_label}) - permanent, tap to download:")
+    if primary:
+        lines.append(f"Download link ({host_label}) - permanent, valid forever:")
         lines.append(primary)
     lines.append(
         "Give the user THIS link and do NOT paste the file contents into your reply. "
-        "Do not substitute another link - not a sandbox preview or signed URL, not a "
-        "cloud-drive share, not a raw transfer token: the link above is the one that "
-        "works for the user. The file may also be attached directly via the message "
-        "tool's media parameter when direct attachment delivery is available. Prefer "
-        "a single clear download link over dumping raw text."
+        "Do not substitute another link - not a gateway /f/ link on this deployment's "
+        "own host, not a sandbox preview or signed URL, not a cloud-drive share, not a "
+        "raw transfer token: onlyfiles links outlive the deployment and the sandbox, "
+        "and the link above is the one that works for the user. The file may also be "
+        "attached directly via the message tool's media parameter when direct "
+        "attachment delivery is available. Prefer a single clear download link over "
+        "dumping raw text."
     )
     return "\n".join(lines)
 
@@ -147,7 +144,10 @@ def remember_artifact(result: dict[str, Any], *, filename: str, description: str
     sandbox restarts and context loss without filling the persistent disk.
     Never raises — memory is best-effort and must not break a delivery.
     """
-    url = str(result.get("url") or "").strip()
+    # Remember the permanent onlyfiles page URL, never the gateway redirect: the
+    # remembered link is handed back to the user verbatim when they ask for the
+    # file again, possibly on a different deployment host.
+    url = str(result.get("page_url") or result.get("url") or "").strip()
     if not url:
         return
     try:

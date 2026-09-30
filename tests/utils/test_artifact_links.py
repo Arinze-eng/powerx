@@ -25,8 +25,9 @@ from nanobot.utils import file_share
 from nanobot.utils.onlyfiles import (
     ArtifactLinkMemory,
     gateway_base_url,
+    gateway_download_url,
     onlyfiles_file_id,
-    permanent_download_url,
+    permanent_public_url,
     safe_upload_filename,
 )
 
@@ -83,24 +84,26 @@ def test_onlyfiles_file_id_parses_page_and_dl_forms() -> None:
     assert onlyfiles_file_id("") == ""
 
 
-def test_permanent_download_url_uses_gateway_when_configured(
+def test_permanent_public_url_stays_onlyfiles_even_with_a_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The delivered link must never be this deployment's own host."""
     monkeypatch.setenv("POWERX_PUBLIC_URL", "https://gateway.example.com/")
     page = "https://onlyfiles.com/ABC123def/file.apk"
-    # The gateway form is stable and downloads, unlike the HTML page URL.
-    assert permanent_download_url(page) == "https://gateway.example.com/f/ABC123def"
+    assert gateway_download_url(page) == "https://gateway.example.com/f/ABC123def"
+    assert permanent_public_url(page) == page
 
 
-def test_permanent_download_url_falls_back_to_page_url(
+def test_permanent_public_url_falls_back_for_a_foreign_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for var in ("POWERX_PUBLIC_URL", "NANOBOT_API_PUBLIC_URL", "API_SERVER_URL"):
         monkeypatch.delenv(var, raising=False)
     page = "https://onlyfiles.com/ABC123def/file.apk"
     assert gateway_base_url() == ""
-    # Without a gateway the page URL is still the permanent, shareable form.
-    assert permanent_download_url(page) == page
+    assert permanent_public_url(page) == page
+    # Nothing to rewrite and no gateway: the caller's URL beats an empty link.
+    assert permanent_public_url("https://example.com/x.apk") == "https://example.com/x.apk"
 
 
 # ---- artifact link memory -------------------------------------------------
@@ -170,8 +173,8 @@ def test_artifact_memory_prunes_to_max_records(tmp_path: Path, monkeypatch: pyte
 # ---- file_share contract --------------------------------------------------
 
 
-def test_normalize_onlyfiles_hands_out_the_permanent_link() -> None:
-    """`url` must be paste-and-download, never the expiring raw token."""
+def test_normalize_onlyfiles_hands_out_the_onlyfiles_page_link() -> None:
+    """`url` is the link the user is given: permanent, onlyfiles' own host."""
     out = file_share._normalize_onlyfiles(
         {
             "url": "https://gateway.example.com/f/abc123",
@@ -179,10 +182,12 @@ def test_normalize_onlyfiles_hands_out_the_permanent_link() -> None:
             "download_url": "https://onlyfiles.com/dl/1789627686.abc/abc123/file.apk",
         }
     )
-    assert out["url"] == "https://gateway.example.com/f/abc123"
+    assert out["url"] == "https://onlyfiles.com/abc123/file.apk"
     assert out["page_url"] == "https://onlyfiles.com/abc123/file.apk"
-    # The expiring token is exposed separately, for immediate use only.
+    # The expiring token stays in the payload for internal one-off transfers,
+    # and is never promoted to the delivered link.
     assert out["download_url"].startswith("https://onlyfiles.com/dl/")
+    assert out["url"] != out["download_url"]
 
 
 def test_normalize_onlyfiles_never_prefers_expiring_token() -> None:
@@ -207,7 +212,9 @@ def test_remember_artifact_persists_via_persistent_dir(
         description="demo",
     )
     hits = onlyfiles.ArtifactLinkMemory(root=tmp_path).search("demo")
-    assert hits and hits[0]["url"] == "https://gateway.example.com/f/zzz"
+    # The remembered link is replayed to the user later, so it must be the
+    # permanent onlyfiles URL — never the deployment-host redirect.
+    assert hits and hits[0]["url"] == "https://onlyfiles.com/zzz/a.apk"
 
 
 def test_remember_artifact_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:

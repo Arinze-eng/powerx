@@ -415,9 +415,11 @@ class AndroidSandboxTool(Tool):
             "acting), tap (x,y from a node's center), swipe, key (keycode=name or "
             "number, e.g. home/back/enter/app_switch), text (text=), screenshot (a PNG "
             "in the sandbox -- hand it to the user with the sandbox tool's "
-            "action='download_url'), shell (command= run inside Android), push (local "
+            "action='download_url', which returns the permanent onlyfiles.com link to "
+            "paste), shell (command= run inside Android), push (local "
             "sandbox file -> device), pull (device path -> sandbox, then download_url to "
-            "give it to the user), logcat (why an app crashed), uninstall. The device "
+            "give the user its onlyfiles.com link -- never a gateway /f/ link), logcat "
+            "(why an app crashed), uninstall. The device "
             "persists between calls, so an app you installed stays installed."
         )
 

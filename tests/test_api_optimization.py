@@ -496,10 +496,18 @@ async def test_upload_and_remember_reuses_url_without_reupload(tmp_path: Path, m
     import nanobot.utils.onlyfiles as onlyfiles_mod
 
     uploads = {"n": 0}
+    page = "https://onlyfiles.com/x/data.csv"
 
     async def fake_upload_path(path, **kw):
         uploads["n"] += 1
-        return {"url": "https://onlyfiles.com/x/data.csv", "download_url": "https://onlyfiles.com/x/data.csv"}
+        # The shape ``upload_path`` really returns, so the remembered path (which
+        # rebuilds this dict) is compared against the same keys.
+        return {
+            "url": page,
+            "page_url": page,
+            "download_url": "https://onlyfiles.com/dl/1.a/x/data.csv",
+            "gateway_url": "",
+        }
 
     monkeypatch.setattr(onlyfiles_mod, "upload_path", fake_upload_path)
     src = tmp_path / "data.csv"
@@ -508,9 +516,9 @@ async def test_upload_and_remember_reuses_url_without_reupload(tmp_path: Path, m
     memory = UploadedUrlMemory(root=tmp_path / "onlyfiles")
     first = await upload_and_remember(src, url_memory=memory)
     second = await upload_and_remember(src, url_memory=memory)
-    assert first == second
+    assert first["url"] == second["url"] == page  # the delivered link, unchanged
     assert uploads["n"] == 1  # second call served from persistent URL memory
 
     # A brand-new memory instance over the same root still remembers it.
     fresh = UploadedUrlMemory(root=tmp_path / "onlyfiles")
-    assert fresh.lookup(b"a,b\n1,2\n") == first
+    assert fresh.lookup(b"a,b\n1,2\n") == {"url": page, "download_url": first["download_url"]}

@@ -93,8 +93,9 @@ Read the result, do not assume it:
 * `plan_shorts`' `reason` on each clip — it names the words-per-second and hook
   score a clip was chosen for, so you can justify the pick.
 
-Then deliver the files. They live in the sandbox, so give the paths and fetch one
-out with the sandbox tool's own `download_url` action when the user wants to keep it.
+Then deliver the files. They live in the sandbox, so fetch the finished one out with
+the sandbox tool's own `download_url` action and give the user **the onlyfiles.com link
+it returns** — never a sandbox path, a preview/signed URL or a `/f/` deployment link.
 
 ## Downloading
 
