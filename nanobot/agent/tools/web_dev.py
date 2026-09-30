@@ -42,6 +42,7 @@ from nanobot.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
+from nanobot.agent.tools.workspace_bridge import StagedProject, stage_from_sandbox
 from nanobot.config.paths import get_workspace_path
 from nanobot.security.workspace_access import current_tool_workspace
 
@@ -198,7 +199,11 @@ class WebDevTool(Tool):
             "deployment/project URLs. Deployments are non-interactive and use the configured "
             "VERCEL_TOKEN. You set env vars with set_env BEFORE deploying so the build can use them. "
             "Always give the user the resulting https URL, and if this is a frontend+backend app, give "
-            "them the CORS-safe public URLs."
+            "them the CORS-safe public URLs. Projects built inside the execution sandbox (Tenki, "
+            "Freestyle, Novita, …) deploy directly: pass project=<the directory name as it exists in "
+            "the sandbox> and the sources are fetched out of it automatically, so a sandbox path is "
+            "never a blocker — never tell the user a workspace path mismatch makes the deploy "
+            "impossible."
         )
 
     def _resolve_project_dir(self, project: str | None) -> Path:
@@ -222,12 +227,121 @@ class WebDevTool(Tool):
                 ) from None
         return resolved
 
+    # ---- sandbox → host bridging -----------------------------------------
+    #
+    # WHY THIS EXISTS (measured, 2026-09-30, Freestyle and Tenki selected):
+    # the agent creates the project *inside the execution sandbox*
+    # (``/home/ubuntu/workspace`` on Freestyle, ``/home/tenki`` on Tenki), while
+    # this tool runs on the host and resolved ``project`` against
+    # ``~/.nanobot/workspace``. A host-only lookup therefore found nothing and
+    # the model reported a path mismatch it could not fix — "the web_dev tool is
+    # attempting to access a workspace path that is inaccessible from the
+    # sandbox". Nothing was wrong with the project; the two filesystems are
+    # simply isolated. ``_resolve_source`` below stages the sandbox copy onto the
+    # host so ``deploy`` works no matter which backend built the files.
+    def _host_dir(self, requested: str | None) -> tuple[Path | None, str | None]:
+        """Resolve the project on the host, tolerating an in-sandbox path.
+
+        An absolute path from inside the sandbox (``/home/tenki/app``) is outside
+        the host workspace, so the containment check rejects it. That is expected
+        rather than an error: return ``None`` and let the staging bridge try.
+        """
+        try:
+            return self._resolve_project_dir(requested), None
+        except ValueError as exc:
+            return None, str(exc)
+
+    def _resolve_source(
+        self, requested: str | None, host_dir: Path | None
+    ) -> tuple[Path | None, StagedProject | None]:
+        """Locate the project, bridging out of the execution sandbox if needed.
+
+        Returns ``(project_dir, staged)``; ``staged`` is non-None only when the
+        directory came from the sandbox and must be cleaned up by the caller.
+        """
+        if host_dir is not None and host_dir.is_dir() and any(host_dir.iterdir()):
+            return host_dir, None
+        staged = self._stage_from_sandbox(requested)
+        if staged is not None:
+            return staged.path, staged
+        return None, None
+
+    def _stage_from_sandbox(self, requested: str | None) -> StagedProject | None:
+        """Run the async sandbox staging bridge from this sync code path."""
+        coro = stage_from_sandbox(requested)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            # Callers run inside asyncio.to_thread, so a loop here means an
+            # unexpected context; skipping beats deadlocking on it.
+            logger.warning("web_dev: cannot stage from sandbox inside a running loop")
+            coro.close()
+            return None
+        try:
+            return asyncio.run(coro)
+        except Exception as exc:  # noqa: BLE001 - staging is best-effort
+            logger.warning("web_dev: sandbox staging failed: {}", exc)
+            return None
+
+    def _with_source(
+        self, project: str
+    ) -> tuple[Path | None, StagedProject | None, str | None]:
+        """Project dir + cleanup handle, or a message that says what to do next."""
+        requested = (project or "").strip() or None
+        host_dir, host_error = self._host_dir(requested)
+        src, staged = self._resolve_source(requested, host_dir)
+        if src is not None:
+            return src, staged, None
+        return None, None, self._missing_project_text(requested, host_dir, host_error)
+
+    @staticmethod
+    def _sandbox_root_hint() -> str:
+        """Name the sandbox root the agent's files live in, when knowable."""
+        try:
+            from nanobot.agent.tools.workspace_bridge import sandbox_workspace_root
+
+            coro = sandbox_workspace_root()
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                root = asyncio.run(coro)
+            else:
+                coro.close()
+                return ""
+        except Exception:  # noqa: BLE001 - a hint is optional
+            return ""
+        return f" (the execution sandbox's project root is {root})" if root else ""
+
+    def _missing_project_text(
+        self, requested: str | None, host_dir: Path | None, host_error: str | None
+    ) -> str:
+        """Explain a missing project in terms the model can act on.
+
+        The old wording let the model conclude the deploy was impossible and hand
+        the user a path mismatch. This one says which directory was looked in,
+        that the sandbox was checked too, and the concrete retry.
+        """
+        return (
+            f"no project sources found to deploy. project={requested or '(workspace root)'!r} "
+            f"resolved to {host_dir or '(rejected)'} on the host"
+            + (f" [{host_error}]" if host_error else "")
+            + ", and staging the directory out of the execution sandbox"
+            + self._sandbox_root_hint()
+            + " produced nothing either. Create the project inside the sandbox first (sandbox "
+            "tool: action=write + action=run), then call web_dev action=deploy with "
+            "project=<the directory name in the sandbox> — the sandbox copy is fetched "
+            "automatically, so never tell the user a workspace path mismatch makes the "
+            "deploy impossible."
+        )
+
     async def execute(self, **kwargs: Any) -> ToolResult | str:
         action = str(kwargs.get("action") or "").strip().lower()
         timeout = max(30, min(int(kwargs.get("timeout") or _DEFAULT_TIMEOUT), 900))
         try:
             if action == "scaffold":
-                return self._scaffold(
+                return await self._scaffold(
                     str(kwargs.get("project") or "").strip(),
                     str(kwargs.get("type") or "frontend").strip().lower(),
                 )
@@ -239,7 +353,8 @@ class WebDevTool(Tool):
                     timeout,
                 )
             if action == "set_env":
-                return self._set_env(
+                return await asyncio.to_thread(
+                    self._set_env,
                     str(kwargs.get("project") or "").strip(),
                     str(kwargs.get("name") or "").strip(),
                     str(kwargs.get("value") or ""),
@@ -255,8 +370,14 @@ class WebDevTool(Tool):
             logger.exception("web_dev error")
             return ToolResult.error(f"web_dev error: {type(exc).__name__}: {exc}")
 
-    def _scaffold(self, project: str, kind: str) -> ToolResult | str:
-        """Create a starter web project directory."""
+    async def _scaffold(self, project: str, kind: str) -> ToolResult | str:
+        """Create a starter web project directory.
+
+        The files go into the **execution sandbox** when one is selected, because
+        that is the filesystem the agent's own write/run tools see; scaffolding
+        onto the host would produce a project the model could not then edit.
+        With no sandbox configured the host workspace is used as before.
+        """
         if not project:
             return ToolResult.error("project (a directory name) is required to scaffold")
         if kind not in {"frontend", "backend", "fullstack"}:
@@ -265,13 +386,65 @@ class WebDevTool(Tool):
             return ToolResult.error(
                 "project name must start with a letter/number and contain only [A-Za-z0-9_.-]"
             )
+        files = self._scaffold_files(project, kind)
+        remote_dir = await self._push_files_to_sandbox(project, files)
+        if remote_dir:
+            return (
+                f"Scaffolded a {kind} web project in {remote_dir} (inside the execution sandbox).\n"
+                "Edit those files with the sandbox tools (action=write / action=run), then call "
+                f"web_dev with action=deploy and project={project} — that directory is fetched out "
+                "of the sandbox automatically, so no path translation is needed."
+            )
         dest = self._resolve_project_dir(project)
         if dest.exists() and any(dest.iterdir()):
             return ToolResult.error(f"project directory {dest} already exists and is not empty")
+        dest.mkdir(parents=True, exist_ok=True)
+        for rel, content in files.items():
+            target = dest / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        return (
+            f"Scaffolded a {kind} web project in {dest}.\n"
+            "Use the filesystem tools to edit the files (write_file/edit_file/apply_patch), "
+            "then call web_dev with action=deploy and project=<dir> to ship it to Vercel."
+        )
 
+    async def _push_files_to_sandbox(self, project: str, files: dict[str, str]) -> str | None:
+        """Write a scaffold into the active sandbox. Returns the remote dir, or None.
+
+        Best-effort by design: no sandbox (or an unwritable one) falls back to the
+        host workspace so scaffolding never fails outright.
+        """
+        from nanobot.agent.tools.workspace_bridge import (
+            remote_workspace_root,
+            resolve_remote_executor,
+        )
+
+        try:
+            executor = await resolve_remote_executor()
+            if not executor.available:
+                return None
+            root = (await remote_workspace_root() or "").rstrip("/")
+            if not root:
+                return None
+            remote_dir = f"{root}/{project}"
+            for rel, content in files.items():
+                path = f"{remote_dir}/{rel}"
+                if executor.native is not None:
+                    await asyncio.to_thread(executor.native.files.write, path, content)
+                else:
+                    await executor.backend.write(path, content)  # type: ignore[attr-defined]
+            return remote_dir
+        except Exception as exc:  # noqa: BLE001 - fall back to the host
+            logger.warning("web_dev: sandbox scaffold failed, using host workspace: {}", exc)
+            return None
+
+    def _scaffold_files(self, project: str, kind: str) -> dict[str, str]:
+        """The starter file set for *kind*, as ``{relative path: content}``."""
+        slug = re.sub(r"[^A-Za-z0-9_-]", "-", project)
+        files: dict[str, str] = {".gitignore": _GITIGNORE}
         if kind == "frontend":
-            dest.mkdir(parents=True, exist_ok=True)
-            (dest / "index.html").write_text(
+            files["index.html"] = (
                 "<!doctype html>\n"
                 "<html lang=\"en\">\n"
                 "<head>\n"
@@ -285,18 +458,17 @@ class WebDevTool(Tool):
                 "</body>\n"
                 "</html>\n"
             )
-            (dest / "vercel.json").write_text('{"framework":null}\n')
-            (dest / ".gitignore").write_text(_GITIGNORE)
-        elif kind == "backend":
-            dest.mkdir(parents=True, exist_ok=True)
-            (dest / "package.json").write_text(
+            files["vercel.json"] = '{"framework":null}\n'
+            return files
+        if kind == "backend":
+            files["package.json"] = (
                 '{\n'
                 '  "name": "%s",\n'
                 '  "type": "module",\n'
                 '  "scripts": { "start": "node server.js" }\n'
-                '}\n' % re.sub(r"[^A-Za-z0-9_-]", "-", project)
+                '}\n' % slug
             )
-            (dest / "server.js").write_text(
+            files["server.js"] = (
                 'import { createServer } from "node:http";\n'
                 'const port = process.env.PORT || 3000;\n'
                 'const server = createServer((req, res) => {\n'
@@ -305,73 +477,76 @@ class WebDevTool(Tool):
                 '});\n'
                 'server.listen(port, () => console.log(`listening on ${port}`));\n'
             )
-            (dest / "vercel.json").write_text(
+            files["vercel.json"] = (
                 '{"version":2,"builds":[{"src":"server.js","use":"@vercel/node"}],'
                 '"routes":[{"src":"/(.*)","dest":"server.js"}]}\n'
             )
-            (dest / ".gitignore").write_text(_GITIGNORE)
-        else:  # fullstack
-            dest.mkdir(parents=True, exist_ok=True)
-            (dest / "package.json").write_text(
-                '{\n'
-                '  "name": "%s",\n'
-                '  "type": "module",\n'
-                '  "scripts": { "start": "node server.js" }\n'
-                '}\n' % re.sub(r"[^A-Za-z0-9_-]", "-", project)
-            )
-            (dest / "server.js").write_text(
-                'import { createServer } from "node:http";\n'
-                'import { readFile } from "node:fs/promises";\n'
-                'const port = process.env.PORT || 3000;\n'
-                'const server = createServer(async (req, res) => {\n'
-                '  if (req.url.startsWith("/api/")) {\n'
-                '    res.setHeader("Content-Type", "application/json");\n'
-                '    res.end(JSON.stringify({ ok: true, data: "from backend" }));\n'
-                '  } else {\n'
-                '    res.setHeader("Content-Type", "text/html");\n'
-                '    res.end(await readFile(new URL("./index.html", import.meta.url), "utf-8"));\n'
-                '  }\n'
-                '});\n'
-                'server.listen(port, () => console.log(`listening on ${port}`));\n'
-            )
-            (dest / "index.html").write_text(
-                "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\" />\n"
-                "  <title>Fullstack App</title>\n</head>\n<body>\n  <h1>Fullstack App</h1>\n"
-                "  <p>API at <code>/api</code></p>\n</body>\n</html>\n"
-            )
-            (dest / ".gitignore").write_text(_GITIGNORE)
-
-        return (
-            f"Scaffolded a {kind} web project in {dest}.\n"
-            "Use the filesystem tools to edit the files (write_file/edit_file/apply_patch), "
-            "then call web_dev with action=deploy and project=<dir> to ship it to Vercel."
+            return files
+        # fullstack
+        files["package.json"] = (
+            '{\n'
+            '  "name": "%s",\n'
+            '  "type": "module",\n'
+            '  "scripts": { "start": "node server.js" }\n'
+            '}\n' % slug
         )
+        files["server.js"] = (
+            'import { createServer } from "node:http";\n'
+            'import { readFile } from "node:fs/promises";\n'
+            'const port = process.env.PORT || 3000;\n'
+            'const server = createServer(async (req, res) => {\n'
+            '  if (req.url.startsWith("/api/")) {\n'
+            '    res.setHeader("Content-Type", "application/json");\n'
+            '    res.end(JSON.stringify({ ok: true, data: "from backend" }));\n'
+            '  } else {\n'
+            '    res.setHeader("Content-Type", "text/html");\n'
+            '    res.end(await readFile(new URL("./index.html", import.meta.url), "utf-8"));\n'
+            '  }\n'
+            '});\n'
+            'server.listen(port, () => console.log(`listening on ${port}`));\n'
+        )
+        files["index.html"] = (
+            "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\" />\n"
+            "  <title>Fullstack App</title>\n</head>\n<body>\n  <h1>Fullstack App</h1>\n"
+            "  <p>API at <code>/api</code></p>\n</body>\n</html>\n"
+        )
+        return files
 
     def _deploy(self, project: str, yes: bool, timeout: int) -> ToolResult | str:
-        dest = self._resolve_project_dir(project or ".")
-        if not dest.is_dir():
-            return ToolResult.error(f"project directory {dest} does not exist")
-        # Link the project first so deploys are deterministic and self-contained.
-        # ``vercel link --project <name>`` creates the project when it does not
-        # exist yet and writes a local ``.vercel`` link. Without this, running
-        # ``vercel deploy`` from inside a git checkout tries to auto-link the
-        # GitHub repository (which needs a GitHub login connection on the
-        # account) and fails loudly before still deploying. Linking first keeps
-        # the agent deploy non-interactive and free of that noise on the very
-        # first run as well as on later redeploys.
-        proj_name = dest.name or "powerx-app"
-        _run_cli(["link", "--yes", "--project", proj_name], cwd=dest, timeout=timeout)
-        args = ["deploy"]
-        if yes:
-            args.append("--yes")
-        out = _run_cli(args, cwd=dest, timeout=timeout)
-        url = _extract_url(out)
-        base = (
-            f"Deployed project from {dest}.\n{out}\n"
-            "Give the user the live URL below to open the site:"
-        ) if url else f"Deployment finished for {dest}.\n{out}\n"
-        if url:
-            base += f"\n\nLive URL: {url}"
+        dest, staged, missing = self._with_source(project)
+        if dest is None:
+            return ToolResult.error(missing or "no project sources found to deploy")
+        where = (
+            f"{dest} (staged out of the execution sandbox)"
+            if staged is not None
+            else str(dest)
+        )
+        try:
+            # Link the project first so deploys are deterministic and self-contained.
+            # ``vercel link --project <name>`` creates the project when it does not
+            # exist yet and writes a local ``.vercel`` link. Without this, running
+            # ``vercel deploy`` from inside a git checkout tries to auto-link the
+            # GitHub repository (which needs a GitHub login connection on the
+            # account) and fails loudly before still deploying. Linking first keeps
+            # the agent deploy non-interactive and free of that noise on the very
+            # first run as well as on later redeploys. The staged copy keeps the
+            # project directory's name, so the link still targets the right project.
+            proj_name = dest.name or "powerx-app"
+            _run_cli(["link", "--yes", "--project", proj_name], cwd=dest, timeout=timeout)
+            args = ["deploy"]
+            if yes:
+                args.append("--yes")
+            out = _run_cli(args, cwd=dest, timeout=timeout)
+            url = _extract_url(out)
+            base = (
+                f"Deployed project from {where}.\n{out}\n"
+                "Give the user the live URL below to open the site:"
+            ) if url else f"Deployment finished for {where}.\n{out}\n"
+            if url:
+                base += f"\n\nLive URL: {url}"
+        finally:
+            if staged is not None:
+                staged.cleanup()
         return base
 
     def _set_env(self, project: str, name: str, value: str, environment: str, timeout: int) -> ToolResult | str:
@@ -379,30 +554,76 @@ class WebDevTool(Tool):
             return ToolResult.error("name (env var name) is required for set_env")
         if environment not in {"production", "preview", "development"}:
             return ToolResult.error(f"unsupported environment: {environment}")
-        dest = self._resolve_project_dir(project or ".")
-        if not dest.is_dir():
-            return ToolResult.error(f"project directory {dest} does not exist")
-        args = ["env", "add", name, environment]
-        out = _run_cli(args, input_text=value + "\n", cwd=dest, timeout=timeout)
+        dest, staged, missing = self._with_source(project)
+        if dest is None:
+            return ToolResult.error(missing or "no project sources found for set_env")
+        try:
+            # The env var lives on the Vercel project, but the CLI needs a linked
+            # directory to know which project that is — so link the (possibly
+            # staged) copy by name first, exactly as deploy does.
+            _run_cli(
+                ["link", "--yes", "--project", dest.name or "powerx-app"],
+                cwd=dest,
+                timeout=timeout,
+            )
+            args = ["env", "add", name, environment]
+            out = _run_cli(args, input_text=value + "\n", cwd=dest, timeout=timeout)
+        finally:
+            if staged is not None:
+                staged.cleanup()
         return (
             f"Setting env var {name} ({environment}) on the Vercel project.\n{out}\n"
             "Note: after setting env vars, redeploy (action=deploy) so the running deployment picks them up."
         )
 
+    def _project_arg(self, project: str) -> tuple[Path, str, bool]:
+        """Return ``(cwd, project name, name is explicit)`` for the read commands.
+
+        ``status``/``inspect`` do not need the build files, so they never stage.
+        When the project only exists inside the execution sandbox there is no host
+        directory to link, and the project *name* is what the CLI wants: run from
+        the workspace root and pass the name explicitly. Otherwise a sandbox path
+        would come back as "project directory … does not exist" even though the
+        deployment is fine.
+        """
+        host_dir, _error = self._host_dir(project)
+        if host_dir is not None and host_dir.is_dir():
+            return host_dir, host_dir.name, False
+        return self._workspace, Path((project or "").strip()).name, True
+
+    @staticmethod
+    def _read_command(base: list[str], selector: str, cwd: Path, timeout: int) -> str:
+        """Run a read-only Vercel command, naming the project when we must.
+
+        Not every subcommand accepts a positional project name, so a rejected
+        selector is retried without it rather than reported as the answer.
+        """
+        if not selector:
+            return _run_cli(list(base), cwd=cwd, timeout=timeout)
+        out = _run_cli([*base, selector], cwd=cwd, timeout=timeout)
+        if "too many arguments" in out.lower() or "[exit_code=1]" in out:
+            out = _run_cli(list(base), cwd=cwd, timeout=timeout)
+        return out
+
     def _status(self, project: str, timeout: int) -> ToolResult | str:
-        dest = self._resolve_project_dir(project or ".")
+        cwd, pname, explicit = self._project_arg(project)
+        selector = pname if explicit else ""
         lines = []
-        env_out = _run_cli(["env", "ls"], cwd=dest, timeout=timeout)
+        env_out = self._read_command(["env", "ls"], selector, cwd, timeout)
         lines.append("Environment variables:\n" + env_out)
-        deployments_out = _run_cli(["ls"], cwd=dest, timeout=timeout)
+        deployments_out = self._read_command(["ls"], selector, cwd, timeout)
         lines.append("\nRecent deployments:\n" + deployments_out)
+        if explicit:
+            lines.append(
+                f"\nNote: {pname!r} is read by name (its files live in the execution sandbox, "
+                "so there is no host copy to link)."
+            )
         return "\n".join(lines)
 
     def _inspect(self, project: str, timeout: int) -> ToolResult | str:
-        dest = self._resolve_project_dir(project or ".")
-        project_arg = project or "."
-        out = _run_cli(["inspect", project_arg], cwd=dest, timeout=timeout)
-        return out
+        cwd, pname, explicit = self._project_arg(project)
+        project_arg = pname or project or "."
+        return _run_cli(["inspect", project_arg], cwd=cwd, timeout=timeout)
 
 
 # Keep flake-style linting happy with unused import hooks if tool is tweaked.

@@ -171,23 +171,28 @@ Follow this order; each step is one `novita_sandbox` call:
 2. `action=write` the source files (design tokens/theme first, then components).
 3. ONE verification op: `{"action":"run","command":"cd <name> && npm install --no-audit --no-fund && npm run build 2>&1 | tail -20"}`.
    Fix errors reported; do not redeploy blind.
-4. `{"action":"deploy","path":"<name>","project_name":"<name>"}` → deploys to
-   production, automatically disables Vercel deployment protection (so the URL
-   is public and testable), then auto-verifies the live site as a browser
-   would. The report contains the URL plus a `[verify]` block — read it.
+4. **Deploy with the `web_dev` tool:** `web_dev action=deploy project=<name>` →
+   returns the live `https://…vercel.app` URL. There is **no** `deploy` action on
+   the sandbox tool, and the two filesystems are separate — `web_dev` runs on the
+   host while the project lives here. It fetches the sandbox copy out itself
+   (the same bridge `build_artifact` uses), so pass the directory **name** and
+   never report a path mismatch or "/home/nanobot/.nanobot/workspace is not
+   accessible" as a reason the deploy cannot happen: it deploys from the sandbox
+   copy. Set secrets first with `web_dev action=set_env`.
 
 ### Testing deployed sites like a real user (definition of done)
 
 - A task is NOT done when the deploy succeeds — it is done when the LIVE SITE
-  works. Check the verify report: HTTP 200 + `HTML: yes` + your `contains`
-  markers present + key routes (pass `routes:["/about","/api/health"]`) OK.
+  works. After `web_dev action=deploy` returns the URL, fetch it and check it:
+  `{"action":"run","command":"curl -sL -A 'Mozilla/5.0' -o /tmp/live.html -w '%{http_code}' <url> && grep -c '<h1' /tmp/live.html"}`
+  — expect HTTP 200 and your content markers present. Use
+  `web_dev action=inspect project=<name>` for the deployment URL(s) and
+  `web_dev action=status` for env vars and recent deployments.
 - **The #1 false alarm:** a plain `curl` of a fresh Vercel URL can return a
   "Sign in / Vercel Authentication" page even though the site is perfect for
   real visitors (cookie-less non-browser requests get blocked by deployment
-  protection). Do NOT report a broken deploy because of that. The `deploy` op
-  now disables protection itself; if you must check manually use
-  `{"action":"verify","url":"..."}` or at minimum a browser User-Agent:
-  `curl -sL -A "Mozilla/5.0 ..." <url>`.
+  protection). Do NOT report a broken deploy because of that — re-check with a
+  browser User-Agent as in the command above.
 - If verification genuinely fails (404, error page, missing content), fix the
   code and re-run only the failed stage (build → deploy); do not redeploy blind.
 

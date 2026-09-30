@@ -34,6 +34,31 @@ unavailable, tell the user an admin must set `VERCEL_TOKEN`.
 
 Always pass `project` as the directory that contains the code you built.
 
+## When the project lives in the execution sandbox
+
+The agent often builds the app **inside** the execution sandbox (Tenki
+`/home/tenki`, Freestyle `/home/ubuntu/workspace`, Novita `/workspace`, …) while
+`web_dev` runs on the host. Those filesystems are isolated, which used to surface
+as a dead end: *"web_dev is attempting to access a workspace path that is
+inaccessible from the sandbox."*
+
+That is no longer a blocker. `web_dev` bridges it: pass the project **name as it
+exists in the sandbox** (e.g. `project=notes-app`) and the sources are fetched
+out of the sandbox automatically before the deploy, then the temp copy is
+removed. `scaffold` pushes its files into the sandbox for the same reason, so the
+directory you scaffolded is the directory your `action=write` / `action=run`
+tools see.
+
+Rules:
+
+- **Never report a path mismatch as the reason a deploy is impossible.** If the
+  bridge genuinely found nothing it says which directory it looked in and what to
+  do — follow that instead of handing the user the error.
+- `status` / `inspect` never need the files; they take the project name and run
+  against the Vercel project itself.
+- Only the *source* travels. `node_modules`, `.next`, `dist`, `.git` are excluded
+  deliberately — Vercel builds from source.
+
 ## Preview vs production
 
 - `web_dev action=deploy` defaults to a **production** deployment (live at `<project>.vercel.app`).
