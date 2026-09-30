@@ -213,6 +213,26 @@ class EmulatorBootError(RuntimeError):
         self.log_tail = log_tail
 
 
+def focused_window() -> str:
+    """The window that currently has focus, as a string ('' when unknown).
+
+    MEASURED FAILURE (Android 11 / API 30, live): ``dumpsys window windows``
+    exits 1 and prints nothing -- the subcommand was retired -- so the focus
+    query silently returned '' and ``launch`` waited its full 30 s every time
+    before giving up, which reads as "the app is slow to start". ``dumpsys
+    window`` is the working form, with ``dumpsys activity activities`` as a
+    fallback because the two disagree about which window is on top.
+    """
+    for command in (
+        "dumpsys window | grep -i mCurrentFocus",
+        "dumpsys activity activities | grep -i mResumedActivity",
+    ):
+        out = adb_shell(command, timeout=60)["out"].strip()
+        if out:
+            return out
+    return ""
+
+
 # --------------------------------------------------------------------------- #
 # actions
 # --------------------------------------------------------------------------- #
@@ -432,13 +452,13 @@ def action_launch(args: argparse.Namespace) -> int:
         # check below is the real condition.
         deadline = time.time() + 30
         while time.time() < deadline:
-            focus = adb_shell("dumpsys window windows | grep -i mCurrentFocus", timeout=60)["out"]
+            focus = focused_window()
             if pkg in focus:
                 break
             time.sleep(2)
         time.sleep(float(args.settle or 0))
 
-    focus = adb_shell("dumpsys window windows | grep -i mCurrentFocus", timeout=60)["out"].strip()
+    focus = focused_window().strip()
     running = adb_shell(f"pidof {shlex.quote(pkg)}", timeout=60)["out"].strip()
     return emit({"ok": True, "action": "launch", "package": pkg, "component": component,
                  "start_output": f"{res['out']} {res['err']}".strip()[-400:],
@@ -618,7 +638,7 @@ def action_ui(args: argparse.Namespace) -> int:
             entry["center"] = [(x1 + x2) // 2, (y1 + y2) // 2]
         nodes.append(entry)
 
-    focus = adb_shell("dumpsys window windows | grep -i mCurrentFocus", timeout=60)["out"].strip()
+    focus = focused_window().strip()
     # Only the first N: a full hierarchy is thousands of nodes and the model pays
     # for every token, while the actionable controls are in the first screenful.
     limit = int(args.limit or 60)
