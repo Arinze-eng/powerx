@@ -41,6 +41,11 @@ YOUTUBE_SCOPES = (
 
 _FLOW_TTL_S = 600
 
+# How long a grant Google has already rejected reads as disconnected without
+# asking again. Long enough to stop a polling UI from hammering the token
+# endpoint, short enough that a fresh connect is never masked.
+_DEAD_GRANT_TTL_S = 60.0
+
 
 class YouTubeOAuthError(Exception):
     """Safe, user-facing error for a YouTube OAuth request."""
@@ -167,6 +172,9 @@ class YouTubeOAuthManager:
     def __init__(self) -> None:
         self._flows: dict[str, _YouTubeFlow] = {}
         self._store = YouTubeCredentialStore()
+        # user_id -> monotonic deadline until which a rejected grant stays
+        # reported as disconnected (see _grant_is_live).
+        self._dead_grants: dict[str, float] = {}
 
     # -- flow lifecycle -----------------------------------------------------
 
@@ -242,6 +250,9 @@ class YouTubeOAuthManager:
         except YouTubeCredentialError as exc:
             raise YouTubeOAuthError(str(exc), status=500) from exc
 
+        # A fresh grant supersedes any negative verdict on the old one.
+        self._dead_grants.pop(flow.user_id, None)
+
         return {
             "status": "connected",
             "channel_id": channel_id,
@@ -260,6 +271,15 @@ class YouTubeOAuthManager:
             return {"connected": False, "configured": configured}
         if not creds:
             return {"connected": False, "configured": configured}
+        if not await self._grant_is_live(user_id, creds):
+            # The row exists but the grant behind it is dead. Reporting
+            # "connected" here would show a channel title with no way back to
+            # Connect while every tool call fails, so report the truth.
+            return {
+                "connected": False,
+                "configured": configured,
+                "needs_reconnect": True,
+            }
         return {
             "connected": True,
             "configured": configured,
@@ -276,6 +296,7 @@ class YouTubeOAuthManager:
                 await self._store.delete_credentials(user_id)
             except YouTubeCredentialError as exc:
                 raise YouTubeOAuthError(str(exc), status=500) from exc
+        self._dead_grants.pop(user_id, None)
         return {"connected": False}
 
     # -- token access for the agent tool ------------------------------------
@@ -312,6 +333,41 @@ class YouTubeOAuthManager:
         return creds.get("access_token")
 
     # -- internals ----------------------------------------------------------
+
+    async def _grant_is_live(self, user_id: str, creds: dict[str, Any]) -> bool:
+        """Whether the stored grant still works, refreshing a stale token.
+
+        Delegates to :meth:`access_token_for_user`, which raises
+        :class:`YouTubeOAuthError` when Google rejects the stored refresh
+        token and persists a renewed one otherwise. Only a definite rejection
+        counts as dead: a network blip keeps reporting the row as-is, so a
+        transient outage never looks like a disconnect.
+
+        *creds* is passed in because the caller already read it; an access
+        token that has not expired needs no further work and no second read.
+        """
+        deadline = self._dead_grants.get(user_id)
+        now = time.monotonic()
+        if deadline is not None:
+            if now < deadline:
+                return False
+            self._dead_grants.pop(user_id, None)
+        expiry = _parse_expiry(creds.get("token_expiry"))
+        if expiry is not None and expiry > datetime.now(timezone.utc) + timedelta(
+            seconds=60
+        ):
+            return True
+        try:
+            token = await self.access_token_for_user(user_id)
+        except YouTubeOAuthError:
+            self._dead_grants[user_id] = now + _DEAD_GRANT_TTL_S
+            return False
+        except Exception:
+            return True
+        if token:
+            return True
+        self._dead_grants[user_id] = now + _DEAD_GRANT_TTL_S
+        return False
 
     def _prune(self) -> None:
         now = time.monotonic()
