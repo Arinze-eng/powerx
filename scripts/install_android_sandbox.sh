@@ -43,6 +43,14 @@ export DEBIAN_FRONTEND=noninteractive
 step() { echo "==> $*"; }
 ok() { echo "    ok: $*"; }
 
+# The completion marker is cleared up front, before any work: on a re-run the
+# previous run's marker is still on disk, and `status` reads only that file -- so
+# without this a second install reported "done" ~25 s in, while apt and
+# sdkmanager were still working. Measured on the Freestyle VM (2026-09-30): a
+# re-run was declared finished at 27.7 s of a job that takes minutes cold.
+rm -f "$HOME_DIR/.install.done"
+echo "install started $(date -u +%FT%TZ)" > "$HOME_DIR/.install.running"
+
 # --------------------------------------------------------------------------- #
 # 1. KVM access
 # --------------------------------------------------------------------------- #
@@ -255,5 +263,6 @@ ACCEL_NOTE="accel: none (no /dev/kvm -- software emulation, slow)"
 if [ -e /dev/kvm ]; then
   ACCEL_NOTE="accel: /dev/kvm present -- hardware acceleration"
 fi
+rm -f "$HOME_DIR/.install.running"
 echo "ANDROID_READY $SYSTEM_IMAGE ($ACCEL_NOTE)" | tee "$HOME_DIR/.install.done"
 echo "==> done. Boot it with: android_cli.py boot"

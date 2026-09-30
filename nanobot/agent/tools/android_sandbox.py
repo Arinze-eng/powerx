@@ -33,14 +33,18 @@ Measured 2026-09-30, because it decides whether this tool is usable at all:
   launch, a 11-node ``ui`` dump, a tap on a real node, text, a 44 KB screenshot,
   push/pull round-trip, logcat, uninstall.
 * On a **Tenki container** (4 GB, no /dev/kvm) the emulator still runs: it falls
-  back to software emulation, which is minutes slower and is what the tool's
-  "still booting" answer is for. That fallback needs the emulator's own runtime
-  libraries installed -- a bare image fails at the very first load with
-  ``error while loading shared libraries: libX11.so.6``, which ``install`` now
-  fixes and ``doctor`` now names.
+  back to software emulation and Android 11 does boot -- measured at ~20 minutes
+  against ~50 s, with the guest handed 1536 MB instead of the AVD's 2048 MB
+  because a larger guest leaves a 4 GB host swapping and the boot never finishes.
+  That fallback needs the emulator's own runtime libraries installed -- a bare
+  image fails at the very first load with ``error while loading shared libraries:
+  libX11.so.6``, which ``install`` now fixes and ``doctor`` now names. Because
+  the boot outlives a single sandbox command, ``boot`` answers
+  ``{"booting": true}`` on such a host and the model polls ``state``.
 
 So: a VM backend with nested virtualisation is the fast path; a container without
-/dev/kvm works but is slow, and ``doctor`` is where that difference is visible.
+/dev/kvm works but is slow, and ``doctor`` is where that difference is visible
+(``ready``, ``runtime.hardware``, ``runtime.guest_memory_mb``).
 
 HOW IT IS INSTALLED
 -------------------

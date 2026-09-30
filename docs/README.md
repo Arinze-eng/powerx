@@ -44,6 +44,7 @@ Pick the row that matches what you want to accomplish next:
 | Expose an OpenAI-compatible endpoint | [OpenAI-Compatible API](./openai-api.md) |
 | Generate and use an API key | [API Platform Keys](./api-platform-keys.md) |
 | Run media forensics in a sandbox | [Deploying Media Forensics](./deploying-media-forensics.md) |
+| Install, drive, and read an Android app with no screen | [Android in a Sandbox](./android-sandbox.md) |
 
 For shorter, outcome-focused walkthroughs, browse the [task guide index](./guides/README.md).
 

@@ -55,6 +55,10 @@ AVD_NAME = os.environ.get("ANDROID_AVD_NAME", "powerx")
 SYSTEM_IMAGE = os.environ.get("ANDROID_SYSTEM_IMAGE", "system-images;android-30;google_apis;x86_64")
 INSTALL_LOG = HOME_DIR / "install.log"
 INSTALL_DONE = HOME_DIR / ".install.done"
+#: Written by the installer while it runs and removed when it finishes, so a
+#: second install is never mistaken for a finished one (the old marker file
+#: used to still be on disk, and `status` reads only the marker).
+INSTALL_RUNNING = HOME_DIR / ".install.running"
 BOOT_LOG = HOME_DIR / "emulator.log"
 
 ADB = str(SDK / "platform-tools" / "adb")
@@ -389,31 +393,45 @@ def _system_image_path() -> Path:
 
 
 def missing_emulator_libs() -> list[str]:
-    """Shared libraries the emulator binary cannot resolve (empty when fine).
+    """Libraries the loader itself cannot resolve (empty when fine).
 
     This is what a bare image fails on first -- measured 2026-09-30 on Tenki:
     ```
     emulator: error while loading shared libraries: libX11.so.6
     ```
-    and with only libX11.so.6 fixed, a real launch segfaulted on
-    ``libX11-xcb.so.1``, which the emulator dlopen()s and ldd therefore cannot
-    see. Both are reported so `doctor` names the fix instead of the symptom.
+    Only `ldd`'s own "not found" lines are reported, because they are the only
+    ones that are a fact about the runtime rather than a guess about it. An
+    earlier revision of this function also flagged the names the launcher
+    dlopen()s (libX11-xcb.so.1, libpulse.so.0) whenever `ldconfig -p` did not
+    list them, and that was wrong: measured on the Freestyle VM, which boots
+    Android in ~50 s, `ldconfig` does not list libX11-xcb.so.1 either, so it was
+    reporting a healthy host as unable to load the emulator. Whether the binary
+    really loads is answered by running it -- see ``emulator_load_error``.
     """
     if not Path(EMULATOR).is_file():
         return []
     resolved = run(["ldd", EMULATOR], timeout=40)["out"]
     found = {line.split("=>")[0].strip() for line in resolved.splitlines()
              if "not found" in line}
-    # dlopen-only names, checked by hand: not in ldd, fatal at first launch.
-    for name in ("libX11-xcb.so.1", "libpulse.so.0"):
-        if name not in _ldconfig_names():
-            found.add(name)
     return sorted(found)
 
 
-def _ldconfig_names() -> set[str]:
-    out = run(["ldconfig", "-p"], timeout=40)["out"]
-    return {line.split(" => ")[0].strip() for line in out.splitlines() if " => " in line}
+def emulator_load_error() -> str:
+    """The emulator binary's own words when it will not start, else "".
+
+    The launcher dlopen()s X11 and audio at runtime, which `ldd` cannot see, so
+    the only honest readiness signal is asking the binary to load. `-version`
+    returns in milliseconds when it works.
+    """
+    if not Path(EMULATOR).is_file():
+        return ""
+    res = run([EMULATOR, "-version"], timeout=40)
+    text = "\n".join(x for x in (res["out"], res["err"]) if x).strip()
+    if res.get("code") == 0 or "Android emulator version" in text:
+        return ""
+    if res.get("timeout"):
+        return ""  # a slow host is not a broken one
+    return (text or "the emulator binary exited without output")[:300]
 
 
 def emulator_runtime_report() -> dict[str, Any]:
@@ -479,21 +497,30 @@ def action_doctor(_: argparse.Namespace) -> int:
         "emulator_process": emulator_running(),
         "java": (run(["java", "-version"], timeout=30)["err"] or "").splitlines()[:1],
         "emulator_missing_libs": missing_emulator_libs(),
+        "emulator_load_error": emulator_load_error(),
     }
     checks["runtime"] = emulator_runtime_report()
     checks["state"] = device_state()
-    # libs are part of readiness now: a host that cannot load the emulator binary
-    # is not "ready" no matter how complete the SDK looks on disk.
+    # Loading the binary is part of readiness now: a host that cannot start the
+    # emulator is not "ready" no matter how complete the SDK looks on disk. This
+    # is the binary's own verdict (see emulator_load_error), not a guess from a
+    # library list -- the guess reported healthy hosts as broken.
     checks["ready"] = bool(
         checks["adb_present"] and checks["emulator_present"]
         and checks["avd_ini_present"] and not checks["emulator_missing_libs"]
+        and not checks["emulator_load_error"]
     )
     checks["installed"] = bool(checks["install_done"])
-    if checks["emulator_missing_libs"]:
+    if checks["emulator_missing_libs"] or checks["emulator_load_error"]:
+        why = ""
+        if checks["emulator_missing_libs"]:
+            why = " (unresolved: " + ", ".join(checks["emulator_missing_libs"]) + ")"
+        elif checks["emulator_load_error"]:
+            why = " -- " + checks["emulator_load_error"]
         note = (
-            "Not ready: the emulator binary cannot load "
-            f"({', '.join(checks['emulator_missing_libs'])}). Run action='install' to "
-            "install its runtime libraries, then action='doctor' again."
+            "Not ready: the emulator binary cannot load" + why + ". Run "
+            "action='install' to install its runtime libraries, then "
+            "action='doctor' again."
         )
     elif not (checks["adb_present"] and checks["emulator_present"]):
         note = ("Not ready: run the installer (action='install'), then action='status' "
@@ -520,17 +547,24 @@ def action_status(_: argparse.Namespace) -> int:
     if INSTALL_LOG.is_file():
         raw = INSTALL_LOG.read_text(errors="replace")
         tail = "\n".join(raw.splitlines()[-25:])
+    running = INSTALL_RUNNING.is_file()
+    if done:
+        note = "Install finished. Run action='doctor', then action='boot'."
+    elif running:
+        note = "Still installing. Poll again in ~30s. Do not tell the user to check back."
+    else:
+        note = (
+            "No install has run yet (no marker). Start one with the android tool's "
+            "action='install', then poll this action."
+        )
     return emit({
         "ok": True,
         "action": "status",
         "done": bool(done),
         "done_marker": done,
+        "running": running,
         "log_tail": tail[-1800:],
-        "note": (
-            "Install finished. Run action='doctor', then action='boot'."
-            if done else
-            "Still installing. Poll again in ~30s. Do not tell the user to check back."
-        ),
+        "note": note,
     })
 
 
@@ -607,9 +641,14 @@ def action_state(_: argparse.Namespace) -> int:
         # or already dead, and the agent cannot read a file inside the sandbox.
         payload["emulator_log_tail"] = emulator_log_tail(700)
         payload["note"] = (
-            "Not booted yet. If the process is running, keep polling; if it is "
-            "gone, run action='doctor' (a missing library or /dev/kvm is the "
-            "usual reason)."
+            "Not booted yet. The emulator process is alive, so keep polling: this "
+            "is a slow host, not a broken one. Measured boot times: ~50 s with "
+            "/dev/kvm, ~20 minutes in software emulation on a 4 GB container. Do "
+            "not tell the user to check back -- poll this action yourself."
+            if payload["emulator_process"] else
+            "The emulator is not running. Run action='boot'; if it exits at once, "
+            "run action='doctor' (a missing library or /dev/kvm is the usual "
+            "reason)."
         )
     return emit(payload)
 
