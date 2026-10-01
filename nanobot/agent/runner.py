@@ -75,6 +75,7 @@ from nanobot.utils.helpers import (
 )
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.memory_guard import log_memory
+from nanobot.utils.memory_reclaim import maybe_reclaim
 from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
@@ -957,6 +958,11 @@ class AgentRunner:
                 iteration=iteration,
                 session=(spec.session_key or "-")[:40],
             )
+            # Capping the high-water mark is what lets a second user share the
+            # container: an unbounded RSS ratchet charges the busiest moment to
+            # everyone idle afterwards. Rate limited, so this is tens of
+            # milliseconds at most every 30 s, not per iteration.
+            maybe_reclaim(tag="turn_end")
             conversation_state.observe_response(response, messages)
             context.response = response
             context.tool_calls = list(response.tool_calls)

@@ -43,6 +43,7 @@ from nanobot.session.keys import UNIFIED_SESSION_KEY, last_channel_from_metadata
 from nanobot.utils.evaluator import evaluate_response, resolve_evaluator_prompt
 from nanobot.utils.helpers import sync_workspace_templates
 from nanobot.utils.memory_guard import log_memory
+from nanobot.utils.memory_reclaim import freeze_long_lived, reclaim_memory
 from nanobot.webui.build import BuildMode
 from nanobot.webui.dev import WebUIDevError, WebUIDevServer
 from nanobot.webui.sidebar_state import read_webui_sidebar_state
@@ -925,6 +926,13 @@ def _run_gateway(
         # number when a container began restarting mid-task with no error: the
         # plan's limit is now in the logs next to the usage it was killed at.
         log_memory("gateway_start", version=__version__)
+        # Everything alive at this point -- config, tool registries, provider
+        # pools -- is long-lived. Freezing it means later collections stop
+        # rescanning it, and one reclaim here returns whatever startup left
+        # free, so the footprint the first turn starts from is the floor rather
+        # than the startup peak.
+        freeze_long_lived()
+        reclaim_memory(tag="gateway_ready")
         try:
             await cron.start()
             # Re-read once on first admission to close the watcher subscription window.
