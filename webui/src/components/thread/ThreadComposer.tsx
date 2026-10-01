@@ -32,6 +32,7 @@ import {
   GripVertical,
   History,
   ImageIcon,
+  ListPlus,
   Loader2,
   MessageCircle,
   Mic,
@@ -116,6 +117,10 @@ import { cn } from "@/lib/utils";
 
 const VOICE_SHORTCUT_CODE = "KeyD";
 const VOICE_SHORTCUT_ARIA = "Control+Shift+D";
+//: Sending is a button, and this is the one keyboard equivalent. Plain Enter is
+//: deliberately not it: Enter is a typing key, and on a phone keyboard it is the
+//: only way to start a new line.
+const SEND_SHORTCUT_ARIA = "Control+Enter Meta+Enter";
 const VOICE_ERROR_VISIBLE_MS = 3_500;
 const VOICE_ERROR_FADE_MS = 500;
 type VoiceShortcutPlatform = "apple" | "chromeos" | "linux" | "other" | "windows";
@@ -962,8 +967,6 @@ export function ThreadComposer({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chipRefs = useRef(new Map<string, HTMLButtonElement>());
   const queuedPromptCounterRef = useRef(0);
-  // Only the prompt queued by the immediately preceding Enter can use the second-Enter shortcut.
-  const secondEnterPromptIdRef = useRef<string | null>(null);
   const draggedQueuedPromptIdRef = useRef<string | null>(null);
   const previousPendingQueueKeyRef = useRef(pendingQueueKey);
   const wasStreamingRef = useRef(isStreaming);
@@ -985,7 +988,6 @@ export function ThreadComposer({
   const showProjectPicker = projectPickerAvailable && !workspaceControlsHidden;
 
   useEffect(() => {
-    secondEnterPromptIdRef.current = null;
     skipQueuedPromptPersistRef.current = true;
     setQueuedPrompts(queuedPromptStorageKey ? readQueuedPrompts(queuedPromptStorageKey) : []);
   }, [pendingQueueKey, queuedPromptStorageKey]);
@@ -1039,7 +1041,6 @@ export function ThreadComposer({
   const addFiles = useCallback(
     (files: File[]) => {
       if (interactionDisabled || files.length === 0) return;
-      secondEnterPromptIdRef.current = null;
       const { rejected } = enqueue(files);
       if (rejected.length > 0) {
         setInlineError(formatRejection(rejected[0].reason));
@@ -1495,7 +1496,6 @@ export function ThreadComposer({
   useLayoutEffect(() => {
     if (previousPendingQueueKeyRef.current === pendingQueueKey) return;
     previousPendingQueueKeyRef.current = pendingQueueKey;
-    secondEnterPromptIdRef.current = null;
     setValue("");
     setSelectedSessionMentions([]);
     setInlineError(null);
@@ -1514,7 +1514,6 @@ export function ThreadComposer({
   const appendTranscription = useCallback((text: string) => {
     const transcript = text.trim();
     if (!transcript) return;
-    secondEnterPromptIdRef.current = null;
     setValue((current) => {
       if (!current.trim()) return transcript;
       const separator = /[\s\n]$/.test(current) ? "" : " ";
@@ -1565,7 +1564,6 @@ export function ThreadComposer({
     function onKeyDown(event: KeyboardEvent): void {
       if (!isVoiceShortcutDown(event) || event.repeat || voiceShortcutDownRef.current) return;
       event.preventDefault();
-      secondEnterPromptIdRef.current = null;
       voiceShortcutDownRef.current = true;
       voiceRecorder.beginShortcutHold();
     }
@@ -1772,7 +1770,6 @@ export function ThreadComposer({
     const queuedImages = readyImagesToQueuedImages(readyImages);
     queuedPromptCounterRef.current += 1;
     const id = `queued-prompt-${Date.now()}-${queuedPromptCounterRef.current}`;
-    secondEnterPromptIdRef.current = id;
     setQueuedPrompts((items) => [
       ...items,
       {
@@ -1802,13 +1799,11 @@ export function ThreadComposer({
   ]);
 
   const removeQueuedPrompt = useCallback((id: string) => {
-    secondEnterPromptIdRef.current = null;
     setQueuedPrompts((items) => items.filter((item) => item.id !== id));
     requestAnimationFrame(() => textareaRef.current?.focus());
   }, []);
 
   const editQueuedPrompt = useCallback((prompt: QueuedPrompt) => {
-    secondEnterPromptIdRef.current = null;
     setQueuedPrompts((items) => items.filter((item) => item.id !== prompt.id));
     setValue(prompt.text);
     setSelectedSessionMentions(prompt.sessionMentions ?? []);
@@ -1833,7 +1828,6 @@ export function ThreadComposer({
 
   const moveQueuedPrompt = useCallback((dragId: string, targetId: string) => {
     if (dragId === targetId) return;
-    secondEnterPromptIdRef.current = null;
     setQueuedPrompts((items) => {
       const from = items.findIndex((item) => item.id === dragId);
       const to = items.findIndex((item) => item.id === targetId);
@@ -1847,7 +1841,6 @@ export function ThreadComposer({
 
   const sendQueuedPrompt = useCallback(
     (prompt: QueuedPrompt) => {
-      secondEnterPromptIdRef.current = null;
       const text = prompt.text.trim();
       const queuedImages = queuedImagesToSendImages(prompt.images);
       setQueuedPrompts((items) => items.filter((item) => item.id !== prompt.id));
@@ -1901,7 +1894,6 @@ export function ThreadComposer({
   useEffect(() => {
     const wasStreaming = wasStreamingRef.current;
     wasStreamingRef.current = isStreaming;
-    if (!isStreaming) secondEnterPromptIdRef.current = null;
     if (!wasStreaming || isStreaming || queuedPrompts.length === 0) return;
     if (skipNextQueuedFlushRef.current) {
       skipNextQueuedFlushRef.current = false;
@@ -1911,7 +1903,6 @@ export function ThreadComposer({
   }, [sendNextQueuedPrompt, isStreaming, queuedPrompts.length]);
 
   const handleStop = useCallback(() => {
-    secondEnterPromptIdRef.current = null;
     if (queuedPrompts.length > 0) {
       skipNextQueuedFlushRef.current = true;
     }
@@ -2094,30 +2085,19 @@ export function ThreadComposer({
         return;
       }
     }
-    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-      e.preventDefault();
-      if (canQueueGuidance) {
-        if (!e.repeat) queueGuidancePrompt();
-        return;
-      }
-      const secondEnterPrompt = queuedPrompts.find(
-        (prompt) => prompt.id === secondEnterPromptIdRef.current,
-      );
-      if (
-        isStreaming
-        && value.length === 0
-        && images.length === 0
-        && !e.altKey
-        && !e.ctrlKey
-        && !e.metaKey
-        && secondEnterPrompt
-      ) {
-        if (!e.repeat) sendQueuedPrompt(secondEnterPrompt);
-        return;
-      }
-      secondEnterPromptIdRef.current = null;
-      submit();
+    // Enter is a typing key. It inserts a newline and never submits, so a line
+    // break can never be read as "send" -- and on a phone keyboard Enter is the
+    // only newline there is. Sending is the send button's job; Cmd/Ctrl+Enter is
+    // the one keyboard equivalent, for a physical keyboard.
+    if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+    e.preventDefault();
+    if (e.repeat) return;
+    if (canQueueGuidance) {
+      queueGuidancePrompt();
+      return;
     }
+    submit();
   };
 
   const onInput: React.FormEventHandler<HTMLTextAreaElement> = (e) => {
@@ -2269,7 +2249,6 @@ export function ThreadComposer({
             onDelete={removeQueuedPrompt}
             onEdit={editQueuedPrompt}
             onDragStart={(id) => {
-              secondEnterPromptIdRef.current = null;
               draggedQueuedPromptIdRef.current = id;
             }}
             onDragEnd={() => {
@@ -2347,14 +2326,10 @@ export function ThreadComposer({
             ref={textareaRef}
             value={value}
             onChange={(e) => {
-              secondEnterPromptIdRef.current = null;
               setValue(e.target.value);
               setSlashMenuDismissed(false);
               setCliAppMenuDismissed(false);
               setCursorPosition(e.target.selectionStart ?? e.target.value.length);
-            }}
-            onBlur={() => {
-              secondEnterPromptIdRef.current = null;
             }}
             onInput={onInput}
             onKeyDown={onKeyDown}
@@ -2514,8 +2489,28 @@ export function ThreadComposer({
                 </Tooltip>
               </TooltipProvider>
             ) : null}
+            {isStreaming && canQueueGuidance ? (
+              // Enter used to queue typed text as guidance while a reply streamed.
+              // Enter only types now, so the same action gets a button: the
+              // queued-guidance stack must stay reachable without a keyboard.
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                aria-label={t("thread.composer.queue")}
+                aria-keyshortcuts={SEND_SHORTCUT_ARIA}
+                onClick={queueGuidancePrompt}
+                className={cn(
+                  "thread-composer-action touch-target rounded-full border border-border/70 bg-card text-muted-foreground shadow-[0_2px_8px_rgba(15,23,42,0.05)] hover:bg-muted/65 hover:text-foreground",
+                  isHero ? "h-8 w-8" : "h-9 w-9",
+                )}
+              >
+                <ListPlus className={cn(isHero ? "h-4 w-4" : "h-4 w-4")} />
+              </Button>
+            ) : null}
             <Button
               type={showStopButton || modelNeedsSetup ? "button" : "submit"}
+              aria-keyshortcuts={showStopButton ? undefined : SEND_SHORTCUT_ARIA}
               size="icon"
               disabled={showStopButton ? interactionDisabled : !canSend && !canOpenModelSettings}
               aria-label={
