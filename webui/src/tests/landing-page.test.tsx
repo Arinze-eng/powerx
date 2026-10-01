@@ -131,17 +131,18 @@ describe("LandingPage composer gating", () => {
     expect(onSignIn).not.toHaveBeenCalled();
   });
 
-  it("sends the task on Enter but keeps Shift+Enter for newlines", () => {
+  it("keeps Enter for newlines and sends on Cmd/Ctrl+Enter", () => {
     const { onSignUp } = renderLanding();
     const composer = screen.getByLabelText(
       "Describe what you want CDNAI to work on",
     );
     fireEvent.change(composer, { target: { value: "Do a thing" } });
 
+    fireEvent.keyDown(composer, { key: "Enter" });
     fireEvent.keyDown(composer, { key: "Enter", shiftKey: true });
     expect(onSignUp).not.toHaveBeenCalled();
 
-    fireEvent.keyDown(composer, { key: "Enter" });
+    fireEvent.keyDown(composer, { key: "Enter", ctrlKey: true });
     expect(onSignUp).toHaveBeenCalledTimes(1);
   });
 

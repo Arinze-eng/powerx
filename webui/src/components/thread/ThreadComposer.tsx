@@ -2179,6 +2179,10 @@ export function ThreadComposer({
       ref={formRef}
       onSubmit={(e) => {
         e.preventDefault();
+        // A phone keyboard's "Go"/"Send" key submits the form implicitly, with
+        // no control activating it. Only a real control -- the send button --
+        // should send; Enter is left to the textarea as a newline.
+        if (!(e.nativeEvent as SubmitEvent).submitter) return;
         submit();
       }}
       onDragEnter={(event) => {
@@ -2337,6 +2341,7 @@ export function ThreadComposer({
             onSelect={(e) => setCursorPosition(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
             onClick={(e) => setCursorPosition(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
             onPaste={onPaste}
+            enterKeyHint="enter"
             rows={1}
             placeholder={sessionDragPreview ? "" : resolvedPlaceholder}
             disabled={interactionDisabled}

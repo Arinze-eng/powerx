@@ -533,7 +533,7 @@ CHAT_MINIAPP_HTML = r"""<!DOCTYPE html>
   <footer>
     <div class="row">
       <button class="icon" id="attach" title="Attach file">📎</button>
-      <textarea id="input" placeholder="Message…" rows="1"></textarea>
+      <textarea id="input" placeholder="Message…" rows="1" enterkeyhint="enter"></textarea>
       <button class="send" id="send" title="Send">➤</button>
     </div>
     <input type="file" id="file" style="display:none" />
@@ -722,7 +722,17 @@ CHAT_MINIAPP_HTML = r"""<!DOCTYPE html>
 
   function autoGrow(){ input.style.height='auto'; input.style.height=Math.min(input.scrollHeight,120)+'px'; }
   input.addEventListener('input', autoGrow);
-  input.addEventListener('keydown', function(e){ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); doSend(); } });
+  // Enter is a typing key: it inserts a newline and never sends, so a line
+  // break can never be read as "send" -- and on a phone keyboard Enter is the
+  // only newline there is. The send button is the way to send; Ctrl/Cmd+Enter
+  // is the one keyboard equivalent, for a hardware keyboard.
+  input.addEventListener('keydown', function(e){
+    if (e.key !== 'Enter' || e.isComposing) return;
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+    e.preventDefault();
+    if (e.repeat) return;
+    doSend();
+  });
   sendBtn.addEventListener('click', doSend);
 
   mintToken();

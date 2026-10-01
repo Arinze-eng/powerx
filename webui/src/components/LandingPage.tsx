@@ -254,12 +254,18 @@ export function LandingPage({ onSignIn, onSignUp, onPrivacy }: LandingPageProps)
                 value={task}
                 onChange={(e) => setTask(e.target.value)}
                 onKeyDown={(e) => {
-                  // Enter sends (like the app); Shift+Enter adds a newline.
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    submitTask();
-                  }
+                  // Enter is a typing key: it inserts a newline and never
+                  // submits, so a line break can never be read as "send" -- and
+                  // on a phone keyboard Enter is the only newline there is.
+                  // Ctrl/Cmd+Enter is the one keyboard send, and so is the
+                  // button.
+                  if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
+                  if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+                  e.preventDefault();
+                  if (e.repeat) return;
+                  submitTask();
                 }}
+                enterKeyHint="enter"
                 rows={1}
                 aria-label="Describe what you want CDNAI to work on"
                 placeholder="Give CDNAI a task to work on…"
@@ -303,6 +309,7 @@ export function LandingPage({ onSignIn, onSignUp, onPrivacy }: LandingPageProps)
                   onClick={submitTask}
                   disabled={!canSend}
                   aria-label="Start this task"
+                  aria-keyshortcuts="Control+Enter Meta+Enter"
                   className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-[#0A0A0A] text-white transition-all hover:bg-[#1F1F1F] active:scale-95 disabled:cursor-not-allowed disabled:bg-[#E7E4DF] disabled:text-[#9A968F]"
                 >
                   <ArrowUp className="h-[18px] w-[18px]" />
