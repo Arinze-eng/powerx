@@ -95,7 +95,11 @@ from nanobot.session.model_selection import (
 from nanobot.session.summary import SessionSummary
 from nanobot.triggers.local_turns import LocalTriggerTurnCoordinator
 from nanobot.utils.cancellation import task_is_cancelling
-from nanobot.utils.document import is_image_file, reference_non_image_attachments
+from nanobot.utils.document import (
+    is_image_file,
+    reference_host_images,
+    reference_non_image_attachments,
+)
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.llm_runtime import LLMRuntime
@@ -1286,6 +1290,11 @@ class AgentLoop:
                             if not line.lstrip().startswith("[image:")
                         ).strip()
                         content = f"{prefix}\n\nUser message: {original}" if original else prefix
+                        # Keep the real host paths in the text: the OCR text
+                        # alone sent the model looking in the sandbox for a file
+                        # that only ever existed here, then asking the user to
+                        # re-upload it.
+                        content = reference_host_images(content, ocr_images)
                         image_paths = [
                             path for path in image_paths if path not in ocr_images
                         ]
@@ -2157,6 +2166,9 @@ class AgentLoop:
             if not line.lstrip().startswith("[image:")
         ).strip()
         content = f"{prefix}\n\nUser message: {original}" if original else prefix
+        # The OCR text alone made the model hunt for the file in the sandbox and
+        # then tell the user to re-upload it. Name the real paths it can use.
+        content = reference_host_images(content, image_paths)
         metadata = dict(msg.metadata or {})
         # Keep the legacy telegram_* keys so downstream provider-state logic and
         # any external consumers continue to work, and add generic aliases.

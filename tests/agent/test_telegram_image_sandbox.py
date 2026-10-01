@@ -564,7 +564,11 @@ async def test_vps_image_turn_removes_original_image_after_ocr(tmp_path, monkeyp
     analyze.assert_awaited_once()
     assert ctx.msg.media == []
     assert "/workspace/telegram-attachments/photo.png" not in ctx.msg.content
-    assert str(image) not in ctx.msg.content
+    # The OCR handoff drops the image block, but it must keep naming the host file: the
+    # user reported the model searching the sandbox for an image it already had and then
+    # asking for a re-upload. The local path is what image work is driven from.
+    assert str(image) in ctx.msg.content
+    assert f"- {image.resolve()}" in ctx.msg.content
     assert "VPS IMAGE 123" in ctx.msg.content
     assert ctx.msg.metadata["telegram_images_execution_backend"] == "vps"
 
@@ -609,7 +613,10 @@ async def test_vps_mixed_turn_stages_only_non_image_attachments(tmp_path, monkey
     assert "/workspace/telegram-attachments/report.pdf" in analysis_prompt
     assert str(image) not in analysis_prompt
     assert "/workspace/telegram-attachments/report.pdf" in ctx.msg.content
-    assert str(image) not in ctx.msg.content
+    # The image block goes away, the host path stays: the model still has to be able to
+    # act on the picture the user sent instead of asking for it again.
+    assert str(image) in ctx.msg.content
+    assert f"- {image.resolve()}" in ctx.msg.content
     assert ctx.msg.media == []
     assert "MIXED TURN" in ctx.msg.content
 
@@ -907,7 +914,10 @@ async def test_websocket_vps_image_turn_removes_original_after_ocr(tmp_path, mon
 
     analyze.assert_awaited_once()
     assert ctx.msg.media == []
-    assert str(image) not in ctx.msg.content
+    # Same contract on the WebUI channel: the file itself is gone from the turn, its host
+    # path is not, so the model never has to ask the user to send it again.
+    assert str(image) in ctx.msg.content
+    assert f"- {image.resolve()}" in ctx.msg.content
     assert "WEBSOCKET VPS OCR 789" in ctx.msg.content
     assert ctx.msg.metadata["telegram_images_execution_backend"] == "vps"
 
@@ -920,3 +930,95 @@ def test_sandbox_image_ocr_channel_predicate() -> None:
     assert _uses_sandbox_image_ocr("api") is False
     assert _uses_sandbox_image_ocr("discord") is False
     assert _uses_sandbox_image_ocr(None) is False
+
+
+@pytest.mark.asyncio
+async def test_telegram_image_turn_names_the_host_file_the_model_can_use(
+    tmp_path, monkeypatch
+) -> None:
+    """The OCR text alone made the model hunt for the file in the sandbox.
+
+    The user's report verbatim: *"The image ... is not in the sandbox workspace —
+    it was processed by the host OCR pipeline but never copied into the execution
+    environment. The sandbox only contains github-env.sh. ... Please re-upload the
+    image directly."* for an image sitting in the media directory on this host.
+    """
+    image = tmp_path / "telegram-photo.jpg"
+    image.write_bytes(b"fake-image-bytes")
+    analyze = AsyncMock(return_value="Recognized text: CHANGE MY BACKGROUND")
+    monkeypatch.setattr(NovitaSandboxTool, "analyze_telegram_images", analyze)
+
+    ctx = SimpleNamespace(
+        kind=TurnKind.USER,
+        session_key="telegram:123",
+        msg=InboundMessage(
+            channel="telegram",
+            sender_id="42",
+            chat_id="123",
+            content="Change the background to red",
+            media=[str(image)],
+            metadata={},
+        ),
+    )
+
+    await AgentLoop._prepare_sandbox_images(AgentLoop.__new__(AgentLoop), ctx)
+
+    content = ctx.msg.content
+    # No image block (a text-only model must never receive one), but the path is
+    # named so image work has a starting point.
+    assert ctx.msg.media == []
+    assert f"- {image.resolve()}" in content
+    assert "never ask the user to send it again" in content
+    assert "do not search the sandbox" in content
+    assert "generate_image" in content
+    assert "Change the background to red" in content
+
+
+@pytest.mark.asyncio
+async def test_websocket_image_turn_gets_the_same_host_path_reference(
+    tmp_path, monkeypatch
+) -> None:
+    image = tmp_path / "browser-upload.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nminimal")
+    analyze = AsyncMock(return_value="no text found")
+    monkeypatch.setattr(NovitaSandboxTool, "analyze_telegram_images", analyze)
+
+    ctx = SimpleNamespace(
+        kind=TurnKind.USER,
+        session_key="websocket:123",
+        msg=InboundMessage(
+            channel="websocket",
+            sender_id="42",
+            chat_id="123",
+            content="Change the background to red",
+            media=[str(image)],
+            metadata={},
+        ),
+    )
+
+    await AgentLoop._prepare_sandbox_images(AgentLoop.__new__(AgentLoop), ctx)
+
+    assert ctx.msg.media == []
+    assert f"- {image.resolve()}" in ctx.msg.content
+
+
+def test_reference_host_images_lists_every_path_once() -> None:
+    from nanobot.utils.document import reference_host_images
+
+    out = reference_host_images(
+        "User message: go",
+        ["/media/a.png", "/media/b.jpg", "/media/a.png", "", None],
+    )
+    assert out.count("/media/a.png") == 1
+    assert "- /media/b.jpg" in out
+    assert out.startswith("User message: go")
+
+
+def test_reference_host_images_is_a_noop_without_paths() -> None:
+    from nanobot.utils.document import reference_host_images
+
+    assert reference_host_images("User message: go", []) == "User message: go"
+    assert reference_host_images("User message: go", ["", None]) == "User message: go"
+    # A path that does not exist is still named: the model must not be told the
+    # upload never happened just because a stat failed.
+    assert "/gone/x.png" in reference_host_images("", ["/gone/x.png"])

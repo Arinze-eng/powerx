@@ -435,6 +435,52 @@ def _canonical_local_media_path(path: str) -> str:
     return path
 
 
+def reference_host_images(content: str, image_paths: list[str]) -> str:
+    """Name the host's image files in the text after a sandbox OCR handoff.
+
+    ``nanobot.agent.loop`` reads inbound images with Tesseract inside the
+    execution backend and removes them from ``media`` so a text-only model is
+    never sent an image block. Dropping the *paths* as well broke every image
+    task that needs the pixels: the model saw only the OCR text, went looking
+    for the file in the sandbox it was about to use (where it has never been),
+    and answered — accurately but uselessly — that the upload had never reached
+    the execution environment, then asked the user to re-upload a file already
+    saved on this host.
+
+    Reported by the user verbatim: *"The image ... is not in the sandbox
+    workspace — it was processed by the host OCR pipeline but never copied into
+    the execution environment. The sandbox only contains github-env.sh. ...
+    Please re-upload the image directly."*
+
+    The paths are appended to the turn text instead, with the one fact that
+    settles the confusion: the bytes are here, and the OCR sandbox is gone.
+    """
+    paths: list[str] = []
+    for path in image_paths:
+        if not isinstance(path, str) or not path:
+            continue
+        canonical = _canonical_local_media_path(path)
+        if canonical not in paths:
+            paths.append(canonical)
+    if not paths:
+        return content
+    listing = "\n".join(f"- {path}" for path in paths)
+    block = (
+        "[Attached image file(s) — the user's own uploads, already saved on this host]\n"
+        f"{listing}\n"
+        "The image analysis above is only a text reading of these files. The sandbox it "
+        "was taken in was not this turn's workspace and no longer exists, so do not search "
+        "the sandbox or any remote workspace for the image, do not conclude that the "
+        "upload failed, and never ask the user to send it again — the paths above ARE the "
+        "attachment. Image work (change a background, crop, resize, recolour, composite, "
+        "animate) starts from one of these local paths: pass one to generate_image as "
+        "reference_images, or read it with read_file first. Only if the task genuinely has "
+        "to run inside the sandbox, upload the exact local path with novita_sandbox "
+        "action='upload' before running commands there."
+    )
+    return f"{content}\n\n{block}" if content else block
+
+
 def reference_non_image_attachments(
     content: str, media: list[str],
 ) -> tuple[str, list[str]]:
