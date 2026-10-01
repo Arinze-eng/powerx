@@ -135,6 +135,30 @@ Model ids: `auto` (the default, and what any namespaced id from another
 provider resolves to), `nano-banana:premium`, `flux:premium`,
 `flux:standard`, or an explicit id such as `nano-banana-2`.
 
+#### Cloudinary is first — including inside a sandbox
+
+Cloudinary is not a fallback for when the sandbox lacks a tool; it is the first
+choice for the work it can do, and the agent is instructed to try it before any
+local encode:
+
+| The ask | First tool |
+| --- | --- |
+| Create an image; change a background; restyle, recolour, replace or remove an object; composite two images | `generate_image` |
+| Trim, crop/re-frame, resize, convert/transcode, join clips, poster frame, animate | `cloudinary_video_edit` |
+| Probe, contact sheet, individual frames, transcribe, captions, shorts, YouTube download, background matte | `media_sandbox` (local ffmpeg/rembg) |
+
+Two consequences worth knowing:
+
+- **A file inside the sandbox is still edited by Cloudinary.** Both tools take a
+  local path or an `https://` link, so the agent publishes a sandbox-only file with
+  `{"action":"download_url","path":"…"}` and passes the resulting
+  `https://onlyfiles.com/…` link as `reference_images`/`source`. The same holds for
+  a link the user attached — it is passed straight through, never re-uploaded.
+- **A Cloudinary failure is not a cue to edit locally.** The tool reports the
+  reason (quota exhausted, add-on missing) and the agent is told to retry the same
+  operation or report it. If it does fall back to `media_sandbox`, it says so in
+  the reply instead of presenting a local ffmpeg/Pillow edit as the hosted result.
+
 #### Cloudinary video editing
 
 `cloudinary_video_edit` edits video by storing the clip once and asking
@@ -486,4 +510,5 @@ Use the reference image. Keep the same robot and composition, change the palette
 | AIHubMix says `Incorrect model ID` | Use `model: "gpt-image-2-free"`; nanobot expands it to the required `openai/gpt-image-2-free` model path internally |
 | Generation times out | Try a smaller/default image size, set AIHubMix `extraBody.quality` to `"low"`, or retry later |
 | Reference image rejected | Reference image paths must be inside the workspace or nanobot media directory and must be valid image files. An `https://` reference (an attachment the user sent as a link) is downloaded into `media/references/` first and then validated, so a rejection means the download failed or the link served a web page rather than an image — the error says which |
+| The agent edits an image or video with ffmpeg/Pillow inside the sandbox instead of using Cloudinary | Cloudinary is meant to be the first tool for generation and for trims, crops, resizes, transcodes, joins, posters and image edits — `media_sandbox` covers only probe/watch/frames/transcribe/captions/shorts/download/bg and the fallback path. The rule lives in `nanobot/templates/agent/sandbox_workspace.md` ("MEDIA ROUTING"), the `image-generation` and `video-editing` skills, and both tool descriptions; a reply that edits locally without naming a Cloudinary failure is an older build |
 | The agent asks the user to re-upload a file they just attached | The attachment arrived as an onlyfiles.com link, not a file on this host. `generate_image` and `cloudinary_video_edit` accept such a link directly for `reference_images`/`source`; a reply asking for a re-upload means an older build, or the link itself is dead |

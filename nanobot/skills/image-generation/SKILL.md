@@ -24,6 +24,24 @@ returns one, and never tell the user image generation is unavailable while
 Video work is a separate tool, `cloudinary_video_edit`, which stores a clip once
 and renders trims, crops, transcodes, posters and concatenations of it.
 
+## Sandbox turns: this does not change
+
+Even when an execution sandbox is active and `media_sandbox` (ffmpeg, Pillow,
+OpenCV, rembg) is in the tool list, image work still goes through `generate_image`
+first. Running Pillow or ImageMagick inside the sandbox for an edit the provider
+renders — recolour, crop, resize, change a background, composite two images — is
+the wrong first move even when it would work, even when the file is already in
+the sandbox, and even when an earlier turn did it that way.
+
+`media_sandbox` is for what the provider cannot do: `probe`, contact sheets,
+`transcribe`, `captions`, `bg` (a rembg matte), and formats Cloudinary refuses.
+Use it only after `generate_image` has been tried, or for one of those.
+
+A picture that only exists inside the sandbox can still be edited by the provider:
+publish it (`{"action":"download_url","path":"<path in the sandbox>"}`) and pass
+the returned `https://onlyfiles.com/…` link as `reference_images`. A link the user
+attached goes straight in, unwrapped.
+
 ## Attachments The User Just Sent
 
 A file the user attaches in the chat may reach you as an `https://` link rather

@@ -591,6 +591,12 @@ class MediaSandboxTool(Tool):
     @property
     def description(self) -> str:
         return (
+            "ROUTE FIRST — for an image or a video EDIT, Cloudinary is the primary provider: "
+            "call generate_image (images) or cloudinary_video_edit (trim, crop, resize, "
+            "transcode, concat, poster, animate) BEFORE this tool, even when you are inside a "
+            "sandbox and the file is already here. This tool owns what Cloudinary does not do "
+            "(probe, watch, frames, transcribe, captions, shorts, download, bg) and is the "
+            "fallback when a Cloudinary render fails — never the first move for an edit. "
             "Video/audio editing in the user's execution sandbox using local ffmpeg — no "
             "paid API. NEVER runs ffmpeg or an encode on the application host. "
             "MANDATORY FIRST STEP: the first media action in a fresh sandbox MUST begin "

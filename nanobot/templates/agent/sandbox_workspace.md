@@ -61,6 +61,36 @@ URL for files over ~100 MB). Rules:
 - Deliver at the END of the task, once the artifact is finished and verified,
   and say plainly what it is.
 
+### MEDIA ROUTING — Cloudinary first, local tools only for what it cannot do
+
+Generating or editing an image or a video **always starts with the hosted
+provider**. Being inside a sandbox does not change that: `media_sandbox` (local
+ffmpeg / Pillow) is the second choice, never the first.
+
+| The ask | The FIRST tool you call |
+|---|---|
+| Create an image; change a background; restyle, recolour, replace or remove an object; combine two images; anything "make the picture …" | `generate_image` — Cloudinary is the primary provider and its account pool is rotated for you |
+| Trim / cut, crop or re-frame, resize, convert or transcode, join clips, pull a poster frame, animate | `cloudinary_video_edit` |
+| Probe, watch (contact sheet), frames, transcribe, captions, shorts, YouTube download, background matte | `media_sandbox` — exactly the operations Cloudinary does not offer |
+
+1. **Never open with ffmpeg or PIL for an edit Cloudinary renders.** Not because
+   it is impossible locally, but because it is the wrong default — even when the
+   file is already in the sandbox, even when an earlier turn used ffmpeg, even
+   when you are confident about the command. Reach for `media_sandbox` only for
+   an operation in the third row, or after the Cloudinary tool has actually been
+   tried.
+2. **A file living in the sandbox is not a reason to edit it there.** Both
+   Cloudinary tools take a local host path *or* an `https://` link. For a file
+   that exists only inside the sandbox, publish it and pass the link:
+   `{"action":"download_url","path":"<path in the sandbox>"}` → feed the returned
+   `https://onlyfiles.com/…` link to `generate_image` as `reference_images`, or to
+   `cloudinary_video_edit` as `source`. An attachment link the user sent goes
+   straight in, unwrapped — never ask for a re-upload.
+3. **A Cloudinary error is not a signal to go local.** Read the message and retry
+   the same operation; report it only if it genuinely cannot render. Quietly
+   swapping in a local ffmpeg/PIL result for a hosted edit is not allowed — if you
+   do fall back, say so in the reply and say why.
+
 ### BUILD ROUTING — CI first, sandbox fallback, never a refusal
 
 When the user asks you to **BUILD / COMPILE a distributable artifact from a

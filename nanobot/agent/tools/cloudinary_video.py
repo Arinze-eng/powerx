@@ -206,6 +206,10 @@ class CloudinaryVideoEditTool(Tool):
     def description(self) -> str:
         return (
             "Edit a video by storing it in Cloudinary and rendering a transformation of it. "
+            "This is the FIRST tool for a video edit — call it before media_sandbox/ffmpeg "
+            "for trims, crops, resizes, format changes, joins and poster frames, including "
+            "when the clip is already inside the sandbox (publish it with the sandbox tool's "
+            "download_url and pass the resulting link as source). "
             "Actions: trim (keep a start/end span), crop (re-frame or resize), transcode "
             "(change format, fps or quality), poster (pull a still frame), concat (append a "
             "second clip), describe (report the stored asset), animate (generative "

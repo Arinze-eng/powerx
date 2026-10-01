@@ -138,8 +138,11 @@ class ImageGenerationTool(Tool):
     def description(self) -> str:
         return (
             "Generate or edit images and store them as persistent artifacts. "
-            "Returns artifact ids and local paths. For edits, pass prior generated image paths "
-            "or user image paths as reference_images."
+            "Returns artifact ids and local paths. For edits, pass prior generated image paths, "
+            "user image paths or an https:// link the user attached as reference_images. "
+            "This is the FIRST tool for any image work — use it before editing a picture with "
+            "Pillow/ImageMagick/rembg inside a sandbox, which is the fallback for the few "
+            "things it cannot do (a transparent-background matte, a local probe)."
         )
 
     def _provider_config(self) -> ProviderConfig | None:
