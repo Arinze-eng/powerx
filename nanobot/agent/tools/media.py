@@ -643,6 +643,11 @@ class MediaSandboxTool(Tool):
             "Background removal: action='bg' takes a still (PNG with alpha) or a video "
             "(per-frame matte). A video without background gives a transparent .webm; "
             "background='RRGGBB' gives an opaque .mp4 with the original audio re-attached. "
+            "bg is a CUTOUT — it takes the subject out or lays it on a flat colour. It is "
+            "NOT the way to swap one background for another in a still: \"change the "
+            "background to yellow, put it by a beach\" is an image edit, so call "
+            "generate_image with the picture as reference_images. Use bg for a still only "
+            "when the ask really is a transparent matte. "
             "Outputs live in the sandbox: report the paths, and fetch a file out with the "
             "sandbox tool's own download_url action."
         )

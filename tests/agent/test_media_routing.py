@@ -115,6 +115,26 @@ def test_cloudinary_video_description_claims_video_edits_first() -> None:
     assert "source" in description
 
 
+def test_background_swap_on_a_still_is_not_a_bg_job() -> None:
+    """``action="bg"`` is a matte, not a background change.
+
+    This is the exact turn from the report: the model reached for
+    ``media_sandbox {"action":"bg","background":"yellow"}`` to replace the
+    background of a still, because nothing told it that the ask belonged to
+    ``generate_image``. The two must not be left as synonyms anywhere the model
+    reads them.
+    """
+    from nanobot.agent.tools.media import MediaSandboxTool
+
+    description = MediaSandboxTool().description
+    assert "bg is a CUTOUT" in description
+    assert "NOT the way to swap one background for another in a still" in description
+
+    template = _read("nanobot", "templates", "agent", "sandbox_workspace.md")
+    assert "transparent background matte" in template
+    assert "A background *swap* on a still is not a `bg` job" in template
+
+
 def test_docs_record_the_routing_rule() -> None:
     docs = _read("docs", "image-generation.md")
     assert "Cloudinary is first — including inside a sandbox" in docs

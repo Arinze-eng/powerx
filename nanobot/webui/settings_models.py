@@ -26,7 +26,10 @@ import httpx
 
 from nanobot.config.loader import resolve_config_env_vars
 from nanobot.config.schema import Config, FallbackCandidate, ModelPresetConfig, ProviderConfig
-from nanobot.providers.image_generation import get_image_gen_provider
+from nanobot.providers.image_generation import (
+    get_image_gen_provider,
+    image_gen_provider_configs,
+)
 from nanobot.providers.oauth_guidance import OAUTH_CLI_KIT_MISSING_MESSAGE
 from nanobot.providers.registry import PROVIDERS, create_dynamic_spec, find_by_name
 from nanobot.webui.settings_contracts import (
@@ -1427,9 +1430,13 @@ def update_provider_settings(
     if changed:
         setattr(config.providers, provider_key, updated_provider_config)
     image_config = config.tools.image_generation
+    # Resolved, not raw: an unset ``enabled`` means "on whenever a provider
+    # can answer", so the restart warning has to follow the same rule the
+    # loader uses or it would stay silent while live image calls go stale.
+    image_enabled = image_config.resolves_enabled(image_gen_provider_configs(config))
     restart_required = (
         changed
-        and image_config.enabled
+        and image_enabled
         and image_config.provider == provider_key
         and get_image_gen_provider(provider_key) is not None
     )

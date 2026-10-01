@@ -1,8 +1,27 @@
 # Image Generation
 
-nanobot can generate and edit images through the `generate_image` tool. Enable the tool in WebUI Settings, then ask for an image normally in chat; the agent decides when to call it and can keep iterating on generated images in the same conversation.
+nanobot can generate and edit images through the `generate_image` tool, backed by the
+configured provider. Ask for an image normally in chat; the agent decides when to call it
+and can keep iterating on generated images in the same conversation.
 
-The feature is disabled by default. Open **Settings → Image**, choose a configured provider and model, enable image generation, and save. The running gateway applies the change immediately. If that screen is not available in your installed version, use the manual config below.
+The tool registers itself **whenever an image provider can actually answer**. On a
+deployment holding Cloudinary credentials that means `generate_image` is simply there:
+Cloudinary leads the provider order, so it is the first — and usually the only — provider
+tried. There is nothing to switch on first.
+
+`tools.imageGeneration.enabled` is tri-state:
+
+* **unset** (the default) — decide from the providers. On when any provider in the chain
+  has credentials, off when none does, so the tool is never advertised with nothing behind
+  it to serve the call.
+* **`true`** — always register, whatever the provider state.
+* **`false`** — never register. An explicit opt-out is honoured, so a deployment that wants
+  no image calls makes none.
+
+Open **Settings → Image** to pick a different provider and model; the toggle there shows the
+effective state and saving it writes an explicit setting. The running gateway applies the
+change immediately. If that screen is not available in your installed version, use the
+manual config below.
 
 ## Quick Setup
 
@@ -54,7 +73,7 @@ The WebUI hides provider storage details from the user. The agent sees the saved
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `tools.imageGeneration.enabled` | boolean | `false` | Register the `generate_image` tool |
+| `tools.imageGeneration.enabled` | boolean or unset | unset (auto) | Register the `generate_image` tool. Unset means "on when a provider is configured"; `false` is a deliberate opt-out and is honoured |
 | `tools.imageGeneration.provider` | string | `"cloudinary"` | Image provider to try first; the ones after it in the default order are then tried in turn. Supported values: `cloudinary`, `openrouter`, `openai`, `openai_codex`, `custom`, `aihubmix`, `minimax`, `gemini`, `ollama`, `stepfun`, `zhipu`, `modelscope` |
 | `tools.imageGeneration.model` | string | `"openai/gpt-5.4-image-2"` | Provider model name |
 | `tools.imageGeneration.defaultAspectRatio` | string | `"1:1"` | Default ratio when the prompt/tool call does not specify one |
@@ -499,7 +518,7 @@ Use the reference image. Keep the same robot and composition, change the palette
 
 | Symptom | Check |
 |---------|-------|
-| `generate_image` is not available | Enable image generation in **Settings → Image** and save. For manual config changes, restart the gateway |
+| `generate_image` is not available | Check that no config sets `tools.imageGeneration.enabled` to `false` — that is the only thing that withholds the tool now. Otherwise no image provider has credentials: add Cloudinary (`CLOUDINARY_ACCOUNTS`) or a provider key, and restart the gateway |
 | Missing API key error | Configure `providers.<provider>.apiKey`; if using `${VAR_NAME}`, confirm the environment variable is visible to the gateway process |
 | `unsupported image generation provider` | Use `cloudinary`, `openrouter`, `openai`, `openai_codex`, `custom`, `aihubmix`, `minimax`, `gemini`, `ollama`, `stepfun`, `zhipu`, or `modelscope` |
 | `Cloudinary is not configured` | Set `CLOUDINARY_ACCOUNTS` or `CLOUDINARY_URL`, or paste a `cloudinary://key:secret@cloud` entry into the Cloudinary provider's API key field in **Settings → Models** |

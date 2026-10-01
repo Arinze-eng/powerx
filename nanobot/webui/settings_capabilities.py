@@ -23,6 +23,7 @@ from nanobot.optional_features import (
 )
 from nanobot.providers.image_generation import (
     get_image_gen_provider,
+    image_gen_provider_configs,
     image_gen_provider_names,
 )
 from nanobot.providers.registry import find_by_name
@@ -204,7 +205,12 @@ def capability_settings_payload(
             or "https://cloud.langfuse.com",
         },
         "image_generation": {
-            "enabled": image_config.enabled,
+            # The effective state, not the raw setting: with the setting
+            # unset this reports whether a provider can actually answer,
+            # which is what the toggle has to show to be truthful.
+            "enabled": image_config.resolves_enabled(
+                image_gen_provider_configs(config)
+            ),
             "provider": image_config.provider,
             "provider_configured": bool(
                 selected_image_provider and selected_image_provider["configured"]
@@ -480,7 +486,7 @@ def update_image_generation_settings(
             image_config.max_images_per_turn = parsed_max
             changed = True
 
-    if image_config.enabled:
+    if image_config.resolves_enabled(image_gen_provider_configs(config)):
         selected_provider = next(
             (
                 provider

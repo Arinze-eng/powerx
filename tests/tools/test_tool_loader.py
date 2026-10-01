@@ -332,12 +332,24 @@ def test_image_gen_tool_config_cls():
 
 
 def test_image_gen_tool_enabled():
-    from nanobot.agent.tools.image_generation import ImageGenerationTool
-    mock_config = MagicMock()
-    mock_config.image_generation.enabled = True
-    ctx = ToolContext(config=mock_config, workspace="/tmp")
+    """An explicit setting is answered as written.
+
+    Uses the real config class, not a MagicMock: ``enabled`` is tri-state now,
+    and a Mock would answer "truthy" for every state including the one that
+    means "ask the providers" (see
+    ``tests/tools/test_image_generation_auto_enable.py``).
+    """
+    from nanobot.agent.tools.image_generation import (
+        ImageGenerationTool,
+        ImageGenerationToolConfig,
+    )
+
+    tools = MagicMock()
+    tools.image_generation = ImageGenerationToolConfig(enabled=True)
+    ctx = ToolContext(config=tools, workspace="/tmp")
     assert ImageGenerationTool.enabled(ctx) is True
-    mock_config.image_generation.enabled = False
+
+    tools.image_generation = ImageGenerationToolConfig(enabled=False)
     assert ImageGenerationTool.enabled(ctx) is False
 
 

@@ -71,7 +71,7 @@ ffmpeg / Pillow) is the second choice, never the first.
 |---|---|
 | Create an image; change a background; restyle, recolour, replace or remove an object; combine two images; anything "make the picture …" | `generate_image` — Cloudinary is the primary provider and its account pool is rotated for you |
 | Trim / cut, crop or re-frame, resize, convert or transcode, join clips, pull a poster frame, animate | `cloudinary_video_edit` |
-| Probe, watch (contact sheet), frames, transcribe, captions, shorts, YouTube download, background matte | `media_sandbox` — exactly the operations Cloudinary does not offer |
+| Probe, watch (contact sheet), frames, transcribe, captions, shorts, YouTube download, a transparent background matte | `media_sandbox` — exactly the operations Cloudinary does not offer |
 
 1. **Never open with ffmpeg or PIL for an edit Cloudinary renders.** Not because
    it is impossible locally, but because it is the wrong default — even when the
@@ -79,6 +79,9 @@ ffmpeg / Pillow) is the second choice, never the first.
    when you are confident about the command. Reach for `media_sandbox` only for
    an operation in the third row, or after the Cloudinary tool has actually been
    tried.
+   A background *swap* on a still is not a `bg` job either: `action="bg"` is a
+   matte/cutout, while "change the background to yellow" is `generate_image`
+   with the picture as `reference_images`.
 2. **A file living in the sandbox is not a reason to edit it there.** Both
    Cloudinary tools take a local host path *or* an `https://` link. For a file
    that exists only inside the sandbox, publish it and pass the link:

@@ -3647,8 +3647,13 @@ async def test_settings_api_returns_safe_subset_and_updates_whitelist(
         assert search_providers["volcengine"]["credential"] == "api_key"
         assert search_providers["keenable"]["credential"] == "optional_api_key"
         assert search_providers["searxng"]["credential"] == "base_url"
-        assert body["image_generation"]["enabled"] is False
-        assert body["image_generation"]["provider"] == "openrouter"
+        # The reported state is the EFFECTIVE one, not the raw setting: an
+        # unset ``tools.imageGeneration.enabled`` means "on when a provider
+        # can answer", and this config hands openai a key. Reporting the raw
+        # value here is what left Cloudinary-only deployments with the tool
+        # switched off and every image edit falling through to the sandbox.
+        assert body["image_generation"]["enabled"] is True
+        assert body["image_generation"]["provider"] == "cloudinary"
         assert body["image_generation"]["provider_configured"] is False
         assert body["image_generation"]["default_aspect_ratio"] == "1:1"
         image_providers = {
@@ -3700,7 +3705,19 @@ async def test_settings_api_returns_safe_subset_and_updates_whitelist(
         assert provider_body["requires_restart"] is False
         provider_rows = {provider["name"]: provider for provider in provider_body["providers"]}
         assert provider_rows["openrouter"]["configured"] is True
-        assert provider_body["image_generation"]["provider_configured"] is True
+        # The selected image provider is still the config default (cloudinary)
+        # at this point, so its status is whatever that provider's own row
+        # reports. The image provider is switched to openrouter further down,
+        # and that is where the status flips to configured.
+        selected_image = next(
+            row
+            for row in provider_body["image_generation"]["providers"]
+            if row["name"] == provider_body["image_generation"]["provider"]
+        )
+        assert (
+            provider_body["image_generation"]["provider_configured"]
+            is selected_image["configured"]
+        )
         assert "sk-or-test" not in provider_updated.text
 
         custom_provider_created = await _webui_mutate(
