@@ -313,17 +313,16 @@ async def test_runner_tool_error_preserves_tool_results_in_messages():
 
 
 @pytest.mark.asyncio
-async def test_length_finish_with_blank_content_routes_to_length_recovery():
+async def test_length_finish_with_blank_content_routes_to_recovery_not_empty_retry():
     """Regression test for #5133.
 
-    A response with finish_reason='length' and blank content (e.g. the model
-    spent its whole output budget on a tool call whose closing tag was
-    truncated) must take the length-recovery path, not the empty-response
-    retry path. Retrying the same prompt cannot recover from output-budget
-    exhaustion.
+    A response with finish_reason='length' and blank content -- the model spent
+    its whole output budget on a tool call whose closing tag was truncated --
+    must take a recovery path, not the empty-response retry path. Retrying the
+    same prompt cannot recover from output-budget exhaustion.
     """
     from nanobot.agent.runner import AgentRunner
-    from nanobot.utils.runtime import LENGTH_RECOVERY_PROMPT
+    from nanobot.utils.runtime import TRUNCATED_TOOL_CALL_PROMPT
 
     provider = MagicMock(spec=LLMProvider)
     # First call: truncated (length) with blank content and a dropped tool call.
@@ -349,11 +348,149 @@ async def test_length_finish_with_blank_content_routes_to_length_recovery():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    # The runner must have injected a length-recovery prompt and continued,
-    # rather than exhausting empty-response retries into a generic apology.
+    # The runner must have injected a recovery prompt and continued, rather than
+    # exhausting empty-response retries into a generic apology.
     user_msgs = [m.get("content") or "" for m in result.messages if m.get("role") == "user"]
-    assert any(LENGTH_RECOVERY_PROMPT in c for c in user_msgs), (
-        "expected a length-recovery message to be appended for a "
+    assert any(TRUNCATED_TOOL_CALL_PROMPT in c for c in user_msgs), (
+        "expected a truncated-tool-call message to be appended for a "
         "finish_reason='length' response with blank content"
     )
     assert result.final_content == "done"
+
+
+@pytest.mark.asyncio
+async def test_truncated_tool_call_is_re_requested_smaller_not_dropped():
+    """A call the output ceiling cut off must be asked for again, not silently lost.
+
+    The call never ran, so there is nothing to continue and no tool result to
+    react to: the only useful next move is the same work, expressed so that one
+    response can hold it. Before this, such a response ended the turn blank, the
+    continuation harness re-sent the same request, and the ceiling cut it in the
+    same place -- "heavy coding stops at a step".
+    """
+    from nanobot.agent.runner import AgentRunner
+    from nanobot.utils.runtime import LENGTH_RECOVERY_PROMPT, TRUNCATED_TOOL_CALL_PROMPT
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        # The ceiling truncates the write_file payload mid-JSON: the call is
+        # dropped, nothing is executed, and no text was produced.
+        LLMResponse(
+            content="",
+            finish_reason="length",
+            tool_calls=[ToolCallRequest(id="call_1", name="write_file", arguments={})],
+            usage={},
+        ),
+        LLMResponse(content="wrote it in sections", finish_reason="stop", tool_calls=[], usage={}),
+    ])
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock()
+
+    result = await AgentRunner().run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "build the app"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=5,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    user_msgs = [m.get("content") or "" for m in result.messages if m.get("role") == "user"]
+    recovery = next(c for c in user_msgs if TRUNCATED_TOOL_CALL_PROMPT in c)
+    # It names the lost call so the model knows which one to re-issue, and says
+    # how to make it fit instead of repeating the same oversized request.
+    assert "write_file" in recovery
+    assert "sections" in recovery
+    # A length-recovery continuation would be wrong here: it asks the model to
+    # carry on half-written text, and there is none.
+    assert not any(LENGTH_RECOVERY_PROMPT in c for c in user_msgs)
+    # Nothing was executed, and the turn still finished with a real answer.
+    tools.execute.assert_not_awaited()
+    assert result.final_content == "wrote it in sections"
+    assert result.stop_reason == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_tool_call_is_not_treated_as_a_burn_loop():
+    """The replay guard exists for a model re-emitting the same truncated text.
+
+    A response whose only output was a dropped tool call has no text at all, so
+    the guard used to classify it as a zero-progress replay and end the turn.
+    It is not: the work was never attempted, and asking for it differently is
+    progress. The turn is given its bounded set of attempts.
+    """
+    from nanobot.agent.runner import _MAX_TRUNCATED_TOOL_CALL_RECOVERIES, AgentRunner
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="",
+        finish_reason="length",
+        tool_calls=[ToolCallRequest(id="call_1", name="write_file", arguments={})],
+        usage={},
+    ))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock()
+
+    result = await AgentRunner().run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "build the app"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=50,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    # One original request plus the bounded set of smaller-call requests, and no
+    # more: a model that will not adapt must not be paid for forever.
+    assert provider.chat_with_retry.await_count == 1 + _MAX_TRUNCATED_TOOL_CALL_RECOVERIES
+    assert result.stop_reason == "empty_final_response"
+    tools.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_later_tool_step_gets_the_truncation_budget_back():
+    """Two oversized calls early on must not disarm a long task's recovery.
+
+    The budget is per outstanding failure, not per turn: once tool work lands,
+    the turn is demonstrably progressing and its recovery budget is restored.
+    """
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        _truncated_write(),
+        # A step that fits and runs.
+        LLMResponse(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[ToolCallRequest(id="c", name="list_dir", arguments={"path": "."})],
+            usage={},
+        ),
+        _truncated_write(),
+        LLMResponse(content="finished", finish_reason="stop", tool_calls=[], usage={}),
+    ])
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="(noop completed with no output)")
+
+    result = await AgentRunner().run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "build the app"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=20,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.final_content == "finished"
+    assert result.stop_reason == "completed"
+    # The second truncation was recovered, not swallowed by the first one's budget.
+    assert provider.chat_with_retry.await_count == 4
+
+
+def _truncated_write() -> LLMResponse:
+    return LLMResponse(
+        content="",
+        finish_reason="length",
+        tool_calls=[ToolCallRequest(id="call_w", name="write_file", arguments={})],
+        usage={},
+    )

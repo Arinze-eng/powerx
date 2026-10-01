@@ -39,9 +39,15 @@ PROFILE_NONE = "off"
 #:
 #: ``reasoning_effort`` is the single biggest lever on a slow reasoning model:
 #: "none" tells the gateway not to emit reasoning tokens at all where the
-#: provider supports it. ``max_tokens`` is the second: a step that answers with
-#: a tool call does not need a large completion budget, and a smaller ceiling
-#: caps the damage when the model decides to ramble.
+#: provider supports it. ``max_tokens`` is the second: it caps the damage when
+#: the model decides to ramble in prose.
+#:
+#: That ``max_tokens`` cap is a *text answer* lever only, and ``apply_to_generation``
+#: refuses to apply it to a request that may have to emit a tool call (see
+#: ``tool_call_payload``). A tool step's output IS its arguments -- a ``write_file``
+#: call carries the whole file -- so a small ceiling truncates the call mid-JSON,
+#: the truncated call is discarded unexecuted, and the step is lost. Capping there
+#: does not make the turn faster, it makes it fail.
 SPEED_PROFILES: dict[str, dict[str, Any]] = {
     PROFILE_NONE: {},
     # For a small or impatient task on a slow model: answer now, no reasoning.
@@ -100,12 +106,21 @@ def apply_to_generation(
     generation: dict[str, Any],
     *,
     profile: str | None = None,
+    tool_call_payload: bool = False,
 ) -> dict[str, Any]:
     """Overlay the active profile onto a set of generation kwargs.
 
     Returns a new mapping. A profile key that is ``None`` in the input is still
     overridden -- "the provider default" is exactly what a force is meant to
     replace -- but a profile never invents a key the caller did not have.
+
+    ``tool_call_payload`` says the request is being given tools, so the model may
+    answer with a tool call whose arguments carry the step's real output (a whole
+    file, a whole patch). The profile's ``max_tokens`` cap is skipped for those
+    requests and the configured ceiling stands: a ceiling too small to hold one
+    complete call does not buy speed, it truncates the call, and the agent drops
+    a truncated call -- so the step is lost and the turn ends with nothing. Every
+    other profile key (``reasoning_effort``, the bigger lever) still applies.
     """
     active = resolve_profile(profile)
     if active is None:
@@ -113,8 +128,11 @@ def apply_to_generation(
     overlay = SPEED_PROFILES[active]
     result = dict(generation)
     for key, value in overlay.items():
-        if key in result:
-            result[key] = value
+        if key not in result:
+            continue
+        if key == "max_tokens" and tool_call_payload:
+            continue
+        result[key] = value
     return result
 
 
@@ -127,4 +145,8 @@ def describe(profile: str | None = None) -> str:
             f"settings (set {ENV_VAR} to one of: {', '.join(known_profiles())})"
         )
     overlay = ", ".join(f"{k}={v}" for k, v in SPEED_PROFILES[active].items())
-    return f"speed profile {active!r} is forced, overriding: {overlay}"
+    return (
+        f"speed profile {active!r} is forced, overriding: {overlay} "
+        "(the max_tokens cap is skipped on requests that carry tools, so a tool "
+        "call's own payload is never truncated)"
+    )

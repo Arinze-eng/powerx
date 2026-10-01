@@ -97,6 +97,35 @@ def build_length_recovery_message(content: str) -> dict[str, str]:
     return {"role": "user", "content": prompt}
 
 
+TRUNCATED_TOOL_CALL_PROMPT = (
+    "The previous assistant response hit the output token limit while it was still "
+    "writing a tool call, so that call was discarded and NOTHING was executed -- the "
+    "workspace and the conversation are unchanged. Asking for the same call again "
+    "would be cut off in the same place.\n\n"
+    "Re-issue the work so that a single response fits inside the limit:\n"
+    "- Large files: write them in sections. Create the file with its first section, "
+    "then extend it with further calls, instead of emitting the whole file at once.\n"
+    "- Batch less: split unrelated edits or files across separate tool calls rather "
+    "than combining them into one response.\n"
+    "Keep the same paths and continue exactly where the discarded call left off. Do "
+    "not explain this to the user or repeat work that already succeeded."
+)
+
+
+def build_truncated_tool_call_message(tool_name: str | None = None) -> dict[str, str]:
+    """Prompt the model to re-issue a tool call that the output limit truncated.
+
+    The call never ran, so there is no tool result to react to and no partial
+    text to continue -- the only useful next move is the same work, expressed so
+    that one response can hold it.
+    """
+    if tool_name:
+        prefix = f"Your `{tool_name}` call was cut off before it could run."
+    else:
+        prefix = "Your tool call was cut off before it could run."
+    return {"role": "user", "content": f"{prefix} {TRUNCATED_TOOL_CALL_PROMPT}"}
+
+
 def build_goal_continue_message(custom: str | None = None) -> dict[str, str]:
     """Prompt the model to continue when a sustained goal is still active."""
     return {"role": "user", "content": custom or SUSTAINED_GOAL_CONTINUE_PROMPT}

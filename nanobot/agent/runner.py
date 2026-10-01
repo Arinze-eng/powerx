@@ -82,6 +82,7 @@ from nanobot.utils.runtime import (
     build_finalization_retry_message,
     build_goal_continue_message,
     build_length_recovery_message,
+    build_truncated_tool_call_message,
     is_blank_text,
     repeated_external_lookup_error,
     repeated_workspace_violation_error,
@@ -101,6 +102,14 @@ _ARREARAGE_ERROR_MESSAGE = (
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
+#: How many times a turn may ask the model to re-issue a tool call that the
+#: output limit truncated. Two, not three: the first recovery is the model
+#: misjudging its budget, the second is it splitting the call as asked. A third
+#: identical attempt is a model that will not adapt, and the turn ends instead of
+#: paying for it again. Bounded separately from _MAX_LENGTH_RECOVERIES because
+#: the two failures need different prompts and neither should spend the other's
+#: budget.
+_MAX_TRUNCATED_TOOL_CALL_RECOVERIES = 2
 #: A ``finish_reason="length"`` response is only worth continuing when it made
 #: textual progress. A blank segment, or one byte-identical to the segment we
 #: just appended, means the model is re-emitting the same truncated prefix:
@@ -709,6 +718,10 @@ class AgentRunner:
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
+        # Tool calls lost to the output ceiling this turn. Bounded by
+        # _MAX_TRUNCATED_TOOL_CALL_RECOVERIES; reset whenever tool work actually
+        # lands, so a long task is not killed by two early truncations.
+        truncated_tool_recoveries = 0
         # Segments from one uninterrupted length-recovery chain. Tool work or
         # injected user input starts a new logical answer and clears the chain.
         length_recovery_parts: list[str] = []
@@ -1140,6 +1153,11 @@ class AgentRunner:
                     },
                 )
                 empty_content_retries = 0
+                # Tool work landed, so the turn is demonstrably making progress:
+                # give the truncation budget back. A long task that loses one
+                # oversized call early must not be finished off by a second one
+                # forty steps later.
+                truncated_tool_recoveries = 0
                 length_recovery_parts.clear()
 
                 # --- Zero-extra-call terminal completion --------------------
@@ -1221,7 +1239,45 @@ class AgentRunner:
                 original_content = response.content
                 clean = hook.finalize_content(context, response.content)
 
-            if response.finish_reason == "length":
+            # --- tool call truncated by the output ceiling --------------------
+            # A response that ran into the token limit *while writing a tool
+            # call* is neither a burn loop nor a partial answer: the call was
+            # discarded unexecuted, no text was produced, and the payload it was
+            # carrying was the step's whole output. Replaying the request changes
+            # nothing -- the ceiling cuts it in the same place every time -- so
+            # ask for the same work expressed smaller instead of dropping the
+            # call and ending the turn with an empty answer. Bounded by
+            # _MAX_TRUNCATED_TOOL_CALL_RECOVERIES.
+            if response.finish_reason == "length" and response.has_tool_calls:
+                if truncated_tool_recoveries < _MAX_TRUNCATED_TOOL_CALL_RECOVERIES:
+                    truncated_tool_recoveries += 1
+                    truncated_name = next(
+                        (tc.name for tc in response.tool_calls if tc.has_valid_name()),
+                        None,
+                    )
+                    logger.warning(
+                        "Output limit truncated {} tool call(s) on turn {} for {} "
+                        "({}/{}); asking for a call that fits",
+                        len(response.tool_calls),
+                        iteration,
+                        spec.session_key or "default",
+                        truncated_tool_recoveries,
+                        _MAX_TRUNCATED_TOOL_CALL_RECOVERIES,
+                    )
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=False)
+                    messages.append(build_truncated_tool_call_message(truncated_name))
+                    await hook.after_iteration(context)
+                    continue
+                logger.warning(
+                    "Tool call still over the output limit on turn {} for {} after "
+                    "{} request(s) to split it; finishing",
+                    iteration,
+                    spec.session_key or "default",
+                    truncated_tool_recoveries,
+                )
+
+            if response.finish_reason == "length" and not response.has_tool_calls:
                 segment = _restore_outer_whitespace(clean or "", original_content)
                 # --- burn-loop guard (see _MAX_LENGTH_RECOVERIES) --------------
                 # Continuing a truncated response is only worthwhile if the
@@ -1506,12 +1562,20 @@ class AgentRunner:
         # A forced speed profile lands here, at the one point every model call
         # is built, so it applies to reasoning turns, tool-call turns and the
         # closing answer alike. With no profile forced this is the identity.
+        #
+        # The profile's max_tokens cap is withheld from any request that carries
+        # tools: such a request can answer with a call whose arguments *are* the
+        # step's work (a write_file carrying a whole file), and a cap too small
+        # to hold one complete call truncates it -- the truncated call is dropped
+        # unexecuted and the turn stalls on an empty response with the work still
+        # outstanding. That is the "heavy coding stops at a step" failure.
         tuned = speed.apply_to_generation(
             {
                 "temperature": generation.temperature,
                 "max_tokens": generation.max_tokens,
                 "reasoning_effort": generation.reasoning_effort,
-            }
+            },
+            tool_call_payload=bool(tools),
         )
         kwargs["temperature"] = tuned["temperature"]
         kwargs["max_tokens"] = tuned["max_tokens"]

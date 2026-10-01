@@ -97,6 +97,63 @@ def test_a_profile_overrides_a_provider_default_rather_than_deferring_to_it() ->
         assert speed.apply_to_generation(_GENERATION)["reasoning_effort"] == "none"
 
 
+def test_a_tool_call_request_keeps_its_configured_output_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cap is a text-answer lever and must not reach a request that may need
+    to emit a tool call's arguments.
+
+    A ``write_file`` call carries the whole file in its arguments, so a ceiling
+    too small to hold one complete call truncates the call mid-JSON. The agent
+    drops a truncated call, so nothing runs, no text is produced, and the turn
+    stalls with the work still outstanding: heavy coding "stops at a step".
+    """
+    monkeypatch.setenv(speed.ENV_VAR, "fast")
+
+    assert speed.apply_to_generation(_GENERATION)["max_tokens"] == 2_048
+
+    tuned = speed.apply_to_generation(_GENERATION, tool_call_payload=True)
+
+    assert tuned["max_tokens"] == _GENERATION["max_tokens"]
+    assert tuned["max_tokens"] == 8_192
+    # The bigger lever still applies: this is a withheld cap, not a disabled profile.
+    assert tuned["reasoning_effort"] == "none"
+    assert tuned["temperature"] == _GENERATION["temperature"]
+
+
+def test_every_profile_withholds_the_cap_from_a_tool_call_request() -> None:
+    """No profile may cap a tool payload, and none may pass the cap through
+    differently from the others."""
+    for name in speed.known_profiles():
+        if name == speed.PROFILE_NONE:
+            continue
+        with speed.force_profile(name):
+            capped = speed.apply_to_generation(_GENERATION)
+            uncapped = speed.apply_to_generation(_GENERATION, tool_call_payload=True)
+
+        assert capped["max_tokens"] < _GENERATION["max_tokens"], name
+        assert uncapped["max_tokens"] == _GENERATION["max_tokens"], name
+
+
+def test_a_tool_call_request_still_gets_an_overridden_provider_default() -> None:
+    """Withholding max_tokens must not turn the rest of the overlay off."""
+    generation = {"temperature": 0.1, "max_tokens": 8_192, "reasoning_effort": None}
+
+    with speed.force_profile("balanced"):
+        tuned = speed.apply_to_generation(generation, tool_call_payload=True)
+
+    assert tuned["reasoning_effort"] == "low"
+    assert tuned["max_tokens"] == 8_192
+
+
+def test_the_description_says_the_cap_skips_tool_requests() -> None:
+    """The model has to be able to explain an uncapped tool-bound call."""
+    described = speed.describe("fast")
+
+    assert "max_tokens" in described
+    assert "tool" in described
+
+
 def test_every_named_profile_is_describable() -> None:
     """The model has to be able to say which one is on."""
     for name in speed.known_profiles():

@@ -1202,6 +1202,99 @@ async def test_runner_passes_max_tokens_to_provider():
 
 
 @pytest.mark.asyncio
+async def test_speed_profile_does_not_cap_a_request_that_carries_tools(monkeypatch):
+    """The forced profile must reach a text call but never a tool call's payload.
+
+    A tool-bearing request is the one that can answer by writing a whole file
+    into a tool call's arguments. Capping it at the profile's text budget
+    truncates the call mid-JSON, the agent drops a truncated call, and the turn
+    ends blank with the work outstanding -- "heavy coding stops at a step".
+    """
+    from nanobot.agent import speed
+    from nanobot.agent.runner import AgentRunner
+
+    monkeypatch.setenv(speed.ENV_VAR, "fast")
+    captured: dict = {}
+
+    async def chat_with_retry(**kwargs):
+        captured.update(kwargs)
+        # No tool call, so the same turn then asks for a closing answer.
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    # A real run offers its tools, so the model can answer with a call whose
+    # arguments carry the step's output.
+    tools.get_definitions.return_value = [
+        {"type": "function", "function": {"name": "write_file"}},
+    ]
+
+    await AgentRunner().run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "build the app"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        max_tokens=8192,
+    ))
+
+    assert captured["max_tokens"] == 8192
+    # The profile still does its job on the same call: it is a withheld cap,
+    # not a disabled profile.
+    assert captured["reasoning_effort"] == "none"
+
+
+def test_speed_profile_still_caps_a_request_with_no_tools(monkeypatch):
+    """The cap has to survive for the calls it was written for.
+
+    Withholding it from tool-bearing requests must not quietly retire the
+    profile: a call that cannot answer with a tool call -- a closing answer, a
+    finalization -- is exactly the text ramble the cap exists to bound.
+    """
+    from nanobot.agent import speed
+    from nanobot.agent.runner import AgentRunner
+
+    monkeypatch.setenv(speed.ENV_VAR, "fast")
+    provider = MagicMock(spec=LLMProvider)
+    impl = AgentRunner()
+
+    def spec():
+        return make_run_spec(
+            provider,
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            max_tokens=8192,
+        )
+
+    with_tools = impl._build_request_kwargs(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        tools=[{"type": "function", "function": {"name": "exec"}}],
+    )
+    without_tools = impl._build_request_kwargs(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        tools=None,
+    )
+    no_tool_definitions = impl._build_request_kwargs(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        tools=[],
+    )
+
+    assert with_tools["max_tokens"] == 8192
+    assert without_tools["max_tokens"] == 2_048
+    assert no_tool_definitions["max_tokens"] == 2_048
+    # Every call is still forced, tool-bearing or not.
+    for kwargs in (with_tools, without_tools, no_tool_definitions):
+        assert kwargs["reasoning_effort"] == "none"
+
+
+@pytest.mark.asyncio
 async def test_runner_passes_reasoning_effort_to_provider():
     """reasoning_effort from AgentRunSpec should reach provider.chat_with_retry."""
     from nanobot.agent.runner import AgentRunner
