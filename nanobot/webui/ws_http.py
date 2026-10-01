@@ -718,19 +718,32 @@ class GatewayHTTPHandler:
         # a worker thread: on the event loop a slow provider test stalls the whole
         # socket and the admin UI sits on "Testing..." because the reply is never
         # delivered.
-        admin_response = await asyncio.to_thread(
-            admin_route,
-            request,
-            got,
-            issue_admin_token=lambda: self.tokens.issue_token(
-                self.config.token_ttl_s,
-                audience="admin",
-            ),
-            ws_path=self.config.path,
-            refresh_runtime_config=self.settings.refresh_runtime_config,
-        )
-        if admin_response is not None:
-            return admin_response
+        #
+        # [FIX 2026-10-01] Only take the thread hop for paths that can actually be
+        # an admin route. This used to run for *every* request before any routing
+        # happened, so ordinary WebUI polling reads (/api/sessions,
+        # /api/workspaces, /api/webui/skills) were queued on the loop's default
+        # executor and competed with the agent's own to_thread work (session
+        # writes, sandbox relays, Supabase calls). When the pool was busy they all
+        # completed together seconds later — the "slow webui http route" 6-17 s
+        # stalls, with several routes logging the same duration and the same end
+        # instant. admin_route only ever answers a fixed set of /api/admin/*
+        # paths plus /admin and returns None for anything else, so skipping the
+        # hop everywhere else is behaviour-identical and keeps the loop free.
+        if got == "/admin" or got.startswith("/api/admin/"):
+            admin_response = await asyncio.to_thread(
+                admin_route,
+                request,
+                got,
+                issue_admin_token=lambda: self.tokens.issue_token(
+                    self.config.token_ttl_s,
+                    audience="admin",
+                ),
+                ws_path=self.config.path,
+                refresh_runtime_config=self.settings.refresh_runtime_config,
+            )
+            if admin_response is not None:
+                return admin_response
 
         # Token issue endpoint
         if self.config.token_issue_path:

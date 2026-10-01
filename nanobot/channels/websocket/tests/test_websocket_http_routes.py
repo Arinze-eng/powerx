@@ -4,7 +4,9 @@ import asyncio
 import json
 import random
 import socket
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -2109,6 +2111,99 @@ async def test_cli_apps_catalog_does_not_block_other_webui_http_routes(
         assert catalog.json()["apps"] == []
     finally:
         release.set()
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_non_admin_routes_never_queue_on_the_shared_thread_pool(
+    bus: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-admin WebUI read must not hop onto the loop's default executor.
+
+    [FIX 2026-10-01] The dispatcher used to hand *every* request to the default
+    executor via ``admin_route`` before any routing happened, so ordinary
+    polling reads (/api/sessions, /api/workspaces, /api/webui/skills) queued
+    behind the agent's own ``to_thread`` work (session writes, sandbox relays,
+    Supabase calls). When that pool was busy they all completed seconds later,
+    which is what produced the "slow webui http route" 6-17 s warnings — several
+    routes logging the same duration and the same end instant. Pin that a
+    non-admin read never waits on that pool.
+    """
+    seen: list[str] = []
+
+    def recording_admin_route(request: Any, path: str, **_kwargs: Any) -> Any:
+        seen.append(path)
+        return None
+
+    monkeypatch.setattr("nanobot.webui.ws_http.admin_route", recording_admin_route)
+    channel = _ch(bus, session_manager=_seed_session(tmp_path), port=29941)
+    server_task = asyncio.create_task(channel.start())
+    loop = asyncio.get_running_loop()
+    gate = threading.Event()
+    hog: asyncio.Task[Any] | None = None
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        auth = {"Authorization": f"Bearer {token}"}
+
+        # One worker, already taken: anything that hops onto the default executor
+        # now waits out the whole hog.
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        hog = asyncio.create_task(asyncio.to_thread(gate.wait, 10.0))
+        await asyncio.sleep(0.05)
+
+        started = time.perf_counter()
+        response = await asyncio.wait_for(
+            _http_get("http://127.0.0.1:29941/api/workspaces", headers=auth),
+            2.0,
+        )
+        elapsed = time.perf_counter() - started
+
+        assert response.status_code == 200
+        assert elapsed < 1.0, (
+            f"non-admin read waited on the shared thread pool for {elapsed:.2f}s"
+        )
+        assert seen == [], f"admin_route consulted for non-admin paths: {seen}"
+    finally:
+        gate.set()
+        if hog is not None:
+            await hog
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_admin_routes_still_leave_the_event_loop(
+    bus: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate must not narrow admin handling: /api/admin/* still runs in a
+    worker thread, so a slow provider test or DBQ read can never stall the
+    gateway socket."""
+    calls: list[tuple[str, bool]] = []
+
+    def recording_admin_route(request: Any, path: str, **_kwargs: Any) -> Any:
+        calls.append((path, threading.current_thread() is threading.main_thread()))
+        return None
+
+    monkeypatch.setattr("nanobot.webui.ws_http.admin_route", recording_admin_route)
+    channel = _ch(bus, session_manager=_seed_session(tmp_path), port=29942)
+    server_task = asyncio.create_task(channel.start())
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        auth = {"Authorization": f"Bearer {token}"}
+
+        response = await _http_get(
+            "http://127.0.0.1:29942/api/admin/supabase/users", headers=auth
+        )
+
+        assert response.status_code == 404
+        assert [path for path, _off_loop in calls] == ["/api/admin/supabase/users"]
+        assert calls[0][1] is False, "admin route ran on the event loop thread"
+    finally:
         await channel.stop()
         await server_task
 
