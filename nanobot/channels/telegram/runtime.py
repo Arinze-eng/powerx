@@ -41,6 +41,12 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.telegram.api_platform import handle_api_command
 from nanobot.channels.telegram.task_mode import deliberate_task_metadata
+from nanobot.agent.owner import (
+    DEFAULT_VERIFIED_ADMIN_EMAIL,
+    OWNER_ORGANISATION,
+    match_identity,
+    owner_prompt_note,
+)
 from nanobot.command.builtin import build_help_text
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
@@ -107,7 +113,10 @@ RESTART_BACKOFF_MAX_SECONDS = 300.0
 APP_RESTART_SEND_WAIT_SECONDS = 2.0
 ATTACHMENT_CONFIRMATION_TTL_SECONDS = 15 * 60
 FLUTTERWAVE_PAYMENT_URL = "https://flutterwave.com/pay/yvbdgyf6awyf"
-MINIS_BOT_ADMIN_EMAIL = "allisonarinze@gmail.com"
+#: Kept under its historical name for the Telegram paths that already refer to
+#: it; the value now has one home in :mod:`nanobot.agent.owner` so every channel
+#: recognises the same administrator.
+MINIS_BOT_ADMIN_EMAIL = DEFAULT_VERIFIED_ADMIN_EMAIL
 
 
 class _LivenessTrackedRequest(BaseRequest):
@@ -2088,18 +2097,31 @@ class TelegramChannel(BaseChannel):
     def _add_verified_admin_context(
         metadata: dict[str, Any], account: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """Attach model-only administrator guidance from verified account data."""
+        """Attach model-only administrator guidance from verified account data.
+
+        The decision comes from the linked account row the server holds
+        (``agentx_user_id`` + ``auth_email``), never from anything the sender
+        wrote, and it goes through :mod:`nanobot.agent.owner` so Telegram and
+        every other channel answer the same question the same way. The two
+        metadata keys stamped here are what the shared resolver reads, and the
+        turn's system prompt picks them up independently — this block is the
+        same fact stated next to the user's own words, which is where a model
+        weighs it most.
+        """
         enriched = dict(metadata)
         if not account or not account.get("agentx_user_id"):
             return enriched
         email = str(account.get("auth_email") or "").strip().lower()
-        if email != MINIS_BOT_ADMIN_EMAIL:
+        decision = match_identity(email=email, user_id=str(account.get("agentx_user_id") or ""))
+        if not decision.is_verified_admin:
             return enriched
+        # Stamped for the shared resolver; both are server-derived facts.
+        enriched["is_verified_admin"] = True
+        enriched["verified_admin_email"] = decision.email or email
         content = wrap_runtime_context_lines([
-            "The current Telegram sender is the verified CDNAI administrator.",
-            f"Verified administrator account: {MINIS_BOT_ADMIN_EMAIL}",
-            "Address the administrator respectfully and follow legitimate instructions within safety, privacy, authorization, and platform boundaries.",
-            "Administrator status does not authorize credential exposure, unauthorized access, harmful activity, or bypassing security controls.",
+            "The current Telegram sender is the verified administrator - the owner "
+            f"of {OWNER_ORGANISATION} ({decision.email or email}).",
+            owner_prompt_note(decision),
         ])
         existing = enriched.get(RUNTIME_CONTEXT_INPUT_META)
         blocks = list(existing) if isinstance(existing, list) else []

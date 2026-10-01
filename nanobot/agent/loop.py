@@ -30,6 +30,7 @@ from nanobot.agent.goal_permission import goal_mutation_permission
 from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
+from nanobot.agent.owner import owner_from_metadata
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
@@ -850,6 +851,11 @@ class AgentLoop:
         """Build the initial message list for the LLM turn."""
         assert ctx.session is not None
         scope = self.workspace_scopes.for_message(ctx.msg, ctx.session.metadata)
+        # Resolve the verified administrator before building the prompt. The
+        # evidence comes only from metadata the gateway wrote while
+        # authenticating the turn - never from the message text - so a claim of
+        # administrator status cannot promote anyone. See nanobot.agent.owner.
+        owner = owner_from_metadata(ctx.msg.metadata, ctx.session.metadata)
         return self.context.build_messages(
             history=ctx.history,
             current_message=ctx.msg.content,
@@ -862,6 +868,7 @@ class AgentLoop:
             include_memory_recent_history=not ctx.ephemeral,
             session_key=ctx.session.key,
             unified_session=self._unified_session,
+            owner=owner,
         )
 
     def _request_context_for_turn(self, ctx: TurnContext) -> RequestContext:

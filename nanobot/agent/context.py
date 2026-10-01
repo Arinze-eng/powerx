@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence, cast
 from loguru import logger
 
 from nanobot.agent.memory import MemoryStore
+from nanobot.agent.owner import DEFAULT_VERIFIED_ADMIN_EMAIL, TurnOwner
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tools import image_generation as image_generation_tools
 from nanobot.agent.tools import mcp as mcp_tools
@@ -133,6 +134,7 @@ class ContextBuilder:
         include_memory_recent_history: bool = True,
         session_key: str | None = None,
         unified_session: bool = False,
+        owner: "TurnOwner | None" = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         stable, volatile = self.build_system_prompt_parts(
@@ -143,6 +145,7 @@ class ContextBuilder:
             include_memory_recent_history=include_memory_recent_history,
             session_key=session_key,
             unified_session=unified_session,
+            owner=owner,
         )
         return "\n\n---\n\n".join(part for part in (stable, volatile) if part)
 
@@ -156,6 +159,7 @@ class ContextBuilder:
         include_memory_recent_history: bool = True,
         session_key: str | None = None,
         unified_session: bool = False,
+        owner: "TurnOwner | None" = None,
     ) -> tuple[str, str]:
         """Split the system prompt into a stable half and a *recency state* half.
 
@@ -178,7 +182,7 @@ class ContextBuilder:
         returns both joined for callers that want the whole prompt as one string.
         """
         root = workspace or self.workspace
-        parts = [self._get_identity(channel=channel, workspace=root)]
+        parts = [self._get_identity(channel=channel, workspace=root, owner=owner)]
         volatile: list[str] = []
 
         bootstrap = self._load_bootstrap_files(root)
@@ -293,8 +297,21 @@ class ContextBuilder:
                 return [*entries[:index], *entries[index + 1:]]
         return entries
 
-    def _get_identity(self, channel: str | None = None, workspace: Path | None = None) -> str:
-        """Get the core identity section."""
+    def _get_identity(
+        self,
+        channel: str | None = None,
+        workspace: Path | None = None,
+        owner: "TurnOwner | None" = None,
+    ) -> str:
+        """Get the core identity section.
+
+        *owner* decides which user-identity rule the model is given. When it
+        reports the verified administrator, the model is told who it is talking
+        to and that he is not restricted; otherwise the hard no-disclosure cap
+        stands unchanged. The decision is made from the turn's authenticated
+        account, never from anything the message says - see
+        :mod:`nanobot.agent.owner`.
+        """
         root = workspace or self.workspace
         workspace_path = str(root.expanduser().resolve())
         agent_workspace_path = str(self.workspace.expanduser().resolve())
@@ -308,6 +325,9 @@ class ContextBuilder:
             runtime=runtime,
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
+            verified_administrator=bool(owner is not None and owner.is_verified_admin),
+            admin_email=(owner.email if owner is not None else "")
+            or DEFAULT_VERIFIED_ADMIN_EMAIL,
         )
 
     def _build_durable_artifacts_section(self) -> str:
@@ -509,6 +529,7 @@ class ContextBuilder:
         include_memory_recent_history: bool = True,
         session_key: str | None = None,
         unified_session: bool = False,
+        owner: TurnOwner | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call.
 
@@ -528,6 +549,7 @@ class ContextBuilder:
             include_memory_recent_history=include_memory_recent_history,
             session_key=session_key,
             unified_session=unified_session,
+            owner=owner,
         )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": stable_prompt},

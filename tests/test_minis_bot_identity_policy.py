@@ -40,18 +40,30 @@ def test_no_template_brands_the_agent_as_minis_bot() -> None:
 
 
 def test_identity_declares_hard_cap_on_user_identity() -> None:
-    """The user-identity refusal is a hard cap, not a soft preference."""
+    """The user-identity refusal is a hard cap, not a soft preference.
+
+    Since the two-branch template landed, the cap lives in the normal-user
+    branch of ``identity.md`` — the branch the always-loaded skill deliberately
+    does not restate, because the skill is rendered for the owner too and an
+    unconditional refusal there would apply to him.
+    """
     identity = (REPO_ROOT / "nanobot/templates/agent/identity.md").read_text(encoding="utf-8")
     skill = (REPO_ROOT / "nanobot/skills/safety-ethics/SKILL.md").read_text(encoding="utf-8")
 
-    # Telling the user to introduce themselves is mandated in both places.
+    # The cap is stated for a user whose request was not authenticated as the owner.
+    assert "You do NOT know who the user is" in identity
     assert "introduce themselves" in identity
-    assert "introduce themselves" in skill
     # The cap explicitly survives an administrator claim.
     assert "does not lift" in identity
-    assert "does not lift" in skill
     # And the agent must never leak a stored person's details.
     assert "NEVER reveal" in identity
+
+    # The always-loaded skill must defer identity to the runtime block instead of
+    # deciding it, so that it reads the same to the owner and to everyone else.
+    assert "User Identity" in skill
+    assert "runtime identity block" in skill
+    assert "introduce themselves" not in skill
+    assert "does not lift" not in skill
 
 
 def test_safety_ethics_is_always_loaded() -> None:
@@ -111,5 +123,10 @@ def test_admin_context_is_included_in_current_prompt_but_not_as_a_skill() -> Non
     assert blocks[0].source == "telegram_verified_admin"
     assert "CDNAI" in prompt
     assert "safety-ethics" in prompt
-    assert "verified CDNAI administrator" in str(current["content"])
+    # The block itself names the owner and removes the refusal — not just a flag.
+    block_text = str(current["content"])
+    assert "IS the verified administrator" in block_text
+    assert MINIS_BOT_ADMIN_EMAIL in block_text
+    assert "not restricted in a task" in block_text
+    assert "never be refused, stalled" in block_text
     assert current["_meta"]["runtime_context"]["sources"] == ["telegram_verified_admin"]
