@@ -12,7 +12,7 @@ import time
 from contextlib import suppress
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -884,6 +884,50 @@ def _safe_path(raw: str) -> str:
     if normalized != _WORKSPACE and not normalized.startswith(_WORKSPACE + "/"):
         raise ValueError("path must remain inside /workspace")
     return normalized
+
+
+_UPLOAD_SUBDIR = "uploads"
+
+#: Appended to every successful ``upload`` result. The turn that reported a
+#: user attachment as unreachable had just watched its own staging call die (see
+#: ``_stage_upload``); with nothing in the sandbox it concluded the media
+#: directory was off limits. The attachment was never unreachable — both
+#: Cloudinary entry points read a local path straight off this host.
+_UPLOAD_NOTE = (
+    " The local file remains readable on this host, so generate_image "
+    "(reference_images) and cloudinary_video_edit (source) can take its path "
+    "directly — an edit does not need this staging step."
+)
+
+
+def _upload_destination(source: Path, requested: Any, *, root: str = _WORKSPACE) -> str:
+    """Where an ``upload`` of *source* lands inside the remote sandbox.
+
+    A model that sends the attachment as ``source`` and omits ``path`` used to
+    reach the backend with an empty destination, where the path guard raised
+    ``ValueError: path is required``. An omitted destination now means
+    ``<root>/uploads/<filename>``.
+    """
+    target = str(requested or "").strip()
+    if target:
+        return target
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", source.name)[:120] or "upload.bin"
+    return f"{root.rstrip('/')}/{_UPLOAD_SUBDIR}/{safe_name}"
+
+
+def _upload_failure(source: Path, path: str, label: str, exc: BaseException) -> str:
+    """The message the model gets when staging a local file fails.
+
+    It must say the local file itself is fine, because the failure mode this
+    replaces ended with the model telling the user the media directory could not
+    be reached at all.
+    """
+    return (
+        f"could not upload {source.name} into {label} ({path}): "
+        f"{type(exc).__name__}: {str(exc)[:300]}. "
+        f"{source} is a readable local file on this host — local tools and the "
+        "Cloudinary tools can use it without staging it in a sandbox."
+    )
 
 
 def _session_key() -> str:
@@ -2612,6 +2656,55 @@ class NovitaSandboxTool(Tool):
         _STORE.set(key, sandbox, template=sandbox_template)
         return sandbox
 
+    async def _prepare_upload(
+        self, kwargs: dict[str, Any], *, label: str
+    ) -> tuple[Path, str] | ToolResult:
+        """Validate an ``upload`` without writing it — used by the VPS branch."""
+
+        async def _noop(_target: str, _data: bytes) -> None:
+            return None
+
+        return await self._stage_upload(kwargs, _noop, label=label)
+
+    async def _stage_upload(
+        self,
+        kwargs: dict[str, Any],
+        write: Callable[[str, bytes], Awaitable[Any]],
+        *,
+        label: str,
+    ) -> tuple[Path, str] | ToolResult:
+        """Validate a local ``source`` and write it into the active sandbox.
+
+        Returns ``(source, destination)`` on success, or a ``ToolResult.error``
+        carrying a usable message. It never raises: an uncaught exception here
+        escapes the tool, leaves the file out of the sandbox, and is what the
+        model then narrates as "the tools cannot reach the media directory".
+        """
+        raw = str(kwargs.get("source") or "").strip()
+        if not raw:
+            return ToolResult.error(
+                "upload needs 'source': the local media path to send. "
+                "Pass source=<path on this host>, and path=<destination inside "
+                "the sandbox> only if you need somewhere other than "
+                f"{_WORKSPACE}/{_UPLOAD_SUBDIR}/<filename>."
+            )
+        source = Path(raw).expanduser().resolve()
+        if not self._local_attachment_allowed(source):
+            return ToolResult.error(
+                f"source must be inside the nanobot media/data directory (got {source}). "
+                "An attachment the user sent is already there — use the path exactly as given."
+            )
+        if not source.is_file():
+            return ToolResult.error(f"source file does not exist: {source}")
+        if source.stat().st_size > _MAX_UPLOAD_BYTES:
+            return ToolResult.error("source file exceeds 200 MiB")
+        path = _upload_destination(source, kwargs.get("path"))
+        try:
+            await write(path, await asyncio.to_thread(source.read_bytes))
+        except Exception as exc:  # noqa: BLE001 - report it, never crash the turn
+            return ToolResult.error(_upload_failure(source, path, label, exc))
+        return source, path
+
     @staticmethod
     def _local_attachment_allowed(source: Path) -> bool:
         """Accept Telegram files under the active config data directory.
@@ -2712,16 +2805,21 @@ class NovitaSandboxTool(Tool):
                 await backend.write(path, content)
                 return f"Wrote {len(content)} characters to {path} in the remote VPS workspace."
             if action == "upload":
-                source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
-                if not self._local_attachment_allowed(source):
-                    return ToolResult.error("source must be inside the nanobot media/data directory")
-                if not source.is_file():
-                    return ToolResult.error("source file does not exist")
-                if source.stat().st_size > _MAX_UPLOAD_BYTES:
-                    return ToolResult.error("source file exceeds 200 MiB")
-                await upload_onlyfile_path(source)
-                await backend.upload(str(source), path, await asyncio.to_thread(source.read_bytes))
-                return f"Uploaded {source.name} via onlyfiles.com to {path} in the remote VPS workspace."
+                prepared = await self._prepare_upload(kwargs, label="the remote VPS workspace")
+                if isinstance(prepared, ToolResult):
+                    return prepared
+                source, path = prepared
+                try:
+                    shared = await upload_onlyfile_path(source)
+                    await backend.upload(str(source), path, await asyncio.to_thread(source.read_bytes))
+                except Exception as exc:  # noqa: BLE001 - report it, never crash the turn
+                    return ToolResult.error(_upload_failure(source, path, "the remote VPS workspace", exc))
+                link = str(shared.get("gateway_url") or shared.get("url") or "").strip()
+                return (
+                    f"Uploaded {source.name} via onlyfiles.com to {path} in the remote VPS workspace."
+                    + (f" Public link: {link}." if link else "")
+                    + _UPLOAD_NOTE
+                )
             if action == "fetch_url":
                 url = str(kwargs.get("url") or "").strip()
                 if not url:
@@ -3142,18 +3240,17 @@ class NovitaSandboxTool(Tool):
                         _DAYTONA_STORE.set_id(key, backend.last_sandbox_id)
                     return f"Wrote {len(content)} characters to {path} in the Daytona workspace."
                 if action == "upload":
-                    source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
-                    if not self._local_attachment_allowed(source):
-                        return ToolResult.error("source must be inside the nanobot media/data directory")
-                    if not source.is_file():
-                        return ToolResult.error("source file does not exist")
-                    if source.stat().st_size > _MAX_UPLOAD_BYTES:
-                        return ToolResult.error("source file exceeds 200 MiB")
-                    path = str(kwargs.get("path") or "")
-                    await backend.write_bytes(path, await asyncio.to_thread(source.read_bytes))
+                    staged = await self._stage_upload(
+                        kwargs,
+                        lambda target, data: backend.write_bytes(target, data),
+                        label="the Daytona workspace",
+                    )
+                    if isinstance(staged, ToolResult):
+                        return staged
+                    source, path = staged
                     if getattr(backend, "last_sandbox_id", ""):
                         _DAYTONA_STORE.set_id(key, backend.last_sandbox_id)
-                    return f"Uploaded {source.name} to {path} in the Daytona workspace."
+                    return f"Uploaded {source.name} to {path} in the Daytona workspace.{_UPLOAD_NOTE}"
                 if action == "fetch_url":
                     url = str(kwargs.get("url") or "").strip()
                     if not url:
@@ -3330,18 +3427,17 @@ class NovitaSandboxTool(Tool):
                         _VERCEL_STORE.set_id(key, backend.last_sandbox_id)
                     return f"Wrote {len(content)} characters to {path} in the Vercel workspace."
                 if action == "upload":
-                    source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
-                    if not self._local_attachment_allowed(source):
-                        return ToolResult.error("source must be inside the nanobot media/data directory")
-                    if not source.is_file():
-                        return ToolResult.error("source file does not exist")
-                    if source.stat().st_size > _MAX_UPLOAD_BYTES:
-                        return ToolResult.error("source file exceeds 200 MiB")
-                    path = str(kwargs.get("path") or "")
-                    await backend.write_bytes(path, await asyncio.to_thread(source.read_bytes))
+                    staged = await self._stage_upload(
+                        kwargs,
+                        lambda target, data: backend.write_bytes(target, data),
+                        label="the Vercel workspace",
+                    )
+                    if isinstance(staged, ToolResult):
+                        return staged
+                    source, path = staged
                     if getattr(backend, "last_sandbox_id", ""):
                         _VERCEL_STORE.set_id(key, backend.last_sandbox_id)
-                    return f"Uploaded {source.name} to {path} in the Vercel workspace."
+                    return f"Uploaded {source.name} to {path} in the Vercel workspace.{_UPLOAD_NOTE}"
                 if action == "fetch_url":
                     url = str(kwargs.get("url") or "").strip()
                     if not url:
@@ -3479,18 +3575,17 @@ class NovitaSandboxTool(Tool):
                         _RUNLOOP_STORE.set_id(key, backend.last_devbox_id)
                     return f"Wrote {len(content)} characters to {path} in the Runloop workspace."
                 if action == "upload":
-                    source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
-                    if not self._local_attachment_allowed(source):
-                        return ToolResult.error("source must be inside the nanobot media/data directory")
-                    if not source.is_file():
-                        return ToolResult.error("source file does not exist")
-                    if source.stat().st_size > _MAX_UPLOAD_BYTES:
-                        return ToolResult.error("source file exceeds 200 MiB")
-                    path = str(kwargs.get("path") or "")
-                    await backend.write_bytes(path, await asyncio.to_thread(source.read_bytes))
+                    staged = await self._stage_upload(
+                        kwargs,
+                        lambda target, data: backend.write_bytes(target, data),
+                        label="the Runloop workspace",
+                    )
+                    if isinstance(staged, ToolResult):
+                        return staged
+                    source, path = staged
                     if getattr(backend, "last_devbox_id", ""):
                         _RUNLOOP_STORE.set_id(key, backend.last_devbox_id)
-                    return f"Uploaded {source.name} to {path} in the Runloop workspace."
+                    return f"Uploaded {source.name} to {path} in the Runloop workspace.{_UPLOAD_NOTE}"
                 if action == "fetch_url":
                     url = str(kwargs.get("url") or "").strip()
                     if not url:
@@ -3650,18 +3745,17 @@ class NovitaSandboxTool(Tool):
                         _TENKI_STORE.set_id(key, backend.last_session_id)
                     return f"Wrote {len(content)} characters to {path} in the Tenki workspace."
                 if action == "upload":
-                    source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
-                    if not self._local_attachment_allowed(source):
-                        return ToolResult.error("source must be inside the nanobot media/data directory")
-                    if not source.is_file():
-                        return ToolResult.error("source file does not exist")
-                    if source.stat().st_size > _MAX_UPLOAD_BYTES:
-                        return ToolResult.error("source file exceeds 200 MiB")
-                    path = str(kwargs.get("path") or "")
-                    await backend.write_bytes(path, await asyncio.to_thread(source.read_bytes))
+                    staged = await self._stage_upload(
+                        kwargs,
+                        lambda target, data: backend.write_bytes(target, data),
+                        label="the Tenki workspace",
+                    )
+                    if isinstance(staged, ToolResult):
+                        return staged
+                    source, path = staged
                     if getattr(backend, "last_session_id", ""):
                         _TENKI_STORE.set_id(key, backend.last_session_id)
-                    return f"Uploaded {source.name} to {path} in the Tenki workspace."
+                    return f"Uploaded {source.name} to {path} in the Tenki workspace.{_UPLOAD_NOTE}"
                 if action == "fetch_url":
                     url = str(kwargs.get("url") or "").strip()
                     if not url:
@@ -3831,18 +3925,17 @@ class NovitaSandboxTool(Tool):
                         _FREESTYLE_STORE.set_id(key, backend.last_session_id)
                     return f"Wrote {len(content)} characters to {path} in the Freestyle VM."
                 if action == "upload":
-                    source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
-                    if not self._local_attachment_allowed(source):
-                        return ToolResult.error("source must be inside the nanobot media/data directory")
-                    if not source.is_file():
-                        return ToolResult.error("source file does not exist")
-                    if source.stat().st_size > _MAX_UPLOAD_BYTES:
-                        return ToolResult.error("source file exceeds 200 MiB")
-                    path = str(kwargs.get("path") or "")
-                    await backend.write_bytes(path, await asyncio.to_thread(source.read_bytes))
+                    staged = await self._stage_upload(
+                        kwargs,
+                        lambda target, data: backend.write_bytes(target, data),
+                        label="the Freestyle VM",
+                    )
+                    if isinstance(staged, ToolResult):
+                        return staged
+                    source, path = staged
                     if getattr(backend, "last_session_id", ""):
                         _FREESTYLE_STORE.set_id(key, backend.last_session_id)
-                    return f"Uploaded {source.name} to {path} in the Freestyle VM."
+                    return f"Uploaded {source.name} to {path} in the Freestyle VM.{_UPLOAD_NOTE}"
                 if action == "fetch_url":
                     url = str(kwargs.get("url") or "").strip()
                     if not url:
@@ -4122,16 +4215,15 @@ class NovitaSandboxTool(Tool):
                     await backend.write(path, content)
                     return f"Wrote {len(content)} characters to {path} in the Upstash workspace."
                 if action == "upload":
-                    source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
-                    if not self._local_attachment_allowed(source):
-                        return ToolResult.error("source must be inside the nanobot media/data directory")
-                    if not source.is_file():
-                        return ToolResult.error("source file does not exist")
-                    if source.stat().st_size > _MAX_UPLOAD_BYTES:
-                        return ToolResult.error("source file exceeds 200 MiB")
-                    path = str(kwargs.get("path") or "")
-                    await backend.write_bytes(path, await asyncio.to_thread(source.read_bytes))
-                    return f"Uploaded {source.name} to {path} in the Upstash workspace."
+                    staged = await self._stage_upload(
+                        kwargs,
+                        lambda target, data: backend.write_bytes(target, data),
+                        label="the Upstash workspace",
+                    )
+                    if isinstance(staged, ToolResult):
+                        return staged
+                    source, path = staged
+                    return f"Uploaded {source.name} to {path} in the Upstash workspace.{_UPLOAD_NOTE}"
                 if action == "fetch_url":
                     url = str(kwargs.get("url") or "").strip()
                     if not url:
@@ -4254,7 +4346,17 @@ class NovitaSandboxTool(Tool):
                         request_timeout=timeout + 30,
                     )
                     return _output(result)
-                path = _safe_path(str(kwargs.get("path") or ""))
+                # `upload` and `fetch_url` derive their own destination, so they
+                # must not run through the required-path guard: an omitted `path`
+                # used to raise `ValueError: path is required` here, before the
+                # branch below could default it.
+                if action in {"upload", "fetch_url"}:
+                    path = ""
+                else:
+                    try:
+                        path = _safe_path(str(kwargs.get("path") or ""))
+                    except ValueError as exc:
+                        return ToolResult.error(f"{action} needs a valid 'path': {exc}")
                 if action == "read":
                     content = await asyncio.to_thread(sandbox.files.read, path)
                     text = str(content)
@@ -4283,17 +4385,15 @@ class NovitaSandboxTool(Tool):
                     await asyncio.to_thread(sandbox.files.write, path, content)
                     return f"Wrote {len(content)} characters to {path} in the remote sandbox."
                 if action == "upload":
-                    source = Path(str(kwargs.get("source") or "")).expanduser().resolve()
-                    allowed_root = Path(os.getenv("NANOBOT_DATA_DIR", str(Path.home() / ".nanobot"))).expanduser().resolve()
-                    if allowed_root not in source.parents and source != allowed_root:
-                        return ToolResult.error("source must be inside the nanobot media/data directory")
-                    if not source.is_file():
-                        return ToolResult.error("source file does not exist")
-                    if source.stat().st_size > _MAX_UPLOAD_BYTES:
-                        return ToolResult.error("source file exceeds 200 MiB")
-                    data = await asyncio.to_thread(source.read_bytes)
-                    await asyncio.to_thread(sandbox.files.write, path, data)
-                    return f"Uploaded {source.name} to {path} in the remote sandbox."
+                    staged = await self._stage_upload(
+                        kwargs,
+                        lambda target, data: asyncio.to_thread(sandbox.files.write, target, data),
+                        label="the remote Novita sandbox",
+                    )
+                    if isinstance(staged, ToolResult):
+                        return staged
+                    source, path = staged
+                    return f"Uploaded {source.name} to {path} in the remote sandbox.{_UPLOAD_NOTE}"
                 if action == "fetch_url":
                     url = str(kwargs.get("url") or "").strip()
                     if not url:
