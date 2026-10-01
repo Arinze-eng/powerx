@@ -74,6 +74,7 @@ The WebUI hides provider storage details from the user. The agent sees the saved
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `tools.imageGeneration.enabled` | boolean or unset | unset (auto) | Register the `generate_image` tool. Unset means "on when a provider is configured"; `false` is a deliberate opt-out and is honoured |
+| `tools.imageGeneration.enabledReviewed` | boolean | `false` | Bookkeeping, not an operator setting: stamped by the one-shot migration that clears a pre-release `enabled: false`, so a later opt-out is never undone |
 | `tools.imageGeneration.provider` | string | `"cloudinary"` | Image provider to try first; the ones after it in the default order are then tried in turn. Supported values: `cloudinary`, `openrouter`, `openai`, `openai_codex`, `custom`, `aihubmix`, `minimax`, `gemini`, `ollama`, `stepfun`, `zhipu`, `modelscope` |
 | `tools.imageGeneration.model` | string | `"openai/gpt-5.4-image-2"` | Provider model name |
 | `tools.imageGeneration.defaultAspectRatio` | string | `"1:1"` | Default ratio when the prompt/tool call does not specify one |

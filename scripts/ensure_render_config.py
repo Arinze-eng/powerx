@@ -440,6 +440,62 @@ def _ensure_subagent_concurrency_cap(data: dict[str, Any]) -> bool:
     return True
 
 
+def _ensure_image_generation_defaults(data: dict[str, Any]) -> bool:
+    """Clear the legacy ``enabled: false`` that kept ``generate_image`` off.
+
+    ``tools.imageGeneration.enabled`` used to default to ``false``, and a
+    settings save writes every field out with its alias, so a config on a
+    persistent disk holds a literal ``"enabled": false`` that no operator ever
+    chose — it is the old default frozen into the file. That is the value that
+    left the Cloudinary deployment with no ``generate_image`` tool at all: the
+    model had no image tool to call and edited pictures with OpenCV in a
+    sandbox instead.
+
+    ``enabled`` is tri-state now, so ``null``/absent means "decide from the
+    providers" and only a real ``false`` means off. This clears the stale
+    literal and stamps ``enabledReviewed`` so it happens exactly once: an
+    operator who switches image generation off after this release is left
+    alone on every later boot.
+    """
+    tools = data.setdefault("tools", {})
+    if not isinstance(tools, dict):
+        return False
+
+    section_key = next(
+        (key for key in ("imageGeneration", "image_generation") if isinstance(tools.get(key), dict)),
+        None,
+    )
+    if section_key is None:
+        # No section at all: the tool decides from the providers, which is the
+        # intended default. Say so, because "the tool is missing" and "the tool
+        # is unmentioned" look identical in every other log line.
+        print(
+            "[entrypoint] image generation: no tools.imageGeneration section"
+            " - generate_image is on whenever an image provider is configured"
+        )
+        return False
+
+    section = tools[section_key]
+    if section.get("enabledReviewed") is True or section.get("enabled_reviewed") is True:
+        return False
+
+    changed = False
+    if section.get("enabled") is False:
+        # A deliberate opt-out is indistinguishable from the stale default by
+        # value alone, so the release that introduced the automatic rule clears
+        # it once and stamps the review. Off after this point means off.
+        section["enabled"] = None
+        changed = True
+        print(
+            "[entrypoint] image generation: cleared a pre-release"
+            ' enabled=false from tools.%s' % section_key
+        )
+    if section.get("enabledReviewed") is not True:
+        section["enabledReviewed"] = True
+        changed = True
+    return changed
+
+
 def ensure_render_defaults(config_path: Path) -> bool:
     """Apply attachment and deliberate-execution defaults without clobbering config."""
     data = _load_config(config_path)
@@ -448,6 +504,7 @@ def ensure_render_defaults(config_path: Path) -> bool:
     changed = _ensure_tools_file(data) or False
     changed = _ensure_browser_defaults(data) or changed
     changed = _ensure_human_browser_defaults(data) or changed
+    changed = _ensure_image_generation_defaults(data) or changed
     changed = _ensure_provider_defaults(data) or changed
     changed = _ensure_telegram_polling_defaults(data) or changed
     changed = _ensure_deliberate_defaults(data) or changed

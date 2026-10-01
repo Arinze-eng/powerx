@@ -73,6 +73,12 @@ class ImageGenerationToolConfig(Base):
     default_image_size: str = "1K"
     max_images_per_turn: int = Field(default=4, ge=1, le=8)
     save_dir: str = "generated"
+    #: Bookkeeping, not an operator setting: stamped True by the release
+    #: that made ``enabled`` tri-state, so the one-shot migration in
+    #: scripts/ensure_render_config.py never undoes a later opt-out. A real
+    #: field on purpose - a settings save dumps the whole config, and an
+    #: extra key would be dropped by validation and lost.
+    enabled_reviewed: bool = False
 
     def resolves_enabled(self, providers: dict[str, ProviderConfig] | None) -> bool:
         """Whether this configuration means "on", given the providers present.

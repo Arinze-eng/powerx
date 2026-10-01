@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from scripts.ensure_render_config import (
+    _ensure_image_generation_defaults,
     _ensure_provider_defaults,
     ensure_file_tool_enabled,
     ensure_render_defaults,
@@ -319,3 +320,85 @@ def test_render_defaults_enable_telegram_steps(tmp_path: Path) -> None:
     assert telegram["sendToolHints"] is True
     assert telegram["sendProgress"] is True
     assert telegram["showReasoning"] is True
+
+
+# ---------------------------------------------------------------------------
+# image generation: the stale ``enabled: false`` a settings save froze in
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_image_generation_false_is_cleared_once() -> None:
+    """``enabled: false`` written by an older release must not outlive it.
+
+    ``enabled`` defaulted to false, the WebUI writes the whole config on any
+    save, and the config lives on a persistent disk - so the file carries a
+    literal false nobody chose. Left in place it keeps generate_image out of
+    the registry and every image edit goes to OpenCV in a sandbox.
+    """
+    data = {"tools": {"imageGeneration": {"enabled": False, "provider": "cloudinary"}}}
+
+    assert _ensure_image_generation_defaults(data) is True
+    section = data["tools"]["imageGeneration"]
+    assert section["enabled"] is None
+    assert section["enabledReviewed"] is True
+    # Anything the operator really did set is left exactly as it was.
+    assert section["provider"] == "cloudinary"
+
+
+def test_a_later_opt_out_is_never_undone() -> None:
+    """Once reviewed, ``false`` means off and stays off."""
+    data = {
+        "tools": {
+            "imageGeneration": {"enabled": False, "enabledReviewed": True},
+        }
+    }
+    assert _ensure_image_generation_defaults(data) is False
+    assert data["tools"]["imageGeneration"]["enabled"] is False
+
+
+def test_an_explicit_true_is_left_alone(tmp_path: Path) -> None:
+    data = {"tools": {"imageGeneration": {"enabled": True}}}
+    # It gets the review stamp, but the value itself is untouched.
+    _ensure_image_generation_defaults(data)
+    assert data["tools"]["imageGeneration"]["enabled"] is True
+
+
+def test_a_missing_section_is_left_missing() -> None:
+    """Absent means "decide from the providers" - nothing to write."""
+    data: dict = {"tools": {}}
+    assert _ensure_image_generation_defaults(data) is False
+    assert "imageGeneration" not in data["tools"]
+
+
+def test_the_snake_case_spelling_is_handled_too() -> None:
+    data = {"tools": {"image_generation": {"enabled": False}}}
+    assert _ensure_image_generation_defaults(data) is True
+    assert data["tools"]["image_generation"]["enabled"] is None
+
+
+def test_the_migration_survives_a_settings_save(tmp_path: Path) -> None:
+    """The stamp is a real config field, so a full dump keeps it.
+
+    If it were an extra key, ``model_validate`` would drop it and the next boot
+    would clear a deliberate opt-out all over again.
+    """
+    from nanobot.config.loader import load_config, save_config
+    from nanobot.config.schema import Config
+
+    config_path = tmp_path / "config.json"
+    data = {"tools": {"imageGeneration": {"enabled": False}}}
+    assert _ensure_image_generation_defaults(data) is True
+    config_path.write_text(json.dumps(data), encoding="utf-8")
+
+    config = load_config(config_path)
+    assert config.tools.image_generation.enabled is None
+    assert config.tools.image_generation.enabled_reviewed is True
+
+    save_config(config, config_path)
+    dumped = json.loads(config_path.read_text(encoding="utf-8"))
+    assert dumped["tools"]["imageGeneration"]["enabledReviewed"] is True
+    assert dumped["tools"]["imageGeneration"]["enabled"] is None
+
+    # And re-running the migration on the saved file changes nothing.
+    assert _ensure_image_generation_defaults(dumped) is False
+    assert dumped["tools"]["imageGeneration"]["enabled"] is None

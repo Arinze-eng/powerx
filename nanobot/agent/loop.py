@@ -776,6 +776,25 @@ class AgentLoop:
             registered.append("my")
 
         logger.info("Registered {} tools: {}", len(registered), registered)
+        # The image tool is the one whose absence is invisible: every other
+        # tool being present while this one is not looks like nothing is
+        # wrong, and the model silently edits pictures locally instead.
+        # Name the setting and the provider chain so a missing
+        # ``generate_image`` is diagnosable from one log line.
+        from nanobot.providers.image_generation import image_provider_chain
+
+        image_config = self.tools_config.image_generation
+        logger.info(
+            "Image generation: generate_image={} (configured enabled={!r}"
+            ", resolved={}, provider={}, chain={})",
+            "generate_image" in registered,
+            image_config.enabled,
+            image_config.resolves_enabled(self._image_generation_provider_configs),
+            image_config.provider,
+            image_provider_chain(
+                image_config.provider, self._image_generation_provider_configs
+            ),
+        )
 
     def register_runtime_context_provider(
         self,
