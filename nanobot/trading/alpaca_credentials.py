@@ -13,10 +13,17 @@ from typing import Any
 
 import httpx
 
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-except ImportError:  # pragma: no cover
-    AESGCM = None
+from nanobot.utils.lazy_import import lazy_attr
+
+# ``cryptography`` is a large compiled package, and this module is imported at
+# startup by the tool loader (nanobot.agent.tools.poll drags in
+# nanobot.trading.polling_engine, which imports ``_env`` from here). Importing it
+# at module scope therefore put its whole footprint on the gateway's floor for a
+# class that is only ever constructed when a user actually stores Alpaca
+# credentials. Resolve it on first use instead; the proxy raises ImportError if
+# the package is missing, which ``_build_crypto`` turns into the same "no crypto"
+# state the previous ``AESGCM is None`` check produced.
+AESGCM = lazy_attr("cryptography.hazmat.primitives.ciphers.aead", "AESGCM")
 
 
 class AlpacaCredentialError(RuntimeError):
@@ -36,8 +43,6 @@ class AlpacaCredentialStore:
         self._crypto = self._build_crypto()
 
     def _build_crypto(self):
-        if AESGCM is None:
-            return None
         token_key = _env("SUPABASE_TOKEN_ENCRYPTION_KEY")
         if not token_key:
             return None
@@ -50,7 +55,10 @@ class AlpacaCredentialStore:
             raw_bytes = hashlib.sha256(raw_bytes).digest()
         if len(raw_bytes) != 32:
             raw_bytes = hashlib.sha256(b"nanobot-alpaca-session-key").digest()
-        return AESGCM(raw_bytes)
+        try:
+            return AESGCM(raw_bytes)
+        except ImportError:  # pragma: no cover - cryptography is an optional extra
+            return None
 
     @property
     def enabled(self) -> bool:

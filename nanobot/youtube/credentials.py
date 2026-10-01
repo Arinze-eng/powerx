@@ -15,10 +15,13 @@ from typing import Any
 
 import httpx
 
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-except ImportError:  # pragma: no cover
-    AESGCM = None
+from nanobot.utils.lazy_import import lazy_attr
+
+# Same reasoning as nanobot.trading.alpaca_credentials: this module is imported
+# at startup by the tool loader, so a module-scope ``cryptography`` import put a
+# large compiled package on the gateway's floor for a class that is only built
+# when a user connects a YouTube account. Resolved on first use instead.
+AESGCM = lazy_attr("cryptography.hazmat.primitives.ciphers.aead", "AESGCM")
 
 
 class YouTubeCredentialError(RuntimeError):
@@ -42,8 +45,6 @@ class YouTubeCredentialStore:
         self._crypto = self._build_crypto()
 
     def _build_crypto(self):
-        if AESGCM is None:
-            return None
         token_key = _env("SUPABASE_TOKEN_ENCRYPTION_KEY")
         if not token_key:
             return None
@@ -56,7 +57,10 @@ class YouTubeCredentialStore:
             raw_bytes = hashlib.sha256(raw_bytes).digest()
         if len(raw_bytes) != 32:
             raw_bytes = hashlib.sha256(b"nanobot-youtube-session-key").digest()
-        return AESGCM(raw_bytes)
+        try:
+            return AESGCM(raw_bytes)
+        except ImportError:  # pragma: no cover - cryptography is an optional extra
+            return None
 
     @property
     def enabled(self) -> bool:

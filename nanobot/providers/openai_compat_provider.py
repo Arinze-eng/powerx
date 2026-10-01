@@ -58,6 +58,14 @@ from nanobot.providers.prompt_cache import (
     resolve_cache_mode,
     strip_cache_markers,
 )
+from nanobot.utils.import_guard import block_module
+
+# ``openai`` probes for its optional aiohttp transport while being imported and
+# pulls the whole aiohttp package in with it, for a transport this codebase never
+# uses. Block that one submodule before anything can import ``openai``: the SDK
+# then takes its documented ImportError branch and everything we actually call is
+# unaffected. See nanobot/utils/import_guard.py for the full rationale.
+block_module("openai._vendor.httpx_aiohttp")
 
 # Module-level placeholder — set lazily by _ensure_client on first real
 # use, or replaced by tests via ``patch(...)``.  Kept as a plain name so

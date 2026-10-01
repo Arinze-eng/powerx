@@ -32,6 +32,7 @@ from nanobot.agent.shape_router import (
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
 from nanobot.agent.plan_cache import (
+    _MAX_STEPS_PER_PLAN,
     make_plan_cache,
     normalize_task,
     plan_cache_enabled,
@@ -1059,7 +1060,17 @@ class AgentRunner:
                                 else {},
                             }
                         )
-                        recorded_outputs.append(str(result))
+                        # Bound the retained outputs. ``plan_cache.put`` keeps
+                        # only the first _MAX_STEPS_PER_PLAN of them and a plan
+                        # longer than that is refused outright, so anything past
+                        # this index could never be read back -- it would just sit
+                        # in memory for the rest of the turn as a full copy of a
+                        # tool result (up to maxToolResultChars each). Capping the
+                        # list here costs nothing: the slice passed to put() and
+                        # the drift guard's index check both behave exactly as
+                        # before, because the extra entries were already ignored.
+                        if len(recorded_outputs) < _MAX_STEPS_PER_PLAN:
+                            recorded_outputs.append(str(result))
 
                 # --- Zero-call middleware completion --------------------------
                 # The model already fetched the data; when the middleware
