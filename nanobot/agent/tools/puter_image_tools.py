@@ -36,6 +36,7 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 from nanobot.config.paths import get_media_dir
+from nanobot.providers.image_generation import primary_image_provider_available
 from nanobot.supabase_auth import SupabaseAuth
 from nanobot.utils.artifacts import (
     ArtifactError,
@@ -46,6 +47,23 @@ from nanobot.utils.artifacts import (
 
 def _supabase() -> SupabaseAuth:
     return SupabaseAuth()
+
+
+def _primary_image_provider_available(ctx: ToolContext) -> bool:
+    """Whether a non-Puter image provider can serve this turn.
+
+    These Puter tools are the **last resort**. Cloudinary is the primary image
+    path, so while it - or any other provider with credentials - can answer,
+    Puter must not even be offered to the model: a tool that is absent from the
+    list cannot be chosen, which is the only kind of "don't use Puter" that
+    holds. Puter appears again when nothing else is configured.
+    """
+    try:
+        providers = getattr(ctx, "image_generation_provider_configs", None) or {}
+        return primary_image_provider_available(providers)
+    except Exception as exc:  # noqa: BLE001 - never let this hide the tools
+        logger.debug("could not resolve primary image providers: {}", exc)
+        return False
 
 
 def _webui_user_id() -> str | None:
@@ -115,8 +133,12 @@ class PuterGenerateImageTool(Tool):
 
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
-        # Only expose on Supabase-backed deployments (Render gateway).
-        return SupabaseAuth().configured
+        # Only expose on Supabase-backed deployments (Render gateway), and only
+        # while no better image provider is configured - Cloudinary is the
+        # primary path, this is the last resort.
+        if not SupabaseAuth().configured:
+            return False
+        return not _primary_image_provider_available(ctx)
 
     @classmethod
     def create(cls, ctx: ToolContext) -> Tool:
@@ -129,8 +151,8 @@ class PuterGenerateImageTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Generate a brand-new image using the AI image service. Use this when the user "
-            "asks to create, make, draw, or generate an image or picture. "
+            "Last-resort image generation, used only when no other image provider is "
+            "configured. Prefer the generate_image tool whenever it is available. "
             "It charges the user a small amount of credit. Returns artifact paths; deliver "
             "them to the user with the message tool's media parameter. "
             "If the account has no credit, tell the user to buy credits and stop."
@@ -220,7 +242,11 @@ class PuterEditImageTool(Tool):
 
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
-        return SupabaseAuth().configured
+        # Last resort: withheld while Cloudinary or any other configured image
+        # provider can serve the request.
+        if not SupabaseAuth().configured:
+            return False
+        return not _primary_image_provider_available(ctx)
 
     @classmethod
     def create(cls, ctx: ToolContext) -> Tool:
@@ -233,9 +259,10 @@ class PuterEditImageTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Edit an existing image (change, enhance, restyle, remove/object, etc.) using the "
-            "AI image service. Use this when the user attaches an image and asks to edit, "
-            "change, or retouch it. It charges a small amount of credit. Returns artifact paths; "
+            "Last-resort image editing, used only when no other image provider is configured. "
+            "Prefer the generate_image tool (with reference_images) whenever it is available. "
+            "Edits an existing image (change, enhance, restyle, remove an object, etc.). "
+            "It charges the user a small amount of credit. Returns artifact paths; "
             "deliver them to the user with the message tool's media parameter. "
             "If the account has no credit, tell the user to buy credits and stop."
         )

@@ -271,6 +271,97 @@ def image_gen_provider_configs(config: Config) -> dict[str, ProviderConfig]:
     }
 
 
+#: What the agent reaches for when the operator has not pinned a provider, and
+#: the order everything else is tried in. Cloudinary leads because it is the
+#: only entry here that carries several credentials at once, so it is the one
+#: that keeps answering after a single key runs out of monthly allowance.
+DEFAULT_IMAGE_PROVIDER_ORDER: tuple[str, ...] = (
+    "cloudinary",
+    "openai",
+    "gemini",
+    "openrouter",
+    "aihubmix",
+    "zhipu",
+    "minimax",
+    "stepfun",
+    "modelscope",
+    "openai_codex",
+    "ollama",
+    "custom",
+)
+
+#: Puter is deliberately absent from the order above. It is reached only by its
+#: own tools (``generate_puter_image`` / ``edit_puter_image``), which withhold
+#: themselves while any provider in this list can answer - see
+#: ``primary_image_provider_available``.
+
+
+def image_provider_available(name: str, providers: dict[str, ProviderConfig]) -> bool:
+    """Whether *name* has everything it needs to be tried.
+
+    A provider with no credentials is not "available", which matters: a stale
+    ``provider: openrouter`` left over from an earlier configuration must not
+    stop the agent from using the keys that are actually present.
+    """
+    cls = get_image_gen_provider(name)
+    if cls is None:
+        return False
+    cfg = providers.get(name)
+    key = cfg.api_key if cfg is not None and isinstance(cfg.api_key, str) else None
+    if name == "cloudinary":
+        from nanobot.providers.cloudinary import configured
+
+        return configured(key)
+    if name == "ollama":
+        # A local server needs no key, so the base URL is the only evidence that
+        # one was actually configured. Treating it as always available would
+        # silently make every other provider "second choice".
+        base = cfg.api_base if cfg is not None and isinstance(cfg.api_base, str) else None
+        return bool(base and base.strip())
+    return bool(key and key.strip())
+
+
+def image_provider_chain(
+    preferred: str | None,
+    providers: dict[str, ProviderConfig],
+    *,
+    order: tuple[str, ...] | None = None,
+) -> list[str]:
+    """The providers to try, in order, for one image request.
+
+    The operator's choice leads when it can actually serve a request; Cloudinary
+    follows it whenever it is configured; then the rest of the default order.
+    Providers with no credentials are dropped rather than tried and failed.
+
+    The chain is what stops a request from quietly ending up somewhere the
+    operator did not intend: the caller walks it and reports every provider it
+    tried when none of them answers, instead of surfacing one provider's error
+    as if it spoke for all of them.
+    """
+    sequence = order or DEFAULT_IMAGE_PROVIDER_ORDER
+    chain: list[str] = []
+
+    def add(name: str) -> None:
+        if name and name not in chain and image_provider_available(name, providers):
+            chain.append(name)
+
+    add(preferred or "")
+    for name in sequence:
+        add(name)
+    for name in _IMAGE_GEN_PROVIDERS:
+        add(name)
+    return chain
+
+
+def primary_image_provider_available(
+    providers: dict[str, ProviderConfig],
+    *,
+    preferred: str | None = None,
+) -> bool:
+    """Whether any non-Puter image provider can serve a request right now."""
+    return bool(image_provider_chain(preferred, providers))
+
+
 # ---------------------------------------------------------------------------
 # Base class
 # ---------------------------------------------------------------------------
@@ -2112,11 +2203,143 @@ class ModelScopeImageGenerationClient(ImageGenerationProvider):
         return images
 
 
+class CloudinaryImageGenerationClient(ImageGenerationProvider):
+    """Cloudinary's Image Generation API, with the account pool behind it.
+
+    Two endpoints carry the whole feature: ``text_to_image`` invents an image
+    from a prompt, and ``image_to_image`` edits one from up to four reference
+    images. Both are metered by a per-environment add-on allowance, which is
+    why the work goes through :class:`~nanobot.providers.cloudinary.CloudinaryClient`
+    rather than straight to HTTP: that client rotates across every configured
+    account and fails over when one runs out.
+
+    A local reference image cannot be sent to this API directly — it takes a
+    public URL or a managed asset id — so references are uploaded first and the
+    returned delivery URL is what the edit is asked to work from. That is also
+    what makes an edit repeatable: the reference keeps a permanent address.
+
+    The tool's ``model`` setting is shared with the other image providers, so an
+    id belonging to a different provider (anything namespaced, like
+    ``openai/gpt-5.4-image-2``) is treated as "let Cloudinary choose" instead of
+    being forwarded as a model Cloudinary has never heard of.
+    """
+
+    provider_name = "cloudinary"
+    model_options = (
+        "auto",
+        "nano-banana:premium",
+        "flux:premium",
+        "flux:standard",
+    )
+    missing_key_message = (
+        "Cloudinary is not configured. Set CLOUDINARY_ACCOUNTS (or CLOUDINARY_URL) "
+        "to a cloudinary://<api_key>:<api_secret>@<cloud_name> entry, or add the "
+        "account in the Cloudinary provider settings."
+    )
+    default_timeout = 300.0
+
+    #: Model ids that belong to this API. Anything else - including the
+    #: OpenAI-style default the tool ships with - resolves to automatic choice.
+    _KNOWN_MODELS = frozenset(
+        {
+            "nano-banana",
+            "nano-banana-2",
+            "flux-2-pro",
+            "muse-image",
+            "gpt-image-2.5-flare",
+        }
+    )
+    _KNOWN_FAMILIES = frozenset({"nano-banana", "flux", "muse", "gpt-image"})
+
+    def _default_base_url(self) -> str:
+        from nanobot.providers.cloudinary import API_BASE
+
+        return API_BASE
+
+    def _media_client(self) -> Any:
+        from nanobot.providers.cloudinary import CloudinaryClient
+
+        return CloudinaryClient(
+            config_api_key=self.api_key,
+            timeout=self.timeout,
+            proxy=self.proxy,
+            client=self._client,
+        )
+
+    def _cloudinary_model(self, model: str) -> str:
+        """Translate the shared model setting into something Cloudinary accepts."""
+        value = (model or "").strip()
+        if not value or value.lower() == "auto":
+            return "auto"
+        if "/" in value:
+            # A namespaced id from another provider: not ours to forward.
+            return "auto"
+        if ":" in value:
+            family = value.split(":", 1)[0].strip()
+            return value if family in self._KNOWN_FAMILIES else "auto"
+        return value if value in self._KNOWN_MODELS else "auto"
+
+    async def generate(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        reference_images: list[str] | None = None,
+        aspect_ratio: str | None = None,
+        image_size: str | None = None,
+    ) -> GeneratedImageResponse:
+        client = self._media_client()
+        if not client.configured:
+            raise ImageGenerationError(self.missing_key_message)
+
+        chosen = self._cloudinary_model(model)
+        refs = [str(p) for p in (reference_images or []) if p][:4]
+
+        if refs:
+            urls: list[str] = []
+            for path in refs:
+                data = Path(path).expanduser().read_bytes()
+                asset = await client.upload(data, resource_type="image")
+                urls.append(asset.secure_url)
+            generation = await client.image_to_image(
+                prompt,
+                urls,
+                model=chosen,
+                aspect_ratio=aspect_ratio,
+                image_size=image_size,
+            )
+        else:
+            generation = await client.text_to_image(
+                prompt,
+                model=chosen,
+                aspect_ratio=aspect_ratio,
+                image_size=image_size,
+            )
+
+        images: list[str] = []
+        for asset in generation.assets:
+            if asset.secure_url.startswith("data:"):
+                images.append(asset.secure_url)
+                continue
+            images.append(await _download_image_data_url(asset.secure_url, proxy=self.proxy))
+        self._require_images(images, {"assets": [a.raw for a in generation.assets]})
+
+        raw: dict[str, Any] = {
+            "assets": [a.raw for a in generation.assets],
+            "remaining": generation.remaining,
+            "limit": generation.limit,
+            "request_id": generation.request_id,
+            "model": chosen,
+        }
+        return GeneratedImageResponse(images=images, content="", raw=raw)
+
+
 # ---------------------------------------------------------------------------
 # Provider registration
 # ---------------------------------------------------------------------------
 
 register_image_gen_provider(AIHubMixImageGenerationClient)
+register_image_gen_provider(CloudinaryImageGenerationClient)
 register_image_gen_provider(CodexImageGenerationClient)
 register_image_gen_provider(CustomImageGenerationClient)
 register_image_gen_provider(GeminiImageGenerationClient)

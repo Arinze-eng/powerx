@@ -79,9 +79,12 @@ async def test_generate_image_tool_stores_artifact_and_source_images(
 
 @pytest.mark.asyncio
 async def test_generate_image_tool_reports_missing_key(tmp_path: Path) -> None:
+    # The provider is named explicitly: the shipped default is Cloudinary, and
+    # the point of this test is that the message identifies whichever provider
+    # was asked for and what it is missing.
     tool = ImageGenerationTool(
         workspace=tmp_path,
-        config=ImageGenerationToolConfig(enabled=True),
+        config=ImageGenerationToolConfig(enabled=True, provider="openrouter"),
         provider_config=ProviderConfig(),
     )
 

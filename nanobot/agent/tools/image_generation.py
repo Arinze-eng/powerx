@@ -31,6 +31,7 @@ from nanobot.providers.image_generation import (
     ImageGenerationProvider,
     get_image_gen_provider,
     image_gen_provider_configs,
+    image_provider_chain,
 )
 from nanobot.security.workspace_access import current_tool_workspace
 from nanobot.security.workspace_policy import WorkspaceBoundaryError, resolve_allowed_path
@@ -49,7 +50,11 @@ if TYPE_CHECKING:
 class ImageGenerationToolConfig(Base):
     """Image generation tool configuration."""
     enabled: bool = False
-    provider: str = "openrouter"
+    #: Cloudinary leads by default: it is the one provider here that holds
+    #: several credentials at once, so it is the one that keeps answering after
+    #: a single key's monthly allowance runs out. An operator who pins another
+    #: provider still gets it first - see ``ImageGenerationTool._provider_chain``.
+    provider: str = "cloudinary"
     model: str = "openai/gpt-5.4-image-2"
     default_aspect_ratio: str = "1:1"
     default_image_size: str = "1K"
@@ -132,8 +137,33 @@ class ImageGenerationTool(Tool):
         return self.provider_configs.get(self.config.provider)
 
     def _provider_client(self) -> ImageGenerationProvider | None:
-        provider = self._provider_config()
+        """The client for the configured provider alone.
+
+        The request itself walks the fallback chain; this is the single-provider
+        view, kept for callers and tests that want to inspect one client.
+        """
+        return self._client_for(self.config.provider)
+
+    def _missing_key_message(self) -> str:
+        """What to say when no provider is usable: name the one that was asked for."""
         cls = get_image_gen_provider(self.config.provider)
+        message = getattr(cls, "missing_key_message", "") if cls is not None else ""
+        return str(message or "").strip()
+
+    def _provider_chain(self) -> list[str]:
+        """The providers to try for this request, best first.
+
+        The configured provider leads when it can serve a request, Cloudinary
+        follows whenever it is configured, and the rest of the default order
+        comes after. Providers with no credentials are dropped, so a stale
+        setting from an earlier configuration cannot stop the agent from using
+        the keys that are actually present.
+        """
+        return image_provider_chain(self.config.provider, self.provider_configs)
+
+    def _client_for(self, name: str) -> ImageGenerationProvider | None:
+        provider = self.provider_configs.get(name)
+        cls = get_image_gen_provider(name)
         if cls is None:
             return None
         kwargs: dict[str, Any] = {
@@ -185,10 +215,6 @@ class ImageGenerationTool(Tool):
         count: int | None = None,
         **kwargs: Any,
     ) -> str:
-        client = self._provider_client()
-        if client is None:
-            return ToolResult.error(f"Error: unsupported image generation provider '{self.config.provider}'")
-
         requested = count or 1
         if requested > self.config.max_images_per_turn:
             return ToolResult.error(
@@ -198,30 +224,76 @@ class ImageGenerationTool(Tool):
 
         try:
             refs = self._resolve_reference_images(reference_images)
-            artifacts: list[dict[str, Any]] = []
-            while len(artifacts) < requested:
-                response = await client.generate(
-                    prompt=prompt,
-                    model=self.config.model,
-                    reference_images=refs,
-                    aspect_ratio=aspect_ratio or self.config.default_aspect_ratio,
-                    image_size=image_size or self.config.default_image_size,
-                )
-                for image_data_url in response.images:
-                    artifact = store_generated_image_artifact(
-                        image_data_url,
-                        prompt=prompt,
-                        model=self.config.model,
-                        source_images=refs,
-                        save_dir=self.config.save_dir,
-                        provider=self.config.provider,
-                    )
-                    artifacts.append(artifact)
-                    if len(artifacts) >= requested:
-                        break
-            return generated_image_tool_result(artifacts)
         except (ArtifactError, ImageGenerationError, OSError) as exc:
             return ToolResult.error(f"Error: {exc}")
+
+        chain = self._provider_chain()
+        if not chain:
+            # Name the provider the operator asked for and what it is missing,
+            # rather than a generic complaint that hides the fix.
+            message = self._missing_key_message()
+            if message:
+                return ToolResult.error(f"Error: {message}")
+            return ToolResult.error(
+                "Error: no image provider is configured. Add Cloudinary credentials "
+                "(CLOUDINARY_ACCOUNTS, or the Cloudinary provider in settings) or another "
+                f"image provider's API key. Asked for {self.config.provider!r}."
+            )
+
+        # Walk the chain rather than betting on one provider: a key that has run
+        # out of monthly allowance, a rate limit or a revoked key is a reason to
+        # ask the next provider, not a reason to fail the turn. The error that
+        # comes back names every provider that was tried, so a real problem is
+        # reported as itself instead of as "no provider worked".
+        attempted: list[str] = []
+        for name in chain:
+            client = self._client_for(name)
+            if client is None:
+                continue
+            attempted.append(name)
+            artifacts: list[dict[str, Any]] = []
+            try:
+                while len(artifacts) < requested:
+                    response = await client.generate(
+                        prompt=prompt,
+                        model=self.config.model,
+                        reference_images=refs,
+                        aspect_ratio=aspect_ratio or self.config.default_aspect_ratio,
+                        image_size=image_size or self.config.default_image_size,
+                    )
+                    for image_data_url in response.images:
+                        artifact = store_generated_image_artifact(
+                            image_data_url,
+                            prompt=prompt,
+                            model=self.config.model,
+                            source_images=refs,
+                            save_dir=self.config.save_dir,
+                            provider=name,
+                        )
+                        artifacts.append(artifact)
+                        if len(artifacts) >= requested:
+                            break
+            except (ArtifactError, ImageGenerationError, OSError) as exc:
+                logger.warning("image generation via {} failed: {}", name, exc)
+                if artifacts:
+                    # Something was produced before the failure: what the user
+                    # can already see beats a clean error.
+                    break
+                continue
+            except Exception as exc:  # noqa: BLE001 - one provider must not end the turn
+                logger.warning("image generation via {} raised: {}", name, exc)
+                if artifacts:
+                    break
+                continue
+            if artifacts:
+                return generated_image_tool_result(artifacts)
+            logger.warning("image generation via {} returned no image", name)
+
+        return ToolResult.error(
+            "Error: image generation failed. Tried: "
+            + (", ".join(attempted) or "nothing (no provider is configured)")
+            + "."
+        )
 
 
 async def reload_image_generation_tool(state: Any, registry: ToolRegistry) -> dict[str, Any]:
@@ -270,6 +342,9 @@ async def reload_image_generation_tool(state: Any, registry: ToolRegistry) -> di
         "enabled": tool_config.enabled,
         "provider": tool_config.provider,
         "model": tool_config.model,
+        # The providers that will actually be tried, in order, so an operator
+        # can see whether the keys they added are part of the run.
+        "providers": image_provider_chain(tool_config.provider, provider_configs),
         "requires_restart": False,
     }
 

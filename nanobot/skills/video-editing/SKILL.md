@@ -170,3 +170,16 @@ whisper and rembg weights) and **waits for it**. If it reports `stage="installin
 the install is progressing normally: poll `action="status"` until `ready=true`, then
 run the action you wanted. Never hand the user ffmpeg commands to run locally, and
 never tell them to check back later — the waiting is the tool's job.
+
+## When local ffmpeg is not the right answer
+
+Local ffmpeg is the default because the footage never leaves the machine. There is
+one hosted alternative, and it is opt-in:
+
+- `cloudinary_video_edit` uploads the clip to Cloudinary and renders the edit on
+  delivery — `trim`, `crop`, `transcode`, `poster` (a still frame), `concat` and,
+  where the account has the add-on, generative `animate`.
+
+Reach for it when the user asks for it by name, when the media is already hosted
+there, or when the sandbox has no ffmpeg. Otherwise stay local: uploading a user's
+footage to a third party is their decision, not a convenience.

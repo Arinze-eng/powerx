@@ -20,21 +20,21 @@ This snippet uses the current built-in image-generation default so the JSON has 
 ```json
 {
   "providers": {
-    "openrouter": {
-      "apiKey": "${OPENROUTER_API_KEY}"
+    "cloudinary": {
+      "apiKey": "${CLOUDINARY_ACCOUNTS}"
     }
   },
   "tools": {
     "imageGeneration": {
       "enabled": true,
-      "provider": "openrouter",
-      "model": "openai/gpt-5.4-image-2"
+      "provider": "cloudinary",
+      "model": "auto"
     }
   }
 }
 ```
 
-See [Provider Notes](#provider-notes) for Custom, AIHubMix, MiniMax, Gemini, Ollama, StepFun, Zhipu, and ModelScope configuration examples.
+See [Provider Notes](#provider-notes) for Cloudinary (the default), Custom, AIHubMix, MiniMax, Gemini, Ollama, StepFun, Zhipu, and ModelScope configuration examples.
 
 > [!TIP]
 > Prefer environment variables for API keys. nanobot resolves `${VAR_NAME}` values from the environment at startup.
@@ -55,7 +55,7 @@ The WebUI hides provider storage details from the user. The agent sees the saved
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `tools.imageGeneration.enabled` | boolean | `false` | Register the `generate_image` tool |
-| `tools.imageGeneration.provider` | string | `"openrouter"` | Current built-in image provider default. Supported values: `openrouter`, `openai`, `openai_codex`, `custom`, `aihubmix`, `minimax`, `gemini`, `ollama`, `stepfun`, `zhipu`, `modelscope` |
+| `tools.imageGeneration.provider` | string | `"cloudinary"` | Image provider to try first; the ones after it in the default order are then tried in turn. Supported values: `cloudinary`, `openrouter`, `openai`, `openai_codex`, `custom`, `aihubmix`, `minimax`, `gemini`, `ollama`, `stepfun`, `zhipu`, `modelscope` |
 | `tools.imageGeneration.model` | string | `"openai/gpt-5.4-image-2"` | Provider model name |
 | `tools.imageGeneration.defaultAspectRatio` | string | `"1:1"` | Default ratio when the prompt/tool call does not specify one |
 | `tools.imageGeneration.defaultImageSize` | string | `"1K"` | Default size hint, for example `1K`, `2K`, `4K`, or `1024x1024` |
@@ -77,6 +77,84 @@ For providers that return image URLs, direct downloads use DNS pinning. When an 
 Both camelCase and snake_case config keys are accepted, but docs use camelCase to match `config.json`.
 
 ## Provider Notes
+
+Providers are tried in order. Cloudinary leads the default order because it is
+the only entry that holds several credentials at once; an operator who pins
+another provider gets that one first, then Cloudinary, then the rest. A
+provider with no credentials is skipped rather than tried and failed, so a
+stale `provider` setting cannot stop the agent from using the keys that are
+actually present. The last error names every provider that was tried.
+
+### Cloudinary
+
+Cloudinary serves AI image generation, text-to-image, image editing from up to
+four references, and video editing. It is also the primary provider, so set it
+up here rather than relying on the fallbacks.
+
+```json
+{
+  "providers": {
+    "cloudinary": {
+      "apiKey": "${CLOUDINARY_ACCOUNTS}"
+    }
+  },
+  "tools": {
+    "imageGeneration": {
+      "enabled": true,
+      "provider": "cloudinary",
+      "model": "auto"
+    }
+  }
+}
+```
+
+An account is a `cloudinary://<api_key>:<api_secret>@<cloud_name>` URL, exactly
+as Cloudinary itself documents it. `CLOUDINARY_URL` takes one account;
+`CLOUDINARY_ACCOUNTS` takes several, separated by newlines, commas, semicolons
+or spaces:
+
+```bash
+CLOUDINARY_ACCOUNTS='cloudinary://111:aaa@cloud-one,cloudinary://222:bbb@cloud-two'
+```
+
+The same string can be pasted into the Cloudinary provider's API key field in
+**Settings → Models**, which is how an administrator adds keys without
+restarting nanobot: the account list is re-read on every request.
+
+**Rotation, and what it can honestly promise.** Each account carries its own
+monthly add-on allowance, and the API reports how much is left on every
+response. nanobot records that number against the account that served the
+request and sends the next call to the account with the most left, so a
+freshly-added key is used before one that is nearly spent. An account that
+reports nothing left, or that answers with a rate limit, a revoked key or a
+server error, is taken out of the rotation and the call fails over to the next
+account. Adding keys multiplies the allowance; it does not remove it — when
+every account is spent, generation stops until the month turns over.
+
+Model ids: `auto` (the default, and what any namespaced id from another
+provider resolves to), `nano-banana:premium`, `flux:premium`,
+`flux:standard`, or an explicit id such as `nano-banana-2`.
+
+#### Cloudinary video editing
+
+`cloudinary_video_edit` edits video by storing the clip once and asking
+Cloudinary for a differently-transformed delivery URL, so nothing is
+re-encoded locally:
+
+| Action | What it does |
+| --- | --- |
+| `trim` | Keep the span between `start` and `end` seconds |
+| `crop` | Re-frame: `width`, `height`, `crop` (`scale`, `fill`, `fit`, …) |
+| `transcode` | Change `format`, `fps` or `quality` |
+| `poster` | Pull a still frame at `start` |
+| `concat` | Append `second_clip` to the end of the source |
+| `describe` | Report the stored asset without rendering anything |
+| `animate` | Generative image-to-video, where the account has that add-on |
+
+Generative video (`animate`) needs Cloudinary's image-to-video add-on. On a
+product environment without it the API answers `MG_00014 not found`, which the
+tool reports as such — it does not pretend the clip was animated. The other six
+actions are rendered by the transformation engine and work on any plan.
 
 ### OpenRouter
 
@@ -399,7 +477,12 @@ Use the reference image. Keep the same robot and composition, change the palette
 |---------|-------|
 | `generate_image` is not available | Enable image generation in **Settings → Image** and save. For manual config changes, restart the gateway |
 | Missing API key error | Configure `providers.<provider>.apiKey`; if using `${VAR_NAME}`, confirm the environment variable is visible to the gateway process |
-| `unsupported image generation provider` | Use `openrouter`, `openai`, `openai_codex`, `custom`, `aihubmix`, `minimax`, `gemini`, `ollama`, `stepfun`, `zhipu`, or `modelscope` |
+| `unsupported image generation provider` | Use `cloudinary`, `openrouter`, `openai`, `openai_codex`, `custom`, `aihubmix`, `minimax`, `gemini`, `ollama`, `stepfun`, `zhipu`, or `modelscope` |
+| `Cloudinary is not configured` | Set `CLOUDINARY_ACCOUNTS` or `CLOUDINARY_URL`, or paste a `cloudinary://key:secret@cloud` entry into the Cloudinary provider's API key field in **Settings → Models** |
+| Generation stops partway through the month | Every Cloudinary account's monthly allowance is spent. Add another account; the pool uses the one with the most left first |
+| Cloudinary edit fails with `400` | A reference image or video layer must be reachable by URL and in the same cloud as the asset it is combined with; nanobot uploads references and pins layers to the base clip's cloud automatically |
+| `MG_00014 not found` from Cloudinary | That operation's add-on (for example image-to-video) is not enabled on the product environment. Trims, crops, transcodes and posters work without it |
+| Puter tools are missing from the tool list | Expected while another image provider is configured: Cloudinary is primary and Puter is withheld as the last resort, returning only when nothing else is configured |
 | AIHubMix says `Incorrect model ID` | Use `model: "gpt-image-2-free"`; nanobot expands it to the required `openai/gpt-image-2-free` model path internally |
 | Generation times out | Try a smaller/default image size, set AIHubMix `extraBody.quality` to `"low"`, or retry later |
 | Reference image rejected | Reference image paths must be inside the workspace or nanobot media directory and must be valid image files |

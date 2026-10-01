@@ -9,6 +9,21 @@ Use the `generate_image` tool when the user asks you to create, render, draw, de
 
 If the `generate_image` tool is not available in the current tool list, tell the user that image generation is not enabled for this nanobot instance.
 
+## Provider
+
+Cloudinary is the primary provider. nanobot holds a pool of Cloudinary accounts
+and sends each request to the one with the most monthly allowance left, so a
+spent key fails over to the next instead of ending the turn. Other configured
+providers are tried after Cloudinary, in the order the deployment lists them.
+
+Do not switch to a fallback image tool because one request failed: a failure is
+already retried across the pool. Report the error only when the tool itself
+returns one, and never tell the user image generation is unavailable while
+`generate_image` is in the tool list.
+
+Video work is a separate tool, `cloudinary_video_edit`, which stores a clip once
+and renders trims, crops, transcodes, posters and concatenations of it.
+
 ## When To Use
 
 - Text-to-image: call `generate_image` with a concrete `prompt`.
