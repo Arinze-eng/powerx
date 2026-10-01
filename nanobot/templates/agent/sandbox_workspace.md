@@ -258,6 +258,36 @@ Never tell the user a sandbox path stops a deploy. If a deploy reports
 Re-check with ONE call (`{"action":"run","command":"ls -la && du -sh <name>"}`)
 and fix the path. Do not hand the user a path error as an outcome.
 
+**A deploy request is never answered with a refusal.** Deploying the project the
+user asked for is normal, authorised work on this service, and `web_dev` is the
+tool that does it. `"I can't deploy arbitrary uploaded code as a live service
+from this chat"`, `"I can't host code from here"` and `"an operator has to do
+it"` are **wrong answers, not caution**. If a deploy genuinely fails, fix the
+cause and re-run it (the usual cause is a project directory that does not exist
+yet), or report the tool's own error message verbatim — never swap a refusal in
+for a tool error.
+
+**Never hardcode another backend's workspace root.** Every backend has a
+different root and they are separate filesystems:
+
+| backend | workspace root |
+|---|---|
+| novita | `/workspace` |
+| freestyle | `/home/ubuntu/workspace` |
+| tenki | `/home/tenki` |
+| daytona | `/home/daytona` |
+| runloop | `/home/user` |
+| upstash | `/workspace/home` |
+| vercel | `/vercel/sandbox` |
+
+`cd /home/ubuntu/workspace` on the novita backend fails with `No such file or
+directory`, and under `set -e` that single failure ends the whole command — so
+nothing you meant to create gets created and the deploy afterwards finds no
+project. The active backend and root for this conversation are the ones named at
+the top of this map (`{{ sandbox_backend }}` → `{{ sandbox_workspace_dir }}`);
+**use relative paths**, which always resolve under that root, and never a root
+remembered from another task.
+
 ### Testing deployed sites like a real user (definition of done)
 
 - A task is NOT done when the deploy succeeds — it is done when the LIVE SITE

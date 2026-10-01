@@ -42,6 +42,7 @@ from nanobot.utils.remote_media import (
     RemoteMediaError,
     is_remote_reference,
     materialize_reference,
+    try_materialize_sandbox_file,
 )
 
 #: A delivery render can take a while for a clip that was never rendered before.
@@ -80,13 +81,30 @@ async def _resolve_media(value: str) -> Path:
     file on this host (see :mod:`nanobot.utils.remote_media`), so a link is
     fetched down before the upload path runs. Without this, editing a video the
     user just attached fails with ``file not found: https://onlyfiles.com/...``.
+
+    The second gap is the sandbox: this tool runs on the gateway host, while the
+    agent's own working files live inside the execution sandbox, so a path the
+    sandbox tool returned (``image_input.jpg``, ``/workspace/out.mp4``) is not a
+    host path. That used to end as ``file not found``, which the turn reported
+    as "Cloudinary failed to locate the staged file". A path that is not a host
+    file is now pulled out of the active sandbox instead.
     """
     if is_remote_reference(value):
         try:
             return await materialize_reference(value)
         except RemoteMediaError as exc:
             raise ArtifactError(f"could not fetch media {value}: {exc}") from exc
-    return _resolve_media_path(value)
+    try:
+        return _resolve_media_path(value)
+    except ArtifactError as local_error:
+        pulled = await try_materialize_sandbox_file(value)
+        if pulled is not None:
+            return pulled
+        raise ArtifactError(
+            f"{local_error}. It is neither a file on this host nor a file in the "
+            "execution sandbox — pass a local host path, an https link, or the "
+            "sandbox path the sandbox tool just wrote."
+        ) from None
 
 
 def _resource_type(path: Path) -> str:

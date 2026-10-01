@@ -58,6 +58,16 @@ _USER_AGENT = "Mozilla/5.0 (compatible; nanobot/1.0)"
 #: casing downstream.
 REFERENCE_SUBDIR = "references"
 
+#: Files copied *out* of the execution sandbox land here, for the same reason.
+SANDBOX_SUBDIR = "sandbox"
+
+#: Ceiling for one pull out of the sandbox. The bytes are held in memory and
+#: Novita moves them as base64 (a third more), so this stays well under the
+#: gateway's memory limit rather than tracking the 200 MiB upload cap.
+SANDBOX_MAX_BYTES = 64 * 1024 * 1024
+
+_SANDBOX_TIMEOUT_S = 180.0
+
 _SUFFIX_BY_MIME = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -255,3 +265,125 @@ def looks_like_html(raw: bytes) -> bool:
     """
     head = raw.lstrip()[:256].lower()
     return head.startswith((b"<!doctype html", b"<html", b"<?xml")) or b"<html" in head
+
+
+def is_sandbox_reference(value: object) -> bool:
+    """True when ``value`` could name a file inside the execution sandbox.
+
+    The Cloudinary tools and ``generate_image`` run on the gateway host, while
+    the agent writes its working files inside the execution sandbox (Novita
+    ``/workspace``, Freestyle ``/home/ubuntu/workspace``, …). A path the sandbox
+    tool handed back therefore means nothing to a host-side resolver, which
+    answered ``file not found`` — and the turn then reported "Cloudinary failed
+    to locate the staged file" for a file that plainly existed one filesystem
+    away.
+    """
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text or is_remote_reference(text):
+        return False
+    return text.startswith("/") or "/" not in text
+
+
+def sandbox_filename(remote_path: str) -> str:
+    """A safe local name for the copy of ``remote_path`` pulled onto this host."""
+    base = Path(str(remote_path).rstrip("/")).name or "sandbox-file"
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in base).strip("._")
+    if not safe:
+        safe = "sandbox-file"
+    digest = hashlib.sha256(str(remote_path).encode("utf-8")).hexdigest()[:12]
+    return f"{digest}-{safe}"
+
+
+async def materialize_sandbox_file(
+    value: str,
+    *,
+    dest_dir: Path | None = None,
+    max_bytes: int = SANDBOX_MAX_BYTES,
+) -> Path:
+    """Copy a file that exists only inside the execution sandbox onto this host.
+
+    ``value`` is either an absolute in-sandbox path (``/workspace/out.png``) or
+    a bare name relative to the active sandbox workspace root (``out.png``).
+    Returns a local :class:`~pathlib.Path` under the media directory, which is
+    an allowed root for every media path guard, so the caller needs no special
+    casing. Raises :class:`RemoteMediaError` with a message a model can act on.
+    """
+    raw = str(value).strip()
+    if not raw:
+        raise RemoteMediaError("no sandbox path was given")
+
+    from nanobot.agent.tools.workspace_bridge import (  # noqa: PLC2701
+        fetch_remote_file,
+        sandbox_workspace_root,
+    )
+
+    if raw.startswith("/"):
+        candidates = [raw]
+    else:
+        root = (await sandbox_workspace_root()) or ""
+        if not root:
+            raise RemoteMediaError(
+                "no execution backend is configured, so there is no sandbox to read "
+                f"{raw} from"
+            )
+        candidates = [f"{root.rstrip('/')}/{raw}"]
+
+    payload: bytes | None = None
+    remote_used = ""
+    for remote in candidates:
+        # An absolute path the backend refuses (outside its own workspace, or a
+        # level it keeps private) must not end the search: the same name is
+        # often present under the workspace root.
+        payload = await fetch_remote_file(remote, max_bytes=max_bytes)
+        if payload:
+            remote_used = remote
+            break
+
+    if not payload:
+        raise RemoteMediaError(
+            f"{raw} was not found in the execution sandbox"
+            # Name the path actually tried whenever it is not the value the
+            # caller handed in — that is what turns "not found" into a location
+            # the model can check with one sandbox call.
+            + (f" (tried {', '.join(candidates)})" if candidates != [raw] else "")
+            + ". Pass the sandbox path the sandbox tool returned, a local path on "
+            "this host, or fetch the file with the sandbox tool's download_url "
+            "action and pass the https link instead."
+        )
+
+    root_dir = dest_dir if dest_dir is not None else get_media_dir() / SANDBOX_SUBDIR
+    root_dir.mkdir(parents=True, exist_ok=True)
+    path = root_dir / sandbox_filename(remote_used)
+    tmp = path.with_name(f".{path.name}.part")
+    tmp.write_bytes(payload)
+    tmp.replace(path)
+    logger.info(
+        "materialized sandbox file {} -> {} ({} bytes)",
+        remote_used,
+        path,
+        len(payload),
+    )
+    return path
+
+
+async def try_materialize_sandbox_file(
+    value: str, *, dest_dir: Path | None = None
+) -> Path | None:
+    """Best-effort :func:`materialize_sandbox_file`: ``None`` on any miss.
+
+    Callers use this after their own lookup already failed, so a value that is
+    simply not a sandbox path — or a sandbox that is unreachable — must fall
+    through to their original error rather than replacing it with this one.
+    """
+    if not is_sandbox_reference(value):
+        return None
+    try:
+        return await materialize_sandbox_file(value, dest_dir=dest_dir)
+    except RemoteMediaError as exc:
+        logger.debug("sandbox file {} not materialized: {}", value, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 - a miss must not mask the real error
+        logger.debug("sandbox file {} errored: {}", value, exc)
+        return None

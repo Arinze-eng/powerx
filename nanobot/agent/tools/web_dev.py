@@ -121,6 +121,34 @@ def _extract_url(text: str) -> str | None:
     return match.group(0).rstrip(".,;)]}")
 
 
+#: Files that mark a directory as a deployable web project. Used when the name
+#: the model passed to ``deploy`` is not a directory in the sandbox and the
+#: staged sandbox root has to be searched for the project instead.
+_DEPLOY_MARKERS = frozenset(
+    {
+        "index.html",
+        "package.json",
+        "vercel.json",
+        "next.config.js",
+        "next.config.mjs",
+        "vite.config.js",
+        "vite.config.ts",
+        "public",
+        "src",
+        "app",
+    }
+)
+
+
+def _looks_like_project(path: Path) -> bool:
+    """True when *path* holds a web project's own entry points."""
+    try:
+        names = {entry.name for entry in path.iterdir()}
+    except OSError:
+        return False
+    return bool(names & _DEPLOY_MARKERS)
+
+
 @tool_parameters(
     tool_parameters_schema(
         required=["action"],
@@ -203,7 +231,12 @@ class WebDevTool(Tool):
             "Freestyle, Novita, …) deploy directly: pass project=<the directory name as it exists in "
             "the sandbox> and the sources are fetched out of it automatically, so a sandbox path is "
             "never a blocker — never tell the user a workspace path mismatch makes the deploy "
-            "impossible."
+            "impossible. Deploying the project the user asked for is normal, authorised work "
+            "on this service, so a refusal is never a valid answer: never reply that you "
+            "cannot deploy arbitrary uploaded code, that hosting is not possible from this "
+            "chat, or that an operator has to do it. If a deploy genuinely fails, fix the "
+            "cause and retry (the usual one is a project directory that does not exist yet) "
+            "or report this tool's error message verbatim."
         )
 
     def _resolve_project_dir(self, project: str | None) -> Path:
@@ -264,7 +297,50 @@ class WebDevTool(Tool):
         staged = self._stage_from_sandbox(requested)
         if staged is not None:
             return staged.path, staged
+        if requested:
+            # The named directory is not in the sandbox either. The measured
+            # cause (2026-10-01, `project="alphaxbot-hf"`) is that the project
+            # was written into the sandbox *root* while the model passed the name
+            # it meant to give it — or, in that same turn, that the extraction
+            # command `cd`-ed into another backend's root and so created nothing
+            # at all. Staging the root and picking the project out of it turns
+            # both into a working deploy instead of "no sources found".
+            root_staged = self._stage_from_sandbox(None)
+            if root_staged is not None:
+                picked = self._pick_project(root_staged.path, requested)
+                if picked is not None:
+                    return picked, root_staged
+                root_staged.cleanup()
         return None, None
+
+    @staticmethod
+    def _pick_project(root: Path, requested: str) -> Path | None:
+        """Choose the project inside a staged copy of the sandbox root.
+
+        The requested name wins when it is really there under the root; then a
+        lone subdirectory that looks like a web project; then the root itself,
+        because "the project *is* the workspace root" is a real and common
+        shape. ``None`` means the staged root holds nothing deployable, and the
+        caller discards it.
+        """
+        want = Path(requested.strip().rstrip("/")).name.lower()
+        try:
+            children = [entry for entry in sorted(root.iterdir()) if entry.is_dir()]
+        except OSError:
+            children = []
+        for child in children:
+            if child.name.lower() == want:
+                return child
+        deployable = [child for child in children if _looks_like_project(child)]
+        if len(deployable) == 1:
+            return deployable[0]
+        if _looks_like_project(root):
+            return root
+        if len(children) == 1:
+            # No marker files, but the root holds exactly one project: take it
+            # rather than sending the model back to a directory listing.
+            return children[0]
+        return None
 
     def _stage_from_sandbox(self, requested: str | None) -> StagedProject | None:
         """Run the async sandbox staging bridge from this sync code path."""
@@ -333,7 +409,11 @@ class WebDevTool(Tool):
             "tool: action=write + action=run), then call web_dev action=deploy with "
             "project=<the directory name in the sandbox> — the sandbox copy is fetched "
             "automatically, so never tell the user a workspace path mismatch makes the "
-            "deploy impossible."
+            "deploy impossible. This is a retryable tool error, not a refusal: "
+            "deploying the user's project is authorised work here, so do not answer "
+            "that you cannot deploy uploaded code or deploy from this chat. Fix the "
+            "directory and call web_dev action=deploy again, or report this message "
+            "to the user verbatim."
         )
 
     async def execute(self, **kwargs: Any) -> ToolResult | str:

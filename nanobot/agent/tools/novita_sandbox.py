@@ -888,6 +888,74 @@ def _safe_path(raw: str) -> str:
 
 _UPLOAD_SUBDIR = "uploads"
 
+#: Where each execution backend's workspace root really is. The agent is told one
+#: root at a time, yet a model can mix them up: the measured turn (2026-10-01)
+#: ran ``cd /home/ubuntu/workspace`` — Freestyle's root — while the *active*
+#: backend was Novita, whose root is ``/workspace``. Under ``set -e`` the failing
+#: ``cd`` ended the command, so the project the user asked to deploy was never
+#: created, the deploy that followed had nothing to ship, and the turn ended in
+#: a refusal. The command still fails; what the guard adds is the reason, in the
+#: one place a model always reads — its own tool result.
+_BACKEND_WORKSPACE_ROOTS = {
+    "novita": _WORKSPACE,
+    "freestyle": "/home/ubuntu/workspace",
+    "tenki": "/home/tenki",
+    "daytona": "/home/daytona",
+    "runloop": "/home/user",
+    "upstash": "/workspace/home",
+    "vercel": "/vercel/sandbox",
+}
+
+
+def _wrong_workspace_root(command: str, backend: str) -> str | None:
+    """The foreign sandbox root *command* uses, or ``None`` when it uses none."""
+    active = _BACKEND_WORKSPACE_ROOTS.get(backend)
+    if not active or not command:
+        return None
+    active_trimmed = active.rstrip("/")
+    for name, root in _BACKEND_WORKSPACE_ROOTS.items():
+        if name == backend or root == active:
+            continue
+        trimmed = root.rstrip("/")
+        if trimmed not in command:
+            continue
+        # One root nested inside the other is not a mix-up: ``/workspace`` and
+        # ``/workspace/home`` are both legitimate for their own backend.
+        if trimmed.startswith(active_trimmed + "/") or active_trimmed.startswith(trimmed + "/"):
+            continue
+        return root
+    return None
+
+
+def _annotate_foreign_workspace_root(
+    action: str, kwargs: dict[str, Any], backend: str, result: "ToolResult | str"
+) -> "ToolResult | str":
+    """Explain a ``run`` that failed inside another backend's workspace root."""
+    if action != "run" or isinstance(result, ToolResult):
+        return result
+    text = result if isinstance(result, str) else ""
+    if not text:
+        return result
+    match = re.search(r"\[exit_code=(-?\d+)\]", text)
+    if match is not None and match.group(1) == "0":
+        return result
+    if match is None and "No such file or directory" not in text:
+        # No exit code and no path error: nothing says the command failed, so
+        # stay out of the way rather than guessing.
+        return result
+    foreign = _wrong_workspace_root(str(kwargs.get("command") or ""), backend)
+    if foreign is None:
+        return result
+    active = _BACKEND_WORKSPACE_ROOTS.get(backend) or ""
+    return text + (
+        f"\n[NOTE: this command uses {foreign}, which belongs to a *different* "
+        f"execution backend, so {foreign} does not exist in this sandbox — that is "
+        f"why it failed. The active backend is {backend} and its workspace root is "
+        f"{active}. Re-run with relative paths (they resolve under {active}) or with "
+        f"absolute paths under {active}, then create the project there. Do not report "
+        "the project as missing from this chat: it was never created here.]"
+    )
+
 #: Appended to every successful ``upload`` result. The turn that reported a
 #: user attachment as unreachable had just watched its own staging call die (see
 #: ``_stage_upload``); with nothing in the sandbox it concluded the media
@@ -4273,6 +4341,17 @@ class NovitaSandboxTool(Tool):
             return ToolResult.error(f"Upstash Box error: {type(exc).__name__}: {str(exc)[:500]}")
 
     async def execute(self, **kwargs: Any) -> ToolResult | str:
+        """Run one sandbox action, annotating a wrong-workspace-root mistake.
+
+        A thin wrapper around :meth:`_dispatch`, so the guard below applies to
+        every backend without touching each one's run path.
+        """
+        action = str(kwargs.get("action", "")).strip().lower()
+        selected, _config = self._selected_backend()
+        result = await self._dispatch(**kwargs)
+        return _annotate_foreign_workspace_root(action, kwargs, selected, result)
+
+    async def _dispatch(self, **kwargs: Any) -> ToolResult | str:
         action = str(kwargs.get("action", "")).strip().lower()
         selected_backend, backend_config = self._selected_backend()
         if selected_backend == "vps":

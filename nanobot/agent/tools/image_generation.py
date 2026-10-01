@@ -45,6 +45,7 @@ from nanobot.utils.remote_media import (
     RemoteMediaError,
     is_remote_reference,
     materialize_reference,
+    try_materialize_sandbox_file,
 )
 
 if TYPE_CHECKING:
@@ -234,7 +235,16 @@ class ImageGenerationTool(Tool):
                 local = await self._materialize_reference(value)
                 resolved.append(self._resolve_reference_image(str(local)))
                 continue
-            resolved.append(self._resolve_reference_image(value))
+            try:
+                resolved.append(self._resolve_reference_image(value))
+            except ImageGenerationError:
+                # A path the sandbox tool returned names a file in the execution
+                # sandbox, not on this host. Pull it across instead of telling
+                # the model the reference it just wrote cannot be found.
+                local = await try_materialize_sandbox_file(value)
+                if local is None:
+                    raise
+                resolved.append(self._resolve_reference_image(str(local)))
         return resolved
 
     async def _materialize_reference(self, url: str) -> Path:
