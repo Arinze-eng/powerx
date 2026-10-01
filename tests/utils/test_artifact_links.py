@@ -226,3 +226,93 @@ def test_remember_artifact_never_raises(monkeypatch: pytest.MonkeyPatch) -> None
 
     monkeypatch.setattr(onlyfiles, "artifact_memory", _boom)
     file_share.remember_artifact({"url": "https://g/f/1"}, filename="a.bin")
+
+
+# ---- resolve_raw_url: the dead-token regression ---------------------------
+
+
+class _FakePage:
+    def __init__(self, body: str) -> None:
+        self.status = 200
+        self._body = body
+
+    async def text(self) -> str:
+        return self._body
+
+    async def __aenter__(self) -> "_FakePage":
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+class _FakeSession:
+    """Records the page URL the resolver reads, so the rewrite is observable."""
+
+    requested: list[str] = []
+
+    def __init__(self, body: str) -> None:
+        self._body = body
+
+    async def __aenter__(self) -> "_FakeSession":
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    def get(self, url: str, **kwargs: object) -> _FakePage:
+        _FakeSession.requested.append(url)
+        return _FakePage(self._body)
+
+
+@pytest.mark.asyncio
+async def test_resolve_raw_url_rebuilds_a_dead_dl_link_from_its_page_form(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``/dl/`` link's token dies in 300 s, so only its page form is re-readable.
+
+    The rewrite used to keep the dead token in the path (``parts[2:]`` dropped
+    only ``dl``), producing ``/1789627686.abc123/ABC123def/file.apk`` — MEASURED
+    live 2026-10-01 as HTTP 404 with an HTML error page. The page form is the id
+    plus the filename, and nothing else.
+    """
+    import aiohttp
+
+    from nanobot.utils.onlyfiles import resolve_raw_url
+
+    _FakeSession.requested = []
+    body = '<a href="/dl/2000000000.fresh/ABC123def/file.apk">download</a>'
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **kw: _FakeSession(body))
+
+    out = await resolve_raw_url(
+        "https://onlyfiles.com/dl/1789627686.abc123/ABC123def/file.apk"
+    )
+
+    assert _FakeSession.requested == ["https://onlyfiles.com/ABC123def/file.apk"]
+    assert out == "https://onlyfiles.com/dl/2000000000.fresh/ABC123def/file.apk"
+
+
+@pytest.mark.asyncio
+async def test_resolve_raw_url_leaves_a_short_dl_link_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import aiohttp
+
+    from nanobot.utils.onlyfiles import resolve_raw_url
+
+    _FakeSession.requested = []
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **kw: _FakeSession("<html/>"))
+
+    link = "https://onlyfiles.com/dl/ABC123def"
+    assert await resolve_raw_url(link) == link
+    # No page view: the link carries nothing to re-read.
+    assert _FakeSession.requested == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_raw_url_passes_a_foreign_http_url_through() -> None:
+    from nanobot.utils.onlyfiles import resolve_raw_url
+
+    assert await resolve_raw_url("http://example.com/a/file.apk") == (
+        "http://example.com/a/file.apk"
+    )

@@ -41,6 +41,11 @@ from nanobot.utils.artifacts import (
     store_generated_image_artifact,
 )
 from nanobot.utils.helpers import detect_image_mime
+from nanobot.utils.remote_media import (
+    RemoteMediaError,
+    is_remote_reference,
+    materialize_reference,
+)
 
 if TYPE_CHECKING:
     from nanobot.agent.tools.context import ToolContext
@@ -69,8 +74,12 @@ class ImageGenerationToolConfig(Base):
             min_length=1,
         ),
         reference_images=ArraySchema(
-            StringSchema("Local path of an existing image artifact or user-provided image to use as an edit reference."),
-            description="Optional local image paths. Use generated artifact paths for iterative edits.",
+            StringSchema(
+                "Local path of an existing image artifact or user-provided image to use as an edit "
+                "reference. An https:// link to a user-uploaded file works too — it is downloaded "
+                "automatically, so never tell the user to re-upload a file that is already attached."
+            ),
+            description="Optional image references: local paths, or https:// links to uploaded files.",
         ),
         aspect_ratio=StringSchema(
             "Optional output aspect ratio, e.g. 1:1, 16:9, 9:16, 4:3.",
@@ -201,10 +210,42 @@ class ImageGenerationTool(Tool):
             raise ImageGenerationError(f"unsupported reference image: {value}")
         return str(resolved)
 
-    def _resolve_reference_images(self, values: list[str] | None) -> list[str]:
+    async def _resolve_reference_images(self, values: list[str] | None) -> list[str]:
+        """Resolve every reference to a readable local image path.
+
+        A browser file attachment reaches the agent as an onlyfiles.com URL, not
+        as a file on this host, so a URL reference is fetched down into the media
+        directory first — otherwise the user is told to upload a file they just
+        uploaded. See :mod:`nanobot.utils.remote_media`.
+        """
         if not values:
             return []
-        return [self._resolve_reference_image(value) for value in values if value]
+        resolved: list[str] = []
+        for value in values:
+            if not value:
+                continue
+            if is_remote_reference(value):
+                # Validate the downloaded copy exactly like a local reference,
+                # so a link that served a viewer page is refused here rather
+                # than handed to a provider as an "image".
+                local = await self._materialize_reference(value)
+                resolved.append(self._resolve_reference_image(str(local)))
+                continue
+            resolved.append(self._resolve_reference_image(value))
+        return resolved
+
+    async def _materialize_reference(self, url: str) -> Path:
+        """Fetch a remote reference onto disk, or fail with a usable message."""
+        try:
+            return await materialize_reference(url)
+        except RemoteMediaError as exc:
+            raise ImageGenerationError(
+                f"could not fetch reference image {url}: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise ImageGenerationError(
+                f"could not store reference image {url}: {exc}"
+            ) from exc
 
     async def execute(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
@@ -223,7 +264,7 @@ class ImageGenerationTool(Tool):
             )
 
         try:
-            refs = self._resolve_reference_images(reference_images)
+            refs = await self._resolve_reference_images(reference_images)
         except (ArtifactError, ImageGenerationError, OSError) as exc:
             return ToolResult.error(f"Error: {exc}")
 

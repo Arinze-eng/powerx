@@ -227,9 +227,15 @@ async def resolve_raw_url(page_url: str, *, timeout_seconds: int = 15) -> str:
     parts = parsed.path.split("/")
     if parts[:2] == ["", "dl"]:
         # /dl/<ts.nonce>/<id>/<file> -> the permanent page form /<id>/<file>.
+        # The LAST TWO segments are the id and the filename; everything before
+        # them (``dl`` and the throwaway token) is dropped. Dropping only ``dl``
+        # leaves the dead token in the path and the page form 404s — MEASURED
+        # live 2026-10-01: ``/dl/1790844302.a6e98eb552efea06/wbw8wqgT2p6e/probe.png``
+        # rewritten that way answered HTTP 404 with an HTML error page, while
+        # ``/wbw8wqgT2p6e/probe.png`` minted a working fresh ``/dl/`` link.
         if len(parts) < 4:
             return page_url
-        raw = f"https://{ONLYFILES_HOST}/" + "/".join(parts[2:])
+        raw = f"https://{ONLYFILES_HOST}/" + "/".join(parts[-2:])
     try:
         timeout = aiohttp.ClientTimeout(total=max(5, min(int(timeout_seconds), 30)))
         async with aiohttp.ClientSession(timeout=timeout) as session:

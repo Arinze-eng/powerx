@@ -24,10 +24,26 @@ returns one, and never tell the user image generation is unavailable while
 Video work is a separate tool, `cloudinary_video_edit`, which stores a clip once
 and renders trims, crops, transcodes, posters and concatenations of it.
 
+## Attachments The User Just Sent
+
+A file the user attaches in the chat may reach you as an `https://` link rather
+than a local path, and a file uploaded through the browser is frequently *only* a
+link — its bytes were never written to this host, so searching the workspace or
+sandbox for it finds nothing and is not evidence that the user failed to attach
+anything.
+
+Never ask the user to re-upload a file that is already in the turn. Pass the link
+you were given straight to `reference_images`: `generate_image` fetches it,
+validates that it really is an image, and continues. The same applies to
+`cloudinary_video_edit`, which accepts a link for `source` and `second_clip`.
+Only when the tool itself answers that it could not fetch the link should you
+report a problem — and then repeat the tool's reason rather than guessing.
+
 ## When To Use
 
 - Text-to-image: call `generate_image` with a concrete `prompt`.
-- Image editing: pass the saved artifact path or user image path in `reference_images`.
+- Image editing: pass the saved artifact path, the user's uploaded file link, or an
+  `https://` URL to the image in `reference_images`.
 - Iterative edits in the same conversation: prefer the most recent generated image artifact if the user says things like "make it brighter", "change the background", or "try another version".
 - Ambiguous edits: ask a short clarifying question if multiple recent images could be the target.
 - After generating images, call the `message` tool with the artifact paths in the `media` parameter to deliver them to the user.

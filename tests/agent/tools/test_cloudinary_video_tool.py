@@ -366,3 +366,86 @@ def test_puter_is_not_part_of_the_chain(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_the_shipped_default_provider_is_cloudinary() -> None:
     assert Config.model_validate({}).tools.image_generation.provider == "cloudinary"
+
+
+# ------------------------------------------- remote references (WebUI uploads)
+
+REMOTE_CLIP = "https://onlyfiles.com/abc123/clip.mp4"
+
+
+@pytest.mark.asyncio
+async def test_a_remote_source_url_is_fetched_before_the_upload(
+    monkeypatch: pytest.MonkeyPatch, media_root: Path, clip: Path
+) -> None:
+    """A WebUI attachment is an onlyfiles URL, not a file on this host."""
+    fake = FakeCloudinary()
+    tool = _tool(monkeypatch, fake)
+    fetched: list[str] = []
+
+    async def fake_materialize(value: str, **_kwargs: Any) -> Path:
+        fetched.append(value)
+        return clip
+
+    monkeypatch.setattr(vid, "materialize_reference", fake_materialize)
+
+    result = await tool.execute("trim", REMOTE_CLIP, start=1.0, end=2.0)
+
+    assert fetched == [REMOTE_CLIP]
+    assert fake.uploads[0]["resource_type"] == "video"
+    assert json.loads(result)["artifacts"]
+
+
+@pytest.mark.asyncio
+async def test_a_remote_source_that_cannot_be_fetched_says_so(
+    monkeypatch: pytest.MonkeyPatch, media_root: Path
+) -> None:
+    fake = FakeCloudinary()
+    tool = _tool(monkeypatch, fake)
+
+    async def fake_materialize(value: str, **_kwargs: Any) -> Path:
+        raise vid.RemoteMediaError("download failed with HTTP 404")
+
+    monkeypatch.setattr(vid, "materialize_reference", fake_materialize)
+
+    result = await tool.execute("trim", REMOTE_CLIP)
+
+    assert "could not fetch media" in result
+    assert "HTTP 404" in result
+    assert fake.uploads == []
+
+
+@pytest.mark.asyncio
+async def test_a_remote_second_clip_is_fetched_too(
+    monkeypatch: pytest.MonkeyPatch, media_root: Path, clip: Path
+) -> None:
+    fake = FakeCloudinary()
+    tool = _tool(monkeypatch, fake)
+    fetched: list[str] = []
+
+    async def fake_materialize(value: str, **_kwargs: Any) -> Path:
+        fetched.append(value)
+        return clip
+
+    monkeypatch.setattr(vid, "materialize_reference", fake_materialize)
+
+    await tool.execute("concat", str(clip), second_clip=REMOTE_CLIP)
+
+    assert fetched == [REMOTE_CLIP]
+    assert fake.uploads[1]["cloud_name"] == "cloud-a"
+
+
+@pytest.mark.asyncio
+async def test_a_local_source_is_never_downloaded(
+    monkeypatch: pytest.MonkeyPatch, media_root: Path, clip: Path
+) -> None:
+    fake = FakeCloudinary()
+    tool = _tool(monkeypatch, fake)
+
+    async def fake_materialize(value: str, **_kwargs: Any) -> Path:
+        raise AssertionError("a local path must not be downloaded")
+
+    monkeypatch.setattr(vid, "materialize_reference", fake_materialize)
+
+    result = await tool.execute("describe", str(clip))
+
+    assert "res.cloudinary.com" in result

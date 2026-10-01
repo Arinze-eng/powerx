@@ -38,6 +38,11 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.config.paths import get_media_dir
 from nanobot.utils.artifacts import ArtifactError
+from nanobot.utils.remote_media import (
+    RemoteMediaError,
+    is_remote_reference,
+    materialize_reference,
+)
 
 #: A delivery render can take a while for a clip that was never rendered before.
 _RENDER_TIMEOUT_S = 180.0
@@ -66,6 +71,22 @@ def _resolve_media_path(value: str) -> Path:
     if not path.is_file():
         raise ArtifactError(f"file not found: {value}")
     return path
+
+
+async def _resolve_media(value: str) -> Path:
+    """A local file for a source that may be a URL instead of a path.
+
+    A user-uploaded file attachment arrives as an onlyfiles.com URL, not as a
+    file on this host (see :mod:`nanobot.utils.remote_media`), so a link is
+    fetched down before the upload path runs. Without this, editing a video the
+    user just attached fails with ``file not found: https://onlyfiles.com/...``.
+    """
+    if is_remote_reference(value):
+        try:
+            return await materialize_reference(value)
+        except RemoteMediaError as exc:
+            raise ArtifactError(f"could not fetch media {value}: {exc}") from exc
+    return _resolve_media_path(value)
 
 
 def _resource_type(path: Path) -> str:
@@ -123,7 +144,10 @@ def _media_tool_result(artifacts: list[dict[str, Any]]) -> str:
             min_length=1,
         ),
         source=StringSchema(
-            description="Local path of the video (or still image for animate) to edit."
+            description=(
+                "Local path of the video (or still image for animate) to edit. An https:// "
+                "link to a file the user uploaded works too — it is downloaded first."
+            )
         ),
         start=NumberSchema(
             description=(
@@ -138,7 +162,11 @@ def _media_tool_result(artifacts: list[dict[str, Any]]) -> str:
         format=StringSchema(description="Output container or image format, e.g. mp4, webm, gif, jpg."),
         fps=IntegerSchema(description="Output frame rate."),
         quality=StringSchema(description="Output quality, e.g. auto, good, best, 70."),
-        second_clip=StringSchema(description="Local path of the clip to append, for the concat action."),
+        second_clip=StringSchema(
+            description=(
+                "Path or https:// link of the clip to append, for the concat action."
+            )
+        ),
         prompt=StringSchema(description="Motion description, for the animate action."),
         public_id=StringSchema(description="Optional Cloudinary public id to store the uploaded asset under."),
         required=["action"],
@@ -236,7 +264,7 @@ class CloudinaryVideoEditTool(Tool):
             if action == "animate":
                 return await self._animate(client, prompt=prompt, source=source, public_id=public_id)
 
-            path = _resolve_media_path(str(source))
+            path = await _resolve_media(str(source))
             asset = await client.upload(
                 path.read_bytes(),
                 resource_type=_resource_type(path),
@@ -272,7 +300,7 @@ class CloudinaryVideoEditTool(Tool):
             elif action == "concat":
                 if not second_clip:
                     return ToolResult.error("Error: concat needs 'second_clip'.")
-                other = _resolve_media_path(str(second_clip))
+                other = await _resolve_media(str(second_clip))
                 # Same cloud as the base: a splice combines two assets, and the
                 # delivery URL cannot reach across product environments.
                 other_asset = await client.upload(
@@ -334,7 +362,7 @@ class CloudinaryVideoEditTool(Tool):
         """Generative image-to-video, only where the account has the add-on."""
         from nanobot.providers.cloudinary import CloudinaryError
 
-        path = _resolve_media_path(str(source))
+        path = await _resolve_media(str(source))
         prompt = prompt or "subtle natural motion, cinematic"
         try:
             # image_to_video animates a *still*, and a video handed to it is

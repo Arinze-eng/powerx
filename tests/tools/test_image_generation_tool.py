@@ -10,6 +10,7 @@ from nanobot.agent.tools.image_generation import ImageGenerationTool
 from nanobot.config.loader import set_config_path
 from nanobot.config.schema import ImageGenerationToolConfig, ProviderConfig
 from nanobot.providers.image_generation import GeneratedImageResponse
+from nanobot.utils.remote_media import RemoteMediaError
 
 PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
@@ -231,3 +232,138 @@ async def test_generate_image_tool_rejects_reference_outside_workspace(tmp_path:
     result = await tool.execute(prompt="edit", reference_images=[str(outside)])
 
     assert "reference_images must be inside the workspace" in result
+
+
+REMOTE_URL = "https://onlyfiles.com/abc123/photo.png"
+
+
+@pytest.mark.asyncio
+async def test_generate_image_tool_fetches_a_remote_reference_before_generating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A WebUI file upload reaches the agent as a URL, not a file.
+
+    reported by the user verbatim: *"the image file isn't available in the
+    workspace or sandbox ... the upload path is being rejected because the
+    source isn't recognized as being inside the media directory"* — for a file
+    the user had just attached.
+    """
+    set_config_path(tmp_path / "config.json")
+    FakeImageClient.instances = []
+    monkeypatch.setattr(
+        "nanobot.agent.tools.image_generation.get_image_gen_provider",
+        lambda name: FakeImageClient if name == "openrouter" else None,
+    )
+    ref = tmp_path / "media" / "references" / "abc123-photo.png"
+    fetched: list[str] = []
+
+    async def fake_materialize(value: str, **_kwargs: Any) -> Path:
+        fetched.append(value)
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_bytes(PNG_BYTES)
+        return ref
+
+    monkeypatch.setattr(
+        "nanobot.agent.tools.image_generation.materialize_reference", fake_materialize
+    )
+    tool = ImageGenerationTool(
+        workspace=tmp_path,
+        config=ImageGenerationToolConfig(enabled=True),
+        provider_config=ProviderConfig(api_key="sk-or-test"),
+    )
+
+    result = await tool.execute(
+        prompt="change the background to red", reference_images=[REMOTE_URL]
+    )
+
+    assert fetched == [REMOTE_URL]
+    payload = json.loads(result)
+    assert payload["artifacts"][0]["source_images"] == [str(ref.resolve())]
+    assert FakeImageClient.instances[0].calls[0]["reference_images"] == [str(ref.resolve())]
+
+
+@pytest.mark.asyncio
+async def test_generate_image_tool_reports_an_unfetchable_remote_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_config_path(tmp_path / "config.json")
+    FakeImageClient.instances = []
+
+    async def fake_materialize(value: str, **_kwargs: Any) -> Path:
+        raise RemoteMediaError("download failed with HTTP 404")
+
+    monkeypatch.setattr(
+        "nanobot.agent.tools.image_generation.materialize_reference", fake_materialize
+    )
+    tool = ImageGenerationTool(
+        workspace=tmp_path,
+        config=ImageGenerationToolConfig(enabled=True),
+        provider_config=ProviderConfig(api_key="sk-or-test"),
+    )
+
+    result = await tool.execute(prompt="edit", reference_images=[REMOTE_URL])
+
+    assert result.startswith("Error: could not fetch reference image")
+    assert "HTTP 404" in result
+    assert FakeImageClient.instances == []
+
+
+@pytest.mark.asyncio
+async def test_generate_image_tool_rejects_a_remote_reference_that_is_not_an_image(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A viewer page served instead of the file must be refused, not uploaded."""
+    set_config_path(tmp_path / "config.json")
+    ref = tmp_path / "media" / "references" / "abc123-photo.html"
+
+    async def fake_materialize(value: str, **_kwargs: Any) -> Path:
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_bytes(b"<!DOCTYPE html><html>viewer</html>")
+        return ref
+
+    monkeypatch.setattr(
+        "nanobot.agent.tools.image_generation.materialize_reference", fake_materialize
+    )
+    tool = ImageGenerationTool(
+        workspace=tmp_path,
+        config=ImageGenerationToolConfig(enabled=True),
+        provider_config=ProviderConfig(api_key="sk-or-test"),
+    )
+
+    result = await tool.execute(prompt="edit", reference_images=[REMOTE_URL])
+
+    assert "unsupported reference image" in result
+
+
+@pytest.mark.asyncio
+async def test_generate_image_tool_does_not_fetch_a_local_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_config_path(tmp_path / "config.json")
+    FakeImageClient.instances = []
+    monkeypatch.setattr(
+        "nanobot.agent.tools.image_generation.get_image_gen_provider",
+        lambda name: FakeImageClient if name == "openrouter" else None,
+    )
+
+    async def fake_materialize(value: str, **_kwargs: Any) -> Path:
+        raise AssertionError("a local path must never be downloaded")
+
+    monkeypatch.setattr(
+        "nanobot.agent.tools.image_generation.materialize_reference", fake_materialize
+    )
+    ref = tmp_path / "ref.png"
+    ref.write_bytes(PNG_BYTES)
+    tool = ImageGenerationTool(
+        workspace=tmp_path,
+        config=ImageGenerationToolConfig(enabled=True),
+        provider_config=ProviderConfig(api_key="sk-or-test"),
+    )
+
+    result = await tool.execute(prompt="edit", reference_images=[str(ref)])
+
+    assert json.loads(result)["artifacts"]
