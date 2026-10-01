@@ -37,7 +37,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote, urlparse, urlsplit
 
-import aiohttp
+from nanobot.utils.lazy_import import lazy_module
+
+aiohttp = lazy_module("aiohttp")
 from loguru import logger
 
 from nanobot.agent.tools.daytona_relay import (

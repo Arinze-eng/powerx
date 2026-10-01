@@ -25,7 +25,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import aiohttp
+from nanobot.utils.lazy_import import lazy_module
+
+aiohttp = lazy_module("aiohttp")
 from loguru import logger
 
 GOFILE_API = "https://api.gofile.io"

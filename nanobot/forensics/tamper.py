@@ -50,7 +50,9 @@ import math
 import warnings
 from typing import Any
 
-import numpy as np
+from nanobot.utils.lazy_import import lazy_module
+
+np = lazy_module("numpy")
 
 #: Detectors whose per-tile map is compared against the whole-frame baseline.
 #: The z-score below is the number of robust deviations a tile must sit at before

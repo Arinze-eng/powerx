@@ -51,7 +51,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Callable
 from urllib.parse import quote
 
-import aiohttp
+from nanobot.utils.lazy_import import lazy_module
+
+aiohttp = lazy_module("aiohttp")
 
 from loguru import logger
 

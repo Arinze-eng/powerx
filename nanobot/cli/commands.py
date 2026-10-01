@@ -55,7 +55,11 @@ from nanobot.agent.hooks import (  # noqa: E402
 from nanobot.agent.loop import AgentLoop  # noqa: E402
 from nanobot.agent.tools.mcp import MCPProvider  # noqa: E402
 from nanobot.agent.tools.registry import ToolRegistry  # noqa: E402
-from nanobot.cli import terminal as cli_terminal  # noqa: E402
+# prompt_toolkit (via nanobot.cli.terminal) is a terminal UI library that the
+# headless gateway never uses, but importing it at module scope cost ~7 MB of
+# permanent RSS on every boot. Resolve it on first real use instead.
+from nanobot.utils.lazy_import import lazy_attr, lazy_module  # noqa: E402
+cli_terminal = lazy_module("nanobot.cli.terminal")  # noqa: E402
 from nanobot.cli.agent import agent  # noqa: E402
 from nanobot.cli.gateway import create_gateway_app  # noqa: E402
 from nanobot.cli.gateway_runtime import _run_gateway  # noqa: E402
@@ -83,7 +87,7 @@ from nanobot.utils.helpers import (  # noqa: E402
 )
 
 # Backward-compatible import for callers that used the former module location.
-SafeFileHistory = cli_terminal.SafeFileHistory
+SafeFileHistory = lazy_attr("nanobot.cli.terminal", "SafeFileHistory")
 
 
 app = typer.Typer(

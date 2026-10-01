@@ -19,7 +19,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import numpy as np
+from nanobot.utils.lazy_import import lazy_module
+
+np = lazy_module("numpy")
 
 from nanobot.forensics.tamper import (
     _decimate as _decimate_for_scan,

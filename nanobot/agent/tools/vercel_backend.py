@@ -60,7 +60,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote, urlencode, urlparse
 
-import aiohttp
+from nanobot.utils.lazy_import import lazy_module
+
+aiohttp = lazy_module("aiohttp")
 from loguru import logger
 
 _MAX_COMMAND_CHARS = 12_000

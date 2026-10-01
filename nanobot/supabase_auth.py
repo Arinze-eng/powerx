@@ -10,7 +10,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from nanobot.utils.lazy_import import lazy_attr
+
+AESGCM = lazy_attr("cryptography.hazmat.primitives.ciphers.aead", "AESGCM")
 
 # Explicit columns (egress fix): telegram_accounts is fetched on every inbound
 # message. select=* shipped the whole row (crypto/auth blobs, opt-ins) each

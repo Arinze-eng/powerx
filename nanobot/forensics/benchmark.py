@@ -35,7 +35,9 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import numpy as np
+from nanobot.utils.lazy_import import lazy_module
+
+np = lazy_module("numpy")
 
 #: Font candidates, in order. The harness needs a real TrueType face: a bitmap
 #: fallback font has no anti-aliasing and no glyph metrics, which would make the

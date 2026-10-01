@@ -32,7 +32,9 @@ from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import quote, urlparse
 
-import aiohttp
+from nanobot.utils.lazy_import import lazy_module
+
+aiohttp = lazy_module("aiohttp")
 
 _MAX_COMMAND_CHARS = 12_000
 _MAX_CONTENT_CHARS = 120_000

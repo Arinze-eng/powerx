@@ -21,7 +21,9 @@ from nanobot.agent.hooks import (
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.mcp import MCPProvider
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.cli import terminal as cli_terminal
+from nanobot.utils.lazy_import import lazy_attr, lazy_module
+
+cli_terminal = lazy_module("nanobot.cli.terminal")
 from nanobot.cli.runtime_config import _migrate_cron_store
 from nanobot.cli.webui_support import (
     _gateway_health_bind_note,
@@ -913,7 +915,13 @@ def _run_gateway(
         shutdown_task: asyncio.Task[Any] | None = None
         runtime_tasks: asyncio.Future[list[Any]] | None = None
         shutdown_event = asyncio.Event()
-        cli_terminal._ensure_interactive_tty_mode()
+        # Only the interactive-terminal path needs prompt_toolkit. On the
+        # headless deployment stdin is not a TTY and the call is a no-op, so
+        # skip it (and the ~7 MB import it drags in) entirely.
+        import sys as _sys
+
+        if _sys.stdin.isatty():
+            cli_terminal._ensure_interactive_tty_mode()
         restore_shutdown_handlers = _install_gateway_shutdown_handlers(
             asyncio.get_running_loop(),
             shutdown_event,

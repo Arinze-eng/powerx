@@ -122,6 +122,12 @@ USER root
 # Ensure crash output reaches Render logs (app output is otherwise swallowed on
 # non-graceful exit).
 ENV PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1
+# Cap glibc's per-thread malloc arenas. Python reserves one arena per thread
+# (glibc allows up to 8 x core count) and never returns them to the kernel;
+# malloc_trim only frees the top of the main arena, so idle arena space is
+# charged to the container for its whole life. Two arenas is ample for this
+# workload and lowers steady-state RSS on a fixed-size plan.
+ENV MALLOC_ARENA_MAX=2
 
 # Gateway health endpoint and optional WebUI/WebSocket channel ports
 EXPOSE 18790 8765

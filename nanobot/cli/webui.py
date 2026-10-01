@@ -6,7 +6,9 @@ import typer
 from pydantic import ValidationError
 from rich.console import Console
 
-from nanobot.cli import terminal as cli_terminal
+from nanobot.utils.lazy_import import lazy_attr, lazy_module
+
+cli_terminal = lazy_module("nanobot.cli.terminal")
 from nanobot.cli.runtime_config import (
     _load_runtime_config,
     _print_config_error,

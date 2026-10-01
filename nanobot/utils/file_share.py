@@ -20,7 +20,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import aiohttp
+from nanobot.utils.lazy_import import lazy_module
+
+aiohttp = lazy_module("aiohttp")
 
 from nanobot.utils.onlyfiles import OnlyFilesError
 from nanobot.utils.onlyfiles import upload_bytes as _onlyfiles_upload_bytes

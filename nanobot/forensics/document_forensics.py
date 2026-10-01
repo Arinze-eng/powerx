@@ -21,7 +21,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import numpy as np
+from nanobot.utils.lazy_import import lazy_module
+
+np = lazy_module("numpy")
 
 #: Amounts as they appear on receipts, with or without a currency symbol.
 #: The number is captured loosely — every digit and separator in a run — and

@@ -20,8 +20,16 @@ from typing import Any, TypedDict, cast
 
 from filelock import FileLock
 from loguru import logger
-from mcp.client.auth import OAuthClientProvider
-from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+from nanobot.utils.lazy_import import lazy_attr
+
+# The MCP SDK is only needed once a server actually performs an OAuth
+# handshake, but importing it at module scope cost ~20 MB of the gateway's
+# permanent footprint (the module is pulled in by the WebUI preset API at
+# startup). Resolve it on first use instead.
+OAuthClientProvider = lazy_attr("mcp.client.auth", "OAuthClientProvider")
+OAuthClientInformationFull = lazy_attr("mcp.shared.auth", "OAuthClientInformationFull")
+OAuthClientMetadata = lazy_attr("mcp.shared.auth", "OAuthClientMetadata")
+OAuthToken = lazy_attr("mcp.shared.auth", "OAuthToken")
 from pydantic import AnyHttpUrl, AnyUrl
 
 from nanobot.config.paths import get_data_dir
