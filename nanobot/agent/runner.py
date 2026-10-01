@@ -1033,6 +1033,14 @@ class AgentRunner:
                     for tool_call, event in zip(response.tool_calls, new_events)
                     if event.get("status") == "ok"
                 )
+                # Hand back the tool working set as soon as it is dead. Tool
+                # results are the largest transient allocations in a turn (up to
+                # maxToolResultChars each, plus sandbox payloads and decoded
+                # images), and a multi-step turn holds the peak of every earlier
+                # batch until the whole turn ends. Reclaiming here keeps the
+                # high-water mark at one batch rather than at the sum of them.
+                # Rate-limited to one collection per RECLAIM_MIN_INTERVAL_S.
+                maybe_reclaim(tag="tool_batch")
                 # Capture the concrete steps taken this iteration so a clean
                 # completion can be distilled into a replayable plan. Only
                 # successful calls are recorded — a failed step is not part of a
