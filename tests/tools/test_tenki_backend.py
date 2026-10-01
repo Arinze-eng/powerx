@@ -351,6 +351,27 @@ def test_safe_path_confines_to_workspace() -> None:
         tenki_backend._safe_path("../../etc/shadow")
 
 
+def test_safe_path_reaches_the_scratch_root_but_not_the_system() -> None:
+    """``/tmp`` is ordinary workspace, not a restricted path.
+
+    A build output, an upload or a scaffold parked in ``/tmp`` is routine, and
+    refusing it broke ``read``/``list``/``download`` and the ``web_dev`` deploy
+    staging step for any project kept there. ``run`` already reaches the whole
+    VM through a shell, so the file guard keeps the model in its lane rather
+    than enforcing a boundary — it must not invent one.
+    """
+    assert tenki_backend._safe_path("/tmp/site/index.html") == "/tmp/site/index.html"
+    assert tenki_backend._safe_path("/tmp/site") == "/tmp/site"
+    assert tenki_backend._safe_path("/tmp") == "/tmp"
+    # Still refused: system paths and the kernel's non-files.
+    for path in ["/etc/passwd", "/var/log/syslog", "/usr/bin/env", "/proc/self/environ", "/sys/kernel", "/dev/mem", "/root/.bashrc"]:
+        with pytest.raises(ValueError):
+            tenki_backend._safe_path(path)
+    # Traversal back out of an allowed root is still refused.
+    with pytest.raises(ValueError):
+        tenki_backend._safe_path("/tmp/../etc/passwd")
+
+
 def test_sdk_available_reflects_the_import_seam(monkeypatch: pytest.MonkeyPatch) -> None:
     assert is_sdk_available() is True  # patched seam resolves
     _sdk_unavailable(monkeypatch)

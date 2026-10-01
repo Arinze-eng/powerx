@@ -94,8 +94,10 @@ Rules:
    below. That is editing an existing binary, NOT building from source, so it does not
    go through GitHub Actions. (MetaTrader 5 / MQL5 compilation likewise stays in the
    sandbox; see the exception below.)
-5. Web/static projects (HTML/Next.js/Vite) still build & deploy via the normal
-   sandbox `deploy` flow — that path is unchanged.
+5. Web/static projects (HTML/Next.js/Vite) are **not** built by `build_artifact`.
+   Build them in the sandbox (`npm run build`) and ship them with the `web_dev`
+   tool — `web_dev action=deploy project=<name>` → a `https://…vercel.app` URL.
+   See "Web project lifecycle" below.
 
 ### ✅ EXCEPTION: MetaTrader 5 / MQL5 — the sandbox CAN do this
 
@@ -204,6 +206,27 @@ Follow this order; each step is one `novita_sandbox` call:
    never report a path mismatch or "/home/nanobot/.nanobot/workspace is not
    accessible" as a reason the deploy cannot happen: it deploys from the sandbox
    copy. Set secrets first with `web_dev action=set_env`.
+
+   `project=` accepts the directory **name**, a path relative to the workspace
+   root, or an absolute sandbox path — and that path may sit anywhere under the
+   roots the sandbox file API is allowed to address: the workspace root itself
+   (`{{ sandbox_workspace_dir }}`), the account's home directory, and `/tmp`.
+   Deploying the workspace root (or `project=/`) works: it is staged the same
+   way. A project outside those roots is the only path that is refused, so put
+   the project under the workspace root and no path is ever "restricted".
+
+### Hosting a site from the sandbox — the path is not the blocker
+
+Never tell the user a sandbox path stops a deploy. If a deploy reports
+`no project sources found`, the answer is always one of:
+
+- the project directory does not exist yet under the sandbox (build it first), or
+- the name passed to `project=` is not the directory's name (`ls` to check), or
+- the path is outside the workspace root, the home directory and `/tmp` — move
+  it under the workspace root and retry.
+
+Re-check with ONE call (`{"action":"run","command":"ls -la && du -sh <name>"}`)
+and fix the path. Do not hand the user a path error as an outcome.
 
 ### Testing deployed sites like a real user (definition of done)
 

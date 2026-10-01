@@ -284,6 +284,25 @@ def test_safe_path_confines_everything_to_the_workspace() -> None:
         _safe_path(f"{WORKSPACE}/../../etc/passwd")
 
 
+def test_safe_path_reaches_the_home_and_scratch_roots_but_not_the_system() -> None:
+    """The VM's home and ``/tmp`` are ordinary workspace, not restricted paths.
+
+    The login directory is ``/home/ubuntu`` while the workspace is
+    ``/home/ubuntu/workspace``, so a project, build output or download parked one
+    level up was unreadable — and ``web_dev action=deploy`` could not stage it.
+    ``run`` already reaches the whole VM through a shell, so the file guard
+    keeps the model in its lane rather than enforcing a boundary.
+    """
+    assert _safe_path("/home/ubuntu/site/index.html") == "/home/ubuntu/site/index.html"
+    assert _safe_path("/home/ubuntu") == "/home/ubuntu"
+    assert _safe_path("/tmp/dist") == "/tmp/dist"
+    for path in ["/etc/passwd", "/var/log/syslog", "/usr/bin/env", "/proc/self/environ", "/sys/kernel", "/dev/mem", "/root/.ssh/id_rsa"]:
+        with pytest.raises(ValueError):
+            _safe_path(path)
+    with pytest.raises(ValueError):
+        _safe_path("/tmp/../etc/passwd")
+
+
 # -------------------------------------------------------------- rotation logic
 
 

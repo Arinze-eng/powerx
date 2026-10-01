@@ -159,17 +159,33 @@ def _archive_command(
     """
     base = _project_basename(remote_dir)
     parent = posixpath.dirname(str(remote_dir or "").rstrip("/")) or "/"
-    # The archive can live *inside* the directory being archived (that is the
-    # case whenever the project root is the workspace root), so it must never be
-    # swept into itself: GNU tar would report "file changed as we read it" and
-    # fail the whole staging command.
+    # The archive is built in a scratch directory OUTSIDE the tree and only moved
+    # into place once tar has exited. It has to be: the archive lives inside the
+    # directory being archived whenever the project root is an ancestor of it —
+    # always the case for the workspace root, i.e. exactly the "deploy the
+    # project I built in the sandbox root" and ``project="/"`` requests.
+    #
+    # ``--exclude=<archive>`` is *not* enough on its own. Measured on GNU tar
+    # 1.35 and on a live Tenki sandbox: the exclusion only suppresses the archive
+    # when the file already exists when tar starts. On a clean first run tar
+    # creates it mid-walk, notices it growing, and aborts with
+    # ``<base>: file changed as we read it`` (exit 1). So staging returned None
+    # and ``web_dev`` answered "no sources found to deploy" on a healthy
+    # sandbox — intermittently, because the *second* run over the same leftover
+    # archive succeeded. Hence both halves of the fix: remove any stale archive
+    # up front, and never write the new one inside the tree.
     flags = _exclude_flags((*excludes, _STAGE_ARCHIVE_NAME))
+    archive_q = shlex.quote(archive)
     command = (
+        f"rm -f {archive_q} && "
+        f'scratch=$(mktemp -d "${{TMPDIR:-/tmp}}/powerx-stage.XXXXXX") && '
         f"cd {shlex.quote(parent)} && "
-        f"tar czf {shlex.quote(archive)} {flags} {shlex.quote(base)}"
+        f'tar czf "$scratch/stage.tar.gz" {flags} {shlex.quote(base)} && '
+        f'mv "$scratch/stage.tar.gz" {archive_q} && '
+        f'rm -rf "$scratch"'
     )
     if with_size:
-        command += f" && wc -c < {shlex.quote(archive)}"
+        command += f" && wc -c < {archive_q}"
     return command
 
 
@@ -336,6 +352,13 @@ async def stage_from_sandbox(
 
     The staging directory is always a **dedicated temp directory** — never the
     caller's workspace — so cleanup can never delete user data.
+
+    Must be called from inside an agent turn: the sandbox it reads is the one
+    held by the session in the current request context. A host-side caller has
+    no request context, so the session key resolves to ``"unknown"`` and this
+    looks at the wrong (usually empty) sandbox — see
+    :func:`resolve_remote_executor`, which takes the key explicitly for exactly
+    that reason.
     """
     backend_name, backend_config = await _selected_backend()
     parent = staging_root or _default_staging_root()

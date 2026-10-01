@@ -363,14 +363,57 @@ def test_archive_command_prefixes_the_project_name(tmp_path: Path) -> None:
     command = workspace_bridge._archive_command("/home/tenki/myapp", DEFAULT_EXCLUDES, with_size=True)
     # The archive is built from the *parent*, naming the project itself.
     assert "cd /home/tenki &&" in command
-    assert command.rstrip().endswith("myapp && wc -c < /tmp/powerx-stage.tar.gz")
+    assert " myapp &&" in command
+    assert command.rstrip().endswith("wc -c < /tmp/powerx-stage.tar.gz")
     assert "'index.html'" not in command
 
 
 def test_archive_command_for_the_root_uses_its_basename() -> None:
     command = workspace_bridge._archive_command("/home/ubuntu/workspace", (), with_size=False)
     assert "cd /home/ubuntu &&" in command
-    assert command.rstrip().endswith("workspace")
+    assert " workspace &&" in command
+
+
+# The archive is written *inside* the tree it archives whenever the project root
+# is an ancestor of it — always true for the workspace root. ``tar
+# --exclude=<archive>`` only suppresses the archive when the file already exists
+# when tar starts, so a clean first run created it mid-walk and aborted with
+# "file changed as we read it" (exit 1). Staging then returned None and web_dev
+# answered "no sources found to deploy" on a healthy sandbox, intermittently.
+# These pin both halves of the fix: build in a scratch dir outside the tree, and
+# clear any stale archive before the walk.
+
+
+def test_archive_is_built_outside_the_tree_it_archives() -> None:
+    archive = workspace_bridge._remote_archive_path("/home/tenki")
+    command = workspace_bridge._archive_command(
+        "/home/tenki", DEFAULT_EXCLUDES, with_size=False, archive=archive
+    )
+    assert "mktemp -d" in command
+    # tar writes to the scratch dir, never straight into the archived tree.
+    assert 'tar czf "$scratch/stage.tar.gz"' in command
+    assert f"mv \"$scratch/stage.tar.gz\" {archive}" in command
+    assert f"tar czf {archive}" not in command
+
+
+def test_archive_command_clears_a_stale_archive_first() -> None:
+    archive = workspace_bridge._remote_archive_path("/home/tenki")
+    command = workspace_bridge._archive_command(
+        "/home/tenki", DEFAULT_EXCLUDES, with_size=False, archive=archive
+    )
+    # Removed before the walk, and excluded from it, so a leftover transfer
+    # archive from an interrupted run can never bloat or fail the next one.
+    assert command.startswith(f"rm -f {archive} && ")
+    assert f"--exclude={workspace_bridge._STAGE_ARCHIVE_NAME}" in command
+
+
+def test_archive_command_still_excludes_its_own_name() -> None:
+    """A root-level archive must not be swept into the archive it writes."""
+    archive = workspace_bridge._remote_archive_path("/home/tenki")
+    command = workspace_bridge._archive_command(
+        "/home/tenki", DEFAULT_EXCLUDES, with_size=False, archive=archive
+    )
+    assert f"--exclude={workspace_bridge._STAGE_ARCHIVE_NAME}" in command
 
 
 def test_project_basename_survives_trailing_slash() -> None:
@@ -451,11 +494,18 @@ def test_transfer_archive_is_workspace_relative() -> None:
     assert not archive.startswith("/tmp/")
 
 
-def test_archive_command_excludes_itself() -> None:
-    """A root-level archive must not be swept into the archive it writes."""
+def test_deploying_the_workspace_root_is_not_an_archive_failure() -> None:
+    """``project="/"`` and a workspace-root project must stage, not fail.
+
+    Both normalise to the workspace root, which is an ancestor of the transfer
+    archive — the exact shape that used to abort tar with "file changed as we
+    read it" on the first run.
+    """
     archive = workspace_bridge._remote_archive_path("/home/tenki")
     command = workspace_bridge._archive_command(
         "/home/tenki", DEFAULT_EXCLUDES, with_size=False, archive=archive
     )
-    assert f"tar czf {archive}" in command
-    assert "--exclude=.nanobot-stage.tar.gz" in command
+    assert "cd /home &&" in command
+    assert " tenki &&" in command
+    # Nothing inside the tree is written while tar walks it.
+    assert 'tar czf "$scratch/stage.tar.gz"' in command

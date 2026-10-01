@@ -311,6 +311,31 @@ def _truncate(text: str) -> str:
     return text[-_MAX_RESULT_CHARS:] if len(text) > _MAX_RESULT_CHARS else text
 
 
+#: Roots the file API addresses *besides* the workspace. The VM is a throwaway
+#: machine the user owns and ``run`` already reaches every path in it through a
+#: shell, so this guard keeps the model in its lane rather than enforcing a
+#: privilege boundary. Refusing the account home and ``/tmp`` broke ordinary
+#: work instead: the VM's login directory is ``/home/ubuntu`` while the workspace
+#: is ``/home/ubuntu/workspace``, so a project, build output or download the
+#: agent parked one level up could not be read, listed or downloaded — and
+#: ``web_dev action=deploy`` could not stage it. Both roots are allowed.
+_EXTRA_ALLOWED_ROOTS: tuple[str, ...] = ("/home/ubuntu", "/tmp")
+
+#: Never addressable, even so: kernel interfaces whose "files" are not files and
+#: whose reads do not end. ``/root`` is also refused because nothing the agent
+#: builds belongs there.
+_DENIED_ROOTS: tuple[str, ...] = ("/proc", "/sys", "/dev", "/root")
+
+
+def _allowed_roots(root: str = WORKSPACE) -> tuple[str, ...]:
+    """Every root the file API addresses: the workspace, then the extra roots."""
+    root_path = PurePosixPath(root).as_posix().rstrip("/") or "/"
+    return (
+        root_path,
+        *(PurePosixPath(item).as_posix().rstrip("/") or "/" for item in _EXTRA_ALLOWED_ROOTS),
+    )
+
+
 def _safe_path(raw: str, root: str = WORKSPACE) -> str:
     value = str(raw or "").strip()
     if not value:
@@ -318,14 +343,17 @@ def _safe_path(raw: str, root: str = WORKSPACE) -> str:
     root_path = PurePosixPath(root).as_posix().rstrip("/") or "/"
     # The LLM frequently asks to "list /" to see the sandbox root. From its
     # perspective that means the workspace, not the VM's real filesystem root.
-    # A bare "/" maps to the workspace; everything else outside stays rejected.
+    # A bare "/" maps to the workspace.
     if value == "/":
         return root_path
     candidate = value if value.startswith("/") else f"{root_path}/{value}"
     normalized = posixpath.normpath(candidate)
-    if normalized != root_path and not normalized.startswith(root_path + "/"):
+    allowed = _allowed_roots(root_path)
+    if any(normalized == base or normalized.startswith(base + "/") for base in _DENIED_ROOTS):
         raise ValueError("path must remain inside the workspace")
-    return normalized
+    if any(normalized == base or normalized.startswith(base + "/") for base in allowed):
+        return normalized
+    raise ValueError("path must remain inside the workspace")
 
 
 def _looks_like_missing_file(detail: str) -> bool:
@@ -954,7 +982,11 @@ class FreestyleExecutionBackend:
 
     async def list(self, path: str) -> str:
         target = _safe_path(path or self.workspace, self.workspace)
-        listing_root = target if target == self.workspace else (posixpath.dirname(target) or self.workspace)
+        # A root always lists itself. Treating "not the workspace root" as "a
+        # file path" meant listing any other allowed root walked its *parent*
+        # instead — listing ``/tmp`` listed the whole filesystem root.
+        roots = _allowed_roots(self.workspace)
+        listing_root = target if target in roots else (posixpath.dirname(target) or self.workspace)
         command = (
             f"find {shlex.quote(listing_root)} -maxdepth 2 -printf '%y %p\\n' 2>/dev/null | head -200"
         )
