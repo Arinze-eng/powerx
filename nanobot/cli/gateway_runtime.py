@@ -1,6 +1,7 @@
 """Foreground gateway runtime and lifecycle helpers."""
 
 import asyncio
+import os
 import signal
 from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from contextlib import suppress
@@ -293,6 +294,68 @@ async def _close_gateway_runtime(
     if runtime_tasks is not None and runtime_tasks.done():
         with suppress(asyncio.CancelledError, Exception):
             await runtime_tasks
+
+
+#: Floor for the idle reclaim cadence. A junk or tiny env value must not turn
+#: housekeeping into a spin loop, so this is the one number guaranteed.
+_RECLAIM_MIN_INTERVAL_S = 15.0
+_RECLAIM_DEFAULT_INTERVAL_S = 60.0
+
+
+def _reclaim_interval_seconds() -> float:
+    """Idle reclaim cadence in seconds.
+
+    Reads ``NANOBOT_MEMORY_RECLAIM_INTERVAL_S`` (default 60s) and floors it at
+    ``_RECLAIM_MIN_INTERVAL_S``. Unset, unparseable or absurd values fall back
+    rather than raising: a telemetry knob must never be a way to fail startup.
+    """
+    try:
+        raw = os.environ.get("NANOBOT_MEMORY_RECLAIM_INTERVAL_S", "")
+        interval = float(raw) if raw else _RECLAIM_DEFAULT_INTERVAL_S
+    except (TypeError, ValueError):
+        interval = _RECLAIM_DEFAULT_INTERVAL_S
+    return max(_RECLAIM_MIN_INTERVAL_S, interval)
+
+
+async def _memory_reclaim_loop(shutdown_event: asyncio.Event) -> None:
+    """Return free heap to the OS on a timer, not only at turn boundaries.
+
+    ``reclaim_memory`` already runs at ``tool_batch``/``turn_end``, but that caps
+    the high-water mark of a *busy* gateway only. An idle container that finished
+    one heavy turn keeps that peak mapped for the life of the process, and the
+    cgroup charges it against the plan's ceiling the whole time. This loop is the
+    missing half: it trims while nobody is using the service, so an idle
+    deployment holds its real floor instead of its worst moment.
+
+    The work runs in a worker thread because ``gc.collect()`` on a large heap
+    stops every thread for tens of milliseconds -- housekeeping must not become a
+    way to add latency to a live turn. Never raises, and returns promptly on
+    shutdown. Cadence is ``_reclaim_interval_seconds()``.
+    """
+    interval = _reclaim_interval_seconds()
+    while not shutdown_event.is_set():
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+            return  # shutdown requested
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            raise
+        try:
+            result = await asyncio.to_thread(
+                reclaim_memory, tag="idle_reclaim", log=False
+            )
+            # One greppable line per cycle: the evidence the reclaimer is alive,
+            # plus what it actually returned this time.
+            log_memory(
+                "idle_reclaim",
+                freed_mb=result["freed_mb"],
+                trimmed=result["trimmed"],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - housekeeping never fails the gateway
+            logger.debug("memory reclaim loop: {}", exc)
 
 
 def _run_gateway(
@@ -998,6 +1061,10 @@ def _run_gateway(
                     _watch_webui_dev_server(webui_dev_server, shutdown_event),
                     name="nanobot-webui-dev-server",
                 ))
+            tasks.append(asyncio.create_task(
+                _memory_reclaim_loop(shutdown_event),
+                name="nanobot-memory-reclaim",
+            ))
             runtime_tasks = asyncio.gather(*tasks)
             shutdown_task = asyncio.create_task(
                 shutdown_event.wait(),
