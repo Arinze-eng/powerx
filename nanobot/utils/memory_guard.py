@@ -42,9 +42,11 @@ from typing import Any
 from loguru import logger
 
 __all__ = [
+    "MEMORY_CHARGE_WARN_RATIO",
     "MEMORY_CRITICAL_RATIO",
     "MEMORY_WARN_RATIO",
     "container_memory_anonymous_bytes",
+    "container_memory_charge_ratio",
     "container_memory_limit_bytes",
     "container_memory_used_bytes",
     "log_memory",
@@ -59,6 +61,19 @@ __all__ = [
 # model iteration holds the request body, tool schemas and the response at once.
 MEMORY_WARN_RATIO = 0.80
 MEMORY_CRITICAL_RATIO = 0.92
+#: Fraction of the *raw* cgroup charge at which the reclaim guard acts.
+#:
+#: ``MEMORY_CRITICAL_RATIO`` grades anonymous memory, which is the right
+#: number for "is this process about to be OOM-killed". It is the wrong
+#: number for "is the platform about to replace this container": the plan's
+#: ceiling is enforced against ``memory.max``, and that is charged the whole
+#: cgroup -- heap *plus* page cache. Measured in production: a gateway graded
+#: ``pressure=ok pct=65.7`` was replaced the same second at ``cgroup_mb=456.7``
+#: of a 488.3 MiB limit (93.5%). The guard never saw it coming because it was
+#: reading the other number. This threshold sits below the steady state the
+#: same deployment showed after the restart (idle charge 79-85%), so it fires
+#: on a genuine climb and stays quiet on a healthy container.
+MEMORY_CHARGE_WARN_RATIO = 0.85
 
 _CGROUP_V2 = Path("/sys/fs/cgroup")
 _CGROUP_V1 = Path("/sys/fs/cgroup/memory")
@@ -108,6 +123,23 @@ def container_memory_used_bytes() -> int | None:
         if value is not None:
             return value
     return None
+
+
+def container_memory_charge_ratio() -> float | None:
+    """Return the raw cgroup charge as a fraction of the limit, or ``None``.
+
+    This is the ratio the *platform* acts on. ``memory.current`` is charged
+    against ``memory.max`` for the whole cgroup, so page cache counts: a
+    container holding a modest heap next to a large read cache still reads as
+    full to whoever decided the plan limit and watches it. Grading on
+    anonymous memory answers a different question, so this is reported
+    alongside it rather than replacing it.
+    """
+    charge = container_memory_used_bytes()
+    limit = container_memory_limit_bytes()
+    if not charge or not limit:
+        return None
+    return charge / limit
 
 
 def _parse_memory_stat(text: str) -> dict[str, int]:
@@ -232,6 +264,9 @@ def memory_snapshot() -> dict[str, Any]:
         "pct": round(ratio * 100, 1) if ratio is not None else None,
         "cgroup_used_bytes": cgroup_used,
         "cgroup_used_mb": round(cgroup_used / _MB, 1) if cgroup_used else 0.0,
+        "charge_pct": (
+            round(cgroup_used / limit * 100, 1) if (cgroup_used and limit) else None
+        ),
         "anonymous_bytes": anonymous,
         "reclaimable_bytes": reclaimable,
         "rss_bytes": process_rss_bytes(),
@@ -252,7 +287,8 @@ def log_memory(tag: str, **extra: Any) -> dict[str, Any]:
     snapshot = memory_snapshot()
     fields = " ".join(f"{key}={value}" for key, value in extra.items())
     message = (
-        "MEMORY tag={} pressure={} pct={} used_mb={} limit_mb={} rss_mb={} cgroup_mb={}{}"
+        "MEMORY tag={} pressure={} pct={} used_mb={} limit_mb={} rss_mb={}"
+        " cgroup_mb={} cgroup_pct={}{}"
     ).format(
         tag,
         snapshot["pressure"],
@@ -261,10 +297,16 @@ def log_memory(tag: str, **extra: Any) -> dict[str, Any]:
         snapshot["limit_mb"],
         snapshot["rss_mb"],
         snapshot["cgroup_used_mb"],
+        snapshot["charge_pct"],
         (" " + fields) if fields else "",
     )
+    charge_pct = snapshot.get("charge_pct")
+    charge_is_high = (
+        charge_pct is not None
+        and charge_pct >= MEMORY_CHARGE_WARN_RATIO * 100
+    )
     try:
-        if snapshot["pressure"] == "critical":
+        if snapshot["pressure"] == "critical" or charge_is_high:
             logger.warning(message)
         else:
             logger.info(message)

@@ -90,6 +90,12 @@ COPY scripts/print_cron_store.py scripts/
 # "the sandbox runner is missing at /app/scripts/forensics_sandbox_runner.py" —
 # silently, because the fallback is designed to be graceful.
 COPY scripts/forensics_sandbox_runner.py scripts/
+# The fourth instance of the same trap, and the quietest: entrypoint.sh runs
+# migrate_cron_timezone.py to rewrite cron jobs stamped with a hard-coded UTC
+# zone. It is called under an `[ -f ... ]` guard, so its ABSENCE from the image
+# turned the repair into a no-op and every pre-existing job kept firing an hour
+# off for an owner at UTC+1 -- with no error anywhere to explain it.
+COPY scripts/migrate_cron_timezone.py scripts/
 COPY --from=webui-builder /app/nanobot/web/dist/ nanobot/web/dist/
 RUN NANOBOT_SKIP_WEBUI_BUILD=1 uv pip install --python "$VIRTUAL_ENV/bin/python" --no-cache .
 

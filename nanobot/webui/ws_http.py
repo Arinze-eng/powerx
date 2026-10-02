@@ -1832,6 +1832,12 @@ class GatewayHTTPHandler:
                 "limit_mb": snapshot.get("limit_mb"),
                 "rss_mb": snapshot.get("rss_mb"),
                 "cgroup_mb": snapshot.get("cgroup_used_mb"),
+                # Raw cgroup charge as a percentage of the plan limit: what the
+                # platform enforces. Reported for observation only -- the status
+                # stays graded on anonymous memory, because failing this probe on
+                # a charge that is mostly reclaimable page cache would invite a
+                # probe-driven restart long before one was needed.
+                "cgroup_pct": snapshot.get("charge_pct"),
             },
             status=200 if healthy else 503,
         )

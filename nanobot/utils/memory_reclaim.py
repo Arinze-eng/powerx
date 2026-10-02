@@ -36,12 +36,17 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.utils.memory_guard import process_rss_bytes
+from nanobot.utils.memory_guard import (
+    MEMORY_CHARGE_WARN_RATIO,
+    container_memory_charge_ratio,
+    process_rss_bytes,
+)
 
 __all__ = [
     "RECLAIM_MIN_INTERVAL_S",
     "freeze_long_lived",
     "maybe_reclaim",
+    "reclaim_if_charge_high",
     "reclaim_memory",
 ]
 
@@ -142,6 +147,30 @@ def maybe_reclaim(*, tag: str = "auto", min_interval_s: float = RECLAIM_MIN_INTE
     """
     now = time.monotonic()
     if _last_reclaim_at and (now - _last_reclaim_at) < max(0.0, float(min_interval_s)):
+        return None
+    return reclaim_memory(tag=tag)
+
+
+def reclaim_if_charge_high(
+    *, tag: str = "charge_guard", ratio: float | None = None
+) -> dict[str, Any] | None:
+    """Reclaim when the raw cgroup charge is near the plan's ceiling.
+
+    Deliberately *not* rate limited. ``maybe_reclaim`` caps the high-water
+    mark of a busy gateway, but it also skips a call that arrives inside its
+    interval -- and the moment the charge is high is exactly the moment a
+    skip is unaffordable. Returns ``None`` when the charge is unknown or
+    below ``ratio`` (default :data:`MEMORY_CHARGE_WARN_RATIO`), so the caller
+    can put this on every model request for the cost of one cgroup read.
+
+    The charge, not anonymous memory, is what the platform compares against
+    the deployment plan's limit; see :mod:`nanobot.utils.memory_guard`.
+    """
+    threshold = (
+        MEMORY_CHARGE_WARN_RATIO if ratio is None else float(ratio)
+    )
+    current = container_memory_charge_ratio()
+    if current is None or current < threshold:
         return None
     return reclaim_memory(tag=tag)
 

@@ -147,8 +147,16 @@ async def test_a_future_iso_time_is_still_accepted(tmp_path) -> None:
     assert service.list_jobs()[0].state.next_run_at_ms is not None
 
 
-async def test_the_confirmation_states_when_it_will_fire(tmp_path) -> None:
+async def test_the_confirmation_states_when_it_will_fire(tmp_path, monkeypatch) -> None:
     """The user reads the model's reply, so the model gets the resolved time."""
+    from nanobot.agent.tools import cron as cron_tool_module
+
+    # Pin the clock. The job is resolved against `now` and then the confirmation
+    # renders the remaining delta against `now` *again*, so on a real clock a
+    # tick between the two reads prints "29m 59s" and fails this on a boundary
+    # about one run in sixty.
+    monkeypatch.setattr(cron_tool_module, "_now_ms", lambda: 1_800_000_000_000)
+
     tool, _, _ = _cron_tool(tmp_path)
 
     text = str(await tool.execute(action="add", message="Reminder", at="+30m"))

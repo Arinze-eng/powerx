@@ -76,7 +76,7 @@ from nanobot.utils.helpers import (
 )
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.memory_guard import log_memory
-from nanobot.utils.memory_reclaim import maybe_reclaim
+from nanobot.utils.memory_reclaim import maybe_reclaim, reclaim_if_charge_high
 from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
@@ -908,6 +908,16 @@ class AgentRunner:
                 messages=len(messages),
                 session=(spec.session_key or "-")[:40],
             )
+            # Give the reclaimable part of the container charge back *before*
+            # the request is built, not only after it. The prompt, the tool
+            # schemas and the response body are allocated together, and the
+            # platform replaces the container when the whole cgroup charge
+            # crosses the plan limit -- heap plus page cache. In production a
+            # fresh session's first turn reached cgroup_mb=456.7 of a
+            # 488.3 MiB limit (93.5%) and the container was recycled the same
+            # second, while the gateway graded itself pressure=ok because it
+            # reads anonymous memory alone. No-op unless the charge is high.
+            reclaim_if_charge_high(tag="charge_guard")
             if spec.strip_image_content_before_provider:
                 # Injections and recovery/finalization messages are appended
                 # between iterations, so scrub again immediately before model

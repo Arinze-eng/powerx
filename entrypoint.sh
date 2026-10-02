@@ -168,18 +168,29 @@ if [ "$PLATFORM_BOOTSTRAP" = "true" ]; then
     else
         echo "[entrypoint] persistent disk detected — skipping Supabase cron/chat restore (egress policy)"
     fi
-    # [FIX 2026-09-05] Backfill per-user chat ownership. Chat isolation is now
-    # fail-closed: an unowned chat is hidden from / denied to every user, so it
-    # must never be left anonymously shared. This reconciles unowned legacy
-    # chats against their core session metadata (which records the owner) and
-    # stamps it. Truly-unowned chats stay hidden, safe, and reclaimable.
-    # Local-only operation (no Supabase traffic); always runs.
-    if [ -f /app/scripts/backfill_chat_owners.py ]; then
-        NANOBOT_DATA_DIR="$dir" /app/.venv/bin/python3 \
-            /app/scripts/backfill_chat_owners.py --apply || \
-            echo "[entrypoint] warning: chat-owner backfill failed (continuing)"
-    fi
 fi
+
+# ---------------------------------------------------------------------------
+# [FIX 2026-10-02] Chat-owner backfill runs *alongside* the gateway, not in
+# front of it.
+#
+# It used to run right here, in the foreground, before the gateway process was
+# ever exec'd -- and it reconciles every chat on the volume (503 rows on the
+# production deployment, several seconds of Python). Until the gateway binds the
+# exposed port nothing answers a request, and the platform's edge turns that
+# into a 503 the user sees as "the app is down". Boot measured from the
+# container log: 13:42:10 entrypoint start, 13:42:28 backfill finished,
+# 13:42:40 "WebSocket server listening" -- 30 s of 503, a fifth of it this scan.
+#
+# The move is safe because chat isolation is fail-CLOSED: an unstamped chat is
+# hidden from every user until this stamps it, never shared. Reconciling after
+# the port is up therefore exposes nothing; it only means legacy chats appear in
+# the sidebar a moment later. Local-only operation, no Supabase traffic, and the
+# same behaviour on every boot.
+#
+# Launched below, after the privilege drop, so it runs as the same unprivileged
+# user the gateway does and writes the data dir it was just chowned.
+# ---------------------------------------------------------------------------
 
 # Backup-sidecar policy: launch the cron/chat Supabase backup loops ONLY when
 # the disk is ephemeral (Render-style). On a persistent volume they would burn
@@ -218,6 +229,12 @@ if [ "$(id -u)" = "0" ]; then
     else
         echo "[entrypoint] Supabase backup sidecars disabled (egress policy)"
     fi
+    # Chat-owner backfill: backgrounded so it never delays the port binding.
+    if [ -f /app/scripts/backfill_chat_owners.py ]; then
+        setpriv --reuid=nanobot --regid=nanobot --init-groups env \
+            NANOBOT_DATA_DIR="$dir" /app/.venv/bin/python3 \
+            /app/scripts/backfill_chat_owners.py --apply &
+    fi
     if setpriv --reuid=nanobot --regid=nanobot --init-groups true 2>/dev/null; then
         echo "[entrypoint] dropping privileges to nanobot via setpriv"
         exec setpriv --reuid=nanobot --regid=nanobot --init-groups /app/scripts/nanobot_launcher.sh "$@"
@@ -254,6 +271,12 @@ if [ "$LAUNCH_SIDECARS" = "true" ]; then
     fi
 else
     echo "[entrypoint] Supabase backup sidecars disabled (egress policy)"
+fi
+
+# Chat-owner backfill: backgrounded so it never delays the port binding.
+if [ -f /app/scripts/backfill_chat_owners.py ]; then
+    NANOBOT_DATA_DIR="$dir" /app/.venv/bin/python3 \
+        /app/scripts/backfill_chat_owners.py --apply &
 fi
 
 exec /app/scripts/nanobot_launcher.sh "$@"
