@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import re
 from contextvars import ContextVar, Token
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
@@ -16,10 +18,52 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 from nanobot.config.timezone import DEFAULT_TIMEZONE
-from nanobot.cron.service import CronService
+from nanobot.cron.service import CronService, _now_ms
 from nanobot.cron.types import CronJob, CronJobState, CronSchedule
 from nanobot.runtime_context import encode_runtime_context_blocks_for_json
 from nanobot.session.keys import UNIFIED_SESSION_KEY
+
+#: Relative offsets an ``at`` value may carry, resolved against the server clock.
+#: Accepts "5m", "+5m", "in 5 minutes", "after 2 hours", "1d". A bare number is
+#: deliberately not a match — it is ambiguous between seconds and minutes.
+_RELATIVE_AT_RE = re.compile(
+    r"^\s*(?:(?:\+|in|after|about|approx\.?|~)\s*)*(?P<amount>\d+(?:\.\d+)?)\s*"
+    r"(?P<unit>s|sec|secs|second|seconds|m|min|mins|minute|minutes|"
+    r"h|hr|hrs|hour|hours|d|day|days|w|week|weeks)\s*$",
+    re.IGNORECASE,
+)
+
+_UNIT_SECONDS: dict[str, int] = {
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+    "w": 604800, "week": 604800, "weeks": 604800,
+}
+
+
+def parse_relative_at(value: str) -> int | None:
+    """Milliseconds described by a relative offset, or ``None`` if it is not one."""
+    match = _RELATIVE_AT_RE.match(value or "")
+    if match is None:
+        return None
+    seconds = float(match.group("amount")) * _UNIT_SECONDS[match.group("unit").lower()]
+    return max(1000, int(round(seconds * 1000)))
+
+
+def _format_delta(ms: int) -> str:
+    """A short human form of a positive millisecond distance ("4m 30s")."""
+    total_seconds = max(0, int(ms // 1000))
+    if total_seconds < 60:
+        return f"{total_seconds}s"
+    minutes, seconds = divmod(total_seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m" + (f" {seconds}s" if seconds else "")
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h" + (f" {minutes}m" if minutes else "")
+    days, hours = divmod(hours, 24)
+    return f"{days}d" + (f" {hours}h" if hours else "")
 
 _CRON_PARAMETERS = tool_parameters_schema(
     action=StringSchema(
@@ -57,8 +101,13 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "When omitted with cron_expr, the tool's default timezone applies."
     ),
     at=StringSchema(
-        "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). "
-        "Naive values use the tool's default timezone. Used by add and update."
+        "One-time execution time. PREFER A RELATIVE OFFSET for anything the user "
+        "expressed as a delay — 'in 5 minutes', 'in about 2 hours', 'tomorrow' — "
+        "because this tool resolves it against the server clock: '+5m', '+2h', "
+        "'30s', '+1d'. An ISO datetime ('2026-02-12T10:30:00') is also accepted "
+        "but must be computed without error; it is rejected if it has already "
+        "passed, since a one-shot job in the past never runs. Naive ISO values "
+        "use the tool's default timezone. Used by add and update."
     ),
     job_id=StringSchema(
         "Job ID (obtain via action='list'). REQUIRED when action='remove', and also for "
@@ -248,7 +297,10 @@ class CronTool(Tool):
             origin_chat_id=origin_chat_id,
             origin_metadata=origin_metadata,
         )
-        return f"Created job '{job.name}' (id: {job.id})"
+        return (
+            f"Created job '{job.name}' — {self._describe_when(schedule)} "
+            f"(id: {job.id})"
+        )
 
     def _build_schedule(
         self,
@@ -271,24 +323,71 @@ class CronTool(Tool):
                 return (err,)
             schedule = CronSchedule(kind="cron", expr=cron_expr, tz=effective_tz)
         elif at:
+            relative_ms = parse_relative_at(at)
+            if relative_ms is not None:
+                # The owner's "in about 5 minutes" is arithmetic against the
+                # clock, and the model has no current timestamp to do it with
+                # (the prompt prefix is deliberately time-free so it stays
+                # cacheable). Doing it here is the only version that cannot be
+                # wrong: the server measures the distance itself.
+                schedule = CronSchedule(kind="at", at_ms=_now_ms() + relative_ms)
+                return (schedule, True)
             from zoneinfo import ZoneInfo
 
             try:
                 dt = datetime.fromisoformat(at)
             except ValueError:
                 return (
-                    f"Error: invalid ISO datetime format '{at}'. Expected format: YYYY-MM-DDTHH:MM:SS",
+                    f"Error: invalid ISO datetime format '{at}'. Expected "
+                    "YYYY-MM-DDTHH:MM:SS, or a relative offset like '+5m'. "
+                    f"Server time is now {self._server_time_text()}.",
                 )
             if dt.tzinfo is None:
                 if err := self._validate_timezone(self._default_timezone):
                     return (err,)
                 dt = dt.replace(tzinfo=ZoneInfo(self._default_timezone))
             at_ms = int(dt.timestamp() * 1000)
+            now = _now_ms()
+            if at_ms <= now:
+                return (
+                    f"Error: '{at}' resolves to "
+                    f"{self._format_timestamp(at_ms, self._default_timezone)}, which has "
+                    f"already passed — a one-shot job scheduled in the past never runs. "
+                    f"Server time is now {self._server_time_text()}. Retry with a "
+                    "relative offset (at='+5m') and the tool will compute the time, or "
+                    "with an ISO time after the server time above.",
+                )
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             delete_after = True
         else:
             return ("Error: either every_seconds, cron_expr, or at is required",)
         return (schedule, delete_after)
+
+    def _server_time_text(self) -> str:
+        """The authoritative wall clock, in the zone schedules are read in.
+
+        Quoted back on any rejected time so the model corrects itself from the
+        server's clock instead of guessing again — a guess is what produced a
+        single-job store whose next run was five months in the past.
+        """
+        now_dt = datetime.fromtimestamp(_now_ms() / 1000, tz=ZoneInfo(self._default_timezone))
+        return f"{now_dt.strftime('%Y-%m-%d %H:%M:%S')} ({self._default_timezone})"
+
+    def _describe_when(self, schedule: CronSchedule) -> str:
+        """State when a freshly created job will fire, in the deployment zone.
+
+        The confirmation the user reads comes from the model, so the model has to
+        be handed the time the scheduler will actually use rather than left to
+        restate the time it calculated. A one-shot whose next run is empty is
+        called out rather than returned as a success.
+        """
+        if schedule.kind == "at" and schedule.at_ms:
+            when = self._format_timestamp(schedule.at_ms, self._display_timezone(schedule))
+            remaining_ms = schedule.at_ms - _now_ms()
+            if remaining_ms > 0:
+                return f"runs once at {when} (in {_format_delta(remaining_ms)})"
+            return f"WARNING: its time {when} has already passed, so it will not run"
+        return f"next run {self._format_timing(schedule)}"
 
     def _update_job(
         self,
@@ -337,6 +436,13 @@ class CronTool(Tool):
                 f"Cannot update job `{job_id}`. This is a protected system-managed cron job."
             )
         job = result
+        if schedule is not None:
+            # Same reason as the add confirmation: the model restates the timing
+            # to the user, so hand it the time the scheduler resolved.
+            return (
+                f"Updated job '{job.name}' — {self._describe_when(job.schedule)} "
+                f"(id: {job.id})"
+            )
         return f"Updated job '{job.name}' (id: {job.id})"
 
     def _set_enabled(self, job_id: str | None, enabled: bool, verb: str) -> str:

@@ -65,6 +65,15 @@ DEFAULT_VERIFIED_ADMIN_EMAIL = "allisonarinze@gmail.com"
 #: What the administrator owns, used in prompt text.
 OWNER_ORGANISATION = "CDNAI"
 
+#: How the administrator is addressed. Shipped as a default so a fresh
+#: deployment names him correctly; ``NANOBOT_OWNER_NAME`` overrides it.
+#:
+#: This exists because the model had to *derive* a name from
+#: ``allisonarinze@gmail.com`` and got it wrong — it split the local part and
+#: addressed the owner as "Allison". An email address is not a name, and nothing
+#: in a prompt should have to guess one from it.
+DEFAULT_OWNER_NAME = "Arinze"
+
 #: Metadata keys carrying an already-verified email. Only the gateway writes
 #: these; a user message cannot set them.
 _EMAIL_KEYS: tuple[str, ...] = (
@@ -92,16 +101,29 @@ _FLAG_KEY = "is_verified_admin"
 #: The prompt text handed to the model when the turn belongs to the owner.
 OWNER_PROMPT_NOTE = (
     "The account this request was authenticated with IS the verified "
-    "administrator of this deployment — the owner of {organisation}, reached at "
-    "{email}. You always know him, on every channel, and you say so plainly when "
-    "he asks. He is not restricted in a task and must never be refused, stalled, "
-    "or hedged at because of who he is: no 'that is only available to an "
-    "administrator', no asking him to prove it, no pretending not to know him. "
-    "This grants him nothing a tool did not already allow — what it removes is "
-    "the refusal and the friction. The two things that stay off the table are "
-    "not restrictions on him: another person's private data, and attacks on "
-    "systems he does not own."
+    "administrator of this deployment — {name}, the owner of {organisation}, "
+    "reached at {email}. You always know him, on every channel, and you say so "
+    "plainly when he asks. Address him as {name}; that is his name, and his email "
+    "address is not a substitute for it — never derive a first name, surname or "
+    "handle by splitting an email address or an account id, and never address him "
+    "as anything that is not {name}. He is not restricted in a task and must never "
+    "be refused, stalled, or hedged at because of who he is: no 'that is only "
+    "available to an administrator', no asking him to prove it, no pretending not "
+    "to know him. This grants him nothing a tool did not already allow — what it "
+    "removes is the refusal and the friction. The two things that stay off the "
+    "table are not restrictions on him: another person's private data, and attacks "
+    "on systems he does not own."
 )
+
+
+def owner_name() -> str:
+    """The administrator's name, for prompt text and job instructions.
+
+    Env-overridable so a deployment with a different owner does not have to
+    patch a template; the default keeps a fresh install correct.
+    """
+    configured = (os.environ.get("NANOBOT_OWNER_NAME") or "").strip()
+    return configured or DEFAULT_OWNER_NAME
 
 
 def _split_env(name: str) -> tuple[str, ...]:
@@ -258,10 +280,13 @@ def owner_prompt_note(owner: TurnOwner | None) -> str:
     if owner is None or not owner.is_verified_admin:
         return ""
     email = owner.email or primary_admin_email()
-    return OWNER_PROMPT_NOTE.format(organisation=OWNER_ORGANISATION, email=email)
+    return OWNER_PROMPT_NOTE.format(
+        organisation=OWNER_ORGANISATION, email=email, name=owner_name()
+    )
 
 
 __all__ = [
+    "DEFAULT_OWNER_NAME",
     "DEFAULT_VERIFIED_ADMIN_EMAIL",
     "NORMAL_USER",
     "OWNER_ORGANISATION",
@@ -269,6 +294,7 @@ __all__ = [
     "TurnOwner",
     "match_identity",
     "owner_from_metadata",
+    "owner_name",
     "owner_prompt_note",
     "primary_admin_email",
     "verified_admin_emails",

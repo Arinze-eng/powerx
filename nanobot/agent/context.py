@@ -10,7 +10,7 @@ from typing import Any, Mapping, Sequence, cast
 from loguru import logger
 
 from nanobot.agent.memory import MemoryStore
-from nanobot.agent.owner import DEFAULT_VERIFIED_ADMIN_EMAIL, TurnOwner
+from nanobot.agent.owner import DEFAULT_VERIFIED_ADMIN_EMAIL, TurnOwner, owner_name
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tools import image_generation as image_generation_tools
 from nanobot.agent.tools import mcp as mcp_tools
@@ -352,6 +352,7 @@ class ContextBuilder:
             verified_administrator=self._is_owner(owner),
             admin_email=(owner.email if owner is not None else "")
             or DEFAULT_VERIFIED_ADMIN_EMAIL,
+            admin_name=owner_name(),
         )
 
     @staticmethod
