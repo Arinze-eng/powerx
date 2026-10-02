@@ -694,6 +694,23 @@ class GatewayHTTPHandler:
         if got == "/api/version":
             return _http_json_response(_deployment_identity())
 
+        # Container health probe (no auth, no blocking work). Served on the
+        # exposed port because that is the only port the platform's probe can
+        # reach: the gateway's own /health listener binds 127.0.0.1 on the
+        # internal port and is invisible from outside.
+        #
+        # It is graded on the same memory pressure the gateway already logs to
+        # the MEMORY line. Crossing MEMORY_CRITICAL_RATIO answers 503, which
+        # makes a configured liveness probe terminate and replace the container
+        # on the probe's schedule. That matters because the alternative is the
+        # kernel OOM killer: a SIGKILL that logs nothing, runs no shutdown path,
+        # and leaves the session store mid-write. A probe-driven restart is a
+        # SIGTERM that the gateway's existing shutdown handling observes, and it
+        # fires while the remaining headroom is still measurable rather than at
+        # the instant the cgroup ceiling is hit.
+        if got == "/api/health":
+            return self._handle_health()
+
         # Permanent artifact download link (no auth). The onlyfiles page URL is
         # permanent but serves an HTML viewer, and the raw /dl/ token expires in
         # ~2h, so neither can be handed to a user. This stable link mints a fresh
@@ -1773,6 +1790,34 @@ class GatewayHTTPHandler:
         )
 
     # -- Misc routes --------------------------------------------------------
+
+    def _handle_health(self) -> Response:
+        """Container health probe: 200 while memory pressure is survivable.
+
+        Fails *open* on a telemetry error. A health endpoint that raises would
+        fail the probe and restart the container over a logging problem, which
+        turns an observation bug into an outage.
+        """
+        try:
+            from nanobot.utils.memory_guard import memory_snapshot
+
+            snapshot = memory_snapshot()
+        except Exception:  # pragma: no cover - telemetry must never fail a probe
+            return _http_json_response({"status": "ok", "pressure": "unknown"})
+
+        healthy = snapshot.get("pressure") != "critical"
+        return _http_json_response(
+            {
+                "status": "ok" if healthy else "unhealthy",
+                "pressure": snapshot.get("pressure"),
+                "pct": snapshot.get("pct"),
+                "used_mb": snapshot.get("used_mb"),
+                "limit_mb": snapshot.get("limit_mb"),
+                "rss_mb": snapshot.get("rss_mb"),
+                "cgroup_mb": snapshot.get("cgroup_used_mb"),
+            },
+            status=200 if healthy else 503,
+        )
 
     async def _dispatch_misc_routes(
         self, connection: Any, request: WsRequest, got: str
