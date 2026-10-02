@@ -15,6 +15,13 @@ def _builder(tmp_path: Path, **kw) -> ContextBuilder:
     return ContextBuilder(workspace=tmp_path, **kw)
 
 
+def _owner():
+    """The verified administrator, as the turn loop resolves him."""
+    from nanobot.agent.owner import DEFAULT_VERIFIED_ADMIN_EMAIL, owner_from_metadata
+
+    return owner_from_metadata({"user_email": DEFAULT_VERIFIED_ADMIN_EMAIL})
+
+
 # ---------------------------------------------------------------------------
 # _merge_message_content (static)
 # ---------------------------------------------------------------------------
@@ -90,23 +97,31 @@ class TestLoadBootstrapFiles:
         assert "## AGENTS.md" in result
         assert "Be helpful." in result
 
-    def test_multiple_bootstrap_files(self, tmp_path):
+    def test_bootstrap_loads_agents_md(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Rules.", encoding="utf-8")
-        (tmp_path / "SOUL.md").write_text("Soul.", encoding="utf-8")
         builder = _builder(tmp_path)
         result = builder._load_bootstrap_files()
         assert "## AGENTS.md" in result
-        assert "## SOUL.md" in result
         assert "Rules." in result
-        assert "Soul." in result
 
-    def test_all_bootstrap_files(self, tmp_path):
+    def test_bootstrap_never_loads_a_project_profile_file(self, tmp_path):
+        """A project directory is user-chosen, so it cannot carry a profile in."""
         for name in ContextBuilder.BOOTSTRAP_FILES:
             (tmp_path / name).write_text(f"Content of {name}", encoding="utf-8")
         builder = _builder(tmp_path)
         result = builder._load_bootstrap_files()
-        for name in ContextBuilder.BOOTSTRAP_FILES:
-            assert f"## {name}" in result
+        assert "## AGENTS.md" in result
+        assert "## SOUL.md" not in result
+        assert "## USER.md" not in result
+
+    def test_agent_profile_files_load_from_the_agent_workspace(self, tmp_path):
+        (tmp_path / "SOUL.md").write_text("Soul.", encoding="utf-8")
+        (tmp_path / "USER.md").write_text("Name: the owner", encoding="utf-8")
+        result = ContextBuilder(tmp_path)._load_agent_profile_files()
+        assert "## SOUL.md" in result
+        assert "Soul." in result
+        assert "## USER.md" in result
+        assert "Name: the owner" in result
 
     def test_legacy_tools_md_is_not_bootstrapped(self, tmp_path):
         (tmp_path / "TOOLS.md").write_text("workspace tool notes", encoding="utf-8")
@@ -136,6 +151,7 @@ class TestLoadBootstrapFiles:
         result = ContextBuilder(agent_home).build_system_prompt(
             workspace=project,
             include_memory_recent_history=False,
+            owner=_owner(),
         )
 
         assert "selected project rules" in result
@@ -167,16 +183,18 @@ class TestLoadBootstrapFiles:
         result = ContextBuilder(tmp_path)._load_bootstrap_files()
 
         assert "## AGENTS.md" not in result
-        assert "## USER.md" not in result
-        assert "## SOUL.md" in result
 
-    def test_customized_user_template_is_loaded(self, tmp_path):
+        profile = ContextBuilder(tmp_path)._load_agent_profile_files()
+        assert "## USER.md" not in profile
+        assert "## SOUL.md" in profile
+
+    def test_customized_user_template_is_loaded_for_the_owner(self, tmp_path):
         from nanobot.utils.helpers import sync_workspace_templates
 
         sync_workspace_templates(tmp_path, silent=True)
         (tmp_path / "USER.md").write_text("User prefers Chinese.", encoding="utf-8")
 
-        result = ContextBuilder(tmp_path)._load_bootstrap_files()
+        result = ContextBuilder(tmp_path)._load_agent_profile_files()
 
         assert "## USER.md" in result
         assert "User prefers Chinese." in result

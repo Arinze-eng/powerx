@@ -185,9 +185,21 @@ class ContextBuilder:
         parts = [self._get_identity(channel=channel, workspace=root, owner=owner)]
         volatile: list[str] = []
 
+        # AGENTS.md is the project's own instructions and is not personal data.
         bootstrap = self._load_bootstrap_files(root)
         if bootstrap:
             parts.append(bootstrap)
+
+        # SOUL.md/USER.md describe the *agent's* workspace — the owner's profile
+        # (name, email, role) lives in USER.md. They are the agent's own identity
+        # file rather than per-user data, but they still name the owner, so they
+        # are injected for the verified administrator only. Without this gate the
+        # owner's name and address reached every authenticated user, because the
+        # workspace files are shared by the whole deployment.
+        if self._is_owner(owner):
+            profile = self._load_agent_profile_files()
+            if profile:
+                parts.append(profile)
 
         parts.append(render_template("agent/tool_contract.md"))
 
@@ -217,7 +229,13 @@ class ContextBuilder:
         if sandbox_section:
             parts.append(sandbox_section)
 
-        if include_memory:
+        # Long-term memory is the *owner's* memory: the deployment shares one
+        # agent workspace, so MEMORY.md holds his profile, his projects and
+        # facts about him. It is injected for the verified administrator only.
+        # Everyone else is told plainly that there is no stored profile for
+        # them, rather than being handed someone else's under the heading
+        # "long-term memory".
+        if include_memory and self._is_owner(owner):
             memory = self.memory.read_memory()
             if memory and not self._is_template_content(memory, "memory/MEMORY.md"):
                 parts.append(f"# Memory\n\n## Long-term Memory\n{memory}")
@@ -244,10 +262,16 @@ class ContextBuilder:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
         if include_memory_recent_history:
+            # A non-owner must only ever see entries from their own session
+            # key. ``unified_session`` widens the read to every non-internal
+            # session — that is the owner's single-user multi-device mode, and
+            # for anyone else it is other people's history. So the widened read
+            # is restricted to the verified administrator, and everyone else is
+            # pinned to the session-keyed read.
             entries = self.memory.read_recent_history_for_prompt(
                 since_cursor=self.memory.get_last_dream_cursor(),
                 session_key=session_key,
-                unified_session=unified_session,
+                unified_session=unified_session and self._is_owner(owner),
             )
             if entries:
                 capped = entries[-self._MAX_RECENT_HISTORY:]
@@ -325,10 +349,23 @@ class ContextBuilder:
             runtime=runtime,
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
-            verified_administrator=bool(owner is not None and owner.is_verified_admin),
+            verified_administrator=self._is_owner(owner),
             admin_email=(owner.email if owner is not None else "")
             or DEFAULT_VERIFIED_ADMIN_EMAIL,
         )
+
+    @staticmethod
+    def _is_owner(owner: "TurnOwner | None") -> bool:
+        """True only for the account the gateway authenticated as the administrator.
+
+        One definition, because every stored-artifact gate below asks the same
+        question and the answer must not drift between them. ``owner`` is resolved
+        by :func:`nanobot.agent.owner.owner_from_metadata` from metadata the
+        gateway wrote while authenticating the turn, never from message text, so
+        "no owner object" and "not the owner" both answer False and a claim in a
+        message cannot reach here at all.
+        """
+        return bool(owner is not None and owner.is_verified_admin)
 
     def _build_durable_artifacts_section(self) -> str:
         """Render the persisted artifact-link index for the system prompt.
@@ -478,24 +515,25 @@ class ContextBuilder:
         return _to_blocks(left) + _to_blocks(right)
 
     def _load_bootstrap_files(self, workspace: Path | None = None) -> str:
-        """Load project instructions plus the agent's global profile files."""
+        """Load the project's own instructions (``AGENTS.md``).
+
+        Only ``AGENTS.md`` is loaded here. ``SOUL.md`` and ``USER.md`` are the
+        agent's profile files and name the owner, so they moved to
+        :meth:`_load_agent_profile_files`, which the prompt gates on the
+        authenticated administrator. A project directory is chosen by the user
+        for the turn, so a project's own ``SOUL.md``/``USER.md`` are deliberately
+        not loaded either — the selected project supplies exactly one file.
+        """
         parts: list[str] = []
         project_root = workspace or self.workspace
         sources = [
             ("AGENTS.md", project_root),
-            ("SOUL.md", self.workspace),
-            ("USER.md", self.workspace),
         ]
 
         for filename, root in sources:
             file_path = root / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
-                if filename == "SOUL.md" and self._is_template_content(
-                    content,
-                    "legacy/SOUL.md",
-                ):
-                    content = load_bundled_template("SOUL.md") or content
                 if not content.strip():
                     continue
                 if filename in self._SKIPPABLE_DEFAULTS and self._is_template_content(
@@ -503,6 +541,35 @@ class ContextBuilder:
                 ):
                     continue
                 parts.append(f"## {filename}\n\n{content}")
+
+        return "\n\n".join(parts) if parts else ""
+
+    def _load_agent_profile_files(self) -> str:
+        """Load the agent's global profile files (``SOUL.md``, ``USER.md``).
+
+        These always come from the agent workspace, never from the selected
+        project, so a project directory can never shadow the agent's identity.
+        Callers gate this on the verified administrator: ``USER.md`` is the
+        owner's profile and must not be handed to anyone else.
+        """
+        parts: list[str] = []
+        for filename in ("SOUL.md", "USER.md"):
+            file_path = self.workspace / filename
+            if not file_path.exists():
+                continue
+            content = file_path.read_text(encoding="utf-8")
+            if filename == "SOUL.md" and self._is_template_content(
+                content,
+                "legacy/SOUL.md",
+            ):
+                content = load_bundled_template("SOUL.md") or content
+            if not content.strip():
+                continue
+            if filename in self._SKIPPABLE_DEFAULTS and self._is_template_content(
+                content, filename
+            ):
+                continue
+            parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
 

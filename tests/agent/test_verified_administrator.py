@@ -276,3 +276,123 @@ def test_turn_loop_resolves_the_owner_from_authenticated_metadata() -> None:
     source = (REPO_ROOT / "nanobot/agent/loop.py").read_text(encoding="utf-8")
     assert "owner = owner_from_metadata(ctx.msg.metadata, ctx.session.metadata)" in source
     assert "owner=owner," in source
+
+
+# --------------------------------------------- the owner's stored profile/memory
+#
+# The identity block alone was not enough. MEMORY.md and USER.md live in one
+# agent workspace shared by the whole deployment, and the prompt builder injected
+# them into *every* turn, so a signed-out WebUI visitor was answered, in the
+# agent's own words, with the owner's name, address and administrator status.
+# These tests pin the gate: the stored profile and the long-term memory reach the
+# verified administrator and nobody else.
+
+_OWNER_PROFILE = "Name: Allison\nEmail: allisonarinze@gmail.com"
+_PRIVATE_MEMORY = "Allison owns CDNAI and prefers short answers."
+
+
+def _builder_with_profile(tmp_path: Path) -> ContextBuilder:
+    (tmp_path / "USER.md").write_text(_OWNER_PROFILE, encoding="utf-8")
+    (tmp_path / "memory").mkdir(exist_ok=True)
+    (tmp_path / "memory" / "MEMORY.md").write_text(_PRIVATE_MEMORY, encoding="utf-8")
+    return ContextBuilder(tmp_path)
+
+
+def _owner_turn() -> object:
+    return owner_from_metadata({"user_email": DEFAULT_VERIFIED_ADMIN_EMAIL})
+
+
+def test_the_owner_prompt_carries_his_stored_profile_and_long_term_memory(
+    tmp_path: Path,
+) -> None:
+    prompt = _builder_with_profile(tmp_path).build_system_prompt(
+        include_memory_recent_history=False,
+        owner=_owner_turn(),  # type: ignore[arg-type]
+    )
+    assert "## USER.md" in prompt
+    assert _OWNER_PROFILE in prompt
+    assert _PRIVATE_MEMORY in prompt
+
+
+def test_a_normal_user_prompt_carries_neither_profile_nor_memory(tmp_path: Path) -> None:
+    """No identity at all is the fail-closed default, and it must stay closed."""
+    prompt = _builder_with_profile(tmp_path).build_system_prompt(
+        include_memory_recent_history=False,
+    )
+    assert "## USER.md" not in prompt
+    assert _OWNER_PROFILE not in prompt
+    assert DEFAULT_VERIFIED_ADMIN_EMAIL not in prompt
+    assert _PRIVATE_MEMORY not in prompt
+    assert "You do NOT know who the user is" in prompt
+
+
+def test_another_account_gets_no_profile_even_with_a_verified_jwt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real, verified session for a *different* account is still not the owner."""
+
+    class _Auth:
+        def verify_access_token_sync(self, _token: str) -> tuple[str, str]:
+            return ("uid-not-owner", "someone.else@example.com")
+
+    monkeypatch.setattr("nanobot.supabase_auth.SupabaseAuth", _Auth)
+    owner = owner_from_metadata({"supabase_access_token": "jwt"})
+    assert not owner.is_verified_admin
+
+    prompt = _builder_with_profile(tmp_path).build_system_prompt(
+        include_memory_recent_history=False,
+        owner=owner,
+    )
+    assert _OWNER_PROFILE not in prompt
+    assert DEFAULT_VERIFIED_ADMIN_EMAIL not in prompt
+    assert _PRIVATE_MEMORY not in prompt
+
+
+def test_the_normal_user_prompt_says_it_has_no_stored_profile(tmp_path: Path) -> None:
+    """The model must be told the absence, or it improvises one from history."""
+    prompt = _builder_with_profile(tmp_path).build_system_prompt(
+        include_memory_recent_history=False,
+    )
+    assert "no stored profile, long-term memory, or saved facts" in prompt
+    assert "never describe a profile, name, email, project, or preference" in prompt
+
+
+def test_the_owner_prompt_is_not_told_it_has_no_profile(tmp_path: Path) -> None:
+    prompt = _builder_with_profile(tmp_path).build_system_prompt(
+        include_memory_recent_history=False,
+        owner=_owner_turn(),  # type: ignore[arg-type]
+    )
+    assert "no stored profile, long-term memory, or saved facts" not in prompt
+
+
+def test_unified_session_never_widens_a_normal_users_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Single-user multi-device mode exposes every non-internal session."""
+    builder = ContextBuilder(tmp_path)
+    seen: dict[str, object] = {}
+
+    def _fake_read(
+        *,
+        since_cursor: int,
+        session_key: str | None,
+        unified_session: bool = False,
+    ) -> list[dict[str, object]]:
+        seen["unified_session"] = unified_session
+        seen["session_key"] = session_key
+        return []
+
+    monkeypatch.setattr(builder.memory, "read_recent_history_for_prompt", _fake_read)
+
+    builder.build_system_prompt(session_key="websocket:mine", unified_session=True)
+    assert seen["unified_session"] is False
+    assert seen["session_key"] == "websocket:mine"
+
+    builder.build_system_prompt(
+        session_key="websocket:mine",
+        unified_session=True,
+        owner=_owner_turn(),  # type: ignore[arg-type]
+    )
+    assert seen["unified_session"] is True
