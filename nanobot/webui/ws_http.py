@@ -469,6 +469,10 @@ class GatewayHTTPHandler:
         self.skill_state_action = skill_state_action
         self._skill_install_lock = asyncio.Lock()
         self._folder_picker_lock = asyncio.Lock()
+        # [FIX 2026-10-02] Single-flight + short-TTL cache for the sidebar
+        # list. See ``_sessions_list_payload_cached`` for why.
+        self._sessions_list_lock = asyncio.Lock()
+        self._sessions_list_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self.cron_service = cron_service
         self.local_trigger_store = local_trigger_store
         self.cron_pending_job_ids = cron_pending_job_ids
@@ -1206,13 +1210,59 @@ class GatewayHTTPHandler:
         # other users' chats.
         if self._supabase_webui_auth_enabled() and not owner_user_id:
             return _http_json_response({"sessions": []})
-        payload = await asyncio.to_thread(
-            self._sessions_list_payload, owner_user_id
-        )
+        payload = await self._sessions_list_payload_cached(owner_user_id)
         return _http_json_response(
             payload,
             accept_encoding=_combined_list_header(request.headers, "Accept-Encoding"),
         )
+
+    #: How long one computed sidebar list is reused, in seconds.
+    #:
+    #: Every open WebUI polls this endpoint, and the work behind it stats the
+    #: persistent volume once per chat (506 chats in production) while holding
+    #: the session file lock. So N clients on a poll tick produced N identical
+    #: multi-second scans that serialized behind that lock and then completed
+    #: together -- the production log shows one client's ``/api/sessions``
+    #: taking 23401 ms and finishing in the same millisecond as the model
+    #: reply. Two seconds collapses a burst into a single scan and is far
+    #: below the interval at which the sidebar can be seen to lag; live
+    #: changes still arrive immediately on the ``session_updated`` event.
+    _SESSIONS_LIST_TTL_S = 2.0
+
+    #: Cap on cached per-owner payloads. Multi-user deployments cache one row
+    #: set per signed-in user; the cap keeps that from growing without bound.
+    _SESSIONS_LIST_CACHE_MAX_OWNERS = 16
+
+    async def _sessions_list_payload_cached(
+        self, owner_user_id: str
+    ) -> dict[str, Any]:
+        """Return the sidebar payload, reusing a very recent scan.
+
+        The expensive part is not the JSON: it is touching the volume once per
+        chat. Paying that per *request* rather than per *interval* is what
+        starved the event loop, and a starved loop cannot answer the
+        platform's liveness probe -- which is what replaces the container and
+        gives the user a 503 while it boots.
+        """
+        cached = self._sessions_list_cache.get(owner_user_id)
+        if cached is not None and (time.monotonic() - cached[0]) < self._SESSIONS_LIST_TTL_S:
+            return cached[1]
+        # Single flight: the first caller scans, every other caller waits on
+        # the same lock and then finds the fresh value above rather than
+        # starting a second scan of the same files.
+        async with self._sessions_list_lock:
+            cached = self._sessions_list_cache.get(owner_user_id)
+            if cached is not None and (
+                time.monotonic() - cached[0]
+            ) < self._SESSIONS_LIST_TTL_S:
+                return cached[1]
+            payload = await asyncio.to_thread(
+                self._sessions_list_payload, owner_user_id
+            )
+            if len(self._sessions_list_cache) >= self._SESSIONS_LIST_CACHE_MAX_OWNERS:
+                self._sessions_list_cache.clear()
+            self._sessions_list_cache[owner_user_id] = (time.monotonic(), payload)
+            return payload
 
     def _sessions_list_payload(self, owner_user_id: str = "") -> dict[str, Any]:
         assert self.session_manager is not None
@@ -1876,7 +1926,7 @@ class GatewayHTTPHandler:
         if got == "/api/webui/skills/delete":
             return self._handle_webui_skill_delete(connection, request)
         if got == "/api/webui/skills":
-            return self._handle_webui_skills(request)
+            return await self._handle_webui_skills(request)
         m = re.match(r"^/api/webui/skills/([^/]+)$", got)
         if m:
             return self._handle_webui_skill_detail(request, m.group(1))
@@ -2119,15 +2169,19 @@ class GatewayHTTPHandler:
             return _http_error(503, str(exc))
         return _http_json_response({"path": path})
 
-    def _handle_webui_skills(self, request: WsRequest) -> Response:
+    async def _handle_webui_skills(self, request: WsRequest) -> Response:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
-        return _http_json_response(
-            webui_skills_payload(
-                self.skills_workspace_path,
-                disabled_skills=self.disabled_skills,
-            )
+        # [FIX 2026-10-02] Built a SkillsLoader and walked every skill directory
+        # on the event loop, so each sidebar read blocked the loop for ~1 s
+        # (measured: 1001 and 1046 ms). On the loop that is a second in which
+        # the liveness probe cannot be answered; off it, the loop stays free.
+        payload = await asyncio.to_thread(
+            webui_skills_payload,
+            self.skills_workspace_path,
+            disabled_skills=self.disabled_skills,
         )
+        return _http_json_response(payload)
 
     async def _handle_webui_skills_search(self, request: WsRequest) -> Response:
         if not self.check_api_token(request):
