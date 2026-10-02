@@ -747,7 +747,19 @@ class GatewayHTTPHandler:
         # instant. admin_route only ever answers a fixed set of /api/admin/*
         # paths plus /admin and returns None for anything else, so skipping the
         # hop everywhere else is behaviour-identical and keeps the loop free.
-        if got == "/admin" or got.startswith("/api/admin/"):
+        # [FIX 2026-10-02] /webui/bootstrap hops too: it is a *sync* handler that
+        # verifies the Supabase access token with a blocking network call, on
+        # the sign-in path where several clients arrive at once. On the loop
+        # that call stalled every other task — the "slow webui http route"
+        # warnings — and a stalled loop cannot answer the platform's
+        # /api/health probe, which is what gets the container terminated and
+        # replaced underneath the user mid-task. They see the replacement as a
+        # 503 until it boots.
+        if (
+            got == "/admin"
+            or got.startswith("/api/admin/")
+            or got == "/webui/bootstrap"
+        ):
             admin_response = await asyncio.to_thread(
                 admin_route,
                 request,
@@ -761,6 +773,10 @@ class GatewayHTTPHandler:
             )
             if admin_response is not None:
                 return admin_response
+            if got == "/webui/bootstrap":
+                return await asyncio.to_thread(
+                    self._handle_bootstrap, connection, request
+                )
 
         # Token issue endpoint
         if self.config.token_issue_path:
@@ -768,7 +784,8 @@ class GatewayHTTPHandler:
             if got == issue_expected:
                 return self._handle_token_issue(connection, request)
 
-        # Bootstrap
+        # Bootstrap (reached through the thread hop above; kept for callers that
+        # dispatch this path directly without the hop).
         if got == "/webui/bootstrap":
             return self._handle_bootstrap(connection, request)
 
@@ -1133,7 +1150,7 @@ class GatewayHTTPHandler:
     async def _dispatch_session_routes(self, request: WsRequest, got: str) -> Response | None:
         m = re.match(r"^/api/sessions/([^/]+)/webui-thread$", got)
         if m:
-            return self._handle_webui_thread_get(request, m.group(1))
+            return await self._handle_webui_thread_get(request, m.group(1))
 
         m = re.match(r"^/api/sessions/([^/]+)/context$", got)
         if m:
@@ -1141,15 +1158,15 @@ class GatewayHTTPHandler:
 
         m = re.match(r"^/api/sessions/([^/]+)/file-preview$", got)
         if m:
-            return self._handle_file_preview(request, m.group(1))
+            return await self._handle_file_preview(request, m.group(1))
 
         m = re.match(r"^/api/sessions/([^/]+)/automations$", got)
         if m:
-            return self._handle_session_automations(request, m.group(1))
+            return await self._handle_session_automations(request, m.group(1))
 
         m = re.match(r"^/api/sessions/([^/]+)/delete$", got)
         if m:
-            return self._handle_session_delete(request, m.group(1))
+            return await self._handle_session_delete(request, m.group(1))
 
         return None
 
@@ -1162,7 +1179,7 @@ class GatewayHTTPHandler:
         if not _is_websocket_channel_session_key(decoded_key):
             return _http_error(404, "session not found")
         # [FIX 2026-09-04] Per-user isolation on session reads.
-        denied = self._webui_session_access_error(request, decoded_key)
+        denied = await self._webui_session_access_error(request, decoded_key)
         if denied is not None:
             return denied
         if self.session_manager is None:
@@ -1182,7 +1199,7 @@ class GatewayHTTPHandler:
             return _http_error(503, "session manager unavailable")
         # [FIX 2026-09-04] Resolve the signed-in Supabase user and scope the
         # returned session list to that user only (per-user chat isolation).
-        owner_user_id = self._supabase_user_id_for_request(request)
+        owner_user_id = await self._supabase_user_id_for_request_async(request)
         # Fail closed in Supabase mode: if we cannot resolve an authentic owner
         # for the request, return an empty list instead of leaking every user's
         # sessions. This is the core guard that prevents one user seeing all
@@ -1255,7 +1272,7 @@ class GatewayHTTPHandler:
             cleaned.append(row)
         return {"sessions": cleaned}
 
-    def _handle_webui_thread_get(self, request: WsRequest, key: str) -> Response:
+    async def _handle_webui_thread_get(self, request: WsRequest, key: str) -> Response:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
         decoded_key = _decode_api_key(key)
@@ -1266,7 +1283,7 @@ class GatewayHTTPHandler:
         # [FIX 2026-09-04] Per-user isolation: only the owner of a session may
         # read its thread. In Supabase mode the caller resolves to a user id and
         # is blocked from every session it does not own.
-        denied = self._webui_session_access_error(request, decoded_key)
+        denied = await self._webui_session_access_error(request, decoded_key)
         if denied is not None:
             return denied
         scope = self.workspaces.scope_for_session_key(decoded_key)
@@ -1335,7 +1352,7 @@ class GatewayHTTPHandler:
             accept_encoding=_combined_list_header(request.headers, "Accept-Encoding"),
         )
 
-    def _handle_file_preview(self, request: WsRequest, key: str) -> Response:
+    async def _handle_file_preview(self, request: WsRequest, key: str) -> Response:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
         decoded_key = _decode_api_key(key)
@@ -1346,7 +1363,7 @@ class GatewayHTTPHandler:
         # [FIX 2026-09-05] Per-user isolation: file previews read from the chat's
         # workspace, so only the owner may probe/read them. Without this one user
         # could pass another user's session key to read their project files.
-        denied = self._webui_session_access_error(request, decoded_key)
+        denied = await self._webui_session_access_error(request, decoded_key)
         if denied is not None:
             return denied
         query = _parse_query(request.path)
@@ -1364,7 +1381,7 @@ class GatewayHTTPHandler:
             return _http_error(e.status, e.message)
         return _http_json_response(payload)
 
-    def _handle_session_automations(self, request: WsRequest, key: str) -> Response:
+    async def _handle_session_automations(self, request: WsRequest, key: str) -> Response:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
         decoded_key = _decode_api_key(key)
@@ -1373,7 +1390,7 @@ class GatewayHTTPHandler:
         if not _is_websocket_channel_session_key(decoded_key):
             return _http_error(404, "session not found")
         # [FIX 2026-09-04] Per-user isolation on session automations read.
-        denied = self._webui_session_access_error(request, decoded_key)
+        denied = await self._webui_session_access_error(request, decoded_key)
         if denied is not None:
             return denied
         pending_job_ids = self._pending_automation_ids_for_session(decoded_key)
@@ -1386,7 +1403,7 @@ class GatewayHTTPHandler:
             )
         )
 
-    def _handle_session_delete(self, request: WsRequest, key: str) -> Response:
+    async def _handle_session_delete(self, request: WsRequest, key: str) -> Response:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
         if self.session_manager is None:
@@ -1398,7 +1415,7 @@ class GatewayHTTPHandler:
             return _http_error(404, "session not found")
         # [FIX 2026-09-04] Per-user isolation on session delete (prevents a user
         # deleting another user's chat).
-        denied = self._webui_session_access_error(request, decoded_key)
+        denied = await self._webui_session_access_error(request, decoded_key)
         if denied is not None:
             return denied
         query = _request_query(request)
@@ -1898,7 +1915,7 @@ class GatewayHTTPHandler:
         if not announcement_id:
             return _http_error(400, "announcement_id is required")
         # Resolve the signed-in user from the request token.
-        user_id = self._supabase_user_id_for_request(request)
+        user_id = await self._supabase_user_id_for_request_async(request)
         if not user_id:
             return _http_json_response({"ok": True, "anonymous": True})
         try:
@@ -1922,7 +1939,7 @@ class GatewayHTTPHandler:
             return _http_error(401, "Unauthorized")
         payload = _mutation_payload(request) or _request_query(request)
         slug = str(payload.get("slug") or "").strip()[:64]
-        email = str(self._supabase_user_email_for_request(request) or "").strip()[:200]
+        email = str(await self._supabase_user_email_for_request_async(request) or "").strip()[:200]
         try:
             from nanobot.supabase_auth import SupabaseAuth
 
@@ -1951,7 +1968,7 @@ class GatewayHTTPHandler:
         except Exception as exc:
             return _http_error(502, f"pay-link unavailable: {type(exc).__name__}")
 
-    def _webui_session_access_error(
+    async def _webui_session_access_error(
         self,
         request: WsRequest,
         decoded_key: str,
@@ -1970,7 +1987,7 @@ class GatewayHTTPHandler:
         see each other's chats. An unowned chat becomes readable to a user only
         after that user claims it via first activity (new_chat / message).
         """
-        owner_user_id = self._supabase_user_id_for_request(request)
+        owner_user_id = await self._supabase_user_id_for_request_async(request)
         chat_id = decoded_key.split(":", 1)[1] if ":" in decoded_key else decoded_key
         try:
             session_owner = self.workspaces.session_owner_user_id(chat_id)
@@ -2001,6 +2018,11 @@ class GatewayHTTPHandler:
         A socket-mutated request carries the identity the socket authenticated
         with, which stays authoritative when the client sent no
         ``X-Nanobot-Auth`` header on the handshake.
+
+        Blocking: on a cache miss this makes a **network round-trip to Supabase**
+        (``verify_access_token_sync``). From an async handler use
+        :meth:`_supabase_user_id_for_request_async` instead — calling this one on
+        the event loop stalls every other task, including the /api/health probe.
         """
         connection_user = getattr(
             request, _WEBUI_MUTATION_SUPABASE_USER_ATTR, ""
@@ -2019,6 +2041,31 @@ class GatewayHTTPHandler:
             return uid or ""
         except Exception:
             return ""
+
+    async def _supabase_user_id_for_request_async(self, request: WsRequest) -> str:
+        """Event-loop-safe form of :meth:`_supabase_user_id_for_request`.
+
+        [FIX 2026-10-02] The WebUI's own polling reads called the synchronous
+        resolver directly from their async handlers, so each cache-missing
+        request did its Supabase round-trip **on the event loop**. Several
+        polling clients at once therefore stalled the whole gateway — the
+        ``slow webui http route`` warnings of 5.7s and 10.3s, and 21.4s during a
+        restart — and a stalled loop is a loop that cannot answer the platform's
+        /api/health probe, which is what gets the container terminated and
+        replaced. The user sees the replacement as a 503 while it boots.
+
+        The socket-authenticated identity is already in hand and stays on the
+        loop; only the token verification (the part that touches the network)
+        is moved to a worker thread.
+        """
+        connection_user = getattr(request, _WEBUI_MUTATION_SUPABASE_USER_ATTR, "")
+        if isinstance(connection_user, str) and connection_user.strip():
+            return connection_user.strip()
+        return await asyncio.to_thread(self._supabase_user_id_for_request, request)
+
+    async def _supabase_user_email_for_request_async(self, request: WsRequest) -> str:
+        """Event-loop-safe form of :meth:`_supabase_user_email_for_request`."""
+        return await asyncio.to_thread(self._supabase_user_email_for_request, request)
 
     def _supabase_user_email_for_request(self, request: WsRequest) -> str:
         """Best-effort resolution of the signed-in user's email for a pay link."""

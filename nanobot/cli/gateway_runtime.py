@@ -3,6 +3,7 @@
 import asyncio
 import os
 import signal
+import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from contextlib import suppress
 from pathlib import Path
@@ -90,6 +91,18 @@ def _signal_name(signum: int) -> str:
     return f"signal {signum}"
 
 
+#: A repeat shutdown signal is only read as "the operator pressed Ctrl+C again"
+#: after this long. An orchestrator stopping a container delivers the signal
+#: more than once as part of its *normal* stop, and the two can land in the same
+#: instant: on 2026-10-02 Northflank's in-place replacement of the container
+#: logged "Gateway shutdown requested by SIGTERM" and "Forcing gateway shutdown
+#: after repeated SIGTERM" in the same millisecond, so the force path cancelled
+#: every runtime task and aborted the turn the user had just sent — for what was
+#: an ordinary container stop. A genuine operator double-tap arrives seconds
+#: later, so waiting costs nothing and a duplicate no longer kills work.
+_FORCE_SHUTDOWN_AFTER_S = 10.0
+
+
 def _install_gateway_shutdown_handlers(
     loop: asyncio.AbstractEventLoop,
     shutdown_event: asyncio.Event,
@@ -100,17 +113,31 @@ def _install_gateway_shutdown_handlers(
     loop_signals: list[int] = []
     previous_handlers: list[tuple[int, Any]] = []
     shutdown_requested = False
+    first_request_at = 0.0
 
     def request_shutdown(signum: int) -> None:
-        nonlocal shutdown_requested
+        nonlocal shutdown_requested, first_request_at
         sig_name = _signal_name(signum)
         if shutdown_requested:
+            waited = time.monotonic() - first_request_at
+            if waited < _FORCE_SHUTDOWN_AFTER_S:
+                # The platform's own stop sequence re-delivers the signal. Keep
+                # draining: cancelling here is what aborted an in-flight turn.
+                logger.info(
+                    "Duplicate {} {:.2f}s after shutdown began — continuing "
+                    "graceful drain (force is {}s away)",
+                    sig_name,
+                    waited,
+                    _FORCE_SHUTDOWN_AFTER_S,
+                )
+                return
             logger.warning("Forcing gateway shutdown after repeated {}", sig_name)
             for task in tasks:
                 if not task.done():
                     task.cancel()
             return
         shutdown_requested = True
+        first_request_at = time.monotonic()
         logger.info("Gateway shutdown requested by {}", sig_name)
         print_status("\nShutting down... Press Ctrl+C again to force.")
         shutdown_event.set()
