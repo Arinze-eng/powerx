@@ -877,7 +877,8 @@
         "unit": "Unit",
         "cronExpression": "Cron expression",
         "timezone": "Timezone",
-        "runAt": "Run at"
+        "runAt": "Run at",
+        "timezoneHint": "Leave blank to use the server timezone (Africa/Lagos, UTC+1)."
       },
       "scheduleTypes": {
         "every": "Interval",

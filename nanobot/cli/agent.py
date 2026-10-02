@@ -168,7 +168,10 @@ def agent(
         _migrate_cron_store(runtime_config)
 
     cron_store_path = get_cron_store_path()
-    cron = CronService(cron_store_path)
+    cron = CronService(
+        cron_store_path,
+        default_timezone=runtime_config.agents.defaults.timezone,
+    )
     tools = ToolRegistry()
     mcp_provider = MCPProvider.from_config(runtime_config, tools)
 

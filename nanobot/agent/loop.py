@@ -57,6 +57,7 @@ from nanobot.channels.telegram.task_mode import (
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
+from nanobot.config.timezone import DEFAULT_TIMEZONE
 from nanobot.providers.base import LLMProvider, ProviderConversationState
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.runtime_context import (
@@ -715,7 +716,7 @@ class AgentLoop:
             sessions=self.sessions,
             provider_snapshot_loader=provider_snapshot_loader,
             image_generation_provider_configs=self._image_generation_provider_configs,
-            timezone=self.context.timezone or "UTC",
+            timezone=self.context.timezone or DEFAULT_TIMEZONE,
             workspace_sandbox=self.workspace_scopes.sandbox_status,
             runtime_events=self.runtime_events,
             # Let peer-resolving tools (mt5_sandbox, arduino_verify) find the

@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
+from nanobot.config.timezone import DEFAULT_TIMEZONE
+
 if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
     from nanobot.agent.tools.exec_session import ExecSessionManager
@@ -88,7 +90,9 @@ class ToolContext:
     file_state_store: FileStates | None = None
     provider_snapshot_loader: Callable[..., ProviderSnapshot] | None = None
     image_generation_provider_configs: dict[str, ProviderConfig] | None = None
-    timezone: str = "UTC"
+    #: Deployment zone for wall-clock tools (cron, naive timestamps). Defaults
+    #: to the deployment zone, not to UTC — see nanobot.config.timezone.
+    timezone: str = DEFAULT_TIMEZONE
     workspace_sandbox: WorkspaceSandboxStatus | None = None
     runtime_events: RuntimeEventBus | None = None
     #: The live registry of tools being built/run. Carried so a tool can resolve a

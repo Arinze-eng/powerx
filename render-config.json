@@ -10,7 +10,9 @@
       "maxTokens": 32768,
       "maxToolResultChars": 131072,
       "workspace": "~/.nanobot/workspace",
-      "botName": "Novita Super Agent"
+      "botName": "Novita Super Agent",
+      "timezone": "Africa/Lagos",
+      "timezoneMode": "manual"
     }
   },
   "providers": {

@@ -483,7 +483,10 @@ def _run_gateway(
         _migrate_cron_store(config)
 
     cron_store_path = get_cron_store_path()
-    cron = CronService(cron_store_path)
+    # The zone a cron expression is read in when the job carries none. Comes
+    # from the resolved config (agents.defaults.timezone, Africa/Lagos on this
+    # deployment) rather than the container's UTC.
+    cron = CronService(cron_store_path, default_timezone=config.agents.defaults.timezone)
     trigger_store = LocalTriggerStore(config.workspace_path)
 
     turn_delivery_factory = TurnDeliveryFactory(

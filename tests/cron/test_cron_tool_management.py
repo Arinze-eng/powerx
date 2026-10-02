@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from nanobot.agent.tools.cron import CronTool
@@ -145,8 +146,10 @@ def test_scheduled_job_actually_fires_end_to_end(tmp_path) -> None:
     service = CronService(tmp_path / "cron" / "jobs.json", on_job=on_job, max_sleep_ms=100)
     tool = CronTool(service)
 
-    # One-shot 1 second from now (naive ISO uses default tz = UTC here).
-    at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() + 1))
+    # One-shot 1 second from now, with an explicit offset. A *naive* ISO time is
+    # read in the deployment's zone (Africa/Lagos), so a UTC wall clock would be
+    # an hour away and never fire inside this test's window.
+    at = datetime.fromtimestamp(time.time() + 1, tz=timezone.utc).isoformat()
     created = _run(tool.execute(action="add", name="e2e", message="hello world", at=at))
     assert "Created job" in created
 

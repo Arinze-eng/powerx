@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from nanobot.config.loader import load_config, save_config
 from nanobot.config.schema import Config
-from nanobot.config.timezone import detect_system_timezone
+from nanobot.config.timezone import (
+    DEFAULT_TIMEZONE,
+    detect_system_timezone,
+    is_utc_alias,
+    resolve_default_timezone,
+)
 
 
 def test_new_config_detects_backend_timezone(monkeypatch) -> None:
@@ -121,3 +128,47 @@ def test_backend_timezone_detection_normalizes_utc_aliases(monkeypatch) -> None:
     )
 
     assert detect_system_timezone() == "UTC"
+
+
+# -- deployment default -------------------------------------------------------
+#
+# A schedule is wall-clock time plus a zone. The container reports UTC while the
+# owner works at UTC+1, so "the host says UTC" must not be adopted as the zone
+# schedules are read in.
+
+
+@pytest.mark.parametrize("host_zone", ["UTC", "Etc/UTC", "GMT", "Zulu"])
+def test_utc_host_falls_back_to_the_deployment_zone(monkeypatch, host_zone: str) -> None:
+    monkeypatch.setattr(
+        "nanobot.config.timezone.get_localzone_name",
+        lambda: host_zone,
+    )
+
+    assert resolve_default_timezone() == DEFAULT_TIMEZONE
+
+
+def test_a_host_with_a_real_zone_still_wins(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "nanobot.config.timezone.get_localzone_name",
+        lambda: "Asia/Shanghai",
+    )
+
+    assert resolve_default_timezone() == "Asia/Shanghai"
+
+
+def test_detection_failure_falls_back_to_the_deployment_zone(monkeypatch) -> None:
+    def unavailable_timezone() -> str:
+        raise OSError("timezone unavailable")
+
+    monkeypatch.setattr("nanobot.config.timezone.get_localzone_name", unavailable_timezone)
+
+    assert resolve_default_timezone() == DEFAULT_TIMEZONE
+
+
+def test_a_new_config_does_not_default_to_utc() -> None:
+    assert DEFAULT_TIMEZONE != "UTC"
+    assert not is_utc_alias(DEFAULT_TIMEZONE)
+    assert is_utc_alias("Etc/UTC")
+    assert is_utc_alias(" utc ")
+    assert not is_utc_alias(None)
+    assert not is_utc_alias("Africa/Lagos")

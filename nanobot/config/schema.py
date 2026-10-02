@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 from pydantic import AliasChoices, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from nanobot.config.timezone import detect_system_timezone
+from nanobot.config.timezone import DEFAULT_TIMEZONE, resolve_default_timezone
 from nanobot.config_base import Base
 from nanobot.cron.types import CronSchedule
 
@@ -144,7 +144,7 @@ class AgentDefaults(Base):
         serialization_alias="toolHintMaxLength",
     )  # Max characters for tool hint display (e.g. "$ cd …/project && npm test")
     reasoning_effort: str | None = None  # low / medium / high / xhigh / max / adaptive / none — LLM thinking effort; None preserves the provider default
-    timezone: str = "UTC"  # Effective IANA timezone, e.g. "Asia/Shanghai"
+    timezone: str = DEFAULT_TIMEZONE  # Effective IANA timezone, e.g. "Africa/Lagos"
     timezone_mode: Literal["auto", "manual"] = "auto"
     bot_name: str = "nanobot"  # Display name shown in CLI prompts (e.g. "{name} is thinking...")
     bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
@@ -182,7 +182,7 @@ class AgentDefaults(Base):
             timezone_mode = "manual" if "timezone" in data else "auto"
             data["timezoneMode"] = timezone_mode
         if timezone_mode == "auto":
-            data["timezone"] = detect_system_timezone()
+            data["timezone"] = resolve_default_timezone()
         return data
 
     @field_validator("timezone")

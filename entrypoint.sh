@@ -73,6 +73,36 @@ if [ -n "$CRON_STORE" ]; then
              "at that path or set POWERX_DATA_DIR to the volume." >&2
     fi
 fi
+
+# ---------------------------------------------------------------------------
+# One-time cron timezone repair (idempotent, safe on every boot).
+#
+# Jobs stored before this deployment had a configured zone were stamped with a
+# hard-coded "UTC" timezone, or with none at all — and the scheduler then read
+# them in the container's zone, which is also UTC. Both fired an hour late for
+# an owner at UTC+1. The scheduler no longer does that, but it recomputes each
+# job's next run from the zone *stored on the job*, so the existing jobs must be
+# rewritten or they stay an hour off forever.
+#
+# Rewrites only jobs whose zone is missing or a UTC alias; a job that names a
+# real zone is left alone. Exits 0 with nothing to do, so it can run every boot.
+# ---------------------------------------------------------------------------
+if [ -f /app/scripts/migrate_cron_timezone.py ]; then
+    _tz_py=""
+    for _py in /app/.venv/bin/python3 python3; do
+        command -v "$_py" >/dev/null 2>&1 && _tz_py="$_py" && break
+    done
+    if [ -n "$_tz_py" ]; then
+        if [ -n "$CRON_STORE" ]; then
+            "$_tz_py" /app/scripts/migrate_cron_timezone.py "$CRON_STORE" || \
+                echo "[entrypoint] warning: cron timezone migration failed (continuing)"
+        else
+            "$_tz_py" /app/scripts/migrate_cron_timezone.py || \
+                echo "[entrypoint] warning: cron timezone migration failed (continuing)"
+        fi
+    fi
+fi
+
 if [ "$RENDER" = "true" ] || [ "$NORTHFLANK" = "true" ]; then
     # Keep the legacy flags working as the bootstrap switch too.
     PLATFORM_BOOTSTRAP=true

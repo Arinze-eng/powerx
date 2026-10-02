@@ -15,6 +15,7 @@ from nanobot.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
+from nanobot.config.timezone import DEFAULT_TIMEZONE
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronSchedule
 from nanobot.runtime_context import encode_runtime_context_blocks_for_json
@@ -79,7 +80,7 @@ _CRON_PARAMETERS = tool_parameters_schema(
 class CronTool(Tool):
     """Tool to schedule reminders and recurring tasks."""
 
-    def __init__(self, cron_service: CronService, default_timezone: str = "UTC"):
+    def __init__(self, cron_service: CronService, default_timezone: str = DEFAULT_TIMEZONE):
         self._cron = cron_service
         self._default_timezone = default_timezone
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
@@ -93,7 +94,10 @@ class CronTool(Tool):
         cron_service = ctx.cron_service
         if cron_service is None:
             raise RuntimeError("CronTool requires an initialized cron service")
-        return cls(cron_service=cron_service, default_timezone=ctx.timezone)
+        return cls(
+            cron_service=cron_service,
+            default_timezone=ctx.timezone or DEFAULT_TIMEZONE,
+        )
 
     @staticmethod
     def _request_route() -> tuple[str, str, str, dict[str, Any]]:

@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 
 from scripts.ensure_render_config import (
+    _DEPLOYMENT_TIMEZONE,
+    _ensure_deployment_timezone,
     _ensure_image_generation_defaults,
     _ensure_provider_defaults,
     ensure_file_tool_enabled,
@@ -402,3 +404,53 @@ def test_the_migration_survives_a_settings_save(tmp_path: Path) -> None:
     # And re-running the migration on the saved file changes nothing.
     assert _ensure_image_generation_defaults(dumped) is False
     assert dumped["tools"]["imageGeneration"]["enabled"] is None
+
+
+# -- deployment timezone ------------------------------------------------------
+
+
+def test_the_deployment_zone_is_pinned_on_boot(tmp_path: Path) -> None:
+    """An unset timezone must not stay at the container's UTC."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"agents": {"defaults": {"model": "custom/x"}}}),
+        encoding="utf-8",
+    )
+
+    assert ensure_render_defaults(config_path) is True
+
+    defaults = json.loads(config_path.read_text(encoding="utf-8"))["agents"]["defaults"]
+    assert defaults["timezone"] == _DEPLOYMENT_TIMEZONE
+    assert _DEPLOYMENT_TIMEZONE != "UTC"
+    # "manual" is what stops the config loader's auto-detect from putting the
+    # container's UTC back on the next load.
+    assert defaults["timezoneMode"] == "manual"
+
+
+def test_a_utc_timezone_left_by_an_older_release_is_replaced() -> None:
+    data = {"agents": {"defaults": {"timezone": "UTC", "timezoneMode": "auto"}}}
+
+    assert _ensure_deployment_timezone(data) is True
+
+    defaults = data["agents"]["defaults"]
+    assert defaults["timezone"] == _DEPLOYMENT_TIMEZONE
+    assert defaults["timezoneMode"] == "manual"
+
+
+def test_a_pinned_zone_is_not_rewritten_every_boot() -> None:
+    data = {"agents": {"defaults": {"timezone": _DEPLOYMENT_TIMEZONE, "timezoneMode": "manual"}}}
+
+    assert _ensure_deployment_timezone(data) is False
+    assert data["agents"]["defaults"]["timezone"] == _DEPLOYMENT_TIMEZONE
+
+
+def test_the_snake_case_mode_is_dropped_so_one_spelling_wins() -> None:
+    data = {
+        "agents": {
+            "defaults": {"timezone": _DEPLOYMENT_TIMEZONE, "timezone_mode": "manual"}
+        }
+    }
+
+    assert _ensure_deployment_timezone(data) is True
+    assert "timezone_mode" not in data["agents"]["defaults"]
+    assert data["agents"]["defaults"]["timezoneMode"] == "manual"

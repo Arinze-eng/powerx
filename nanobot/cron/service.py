@@ -16,6 +16,7 @@ from typing import Any, Callable, Coroutine, Literal
 from filelock import FileLock
 from loguru import logger
 
+from nanobot.config.timezone import DEFAULT_TIMEZONE
 from nanobot.cron.session_turns import is_bound_cron_job
 from nanobot.cron.types import (
     CronJob,
@@ -39,8 +40,20 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
-    """Compute next run time in ms."""
+def _compute_next_run(
+    schedule: CronSchedule,
+    now_ms: int,
+    default_tz: str | None = None,
+) -> int | None:
+    """Compute next run time in ms.
+
+    A cron expression is wall-clock time in *some* zone. ``schedule.tz`` names
+    it when the caller supplied one; otherwise ``default_tz`` (the deployment's
+    configured zone) is used. The old fallback was the container's own zone,
+    which on this platform is UTC — so an expression with no explicit zone, and
+    every one stamped with the old hard-coded UTC default, fired an hour off for
+    an owner at UTC+1.
+    """
     if schedule.kind == "at":
         return schedule.at_ms if schedule.at_ms and schedule.at_ms > now_ms else None
 
@@ -57,7 +70,7 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
             from croniter import croniter
             # Use caller-provided reference time for deterministic scheduling
             base_time = now_ms / 1000
-            tz = ZoneInfo(schedule.tz) if schedule.tz else datetime.now().astimezone().tzinfo
+            tz = ZoneInfo(schedule.tz or default_tz or DEFAULT_TIMEZONE)
             base_dt = datetime.fromtimestamp(base_time, tz=tz)
             cron = croniter(schedule.expr, base_dt)
             next_dt = cron.get_next(datetime)
@@ -163,6 +176,7 @@ class CronService:
         max_sleep_ms: int = 300_000,  # 5 minutes
         *,
         allow_unbound_agent_jobs: bool = True,
+        default_timezone: str | None = None,
     ):
         """Create a cron service.
 
@@ -170,8 +184,15 @@ class CronService:
         not bound to a concrete chat session are kept enabled (and run through
         the general execution path) instead of being silently disabled. Defaults
         to ``True`` so cron works for any task from any context.
+
+        ``default_timezone`` is the zone a cron expression is interpreted in
+        when the job itself carries none (``agents.defaults.timezone``). It
+        defaults to the deployment zone rather than to the container's, so a
+        schedule created without an explicit zone still fires at the hour the
+        user meant.
         """
         self.store_path = store_path
+        self._default_timezone = (default_timezone or "").strip() or DEFAULT_TIMEZONE
         self._action_path = store_path.parent / "action.jsonl"
         self._run_records_dir = store_path.parent / "runs"
         self._lock = FileLock(str(self._action_path.parent) + ".lock")
@@ -183,6 +204,11 @@ class CronService:
         self._store_dirty = False
         self.max_sleep_ms = max_sleep_ms
         self._allow_unbound_agent_jobs = allow_unbound_agent_jobs
+
+    @property
+    def default_timezone(self) -> str:
+        """Zone used for cron jobs that carry no timezone of their own."""
+        return self._default_timezone
 
     def _should_persist_store(self) -> bool:
         """Return whether this instance currently owns the live store."""
@@ -513,7 +539,9 @@ class CronService:
             if self._enforce_agent_binding(job):
                 continue
             if job.enabled:
-                job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+                job.state.next_run_at_ms = _compute_next_run(
+                    job.schedule, now, default_tz=self._default_timezone
+                )
 
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
@@ -641,7 +669,9 @@ class CronService:
                 job.state.next_run_at_ms = None
         else:
             # Compute next run
-            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+            job.state.next_run_at_ms = _compute_next_run(
+                job.schedule, _now_ms(), default_tz=self._default_timezone
+            )
 
     def _append_action(
         self,
@@ -719,7 +749,11 @@ class CronService:
                 origin_chat_id=origin_chat_id,
                 origin_metadata=encode_runtime_context_blocks_for_json(origin_metadata or {}),
             ),
-            state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
+            state=CronJobState(
+                next_run_at_ms=_compute_next_run(
+                    schedule, now, default_tz=self._default_timezone
+                )
+            ),
             created_at_ms=now,
             updated_at_ms=now,
             delete_after_run=delete_after_run,
@@ -741,7 +775,11 @@ class CronService:
         """Register an internal system job (idempotent on restart)."""
         store = self._require_store()
         now = _now_ms()
-        job.state = CronJobState(next_run_at_ms=_compute_next_run(job.schedule, now))
+        job.state = CronJobState(
+            next_run_at_ms=_compute_next_run(
+                job.schedule, now, default_tz=self._default_timezone
+            )
+        )
         job.created_at_ms = now
         job.updated_at_ms = now
         store.jobs = [j for j in store.jobs if j.id != job.id]
@@ -797,7 +835,9 @@ class CronService:
                 job.updated_at_ms = _now_ms()
                 self._enforce_agent_binding(job)
                 if job.enabled:
-                    job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+                    job.state.next_run_at_ms = _compute_next_run(
+                job.schedule, _now_ms(), default_tz=self._default_timezone
+            )
                 else:
                     job.state.next_run_at_ms = None
                 if self._should_persist_store():
@@ -852,7 +892,9 @@ class CronService:
 
         job.updated_at_ms = _now_ms()
         if job.enabled:
-            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+            job.state.next_run_at_ms = _compute_next_run(
+                job.schedule, _now_ms(), default_tz=self._default_timezone
+            )
         else:
             job.state.next_run_at_ms = None
 

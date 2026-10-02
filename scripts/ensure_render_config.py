@@ -7,6 +7,14 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, TypeGuard
+from zoneinfo import ZoneInfo
+
+#: Zone a wall-clock value is read in when nothing else names one. Kept local
+#: (rather than imported from ``nanobot.config.timezone``) because this script
+#: runs standalone from the entrypoint, before the package is importable.
+_DEPLOYMENT_TIMEZONE = (
+    os.environ.get("NANOBOT_DEFAULT_TIMEZONE") or ""
+).strip() or "Africa/Lagos"
 
 _DEFAULT_MAX_TOOL_ITERATIONS = 120
 _LEGACY_DEFAULT_MAX_TOOL_ITERATIONS = 80
@@ -496,6 +504,58 @@ def _ensure_image_generation_defaults(data: dict[str, Any]) -> bool:
     return changed
 
 
+def _ensure_deployment_timezone(data: dict[str, Any]) -> bool:
+    """Pin the deployment to one zone so schedules are never read as UTC.
+
+    A stored cron expression is wall-clock time plus a zone. The container
+    reports UTC while the owner works at UTC+1 (West Africa Time), so every
+    schedule without an explicit zone — and every one stamped with the old
+    hard-coded ``UTC`` default — fired an hour late. Which zone the deployment
+    means is not something the image can detect, so it is pinned here on every
+    boot, with ``timezoneMode: manual`` so the config loader's auto-detect
+    cannot quietly overwrite it on the next load.
+
+    This runs on every boot but only writes when the value actually differs, so
+    it is idempotent. ``NANOBOT_DEFAULT_TIMEZONE`` relocates the deployment;
+    an unparseable value is ignored rather than written.
+    """
+    agents = data.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        return False
+    defaults = agents.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        return False
+
+    try:
+        ZoneInfo(_DEPLOYMENT_TIMEZONE)
+    except Exception:
+        print(
+            "[entrypoint] timezone: ignoring unknown NANOBOT_DEFAULT_TIMEZONE"
+            f" {_DEPLOYMENT_TIMEZONE!r}"
+        )
+        return False
+
+    changed = False
+    current = defaults.get("timezone")
+    current_text = current.strip() if isinstance(current, str) else ""
+    if current_text != _DEPLOYMENT_TIMEZONE:
+        defaults["timezone"] = _DEPLOYMENT_TIMEZONE
+        changed = True
+        print(
+            "[entrypoint] timezone: "
+            f"{current_text or 'unset'} -> {_DEPLOYMENT_TIMEZONE} (schedules read in this zone)"
+        )
+    mode = defaults.get("timezoneMode", defaults.get("timezone_mode"))
+    if mode != "manual" or defaults.get("timezoneMode") != "manual":
+        defaults["timezoneMode"] = "manual"
+        changed = True
+    if "timezone_mode" in defaults:
+        # Keep one spelling, so nothing later has to guess which one wins.
+        defaults.pop("timezone_mode", None)
+        changed = True
+    return changed
+
+
 def ensure_render_defaults(config_path: Path) -> bool:
     """Apply attachment and deliberate-execution defaults without clobbering config."""
     data = _load_config(config_path)
@@ -511,6 +571,7 @@ def ensure_render_defaults(config_path: Path) -> bool:
     changed = _ensure_high_context_defaults(data) or changed
     changed = _ensure_subagent_concurrency_cap(data) or changed
     changed = _ensure_execution_backend_selection(data) or changed
+    changed = _ensure_deployment_timezone(data) or changed
     return _write_config(config_path, data) if changed else False
 
 

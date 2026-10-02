@@ -2457,7 +2457,11 @@ def _validate_automation_schedule(schedule: CronSchedule) -> str | None:
 
         from croniter import croniter
 
-        tz = ZoneInfo(schedule.tz) if schedule.tz else datetime.now().astimezone().tzinfo
+        from nanobot.config.timezone import DEFAULT_TIMEZONE
+
+        # Validate against the zone the job will actually be read in: its own,
+        # or the deployment default. The container's zone is neither.
+        tz = ZoneInfo(schedule.tz or DEFAULT_TIMEZONE)
         base = datetime.now(tz=tz)
         croniter(cast(str, schedule.expr), base).get_next(datetime)
     except Exception:

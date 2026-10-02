@@ -869,9 +869,15 @@ export function AutomationEditDialog({
                     <Input
                       value={draft.tz}
                       onChange={(event) => setDraft((prev) => ({ ...prev, tz: event.target.value }))}
-                      placeholder="Asia/Shanghai"
+                      placeholder="Africa/Lagos"
                       className="text-[13px]"
                     />
+                    <span className="text-[11px] text-muted-foreground">
+                      {tx(
+                        "settings.automations.fields.timezoneHint",
+                        "Leave blank to use the server timezone (Africa/Lagos, UTC+1).",
+                      )}
+                    </span>
                   </label>
                 </div>
               ) : null}
