@@ -41,7 +41,12 @@ def test_webui_session_list_reuses_valid_index_without_scanning_files(
     assert list_webui_sessions(manager)[0]["preview"] == "indexed preview"
     assert list_webui_sessions(manager)[0]["model_preset"] == "fast"
 
-    def fail_scan(session_manager: SessionManager, path: Path, webui_dir: Path) -> None:
+    def fail_scan(
+        session_manager: SessionManager,
+        path: Path,
+        webui_dir: Path,
+        activity_index=None,
+    ) -> None:
         raise AssertionError(f"unexpected session file scan: {path}")
 
     monkeypatch.setattr(session_list_index, "_scan_session_row", fail_scan)
@@ -284,9 +289,10 @@ def test_webui_session_list_rescans_only_changed_file(tmp_path: Path, monkeypatc
         session_manager: SessionManager,
         path: Path,
         webui_dir: Path,
+        activity_index=None,
     ) -> dict | None:
         scanned.append(path.name)
-        return original_scan(session_manager, path, webui_dir)
+        return original_scan(session_manager, path, webui_dir, activity_index)
 
     monkeypatch.setattr(session_list_index, "_scan_session_row", record_scan)
 
@@ -724,9 +730,10 @@ def test_webui_session_list_rescans_when_transcript_changes(
         session_manager: SessionManager,
         path: Path,
         webui_dir: Path,
+        activity_index=None,
     ) -> dict | None:
         scanned.append(path.name)
-        return original_scan(session_manager, path, webui_dir)
+        return original_scan(session_manager, path, webui_dir, activity_index)
 
     monkeypatch.setattr(session_list_index, "_scan_session_row", record_scan)
 

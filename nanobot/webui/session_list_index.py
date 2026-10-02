@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 from datetime import datetime
+from stat import S_ISREG
 from pathlib import Path
 from typing import Any, cast
 
@@ -88,6 +89,9 @@ def _reconcile_index(session_manager: SessionManager) -> tuple[list[dict[str, An
         and isinstance(row.get("file"), str)
     }
     webui_dir = get_webui_dir()
+    # One directory read for the whole reconcile: every chat's activity is
+    # answered from this instead of re-stat'ing three paths per chat.
+    activity_index = _WebuiActivityIndex(webui_dir)
     session_paths: dict[str, Path] = {}
     for path in sorted(session_manager.sessions_dir.glob("*.jsonl")):
         key = SessionManager._session_key_from_path(path)  # pyright: ignore[reportPrivateUsage]
@@ -106,13 +110,17 @@ def _reconcile_index(session_manager: SessionManager) -> tuple[list[dict[str, An
     for key, path in sorted(session_paths.items()):
         identity = (_SESSION_SOURCE, path.name)
         row = existing_by_source.get(identity)
-        if row is not None and _indexed_row_matches_file(row, path, webui_dir):
+        if row is not None and _indexed_row_matches_file(
+            row, path, webui_dir, activity_index
+        ):
             rows.append(row)
             expected_sources.add(identity)
             continue
 
         changed = True
-        scanned = _scan_session_row(session_manager, path, webui_dir)
+        scanned = _scan_session_row(
+            session_manager, path, webui_dir, activity_index
+        )
         if scanned is not None:
             rows.append(scanned)
             expected_sources.add(identity)
@@ -132,13 +140,16 @@ def _reconcile_index(session_manager: SessionManager) -> tuple[list[dict[str, An
             row,
             key,
             webui_dir,
+            activity_index,
         ):
             rows.append(row)
             expected_sources.add(identity)
             continue
 
         changed = True
-        scanned = _scan_transcript_row(key, stem, paths, webui_dir)
+        scanned = _scan_transcript_row(
+            key, stem, paths, webui_dir, activity_index
+        )
         scanned_key = scanned.get("key") if scanned is not None else None
         if scanned is not None and scanned_key not in session_paths:
             rows.append(scanned)
@@ -194,7 +205,12 @@ def _file_signature(path: Path) -> dict[str, int]:
     return {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
 
 
-def _indexed_row_matches_file(row: dict[str, Any], path: Path, webui_dir: Path) -> bool:
+def _indexed_row_matches_file(
+    row: dict[str, Any],
+    path: Path,
+    webui_dir: Path,
+    activity_index: _WebuiActivityIndex | None = None,
+) -> bool:
     if not all(isinstance(row.get(key), str) for key in ("key", "created_at", "updated_at")):
         return False
     if not isinstance(row.get("title", ""), str) or not isinstance(row.get("preview", ""), str):
@@ -207,7 +223,9 @@ def _indexed_row_matches_file(row: dict[str, Any], path: Path, webui_dir: Path) 
         signature = _file_signature(path)
     except OSError:
         return False
-    activity_signature = _webui_activity_signature(str(row.get("key")), webui_dir)
+    activity_signature = _webui_activity_signature(
+        str(row.get("key")), webui_dir, activity_index
+    )
     return (
         row.get("mtime_ns") == signature["mtime_ns"]
         and row.get("size") == signature["size"]
@@ -221,6 +239,7 @@ def _indexed_transcript_row_matches(
     row: dict[str, Any],
     session_key: str,
     webui_dir: Path,
+    activity_index: _WebuiActivityIndex | None = None,
 ) -> bool:
     if not all(isinstance(row.get(key), str) for key in ("key", "created_at", "updated_at")):
         return False
@@ -232,7 +251,7 @@ def _indexed_transcript_row_matches(
         return False
     if not isinstance(row.get(_WORKSPACE_SCOPE_PRESENT_FIELD), bool):
         return False
-    signature = _webui_activity_signature(session_key, webui_dir)
+    signature = _webui_activity_signature(session_key, webui_dir, activity_index)
     return (
         row.get(_WEBUI_ACTIVITY_MTIME_NS) == signature[_WEBUI_ACTIVITY_MTIME_NS]
         and row.get(_WEBUI_ACTIVITY_SIZE) == signature[_WEBUI_ACTIVITY_SIZE]
@@ -413,7 +432,133 @@ def _webui_activity_paths(session_key: str, webui_dir: Path) -> list[Path]:
     return paths
 
 
-def _webui_activity_signature(session_key: str, webui_dir: Path) -> dict[str, int]:
+class _WebuiActivityIndex:
+    """Activity signatures for every chat under one webui directory.
+
+    [_FIX 2026-10-02] The sidebar read was the thing replacing the container
+    underneath a user mid-task, and the cost was here. ``_webui_activity_signature``
+    resolves up to three paths per chat, calls ``stat`` then ``is_file`` on each
+    (two metadata operations apiece), and does a full ``readdir`` of the chat's
+    ``.segments`` directory -- roughly seven metadata operations per chat, run
+    once per chat while the caller holds the session file lock. Production has
+    506 chats and a persistent volume, and the route cost the loop 4-23 s: the
+    log shows ``/api/sessions`` at 18308 ms, then 20727 ms, then 23401 ms.
+
+    One ``os.scandir`` of ``webui_dir`` returns every candidate name and, from
+    ``d_type``, whether it is a directory, so the per-chat lookups collapse to a
+    dict hit plus one ``stat`` for each file that actually exists. The stat is
+    deferred and cached on the ``DirEntry``, so a chat with no webui files costs
+    nothing at all.
+
+    Semantics are the ones the old path-by-path code had, deliberately: the two
+    top-level names are counted when ``stat`` follows through to a regular file
+    (a symlink to a regular file still counts), and a ``.segments`` directory
+    contributes only its non-symlink regular-file children.
+    """
+
+    __slots__ = ("_candidates", "_segments", "_segment_stats")
+
+    def __init__(self, webui_dir: Path) -> None:
+        self._candidates: dict[str, list[os.DirEntry[str]]] = {}
+        #: stem -> the chat's ``.segments`` directory, when one exists.
+        self._segments: dict[str, str] = {}
+        #: stem -> (mtime_ns, size) for each of its segment files, filled on
+        #: first use and reused, so one reconcile reads the disk once.
+        self._segment_stats: dict[str, list[tuple[int, int]]] = {}
+        try:
+            with os.scandir(webui_dir) as entries:
+                for entry in entries:
+                    name = entry.name
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if name.endswith(_TRANSCRIPT_SEGMENTS_SUFFIX):
+                                self._segments[
+                                    name[: -len(_TRANSCRIPT_SEGMENTS_SUFFIX)]
+                                ] = entry.path
+                            continue
+                    except OSError:
+                        continue
+                    for suffix in (".jsonl", ".json"):
+                        if name.endswith(suffix):
+                            self._candidates.setdefault(
+                                name[: -len(suffix)], []
+                            ).append(entry)
+                            break
+        except OSError:
+            # An unreadable directory degrades to "no activity", which is what
+            # the per-path code produced when every ``stat`` failed.
+            return
+
+    def _segment_stats_for(self, stem: str) -> list[tuple[int, int]]:
+        cached = self._segment_stats.get(stem)
+        if cached is not None:
+            return cached
+        results: list[tuple[int, int]] = []
+        directory = self._segments.get(stem)
+        if directory is not None:
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        try:
+                            result = entry.stat()
+                        except OSError:
+                            continue
+                        results.append((result.st_mtime_ns, result.st_size))
+            except OSError:
+                results = []
+        results.sort()
+        self._segment_stats[stem] = results
+        return results
+
+    def signature(self, session_key: str) -> dict[str, int]:
+        """Return one chat's signature as of this index's directory read.
+
+        Every lookup is served from the single ``os.scandir`` taken in
+        ``__init__`` plus one stat per file that exists -- and the segment
+        directory is walked once, on the first lookup that needs it. Repeated
+        lookups inside one reconcile therefore touch the disk not at all, which
+        is what makes one reconcile pass a consistent snapshot.
+        """
+        stem = SessionManager.safe_key(session_key)
+        latest_mtime_ns = 0
+        total_size = 0
+        file_count = 0
+        for entry in self._candidates.get(stem, ()):
+            try:
+                result = entry.stat()
+            except OSError:
+                continue
+            if not S_ISREG(result.st_mode):
+                continue
+            file_count += 1
+            latest_mtime_ns = max(latest_mtime_ns, result.st_mtime_ns)
+            total_size += result.st_size
+        for mtime_ns, size in self._segment_stats_for(stem):
+            file_count += 1
+            latest_mtime_ns = max(latest_mtime_ns, mtime_ns)
+            total_size += size
+        return {
+            _WEBUI_ACTIVITY_MTIME_NS: latest_mtime_ns,
+            _WEBUI_ACTIVITY_SIZE: total_size,
+            _WEBUI_ACTIVITY_FILES: file_count,
+        }
+
+
+def _webui_activity_signature(
+    session_key: str,
+    webui_dir: Path,
+    index: _WebuiActivityIndex | None = None,
+) -> dict[str, int]:
+    """Return one chat's activity signature.
+
+    ``index`` is the prebuilt directory-wide view. Pass it whenever more than a
+    single chat is being examined; building it costs one ``os.scandir``, and
+    rebuilding the answer per chat is what made the sidebar read multi-second.
+    """
+    if index is not None:
+        return index.signature(session_key)
     latest_mtime_ns = 0
     total_size = 0
     file_count = 0
@@ -482,9 +627,16 @@ def _visible_activity_updated_at(
     return _latest_updated_at(visible_message_at, webui_activity) or stored
 
 
-def _indexed_row_for_session(session: Session, path: Path, webui_dir: Path) -> dict[str, Any]:
+def _indexed_row_for_session(
+    session: Session,
+    path: Path,
+    webui_dir: Path,
+    activity_index: _WebuiActivityIndex | None = None,
+) -> dict[str, Any]:
     signature = _file_signature(path)
-    activity_signature = _webui_activity_signature(session.key, webui_dir)
+    activity_signature = _webui_activity_signature(
+        session.key, webui_dir, activity_index
+    )
     activity_updated_at = _webui_activity_updated_at(activity_signature)
     visible_message_at = _last_visible_message_at(session.messages)
     owner_raw = session.metadata.get(WEBUI_SESSION_OWNER_KEY)
@@ -546,9 +698,10 @@ def _scan_transcript_row(
     stem: str,
     paths: tuple[Path, ...],
     webui_dir: Path,
+    activity_index: _WebuiActivityIndex | None = None,
 ) -> dict[str, Any] | None:
     path_key = session_key or f"websocket:{stem.removeprefix(_WEBUI_SESSION_STEM_PREFIX)}"
-    signature = _webui_activity_signature(path_key, webui_dir)
+    signature = _webui_activity_signature(path_key, webui_dir, activity_index)
     activity_updated_at = _webui_activity_updated_at(signature)
     if activity_updated_at is None:
         return None
@@ -629,6 +782,7 @@ def _scan_session_row(
     session_manager: SessionManager,
     path: Path,
     webui_dir: Path,
+    activity_index: _WebuiActivityIndex | None = None,
 ) -> dict[str, Any] | None:
     storage_key = SessionManager._session_key_from_path(path)  # pyright: ignore[reportPrivateUsage]
     if storage_key is None:
@@ -689,7 +843,9 @@ def _scan_session_row(
                 updated_at_s = updated_at_s or fallback_time
             key = data.get("key") or storage_key
             metadata = data.get("metadata", {})
-            activity_signature = _webui_activity_signature(key, webui_dir)
+            activity_signature = _webui_activity_signature(
+                key, webui_dir, activity_index
+            )
             activity_updated_at = _webui_activity_updated_at(activity_signature)
             if not isinstance(metadata, dict):
                 metadata = {}
@@ -717,4 +873,4 @@ def _scan_session_row(
         repaired = session_manager._repair(storage_key)  # pyright: ignore[reportPrivateUsage]
         if repaired is None:
             return None
-        return _indexed_row_for_session(repaired, path, webui_dir)
+        return _indexed_row_for_session(repaired, path, webui_dir, activity_index)

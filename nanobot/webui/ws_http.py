@@ -473,6 +473,13 @@ class GatewayHTTPHandler:
         # list. See ``_sessions_list_payload_cached`` for why.
         self._sessions_list_lock = asyncio.Lock()
         self._sessions_list_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        # Owners whose background refresh is in flight, so a poll tick starts
+        # at most one scan and never a second while the first is still running.
+        self._sessions_list_refreshing: set[str] = set()
+        # Strong references to those refresh tasks: asyncio keeps only a weak
+        # reference to a running task, so an un-referenced one can be collected
+        # mid-flight.
+        self._sessions_list_refresh_tasks: set[asyncio.Task[None]] = set()
         self.cron_service = cron_service
         self.local_trigger_store = local_trigger_store
         self.cron_pending_job_ids = cron_pending_job_ids
@@ -1216,17 +1223,9 @@ class GatewayHTTPHandler:
             accept_encoding=_combined_list_header(request.headers, "Accept-Encoding"),
         )
 
-    #: How long one computed sidebar list is reused, in seconds.
-    #:
-    #: Every open WebUI polls this endpoint, and the work behind it stats the
-    #: persistent volume once per chat (506 chats in production) while holding
-    #: the session file lock. So N clients on a poll tick produced N identical
-    #: multi-second scans that serialized behind that lock and then completed
-    #: together -- the production log shows one client's ``/api/sessions``
-    #: taking 23401 ms and finishing in the same millisecond as the model
-    #: reply. Two seconds collapses a burst into a single scan and is far
-    #: below the interval at which the sidebar can be seen to lag; live
-    #: changes still arrive immediately on the ``session_updated`` event.
+    #: How stale a cached sidebar list is allowed to get before a refresh is
+    #: started, in seconds. It is a *refresh cadence*, not a gate a request
+    #: waits behind -- see ``_sessions_list_payload_cached``.
     _SESSIONS_LIST_TTL_S = 2.0
 
     #: Cap on cached per-owner payloads. Multi-user deployments cache one row
@@ -1236,33 +1235,78 @@ class GatewayHTTPHandler:
     async def _sessions_list_payload_cached(
         self, owner_user_id: str
     ) -> dict[str, Any]:
-        """Return the sidebar payload, reusing a very recent scan.
+        """Return the sidebar payload without ever waiting on a volume scan.
 
-        The expensive part is not the JSON: it is touching the volume once per
-        chat. Paying that per *request* rather than per *interval* is what
-        starved the event loop, and a starved loop cannot answer the
-        platform's liveness probe -- which is what replaces the container and
-        gives the user a 503 while it boots.
+        [_FIX 2026-10-02] This route was the thing that got the container
+        replaced underneath a user mid-task, and it is not the JSON that costs:
+        it is touching the persistent volume once per chat while holding the
+        session file lock. Production has 506 chats, and the log shows the
+        route at 16867 ms, then 18308 ms, then 20727 ms, then 23401 ms -- each
+        one finishing in the same millisecond as a SIGTERM. A WebUI poll tick
+        must not be able to stall the process for twenty seconds.
+
+        So a request never runs the scan. Once a payload exists it is returned
+        immediately, however old it is, and a refresh is started in the
+        background if it has gone past ``_SESSIONS_LIST_TTL_S``. The sidebar
+        stays live through the ``session_updated`` push event, which is what
+        carries an in-progress turn's changes; the polled list is the backstop
+        for changes this process did not make.
+
+        The one unavoidable synchronous scan is the first request for an owner
+        after boot, because there is nothing to serve. That one is single
+        flighted, so a burst of clients arriving together still pays for a
+        single scan and the rest wait for it rather than each starting their
+        own.
         """
         cached = self._sessions_list_cache.get(owner_user_id)
-        if cached is not None and (time.monotonic() - cached[0]) < self._SESSIONS_LIST_TTL_S:
+        if cached is not None:
+            if (time.monotonic() - cached[0]) >= self._SESSIONS_LIST_TTL_S:
+                self._start_sessions_list_refresh(owner_user_id)
             return cached[1]
-        # Single flight: the first caller scans, every other caller waits on
-        # the same lock and then finds the fresh value above rather than
-        # starting a second scan of the same files.
         async with self._sessions_list_lock:
             cached = self._sessions_list_cache.get(owner_user_id)
-            if cached is not None and (
-                time.monotonic() - cached[0]
-            ) < self._SESSIONS_LIST_TTL_S:
+            if cached is not None:
                 return cached[1]
             payload = await asyncio.to_thread(
                 self._sessions_list_payload, owner_user_id
             )
-            if len(self._sessions_list_cache) >= self._SESSIONS_LIST_CACHE_MAX_OWNERS:
-                self._sessions_list_cache.clear()
-            self._sessions_list_cache[owner_user_id] = (time.monotonic(), payload)
+            self._store_sessions_list_payload(owner_user_id, payload)
             return payload
+
+    def _store_sessions_list_payload(
+        self, owner_user_id: str, payload: dict[str, Any]
+    ) -> None:
+        if (
+            owner_user_id not in self._sessions_list_cache
+            and len(self._sessions_list_cache) >= self._SESSIONS_LIST_CACHE_MAX_OWNERS
+        ):
+            self._sessions_list_cache.clear()
+        self._sessions_list_cache[owner_user_id] = (time.monotonic(), payload)
+
+    def _start_sessions_list_refresh(self, owner_user_id: str) -> None:
+        """Recompute one owner's sidebar payload without blocking a response."""
+        if owner_user_id in self._sessions_list_refreshing:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - no loop means no request either
+            return
+        self._sessions_list_refreshing.add(owner_user_id)
+        task = loop.create_task(self._refresh_sessions_list(owner_user_id))
+        self._sessions_list_refresh_tasks.add(task)
+        task.add_done_callback(self._sessions_list_refresh_tasks.discard)
+
+    async def _refresh_sessions_list(self, owner_user_id: str) -> None:
+        try:
+            async with self._sessions_list_lock:
+                payload = await asyncio.to_thread(
+                    self._sessions_list_payload, owner_user_id
+                )
+                self._store_sessions_list_payload(owner_user_id, payload)
+        except Exception as e:  # pragma: no cover - a refresh must not break polling
+            self._log.debug("Sidebar list refresh failed for {}: {}", owner_user_id, e)
+        finally:
+            self._sessions_list_refreshing.discard(owner_user_id)
 
     def _sessions_list_payload(self, owner_user_id: str = "") -> dict[str, Any]:
         assert self.session_manager is not None
