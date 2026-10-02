@@ -70,9 +70,14 @@ MEMORY_CRITICAL_RATIO = 0.92
 #: cgroup -- heap *plus* page cache. Measured in production: a gateway graded
 #: ``pressure=ok pct=65.7`` was replaced the same second at ``cgroup_mb=456.7``
 #: of a 488.3 MiB limit (93.5%). The guard never saw it coming because it was
-#: reading the other number. This threshold sits below the steady state the
-#: same deployment showed after the restart (idle charge 79-85%), so it fires
-#: on a genuine climb and stays quiet on a healthy container.
+#: reading the other number.
+#:
+#: Expect this to trip on a freshly booted container too, and that is correct
+#: rather than a false alarm: a replacement container reads its own image into
+#: page cache and charges ~92% of the limit before it has served anything (the
+#: kernel hands that back within a minute -- a later idle reclaim on the same
+#: process measured 46.7%). Tripping there costs one collection, which is the
+#: same thing ``idle_reclaim`` would have done a moment later anyway.
 MEMORY_CHARGE_WARN_RATIO = 0.85
 
 _CGROUP_V2 = Path("/sys/fs/cgroup")
