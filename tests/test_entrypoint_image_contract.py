@@ -15,7 +15,10 @@ matching COPY line.
 """
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,3 +66,81 @@ def test_cron_store_audit_uses_the_venv_python() -> None:
     text = ENTRYPOINT.read_text(encoding="utf-8")
     assert "print_cron_store.py" in text
     assert "/app/.venv/bin/python3" in text
+
+
+# ---------------------------------------------------------------------------
+# The cron-store path must be resolved WITHOUT starting Python in the
+# foreground. `print_cron_store.py` imports nanobot, which on the deployment's
+# 0.2-vCPU plan cost 17.6 s of interpreter start -- all of it in front of the
+# port bind, i.e. 17.6 s of 503 on every redeploy. These two guards keep the
+# shell resolution honest: one that the application's own answer still agrees
+# with it, one that it never comes back to the foreground path.
+# ---------------------------------------------------------------------------
+
+_SHELL_RESOLUTION = """\
+dir="$HOME/.nanobot"
+CRON_STORE=""
+if [ -n "${POWERX_DATA_DIR:-}" ]; then
+    CRON_STORE="$POWERX_DATA_DIR/cron/jobs.json"
+elif [ -d /data ] && [ -w /data ]; then
+    CRON_STORE="/data/powerx/cron/jobs.json"
+else
+    CRON_STORE="$dir/persistent/cron/jobs.json"
+fi
+printf '%s' "$CRON_STORE"
+"""
+
+
+def test_shell_cron_store_resolution_matches_the_application(tmp_path: Path) -> None:
+    """The shell branch and nanobot's own resolver must give the same path.
+
+    Duplicating the resolution in shell is only safe while the two agree, so
+    this executes both against one environment and compares.
+    """
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    env.pop("POWERX_DATA_DIR", None)
+
+    shell = subprocess.run(
+        ["sh", "-c", _SHELL_RESOLUTION], capture_output=True, text=True, env=env, timeout=60
+    )
+    assert shell.returncode == 0, shell.stderr
+    assert shell.stdout.strip(), "the shell resolution produced nothing"
+
+    py = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from nanobot.config.paths import get_cron_store_path;"
+            "print(get_cron_store_path())",
+        ],
+        capture_output=True,
+        text=True,
+        env={**env, "PYTHONPATH": str(ROOT)},
+        cwd=str(ROOT),
+        timeout=180,
+    )
+    assert py.returncode == 0, py.stderr[-2000:]
+    assert shell.stdout.strip() == py.stdout.strip()
+
+
+def test_entrypoint_does_not_start_python_for_the_cron_store() -> None:
+    """The foreground path resolves the store in shell; the audit is backgrounded.
+
+    `print_cron_store.py` must still be *called* (the durability audit depends
+    on the application's answer), but only after the privilege drop and only in
+    the background, so it can never sit in front of the port bind again.
+    """
+    text = ENTRYPOINT.read_text(encoding="utf-8")
+    assert 'CRON_STORE=$(' not in text, (
+        "entrypoint.sh captures the cron store from a command substitution again -- "
+        "that is the interpreter start that cost 17.6 s of boot"
+    )
+    marker = "/app/scripts/print_cron_store.py"
+    audit = text.index(marker)
+    assert audit > text.index("CRON_STORE="), (
+        "the audit must compare against the shell-resolved path, so it belongs after it"
+    )
+    # Every call site must sit inside a backgrounded subshell, so the audit can
+    # never hold up the exec of the gateway.
+    assert ") &" in text[audit:], "the cron-store audit must be backgrounded"

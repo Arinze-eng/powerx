@@ -55,13 +55,29 @@ fi
 # So: print the resolved path, print whether the volume really backs it, and
 # warn loudly when the two disagree.
 # ---------------------------------------------------------------------------
+# [FIX 2026-10-02] The path is resolved in SHELL, not by starting Python.
+#
+# This used to call print_cron_store.py, which imports nanobot -- a whole
+# interpreter start on the deployment's 0.2-vCPU plan. Measured in the
+# production log it cost 17.6 s, and every one of those seconds sat in front of
+# the port bind, so it was 17.6 s of the 503 the user saw on every redeploy and
+# every container replacement. The resolution below is the same three branches
+# `nanobot.config.paths.get_persistent_data_dir` uses (mirrored in
+# scripts/migrate_cron_timezone.py:default_store_path). The application's own
+# answer is still checked against it -- in the background, after the port is up
+# (see the audit near the privilege drop). Boot no longer waits on Python to
+# learn one path.
 CRON_STORE=""
-for _py in /app/.venv/bin/python3 python3; do
-    if [ -f /app/scripts/print_cron_store.py ] && command -v "$_py" >/dev/null 2>&1; then
-        CRON_STORE=$("$_py" /app/scripts/print_cron_store.py 2>/dev/null || true)
-        [ -n "$CRON_STORE" ] && break
-    fi
-done
+if [ -n "${POWERX_DATA_DIR:-}" ]; then
+    CRON_STORE="$POWERX_DATA_DIR/cron/jobs.json"
+elif [ -d /data ] && [ -w /data ]; then
+    CRON_STORE="/data/powerx/cron/jobs.json"
+else
+    CRON_STORE="$dir/persistent/cron/jobs.json"
+fi
+# print_cron_store.py used to create this directory as a side effect; make sure
+# the mount check below sees a real path on a first boot too.
+mkdir -p "$(dirname "$CRON_STORE")" 2>/dev/null || true
 if [ -n "$CRON_STORE" ]; then
     echo "[entrypoint] cron store: $CRON_STORE"
     CRON_DIR=$(dirname "$CRON_STORE")
@@ -235,6 +251,18 @@ if [ "$(id -u)" = "0" ]; then
             NANOBOT_DATA_DIR="$dir" /app/.venv/bin/python3 \
             /app/scripts/backfill_chat_owners.py --apply &
     fi
+    # Cron-store audit: ask nanobot where it will actually keep cron and warn if
+    # that disagrees with the shell resolution above. Backgrounded -- the port must
+    # never wait on an interpreter start to print a diagnostic.
+    if [ -f /app/scripts/print_cron_store.py ]; then
+        (
+            _app_store=$(/app/.venv/bin/python3 /app/scripts/print_cron_store.py 2>/dev/null || true)
+            if [ -n "$_app_store" ] && [ "$_app_store" != "$CRON_STORE" ]; then
+                echo "[entrypoint] WARNING: entrypoint resolved cron store $CRON_STORE but" \
+                     "nanobot resolves $_app_store -- check POWERX_DATA_DIR" >&2
+            fi
+        ) &
+    fi
     if setpriv --reuid=nanobot --regid=nanobot --init-groups true 2>/dev/null; then
         echo "[entrypoint] dropping privileges to nanobot via setpriv"
         exec setpriv --reuid=nanobot --regid=nanobot --init-groups /app/scripts/nanobot_launcher.sh "$@"
@@ -277,6 +305,19 @@ fi
 if [ -f /app/scripts/backfill_chat_owners.py ]; then
     NANOBOT_DATA_DIR="$dir" /app/.venv/bin/python3 \
         /app/scripts/backfill_chat_owners.py --apply &
+fi
+
+# Cron-store audit: ask nanobot where it will actually keep cron and warn if
+# that disagrees with the shell resolution above. Backgrounded -- the port must
+# never wait on an interpreter start to print a diagnostic.
+if [ -f /app/scripts/print_cron_store.py ]; then
+    (
+        _app_store=$(/app/.venv/bin/python3 /app/scripts/print_cron_store.py 2>/dev/null || true)
+        if [ -n "$_app_store" ] && [ "$_app_store" != "$CRON_STORE" ]; then
+            echo "[entrypoint] WARNING: entrypoint resolved cron store $CRON_STORE but" \
+                 "nanobot resolves $_app_store -- check POWERX_DATA_DIR" >&2
+        fi
+    ) &
 fi
 
 exec /app/scripts/nanobot_launcher.sh "$@"
