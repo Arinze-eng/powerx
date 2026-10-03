@@ -45,15 +45,13 @@ SESSION_CACHE_MAX_SIZE = 128
 MIN_COMPACTED_REPLAY_MESSAGES = 8
 _MESSAGE_TIME_PREFIX_RE = re.compile(r"^\[Message Time: [^\]]+\]\n?")
 _LOCAL_IMAGE_BREADCRUMB_RE = re.compile(r"^\[image: (?:/|~)[^\]]+\]\s*$")
-_TOOL_CALL_ECHO_RE = re.compile(r'^\s*(?:generate_image|message)\([^)]*\)\s*$')
+_TOOL_CALL_ECHO_RE = re.compile(r"^\s*(?:generate_image|message)\([^)]*\)\s*$")
 _SESSION_PREVIEW_MAX_CHARS = 120
 _SESSION_LIST_PREVIEW_MAX_RECORDS = 200
 _SESSION_LIST_PREVIEW_MAX_CHARS = 1_000_000
 _SESSION_DATA_ERRORS = (ValueError, TypeError, AttributeError, KeyError)
 _PROVIDER_STATE_RECORD_TYPE = "provider_state"
-_PROVIDER_STATE_RECORD_PREFIX_RE = re.compile(
-    r'^\s*\{\s*"_type"\s*:\s*"provider_state"\s*(?:,|\})'
-)
+_PROVIDER_STATE_RECORD_PREFIX_RE = re.compile(r'^\s*\{\s*"_type"\s*:\s*"provider_state"\s*(?:,|\})')
 _FORK_VOLATILE_METADATA_KEYS = {
     "goal_state",
     "pending_user_turn",
@@ -99,8 +97,7 @@ def _sanitize_assistant_replay_text(content: str) -> str:
     lines = [
         line
         for line in content.splitlines()
-        if not _LOCAL_IMAGE_BREADCRUMB_RE.match(line)
-        and not _TOOL_CALL_ECHO_RE.match(line)
+        if not _LOCAL_IMAGE_BREADCRUMB_RE.match(line) and not _TOOL_CALL_ECHO_RE.match(line)
     ]
     return "\n".join(lines).strip()
 
@@ -108,8 +105,7 @@ def _sanitize_assistant_replay_text(content: str) -> str:
 def _strip_local_image_breadcrumbs(content: str) -> str:
     """Remove stale local-image references from replayed Telegram turns."""
     return "\n".join(
-        line for line in content.splitlines()
-        if not _LOCAL_IMAGE_BREADCRUMB_RE.match(line)
+        line for line in content.splitlines() if not _LOCAL_IMAGE_BREADCRUMB_RE.match(line)
     ).strip()
 
 
@@ -202,12 +198,7 @@ class Session:
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
-        msg = {
-            "role": role,
-            "content": content,
-            "timestamp": datetime.now().isoformat(),
-            **kwargs
-        }
+        msg = {"role": role, "content": content, "timestamp": datetime.now().isoformat(), **kwargs}
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
@@ -277,18 +268,14 @@ class Session:
                 dict,
             )
             if not include_runtime_context:
-                had_marker = isinstance(
-                    message.get(RUNTIME_CONTEXT_HISTORY_META), dict
-                )
+                had_marker = isinstance(message.get(RUNTIME_CONTEXT_HISTORY_META), dict)
                 message = public_history_message(message)
                 # Belt & braces for rows without a durable marker (assistant
                 # echoes, legacy/foreign rows). Never apply to user rows that
                 # carry a real marker: their block was legitimately appended by
                 # the runtime and only belongs in provider replay.
                 if not had_marker or message.get("role") != "user":
-                    stripped_content = strip_runtime_context_from_content(
-                        message.get("content")
-                    )
+                    stripped_content = strip_runtime_context_from_content(message.get("content"))
                     if stripped_content != message.get("content"):
                         message = {**message, "content": stripped_content}
             content = message.get("content", "")
@@ -337,10 +324,18 @@ class Session:
                     breadcrumbs = "\n".join(cli_lines)
                     content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
             if role == "assistant" and isinstance(content, str) and not content.strip():
-                if not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")):
+                if not any(
+                    key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")
+                ):
                     continue
             entry: dict[str, Any] = {"role": message["role"], "content": content}
-            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
+            for key in (
+                "tool_calls",
+                "tool_call_id",
+                "name",
+                "reasoning_content",
+                "thinking_blocks",
+            ):
                 if key in message:
                     entry[key] = message[key]
             out.append(entry)
@@ -432,19 +427,22 @@ class Session:
         first_user = next((i for i, m in enumerate(retained) if m.get("role") == "user"), None)
         if first_user is not None:
             if first_user > 0 and retained[first_user - 1].get("_channel_delivery"):
-                retained = retained[first_user - 1:]
+                retained = retained[first_user - 1 :]
             else:
                 retained = retained[first_user:]
         elif not extend_to_user:
             # If the hard-capped tail is assistant/tool-only, anchor to the
             # latest user in the full session and take a capped forward window.
             latest_user = next(
-                (i for i in range(len(self.messages) - 1, -1, -1)
-                 if self.messages[i].get("role") == "user"),
+                (
+                    i
+                    for i in range(len(self.messages) - 1, -1, -1)
+                    if self.messages[i].get("role") == "user"
+                ),
                 None,
             )
             if latest_user is not None:
-                retained = self.messages[latest_user: latest_user + max_messages]
+                retained = self.messages[latest_user : latest_user + max_messages]
 
         # Mirror get_history(): avoid persisting orphan tool results at the front.
         start = find_legal_message_start(retained)
@@ -469,16 +467,12 @@ class Session:
         # dropped may include messages from *after* the consolidated prefix
         # (e.g. in the else branch).
         already_consolidated = sum(
-            1 for i, m in enumerate(original)
-            if i < before_lc and id(m) not in retained_ids
+            1 for i, m in enumerate(original) if i < before_lc and id(m) not in retained_ids
         )
 
         # New last_consolidated = count of retained messages that were inside
         # the old consolidated prefix.
-        new_lc = sum(
-            1 for i, m in enumerate(original)
-            if i < before_lc and id(m) in retained_ids
-        )
+        new_lc = sum(1 for i, m in enumerate(original) if i < before_lc and id(m) in retained_ids)
 
         self.messages = retained
         self.last_consolidated = new_lc
@@ -489,6 +483,7 @@ class Session:
             dropped=dropped,
             already_consolidated_count=already_consolidated,
         )
+
 
 class SessionPayload(TypedDict):
     key: str
@@ -1176,9 +1171,7 @@ class JsonlSessionStore:
                             else 0
                         )
                     elif record_type == _PROVIDER_STATE_RECORD_TYPE:
-                        candidate = ProviderConversationState.from_private_record(
-                            data.get("state")
-                        )
+                        candidate = ProviderConversationState.from_private_record(data.get("state"))
                         if candidate is None:
                             skipped += 1
                         else:
@@ -1357,15 +1350,9 @@ class JsonlSessionStore:
                         created_at_value = cast(object, data.get("created_at"))
                         updated_at_value = cast(object, data.get("updated_at"))
                         stored_key_value = cast(object, data.get("key"))
-                        created_at = (
-                            created_at_value if isinstance(created_at_value, str) else None
-                        )
-                        updated_at = (
-                            updated_at_value if isinstance(updated_at_value, str) else None
-                        )
-                        stored_key = (
-                            stored_key_value if isinstance(stored_key_value, str) else None
-                        )
+                        created_at = created_at_value if isinstance(created_at_value, str) else None
+                        updated_at = updated_at_value if isinstance(updated_at_value, str) else None
+                        stored_key = stored_key_value if isinstance(stored_key_value, str) else None
                     elif record_type == _PROVIDER_STATE_RECORD_TYPE:
                         continue
                     else:
@@ -1596,6 +1583,13 @@ class SessionManager:
     ):
         self.workspace = workspace
         self._jsonl_store = JsonlSessionStore(workspace, sessions_root=sessions_root)
+        if store is None:
+            # The sandbox-backed store is opt-in through NANOBOT_SESSION_STORE;
+            # importing it here (not at module scope) keeps the import graph
+            # acyclic, because that module imports this one.
+            from nanobot.session.sandbox_store import store_from_env
+
+            store = store_from_env(workspace, sessions_root=sessions_root)
         self._store: SessionStore = store if store is not None else self._jsonl_store
         self.sessions_dir = self._jsonl_store.sessions_dir
         self.legacy_sessions_dir = self._jsonl_store.legacy_sessions_dir
