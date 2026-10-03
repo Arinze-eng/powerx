@@ -68,8 +68,17 @@ from nanobot.session.manager import (
     SessionPayload,
 )
 
-#: Default directory inside the sandbox that holds the mirrored sessions.
-DEFAULT_REMOTE_ROOT = "$HOME/.nanobot/sessions"
+#: Subdirectory of the sandbox's own workspace that holds the mirrored sessions.
+DEFAULT_REMOTE_SUBDIR = ".nanobot/sessions"
+
+#: Last resort when the backend reports no workspace at all. Every backend's file
+#: API allows ``/tmp``; the others allow only their workspace, so a hardcoded
+#: ``$HOME``-style root would be refused by the path guard on every one of them.
+FALLBACK_REMOTE_ROOT = "/tmp/.nanobot/sessions"
+
+#: The native Novita SDK handle exposes no workspace attribute, but its sandbox
+#: workspace is a fixed path.
+NATIVE_WORKSPACE = "/workspace"
 
 #: Bound on how many sessions one rehydrate pass will pull. A first boot against
 #: a large history must not turn into an unbounded transfer.
@@ -134,6 +143,54 @@ class RemoteSandboxTransport:
         self._timeout = timeout
         self._ready_dirs: set[str] = set()
         self._dirs_lock = threading.Lock()
+        self._root: str | None = None
+        self._root_lock = threading.Lock()
+
+    # -- remote root -------------------------------------------------------- #
+    async def _resolve_root(self) -> str:
+        """Put the mirror inside the sandbox's *own* workspace.
+
+        Every backend's file API refuses a path outside its workspace (Freestyle
+        additionally allows ``/home/ubuntu`` and ``/tmp``; VPS requires its
+        configured ``workspace_dir``), so the root has to be derived from the
+        backend rather than assumed. ``$HOME`` is deliberately not used: it is a
+        shell expansion, and no path guard ever runs a shell.
+        """
+        from nanobot.agent.tools.workspace_bridge import resolve_remote_executor
+
+        try:
+            executor = await resolve_remote_executor()
+        except Exception:  # noqa: BLE001 - no backend is a fallback, not a failure
+            return FALLBACK_REMOTE_ROOT
+        backend = executor.backend
+        candidates: list[Any] = [
+            getattr(backend, "workspace", None),
+            getattr(getattr(backend, "config", None), "workspace_dir", None),
+            getattr(backend, "_resolved_workspace", None),
+        ]
+        if executor.native is not None:
+            candidates.append(NATIVE_WORKSPACE)
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip().startswith("/"):
+                return f"{candidate.strip().rstrip('/')}/{DEFAULT_REMOTE_SUBDIR}"
+        return FALLBACK_REMOTE_ROOT
+
+    def root(self) -> str:
+        """The resolved remote root, computed once."""
+        with self._root_lock:
+            if self._root is not None:
+                return self._root
+        resolved: str | None = None
+        try:
+            resolved = self._loop.call(self._resolve_root(), timeout=self._timeout)
+        except Exception:  # noqa: BLE001 - a failed resolve must not raise
+            resolved = None
+        with self._root_lock:
+            if self._root is None:
+                self._root = (
+                    resolved if isinstance(resolved, str) and resolved else FALLBACK_REMOTE_ROOT
+                )
+            return self._root
 
     # -- async internals --------------------------------------------------- #
     async def _ensure_parent(self, remote: str) -> None:
@@ -310,11 +367,10 @@ class SandboxSessionStore:
         # metadata line, provider state, atomic replace, fsync) stays in exactly
         # one implementation and this class only moves bytes.
         self._local = JsonlSessionStore(workspace, sessions_root=mirror_root or sessions_root)
-        self._remote_root = (
-            remote_root
-            or os.getenv("NANOBOT_SANDBOX_SESSIONS_ROOT", "").strip()
-            or DEFAULT_REMOTE_ROOT
-        )
+        # An explicit root wins; otherwise the transport derives one from the
+        # backend's workspace on first use, because every backend's path guard
+        # refuses anything outside it.
+        self._remote_root = remote_root or os.getenv("NANOBOT_SANDBOX_SESSIONS_ROOT", "").strip()
         self._transport = transport or RemoteSandboxTransport()
         self._hydrated = False
         self._lock = threading.Lock()
@@ -336,12 +392,24 @@ class SandboxSessionStore:
 
     @property
     def remote_root(self) -> str:
-        return self._remote_root
+        return self._root()
+
+    def _root(self) -> str:
+        """The remote root: explicit, from the environment, or backend-derived."""
+        if self._remote_root:
+            return self._remote_root
+        derive = getattr(self._transport, "root", None)
+        if callable(derive):
+            try:
+                return str(derive())
+            except Exception:  # noqa: BLE001 - a transport that cannot answer
+                pass
+        return FALLBACK_REMOTE_ROOT
 
     # -- remote paths ------------------------------------------------------ #
     def _remote_path(self, key: str) -> str:
         name = self._local.get_session_path(key).name
-        return f"{self._remote_root}/{name}"
+        return f"{self._root()}/{name}"
 
     # -- background worker ------------------------------------------------- #
     def _enqueue(self, op: str, key: str) -> None:
@@ -398,12 +466,13 @@ class SandboxSessionStore:
             if self._hydrated:
                 return
             self._hydrated = True
-        names = self._transport.list_remote(self._remote_root)
+        root = self._root()
+        names = self._transport.list_remote(root)
         for name in names[:MAX_HYDRATE_FILES]:
             path = self._local.sessions_dir / name
             if path.exists():
                 continue
-            self._transport.pull(f"{self._remote_root}/{name}", path)
+            self._transport.pull(f"{root}/{name}", path)
 
     # -- SessionStore protocol --------------------------------------------- #
     def load(self, key: str) -> Session | None:
@@ -466,7 +535,8 @@ __all__ = [
     "SandboxTransport",
     "RemoteSandboxTransport",
     "store_from_env",
-    "DEFAULT_REMOTE_ROOT",
+    "DEFAULT_REMOTE_SUBDIR",
+    "FALLBACK_REMOTE_ROOT",
     "MAX_HYDRATE_FILES",
     "MAX_PUSH_BYTES",
 ]

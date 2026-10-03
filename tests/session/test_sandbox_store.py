@@ -541,3 +541,95 @@ def test_manager_still_honours_an_explicit_store(tmp_path, monkeypatch) -> None:
     )
     manager = SessionManager(tmp_path / "work", sessions_root=tmp_path / "store", store=store)
     assert manager._store is store
+
+
+# -- the remote root has to live inside the backend's own workspace ---------
+
+
+class _WorkspaceBackend(_ByteWriterBackend):
+    """The shape Daytona/Freestyle/Runloop/Tenki/Upstash/Vercel expose."""
+
+    def __init__(self, workspace: str) -> None:
+        super().__init__()
+        self.workspace = workspace
+
+
+class _VPSBackend(_UploadBackend):
+    """VPS carries its workspace on the config, not on the backend."""
+
+    def __init__(self, workspace_dir: str) -> None:
+        super().__init__()
+        self.config = type("Config", (), {"workspace_dir": workspace_dir})()
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [
+        (_WorkspaceBackend("/home/ubuntu/workspace"), "/home/ubuntu/workspace/.nanobot/sessions"),
+        (_WorkspaceBackend("/home/daytona"), "/home/daytona/.nanobot/sessions"),
+        (_WorkspaceBackend("/home/user"), "/home/user/.nanobot/sessions"),
+        (_WorkspaceBackend("/home/tenki"), "/home/tenki/.nanobot/sessions"),
+        (_WorkspaceBackend("/workspace/home"), "/workspace/home/.nanobot/sessions"),
+        (_WorkspaceBackend("/vercel/sandbox"), "/vercel/sandbox/.nanobot/sessions"),
+        (_VPSBackend("/workspace"), "/workspace/.nanobot/sessions"),
+    ],
+)
+def test_the_root_is_derived_from_the_backend_workspace(bridge, backend, expected) -> None:
+    bridge["executor"] = _executor(backend=backend)
+    assert _transport().root() == expected
+
+
+def test_the_root_uses_the_native_sandbox_workspace(bridge) -> None:
+    bridge["executor"] = _executor(native=_NativeSandbox())
+    assert _transport().root() == "/workspace/.nanobot/sessions"
+
+
+def test_the_root_never_leans_on_a_shell_expansion(bridge) -> None:
+    """``$HOME`` is a shell expansion and no path guard ever runs a shell."""
+    bridge["executor"] = _executor(backend=_WorkspaceBackend("/home/ubuntu/workspace"))
+    assert "$" not in _transport().root()
+
+
+def test_the_root_falls_back_when_no_backend_is_configured(bridge) -> None:
+    from nanobot.agent.tools.workspace_bridge import RemoteExecutor
+
+    bridge["executor"] = RemoteExecutor(name="unavailable")
+    assert _transport().root() == sbx.FALLBACK_REMOTE_ROOT
+
+
+async def test_push_and_remove_target_the_derived_root(tmp_path, bridge) -> None:
+    backend = _WorkspaceBackend("/home/ubuntu/workspace")
+    bridge["executor"] = _executor(backend=backend)
+    local = tmp_path / "s.jsonl"
+    local.write_bytes(b'{"_type": "metadata"}\n')
+    transport = _transport()
+
+    await transport._push(local, f"{transport.root()}/s.jsonl")
+    await transport._remove(f"{transport.root()}/s.jsonl")
+
+    assert list(backend.written) == ["/home/ubuntu/workspace/.nanobot/sessions/s.jsonl"]
+    assert bridge["commands"] == [
+        "mkdir -p /home/ubuntu/workspace/.nanobot/sessions",
+        "rm -f /home/ubuntu/workspace/.nanobot/sessions/s.jsonl",
+    ]
+
+
+def test_an_explicit_root_beats_the_backend_workspace(bridge, tmp_path) -> None:
+    bridge["executor"] = _executor(backend=_WorkspaceBackend("/home/ubuntu/workspace"))
+    made = sbx.SandboxSessionStore(
+        tmp_path / "work",
+        sessions_root=tmp_path / "store",
+        remote_root="/mnt/durable/sessions",
+        transport=FakeTransport(),
+    )
+    assert made.remote_root == "/mnt/durable/sessions"
+
+
+def test_the_store_falls_back_when_the_transport_cannot_derive_a_root(tmp_path) -> None:
+    made = sbx.SandboxSessionStore(
+        tmp_path / "work",
+        sessions_root=tmp_path / "store",
+        transport=FakeTransport(),  # no ``root`` method at all
+    )
+    assert made.remote_root == sbx.FALLBACK_REMOTE_ROOT
+    assert made._remote_path("cli:one").startswith(sbx.FALLBACK_REMOTE_ROOT + "/")
