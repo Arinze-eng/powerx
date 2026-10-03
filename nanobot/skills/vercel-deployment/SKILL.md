@@ -16,10 +16,12 @@ unavailable, tell the user an admin must set `VERCEL_TOKEN`.
 
 ## The golden path
 
-1. Build the app locally (see `frontend-development` / `backend-development`).
-2. Ensure it builds cleanly (`npm run build`) before deploying.
+1. Build the app **in the execution sandbox** (see `frontend-development` /
+   `backend-development`); the files live at the sandbox workspace root.
+2. Ensure it builds cleanly (`npm run build`) — run that in the sandbox too.
 3. Set required env vars FIRST: `web_dev action=set_env name=... value=... environment=production`.
-4. Deploy: `web_dev action=deploy project=<dir>` → returns the live `https://…vercel.app` URL.
+4. Deploy: `web_dev action=deploy project=<dir>` → runs the Vercel CLI in the
+   sandbox and returns the live `https://…vercel.app` URL.
 5. Give the user the URL and open it to verify.
 
 ## web_dev actions (the tool you call)
@@ -31,33 +33,45 @@ unavailable, tell the user an admin must set `VERCEL_TOKEN`.
 | `set_env` | Add an env var to the project | `project`, `name`, `value`, `environment` |
 | `status` | List deployments + env vars | `project` |
 | `inspect` | Show current deployment/project URLs | `project` |
+| `install` | Provision Node + the Vercel CLI in the sandbox (automatic on first deploy) | — |
 
-Always pass `project` as the directory that contains the code you built.
+Always pass `project` as the directory that contains the code you built, as it
+exists in the execution sandbox.
 
-## When the project lives in the execution sandbox
+## Where this runs: inside the execution sandbox
 
-The agent often builds the app **inside** the execution sandbox (Tenki
-`/home/tenki`, Freestyle `/home/ubuntu/workspace`, Novita `/workspace`, …) while
-`web_dev` runs on the host. Those filesystems are isolated, which used to surface
-as a dead end: *"web_dev is attempting to access a workspace path that is
-inaccessible from the sandbox."*
+The project is **built in the execution sandbox** (Tenki `/home/tenki`, Freestyle
+`/home/ubuntu/workspace`, Novita `/workspace`, …), so the Vercel CLI runs there
+too. `web_dev` never runs Node on the application host and never stages the
+project onto it. The method is the same one `media_sandbox` and `mt5_sandbox`
+use:
 
-That is no longer a blocker. `web_dev` bridges it: pass the project **name as it
-exists in the sandbox** (e.g. `project=notes-app`) and the sources are fetched
-out of the sandbox automatically before the deploy, then the temp copy is
-removed. `scaffold` pushes its files into the sandbox for the same reason, so the
-directory you scaffolded is the directory your `action=write` / `action=run`
-tools see.
+1. **bootstrap** — the tool fetches its sandbox installer on every call.
+2. **install** — the first call downloads Node.js and the Vercel CLI *into the
+   sandbox* (`~/.webdev`). This takes about a minute, once per sandbox.
+3. **run** — `vercel link` / `vercel deploy` execute inside the sandbox against
+   the project directory that is already there.
+4. **read back** — the live URL is parsed out of the CLI output and returned.
+
+You do not have to install anything by hand: `deploy` does it on the first call.
+If a deploy reports the toolchain is not ready, call `web_dev action=install`
+once and retry. **Never ask the user to install Node, npm or the Vercel CLI.**
+
+Pass `project` as the directory **as it exists in the sandbox** — a bare name
+(`project=notes-app`, resolved under the sandbox workspace root) or an absolute
+in-sandbox path. `scaffold` writes its files into the sandbox for the same
+reason, so the directory you scaffolded is the directory your `action=write` /
+`action=run` tools see.
 
 Rules:
 
 - **Never report a path mismatch as the reason a deploy is impossible.** If the
-  bridge genuinely found nothing it says which directory it looked in and what to
-  do — follow that instead of handing the user the error.
-- `status` / `inspect` never need the files; they take the project name and run
-  against the Vercel project itself.
-- Only the *source* travels. `node_modules`, `.next`, `dist`, `.git` are excluded
-  deliberately — Vercel builds from source.
+  project really is not there, the tool says which directory it looked in inside
+  the sandbox and what to do — follow that instead of handing the user the error.
+- `status` / `inspect` do not need the build files; they link the Vercel project
+  by name inside the sandbox and read it there.
+- Nothing is copied to the application host — not the sources and not
+  `node_modules`. Vercel builds from source, in the sandbox or on its own servers.
 
 ## Preview vs production
 

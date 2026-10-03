@@ -19,11 +19,31 @@ Deployment is fully non-interactive: ``vercel deploy --yes`` with the token.
 Project files may be produced with the ordinary filesystem tools or the
 ``scaffold`` action into a local directory under the agent workspace, then
 passed to ``deploy`` by project path.
+
+WHERE THE WORK RUNS
+-------------------
+The Vercel CLI is a Node program: it resolves a dependency graph, bundles the
+project and uploads it. The application host is a small skeleton that also serves
+every user's gateway turn, so this tool does **not** run Node there. It follows
+the same method as ``media`` (ffmpeg/whisper) and ``mt5_sandbox`` (Wine/MT5):
+
+    1. bootstrap  fetch ``install_webdev_sandbox.sh`` into the sandbox
+    2. install    Node.js + the Vercel CLI, once, inside the sandbox
+    3. run        ``vercel …`` inside the sandbox, against the project directory
+                  that is already there (the project was built there)
+    4. parse      the CLI's output back into the live URL for the user
+
+With an execution sandbox configured, every ``deploy``/``set_env``/``status``/
+``inspect`` therefore runs entirely in the sandbox and nothing is staged onto the
+host. The host-side CLI path is kept only for a deployment with no sandbox at all
+(``NANOBOT_EXECUTION_BACKEND`` unset) so the tool still works in a bare local
+setup; production always takes the sandbox path.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shlex
@@ -50,6 +70,37 @@ VERCEL_CLI = "vercel"
 _TOKEN_ENV = "VERCEL_TOKEN"
 _MAX_RESULT_CHARS = 16_000
 _DEFAULT_TIMEOUT = 300
+
+#: Raw GitHub base for the sandbox-side installer. Same last-resort-source note as
+#: ``media.py``: the sandbox's egress path caches ``raw.githubusercontent.com`` by
+#: URL *path* and ignores query strings, so a branch URL can serve a revision
+#: several pushes old. ``bootstrap_command`` resolves ``main`` to a commit SHA and
+#: prefers that URL.
+_RAW_BASE = os.getenv(
+    "WEBDEV_SCRIPT_RAW_BASE",
+    "https://raw.githubusercontent.com/Arinze-eng/powerx/main/scripts",
+)
+
+#: Owner/repo used to resolve ``main`` to a commit SHA before downloading.
+_REPO = os.getenv("WEBDEV_SCRIPT_REPO", "Arinze-eng/powerx")
+
+#: Version of the sandbox-side installer this tool requires. MUST be kept equal to
+#: ``WEBDEV_INSTALLER_VERSION`` in ``scripts/install_webdev_sandbox.sh``: the
+#: bootstrap refuses a download that does not carry this exact marker, so a cached
+#: revision is reported loudly instead of executed silently. Bump BOTH together.
+_CLI_VERSION = "1.0.0"
+
+#: Where the toolchain lives inside the sandbox.
+_WEBDEV_HOME = "$HOME/.webdev"
+_VERCEL_BIN = f"{_WEBDEV_HOME}/node_modules/.bin/vercel"
+_INSTALLER_PATH = f"{_WEBDEV_HOME}/bin/install_webdev_sandbox.sh"
+
+#: The sandbox caps one command at 900 s (``_MAX_TIMEOUT`` in ``novita_sandbox``).
+_SANDBOX_MAX_TIMEOUT = 900
+
+#: Sentinel the sandbox prints when the project directory is not there, so a
+#: missing directory is reported as such rather than as a confusing CLI error.
+_NO_PROJECT_SENTINEL = "__WEBDEV_NO_PROJECT__"
 
 _GITIGNORE = """.venv/
 node_modules/
@@ -121,6 +172,103 @@ def _extract_url(text: str) -> str | None:
     return match.group(0).rstrip(".,;)]}")
 
 
+def _extract_json(text: str) -> dict[str, Any] | None:
+    """Return the last JSON object on its own line of *text*, or ``None``.
+
+    The sandbox CLIs write progress to stderr and exactly one JSON object to
+    stdout, so scanning from the end finds the payload without depending on the
+    line count before it.
+    """
+    for line in reversed((text or "").splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+#: Bootstrap shell. ``{...}`` placeholders are filled by ``bootstrap_command``.
+#:
+#: MEASURED (same trap as ``mt5_sandbox``): the sandbox's egress path caches
+#: ``raw.githubusercontent.com`` by URL *path*, so ``.../main/scripts/...`` can
+#: keep returning a revision several pushes old — a fix that is on main, tested
+#: and verified from the host still runs the OLD code in the sandbox. A
+#: commit-pinned URL is never cached because that exact URL was never requested.
+#: So: resolve ``main`` to a SHA through the API, download the pinned URL, and
+#: VERIFY the result carries the installer version this tool requires; only then
+#: fall back to the branch URL, and warn loudly if every source failed.
+#:
+#: The install runs only when the ready marker is absent, so after the first call
+#: this prefix is one cheap curl.
+_BOOTSTRAP_TEMPLATE = """\
+mkdir -p {home}/bin
+_want='{version}'
+_fetch() {{ curl -fsSL --retry 2 "$1" -o "$2" 2>/dev/null && grep -q "WEBDEV_INSTALLER_VERSION='$_want'" "$2"; }}
+_sha=$(curl -fsSL 'https://api.github.com/repos/{repo}/commits/main' 2>/dev/null \
+  | python3 -c "import sys,json;print((json.load(sys.stdin) or {{}}).get('sha',''))" 2>/dev/null)
+_ok=''
+for _base in "https://raw.githubusercontent.com/{repo}/$_sha/scripts" "{raw_base}"; do
+  if _fetch "$_base/install_webdev_sandbox.sh" {installer}; then
+    _ok=1
+    break
+  fi
+done
+chmod +x {installer} 2>/dev/null
+if [ -z "$_ok" ]; then
+  echo "WARNING: could not fetch install_webdev_sandbox.sh version $_want (a cached copy of an" >&2
+  echo "older revision may be in use). Retry, or set WEBDEV_SCRIPT_RAW_BASE." >&2
+elif [ ! -x "{bin}" ]; then
+  bash {installer} --install >/dev/null 2>&1 || true
+fi\
+"""
+
+
+def bootstrap_command() -> str:
+    """Idempotently fetch the webdev installer into the sandbox and run it once."""
+    return _BOOTSTRAP_TEMPLATE.format(
+        home=_WEBDEV_HOME,
+        bin=_VERCEL_BIN,
+        installer=_INSTALLER_PATH,
+        repo=_REPO,
+        raw_base=_RAW_BASE,
+        version=_CLI_VERSION,
+    )
+
+
+def _sandbox_tool(ctx: ToolContext | None) -> Any:
+    """Find the configured execution sandbox tool, exactly as ``media`` does.
+
+    Same resolution order and the same defensive shape, so web_dev inherits
+    whatever backend the deployment already chose (Novita by default) plus its
+    per-session sandbox reuse, sizing and lifecycle. The registry is a
+    ToolRegistry, not a dict: resolve by name first, then verify the tool's own
+    ``name`` agrees, because a permissive stand-in answers any attribute.
+    """
+    if ctx is None:
+        return None
+    registry = getattr(ctx, "tool_registry", None)
+    if registry is None:
+        registry = getattr(ctx, "tools", None)
+    if registry is None:
+        return None
+
+    for name in ("novita_sandbox", "vps_exec", "runloop_sandbox", "daytona_sandbox"):
+        getter = getattr(registry, "get", None)
+        if callable(getter):
+            try:
+                tool = getter(name)
+            except Exception:  # pragma: no cover - defensive
+                tool = None
+            if tool is not None and getattr(tool, "name", None) == name:
+                return tool
+    return None
+
+
 #: Files that mark a directory as a deployable web project. Used when the name
 #: the model passed to ``deploy`` is not a directory in the sandbox and the
 #: staged sandbox root has to be searched for the project instead.
@@ -154,12 +302,15 @@ def _looks_like_project(path: Path) -> bool:
         required=["action"],
         action=StringSchema(
             "Operation: scaffold (create a starter project), deploy (ship a project to Vercel and return its URL), "
-            "set_env (set an environment variable), status (list deployments + env vars), or inspect (show project/deployment details)",
-            enum=["scaffold", "deploy", "set_env", "status", "inspect"],
+            "set_env (set an environment variable), status (list deployments + env vars), inspect (show project/deployment "
+            "details), or install (provision Node + the Vercel CLI in the execution sandbox; normally automatic)",
+            enum=["scaffold", "deploy", "set_env", "status", "inspect", "install"],
         ),
         project=StringSchema(
-            "Project name or directory. For scaffold: a new name to create. For deploy/status/inspect: the "
-            "directory containing the project to act on (may be a new scaffolded dir).",
+            "Project name or directory. For scaffold: a new name to create. For "
+            "deploy/set_env/status/inspect: the directory holding the project, as it exists "
+            "in the execution sandbox — a bare name (e.g. 'notes-app', resolved under the "
+            "sandbox workspace root) or an absolute in-sandbox path.",
         ),
         type=StringSchema(
             "For scaffold only: frontend, backend, or fullstack. Default frontend.",
@@ -205,11 +356,22 @@ class WebDevTool(Tool):
         return cls(
             workspace=Path(ctx.workspace) if ctx.workspace else get_workspace_path(),
             restrict_to_workspace=ctx.config.restrict_to_workspace,
+            ctx=ctx,
         )
 
-    def __init__(self, *, workspace: str | Path | None = None, restrict_to_workspace: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        workspace: str | Path | None = None,
+        restrict_to_workspace: bool = False,
+        ctx: ToolContext | None = None,
+    ) -> None:
         self._workspace = Path(workspace).expanduser().resolve() if workspace else get_workspace_path().expanduser().resolve()
         self._restrict_to_workspace = restrict_to_workspace
+        # Carried so the execution sandbox tool can be resolved at execute() time
+        # (``enabled()`` runs before the registry exists, so it cannot be resolved
+        # there). ``None`` means a bare local deployment with no sandbox.
+        self._ctx = ctx
 
     @property
     def name(self) -> str:
@@ -236,7 +398,11 @@ class WebDevTool(Tool):
             "cannot deploy arbitrary uploaded code, that hosting is not possible from this "
             "chat, or that an operator has to do it. If a deploy genuinely fails, fix the "
             "cause and retry (the usual one is a project directory that does not exist yet) "
-            "or report this tool's error message verbatim."
+            "or report this tool's error message verbatim. Everything runs INSIDE the "
+            "execution sandbox, where the project was built: the Vercel CLI and Node.js are "
+            "installed there (action='install' provisions them, and the first deploy does it "
+            "automatically) and a deploy never stages files onto the application host. An "
+            "absolute in-sandbox path for project works as well as a bare directory name."
         )
 
     def _resolve_project_dir(self, project: str | None) -> Path:
@@ -419,33 +585,61 @@ class WebDevTool(Tool):
     async def execute(self, **kwargs: Any) -> ToolResult | str:
         action = str(kwargs.get("action") or "").strip().lower()
         timeout = max(30, min(int(kwargs.get("timeout") or _DEFAULT_TIMEOUT), 900))
+        project = str(kwargs.get("project") or "").strip()
         try:
             if action == "scaffold":
                 return await self._scaffold(
-                    str(kwargs.get("project") or "").strip(),
-                    str(kwargs.get("type") or "frontend").strip().lower(),
+                    project, str(kwargs.get("type") or "frontend").strip().lower()
                 )
+            if action not in {"deploy", "set_env", "status", "inspect", "install"}:
+                return ToolResult.error(f"Unknown web_dev action: {action}")
+
+            # set_env input validation is shared: a bad call must be rejected
+            # BEFORE the sandbox is asked to do anything, on both paths.
+            name = str(kwargs.get("name") or "").strip()
+            environment = str(kwargs.get("environment") or "production").strip().lower()
+            if action == "set_env":
+                if not name:
+                    return ToolResult.error("name (env var name) is required for set_env")
+                if environment not in {"production", "preview", "development"}:
+                    return ToolResult.error(f"unsupported environment: {environment}")
+
+            sandbox = _sandbox_tool(getattr(self, "_ctx", None))
+            if sandbox is not None:
+                # EVERYTHING runs in the sandbox: the project was built there and
+                # the CLI is installed there, so nothing is staged onto the host.
+                if action == "install":
+                    return await self._install_in_sandbox(sandbox)
+                if action == "deploy":
+                    return await self._deploy_in_sandbox(
+                        sandbox, project, bool(kwargs.get("yes", True)), timeout
+                    )
+                if action == "set_env":
+                    return await self._set_env_in_sandbox(
+                        sandbox, project, name, str(kwargs.get("value") or ""), environment, timeout
+                    )
+                if action == "status":
+                    return await self._status_in_sandbox(sandbox, project, timeout)
+                return await self._inspect_in_sandbox(sandbox, project, timeout)
+
+            if action == "install":
+                return ToolResult.error(
+                    "No execution sandbox is configured, so there is nothing to install. The "
+                    "web deploy toolchain (Node + the Vercel CLI) installs inside a sandbox — "
+                    "this tool never runs it on the application host."
+                )
+            # No sandbox at all: the host-side CLI path, for a bare local setup.
             if action == "deploy":
                 return await asyncio.to_thread(
-                    self._deploy,
-                    str(kwargs.get("project") or "").strip(),
-                    bool(kwargs.get("yes", True)),
-                    timeout,
+                    self._deploy, project, bool(kwargs.get("yes", True)), timeout
                 )
             if action == "set_env":
                 return await asyncio.to_thread(
-                    self._set_env,
-                    str(kwargs.get("project") or "").strip(),
-                    str(kwargs.get("name") or "").strip(),
-                    str(kwargs.get("value") or ""),
-                    str(kwargs.get("environment") or "production").strip().lower(),
-                    timeout,
+                    self._set_env, project, name, str(kwargs.get("value") or ""), environment, timeout
                 )
             if action == "status":
-                return await asyncio.to_thread(self._status, str(kwargs.get("project") or "").strip(), timeout)
-            if action == "inspect":
-                return await asyncio.to_thread(self._inspect, str(kwargs.get("project") or "").strip(), timeout)
-            return ToolResult.error(f"Unknown web_dev action: {action}")
+                return await asyncio.to_thread(self._status, project, timeout)
+            return await asyncio.to_thread(self._inspect, project, timeout)
         except Exception as exc:
             logger.exception("web_dev error")
             return ToolResult.error(f"web_dev error: {type(exc).__name__}: {exc}")
@@ -591,6 +785,191 @@ class WebDevTool(Tool):
             "  <p>API at <code>/api</code></p>\n</body>\n</html>\n"
         )
         return files
+
+    # ------------------------------------------------------------------ #
+    # sandbox execution — the production path
+    #
+    # The project is BUILT in the execution sandbox, so the CLI that ships it runs
+    # there too. Nothing is staged onto the host: these methods resolve the
+    # project directory inside the sandbox, provision Node + the Vercel CLI there,
+    # run the CLI there, and parse the URL back. That is the same method
+    # ``media`` and ``mt5_sandbox`` use, and it keeps the host a skeleton.
+    # ------------------------------------------------------------------ #
+    async def _run_in_sandbox(self, sandbox: Any, command: str, timeout: int) -> str:
+        """Run one command in the sandbox, refreshing the toolchain first.
+
+        The bootstrap prefix is why a fixed installer ships without rebuilding the
+        sandbox — and why the very first call also installs Node + the Vercel CLI.
+        """
+        return str(
+            await sandbox.execute(
+                action="run",
+                command=f"{bootstrap_command()} >/dev/null 2>&1 || true; {command}",
+                timeout=max(30, min(timeout, _SANDBOX_MAX_TIMEOUT)),
+            )
+        )
+
+    async def _remote_dir(self, project: str | None) -> str | None:
+        """Resolve the project directory *inside* the sandbox.
+
+        An absolute in-sandbox path is used as-is; a bare name is joined to the
+        sandbox workspace root, which is where the agent's own write/run tools put
+        the project. ``None`` means the root could not be resolved.
+        """
+        from nanobot.agent.tools.workspace_bridge import remote_workspace_root
+
+        root = (await remote_workspace_root() or "").rstrip("/")
+        if not root:
+            return None
+        raw = (project or "").strip()
+        if not raw:
+            return root
+        if raw.startswith("/"):
+            return raw.rstrip("/") or root
+        return f"{root}/{raw.strip('/')}"
+
+    @staticmethod
+    def _link_in_sandbox(remote: str, proj_name: str, token: str) -> str:
+        """Shell that links *proj_name* from a scratch dir (read commands only).
+
+        ``status``/``inspect`` do not need the build files — the CLI only needs a
+        linked directory to know which project is meant — so this never requires
+        the project directory to exist.
+        """
+        slug = re.sub(r"[^A-Za-z0-9_.-]", "-", proj_name) or "app"
+        linkdir = f"{_WEBDEV_HOME}/link-{slug}"
+        return (
+            f"mkdir -p {shlex.quote(linkdir)} && cd {shlex.quote(linkdir)} && "
+            f"{_VERCEL_BIN} link --yes --project {shlex.quote(proj_name)} "
+            f"--token {shlex.quote(token)} >/dev/null 2>&1 || true; "
+        )
+
+    @staticmethod
+    def _sandbox_missing_project_text(project: str | None, remote: str) -> str:
+        return (
+            f"no project sources found to deploy. project={project or '(sandbox root)'!r} "
+            f"resolved to {remote} inside the execution sandbox, and that directory does not "
+            "exist there. Create the project inside the sandbox first (sandbox tool: "
+            "action=write + action=run), then call web_dev action=deploy with "
+            "project=<the directory name in the sandbox>. This is a retryable tool error, "
+            "not a refusal: deploying the user's project is authorised work here."
+        )
+
+    async def _install_in_sandbox(self, sandbox: Any) -> ToolResult | str:
+        """Provision Node + the Vercel CLI in the sandbox and report the result."""
+        out = await self._run_in_sandbox(
+            sandbox, f"bash {_INSTALLER_PATH} --install", timeout=600
+        )
+        payload = _extract_json(out)
+        if payload and payload.get("ready"):
+            return json.dumps(
+                {
+                    **payload,
+                    "ok": True,
+                    "message": "The web deploy toolchain (Node + the Vercel CLI) is installed "
+                    "in the sandbox. deploy/set_env/status/inspect work now.",
+                }
+            )
+        return ToolResult.error(
+            json.dumps(
+                {
+                    "ok": False,
+                    "failure": "webdev_install_incomplete",
+                    "message": "The web deploy toolchain is not ready in the sandbox yet.",
+                    "next": "Retry web_dev action=install. The first run downloads Node.js and "
+                    "the Vercel CLI into the sandbox (about a minute).",
+                    "detail": out[-1500:],
+                }
+            )
+        )
+
+    async def _deploy_in_sandbox(
+        self, sandbox: Any, project: str, yes: bool, timeout: int
+    ) -> ToolResult | str:
+        remote = await self._remote_dir(project)
+        if remote is None:
+            return ToolResult.error(
+                "Could not resolve the sandbox workspace root, so the project directory is "
+                "unknown. Retry, or check the sandbox tool."
+            )
+        name = self._project_name(project, Path(remote))
+        token = _vercel_token() or ""
+        args = [f"--token {shlex.quote(token)}"]
+        if yes:
+            args.append("--yes")
+        # `link` first so the deploy is deterministic and self-contained: without
+        # it, deploying from inside a git checkout tries to auto-link the GitHub
+        # repository and needs a GitHub login connection on the account.
+        command = (
+            f"if [ ! -d {shlex.quote(remote)} ]; then echo {_NO_PROJECT_SENTINEL}; "
+            f"else cd {shlex.quote(remote)} && "
+            f"{_VERCEL_BIN} link --yes --project {shlex.quote(name)} "
+            f"--token {shlex.quote(token)} >/dev/null 2>&1; "
+            f"{_VERCEL_BIN} deploy {' '.join(args)}; fi"
+        )
+        out = await self._run_in_sandbox(sandbox, command, timeout=timeout)
+        if _NO_PROJECT_SENTINEL in out:
+            return ToolResult.error(self._sandbox_missing_project_text(project, remote))
+        url = _extract_url(out)
+        where = f"{remote} (inside the execution sandbox)"
+        base = (
+            f"Deployed project from {where}.\n{out}\n"
+            "Give the user the live URL below to open the site:"
+        ) if url else f"Deployment finished for {where}.\n{out}\n"
+        if url:
+            base += f"\n\nLive URL: {url}"
+        return base
+
+    async def _set_env_in_sandbox(
+        self, sandbox: Any, project: str, name: str, value: str, environment: str, timeout: int
+    ) -> ToolResult | str:
+        remote = await self._remote_dir(project)
+        if remote is None:
+            return ToolResult.error(
+                "Could not resolve the sandbox workspace root, so the project directory is "
+                "unknown. Retry, or check the sandbox tool."
+            )
+        token = _vercel_token() or ""
+        proj_name = self._project_name(project, Path(remote))
+        command = (
+            f"if [ ! -d {shlex.quote(remote)} ]; then echo {_NO_PROJECT_SENTINEL}; "
+            f"else cd {shlex.quote(remote)} && "
+            f"{_VERCEL_BIN} link --yes --project {shlex.quote(proj_name)} "
+            f"--token {shlex.quote(token)} >/dev/null 2>&1; "
+            f"printf '%s\\n' {shlex.quote(value)} | "
+            f"{_VERCEL_BIN} env add {shlex.quote(name)} {shlex.quote(environment)} "
+            f"--token {shlex.quote(token)}; fi"
+        )
+        out = await self._run_in_sandbox(sandbox, command, timeout=timeout)
+        if _NO_PROJECT_SENTINEL in out:
+            return ToolResult.error(self._sandbox_missing_project_text(project, remote))
+        return (
+            f"Set env var {name} ({environment}) on the Vercel project (from inside the "
+            f"execution sandbox).\n{out}\n"
+            "Note: after setting env vars, redeploy (action=deploy) so the running deployment "
+            "picks them up."
+        )
+
+    async def _status_in_sandbox(self, sandbox: Any, project: str, timeout: int) -> ToolResult | str:
+        remote = await self._remote_dir(project)
+        token = _vercel_token() or ""
+        proj_name = self._project_name(project, Path(remote or "powerx-app"))
+        command = (
+            self._link_in_sandbox(remote or "", proj_name, token)
+            + f"echo '--- environment variables ---'; {_VERCEL_BIN} env ls --token {shlex.quote(token)}; "
+            + f"echo '--- recent deployments ---'; {_VERCEL_BIN} ls --token {shlex.quote(token)}"
+        )
+        return await self._run_in_sandbox(sandbox, command, timeout=timeout)
+
+    async def _inspect_in_sandbox(self, sandbox: Any, project: str, timeout: int) -> ToolResult | str:
+        remote = await self._remote_dir(project)
+        token = _vercel_token() or ""
+        proj_name = self._project_name(project, Path(remote or "powerx-app"))
+        command = (
+            self._link_in_sandbox(remote or "", proj_name, token)
+            + f"{_VERCEL_BIN} inspect {shlex.quote(proj_name)} --token {shlex.quote(token)}"
+        )
+        return await self._run_in_sandbox(sandbox, command, timeout=timeout)
 
     @staticmethod
     def _project_name(requested: str | None, staged_dir: Path) -> str:

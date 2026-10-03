@@ -26,7 +26,14 @@ def test_web_dev_tool_schema() -> None:
     tool = WebDevTool(workspace="/tmp")
     assert tool.name == "web_dev"
     props = tool.parameters["properties"]
-    assert props["action"]["enum"] == ["scaffold", "deploy", "set_env", "status", "inspect"]
+    assert props["action"]["enum"] == [
+        "scaffold",
+        "deploy",
+        "set_env",
+        "status",
+        "inspect",
+        "install",
+    ]
     assert tool.parameters["required"] == ["action"]
     assert {"project", "type", "name", "value", "environment", "yes", "timeout"} <= set(props)
 
@@ -319,3 +326,144 @@ def test_prompts_state_the_sandbox_bridge() -> None:
     assert "Never report a path mismatch" in skill
     web_skill = (root / "nanobot" / "skills" / "web-development" / "SKILL.md").read_text()
     assert "path\nmismatch" in web_skill or "path mismatch" in web_skill
+
+
+# --------------------------------------------------------------------------- #
+# The sandbox execution path: web dev must not touch the host
+# --------------------------------------------------------------------------- #
+#
+# The project is BUILT in the execution sandbox, so the CLI that ships it runs
+# there too. These tests pin that: with a sandbox configured, deploy/set_env/
+# status/inspect run inside it, the Vercel CLI is never invoked on the host, and
+# nothing is staged out of the sandbox onto the host.
+def _sandbox_ctx(sandbox):
+    class _Registry:
+        def get(self, name):
+            return sandbox if getattr(sandbox, "name", None) == name else None
+
+    class _Ctx:
+        tool_registry = _Registry()
+
+    return _Ctx()
+
+
+class _FakeSandbox:
+    name = "novita_sandbox"
+
+    def __init__(self, reply: str = "{}") -> None:
+        self.commands: list[str] = []
+        self.reply = reply
+
+    async def execute(self, **kwargs):
+        self.commands.append(kwargs.get("command", ""))
+        return self.reply
+
+
+def _pin_sandbox_root(monkeypatch, root: str = "/workspace") -> None:
+    async def fake_root(session_key=None):
+        return root
+
+    monkeypatch.setattr(
+        "nanobot.agent.tools.workspace_bridge.remote_workspace_root", fake_root
+    )
+
+
+def test_bootstrap_command_is_commit_pinned_and_version_checked() -> None:
+    """A cached branch URL must never be executed silently (see mt5_sandbox)."""
+    from nanobot.agent.tools.web_dev import bootstrap_command
+
+    cmd = bootstrap_command()
+    # main is resolved to a SHA through the API and that URL is tried first…
+    assert "api.github.com/repos/Arinze-eng/powerx/commits/main" in cmd
+    assert "raw.githubusercontent.com/Arinze-eng/powerx/$_sha/scripts" in cmd
+    # …the downloaded installer is verified against the required version…
+    assert "WEBDEV_INSTALLER_VERSION='$_want'" in cmd
+    # …and it is only run when the CLI is genuinely absent (idempotent).
+    assert 'elif [ ! -x "$HOME/.webdev/node_modules/.bin/vercel" ]' in cmd
+
+
+def test_deploy_runs_in_the_sandbox_and_never_on_the_host(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VERCEL_TOKEN", "vcp_test123")
+    _pin_sandbox_root(monkeypatch, "/home/ubuntu/workspace")
+    sandbox = _FakeSandbox(reply="Production   https://notes-app.vercel.app\n[exit_code=0]")
+
+    def host_must_not_run(*args, **kwargs):
+        raise AssertionError("the Vercel CLI must not run on the application host")
+
+    monkeypatch.setattr(web_dev_module, "_run_cli", host_must_not_run)
+    monkeypatch.setattr(
+        WebDevTool,
+        "_stage_from_sandbox",
+        lambda self, requested: (_ for _ in ()).throw(
+            AssertionError("nothing may be staged onto the host")
+        ),
+    )
+
+    tool = WebDevTool(workspace=str(tmp_path), ctx=_sandbox_ctx(sandbox))
+    res = asyncio.run(tool.execute(action="deploy", project="notes-app"))
+
+    text = str(res)
+    assert not getattr(res, "is_error", False), text
+    assert "https://notes-app.vercel.app" in text
+    assert sandbox.commands, "the deploy must reach the sandbox"
+    joined = "\n".join(sandbox.commands)
+    assert "cd /home/ubuntu/workspace/notes-app" in joined
+    assert "deploy" in joined and "--token vcp_test123" in joined
+    assert "inside the execution sandbox" in text
+
+
+def test_deploy_in_sandbox_reports_a_missing_project_directory(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VERCEL_TOKEN", "vcp_test123")
+    _pin_sandbox_root(monkeypatch, "/workspace")
+    sandbox = _FakeSandbox(reply="__WEBDEV_NO_PROJECT__")
+    tool = WebDevTool(workspace=str(tmp_path), ctx=_sandbox_ctx(sandbox))
+    res = asyncio.run(tool.execute(action="deploy", project="ghost"))
+    assert res.is_error
+    text = str(res)
+    assert "/workspace/ghost" in text
+    assert "sandbox" in text
+
+
+def test_install_action_reports_the_sandbox_toolchain(tmp_path, monkeypatch) -> None:
+    _pin_sandbox_root(monkeypatch, "/workspace")
+    sandbox = _FakeSandbox(
+        reply='{"installer_version": "1.0.0", "node": "/usr/bin/node", '
+        '"vercel": "62.2.0", "ready": true}'
+    )
+    tool = WebDevTool(workspace=str(tmp_path), ctx=_sandbox_ctx(sandbox))
+    res = asyncio.run(tool.execute(action="install"))
+    text = str(res)
+    assert not getattr(res, "is_error", False), text
+    assert "installed in the sandbox" in text
+    assert "62.2.0" in text
+
+
+def test_install_without_a_sandbox_refuses(tmp_path) -> None:
+    tool = WebDevTool(workspace=str(tmp_path))
+    res = asyncio.run(tool.execute(action="install"))
+    assert res.is_error
+    assert "never runs it on the application host" in str(res)
+
+
+def test_set_env_runs_in_the_sandbox(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VERCEL_TOKEN", "vcp_test123")
+    _pin_sandbox_root(monkeypatch, "/workspace")
+    sandbox = _FakeSandbox(reply="Added Environment Variable KEY to Project notes-app\n")
+    tool = WebDevTool(workspace=str(tmp_path), ctx=_sandbox_ctx(sandbox))
+    res = asyncio.run(
+        tool.execute(action="set_env", project="notes-app", name="KEY", value="v")
+    )
+    assert not getattr(res, "is_error", False), str(res)
+    joined = "\n".join(sandbox.commands)
+    assert "env add" in joined and "KEY" in joined
+
+
+def test_status_in_sandbox_links_before_reading(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VERCEL_TOKEN", "vcp_test123")
+    _pin_sandbox_root(monkeypatch, "/workspace")
+    sandbox = _FakeSandbox(reply="--- environment variables ---\n--- recent deployments ---\n")
+    tool = WebDevTool(workspace=str(tmp_path), ctx=_sandbox_ctx(sandbox))
+    asyncio.run(tool.execute(action="status", project="notes-app"))
+    joined = "\n".join(sandbox.commands)
+    assert "link --yes --project notes-app" in joined
+    assert "env ls" in joined and " ls " in joined

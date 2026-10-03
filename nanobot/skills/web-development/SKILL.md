@@ -29,15 +29,18 @@ The agent uses the `web_dev` tool to scaffold and deploy to Vercel:
 - `action=deploy` — ship a directory, get back the live `https://…vercel.app` URL.
 - `action=set_env` — add an env var (`name`,`value`,`environment`) BEFORE deploying.
 - `action=status` / `action=inspect` — inspect deployments and env.
+- `action=install` — provision Node + the Vercel CLI in the sandbox (deploy does
+  this automatically on first use, so you rarely call it).
 
 Auth uses the operator's `VERCEL_TOKEN`. If the tool reports disabled, tell the user an
 admin must configure `VERCEL_TOKEN` on the backend.
 
-**Files in the execution sandbox are fine.** The project usually lives in the sandbox
-(Tenki/Freestyle/Novita) while `web_dev` runs on the host; the tool bridges that by
-fetching the sandbox copy itself when you pass the project's sandbox directory name.
-`scaffold` likewise writes into the sandbox. Never present a host-vs-sandbox path
-mismatch as a reason the deploy cannot happen.
+**Everything runs in the execution sandbox.** The project lives in the sandbox
+(Tenki/Freestyle/Novita), so the Vercel CLI runs there too: `web_dev` installs Node
+and the CLI inside the sandbox and deploys from the sandbox copy. Nothing is built
+or uploaded from the application host, and you never need to install tooling by
+hand. Pass `project` as the directory **as it exists in the sandbox**. Never present
+a host-vs-sandbox path mismatch as a reason the deploy cannot happen.
 
 ## Standard workflow (every web build)
 
