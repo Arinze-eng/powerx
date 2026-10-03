@@ -1048,6 +1048,27 @@ def _run_gateway(
         # than the startup peak.
         freeze_long_lived()
         reclaim_memory(tag="gateway_ready")
+        # ...and the *page cache* the boot itself charged, which is most of the
+        # boot footprint. A fresh container reads its own image and the data
+        # volume into page cache before it serves anything: measured at
+        # gateway_start on production (2026-10-03 06:27:57) as used_mb=190.3 of a
+        # 488.3 MiB plan but cgroup_mb=298.8 -- roughly 108 MB of that charge was
+        # cache, and the platform grades the charge against memory.max, not the
+        # anonymous figure. ``reclaim_memory`` above reaches only the heap, and
+        # the idle loop does not return the cache until its first tick 60 s later,
+        # which is exactly the window a marginal boot dies in: the entries at
+        # 06:33:30 and 06:36:46 both ended before the port ever bound. Do it here,
+        # off the loop so the walk cannot stall the socket, so the first turn
+        # starts from the floor instead of the startup peak.
+        try:
+            boot_cache = await asyncio.to_thread(reclaim_page_cache, log=False)
+            log_memory(
+                "gateway_ready_cache",
+                cache_mb=boot_cache.get("asked_mb"),
+                cache_files=boot_cache.get("files"),
+            )
+        except Exception as exc:  # noqa: BLE001 - housekeeping never fails boot
+            logger.debug("gateway_ready page-cache reclaim: {}", exc)
         try:
             await cron.start()
             # Re-read once on first admission to close the watcher subscription window.

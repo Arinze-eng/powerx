@@ -32,6 +32,20 @@ def test_reclaim_loop_is_a_coroutine_function() -> None:
     assert asyncio.iscoroutinefunction(gateway_runtime._memory_reclaim_loop)
 
 
+def test_gateway_start_returns_page_cache_not_only_heap() -> None:
+    """The boot footprint is mostly cache, so ``gateway_ready`` must sweep it.
+
+    ``reclaim_memory`` at gateway_ready reaches the heap only, and the idle loop
+    that does sweep page cache does not tick for a minute. On a plan this small
+    the container that dies during boot dies in that gap (production: two boots
+    on 2026-10-03, 06:33:30 and 06:36:46, both ended before the port bound), so
+    the boot reclaim has to hand the cache back itself, off the event loop.
+    """
+    src = inspect.getsource(gateway_runtime)
+    assert "await asyncio.to_thread(reclaim_page_cache" in src
+    assert '"gateway_ready_cache"' in src
+
+
 # --------------------------------------------------------------------------- #
 # cadence
 # --------------------------------------------------------------------------- #
