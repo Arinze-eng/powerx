@@ -229,6 +229,32 @@ fi
 # performed, exit rather than run the agent as root.
 if [ "$(id -u)" = "0" ]; then
     chown -R nanobot:nanobot "$dir" 2>/dev/null || echo "[entrypoint] warning: chown $dir failed"
+
+    # [FIX 2026-10-03] Hand the kernel back the page cache this container charged
+    # to itself before it has served anything. A fresh container reads its own
+    # image into page cache and reaches ~92% of the plan limit at gateway_start
+    # with anonymous memory near 40% (1e9cb26) -- the platform replaces a
+    # container that crosses the limit, and every replacement is a 503 window
+    # while the replacement boots. It was measured again across three failed
+    # boots in a row (2026-10-03 05:01-05:03), each killed before the port bound.
+    #
+    # memory.reclaim is root-owned (mode 0200), so this window -- after the
+    # privilege drop at the end of this block, it is gone -- is the only chance
+    # the gateway has to do this with the kernel's whole-cgroup interface.
+    if [ -w /sys/fs/cgroup/memory.reclaim ]; then
+        _file_bytes=$(awk '/^file /{print $2; exit}' /sys/fs/cgroup/memory.stat 2>/dev/null || true)
+        if [ -n "${_file_bytes:-}" ] && [ "$_file_bytes" -gt 0 ] 2>/dev/null; then
+            # The kernel refuses a request larger than what is reclaimable (EIO),
+            # so ask for a fraction and step down once rather than lose the write.
+            if echo "$(( _file_bytes * 3 / 4 ))" > /sys/fs/cgroup/memory.reclaim 2>/dev/null; then
+                echo "[entrypoint] reclaimed page cache: asked $(( _file_bytes / 1048576 * 3 / 4 )) MB back"
+            elif echo "$(( _file_bytes / 8 ))" > /sys/fs/cgroup/memory.reclaim 2>/dev/null; then
+                echo "[entrypoint] reclaimed page cache: asked $(( _file_bytes / 1048576 / 8 )) MB back (stepped down)"
+            else
+                echo "[entrypoint] warning: memory.reclaim refused this write; continuing" >&2
+            fi
+        fi
+    fi
     if [ "$LAUNCH_SIDECARS" = "true" ]; then
         # Start the cron-job backup sidecar so newly scheduled reminders /
         # assignments are pushed to Supabase continuously too.

@@ -917,7 +917,14 @@ class AgentRunner:
             # 488.3 MiB limit (93.5%) and the container was recycled the same
             # second, while the gateway graded itself pressure=ok because it
             # reads anonymous memory alone. No-op unless the charge is high.
-            reclaim_if_charge_high(tag="charge_guard")
+            #
+            # Off the loop, because the guard now also hands back *page cache*:
+            # that is the half of the charge which actually climbs in a heavy
+            # turn, and reaching it means filesystem work (a bounded fadvise
+            # sweep, or one cgroup write). Running it on the loop would stall the
+            # platform's /api/health probe -- the very thing whose failure gets
+            # the container replaced under the user mid-task.
+            await asyncio.to_thread(reclaim_if_charge_high, tag="charge_guard")
             if spec.strip_image_content_before_provider:
                 # Injections and recovery/finalization messages are appended
                 # between iterations, so scrub again immediately before model
@@ -973,7 +980,7 @@ class AgentRunner:
             # container: an unbounded RSS ratchet charges the busiest moment to
             # everyone idle afterwards. Rate limited, so this is tens of
             # milliseconds at most every 30 s, not per iteration.
-            maybe_reclaim(tag="turn_end")
+            await asyncio.to_thread(maybe_reclaim, tag="turn_end")
             conversation_state.observe_response(response, messages)
             context.response = response
             context.tool_calls = list(response.tool_calls)
@@ -1051,7 +1058,7 @@ class AgentRunner:
                 # batch until the whole turn ends. Reclaiming here keeps the
                 # high-water mark at one batch rather than at the sum of them.
                 # Rate-limited to one collection per RECLAIM_MIN_INTERVAL_S.
-                maybe_reclaim(tag="tool_batch")
+                await asyncio.to_thread(maybe_reclaim, tag="tool_batch")
                 # Capture the concrete steps taken this iteration so a clean
                 # completion can be distilled into a replayable plan. Only
                 # successful calls are recorded — a failed step is not part of a

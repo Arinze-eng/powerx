@@ -208,7 +208,10 @@ def test_the_guard_runs_before_every_model_request() -> None:
 
     src = inspect.getsource(runner)
     started = src.index('"model_iteration_start"')
-    guard = src.index('reclaim_if_charge_high(tag="charge_guard")')
+    # Off the loop: the guard now reaches page cache too, which is filesystem
+    # work, and a stalled loop is what fails the health probe. See
+    # tests/utils/test_memory_page_cache_reclaim.py for that half.
+    guard = src.index('await asyncio.to_thread(reclaim_if_charge_high, tag="charge_guard")')
     request = src.index("response = await self._request_model(")
 
     assert started < guard < request, (
