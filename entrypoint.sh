@@ -278,10 +278,28 @@ if [ "$(id -u)" = "0" ]; then
         echo "[entrypoint] Supabase backup sidecars disabled (egress policy)"
     fi
     # Chat-owner backfill: backgrounded so it never delays the port binding.
-    if [ -f /app/scripts/backfill_chat_owners.py ]; then
-        setpriv --reuid=nanobot --regid=nanobot --init-groups env \
-            NANOBOT_DATA_DIR="$dir" /app/.venv/bin/python3 \
-            /app/scripts/backfill_chat_owners.py --apply &
+    #
+    # [FIX 2026-10-03] This is a ONE-TIME migration, so it must not re-run on
+    # every boot. It reconciles every chat on the volume (518 rows on this
+    # deployment) as a SECOND Python interpreter, so on a 512 MB plan it loads
+    # the whole transcript corpus while the gateway is still importing -- and
+    # it did that on every restart, including restarts caused by the memory
+    # spike itself. Measured on this box: the boot that logged the backfill at
+    # 06:31:50 was gone by 06:33:30, and the cycle repeated every 45-90 s.
+    # Guard it with a marker on the persistent volume and write that marker
+    # only when the run exits clean: an interrupted run (the container killed
+    # mid-scan) must retry, because owner stamping is fail-CLOSED and an
+    # unstamped chat stays hidden until it is stamped.
+    if [ -f /app/scripts/backfill_chat_owners.py ] \
+        && [ ! -f "$dir/persistent/.chat_owner_backfill.done" ]; then
+        (
+            setpriv --reuid=nanobot --regid=nanobot --init-groups env \
+                NANOBOT_DATA_DIR="$dir" /app/.venv/bin/python3 \
+                /app/scripts/backfill_chat_owners.py --apply \
+            && mkdir -p "$dir/persistent" \
+            && : > "$dir/persistent/.chat_owner_backfill.done" \
+            && echo "[entrypoint] chat-owner backfill complete -- will not run again"
+        ) &
     fi
     # Cron-store audit: ask nanobot where it will actually keep cron and warn if
     # that disagrees with the shell resolution above. Backgrounded -- the port must
@@ -334,9 +352,16 @@ else
 fi
 
 # Chat-owner backfill: backgrounded so it never delays the port binding.
-if [ -f /app/scripts/backfill_chat_owners.py ]; then
-    NANOBOT_DATA_DIR="$dir" /app/.venv/bin/python3 \
-        /app/scripts/backfill_chat_owners.py --apply &
+# One-time migration, marker-gated exactly as in the privileged branch above.
+if [ -f /app/scripts/backfill_chat_owners.py ] \
+    && [ ! -f "$dir/persistent/.chat_owner_backfill.done" ]; then
+    (
+        NANOBOT_DATA_DIR="$dir" /app/.venv/bin/python3 \
+            /app/scripts/backfill_chat_owners.py --apply \
+        && mkdir -p "$dir/persistent" \
+        && : > "$dir/persistent/.chat_owner_backfill.done" \
+        && echo "[entrypoint] chat-owner backfill complete -- will not run again"
+    ) &
 fi
 
 # Cron-store audit: ask nanobot where it will actually keep cron and warn if
