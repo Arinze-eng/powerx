@@ -32,6 +32,13 @@ from nanobot.agent.tools.exec_session import (
     format_session_poll,
 )
 from nanobot.agent.tools.sandbox import wrap_command
+from nanobot.agent.tools.sandbox_shell import (
+    SHELL_SANDBOX_ENV,
+    SandboxShellError,
+    calling_session_key,
+    run_in_sandbox,
+    sandbox_shell_enabled,
+)
 from nanobot.agent.tools.schema import (
     BooleanSchema,
     IntegerSchema,
@@ -113,6 +120,14 @@ class _PreparedCommand:
     timeout: int | None
     shell_program: str | None
     login: bool
+    #: True when the command was wrapped for a *local* execution mechanism --
+    #: ``bwrap`` on the host, or a Windows shell -- and therefore carries host
+    #: paths and host-only flags that must not be shipped to the sandbox.
+    host_only: bool = False
+    #: The configured workspace root, resolved during the guards. Carried out so
+    #: the remote path can map the working directory onto the sandbox's own
+    #: workspace instead of re-deriving it and disagreeing with the guards.
+    workspace_root: str | None = None
 
 
 @tool_parameters(
@@ -328,6 +343,17 @@ class ExecTool(Tool):
         if isinstance(prepared, str):
             return prepared
 
+        # The guards above have already run, so the sandbox path cannot become a
+        # way around the allowlist, the path check or the network check. Offload
+        # only once the command is known to be allowed.
+        if sandbox_shell_enabled():
+            refused = self._refuse_remote_shell(prepared, yield_time_ms)
+            if refused is not None:
+                return refused
+            remote = await self._run_remote_shell(prepared, max_output_chars)
+            if remote is not None:
+                return remote
+
         if yield_time_ms is not None:
             return await self._execute_session(prepared, yield_time_ms, max_output_chars)
 
@@ -391,6 +417,71 @@ class ExecTool(Tool):
             if process is not None:
                 await self._kill_process_tree(process)
             return ToolResult.error(f"Error executing command: {str(e)}")
+
+    def _refuse_remote_shell(
+        self, prepared: _PreparedCommand, yield_time_ms: int | None
+    ) -> str | None:
+        """Refuse a command the sandbox cannot run faithfully, or ``None``.
+
+        Both cases here would otherwise be *silently different* if they were sent
+        to the sandbox, and a caller that cannot tell where its command ran cannot
+        trust the result:
+
+        * a ``yield_time_ms`` session returns a ``session_id`` to poll and write
+          to -- that handle names a local process, and no backend's ``run``
+          exposes one;
+        * a ``bwrap``-wrapped command carries host bind mounts and host paths that
+          do not exist in the sandbox.
+        """
+        if yield_time_ms is not None:
+            return ToolResult.error(
+                f"Error: yield_time_ms sessions run on the host and cannot be "
+                f"offloaded, but {SHELL_SANDBOX_ENV} is set. Re-run without "
+                "yield_time_ms, or unset it to keep the local session behaviour."
+            )
+        if prepared.host_only:
+            return ToolResult.error(
+                f"Error: this command is wrapped for the host sandbox "
+                f"({self.sandbox!r}) and cannot run in the execution sandbox, but "
+                f"{SHELL_SANDBOX_ENV} is set."
+            )
+        return None
+
+    async def _run_remote_shell(
+        self, prepared: _PreparedCommand, max_output_chars: int | None
+    ) -> str | None:
+        """Run *prepared* in the execution sandbox, or ``None`` to run it locally.
+
+        ``None`` means "no sandbox is reachable", which is a transport problem and
+        therefore a fallback. A working directory with no equivalent in the
+        sandbox is *not* a fallback: it is returned as an error, because running
+        the command against the host workspace would answer a different question.
+        """
+        try:
+            ok, output = await run_in_sandbox(
+                prepared.command,
+                host_cwd=prepared.cwd,
+                workspace_root=prepared.workspace_root,
+                timeout=prepared.timeout,
+                session_key=calling_session_key(),
+            )
+        except SandboxShellError as exc:
+            if exc.degradable:
+                logger.debug("shell: sandbox unavailable, running locally: {}", exc)
+                return None
+            return ToolResult.error(f"Error: {exc}")
+
+        body = output.strip() or "(no output)"
+        max_len = clamp_session_int(max_output_chars, self._MAX_OUTPUT, 1000, MAX_OUTPUT_CHARS)
+        if len(body) > max_len:
+            half = max_len // 2
+            body = (
+                body[:half]
+                + f"\n\n... ({len(body) - max_len:,} chars truncated) ...\n\n"
+                + body[-half:]
+            )
+        marker = "" if ok else "Error: "
+        return f"{marker}{body}\nExit code: {'0' if ok else 'non-zero'}\n(ran in the sandbox)"
 
     async def _execute_session(
         self,
@@ -479,6 +570,7 @@ class ExecTool(Tool):
         if guard_error:
             return guard_error
 
+        host_only = False
         if self.sandbox:
             if _IS_WINDOWS:
                 logger.warning(
@@ -496,6 +588,11 @@ class ExecTool(Tool):
                     sandbox_rw_binds=[str(p) for p in self.sandbox_rw_binds],
                 )
                 cwd = str(Path(workspace).resolve())
+                # ``wrap_command`` produces a host ``bwrap`` invocation with host
+                # bind mounts baked into it. Shipping that to the sandbox would
+                # run a container-in-a-container against paths that do not exist
+                # there, so the remote path refuses it instead (see execute).
+                host_only = True
 
         effective_timeout = self._resolve_timeout(timeout)
         env = self._build_env()
@@ -517,6 +614,8 @@ class ExecTool(Tool):
             timeout=effective_timeout,
             shell_program=shell_program,
             login=False if login is None else login,
+            host_only=host_only,
+            workspace_root=workspace_root,
         )
 
     def _compose_path(self, current_path: str) -> str:

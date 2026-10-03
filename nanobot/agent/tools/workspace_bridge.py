@@ -802,6 +802,22 @@ async def fetch_remote_file(
         return None
 
 
+async def executor_workspace_root(
+    executor: RemoteExecutor, session_key: str | None = None
+) -> str | None:
+    """Return the workspace root of an *already resolved* executor.
+
+    A caller holding a handle has no reason to resolve the backend a second time:
+    for Novita that second resolution is another lookup of a live in-process
+    handle, and it can disagree with the handle the caller is actually about to
+    run against. Passing the handle through keeps the two in step.
+    """
+    if executor.backend is not None:
+        _, backend_config = await _selected_backend()
+        return _backend_root(executor.name, executor.backend, backend_config)
+    return await sandbox_workspace_root()
+
+
 async def remote_workspace_root(session_key: str | None = None) -> str | None:
     """Return the workspace root of the *resolved* backend instance.
 
@@ -809,10 +825,7 @@ async def remote_workspace_root(session_key: str | None = None) -> str | None:
     configuration-derived and therefore needs a live instance to resolve.
     """
     ex = await resolve_remote_executor(session_key=session_key)
-    if ex.backend is not None:
-        _, backend_config = await _selected_backend()
-        return _backend_root(ex.name, ex.backend, backend_config)
-    return await sandbox_workspace_root()
+    return await executor_workspace_root(ex, session_key=session_key)
 
 
 __all__ = [
@@ -820,6 +833,7 @@ __all__ = [
     "sandbox_workspace_root",
     "remote_workspace_root",
     "resolve_remote_executor",
+    "executor_workspace_root",
     "run_remote",
     "fetch_remote_file",
     "RemoteExecutor",
