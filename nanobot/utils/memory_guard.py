@@ -47,6 +47,7 @@ __all__ = [
     "MEMORY_WARN_RATIO",
     "container_memory_anonymous_bytes",
     "container_memory_charge_ratio",
+    "container_memory_file_cache_bytes",
     "container_memory_limit_bytes",
     "container_memory_used_bytes",
     "log_memory",
@@ -186,6 +187,33 @@ def container_memory_anonymous_bytes() -> int | None:
             continue
         values = _parse_memory_stat(text)
         for key in ("anon", "rss"):
+            if key in values:
+                return values[key]
+    return None
+
+
+def container_memory_file_cache_bytes() -> int | None:
+    """Return the cgroup's page-cache charge in bytes, or ``None`` when unknown.
+
+    This is the half of ``memory.current`` that :func:`container_memory_anonymous_bytes`
+    excludes: clean, reclaimable page cache from files this container read or
+    wrote. It is the number a fadvise sweep is trying to move, so reading it
+    either side of a sweep is the only honest way to say how much was actually
+    handed back -- the byte count a sweep *asks* about is a sum of file sizes,
+    and a file's size says nothing about how much of it was cached.
+
+    cgroup v2 names this ``file``; v1 names the same quantity ``total_cache``.
+    """
+    for stat_path in (
+        _CGROUP_V2 / "memory.stat",   # cgroup v2: file
+        _CGROUP_V1 / "memory.stat",   # cgroup v1: total_cache
+    ):
+        try:
+            text = stat_path.read_text()
+        except OSError:
+            continue
+        values = _parse_memory_stat(text)
+        for key in ("file", "total_cache"):
             if key in values:
                 return values[key]
     return None

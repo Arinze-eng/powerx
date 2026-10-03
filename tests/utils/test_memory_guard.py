@@ -191,6 +191,36 @@ def test_anonymous_memory_is_read_from_memory_stat(cgroup_v2) -> None:
     assert memory_guard.container_memory_anonymous_bytes() == 300
 
 
+def test_file_cache_is_read_from_memory_stat(cgroup_v2) -> None:
+    """The reclaimable half of the charge, which a fadvise sweep is meant to move.
+
+    Read either side of a sweep it is the only honest measure of what was handed
+    back: the summed size of the files a sweep reached is an upper bound, because
+    a file contributes its whole length whether or not any of it was cached.
+    """
+    cgroup_v2(limit=str(1000), current=str(950), anon=str(300), file_cache=str(640))
+
+    assert memory_guard.container_memory_file_cache_bytes() == 640
+
+
+def test_file_cache_is_none_without_a_file_line(cgroup_v2) -> None:
+    """An unknown cache figure must stay unknown rather than read as zero."""
+    cgroup_v2(limit=str(1000), current=str(950), anon=str(300))
+
+    assert memory_guard.container_memory_file_cache_bytes() is None
+
+
+def test_cgroup_v1_names_file_cache_total_cache(tmp_path, monkeypatch) -> None:
+    """v1 has no ``file``: the same quantity is ``total_cache``."""
+    v1 = tmp_path / "memory"
+    v1.mkdir()
+    (v1 / "memory.stat").write_text("total_cache 314572800\nrss 104857600\n")
+    monkeypatch.setattr(memory_guard, "_CGROUP_V2", tmp_path / "absent-v2")
+    monkeypatch.setattr(memory_guard, "_CGROUP_V1", v1)
+
+    assert memory_guard.container_memory_file_cache_bytes() == 314572800
+
+
 def test_cgroup_v1_names_anonymous_memory_rss(tmp_path, monkeypatch) -> None:
     """v1 has no ``anon``: the same quantity is ``rss`` in its memory.stat."""
     v1 = tmp_path / "memory"

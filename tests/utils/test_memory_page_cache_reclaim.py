@@ -170,13 +170,51 @@ def test_the_sweep_is_bounded(tmp_path) -> None:
 def test_the_sweep_never_raises_on_a_missing_or_unreadable_root(tmp_path) -> None:
     result = fadvise_page_cache([tmp_path / "missing", tmp_path / "also-missing"])
 
-    assert result == {"files": 0, "asked_mb": 0.0, "roots": []}
+    assert result["files"] == 0
+    assert result["asked_mb"] == 0.0
+    assert result["roots"] == []
 
 
 def test_a_root_that_is_a_file_is_skipped(tmp_path) -> None:
     target = tmp_path / "a-file"
     target.write_bytes(b"x")
     assert fadvise_page_cache([target])["files"] == 0
+
+
+def test_the_sweep_reports_the_cache_it_actually_dropped(tmp_path, monkeypatch) -> None:
+    """``asked_mb`` is a sum of file sizes; only the cgroup reading is a result.
+
+    A file contributes its whole length to ``asked_mb`` whether or not any of it
+    was cached, so a sweep over a directory of large files can report a large
+    ``asked_mb`` while handing back nothing -- which is exactly the shape of the
+    production log (``asked_mb=177.9`` every cycle, charge unmoved). The honest
+    figure is the cgroup's own page-cache charge either side of the sweep.
+    """
+    (tmp_path / "big.bin").write_bytes(b"x" * (3 * _MB))
+    readings = iter([100 * _MB, 60 * _MB])
+    monkeypatch.setattr(memory_reclaim, "container_memory_file_cache_bytes", lambda: next(readings))
+
+    result = fadvise_page_cache([tmp_path])
+
+    assert result["asked_mb"] == 3.0, "the file's size is still reported"
+    assert result["dropped_mb"] == 40.0, "but the drop is what the kernel handed back"
+
+
+def test_the_drop_is_unknown_rather_than_guessed_without_a_cgroup(tmp_path, monkeypatch) -> None:
+    """A platform without ``memory.stat`` gets ``None``, never an invented number."""
+    (tmp_path / "big.bin").write_bytes(b"x" * (3 * _MB))
+    monkeypatch.setattr(memory_reclaim, "container_memory_file_cache_bytes", lambda: None)
+
+    assert fadvise_page_cache([tmp_path])["dropped_mb"] is None
+
+
+def test_a_page_faulted_back_in_never_reads_as_a_negative_drop(tmp_path, monkeypatch) -> None:
+    """Another thread can fault a page in between the two reads."""
+    (tmp_path / "big.bin").write_bytes(b"x" * (3 * _MB))
+    readings = iter([10 * _MB, 12 * _MB])
+    monkeypatch.setattr(memory_reclaim, "container_memory_file_cache_bytes", lambda: next(readings))
+
+    assert fadvise_page_cache([tmp_path])["dropped_mb"] == 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -196,6 +234,41 @@ def test_the_cgroup_win_skips_the_sweep(monkeypatch, tmp_path) -> None:
 
     assert result["cgroup_ok"] is True
     assert walked == [], "the sweep ran even though the kernel took the whole ask"
+
+
+def test_the_cgroup_win_reports_its_own_drop(monkeypatch, tmp_path) -> None:
+    """The kernel write returns no count, so the drop is measured, not assumed."""
+    _install_cgroup(monkeypatch, tmp_path, limit_mb=488, charge_mb=450.1, anon_mb=288.4)
+    _install_reclaim_file(monkeypatch, tmp_path)
+    readings = iter([170 * _MB, 20 * _MB])
+    monkeypatch.setattr(memory_reclaim, "container_memory_file_cache_bytes", lambda: next(readings))
+
+    result = reclaim_page_cache([tmp_path])
+
+    assert result["cgroup_ok"] is True
+    assert result["dropped_mb"] == 150.0
+
+
+def test_the_guard_logs_the_measured_drop_not_only_the_ask(monkeypatch, tmp_path) -> None:
+    """The log line is what an operator reads under pressure; it must not lie."""
+    _install_cgroup(monkeypatch, tmp_path, limit_mb=488, charge_mb=450.1, anon_mb=288.4)
+    monkeypatch.setattr(memory_reclaim, "_CGROUP_RECLAIM_PATHS", (tmp_path,))
+    # Read once by the composite and once either side of the sweep.
+    readings = iter([180 * _MB, 180 * _MB, 176 * _MB])
+    monkeypatch.setattr(memory_reclaim, "container_memory_file_cache_bytes", lambda: next(readings))
+    (tmp_path / "big.bin").write_bytes(b"x" * (4 * _MB))
+    lines: list[str] = []
+    monkeypatch.setattr(
+        memory_reclaim.logger, "info", lambda message, *a, **k: lines.append(message)
+    )
+
+    reclaim_page_cache([tmp_path])
+
+    assert lines, "a sweep that reached files must log a line"
+    assert "dropped_mb=" in lines[0], (
+        "without the measured figure the line cannot distinguish 'handed back 178 MB' "
+        "from 'asked about 178 MB and handed back nothing'"
+    )
 
 
 def test_the_sweep_runs_when_the_kernel_refuses(monkeypatch, tmp_path) -> None:

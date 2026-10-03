@@ -42,6 +42,7 @@ from loguru import logger
 from nanobot.utils.memory_guard import (
     MEMORY_CHARGE_WARN_RATIO,
     container_memory_charge_ratio,
+    container_memory_file_cache_bytes,
     memory_snapshot,
     process_rss_bytes,
 )
@@ -245,13 +246,25 @@ def fadvise_page_cache(
     toolchain it read back. Only *clean* pages are dropped, so this can never
     lose data, and a file still being written keeps its dirty pages.
 
-    Returns ``{"files", "asked_mb", "roots"}``. Never raises: reclaiming is
-    housekeeping, and housekeeping must not become a new way to fail a turn.
+    ``asked_mb`` is the summed *size* of the files the sweep reached, which is an
+    upper bound and not a result: a file contributes its whole length whether or
+    not any of it was cached, and ``POSIX_FADV_DONTNEED`` drops only the clean
+    pages that are not referenced. Measured on this kernel against a directory of
+    freshly read files, a sweep that asked for 192 MB handed back 161 MB of
+    cgroup charge -- close, but not the same number, and the gap grows when the
+    cache is being re-read by a running build. ``dropped_mb`` is therefore the
+    measured figure: the cgroup's own page-cache charge read either side of the
+    sweep. It is ``None`` where ``memory.stat`` is unreadable, never a guess.
+
+    Returns ``{"files", "asked_mb", "dropped_mb", "roots"}``. Never raises:
+    reclaiming is housekeeping, and housekeeping must not become a new way to
+    fail a turn.
     """
     targets = [
         Path(root)
         for root in (roots if roots is not None else _default_page_cache_roots())
     ]
+    cache_before = container_memory_file_cache_bytes()
     files = 0
     asked = 0
     walked: list[str] = []
@@ -285,9 +298,16 @@ def fadvise_page_cache(
                 os.close(fd)
             files += 1
             asked += size
+    dropped: float | None = None
+    cache_after = container_memory_file_cache_bytes()
+    if cache_before is not None and cache_after is not None:
+        # Never negative: another thread can fault a page in between the two
+        # reads, and a negative "handed back" would be nonsense in a log line.
+        dropped = round(max(cache_before - cache_after, 0) / (1024 * 1024), 1)
     return {
         "files": files,
         "asked_mb": round(asked / (1024 * 1024), 1),
+        "dropped_mb": dropped,
         "roots": walked,
     }
 
@@ -356,6 +376,7 @@ def reclaim_page_cache(
     because one syscall can return the whole charge; the sweep runs when it is
     refused, which is the normal case for an unprivileged gateway.
     """
+    cache_before = container_memory_file_cache_bytes()
     cgroup = reclaim_cgroup_charge()
     result: dict[str, Any] = {
         "cgroup_ok": cgroup["ok"],
@@ -365,14 +386,22 @@ def reclaim_page_cache(
         # One write asked the kernel for the whole cgroup; nothing to walk.
         result["files"] = 0
         result["asked_mb"] = cgroup["requested_mb"]
+        cache_after = container_memory_file_cache_bytes()
+        result["dropped_mb"] = (
+            round(max(cache_before - cache_after, 0) / (1024 * 1024), 1)
+            if cache_before is not None and cache_after is not None
+            else None
+        )
     else:
         result.update(fadvise_page_cache(roots))
     if log:
         if cgroup["ok"] or result.get("asked_mb", 0) >= 1.0:
             logger.info(
-                "MEMORY tag=charge_guard_page_cache cgroup_ok={} asked_mb={} files={} reason={}",
+                "MEMORY tag=charge_guard_page_cache cgroup_ok={} asked_mb={} dropped_mb={}"
+                " files={} reason={}",
                 cgroup["ok"],
                 result.get("asked_mb"),
+                result.get("dropped_mb"),
                 result.get("files"),
                 cgroup["reason"] or "-",
             )
