@@ -614,6 +614,16 @@ class FreestyleExecutionConfig(Base):
     # VM. -1 means "never pause for idleness", which is the provider default and
     # is deliberately not this deployment's default.
     idle_pause_seconds: int = Field(default=300, ge=-1, le=86_400)
+    # Provider-side idle auto-DELETE (``autoDeleteSeconds``): the VM destroys
+    # itself once it has been unused for this many seconds. Distinct from
+    # ``idle_pause_seconds`` above: a pause freezes the machine and keeps its
+    # disk so the next operation resumes the very same VM, while an auto-delete
+    # gives the account's VM slot back — which is what lets a full rotation
+    # account accept new sessions again. -1 (the default) preserves the old
+    # behaviour of never deleting an unused VM, so a session's disk survives
+    # between tasks. Set it lower than the lowest quota account's appetite when
+    # the account's VM cap, not the machine's life, is the constraint.
+    auto_delete_seconds: int = Field(default=-1, ge=-1, le=2_592_000)
     tag: str = "powerx"
     fetch_allow_hosts: str = ""
     # Keep the VM (and every file on it) alive across finished tasks, agent

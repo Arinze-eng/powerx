@@ -95,6 +95,8 @@ _LANE_FATAL_MARKERS = (
     "limit_exceeded",
     "limit exceeded",
     "plan's limit",
+    "at limit",
+    "limit of",
     "capacity",
     "quota",
     "conflict",
@@ -102,6 +104,11 @@ _LANE_FATAL_MARKERS = (
     "invalid_api_key",
     "unauthorized",
     "too many",
+    # The provider answers a full account with a bare 429 on create, so treat
+    # the status itself as "this lane cannot serve us" rather than trusting a
+    # message body that may not name the condition.
+    "returned 429",
+    "429",
 )
 
 #: VM states that mean "this VM is not usable and must be recreated".
@@ -253,6 +260,29 @@ def validate_freestyle_idle_pause_seconds(raw: Any) -> int:
     return value
 
 
+def validate_freestyle_auto_delete_seconds(raw: Any) -> int:
+    """Idle auto-DELETE window in seconds, as the provider's ``autoDeleteSeconds``.
+
+    ``-1`` is the provider's sentinel for "never delete an unused VM" and stays
+    the default, because a session's disk is what the next task reattaches to.
+    A finite value gives a full rotation account's VM slot back once a machine
+    has gone that long unused. ``0`` is rejected: the provider would read it as
+    "delete immediately", so a zero that arrived from an empty form field would
+    silently destroy every VM the moment it went idle.
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("Freestyle auto-delete must be a whole number of seconds") from None
+    if value == -1:
+        return -1
+    if not 60 <= value <= 2_592_000:
+        raise ValueError(
+            "Freestyle auto-delete must be between 60 and 2592000 seconds, or -1 to disable it"
+        )
+    return value
+
+
 def validate_freestyle_tag(raw: str) -> str:
     value = str(raw or "").strip() or "powerx"
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,60}", value):
@@ -368,6 +398,21 @@ def _detail(exc: BaseException) -> str:
     return text[:400] or type(exc).__name__
 
 
+def _vm_int(value: Any) -> int:
+    """Read a numeric VM field leniently for a describe probe.
+
+    ``None`` (the provider's "no window set") maps to -1, and a value the
+    provider chose that is not a number passes through as -1 rather than
+    raising, because a status read must never fail on the provider's data.
+    """
+    if value is None:
+        return -1
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
 def _parse_df_kb(text: str) -> dict[str, int]:
     """Pull total/free megabytes out of ``df -Pk`` output (POSIX column order)."""
     for line in reversed(str(text or "").splitlines()):
@@ -448,6 +493,12 @@ class FreestyleExecutionBackend:
         # whole point is that an idle sandbox stops holding a machine.
         self.idle_pause_seconds = validate_freestyle_idle_pause_seconds(
             getattr(config, "idle_pause_seconds", 300)
+        )
+        # Provider-side idle auto-delete. Sent on create as ``autoDeleteSeconds``.
+        # An unset field keeps -1 ("never delete"), so a session's disk survives
+        # between tasks exactly as it did before the setting existed.
+        self.auto_delete_seconds = validate_freestyle_auto_delete_seconds(
+            getattr(config, "auto_delete_seconds", -1)
         )
         self.tag = validate_freestyle_tag(str(getattr(config, "tag", "") or "powerx"))
         self.fetch_allow_hosts = validate_freestyle_fetch_allow_hosts(
@@ -679,7 +730,12 @@ class FreestyleExecutionBackend:
             "maxRunTotalSeconds": int(self.max_duration_seconds),
             # Never delete an *unused* VM on us: persistence is what lets the
             # next task reattach to the same disk. Reset is what destroys it.
-            "autoDeleteSeconds": -1,
+            # An unused VM is deleted once it has gone this long without use,
+            # which is what lets a rotation account at its VM cap take a new
+            # session again. -1 (the default) never deletes one, so persistence
+            # is what lets the next task reattach to the same disk. Reset is
+            # what destroys a VM outright.
+            "autoDeleteSeconds": int(self.auto_delete_seconds),
             # The provider's own idle auto-pause. A VM that has gone this long
             # without network activity freezes itself, keeping disk AND memory,
             # so an abandoned sandbox stops holding a machine while the next
@@ -1288,6 +1344,14 @@ class FreestyleExecutionBackend:
                 if vm.get("idleTimeoutSeconds") is not None
                 else -1
             ),
+            # The auto-delete window the VM actually carries, so the admin Test
+            # line confirms the idle delete is ARMED rather than merely saved.
+            # The provider reports ``null`` when a VM will never be deleted for
+            # idleness, which is the -1 the admin form uses for the same thing.
+            # Read leniently: a describe probe must never fail on a value the
+            # provider chose, so a non-numeric or out-of-range window passes
+            # through rather than raising.
+            "auto_delete_seconds": _vm_int(vm.get("autoDeleteSeconds")),
         }
         payload.update(_parse_df_kb(str(probe.get("stdout") or "")))
         return payload
@@ -1307,6 +1371,7 @@ __all__ = [
     "validate_freestyle_api_key",
     "validate_freestyle_api_keys",
     "validate_freestyle_api_url",
+    "validate_freestyle_auto_delete_seconds",
     "validate_freestyle_cpu_cores",
     "validate_freestyle_disk_size_gb",
     "validate_freestyle_fetch_allow_hosts",

@@ -257,6 +257,19 @@ def apply_render_execution_env(config: Any) -> Any:
         fs_ttl = _positive_int(_env("NANOBOT_FREESTYLE_MAX_DURATION_SECONDS"), maximum=2_592_000)
         if fs_ttl is not None and fs_ttl >= 60 and int(getattr(freestyle, "max_duration_seconds", 3600) or 3600) == 3600:
             freestyle.max_duration_seconds = fs_ttl
+        # Idle auto-delete window (seconds). Unlike the fields above this one is
+        # a plain, non-negative integer whose -1 is the meaningful "off" value,
+        # so it is parsed directly rather than through ``_positive_int``.
+        fs_auto_delete = _env("NANOBOT_FREESTYLE_AUTO_DELETE_SECONDS")
+        if fs_auto_delete and int(getattr(freestyle, "auto_delete_seconds", -1)) == -1:
+            try:
+                parsed_auto_delete = int(fs_auto_delete)
+            except ValueError:
+                parsed_auto_delete = None
+            # -1 (off) and any usable window fill a still-default field; an
+            # admin-saved value wins, so the env never overrides the form.
+            if parsed_auto_delete is not None and (parsed_auto_delete == -1 or parsed_auto_delete >= 60):
+                freestyle.auto_delete_seconds = parsed_auto_delete
         _fill(freestyle, "tag", _env("NANOBOT_FREESTYLE_TAG"))
         _fill(freestyle, "fetch_allow_hosts", _env("NANOBOT_FREESTYLE_FETCH_ALLOW_HOSTS"))
     # Vercel Sandbox overlay (used when the deployment selects the Vercel

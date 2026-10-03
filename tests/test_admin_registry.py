@@ -1363,6 +1363,7 @@ def test_admin_can_select_the_freestyle_backend_and_round_trip_its_settings(
         "freestyleMemoryMb": 8192,
         "freestyleMaxDurationSeconds": 5400,
         "freestyleIdlePauseSeconds": 900,
+        "freestyleAutoDeleteSeconds": 1800,
         "freestyleTag": "powerx",
         "freestyleFetchAllowHosts": "gofile.io,onlyfiles.com",
         "freestylePersistWorkspace": True,
@@ -1389,6 +1390,7 @@ def test_admin_can_select_the_freestyle_backend_and_round_trip_its_settings(
     assert freestyle["memory_mb"] == 8192
     assert freestyle["max_duration_seconds"] == 5400
     assert freestyle["idle_pause_seconds"] == 900
+    assert freestyle["auto_delete_seconds"] == 1800
     assert freestyle["tag"] == "powerx"
     assert freestyle["fetch_allow_hosts"] == "gofile.io,onlyfiles.com"
 
@@ -1398,6 +1400,9 @@ def test_admin_can_select_the_freestyle_backend_and_round_trip_its_settings(
     assert saved_freestyle["apiKeys"] == [lane_a, lane_b]
     assert saved_freestyle["memoryMb"] == 8192
     assert saved_freestyle["maxDurationSeconds"] == 5400
+    # An idle auto-delete window is stored when the admin sets one, so a full
+    # rotation account gives its VM slot back; the default stays "never".
+    assert saved_freestyle["autoDeleteSeconds"] == 1800
 
     # Blank keeps the saved lanes; a sent list replaces the whole thing.
     blank = _request("/api/admin/execution-settings")
@@ -1449,6 +1454,11 @@ def test_freestyle_save_defaults_to_eight_gb_and_rejects_bad_values(
         # field must be refused rather than silently freezing the VM.
         {"freestyleIdlePauseSeconds": 0},
         {"freestyleIdlePauseSeconds": 86_401},
+        # 0 would read as "delete immediately" to the provider, so an empty form
+        # field must be refused rather than silently destroying idle VMs.
+        {"freestyleAutoDeleteSeconds": 0},
+        {"freestyleAutoDeleteSeconds": 59},
+        {"freestyleAutoDeleteSeconds": 2_592_001},
         {"freestyleMaxDurationSeconds": 30},
         {"freestyleApiUrl": "http://api.freestyle.sh"},
         {"freestyleApiKeys": "not a valid key!!"},
@@ -1512,6 +1522,7 @@ def test_the_test_button_probes_freestyle_with_the_configured_lanes(
         "freestyleApiKeys": f"{lane_a},{lane_b}",
         "freestyleMemoryMb": 8192,
         "freestyleIdlePauseSeconds": 1200,
+        "freestyleAutoDeleteSeconds": 900,
     }
     response = admin_registry.admin_route(request, "/api/admin/execution-test")
     assert response is not None
@@ -1529,6 +1540,9 @@ def test_the_test_button_probes_freestyle_with_the_configured_lanes(
     # otherwise Test would report a VM that auto-pauses on a different schedule
     # from the one a real task gets.
     assert seen["config"].idle_pause_seconds == 1200
+    # The same rule for the auto-delete window: the probe carries the value the
+    # button was told about, so Test reports the schedule a real task would get.
+    assert seen["config"].auto_delete_seconds == 900
 
 
 def test_the_freestyle_page_does_not_overclaim_what_rotation_buys(monkeypatch) -> None:

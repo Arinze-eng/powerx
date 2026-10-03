@@ -39,6 +39,7 @@ from nanobot.agent.tools.freestyle_backend import (
     validate_freestyle_api_key,
     validate_freestyle_api_keys,
     validate_freestyle_api_url,
+    validate_freestyle_auto_delete_seconds,
     validate_freestyle_cpu_cores,
     validate_freestyle_disk_size_gb,
     validate_freestyle_fetch_allow_hosts,
@@ -70,6 +71,10 @@ class _FakeTransport:
         self.files: dict[str, bytes] = {}
         self.by_id: dict[str, dict[str, Any]] = {}
         self.denied_lanes: set[int] = set()
+        # The message a denied lane raises. The default names the condition the
+        # way the real API does; a test can override it to prove the bare status
+        # is enough on its own.
+        self.denied_message = "Freestyle {method} {path} returned 429: quota exceeded for this account"
         self.counter = 0
 
     def install(self, backend: FreestyleExecutionBackend) -> None:
@@ -100,7 +105,7 @@ class _FakeTransport:
             lane_index = int(lane or 0)
             if lane_index in self.denied_lanes:
                 raise FreestyleError(
-                    f"Freestyle {method} {path} returned 429: quota exceeded for this account"
+                    self.denied_message.format(method=method, path=path)
                 )
             if method == "POST" and path == "/v5/vms":
                 self.counter += 1
@@ -238,6 +243,21 @@ def test_validate_idle_pause_window() -> None:
             validate_freestyle_idle_pause_seconds(bad)
 
 
+def test_validate_auto_delete_window() -> None:
+    # -1 is the provider's own "never delete an unused VM" sentinel and stays
+    # the default so a session's disk survives between tasks.
+    assert validate_freestyle_auto_delete_seconds(-1) == -1
+    assert validate_freestyle_auto_delete_seconds(60) == 60
+    assert validate_freestyle_auto_delete_seconds(2_592_000) == 2_592_000
+    assert FreestyleExecutionConfig().auto_delete_seconds == -1
+    # 0 must never be passed through: the provider reads it as "delete
+    # immediately", so an empty form field would destroy every VM the moment it
+    # went idle while looking like the feature was simply off.
+    for bad in (0, 1, 59, -2, 2_592_001, "x", None):
+        with pytest.raises(ValueError):
+            validate_freestyle_auto_delete_seconds(bad)
+
+
 def test_validate_duration_tag_snapshot_and_fetch_hosts() -> None:
     assert validate_freestyle_max_duration_seconds(3600) == 3600
     assert validate_freestyle_tag("") == "powerx"
@@ -334,6 +354,24 @@ def test_new_session_uses_the_next_lane_and_pins_to_it() -> None:
     assert second.api_key == KEY_B
 
 
+def test_a_full_account_is_parked_and_the_next_lane_takes_the_session() -> None:
+    """A lane-fatal 429 must park its lane and rotate on, not retry it.
+
+    The real provider answers a full account with a bare 429 whose body may not
+    name the condition, so the status alone has to count as lane-fatal.
+    """
+    backend, transport = _backend(api_keys=[KEY_A, KEY_B])
+    transport.denied_lanes = {0}
+    # A bare status in the message, with no "quota"/"limit" keyword: the old
+    # marker list would have let this through and retried the full lane.
+    transport.denied_message = "Freestyle POST /v5/vms returned 429: "
+    vm, lane = asyncio.run(backend._ensure_vm())
+    assert lane == 1
+    assert backend.lane_index == 1
+    # The full lane is now parked, so a fresh session skips it entirely.
+    assert 0 in backend.rotation.parked()
+
+
 def test_pinned_session_never_rotates_away_from_its_disk() -> None:
     backend, transport = _backend(api_keys=[KEY_A, KEY_B])
     asyncio.run(backend._ensure_vm())  # pins lane 0
@@ -396,6 +434,17 @@ def test_create_body_carries_the_idle_pause_window() -> None:
         c for c in transport_never.calls if c["method"] == "POST" and c["path"] == "/v5/vms"
     )
     assert create["json"]["idleTimeoutSeconds"] == -1
+
+
+def test_create_body_carries_the_auto_delete_window() -> None:
+    """The idle auto-DELETE window is armed at create on the provider's field."""
+    backend, transport = _backend(auto_delete_seconds=600)
+    asyncio.run(backend._ensure_vm())
+    create = next(c for c in transport.calls if c["method"] == "POST" and c["path"] == "/v5/vms")
+    assert create["json"]["autoDeleteSeconds"] == 600
+    # Auto-delete is independent of the idle PAUSE and the run budget.
+    assert create["json"]["idleTimeoutSeconds"] == 300
+    assert create["json"]["maxRunTotalSeconds"] == 3600
 
 
 def test_run_short_command_stays_inside_the_sync_ceiling() -> None:
