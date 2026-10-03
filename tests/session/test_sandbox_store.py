@@ -18,14 +18,17 @@ class FakeTransport:
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
         self.calls: list[tuple[str, str]] = []
+        self.keys: list[tuple[str, str | None]] = []
 
-    def push(self, local: Path, remote: str) -> bool:
+    def push(self, local: Path, remote: str, key: str | None = None) -> bool:
         self.calls.append(("push", remote))
+        self.keys.append(("push", key))
         self.files[remote] = Path(local).read_bytes()
         return True
 
-    def pull(self, remote: str, local: Path) -> bool:
+    def pull(self, remote: str, local: Path, key: str | None = None) -> bool:
         self.calls.append(("pull", remote))
+        self.keys.append(("pull", key))
         data = self.files.get(remote)
         if data is None:
             return False
@@ -33,17 +36,19 @@ class FakeTransport:
         local.write_bytes(data)
         return True
 
-    def remove(self, remote: str) -> bool:
+    def remove(self, remote: str, key: str | None = None) -> bool:
         self.calls.append(("remove", remote))
+        self.keys.append(("remove", key))
         self.files.pop(remote, None)
         return True
 
-    def list_remote(self, remote_dir: str) -> list[str]:
+    def list_remote(self, remote_dir: str, key: str | None = None) -> list[str]:
         self.calls.append(("list", remote_dir))
+        self.keys.append(("list", key))
         return sorted(
-            key.rsplit("/", 1)[-1]
-            for key in self.files
-            if key.startswith(remote_dir.rstrip("/") + "/")
+            name.rsplit("/", 1)[-1]
+            for name in self.files
+            if name.startswith(remote_dir.rstrip("/") + "/")
         )
 
     def ops(self, name: str) -> list[str]:
@@ -415,7 +420,7 @@ async def test_push_uses_write_bytes_when_the_backend_has_it(tmp_path, bridge) -
     local = tmp_path / "s.jsonl"
     local.write_bytes(b'{"_type": "metadata"}\n')
 
-    assert await _transport()._push(local, "/remote/sessions/s.jsonl") is True
+    assert await _transport()._push(local, "/remote/sessions/s.jsonl", None) is True
 
     assert backend.written["/remote/sessions/s.jsonl"] == local.read_bytes()
     assert bridge["commands"] == ["mkdir -p /remote/sessions"], "the parent is made first"
@@ -427,7 +432,7 @@ async def test_push_uses_upload_on_a_backend_without_write_bytes(tmp_path, bridg
     local = tmp_path / "s.jsonl"
     local.write_bytes(b'{"_type": "metadata"}\n')
 
-    assert await _transport()._push(local, "/remote/sessions/s.jsonl") is True
+    assert await _transport()._push(local, "/remote/sessions/s.jsonl", None) is True
 
     assert backend.uploaded["/remote/sessions/s.jsonl"] == local.read_bytes()
 
@@ -438,7 +443,7 @@ async def test_push_falls_back_to_the_text_write(tmp_path, bridge) -> None:
     local = tmp_path / "s.jsonl"
     local.write_bytes(b'{"_type": "metadata"}\n')
 
-    assert await _transport()._push(local, "/remote/sessions/s.jsonl") is True
+    assert await _transport()._push(local, "/remote/sessions/s.jsonl", None) is True
 
     assert backend.written["/remote/sessions/s.jsonl"] == local.read_text()
 
@@ -449,7 +454,7 @@ async def test_push_to_the_native_sdk_uses_files_write(tmp_path, bridge) -> None
     local = tmp_path / "s.jsonl"
     local.write_bytes(b'{"_type": "metadata"}\n')
 
-    assert await _transport()._push(local, "/remote/sessions/s.jsonl") is True
+    assert await _transport()._push(local, "/remote/sessions/s.jsonl", None) is True
 
     assert native.written["/remote/sessions/s.jsonl"] == local.read_text()
 
@@ -461,7 +466,7 @@ async def test_a_large_session_avoids_the_text_only_native_cap(tmp_path, bridge)
     local = tmp_path / "big.jsonl"
     local.write_bytes(b'{"_type": "metadata"}\n' + b"x" * (sbx._TEXT_WRITE_LIMIT + 10))
 
-    assert await _transport()._push(local, "/remote/sessions/big.jsonl") is True
+    assert await _transport()._push(local, "/remote/sessions/big.jsonl", None) is True
 
     assert getattr(native, "written", {}) == {}, "the text API must not be used"
     assert any("base64 -d" in command for command in bridge["commands"])
@@ -473,7 +478,7 @@ async def test_push_is_refused_past_the_size_cap(tmp_path, bridge) -> None:
     local = tmp_path / "huge.jsonl"
     local.write_bytes(b"x" * (sbx.MAX_PUSH_BYTES + 1))
 
-    assert await _transport()._push(local, "/remote/sessions/huge.jsonl") is False
+    assert await _transport()._push(local, "/remote/sessions/huge.jsonl", None) is False
     assert backend.written == {}
 
 
@@ -484,26 +489,87 @@ async def test_push_degrades_when_no_sandbox_is_configured(tmp_path, bridge) -> 
     local = tmp_path / "s.jsonl"
     local.write_bytes(b'{"_type": "metadata"}\n')
 
-    assert await _transport()._push(local, "/remote/sessions/s.jsonl") is False
+    assert await _transport()._push(local, "/remote/sessions/s.jsonl", None) is False
 
 
 async def test_remove_goes_through_the_exec_plane(bridge) -> None:
     bridge["executor"] = _executor(backend=_ByteWriterBackend())
 
-    assert await _transport()._remove("/remote/sessions/s.jsonl") is True
+    assert await _transport()._remove("/remote/sessions/s.jsonl", None) is True
 
     assert bridge["commands"] == ["rm -f /remote/sessions/s.jsonl"]
 
 
-async def test_list_remote_filters_to_session_files(tmp_path, monkeypatch) -> None:
+async def test_list_remote_filters_to_session_files(tmp_path, monkeypatch, bridge) -> None:
     from nanobot.agent.tools import workspace_bridge as wb
+
+    bridge["executor"] = _executor(backend=_ByteWriterBackend())
 
     async def fake_run(command, *, timeout=120, executor=None):
         return True, "a.jsonl\nb.txt\n.workspace\nc.jsonl\n"
 
     monkeypatch.setattr(wb, "run_remote", fake_run)
 
-    assert await _transport()._list("/remote/sessions") == ["a.jsonl", "c.jsonl"]
+    assert await _transport()._list("/remote/sessions", None) == ["a.jsonl", "c.jsonl"]
+
+
+# -- the sandbox key has to be captured, not looked up later ----------------
+
+
+def test_the_key_is_captured_on_the_calling_thread(store, monkeypatch) -> None:
+    """The worker has no request context, so the key must be read before it goes."""
+    made, transport = store
+    monkeypatch.setattr(sbx, "sandbox_key", lambda: "web:abc")
+
+    made.save(_session("cli:one"))
+    assert made.flush(5.0)
+
+    assert transport.keys == [("push", "web:abc")]
+
+
+def test_deletes_carry_the_key_too(store, monkeypatch) -> None:
+    made, transport = store
+    made.save(_session("cli:one"))
+    assert made.flush(5.0)
+    monkeypatch.setattr(sbx, "sandbox_key", lambda: "telegram:99")
+
+    made.delete("cli:one")
+    assert made.flush(5.0)
+
+    assert ("remove", "telegram:99") in transport.keys
+
+
+def test_a_hydrating_read_carries_the_key(store, tmp_path, monkeypatch) -> None:
+    made, transport = store
+    made.save(_session("cli:one"))
+    assert made.flush(5.0)
+    monkeypatch.setattr(sbx, "sandbox_key", lambda: "web:abc")
+
+    cold = _cold(tmp_path, transport)
+    cold.load("cli:one")
+
+    assert [entry for entry in transport.keys if entry[0] == "pull"] == [("pull", "web:abc")]
+
+
+def test_sandbox_key_is_none_without_a_request_context() -> None:
+    """The ``"unknown"`` sentinel must not become a key we try to resolve."""
+    assert sbx.sandbox_key() is None
+
+
+def test_an_unreachable_sandbox_is_reported_not_swallowed(tmp_path, bridge, caplog) -> None:
+    """A mirror that reaches nowhere must not look like success."""
+    from nanobot.agent.tools.workspace_bridge import RemoteExecutor
+
+    bridge["executor"] = RemoteExecutor(name="unavailable")
+    local = tmp_path / "s.jsonl"
+    local.write_bytes(b'{"_type": "metadata"}\n')
+    transport = _transport()
+
+    assert transport.push(local, "/remote/sessions/s.jsonl", None) is False
+
+    transport2 = _transport()
+    transport2.push(local, "/remote/sessions/s.jsonl", None)
+    assert transport2._warned_unavailable is True
 
 
 # -- the manager's own wiring ----------------------------------------------
@@ -576,12 +642,12 @@ class _VPSBackend(_UploadBackend):
 )
 def test_the_root_is_derived_from_the_backend_workspace(bridge, backend, expected) -> None:
     bridge["executor"] = _executor(backend=backend)
-    assert _transport().root() == expected
+    assert _transport().root(None) == expected
 
 
 def test_the_root_uses_the_native_sandbox_workspace(bridge) -> None:
     bridge["executor"] = _executor(native=_NativeSandbox())
-    assert _transport().root() == "/workspace/.nanobot/sessions"
+    assert _transport().root(None) == "/workspace/.nanobot/sessions"
 
 
 def test_the_root_never_leans_on_a_shell_expansion(bridge) -> None:
@@ -594,7 +660,7 @@ def test_the_root_falls_back_when_no_backend_is_configured(bridge) -> None:
     from nanobot.agent.tools.workspace_bridge import RemoteExecutor
 
     bridge["executor"] = RemoteExecutor(name="unavailable")
-    assert _transport().root() == sbx.FALLBACK_REMOTE_ROOT
+    assert _transport().root(None) == sbx.FALLBACK_REMOTE_ROOT
 
 
 async def test_push_and_remove_target_the_derived_root(tmp_path, bridge) -> None:
@@ -604,8 +670,8 @@ async def test_push_and_remove_target_the_derived_root(tmp_path, bridge) -> None
     local.write_bytes(b'{"_type": "metadata"}\n')
     transport = _transport()
 
-    await transport._push(local, f"{transport.root()}/s.jsonl")
-    await transport._remove(f"{transport.root()}/s.jsonl")
+    await transport._push(local, f"{transport.root(None)}/s.jsonl", None)
+    await transport._remove(f"{transport.root(None)}/s.jsonl", None)
 
     assert list(backend.written) == ["/home/ubuntu/workspace/.nanobot/sessions/s.jsonl"]
     assert bridge["commands"] == [

@@ -31,17 +31,30 @@ The transport runs on its own daemon thread with its own event loop, so a sync
 caller never has to be "inside a running loop" (which is exactly the trap
 ``workspace_bridge.stage_from_sandbox`` documents) and never awaits the caller's.
 
+WHY THE SANDBOX KEY IS CAPTURED, NOT LOOKED UP
+---------------------------------------------
+The background worker has no request context, and ``workspace_bridge`` resolves
+the *ambient* sandbox from that context (``novita_sandbox._session_key()`` falls
+back to ``"unknown"``). On the native Novita path the resolver is literally
+``_STORE.get(key)`` — a lookup in a map of *live, in-process* sandbox handles — so
+from a contextless thread it returns nothing, the executor is unavailable, and
+every push would fail silently.
+
+So the key is captured **on the calling thread**, which is inside the request
+context, and handed to the worker. Resolution then bypasses the contextvar
+entirely. When even that fails the store says so once, loudly: a mirror that
+never reaches the sandbox must not look like success.
+
 Enable it with ``NANOBOT_SESSION_STORE=sandbox``. Default off: with the flag
 unset nothing here is constructed and persistence is byte-for-byte the old
 behaviour.
 
 KNOWN LIMITS
 ------------
-* One shared sandbox. The transport resolves the *ambient* executor, so all
-  sessions mirror into the one sandbox that executor names, not one sandbox per
-  session. That is deliberate for the first step (get state off the host's single
-  volume); per-session sandboxes need the session key to be known before the
-  session is loaded, which is a separate problem.
+* One sandbox per session key. Because the key is request-scoped, the mirror for
+  a session follows that session's sandbox, so ``list_sessions`` can only merge
+  what the *current* sandbox holds. A host-wide listing needs one host-owned
+  sandbox for session state, which is the next step and a separate decision.
 * Pushes are best-effort. A failed push is logged and retried on the next write
   to that session; ``flush()`` reports whether the queue drained.
 """
@@ -93,16 +106,42 @@ MAX_PUSH_BYTES = 64 * 1024 * 1024
 _TEXT_WRITE_LIMIT = 100_000
 
 
+def sandbox_key() -> str | None:
+    """The sandbox key for the *current* request, or ``None`` outside one.
+
+    Called on the calling thread, never from the worker: this is the whole point
+    of capturing it. ``None`` means "no context", which the transport reports
+    honestly rather than resolving to a sandbox that does not exist —
+    ``novita_sandbox._session_key()`` answers the literal ``"unknown"`` when
+    there is no request context, and that is a sentinel, never a real key.
+    """
+    try:
+        from nanobot.agent.tools.novita_sandbox import _session_key  # noqa: PLC2701
+    except Exception:  # noqa: BLE001 - no sandbox stack installed
+        return None
+    try:
+        key = _session_key()
+    except Exception:  # noqa: BLE001
+        return None
+    if not key or key == "unknown":
+        return None
+    return key
+
+
 class SandboxTransport(Protocol):
-    """The four file operations the store needs from a sandbox."""
+    """The four file operations the store needs from a sandbox.
 
-    def push(self, local: Path, remote: str) -> bool: ...
+    Every method takes the sandbox *key* captured on the calling thread, because
+    the transport's own thread cannot discover it.
+    """
 
-    def pull(self, remote: str, local: Path) -> bool: ...
+    def push(self, local: Path, remote: str, key: str | None = None) -> bool: ...
 
-    def remove(self, remote: str) -> bool: ...
+    def pull(self, remote: str, local: Path, key: str | None = None) -> bool: ...
 
-    def list_remote(self, remote_dir: str) -> list[str]: ...
+    def remove(self, remote: str, key: str | None = None) -> bool: ...
+
+    def list_remote(self, remote_dir: str, key: str | None = None) -> list[str]: ...
 
 
 class _LoopThread:
@@ -145,9 +184,30 @@ class RemoteSandboxTransport:
         self._dirs_lock = threading.Lock()
         self._root: str | None = None
         self._root_lock = threading.Lock()
+        self._warned_unavailable = False
+
+    # -- executor ----------------------------------------------------------- #
+    async def _executor(self, key: str | None) -> Any:
+        from nanobot.agent.tools.workspace_bridge import resolve_remote_executor
+
+        try:
+            return await resolve_remote_executor(session_key=key)
+        except Exception:  # noqa: BLE001 - absence of a backend is not fatal
+            return None
+
+    def _warn_unavailable(self, key: str | None) -> None:
+        """Say once that the mirror is not reaching anywhere."""
+        if self._warned_unavailable:
+            return
+        self._warned_unavailable = True
+        logger.warning(
+            "sandbox session store: no sandbox is reachable (key={}); sessions are "
+            "being written locally only",
+            key or "ambient",
+        )
 
     # -- remote root -------------------------------------------------------- #
-    async def _resolve_root(self) -> str:
+    async def _resolve_root(self, key: str | None) -> str:
         """Put the mirror inside the sandbox's *own* workspace.
 
         Every backend's file API refuses a path outside its workspace (Freestyle
@@ -156,11 +216,8 @@ class RemoteSandboxTransport:
         backend rather than assumed. ``$HOME`` is deliberately not used: it is a
         shell expansion, and no path guard ever runs a shell.
         """
-        from nanobot.agent.tools.workspace_bridge import resolve_remote_executor
-
-        try:
-            executor = await resolve_remote_executor()
-        except Exception:  # noqa: BLE001 - no backend is a fallback, not a failure
+        executor = await self._executor(key)
+        if executor is None:
             return FALLBACK_REMOTE_ROOT
         backend = executor.backend
         candidates: list[Any] = [
@@ -175,14 +232,14 @@ class RemoteSandboxTransport:
                 return f"{candidate.strip().rstrip('/')}/{DEFAULT_REMOTE_SUBDIR}"
         return FALLBACK_REMOTE_ROOT
 
-    def root(self) -> str:
+    def root(self, key: str | None = None) -> str:
         """The resolved remote root, computed once."""
         with self._root_lock:
             if self._root is not None:
                 return self._root
         resolved: str | None = None
         try:
-            resolved = self._loop.call(self._resolve_root(), timeout=self._timeout)
+            resolved = self._loop.call(self._resolve_root(key), timeout=self._timeout)
         except Exception:  # noqa: BLE001 - a failed resolve must not raise
             resolved = None
         with self._root_lock:
@@ -193,7 +250,7 @@ class RemoteSandboxTransport:
             return self._root
 
     # -- async internals --------------------------------------------------- #
-    async def _ensure_parent(self, remote: str) -> None:
+    async def _ensure_parent(self, remote: str, executor: Any) -> None:
         """Best-effort ``mkdir -p`` of *remote*'s parent, once per directory.
 
         Backends that write through their own file API already create parents;
@@ -209,14 +266,14 @@ class RemoteSandboxTransport:
         from nanobot.agent.tools.workspace_bridge import run_remote
 
         try:
-            await run_remote(f"mkdir -p {shlex.quote(parent)}", timeout=60)
+            await run_remote(f"mkdir -p {shlex.quote(parent)}", timeout=60, executor=executor)
         except Exception as exc:  # noqa: BLE001 - a failed mkdir is not fatal
             logger.debug("sandbox session mkdir failed ({}): {}", parent, exc)
             return
         with self._dirs_lock:
             self._ready_dirs.add(parent)
 
-    async def _write_bytes(self, remote: str, data: bytes, local: Path) -> bool:
+    async def _write_bytes(self, remote: str, data: bytes, local: Path, executor: Any) -> bool:
         """Write through whichever byte API the resolved backend offers.
 
         Every backend in the tree exposes a different one, so the order is:
@@ -225,14 +282,11 @@ class RemoteSandboxTransport:
         the plain text ``write`` — and only the *native* Novita SDK path, whose
         file API is text-only, is capped by ``_TEXT_WRITE_LIMIT``.
         """
-        from nanobot.agent.tools.workspace_bridge import resolve_remote_executor
-
-        executor = await resolve_remote_executor()
-        if not executor.available:
+        if executor is None or not executor.available:
             return False
         if executor.native is not None:
             if len(data) > _TEXT_WRITE_LIMIT:
-                return await self._write_via_exec(remote, data)
+                return await self._write_via_exec(remote, data, executor)
             text = data.decode("utf-8", errors="replace")
             await asyncio.to_thread(executor.native.files.write, remote, text)
             return True
@@ -250,19 +304,19 @@ class RemoteSandboxTransport:
         await backend.write(remote, data.decode("utf-8", errors="replace"))  # type: ignore[attr-defined]
         return True
 
-    async def _write_via_exec(self, remote: str, data: bytes) -> bool:
+    async def _write_via_exec(self, remote: str, data: bytes, executor: Any) -> bool:
         """Write through the exec plane as base64. The universal fallback."""
         from nanobot.agent.tools.workspace_bridge import run_remote
 
-        await self._ensure_parent(remote)
+        await self._ensure_parent(remote, executor)
         encoded = base64.b64encode(data).decode("ascii")
         command = f"printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(remote)}"
-        ok, out = await run_remote(command, timeout=180)
+        ok, out = await run_remote(command, timeout=180, executor=executor)
         if not ok:
             logger.debug("sandbox session exec write failed ({}): {}", remote, out[:200])
         return ok
 
-    async def _push(self, local: Path, remote: str) -> bool:
+    async def _push(self, local: Path, remote: str, key: str | None) -> bool:
         try:
             data = local.read_bytes()
         except OSError:
@@ -275,18 +329,26 @@ class RemoteSandboxTransport:
                 MAX_PUSH_BYTES,
             )
             return False
+        executor = await self._executor(key)
+        if executor is None or not executor.available:
+            self._warn_unavailable(key)
+            return False
         try:
-            await self._ensure_parent(remote)
-            return await self._write_bytes(remote, data, local)
+            await self._ensure_parent(remote, executor)
+            return await self._write_bytes(remote, data, local, executor)
         except Exception as exc:  # noqa: BLE001 - a failed push is retried next time
             logger.warning("sandbox session push failed ({}): {}", remote, exc)
             return False
 
-    async def _pull(self, remote: str, local: Path) -> bool:
+    async def _pull(self, remote: str, local: Path, key: str | None) -> bool:
         from nanobot.agent.tools.workspace_bridge import fetch_remote_file
 
+        executor = await self._executor(key)
+        if executor is None or not executor.available:
+            self._warn_unavailable(key)
+            return False
         try:
-            data = await fetch_remote_file(remote)
+            data = await fetch_remote_file(remote, executor=executor)
         except Exception as exc:  # noqa: BLE001
             logger.warning("sandbox session pull failed ({}): {}", remote, exc)
             return False
@@ -301,20 +363,32 @@ class RemoteSandboxTransport:
         except OSError:
             return False
 
-    async def _remove(self, remote: str) -> bool:
+    async def _remove(self, remote: str, key: str | None) -> bool:
         from nanobot.agent.tools.workspace_bridge import run_remote
 
+        executor = await self._executor(key)
+        if executor is None or not executor.available:
+            self._warn_unavailable(key)
+            return False
         try:
-            ok, _out = await run_remote(f"rm -f {shlex.quote(remote)}", timeout=60)
+            ok, _out = await run_remote(
+                f"rm -f {shlex.quote(remote)}", timeout=60, executor=executor
+            )
             return ok
         except Exception as exc:  # noqa: BLE001
             logger.debug("sandbox session remove failed ({}): {}", remote, exc)
             return False
 
-    async def _list(self, remote_dir: str) -> list[str]:
+    async def _list(self, remote_dir: str, key: str | None) -> list[str]:
         from nanobot.agent.tools.workspace_bridge import run_remote
 
-        ok, out = await run_remote(f"ls -1 {remote_dir} 2>/dev/null || true", timeout=60)
+        executor = await self._executor(key)
+        if executor is None or not executor.available:
+            self._warn_unavailable(key)
+            return []
+        ok, out = await run_remote(
+            f"ls -1 {remote_dir} 2>/dev/null || true", timeout=60, executor=executor
+        )
         if not ok and not out:
             return []
         return [
@@ -322,27 +396,27 @@ class RemoteSandboxTransport:
         ]
 
     # -- sync surface ------------------------------------------------------ #
-    def push(self, local: Path, remote: str) -> bool:
+    def push(self, local: Path, remote: str, key: str | None = None) -> bool:
         try:
-            return bool(self._loop.call(self._push(local, remote), timeout=self._timeout))
+            return bool(self._loop.call(self._push(local, remote, key), timeout=self._timeout))
         except Exception:  # noqa: BLE001 - timeout/transport failure
             return False
 
-    def pull(self, remote: str, local: Path) -> bool:
+    def pull(self, remote: str, local: Path, key: str | None = None) -> bool:
         try:
-            return bool(self._loop.call(self._pull(remote, local), timeout=self._timeout))
+            return bool(self._loop.call(self._pull(remote, local, key), timeout=self._timeout))
         except Exception:  # noqa: BLE001
             return False
 
-    def remove(self, remote: str) -> bool:
+    def remove(self, remote: str, key: str | None = None) -> bool:
         try:
-            return bool(self._loop.call(self._remove(remote), timeout=self._timeout))
+            return bool(self._loop.call(self._remove(remote, key), timeout=self._timeout))
         except Exception:  # noqa: BLE001
             return False
 
-    def list_remote(self, remote_dir: str) -> list[str]:
+    def list_remote(self, remote_dir: str, key: str | None = None) -> list[str]:
         try:
-            return list(self._loop.call(self._list(remote_dir), timeout=self._timeout))
+            return list(self._loop.call(self._list(remote_dir, key), timeout=self._timeout))
         except Exception:  # noqa: BLE001
             return []
 
@@ -374,7 +448,9 @@ class SandboxSessionStore:
         self._transport = transport or RemoteSandboxTransport()
         self._hydrated = False
         self._lock = threading.Lock()
-        self._queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        # (op, session key, sandbox key). The sandbox key is captured on the
+        # calling thread, where the request context still exists.
+        self._queue: queue.Queue[tuple[str, str, str | None]] = queue.Queue()
         # Counts enqueued-but-not-finished work. ``queue.empty()`` is not a
         # "done" signal: the worker pops an item before it has pushed it, so an
         # emptiness check lets ``flush`` return while a push is still in flight.
@@ -394,47 +470,51 @@ class SandboxSessionStore:
     def remote_root(self) -> str:
         return self._root()
 
-    def _root(self) -> str:
+    def _root(self, skey: str | None = None) -> str:
         """The remote root: explicit, from the environment, or backend-derived."""
         if self._remote_root:
             return self._remote_root
         derive = getattr(self._transport, "root", None)
         if callable(derive):
             try:
-                return str(derive())
+                return str(derive(skey if skey is not None else sandbox_key()))
             except Exception:  # noqa: BLE001 - a transport that cannot answer
                 pass
         return FALLBACK_REMOTE_ROOT
 
     # -- remote paths ------------------------------------------------------ #
-    def _remote_path(self, key: str) -> str:
+    def _remote_path(self, key: str, skey: str | None = None) -> str:
         name = self._local.get_session_path(key).name
-        return f"{self._root()}/{name}"
+        return f"{self._root(skey)}/{name}"
 
     # -- background worker ------------------------------------------------- #
     def _enqueue(self, op: str, key: str) -> None:
+        # The sandbox key is read HERE, on the caller's thread: the worker has no
+        # request context, and the Novita resolver is a lookup of live in-process
+        # sandbox handles keyed by it.
+        skey = sandbox_key()
         # Incremented before the put so the worker can never finish an item that
         # a waiting ``flush`` has not yet counted.
         with self._idle:
             self._pending += 1
-        self._queue.put((op, key))
+        self._queue.put((op, key, skey))
 
     def _drain(self) -> None:
         while True:
             try:
-                op, key = self._queue.get()
+                op, key, skey = self._queue.get()
             except Exception:  # pragma: no cover - queue is unbounded
                 continue
             try:
-                remote = self._remote_path(key)
+                remote = self._remote_path(key, skey)
                 if op == "remove":
-                    self._transport.remove(remote)
+                    self._transport.remove(remote, skey)
                     continue
                 path = self._local.get_session_path(key)
                 # A file that is gone locally is a delete, not a push: the delete
                 # enqueued its own removal, so a missing file here is not an error.
                 if path.exists():
-                    self._transport.push(path, remote)
+                    self._transport.push(path, remote, skey)
             except Exception as exc:  # noqa: BLE001 - the worker must never die
                 logger.debug("sandbox session push worker: {}", exc)
             finally:
@@ -459,20 +539,22 @@ class SandboxSessionStore:
         path = self._local.get_session_path(key)
         if path.exists():
             return False
-        return bool(self._transport.pull(self._remote_path(key), path))
+        skey = sandbox_key()
+        return bool(self._transport.pull(self._remote_path(key, skey), path, skey))
 
     def _hydrate_all(self) -> None:
         with self._lock:
             if self._hydrated:
                 return
             self._hydrated = True
-        root = self._root()
-        names = self._transport.list_remote(root)
+        skey = sandbox_key()
+        root = self._root(skey)
+        names = self._transport.list_remote(root, skey)
         for name in names[:MAX_HYDRATE_FILES]:
             path = self._local.sessions_dir / name
             if path.exists():
                 continue
-            self._transport.pull(f"{root}/{name}", path)
+            self._transport.pull(f"{root}/{name}", path, skey)
 
     # -- SessionStore protocol --------------------------------------------- #
     def load(self, key: str) -> Session | None:
@@ -535,6 +617,7 @@ __all__ = [
     "SandboxTransport",
     "RemoteSandboxTransport",
     "store_from_env",
+    "sandbox_key",
     "DEFAULT_REMOTE_SUBDIR",
     "FALLBACK_REMOTE_ROOT",
     "MAX_HYDRATE_FILES",
