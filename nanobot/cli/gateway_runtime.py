@@ -47,7 +47,11 @@ from nanobot.session.keys import UNIFIED_SESSION_KEY, last_channel_from_metadata
 from nanobot.utils.evaluator import evaluate_response, resolve_evaluator_prompt
 from nanobot.utils.helpers import sync_workspace_templates
 from nanobot.utils.memory_guard import log_memory
-from nanobot.utils.memory_reclaim import freeze_long_lived, reclaim_memory
+from nanobot.utils.memory_reclaim import (
+    freeze_long_lived,
+    reclaim_memory,
+    reclaim_page_cache,
+)
 from nanobot.webui.build import BuildMode
 from nanobot.webui.dev import WebUIDevError, WebUIDevServer
 from nanobot.webui.sidebar_state import read_webui_sidebar_state
@@ -372,12 +376,22 @@ async def _memory_reclaim_loop(shutdown_event: asyncio.Event) -> None:
             result = await asyncio.to_thread(
                 reclaim_memory, tag="idle_reclaim", log=False
             )
+            # Heap alone does not move the charge an idle container is graded on.
+            # Read live from the old build: cgroup_mb holds at 376 while freed_mb
+            # reports 18 every cycle and anonymous memory sits flat at 58.7% --
+            # the 77% charge is cache, and it reached 85.7% over four idle
+            # minutes on 2026-10-03, one background write from the plan limit
+            # with no turn running to trip the charge guard. Hand that half back
+            # here too, off the loop like the rest of the housekeeping.
+            page_cache = await asyncio.to_thread(reclaim_page_cache, log=False)
             # One greppable line per cycle: the evidence the reclaimer is alive,
             # plus what it actually returned this time.
             log_memory(
                 "idle_reclaim",
                 freed_mb=result["freed_mb"],
                 trimmed=result["trimmed"],
+                cache_mb=page_cache.get("asked_mb"),
+                cache_files=page_cache.get("files"),
             )
         except asyncio.CancelledError:
             raise

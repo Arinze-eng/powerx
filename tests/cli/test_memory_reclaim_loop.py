@@ -63,6 +63,20 @@ def _fast_interval(monkeypatch, seconds: float = 0.02) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_real_page_cache_sweep(monkeypatch):
+    """Every cycle now also hands back page cache; keep that off the real disk.
+
+    The sweep is bounded but real, and these tests must not depend on the host
+    filesystem. Individual tests override this to assert what gets logged.
+    """
+    monkeypatch.setattr(
+        gateway_runtime,
+        "reclaim_page_cache",
+        lambda *a, **k: {"asked_mb": 0.0, "files": 0, "cgroup_ok": False, "cgroup_reason": ""},
+    )
+
+
 def test_loop_reclaims_without_any_turn_and_logs_it(monkeypatch) -> None:
     """The whole point: memory comes back while the service is idle."""
     calls: list[str] = []
@@ -76,7 +90,14 @@ def test_loop_reclaims_without_any_turn_and_logs_it(monkeypatch) -> None:
         logged.append((tag, extra))
         return {}
 
+    page_calls: list[str] = []
+
+    def fake_page_cache(*, log: bool = True):
+        page_calls.append("sweep")
+        return {"asked_mb": 41.2, "files": 17, "cgroup_ok": False, "cgroup_reason": ""}
+
     monkeypatch.setattr(gateway_runtime, "reclaim_memory", fake_reclaim)
+    monkeypatch.setattr(gateway_runtime, "reclaim_page_cache", fake_page_cache)
     monkeypatch.setattr(gateway_runtime, "log_memory", fake_log_memory)
     _fast_interval(monkeypatch)
 
@@ -92,10 +113,13 @@ def test_loop_reclaims_without_any_turn_and_logs_it(monkeypatch) -> None:
 
     asyncio.run(scenario())
     assert calls == ["idle_reclaim"], calls
+    assert page_calls == ["sweep"], "the idle cycle must hand back page cache too"
     assert logged, "each cycle must emit a greppable MEMORY line"
     assert logged[0][0] == "idle_reclaim"
     assert logged[0][1]["freed_mb"] == 7.5
     assert logged[0][1]["trimmed"] == 1
+    assert logged[0][1]["cache_mb"] == 41.2
+    assert logged[0][1]["cache_files"] == 17
 
 
 def test_ready_shutdown_exits_without_reclaiming(monkeypatch) -> None:
