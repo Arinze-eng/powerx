@@ -274,6 +274,67 @@ describe("NanobotClient", () => {
     expect(lastSocket().sent).toEqual([]);
   });
 
+  it("holds a mutation issued while the socket is reconnecting", async () => {
+    // Opening a session or topic while the socket is mid-reconnect used to
+    // reject instantly with "503 WebUI connection is not open", which read as
+    // the app being broken until the socket came back on its own. The request
+    // belongs to the user; it waits for the socket and then runs.
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: true,
+      maxBackoffMs: 10,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    client.connect();
+    lastSocket().fakeOpen();
+    lastSocket().fakeCloseWithCode(1006);
+
+    const pending = client.requestMutation<{ opened: boolean }>("session.open", {
+      key: "websocket:abc",
+    });
+    // Nothing was sent, and nothing was rejected.
+    expect(lastSocket().sent).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(20);
+    const retrySocket = lastSocket();
+    retrySocket.fakeOpen();
+
+    const frame = JSON.parse(retrySocket.sent.at(-1) as string);
+    expect(frame).toMatchObject({
+      type: "webui_request",
+      action: "session.open",
+      payload: { key: "websocket:abc" },
+    });
+
+    retrySocket.fakeMessage({
+      event: "webui_response",
+      request_id: frame.request_id,
+      ok: true,
+      result: { opened: true },
+    });
+    await expect(pending).resolves.toEqual({ opened: true });
+  });
+
+  it("still rejects a mutation queued during a reconnect that never completes", async () => {
+    // Queueing must not swallow a real outage: the client-side timeout is what
+    // ends it, with a reason rather than a transport lie.
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: true,
+      maxBackoffMs: 10,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    client.connect();
+    lastSocket().fakeOpen();
+    lastSocket().fakeCloseWithCode(1006);
+
+    const pending = expect(
+      client.requestMutation("session.open", {}, 25),
+    ).rejects.toMatchObject({ status: 504 });
+    await vi.advanceTimersByTimeAsync(25);
+    await pending;
+  });
+
   it("keeps temporary chats out of attachment and reconnect state", async () => {
     const client = new NanobotClient({
       url: "ws://test",

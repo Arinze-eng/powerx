@@ -874,6 +874,15 @@ export class NanobotClient {
    * Send one WebUI mutation over the authenticated socket. Pending requests are
    * replayed with the same request_id after reconnect so the gateway can join or
    * replay the original operation. A client-side timeout still ends all retries.
+   *
+   * A socket that is briefly down is not a failed operation: the client
+   * reconnects on its own and ``handleOpen`` replays everything in
+   * ``pendingWebUIRequests``, so a mutation issued *during* a reconnect is
+   * queued here and sent when the socket is back. Rejecting instead is what
+   * surfaced a bare "503 WebUI connection is not open" the moment the user
+   * opened another session or topic, which read as a broken app until the
+   * socket returned by itself. It is only rejected when no socket is coming —
+   * there is no connection and ``reconnect`` is off.
    */
   requestMutation<T>(
     action: string,
@@ -881,7 +890,9 @@ export class NanobotClient {
     timeoutMs: number = 20_000,
   ): Promise<T> {
     const socket = this.socket;
-    if (!socket || socket.readyState !== WS_OPEN) {
+    const socketOpen = !!socket && socket.readyState === WS_OPEN;
+    const willReconnect = !this.intentionallyClosed && this.shouldReconnect;
+    if (!socketOpen && !willReconnect) {
       return Promise.reject(
         new WebUIMutationError(503, "WebUI connection is not open"),
       );
@@ -922,8 +933,15 @@ export class NanobotClient {
         timer,
         serializedFrame,
       });
+      // Send now when the socket is up. When it is mid-reconnect the entry is
+      // left registered and ``handleOpen`` sends it on connect — the same
+      // replay path every other pending mutation already uses.
+      const live = this.socket;
+      if (!live || live.readyState !== WS_OPEN) {
+        return;
+      }
       try {
-        socket.send(serializedFrame);
+        live.send(serializedFrame);
       } catch {
         clearTimeout(timer);
         this.pendingWebUIRequests.delete(requestId);
