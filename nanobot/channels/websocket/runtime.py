@@ -1255,17 +1255,23 @@ class WebSocketChannel(BaseChannel):
             )
             if scope is None:
                 return
-            self._workspaces.persist_scope(
+            # [FIX 2026-10-03] Two session saves (file lock + fsync on the
+            # persistent volume) used to run right here on the event loop. On a
+            # slow volume that stalls the loop, the platform's /api/health probe
+            # goes unanswered, and the container is replaced under the user (503).
+            await asyncio.to_thread(
+                self._workspaces.persist_scope,
                 new_id,
                 scope,
                 owner_user_id=self._conn_supabase_user.get(connection, ""),
             )
+            model_fields = await asyncio.to_thread(self._attached_model_fields, new_id)
             self._attach(connection, new_id)
             await self._send_event(
                 connection,
                 "attached",
                 chat_id=new_id,
-                **self._attached_model_fields(new_id),
+                **model_fields,
             )
             await self._send_event(
                 connection,

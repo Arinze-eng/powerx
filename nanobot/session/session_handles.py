@@ -6,6 +6,7 @@ import hashlib
 import math
 import re
 import secrets
+import threading
 from dataclasses import dataclass
 from typing import Any, TypedDict, cast
 
@@ -143,6 +144,9 @@ def _allocate_name(used: set[str]) -> str:
             return name
 
 
+_ALLOCATION_LOCK = threading.Lock()
+
+
 class SessionHandleResolver:
     """Allocate and resolve handles stored in canonical session metadata."""
 
@@ -150,6 +154,71 @@ class SessionHandleResolver:
         self._sessions = sessions
 
     def _ensure_all(self) -> dict[str, SessionHandle]:
+        # [FIX 2026-10-03] The old body held the shared session-files lock while
+        # it listed AND re-read all ~500 chats, on every sidebar refresh. Saves
+        # on the event loop take that lock, so the loop stalled behind it and
+        # the platform's health probe failed (the "503 on a new session").
+        # The read pass is now lock-free; only the rare handle write for a
+        # not-yet-named chat goes through the per-file locked update.
+        headers = self._sessions.session_headers_nolock() if hasattr(
+            self._sessions, "session_headers_nolock"
+        ) else None
+        if headers is None:
+            return self._ensure_all_locked()
+        names, _used, pending = self._classify(headers)
+        if pending:
+            with _ALLOCATION_LOCK:
+                # Re-read: another caller may have named them while we waited.
+                headers = self._sessions.session_headers_nolock() or headers
+                names, used, pending = self._classify(headers)
+                for key in pending:
+                    name = _allocate_name(used)
+                    if not self._sessions.update_session_metadata(
+                        key,
+                        {SESSION_HANDLE_METADATA_KEY: name},
+                        fsync=True,
+                    ):
+                        continue
+                    names[key] = name
+                    used.add(name)
+        return {
+            key: session_handle_for_name(key, name)
+            for key, name in names.items()
+        }
+
+    @staticmethod
+    def _classify(
+        headers: list[dict[str, Any]],
+    ) -> tuple[dict[str, str], set[str], list[str]]:
+        rows = sorted(
+            headers,
+            key=lambda row: (str(row.get("created_at", "")), str(row.get("key", ""))),
+        )
+        used: set[str] = set()
+        names: dict[str, str] = {}
+        pending: list[str] = []
+        for row in rows:
+            raw_key: Any = row.get("key")
+            if not isinstance(raw_key, str):
+                continue
+            metadata = row.get("metadata")
+            raw_name = (
+                metadata.get(SESSION_HANDLE_METADATA_KEY)
+                if isinstance(metadata, dict)
+                else None
+            )
+            try:
+                name = normalize_session_handle(raw_name) if isinstance(raw_name, str) else ""
+            except ValueError:
+                name = ""
+            if not name or name in used:
+                pending.append(raw_key)
+                continue
+            names[raw_key] = name
+            used.add(name)
+        return names, used, pending
+
+    def _ensure_all_locked(self) -> dict[str, SessionHandle]:
         with self._sessions.locked_session_files():
             rows = sorted(
                 self._sessions.list_sessions(),

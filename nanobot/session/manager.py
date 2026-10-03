@@ -1385,6 +1385,50 @@ class JsonlSessionStore:
                 return self.session_payload(repaired)
             return None
 
+    def session_headers_nolock(self) -> list[dict[str, Any]]:
+        """Read every session's metadata header WITHOUT the session-files lock.
+
+        Read-only and repair-free: session files are replaced atomically, so a
+        concurrent writer yields either the old or the new header, never a torn
+        one. Unreadable files are skipped (the locked paths own repair). Exists
+        so a sidebar-wide read never holds the lock the event loop's own saves
+        need.
+        """
+        headers: list[dict[str, Any]] = []
+        try:
+            paths = list(self.sessions_dir.glob("*.jsonl"))
+        except OSError:
+            return headers
+        for path in paths:
+            storage_key = self.session_key_from_path(path)
+            if storage_key is None:
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    first_line = ""
+                    for line in f:
+                        first_line = line.strip()
+                        if first_line:
+                            break
+                if not first_line:
+                    continue
+                data = _json_object(json.loads(first_line))
+            except (OSError, ValueError, *_SESSION_DATA_ERRORS):
+                continue
+            if data.get("_type") != "metadata":
+                continue
+            key_value = data.get("key")
+            created = data.get("created_at")
+            meta = data.get("metadata", {})
+            headers.append(
+                {
+                    "key": key_value if isinstance(key_value, str) and key_value else storage_key,
+                    "created_at": created if isinstance(created, str) else "",
+                    "metadata": meta if isinstance(meta, dict) else {},
+                }
+            )
+        return headers
+
     def read_metadata(self, key: str) -> SessionMetadataPayload | None:
         with self._session_files_lock:
             return self._read_metadata_unlocked(key)
@@ -1842,6 +1886,12 @@ class SessionManager:
         if updated and (session := self.get_cached(key)) is not None:
             session.metadata.update(deepcopy(updates))
         return updated
+
+    def session_headers_nolock(self) -> list[dict[str, Any]] | None:
+        """Lock-free metadata headers, or None when the store is not the JSONL one."""
+        if self._store is not self._jsonl_store:
+            return None
+        return self._jsonl_store.session_headers_nolock()
 
     def list_sessions(self) -> list[dict[str, Any]]:
         return cast(list[dict[str, Any]], self._store.list_sessions())

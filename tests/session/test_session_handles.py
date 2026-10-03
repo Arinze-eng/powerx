@@ -126,35 +126,39 @@ def test_concurrent_resolvers_do_not_allocate_duplicate_handles(tmp_path: Path) 
     assert len({handle.name for handle in snapshots[0]}) == 8
 
 
-def test_session_snapshot_and_handle_sync_share_one_lock(
+def test_handle_listing_never_holds_the_session_files_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A sidebar-wide handle read must not block saves.
+
+    Saves run on the event loop; if this read held the shared lock for the whole
+    scan, the loop stalled, the health probe failed and the container was
+    replaced (the 503 on a new session).
+    """
     manager = SessionManager(tmp_path)
     _persist(manager, "websocket:first")
     _persist(manager, "websocket:second")
     resolver = SessionHandleResolver(manager)
     resolver.list_all()
-    snapshot_taken = Event()
-    release_snapshot = Event()
-    original_list = manager.list_sessions
+    reading = Event()
+    release = Event()
+    original = manager.session_headers_nolock
 
-    def paused_list():
-        rows = original_list()
-        snapshot_taken.set()
-        assert release_snapshot.wait(timeout=2)
+    def paused_headers():
+        rows = original()
+        reading.set()
+        assert release.wait(timeout=2)
         return rows
 
-    monkeypatch.setattr(manager, "list_sessions", paused_list)
+    monkeypatch.setattr(manager, "session_headers_nolock", paused_headers)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        old_sync = pool.submit(resolver.list_all)
-        assert snapshot_taken.wait(timeout=2)
+        listing = pool.submit(resolver.list_all)
+        assert reading.wait(timeout=2)
         deletion = pool.submit(manager.delete_session, "websocket:first")
-        with pytest.raises(FutureTimeout):
-            deletion.result(timeout=0.05)
-        release_snapshot.set()
-        old_sync.result(timeout=2)
-        assert deletion.result(timeout=2)
+        assert deletion.result(timeout=2)  # not blocked by the in-flight read
+        release.set()
+        listing.result(timeout=2)
 
 
 def test_resolver_lists_every_persisted_channel_and_resolves_by_name(

@@ -65,14 +65,28 @@ _TRANSCRIPT_NON_ANSWER_KINDS = {"progress", "reasoning", "tool_hint"}
 
 
 def list_webui_sessions(session_manager: SessionManager) -> list[dict[str, Any]]:
-    """Return session rows for the WebUI sidebar, backed by a rebuildable cache."""
-    with session_manager.locked_session_files():
-        rows, changed = _reconcile_index(session_manager)
-        if changed:
-            try:
-                _write_index_rows(session_manager.sessions_dir, rows)
-            except Exception as e:
-                logger.debug("Failed to write WebUI session list index: {}", e)
+    """Return session rows for the WebUI sidebar, backed by a rebuildable cache.
+
+    [FIX 2026-10-03] This used to hold the shared session-files lock for the
+    whole reconcile (a stat/read per chat, 500+ chats, on a slow volume:
+    10-23 s). Every ``SessionManager.save`` takes that same lock, and
+    ``new_chat`` / the first turn of a chat save *on the event loop*, so the
+    first thing a user did in a new session blocked the loop behind the sidebar
+    scan. A blocked loop cannot answer the platform's /api/health probe, the
+    platform replaced the container, and the user saw a 503.
+
+    The scan is read-only and every session file is replaced atomically
+    (write tmp + os.replace), so it is safe without the lock: a row is only
+    trusted when its file signature still matches, and a racing writer just
+    causes a rescan of that one file next time. The index file is itself written
+    tmp + replace, so concurrent refreshes cannot corrupt it.
+    """
+    rows, changed = _reconcile_index(session_manager)
+    if changed:
+        try:
+            _write_index_rows(session_manager.sessions_dir, rows)
+        except Exception as e:
+            logger.debug("Failed to write WebUI session list index: {}", e)
     sessions = [
         _public_row(session_manager.sessions_dir, get_webui_dir(), row)
         for row in rows
