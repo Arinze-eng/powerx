@@ -1289,17 +1289,65 @@ def _bg_video(src: Path, args: argparse.Namespace, model: str) -> int:
 def cmd_download(args: argparse.Namespace) -> int:
     """yt-dlp, the one tool that reliably turns a link into a file."""
     ytdlp = _require("yt-dlp")
-    out_dir = Path(args.out or "downloads").expanduser()
+
+    # ``--out`` is documented as "file or directory" and the model writes
+    # ``--out clip.mp4`` because that is what the tool schema promises. This used
+    # to treat EVERY value as a directory: ``mkdir`` created a folder literally
+    # named ``clip.mp4`` and the video landed inside it under its YouTube title.
+    # MEASURED 2026-10-03 on Freestyle: ``--out $HOME/dl/yt_test.mp4`` produced
+    # ``dl/yt_test.mp4/Akpan and Oduma 'BAD FRIEND' [9lY-1J8LPS0].mp4``. That
+    # silently breaks every chained edit, because the next action is handed a
+    # path that is a directory, and ffprobe answers "Is a directory".
+    #
+    # A value carrying a media extension is therefore a target FILE: the stem is
+    # kept and yt-dlp fills in the real container extension (which is why the
+    # template still ends in ``%(ext)s`` -- the merged container is decided by
+    # yt-dlp, not by us, and claiming a name we did not produce would be a lie).
+    # Anything else is a directory, as before.
+    raw_out = str(args.out or "").strip()
+    target_file: Path | None = None
+    if raw_out and Path(raw_out).suffix.lower() in (VIDEO_EXT | AUDIO_EXT):
+        target_file = Path(raw_out).expanduser()
+        out_dir = target_file.parent
+    else:
+        out_dir = Path(raw_out or "downloads").expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    template = str(out_dir / "%(title).120B [%(id)s].%(ext)s")
+    if target_file is not None:
+        template = str(target_file.with_suffix("")) + ".%(ext)s"
+    else:
+        template = str(out_dir / "%(title).120B [%(id)s].%(ext)s")
+
     height = {"best": 0, "1080": 1080, "720": 720, "480": 480}.get(str(args.quality), 1080)
+
+    # Codec preference. YouTube's "best" is now AV1 video + Opus audio, which is
+    # the wrong default for a tool whose whole purpose is cutting clips for
+    # TikTok/Instagram and re-encoding them: AV1 is slow to decode on the CPU
+    # sandbox, several social uploaders reject it, and a later ``trim``/``crop``
+    # has to transcode it anyway. MEASURED 2026-10-03: an unqualified download of
+    # youtu.be/9lY-1J8LPS0 returned ``video_codec=av1, audio_codec=opus``.
+    # ``-S`` is a *sort*, not a filter: h264/aac is preferred when the format
+    # exists at the requested height, and the fallback chain below still serves
+    # the video when it does not -- so this can never make a download fail that
+    # previously succeeded. ``--codec best`` restores the old raw preference.
+    if str(getattr(args, "codec", "h264") or "h264").lower() == "best":
+        sort_spec = None
+    else:
+        sort_spec = "vcodec:h264,acodec:aac,ext:mp4:m4a"
+
+    if height:
+        fmt = "bv*[height<=%d]+ba/b[height<=%d]/bv*+ba/b" % (height, height)
+    else:
+        fmt = "bv*+ba/b"
+
     cmd = [
         ytdlp, "--no-playlist" if not args.playlist else "--yes-playlist",
         "--no-warnings", "--newline", "--no-progress",
-        "-f", ("bestvideo[height<=%d]+bestaudio/best[height<=%d]/best" % (height, height)) if height else "bestvideo+bestaudio/best",
+        "-f", fmt,
         "--merge-output-format", "mp4",
-        "-o", template,
     ]
+    if sort_spec:
+        cmd += ["-S", sort_spec]
+    cmd += ["-o", template]
     if args.audio_only:
         cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
     if args.cookies:
@@ -1314,11 +1362,23 @@ def cmd_download(args: argparse.Namespace) -> int:
         raise MediaError(
             f"download failed: {_tail(proc.stderr or proc.stdout)}"
         )
-    produced = sorted(
-        (p for p in out_dir.iterdir() if p.is_file() and p.stem != ""),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    # A named target file means "these files", not "everything in this folder":
+    # the directory may already hold earlier downloads, and reporting a stale
+    # one as this call's output is how a chained edit ends up operating on the
+    # wrong video.
+    if target_file is not None:
+        candidates = sorted(
+            (p for p in out_dir.glob(target_file.stem + ".*") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    else:
+        candidates = sorted(
+            (p for p in out_dir.iterdir() if p.is_file() and p.stem != ""),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    produced = candidates
     newest = produced[0] if produced else None
     result: dict[str, Any] = {
         "url": args.url,
@@ -1709,6 +1769,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("url")
     p.add_argument("--out")
     p.add_argument("--quality", default="1080", choices=["best", "1080", "720", "480"])
+    # h264/aac by default: the social-upload and re-encode friendly pair. `best`
+    # restores yt-dlp's raw preference (currently AV1/Opus on YouTube), which is
+    # only what you want when the file will never be edited or re-uploaded.
+    p.add_argument("--codec", default="h264", choices=["h264", "best"])
     p.add_argument("--audio-only", action="store_true")
     p.add_argument("--playlist", action="store_true")
     p.add_argument("--cookies")

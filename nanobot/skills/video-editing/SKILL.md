@@ -118,19 +118,61 @@ Then deliver the files. They live in the sandbox, so fetch the finished one out 
 the sandbox tool's own `download_url` action and give the user **the onlyfiles.com link
 it returns** — never a sandbox path, a preview/signed URL or a `/f/` deployment link.
 
-## Downloading
+## Downloading from YouTube (and anywhere else yt-dlp reaches)
+
+You can pull a video straight off a link and then edit it — all inside the sandbox,
+with nothing running on the application host. This is the normal way to start a
+short/clip job from a URL the user pasted.
 
 ```
-media_sandbox(action="download", url="https://youtu.be/...", out="/path",
-              quality="1080")            # or audio_only=true, section="*00:01:00-00:02:30"
+media_sandbox(action="download", url="https://youtu.be/9lY-1J8LPS0",
+              out="/home/ubuntu/dl/clip.mp4", quality="720")
 ```
+
+**`out` decides the shape of the result — read this, it is the #1 thing to get right:**
+
+* ends in a media extension (`clip.mp4`) → it is the **output file**, and the video
+  lands at exactly that path.
+* anything else (`/home/ubuntu/dl`) → it is a **directory**, and the file is named
+  from the video's own title.
+
+Prefer the **file** form whenever you are going to edit the result: every later
+action needs the real path, and a title-named file inside a folder is a path you
+have to go and read back out of the result before you can use it.
+
+`codec="h264"` is the default and is what you want: H.264/AAC re-encodes fast on a
+CPU sandbox and is accepted by TikTok, Instagram and every editor. `codec="best"`
+takes the platform's raw preference instead — YouTube now serves AV1/Opus, which is
+slower to decode and refused by several uploaders — so only use it for a file that
+will never be edited or re-uploaded.
 
 `subtitles="en"` also pulls the platform's own captions — cheaper and more accurate
 than transcribing when they exist. One URL means one video: `playlist=true` is
 required for a whole channel, deliberately.
 
-Download, then **watch it** before editing. A downloaded video's shape is rarely
-what the user described.
+### The link → edit chain
+
+Download, then **watch it** before editing — a downloaded video's shape is rarely
+what the user described. The full job, in order:
+
+```
+media_sandbox(action="download", url="<link>", out="/home/ubuntu/dl/clip.mp4",
+              quality="720")                       # 1. fetch
+media_sandbox(action="watch", input="/home/ubuntu/dl/clip.mp4",
+              count=16, timestamps=True)           # 2. LOOK at it
+media_sandbox(action="shorts", input="/home/ubuntu/dl/clip.mp4",
+              count=3, captions=True)              # 3. or trim/crop/hd
+```
+
+Then fetch the finished file out with `download_url` and give the user the
+`onlyfiles.com` link (see "Delivering the result" above). Never tell the user to
+download it themselves and never hand them a raw ffmpeg command.
+
+**Where this runs.** The download, the ffmpeg encode and the model weights all live
+in the user's execution sandbox. The application host only issues the command and
+reads the JSON back — it never runs yt-dlp, ffmpeg or a whisper model. Keep it that
+way: if you find yourself writing a local `ffmpeg`/`yt-dlp` invocation, you have
+taken the wrong path.
 
 ## Transcripts and captions
 
