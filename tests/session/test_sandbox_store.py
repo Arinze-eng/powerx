@@ -699,3 +699,97 @@ def test_the_store_falls_back_when_the_transport_cannot_derive_a_root(tmp_path) 
     )
     assert made.remote_root == sbx.FALLBACK_REMOTE_ROOT
     assert made._remote_path("cli:one").startswith(sbx.FALLBACK_REMOTE_ROOT + "/")
+
+
+# -- one store per directory ------------------------------------------------ #
+#
+# The production traceback (2026-10-03T17:16:50Z), from the webui sidebar:
+#
+#     ws_http.py:1316 _sessions_list_payload
+#       -> SessionHandleResolver._ensure_all_locked      (headers were None)
+#       -> with self._sessions.locked_session_files():   <-- JsonlSessionStore #1
+#       -> SandboxSessionStore.list_sessions
+#       -> self._local.list_sessions()                   <-- JsonlSessionStore #2
+#       -> with self._session_files_lock:                <-- same path, other object
+#     RuntimeError: Deadlock: lock '.../.session-files.lock' is already held by a
+#     different FileLock instance in this thread.
+#
+# Two causes, both pinned below: the wrapper built a *second* store over the same
+# sessions directory, and it reported ``None`` from ``session_headers_nolock`` so
+# the caller took the locked path in the first place.
+
+
+def test_the_wrapper_reuses_a_store_it_is_handed(tmp_path) -> None:
+    """One directory, one store, one lock object."""
+    own = JsonlSessionStore(tmp_path / "work", sessions_root=tmp_path / "store")
+
+    made = sbx.SandboxSessionStore(
+        tmp_path / "work",
+        sessions_root=tmp_path / "store",
+        remote_root="/remote/sessions",
+        transport=FakeTransport(),
+        local=own,
+    )
+
+    assert made.local is own, (
+        "a second store over one sessions directory is a second lock over one "
+        "lock file, and filelock calls that a deadlock on the first nested acquire"
+    )
+    assert made.local._session_files_lock is own._session_files_lock
+
+
+def test_an_explicit_mirror_root_still_builds_its_own_store(tmp_path) -> None:
+    """The mirror directory is the one thing that may legitimately differ."""
+    own = JsonlSessionStore(tmp_path / "work", sessions_root=tmp_path / "store")
+
+    made = sbx.SandboxSessionStore(
+        tmp_path / "work",
+        sessions_root=tmp_path / "store",
+        remote_root="/remote/sessions",
+        transport=FakeTransport(),
+        mirror_root=tmp_path / "elsewhere",
+        local=own,
+    )
+
+    assert made.local is not own
+    assert made.local.sessions_dir != own.sessions_dir, "distinct directories, distinct locks"
+
+
+def test_the_manager_hands_its_own_store_to_the_wrapper(tmp_path, monkeypatch) -> None:
+    """The wiring that matters: the boot path must not build the second store."""
+    monkeypatch.setenv("NANOBOT_SESSION_STORE", "sandbox")
+    monkeypatch.setattr(sbx, "RemoteSandboxTransport", lambda: FakeTransport())
+
+    mgr = SessionManager(tmp_path / "work", sessions_root=tmp_path / "store")
+
+    assert isinstance(mgr._store, sbx.SandboxSessionStore)
+    assert mgr._store.local is mgr._jsonl_store
+    assert mgr._store.local.sessions_dir == mgr.sessions_dir
+
+
+def test_headers_are_served_through_the_wrapper(tmp_path, monkeypatch) -> None:
+    """``None`` here is what sent the sidebar down the locked path."""
+    monkeypatch.setenv("NANOBOT_SESSION_STORE", "sandbox")
+    monkeypatch.setattr(sbx, "RemoteSandboxTransport", lambda: FakeTransport())
+    mgr = SessionManager(tmp_path / "work", sessions_root=tmp_path / "store")
+    mgr.save(_session("cli:one", "hello"))
+
+    headers = mgr.session_headers_nolock()
+
+    assert headers is not None, "a wrapper that can answer must answer"
+    assert [row["key"] for row in headers] == ["cli:one"]
+
+
+def test_the_sidebar_handle_list_survives_the_wrapper(tmp_path, monkeypatch) -> None:
+    """The exact call that raised ``Deadlock`` in production, end to end."""
+    from nanobot.session.session_handles import SessionHandleResolver
+
+    monkeypatch.setenv("NANOBOT_SESSION_STORE", "sandbox")
+    monkeypatch.setattr(sbx, "RemoteSandboxTransport", lambda: FakeTransport())
+    mgr = SessionManager(tmp_path / "work", sessions_root=tmp_path / "store")
+    mgr.save(_session("cli:one", "hello"))
+
+    handles = SessionHandleResolver(mgr).list_all_by_key()
+
+    assert list(handles) == ["cli:one"]
+    assert handles["cli:one"].name, "the handle is allocated, not empty"

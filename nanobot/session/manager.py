@@ -1589,7 +1589,11 @@ class SessionManager:
             # acyclic, because that module imports this one.
             from nanobot.session.sandbox_store import store_from_env
 
-            store = store_from_env(workspace, sessions_root=sessions_root)
+            # ``local`` hands over the store just built above rather than letting
+            # the wrapper build a second one over the same directory: two stores
+            # on one sessions dir are two lock objects on one lock file, and the
+            # sidebar's list-then-read path enters one while holding the other.
+            store = store_from_env(workspace, sessions_root=sessions_root, local=self._jsonl_store)
         self._store: SessionStore = store if store is not None else self._jsonl_store
         self.sessions_dir = self._jsonl_store.sessions_dir
         self.legacy_sessions_dir = self._jsonl_store.legacy_sessions_dir
@@ -1882,10 +1886,21 @@ class SessionManager:
         return updated
 
     def session_headers_nolock(self) -> list[dict[str, Any]] | None:
-        """Lock-free metadata headers, or None when the store is not the JSONL one."""
-        if self._store is not self._jsonl_store:
+        """Lock-free metadata headers, or None when no active store can answer.
+
+        The active store is asked rather than the JSONL one specifically. A store
+        that wraps the JSONL store -- the sandbox-backed mirror -- can answer the
+        same question without the session-files lock; reporting ``None`` for it
+        sent every sidebar refresh down the *locked* path instead, which is both
+        the stall that path exists to avoid and, since the wrapper's mirror is a
+        second store over the same directory, a ``Deadlock``.
+        """
+        if self._store is self._jsonl_store:
+            return self._jsonl_store.session_headers_nolock()
+        reader = getattr(self._store, "session_headers_nolock", None)
+        if reader is None:
             return None
-        return self._jsonl_store.session_headers_nolock()
+        return cast(list[dict[str, Any]] | None, reader())
 
     def list_sessions(self) -> list[dict[str, Any]]:
         return cast(list[dict[str, Any]], self._store.list_sessions())

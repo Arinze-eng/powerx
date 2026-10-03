@@ -436,11 +436,27 @@ class SandboxSessionStore:
         remote_root: str | None = None,
         transport: SandboxTransport | None = None,
         mirror_root: Path | None = None,
+        local: JsonlSessionStore | None = None,
     ) -> None:
         # The mirror is a real JsonlSessionStore, so every format decision (the
         # metadata line, provider state, atomic replace, fsync) stays in exactly
         # one implementation and this class only moves bytes.
-        self._local = JsonlSessionStore(workspace, sessions_root=mirror_root or sessions_root)
+        #
+        # A caller that already owns a store over this directory passes it in:
+        # two instances resolve to the same sessions directory and therefore to
+        # the same lock *file*, and ``filelock`` treats two lock objects on one
+        # path as a deadlock the moment one is held while the other is entered --
+        # which is exactly what the sidebar's list-then-read path does.
+        # An explicit ``mirror_root`` wins: it names a directory of its own, so a
+        # store handed in for the *default* directory is the wrong one. Only when
+        # the mirror would land on the same directory is the caller's store the
+        # correct object to share.
+        if mirror_root is not None:
+            self._local = JsonlSessionStore(workspace, sessions_root=mirror_root)
+        elif local is not None:
+            self._local = local
+        else:
+            self._local = JsonlSessionStore(workspace, sessions_root=sessions_root)
         # An explicit root wins; otherwise the transport derives one from the
         # backend's workspace on first use, because every backend's path guard
         # refuses anything outside it.
@@ -596,17 +612,40 @@ class SandboxSessionStore:
         self._hydrate_all()
         return self._local.list_sessions()
 
+    def session_headers_nolock(self) -> list[dict[str, Any]]:
+        """Metadata headers read WITHOUT the session-files lock, as the mirror does.
 
-def store_from_env(workspace: Path, *, sessions_root: Path | None = None) -> Any:
+        The mirror is a ``JsonlSessionStore`` over the very directory the caller
+        already locks, so answering "not me" here sent every sidebar refresh down
+        the locked path -- which then re-entered that same lock through this
+        store's second instance and raised ``Deadlock``. Hydration runs first for
+        the same reason ``list_sessions`` does it: on a fresh host the mirror is
+        empty, and an empty header list reads as "no sessions" rather than
+        "not pulled yet".
+        """
+        self._hydrate_all()
+        return self._local.session_headers_nolock()
+
+
+def store_from_env(
+    workspace: Path,
+    *,
+    sessions_root: Path | None = None,
+    local: JsonlSessionStore | None = None,
+) -> Any:
     """Return a ``SandboxSessionStore`` when ``NANOBOT_SESSION_STORE=sandbox``.
 
     The single decision point, so ``SessionManager`` construction stays unchanged
     and the feature is one environment variable away in either direction.
+
+    ``local`` is the store the caller already built over the same directory. It
+    must be passed when one exists: a second store over one sessions directory is
+    a second lock over one lock file, which deadlocks the first nested acquire.
     """
     if os.getenv("NANOBOT_SESSION_STORE", "").strip().lower() != "sandbox":
         return None
     try:
-        return SandboxSessionStore(workspace, sessions_root=sessions_root)
+        return SandboxSessionStore(workspace, sessions_root=sessions_root, local=local)
     except Exception as exc:  # noqa: BLE001 - never break boot over this
         logger.warning("sandbox session store unavailable, using local sessions: {}", exc)
         return None
