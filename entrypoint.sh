@@ -238,21 +238,27 @@ if [ "$(id -u)" = "0" ]; then
     # while the replacement boots. It was measured again across three failed
     # boots in a row (2026-10-03 05:01-05:03), each killed before the port bound.
     #
-    # memory.reclaim is root-owned (mode 0200), so this window -- after the
-    # privilege drop at the end of this block, it is gone -- is the only chance
-    # the gateway has to do this with the kernel's whole-cgroup interface.
-    if [ -w /sys/fs/cgroup/memory.reclaim ]; then
+    # memory.reclaim is root-owned (mode 0200). Root bypasses the mode bits, so
+    # what actually decides whether this works is the mount: a container whose
+    # /sys/fs/cgroup is mounted read-only refuses the write even here, and there
+    # is no second chance after the privilege drop at the end of this block. The
+    # attempt is logged either way -- a silent skip on a platform that refuses it
+    # reads as "no cache to reclaim" when the truth is "this lever is closed".
+    _reclaim=/sys/fs/cgroup/memory.reclaim
+    if [ ! -e "$_reclaim" ]; then
+        echo "[entrypoint] page cache reclaim skipped: $_reclaim absent (cgroup v1, or not exposed)"
+    else
         _file_bytes=$(awk '/^file /{print $2; exit}' /sys/fs/cgroup/memory.stat 2>/dev/null || true)
-        if [ -n "${_file_bytes:-}" ] && [ "$_file_bytes" -gt 0 ] 2>/dev/null; then
-            # The kernel refuses a request larger than what is reclaimable (EIO),
-            # so ask for a fraction and step down once rather than lose the write.
-            if echo "$(( _file_bytes * 3 / 4 ))" > /sys/fs/cgroup/memory.reclaim 2>/dev/null; then
-                echo "[entrypoint] reclaimed page cache: asked $(( _file_bytes / 1048576 * 3 / 4 )) MB back"
-            elif echo "$(( _file_bytes / 8 ))" > /sys/fs/cgroup/memory.reclaim 2>/dev/null; then
-                echo "[entrypoint] reclaimed page cache: asked $(( _file_bytes / 1048576 / 8 )) MB back (stepped down)"
-            else
-                echo "[entrypoint] warning: memory.reclaim refused this write; continuing" >&2
-            fi
+        if [ -z "${_file_bytes:-}" ] || ! [ "$_file_bytes" -gt 0 ] 2>/dev/null; then
+            echo "[entrypoint] page cache reclaim skipped: memory.stat reports no file bytes"
+        # The kernel refuses a request larger than what is reclaimable (EIO), so
+        # ask for a fraction and step down once rather than lose the write.
+        elif echo "$(( _file_bytes * 3 / 4 ))" > "$_reclaim" 2>/dev/null; then
+            echo "[entrypoint] reclaimed page cache: asked $(( _file_bytes / 1048576 * 3 / 4 )) MB back"
+        elif echo "$(( _file_bytes / 8 ))" > "$_reclaim" 2>/dev/null; then
+            echo "[entrypoint] reclaimed page cache: asked $(( _file_bytes / 1048576 / 8 )) MB back (stepped down)"
+        else
+            echo "[entrypoint] page cache reclaim skipped: $_reclaim refused the write (read-only mount, or not permitted); continuing" >&2
         fi
     fi
     if [ "$LAUNCH_SIDECARS" = "true" ]; then
