@@ -167,6 +167,62 @@ def test_the_sweep_is_bounded(tmp_path) -> None:
     assert fadvise_page_cache([tmp_path], max_files=3)["files"] == 3
 
 
+def test_the_size_floor_is_applied_before_the_budget_is_spent(tmp_path) -> None:
+    """Small files must not consume the allowance reserved for large ones.
+
+    Every root this sweep walks has this shape -- a handful of large build
+    outputs buried in a tree of small files. Charging the budget per file
+    *visited* and only then discarding the ones under the floor spends it on
+    exactly the files it will not fadvise. The live deployment logged the
+    symptom on 2026-10-03: ``files=57`` from a budget of 512, so 455 entries
+    went on files that were thrown away and 89% of the sweep's reach was lost.
+    """
+    for index in range(10):
+        (tmp_path / f"tiny{index}.txt").write_text("y" * 1000)
+    (tmp_path / "build-output.bin").write_bytes(b"x" * (3 * _MB))
+
+    # The allowance is smaller than the number of small files: the large file is
+    # only reached because the floor is applied inside the walker.
+    result = fadvise_page_cache([tmp_path], max_files=2)
+
+    assert result["files"] == 1, "the 3 MB file must be reached, not skipped"
+    assert result["asked_mb"] == 3.0
+
+
+def test_the_crawl_stops_at_max_entries(tmp_path, monkeypatch) -> None:
+    """The floor moved inside the walker, so the file budget no longer bounds it.
+
+    Nothing here qualifies, so ``max_files`` can never end the walk; without a
+    separate ceiling it would traverse the whole tree on every model iteration
+    while the charge is high.
+    """
+    node = tmp_path
+    for index in range(50):
+        node = node / f"d{index}"
+        node.mkdir()
+        (node / "tiny.txt").write_text("y" * 100)
+
+    entered: list[str] = []
+    real_scandir = os.scandir
+
+    def _counting(path="."):  # noqa: ANN001 - test double
+        entered.append(str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", _counting)
+
+    files = list(
+        memory_reclaim._iter_cacheable_files(
+            tmp_path, max_files=512, min_file_bytes=_MB, max_entries=10
+        )
+    )
+
+    assert files == [], "nothing here clears the floor"
+    assert 1 <= len(entered) < 10, (
+        "the entry ceiling must end the walk well before the 50th directory"
+    )
+
+
 def test_the_sweep_never_raises_on_a_missing_or_unreadable_root(tmp_path) -> None:
     result = fadvise_page_cache([tmp_path / "missing", tmp_path / "also-missing"])
 

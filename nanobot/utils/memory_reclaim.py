@@ -87,6 +87,14 @@ _CGROUP_RECLAIM_MARGIN = 0.75
 _FADVISE_MAX_FILES = 512
 _FADVISE_MIN_FILE_BYTES = 1 * 1024 * 1024
 
+#: Hard ceiling on *entries examined*, independent of how many files qualify.
+#: The file budget alone cannot bound the crawl once the size floor is applied
+#: inside the walker: a tree of 100k small modules would never reach
+#: ``_FADVISE_MAX_FILES`` files and would be walked to the end on every
+#: iteration. 20k ``stat`` calls is tens of milliseconds -- affordable
+#: housekeeping, and it only gets spent where qualifying files are sparse.
+_FADVISE_MAX_ENTRIES = 20_000
+
 
 def _malloc_trim() -> int | None:
     """Ask glibc to return free heap to the kernel. ``None`` when unavailable.
@@ -200,19 +208,35 @@ def _default_page_cache_roots() -> list[Path]:
     return roots
 
 
-def _iter_cacheable_files(root: Path, *, max_files: int) -> Iterator[Path]:
-    """Yield up to *max_files* regular files under *root*, depth-first.
+def _iter_cacheable_files(
+    root: Path,
+    *,
+    max_files: int,
+    min_file_bytes: int = 0,
+    max_entries: int = _FADVISE_MAX_ENTRIES,
+) -> Iterator[Path]:
+    """Yield up to *max_files* regular files of at least *min_file_bytes*.
 
     ``scandir`` is consumed lazily rather than materialised: this runs on every
     model iteration once the charge is high, and a volume here holds hundreds of
     thousands of files. Symlinks are not followed, so the sweep cannot be walked
     out of the directories it was pointed at.
+
+    The size floor is applied *here*, before the budget is charged. Applying it
+    in the caller instead -- as this did originally -- spends the whole
+    ``max_files`` allowance on files that are then discarded for being under the
+    floor. Measured against the live deployment's root list, 512 entries yielded
+    57 qualifying files: 89% of the budget went on files that were thrown away,
+    so the sweep fadvised 57 files where it could have fadvised 512. *max_entries*
+    is the crawl's real ceiling, since the file budget no longer bounds how many
+    entries get examined.
     """
-    if max_files <= 0:
+    if max_files <= 0 or max_entries <= 0:
         return
     stack = [root]
     yielded = 0
-    while stack and yielded < max_files:
+    examined = 0
+    while stack and yielded < max_files and examined < max_entries:
         current = stack.pop()
         try:
             entries = os.scandir(current)
@@ -220,16 +244,27 @@ def _iter_cacheable_files(root: Path, *, max_files: int) -> Iterator[Path]:
             continue
         with entries:
             for entry in entries:
+                if examined >= max_entries:
+                    return
+                examined += 1
                 try:
                     if entry.is_dir(follow_symlinks=False):
                         stack.append(Path(entry.path))
-                    elif entry.is_file(follow_symlinks=False):
-                        yielded += 1
-                        yield Path(entry.path)
-                        if yielded >= max_files:
-                            return
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    if min_file_bytes > 0:
+                        try:
+                            if entry.stat(follow_symlinks=False).st_size < min_file_bytes:
+                                continue
+                        except OSError:
+                            continue
                 except OSError:
                     continue
+                yielded += 1
+                yield Path(entry.path)
+                if yielded >= max_files:
+                    return
 
 
 def fadvise_page_cache(
@@ -277,7 +312,11 @@ def fadvise_page_cache(
         except OSError:
             continue
         walked.append(str(root))
-        for path in _iter_cacheable_files(root, max_files=max_files - files):
+        for path in _iter_cacheable_files(
+            root,
+            max_files=max_files - files,
+            min_file_bytes=min_file_bytes,
+        ):
             try:
                 size = path.stat().st_size
             except OSError:
