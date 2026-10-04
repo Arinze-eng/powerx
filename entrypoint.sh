@@ -377,4 +377,14 @@ if [ -f /app/scripts/print_cron_store.py ]; then
     ) &
 fi
 
+# Bound how many agent turns run at once, and therefore how much RAM the
+# container can be asked for. Each running turn holds its own message list, so
+# peak usage is the gateway baseline plus one working set per concurrent turn;
+# nanobot's default of 3 assumes a host that can guarantee three at once, and a
+# 512 MB plan cannot (a single measured turn reached 318 MB of anonymous memory).
+# Two keeps concurrent users served while halving the worst case, and unlike
+# config.json this is read straight from the environment by the agent loop.
+# Set NANOBOT_MAX_CONCURRENT_REQUESTS on the platform to override.
+export NANOBOT_MAX_CONCURRENT_REQUESTS="${NANOBOT_MAX_CONCURRENT_REQUESTS:-2}"
+
 exec /app/scripts/nanobot_launcher.sh "$@"
