@@ -189,6 +189,56 @@ def test_the_size_floor_is_applied_before_the_budget_is_spent(tmp_path) -> None:
     assert result["asked_mb"] == 3.0
 
 
+def test_the_default_roots_reach_the_image_that_the_boot_cached(tmp_path, monkeypatch) -> None:
+    """The boot charge is the image's own files, so the sweep has to list them.
+
+    The sweep was pointed at the workspace, the data dir and the tool caches --
+    everything a *turn* fills, and nothing the *boot* fills. Production logged
+    the consequence at ``gateway_ready_cache``: ``asked_mb=1016.2`` against the
+    volume while the charge it was added to lower sat at ``cgroup_mb=298.8`` of a
+    488.3 MiB plan, ~108 MB of it page cache the walk never named.
+    """
+    prefix = tmp_path / "venv"
+    (prefix / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
+    (prefix / "lib" / "python3.12" / "site-packages" / "mod.so").write_bytes(b"x" * (5 * _MB))
+    monkeypatch.setattr(memory_reclaim.sys, "prefix", str(prefix))
+    monkeypatch.setattr(memory_reclaim.sys, "base_prefix", "/usr")
+
+    result = fadvise_page_cache()
+
+    assert str(prefix) in result["roots"], "the virtualenv holding the image is unreachable"
+    assert result["files"] >= 1
+    assert f"{tmp_path}" not in result["roots"]
+
+
+def test_a_system_interpreter_is_not_walked_as_an_image_root(monkeypatch) -> None:
+    """``/usr`` is not this deployment's cache; crawling it is not housekeeping."""
+    monkeypatch.setattr(memory_reclaim.sys, "prefix", "/usr")
+    monkeypatch.setattr(memory_reclaim.sys, "base_prefix", "/usr")
+
+    assert all(root != "/usr" for root in memory_reclaim._image_cache_roots())
+
+
+def test_the_image_roots_are_claimed_last_so_the_hot_path_keeps_its_budget(monkeypatch) -> None:
+    """The sweep runs per iteration at high charge; the image must not starve it.
+
+    ``fadvise_page_cache`` walks its roots in order and gives each whatever file
+    budget is left, so appending the image after the writable roots is what makes
+    this change free on the hot path: a turn's own cache still gets first claim,
+    and the image gets the remainder.
+    """
+    monkeypatch.setattr(
+        memory_reclaim, "_image_cache_roots", lambda: [Path("/image-only")]
+    )
+
+    roots = memory_reclaim._default_page_cache_roots()
+
+    assert roots[-1] == Path("/image-only"), (
+        "the image is claimed before the writable roots, so a busy volume would "
+        "lose its allowance to files the boot cached once"
+    )
+
+
 def test_the_crawl_stops_at_max_entries(tmp_path, monkeypatch) -> None:
     """The floor moved inside the walker, so the file budget no longer bounds it.
 

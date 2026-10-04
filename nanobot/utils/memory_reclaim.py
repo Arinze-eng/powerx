@@ -188,12 +188,49 @@ def maybe_reclaim(*, tag: str = "auto", min_interval_s: float = RECLAIM_MIN_INTE
     return reclaim_memory(tag=tag)
 
 
+def _image_cache_roots() -> list[Path]:
+    """The deployment's own installed files -- what reading the image caches.
+
+    A fresh container faults its own code into page cache before it serves
+    anything: the virtualenv's extension modules and the application package.
+    Measured on production at ``gateway_start`` (2026-10-03 06:27:57):
+    ``used_mb=190.3`` of a 488.3 MiB plan but ``cgroup_mb=298.8``, so ~108 MB of
+    the boot charge was cache. None of it lives under the workspace, the data dir
+    or the toolchain caches, so a sweep pointed only at those walked past the
+    exact pages it exists to hand back: the boot sweep logged ``asked_mb=1016.2``
+    against the volume while the charge it was added to lower stayed put.
+
+    Deliberately appended *after* the writable roots. The per-iteration sweep
+    must still spend its file budget where a turn actually left cache; the image
+    is the fallback that gets whatever allowance is left over, which is the
+    shape that costs the hot path nothing.
+
+    ``sys.prefix`` is only a virtualenv when it differs from ``sys.base_prefix``.
+    A system interpreter lives under ``/usr``, and walking that is not
+    housekeeping -- it is a crawl of the whole distribution.
+    """
+    roots: list[Path] = []
+    try:
+        prefix = Path(sys.prefix)
+        if prefix != Path(sys.base_prefix):
+            roots.append(prefix)
+    except Exception:  # noqa: BLE001 - a missing interpreter path is not fatal
+        pass
+    try:
+        # nanobot/utils/memory_reclaim.py -> nanobot/
+        roots.append(Path(__file__).resolve().parents[1])
+    except (OSError, IndexError):  # pragma: no cover - defensive
+        pass
+    return roots
+
+
 def _default_page_cache_roots() -> list[Path]:
     """Directories whose page cache this deployment wants back.
 
     The agent workspace and the data dir are what a turn writes; the toolchain
-    caches are what installing or running a CLI fills. Missing paths are skipped
-    by the sweep, so listing a directory this deployment does not have is free.
+    caches are what installing or running a CLI fills; the image roots are what
+    the boot itself faults in. Missing paths are skipped by the sweep, so listing
+    a directory this deployment does not have is free.
     """
     roots: list[Path] = []
     try:
@@ -205,6 +242,7 @@ def _default_page_cache_roots() -> list[Path]:
         pass
     home = Path(os.path.expanduser("~"))
     roots.extend((home / ".npm", home / ".cache", home / ".vercel"))
+    roots.extend(_image_cache_roots())
     return roots
 
 
