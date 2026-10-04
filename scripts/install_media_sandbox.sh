@@ -40,8 +40,25 @@ MEDIA_BIN="${MEDIA_BIN:-$HOME/.media/bin}"
 CACHE_DIR="${MEDIA_CACHE_DIR:-$HOME/.cache/media_cli}"
 MODELS_DIR="${MEDIA_MODELS_DIR:-$HOME/.cache/media_cli/models}"
 PY="${PYTHON:-python3}"
+#: Where wheels go when the interpreter's own site-packages is not writable.
+#:
+#: MEASURED 2026-10-04 on Freestyle: its interpreter is a root-owned virtualenv
+#: (/opt/freestyle/python), so `--user` is refused outright AND a plain install
+#: dies with "[Errno 13] Permission denied: .../site-packages/flatbuffers". Both
+#: look identical from the outside — "optional wheel unavailable" — and between
+#: them they cost numpy, cv2, faster-whisper, rembg and onnxruntime. `--target`
+#: needs no permission on the interpreter at all, so it is the last resort that
+#: actually lands. media_cli.py puts this directory on sys.path and PATH itself,
+#: which is what makes a --target install usable without a venv activation.
+MEDIA_PYLIB="${MEDIA_PYLIB:-$HOME/.media/pylib}"
 
-mkdir -p "${MEDIA_BIN}" "${CACHE_DIR}" "${MODELS_DIR}" 2>/dev/null || true
+mkdir -p "${MEDIA_BIN}" "${CACHE_DIR}" "${MODELS_DIR}" "${MEDIA_PYLIB}" 2>/dev/null || true
+
+# Exported once, for the whole script: a --target install is invisible to any
+# interpreter that is not told about it, and every step below — warm_models, the
+# entry-point shim, the final summary — is an `import`. Children inherit this, so
+# it also covers the console scripts we place in MEDIA_BIN.
+export PYTHONPATH="${MEDIA_PYLIB}${PYTHONPATH:+:${PYTHONPATH}}"
 
 log() { printf '[media-install] %s\n' "$*" >&2; }
 
@@ -108,6 +125,36 @@ fetch_url() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # --------------------------------------------------------------------------- #
+# Filters the CLI actually invokes, and why this list has to be CHECKED rather
+# than assumed.
+#
+# MEASURED 2026-10-04: johnvansickle's ffmpeg-release-amd64-static (7.0.2) installs
+# cleanly, answers `-version` with a normal release string, and is missing
+# `drawtext` — every burned timestamp and burned caption. It was the ONLY filter
+# absent there, which is exactly why presence of a binary is the wrong check: the
+# failure surfaces far from the install, as
+#   watch --timestamps -> "[AVFilterGraph] No such filter: 'drawtext'"
+# which reads as a broken feature, not a broken build. `-version` cannot tell the
+# two apart; `-filters` can. So we check, and a build missing any of these is
+# treated as a failed candidate and the next one is tried.
+# --------------------------------------------------------------------------- #
+MEDIA_REQUIRED_FILTERS="${MEDIA_REQUIRED_FILTERS:-drawtext subtitles ass overlay scale crop fps setsar unsharp format gblur}"
+
+# Echoes the space-separated filters the installed ffmpeg lacks ("" when it has
+# them all). Never fails: an unreadable filter list counts as everything missing,
+# so a broken binary falls through to the next candidate instead of being used.
+missing_filters() {
+  local available="" missing="" f path
+  path="$(command -v ffmpeg 2>/dev/null || true)"
+  [ -n "${path}" ] || { printf 'ffmpeg'; return 0; }
+  available="$(ffmpeg -hide_banner -filters 2>/dev/null | awk '{print $2}')" || available=""
+  for f in ${MEDIA_REQUIRED_FILTERS}; do
+    printf '%s\n' "${available}" | grep -qx "${f}" || missing="${missing} ${f}"
+  done
+  printf '%s' "${missing# }"
+}
+
+# --------------------------------------------------------------------------- #
 # 0. A usable pip, without assuming it exists or that it may write system dirs.
 #
 # The base images differ: some ship pip, some ship an externally-managed system
@@ -128,8 +175,26 @@ ensure_pip() {
   ${PY} -m pip --version >/dev/null 2>&1
 }
 
-# Install one or more wheels into --user, self-healing the one environment quirk
-# that actually bites in these images.
+# Where a wheel should land, decided by asking the interpreter instead of assuming.
+#
+# MEASURED 2026-10-04 on Freestyle: that image runs its interpreter inside a
+# virtualenv (/opt/freestyle/python, VIRTUAL_ENV set), and pip refuses `--user`
+# there with "Can not perform a '--user' install. User site-packages are not
+# visible in this virtualenv." The installer still exited 0 and still printed a
+# summary, so the ONLY visible symptom was `python_deps` reading false for Pillow,
+# numpy, cv2, faster-whisper, rembg and onnxruntime at once — six "unavailable
+# wheels" that were really one wrong flag. In a virtualenv the target is the venv
+# itself (no flag); on a system interpreter it is --user.
+pip_target() {
+  if ${PY} -c 'import sys; raise SystemExit(0 if sys.prefix == sys.base_prefix else 1)' 2>/dev/null; then
+    printf '%s' "--user"
+  else
+    printf '%s' ""
+  fi
+}
+
+# Install one or more wheels into the right target, self-healing the two
+# environment quirks that actually bite in these images.
 #
 # MEASURED: Debian 12+/Ubuntu 24 ship an "externally managed" system Python whose
 # pip refuses every install with `error: externally-managed-environment`. That
@@ -139,8 +204,9 @@ ensure_pip() {
 # older pips do not have, and a version comparison is one more thing to get wrong.
 # The retry costs nothing when it is not needed.
 pip_install() {
-  local out=""
-  if out="$(${PY} -m pip install --user ${PIP_FLAGS} --disable-pip-version-check \
+  local out="" target
+  target="$(pip_target)"
+  if out="$(${PY} -m pip install ${target} ${PIP_FLAGS} --disable-pip-version-check \
       --no-input --no-cache-dir --upgrade "$@" 2>&1)"; then
     printf '%s\n' "${out}" >&2
     return 0
@@ -149,7 +215,29 @@ pip_install() {
     *externally-managed*|*"externally managed"*)
       log "system Python is externally managed; retrying with --break-system-packages"
       PIP_FLAGS="--break-system-packages"
-      if ${PY} -m pip install --user ${PIP_FLAGS} --disable-pip-version-check \
+      if ${PY} -m pip install ${target} ${PIP_FLAGS} --disable-pip-version-check \
+        --no-input --no-cache-dir --upgrade "$@" >&2; then
+        return 0
+      fi
+      ;;
+    *"User site-packages are not visible"*|*"perform a '--user' install"*)
+      # Belt and braces: if the venv probe above ever misreads an image, retry
+      # without the flag rather than losing every Python piece to it.
+      log "this interpreter rejects --user; retrying into its own site-packages"
+      if ${PY} -m pip install ${PIP_FLAGS} --disable-pip-version-check \
+        --no-input --no-cache-dir --upgrade "$@" >&2; then
+        return 0
+      fi
+      ;;
+  esac
+  # Last resort, and the one that works on a root-owned virtualenv: install into a
+  # directory WE own. No interpreter permission is involved, so "Permission denied"
+  # stops being a dead end. media_cli.py puts ${MEDIA_PYLIB} on sys.path at import.
+  case "${out}" in
+    *"Permission denied"*|*"Errno 13"*|*"externally-managed"*)
+      log "cannot write the interpreter's site-packages; installing into ${MEDIA_PYLIB}"
+      mkdir -p "${MEDIA_PYLIB}" 2>/dev/null || true
+      if ${PY} -m pip install --target "${MEDIA_PYLIB}" ${PIP_FLAGS} --disable-pip-version-check \
         --no-input --no-cache-dir --upgrade "$@" >&2; then
         return 0
       fi
@@ -169,7 +257,13 @@ pip_install() {
 # have a package manager that works.
 # --------------------------------------------------------------------------- #
 install_ffmpeg() {
-  if have ffmpeg && have ffprobe; then
+  # MEDIA_BIN goes on PATH first, so the check below sees a binary a PREVIOUS run
+  # left there. Without this the script was only idempotent on a login shell: on a
+  # fresh non-login shell it re-downloaded a build it already had. And the check is
+  # capability-based, not presence-based, so a rerun also REPAIRS an incomplete
+  # build instead of re-accepting it forever.
+  export PATH="${MEDIA_BIN}:$PATH"
+  if have ffmpeg && have ffprobe && [ -z "$(missing_filters)" ]; then
     log "ffmpeg already present: $(ffmpeg -version 2>/dev/null | head -1)"
     return 0
   fi
@@ -191,8 +285,22 @@ install_ffmpeg() {
     fi
   fi
 
+  local lacking=""
+  if [ -x "${MEDIA_BIN}/ffmpeg" ]; then
+    lacking="$(missing_filters)"
+    if [ -z "${lacking}" ]; then
+      log "ffmpeg ready: $(ffmpeg -version 2>/dev/null | head -1)"
+      return 0
+    fi
+    log "WARN: the build that installed is missing filters: ${lacking} — trying a GPL build that has them"
+  fi
+
   # (b) BtbN's GPL builds — a different host, so a johnvansickle outage is survivable.
-  if [ ! -x "${MEDIA_BIN}/ffmpeg" ]; then
+  # Tried when nothing was installed AND when the build that installed cannot run the
+  # filters the CLI needs — the failure mode a `-version` string hides. The previous
+  # binary is left in place until this one lands, so a failed attempt cannot leave the
+  # sandbox with no ffmpeg at all.
+  if [ ! -x "${MEDIA_BIN}/ffmpeg" ] || [ -n "${lacking}" ]; then
     url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
     status ffmpeg "static build unavailable; trying the BtbN build"
     if fetch_url "${url}" "${tmp}/btbn.tar.xz" 1000000; then
@@ -204,6 +312,14 @@ install_ffmpeg() {
         install -m 0755 "$(dirname "${bin}")/ffprobe" "${MEDIA_BIN}/ffprobe" 2>/dev/null || true
       fi
     fi
+  fi
+
+  # Same check again: if this build closed the gap we are done, and if it did not we
+  # still fall through to the wheel below rather than accepting a known-incomplete
+  # binary as if it were fine.
+  if [ -x "${MEDIA_BIN}/ffmpeg" ] && [ -z "$(missing_filters)" ]; then
+    log "ffmpeg ready: $(ffmpeg -version 2>/dev/null | head -1)"
+    return 0
   fi
 
   # (c) Last resort: the imageio-ffmpeg wheel ships a working ffmpeg binary.
@@ -232,7 +348,15 @@ PY
   # later step in this script resolves the binary we just placed.
   export PATH="${MEDIA_BIN}:$PATH"
   if have ffmpeg; then
-    log "ffmpeg ready: $(ffmpeg -version 2>/dev/null | head -1)"
+    local still=""
+    still="$(missing_filters)"
+    if [ -n "${still}" ]; then
+      # Installed but incomplete. Say WHICH filters are gone so the refusal a later
+      # action prints names the real cause instead of looking like a broken feature.
+      log "WARN: ffmpeg installed but lacks: ${still} — burned captions/timestamps will refuse with a reason"
+    else
+      log "ffmpeg ready: $(ffmpeg -version 2>/dev/null | head -1)"
+    fi
     return 0
   fi
   log "WARN: ffmpeg could not be installed — video actions will refuse with a reason"
@@ -303,13 +427,72 @@ install_python_stack() {
   done
 
   # Make sure the console scripts are reachable from a non-login shell.
-  local name
+  local name src
   for name in rembg yt-dlp; do
-    if [ -x "${HOME}/.local/bin/${name}" ]; then
-      ln -sf "${HOME}/.local/bin/${name}" "${MEDIA_BIN}/${name}" 2>/dev/null || true
-    fi
+    for src in "${HOME}/.local/bin/${name}" "${MEDIA_PYLIB}/bin/${name}"; do
+      if [ -x "${src}" ]; then
+        ln -sf "${src}" "${MEDIA_BIN}/${name}" 2>/dev/null || true
+        break
+      fi
+    done
   done
+
+  # A `--target` install does not reliably write the console script: MEASURED
+  # 2026-10-04, numpy's f2py and onnxruntime's test binary landed in
+  # ${MEDIA_PYLIB}/bin while rembg's did not — so `action=bg` refused with "rembg
+  # is not installed" while the package sat importable one directory away. When the
+  # package imports but the entry point is missing, write the two-line shim that
+  # calls the same function the console script would have called.
+  if [ ! -x "${MEDIA_BIN}/rembg" ] && ${PY} -c 'import rembg.cli' >/dev/null 2>&1; then
+    log "no rembg console script was installed; writing the entry-point shim"
+    printf '#!/usr/bin/env python3\nfrom rembg.cli import main\nmain()\n' >"${MEDIA_BIN}/rembg" 2>/dev/null || true
+    chmod 0755 "${MEDIA_BIN}/rembg" 2>/dev/null || true
+  fi
+
+  repair_pyav
   return 0
+}
+
+# Does the installed PyAV still accept the argument faster-whisper calls it with?
+#
+# MEASURED 2026-10-04: pip resolves `av` to its NEWEST release, but PyAV REMOVED the
+# ``metadata_errors`` argument to ``av.open`` — and faster-whisper 1.2.1 still passes
+# it whenever it decodes audio. So the fully-installed state gave
+#   transcribe -> TypeError: open() got an unexpected keyword argument 'metadata_errors'
+# on av 19.0.1 while `doctor` happily reported faster_whisper 1.2.1 present: the
+# whisper model was there, the audio decoder was not. transcribe, captions and
+# `shorts --captions` were all dead. Verified fixed by av 18.1.0.
+#
+# Same rule as the ffmpeg check above: probe the capability the caller actually
+# uses and repair it, instead of trusting the resolver's version choice.
+av_accepts_metadata_errors() {
+  ${PY} - <<'PY' >/dev/null 2>&1
+import av
+try:
+    av.open("/dev/null", metadata_errors="ignore")
+except TypeError:
+    raise SystemExit(1)
+except Exception:
+    raise SystemExit(0)
+PY
+}
+
+repair_pyav() {
+  ${PY} -c 'import faster_whisper' >/dev/null 2>&1 || return 0
+  av_accepts_metadata_errors && return 0
+  log "the installed PyAV rejects metadata_errors, which faster-whisper needs; pinning av<19"
+  # Only the copy WE installed is removed, and only from our own target directory —
+  # a PyAV that came with the image is left where it is.
+  local where=""
+  where="$(${PY} -c 'import av, os; print(os.path.dirname(os.path.dirname(av.__file__)))' 2>/dev/null || true)"
+  if [ "${where}" = "${MEDIA_PYLIB}" ]; then
+    rm -rf "${MEDIA_PYLIB}/av" "${MEDIA_PYLIB}/av.libs" "${MEDIA_PYLIB}"/av-*.dist-info 2>/dev/null || true
+  fi
+  if pip_install "av<19" && av_accepts_metadata_errors; then
+    log "PyAV pinned to a faster-whisper-compatible release: $(${PY} -c 'import av; print(av.__version__)' 2>/dev/null)"
+  else
+    log "WARN: could not pin a compatible PyAV — transcribe will refuse with a reason"
+  fi
 }
 
 # --------------------------------------------------------------------------- #
@@ -390,7 +573,7 @@ install_python_stack || true
 install_fonts || true
 warm_models || true
 
-export PATH="${MEDIA_BIN}:${HOME}/.local/bin:$PATH"
+export PATH="${MEDIA_BIN}:${HOME}/.local/bin:${MEDIA_PYLIB}/bin:$PATH"
 
 # A machine-readable summary, built from what is ACTUALLY present rather than from
 # what we tried to install — this is what makes the JSON worth parsing.
@@ -408,6 +591,22 @@ def version(cmd, *args):
     except Exception:
         return "ok"
 
+# Which of the filters the CLI actually invokes this build can run. Reported so a
+# build that installed but cannot burn captions is visible here instead of only at
+# the first `watch --timestamps`, where it looks like a broken feature.
+def ffmpeg_filters():
+    path = shutil.which("ffmpeg")
+    if not path:
+        return {"available": False, "missing": []}
+    try:
+        out = subprocess.run([path, "-hide_banner", "-filters"], capture_output=True,
+                             text=True, timeout=60)
+        have = {parts[1] for parts in (line.split() for line in out.stdout.splitlines()) if len(parts) > 1}
+    except Exception:
+        return {"available": False, "missing": []}
+    required = "drawtext subtitles ass overlay scale crop fps setsar unsharp format gblur".split()
+    return {"available": True, "missing": [f for f in required if f not in have]}
+
 deps = {}
 for module in ("PIL", "numpy", "cv2", "faster_whisper", "rembg"):
     try:
@@ -422,6 +621,7 @@ print(json.dumps({
     "yt_dlp": shutil.which("yt-dlp"),
     "ffmpeg_version": version("ffmpeg", "-version"),
     "yt_dlp_version": version("yt-dlp", "--version"),
+    "ffmpeg_filters": ffmpeg_filters(),
     "python_deps": deps,
 }))
 PY

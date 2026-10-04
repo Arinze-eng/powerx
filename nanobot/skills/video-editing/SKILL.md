@@ -1,6 +1,6 @@
 ---
 name: video-editing
-description: Edit video and audio — Cloudinary first for trims, crops, resizes, transcodes, joins and poster frames, with local ffmpeg in the sandbox for what Cloudinary cannot do (probe, contact sheets, transcription, captions, shorts, downloads, background mattes). Use whenever the user asks to edit, cut, crop, resize, upscale, caption, transcribe, download or clip a video or its audio.
+description: Edit video and audio — Cloudinary first for trims, crops, resizes, transcodes, joins and poster frames, with local ffmpeg in the sandbox for what Cloudinary cannot do (probe, contact sheets, transcription, captions, shorts, blurred-background verticals, downloads, background mattes). Use whenever the user asks to edit, cut, crop, resize, upscale, caption, transcribe, download or clip a video or its audio.
 metadata: {"nanobot":{"emoji":"🎬","os":["linux"],"always":false}}
 ---
 
@@ -15,8 +15,9 @@ Before a single local ffmpeg command, decide which tool owns the operation:
   in Cloudinary and renders the transformation on delivery. Try this before
   `media_sandbox` every time, for a user's own footage as much as anything else.
 - **`media_sandbox` — for what Cloudinary does not offer:** `probe`, `watch`,
-  `frames`, `transcribe`, `captions`, `shorts`, `download`, `bg`, and any filter or
-  codec Cloudinary refuses. It is also the fallback when a Cloudinary render fails
+  `frames`, `transcribe`, `captions`, `shorts`, `blur`, `download`, `bg`, and any
+  filter or codec Cloudinary refuses. It is also the fallback when a Cloudinary
+  render fails
   and the user still needs the result.
 
 Being in a sandbox is not a reason to edit locally. A local ffmpeg encode of
@@ -63,6 +64,7 @@ belong to `cloudinary_video_edit` first, so reach for this table for
 | --- | --- |
 | Cut a range out | `trim` (add `fast=true` for an instant keyframe-aligned cut) |
 | Make it vertical / square | `crop` with `aspect="9:16"`, `focus="face"` for a speaker |
+| Vertical WITHOUT losing the sides | `blur` — the whole frame, blurred, behind a portrait clip |
 | "Put it in HD" | `hd` (defaults to 1080) |
 | Explicit resize | `scale` with `height` or `width` |
 | Join clips | `concat` with `inputs` |
@@ -76,6 +78,25 @@ belong to `cloudinary_video_edit` first, so reach for this table for
 Quality is the default: H.264 CRF 18 preset slow, `+faststart`, AAC 192k. Use
 `preset="veryfast"` or `crf=23` only for a draft you intend to redo.
 
+**`blur` is the vertical you want for anything that is not a talking head.** `crop`
+throws the sides of a 16:9 frame away, which is wrong for a screen share, a two-shot
+or a wide stage: the viewer loses the content. `blur` keeps the entire frame — it
+scales it to COVER the portrait canvas, blurs it (and dims it slightly), and lays
+the untouched frame on top at `foreground` of the output width (default 0.92). This
+is the shape short-form platforms reward. It takes `start`/`duration` in the SAME
+pass, so a one-minute vertical out of a two-hour recording is ONE encode, not a
+trim to an intermediate file and a second encode of it:
+
+```
+media_sandbox(action="blur", input="/path/long.mp4", start="00:20:00",
+              duration="60", aspect="9:16", output_height=1920)   # one encode
+```
+
+Set `blur=0` to keep the background sharp, `dim=0` to stop it darkening, and
+`foreground=1.0` for the tightest crop of the blurred border. The result reports
+`background_visible=false` when the source is already as tall as the target, so a
+plain bordered video is never mistaken for a composite.
+
 **Crop focus.** `focus="face"` samples five frames, finds the speaker with OpenCV
 and keeps them centred. It is deliberately best-effort: if no face is found it falls
 back to the anchor (centre by default) and says so. A screen recording wants
@@ -87,7 +108,8 @@ real 1080x1920, so `shorts` from it come out 404x718 — exactly 9:16 — with
 `upscaled=false`. Say that plainly to the user instead of implying a 1080p master.
 
 **Long work is detached.** These actions routinely outlive one sandbox command:
-`hd`, `scale`, `concat`, `transcribe`, `captions`, `bg`, `download`, `shorts`. The
+`hd`, `scale`, `concat`, `transcribe`, `captions`, `bg`, `download`, `shorts`,
+`blur`. The
 tool waits ~200 s inline, then returns a `job_id`:
 
 ```

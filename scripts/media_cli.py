@@ -29,6 +29,7 @@ Usage (inside the sandbox):
     media_cli.py watch  in.mp4 --count 12 --out sheet.png
     media_cli.py trim   in.mp4 --start 00:00:05 --end 00:00:12 --out cut.mp4
     media_cli.py crop   in.mp4 --aspect 9:16 --focus face --out vert.mp4
+    media_cli.py blur   in.mp4 --aspect 9:16 --start 00:12:00 --duration 60 --out short.mp4
     media_cli.py hd     in.mp4 --height 1080 --out hd.mp4
     media_cli.py bg     in.mp4 --model u2net_human_seg --out cutout.webm
     media_cli.py download 'https://youtu.be/...' --out downloads --quality 1080
@@ -56,7 +57,7 @@ from typing import Any, Iterable
 #: ``nanobot/agent/tools/media.py`` greps for this exact assignment and refuses
 #: to run a sandbox copy that carries a different one, so a stale (CDN-cached)
 #: revision can never masquerade as the current one.
-CLI_VERSION = "1.0.0"
+CLI_VERSION = "1.1.1"
 
 #: Where heavy downloads live so they survive across calls in one sandbox.
 CACHE_DIR = Path(os.getenv("MEDIA_CACHE_DIR", str(Path.home() / ".cache" / "media_cli")))
@@ -70,18 +71,51 @@ CACHE_DIR = Path(os.getenv("MEDIA_CACHE_DIR", str(Path.home() / ".cache" / "medi
 #: ffmpeg sits two directories away.
 MEDIA_BIN = Path(os.getenv("MEDIA_BIN", str(Path.home() / ".media" / "bin")))
 
+#: Where the installer puts wheels when the interpreter's own site-packages is not
+#: writable (a root-owned virtualenv, an externally-managed system Python).
+#:
+#: MEASURED 2026-10-04 on Freestyle: its Python is a root-owned venv, so pip could
+#: neither `--user` nor write site-packages, and numpy/cv2/faster-whisper/rembg
+#: were all "unavailable" for want of a writable directory. The installer now falls
+#: back to `--target` here; this is the other half of that fix, because a --target
+#: install is only importable if something puts it on sys.path — and the tool layer
+#: runs this file with a bare `python3`, so there is no activation step to rely on.
+MEDIA_PYLIB = Path(os.getenv("MEDIA_PYLIB", str(Path.home() / ".media" / "pylib")))
+
 
 def _prepare_path() -> None:
-    """Prepend the installer's bin dirs to PATH, once, at import time.
+    """Prepend the installer's bin dirs to PATH and its wheel dir to sys.path.
 
     Prepending unconditionally is deliberate: a directory that does not exist yet
     is harmless on PATH, and re-running this cannot duplicate entries because the
     list is rebuilt from the current value only when something is actually new.
     """
-    extra = [str(MEDIA_BIN), str(Path.home() / ".local" / "bin"), str(CACHE_DIR / "bin")]
+    extra = [
+        str(MEDIA_BIN),
+        str(Path.home() / ".local" / "bin"),
+        str(MEDIA_PYLIB / "bin"),
+        str(CACHE_DIR / "bin"),
+    ]
     current = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
     merged = [*extra, *[part for part in current if part not in extra]]
     os.environ["PATH"] = os.pathsep.join(merged)
+    if MEDIA_PYLIB.is_dir():
+        # sys.path[0] is this script's own directory; the --target libs must win
+        # over any stale copy already importable from the interpreter, so they go
+        # in front of it rather than at the end.
+        if str(MEDIA_PYLIB) not in sys.path:
+            sys.path.insert(0, str(MEDIA_PYLIB))
+        # PYTHONPATH as well, because a sys.path edit does NOT reach a child
+        # process. MEASURED 2026-10-04: `doctor` reported faster_whisper and rembg
+        # as missing — its probe is a `python3 -c "import ..."` subprocess, and the
+        # rembg CLI we shell out to for `bg` is another — while the same imports
+        # succeeded in-process. Exporting the directory is what makes both children
+        # see the --target install.
+        existing = os.environ.get("PYTHONPATH", "")
+        if str(MEDIA_PYLIB) not in existing.split(os.pathsep):
+            os.environ["PYTHONPATH"] = (
+                f"{MEDIA_PYLIB}{os.pathsep}{existing}" if existing else str(MEDIA_PYLIB)
+            )
 
 
 _prepare_path()
@@ -413,8 +447,23 @@ _CAPTION_ALARM_MARKERS = (
     "fontselect",
     "unable to find a suitable font",
     "failed to find any fallback",
-    "no usable font",
     "glyph 0x",
+)
+
+#: A line that LOOKS like a caption failure and is not.
+#:
+#: MEASURED 2026-10-04 on Freestyle: ffmpeg prints
+#:   "[Parsed_subtitles_0] No usable fontconfig configuration file found, using fallback."
+#: on every burn-in in that image, and the captions are rendered perfectly — the
+#: frame shows them, bold and legible. It matched the old "no usable font" marker,
+#: so `captions_ok` came back false and the tool told the model the captions "may be
+#: missing". A false alarm here is not harmless: the model believes it, apologises
+#: to the user for captions that are visibly present, or burns them a second time
+#: for another full encode. The warning is therefore allowed to be noisy, but a line
+#: matching one of these is never reported as a failure.
+_CAPTION_BENIGN_MARKERS = (
+    "no usable fontconfig configuration file",
+    "using fallback",
 )
 
 
@@ -422,7 +471,12 @@ def _caption_warnings(stderr: str) -> list[str]:
     found: list[str] = []
     for line in (stderr or "").splitlines():
         line = line.strip()
-        if line and any(marker in line.lower() for marker in _CAPTION_ALARM_MARKERS):
+        lowered = line.lower()
+        if not line:
+            continue
+        if any(marker in lowered for marker in _CAPTION_BENIGN_MARKERS):
+            continue
+        if any(marker in lowered for marker in _CAPTION_ALARM_MARKERS):
             found.append(line[:220])
     return found[:8]
 
@@ -888,6 +942,111 @@ def _face_center_x(src: Path, width: int, height: int) -> float | None:
         return centres[len(centres) // 2]
     except Exception:
         return None
+
+
+def cmd_blur(args: argparse.Namespace) -> int:
+    """A portrait clip with the WHOLE frame behind it as a blurred background.
+
+    This is the shape every short-form platform actually rewards, and it is not
+    the same thing as ``crop``: a crop throws away the sides of a 16:9 recording,
+    so a screen share, a two-shot or a wide sports frame loses the content the
+    viewer came for. Here nothing is discarded — the full frame is scaled to
+    COVER the portrait canvas (overflow cropped by the scale itself), blurred, and
+    optionally dimmed, and the untouched full frame is laid on top at the width
+    ``--foreground`` asks for. Reading order is preserved, the aspect is exactly
+    the one requested, and no pixels are invented.
+
+    ``--start/--end/--duration`` are honoured in the SAME pass, deliberately: the
+    1-minute short out of a 97-minute source is one ffmpeg invocation, not a trim
+    to a 2.5 GB intermediate and then a second encode of it. That is the whole
+    reason this action exists as a filter graph rather than as "call trim, then
+    crop, then overlay".
+    """
+    ffmpeg = _require("ffmpeg")
+    src = _existing(args.input, kinds="video")
+    info = probe(src)
+    width, height = int(info.get("width") or 0), int(info.get("height") or 0)
+    if not width or not height:
+        raise MediaError("input has no video dimensions")
+
+    want_w, _, want_h = str(args.aspect).partition(":")
+    if not want_h:
+        raise MediaError(f"--aspect must look like 9:16 or 4:5, got {args.aspect!r}")
+    try:
+        ratio = float(want_w) / float(want_h)
+    except ValueError as exc:
+        raise MediaError(f"--aspect must be a numeric ratio, got {args.aspect!r}") from exc
+
+    # Even dimensions on both sides: yuv420p halves the chroma, and an odd target
+    # either fails the encode outright or gets silently nudged, which then no
+    # longer matches the aspect that was asked for.
+    target_h = int(args.output_height)
+    if target_h % 2:
+        target_h -= 1
+    target_w = max(2, int(round(target_h * ratio)) // 2 * 2)
+
+    sigma = max(0.0, float(args.blur))
+    foreground = min(1.0, max(0.05, float(args.foreground)))
+    fg_w = max(2, int(round(target_w * foreground)) // 2 * 2)
+    fg_h = max(1, int(round(fg_w * height / width)) // 2 * 2)
+
+    # COVER, not CONTAIN: `force_original_aspect_ratio=increase` scales until both
+    # sides are at least the canvas, so the subsequent crop always has material to
+    # take and never pads with black bars.
+    bg_chain = (
+        f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase:flags=bicubic,"
+        f"crop={target_w}:{target_h}"
+    )
+    if sigma > 0:
+        bg_chain += f",gblur=sigma={sigma:.2f}:steps=2"
+    dim = max(0.0, float(args.dim))
+    if dim > 0:
+        bg_chain += f",eq=brightness=-{dim:.3f}"
+    filter_complex = (
+        "[0:v]split=2[bg][fg];"
+        f"[bg]{bg_chain}[bgv];"
+        f"[fg]scale={fg_w}:{fg_h}:flags=lanczos[fgv];"
+        "[bgv][fgv]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
+    )
+
+    out = _out_path(args.out, src, ".mp4")
+    start = _seconds(args.start)
+    if args.duration:
+        length = _seconds(args.duration)
+    elif args.end:
+        length = _seconds(args.end) - start
+    else:
+        length = (info.get("duration") or 0.0) - start
+    if length <= 0:
+        raise MediaError("the requested range is empty (check --start/--end/--duration)")
+
+    cmd = [ffmpeg, "-v", "error"]
+    if start:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", str(src), "-t", f"{length:.3f}", "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "0:a?", *_video_encoder_args(crf=args.crf, preset=args.preset),
+            "-y", str(out)]
+    proc = run(cmd, timeout=3600)
+    if proc.returncode != 0:
+        raise MediaError(f"blur composite failed: {_tail(proc.stderr)}")
+
+    verified = _verify(
+        out,
+        expect={"width": target_w, "height": target_h,
+                "duration": {"value": round(length, 3), "tolerance": 0.5}},
+    )
+    return ok(
+        input=str(src), output=str(out), aspect=args.aspect,
+        output_size={"w": target_w, "h": target_h},
+        background={"mode": "blur", "blur_sigma": sigma, "dim": dim},
+        foreground_size={"w": fg_w, "h": fg_h}, foreground_fraction=foreground,
+        # The one case where the result would quietly be a plain bordered video:
+        # a source as tall as the target. Reported rather than left to be noticed.
+        background_visible=fg_h < target_h,
+        start=round(start, 3), duration=round(length, 3),
+        source={"width": width, "height": height},
+        output_probe=verified,
+    )
 
 
 def cmd_scale(args: argparse.Namespace) -> int:
@@ -1687,6 +1846,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--focus", default="center", choices=["center", "face"])
     p.add_argument("--out")
     p.set_defaults(func=cmd_crop)
+
+    p = sub.add_parser("blur", help="portrait clip over the whole frame as a blurred background")
+    p.add_argument("input")
+    p.add_argument("--aspect", default="9:16")
+    p.add_argument("--output-height", type=int, default=1920)
+    p.add_argument("--blur", type=float, default=28.0, help="gblur sigma (0 disables the blur)")
+    p.add_argument("--dim", type=float, default=0.08, help="darken the background by this much (0-1)")
+    p.add_argument("--foreground", type=float, default=0.92,
+                   help="sharp layer width as a fraction of the output width")
+    p.add_argument("--start", default="0")
+    p.add_argument("--end")
+    p.add_argument("--duration")
+    p.add_argument("--crf", type=int, default=18)
+    p.add_argument("--preset", default="slow")
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_blur)
 
     p = sub.add_parser("scale", help="resize, sharpening when growing (HD/4K)")
     p.add_argument("input")

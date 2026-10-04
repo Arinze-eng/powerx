@@ -84,7 +84,7 @@ _REPO = os.getenv("MEDIA_SCRIPT_REPO", "Arinze-eng/powerx")
 #: that is no longer running, the caller gets a loud warning and a retry against a
 #: different source. Bump BOTH constants together whenever the CLI's contract with
 #: this tool changes.
-_CLI_VERSION = "1.0.0"
+_CLI_VERSION = "1.1.1"
 
 #: Where the CLI, its installer and its detached jobs live inside the sandbox.
 _MEDIA_HOME = "$HOME/.media"
@@ -109,6 +109,7 @@ _TIMEOUTS: dict[str, int] = {
     "watch": _MAX_TIMEOUT,
     "trim": _MAX_TIMEOUT,
     "crop": _MAX_TIMEOUT,
+    "blur": _MAX_TIMEOUT,
     "scale": _MAX_TIMEOUT,
     "hd": _MAX_TIMEOUT,
     "concat": _MAX_TIMEOUT,
@@ -126,7 +127,7 @@ _DEFAULT_TIMEOUT = 300
 #: and reported through ``job``. Everything NOT in this set is expected to finish
 #: inside one command and is run inline.
 _LONG_ACTIONS = frozenset(
-    {"hd", "scale", "concat", "transcribe", "captions", "bg", "download", "shorts"}
+    {"hd", "scale", "concat", "transcribe", "captions", "bg", "download", "shorts", "blur"}
 )
 
 #: How long the tool waits inline for a detached action before handing back a
@@ -147,6 +148,7 @@ _ALL_ACTIONS = (
     "watch",
     "trim",
     "crop",
+    "blur",
     "scale",
     "hd",
     "concat",
@@ -183,6 +185,14 @@ _FLAG_SPEC: dict[str, dict[str, Any]] = {
         "flags": {
             "aspect": "--aspect", "width": "--width", "height": "--height", "x": "--x",
             "y": "--y", "anchor": "--anchor", "focus": "--focus", "out": "--out",
+        },
+    },
+    "blur": {
+        "positional": ("input",),
+        "flags": {
+            "aspect": "--aspect", "output_height": "--output-height", "blur": "--blur",
+            "dim": "--dim", "foreground": "--foreground", "start": "--start", "end": "--end",
+            "duration": "--duration", "crf": "--crf", "preset": "--preset", "out": "--out",
         },
     },
     "scale": {
@@ -669,11 +679,11 @@ class MediaSandboxTool(Tool):
                 "section": {"type": "string", "description": "action=download: a single range, e.g. '*00:01:00-00:02:30'."},
                 "subtitles": {"type": "string", "description": "action=download: also fetch the platform's captions in this language code, e.g. 'en'."},
                 "cookies": {"type": "string", "description": "action=download: path to a cookies.txt, for a video that needs a session."},
-                "start": {"type": "string", "description": "action=trim: start, as seconds or HH:MM:SS(.mmm)."},
+                "start": {"type": "string", "description": "trim/blur: start, as seconds or HH:MM:SS(.mmm)."},
                 "end": {"type": "string", "description": "action=trim: absolute end."},
-                "duration": {"type": "string", "description": "action=trim: length instead of an absolute end."},
+                "duration": {"type": "string", "description": "trim/blur: length instead of an absolute end."},
                 "fast": {"type": "boolean", "description": "action=trim: stream copy without re-encoding. Instant, but it can only cut on a keyframe, so the result is usually a second or two longer than asked (and the result says so)."},
-                "aspect": {"type": "string", "description": "crop/shorts: target aspect, e.g. 9:16, 1:1, 4:5."},
+                "aspect": {"type": "string", "description": "crop/shorts/blur: target aspect, e.g. 9:16, 1:1, 4:5."},
                 "focus": {"type": "string", "enum": ["center", "face"], "description": "crop/shorts: 'face' keeps the detected speaker centred. Deliberately best-effort — with no detectable face the crop falls back to the anchor."},
                 "anchor": {"type": "string", "enum": ["center", "top", "bottom", "left", "right"], "description": "Which edge the crop is pinned to when there is no face to follow."},
                 "x": {"type": "integer", "description": "action=crop: explicit left offset."},
@@ -706,7 +716,10 @@ class MediaSandboxTool(Tool):
                 "caption_style": {"type": "string", "enum": ["shorts", "clean", "karaoke"], "description": "action=shorts: caption look for the burned clips."},
                 "min_seconds": {"type": "number", "description": "action=shorts: shortest clip to consider (default 15)."},
                 "max_seconds": {"type": "number", "description": "action=shorts: longest clip to consider (default 45)."},
-                "output_height": {"type": "integer", "description": "action=shorts: target height (default 1920). Never invents pixels: when the source cannot afford it, the clip keeps the crop's own resolution at exactly the requested aspect and reports upscaled=false."},
+                "output_height": {"type": "integer", "description": "shorts/blur: target height (default 1920). shorts never invents pixels: when the source cannot afford it, the clip keeps the crop's own resolution at exactly the requested aspect and reports upscaled=false."},
+                "blur": {"type": "number", "description": "action=blur: gaussian sigma for the background (default 28). 0 keeps the background sharp."},
+                "dim": {"type": "number", "description": "action=blur: darken the blurred background by this much, 0-1 (default 0.08). Keeps the sharp foreground readable."},
+                "foreground": {"type": "number", "description": "action=blur: the sharp layer's width as a fraction of the output width (default 0.92). Lower it for a wider blurred border."},
                 "transcript": {"type": "string", "description": "action=shorts: an existing transcript json to plan from, instead of transcribing."},
                 "no_transcribe": {"type": "boolean", "description": "action=shorts: plan only from an existing transcript; refuse rather than transcribe."},
                 "background_run": {"type": "boolean", "description": "Force a long action to run detached immediately instead of waiting inline for it."},

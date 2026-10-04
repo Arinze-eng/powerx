@@ -123,7 +123,7 @@ def test_schema_exposes_all_actions():
     actions = set(params["properties"]["action"]["enum"])
     assert {
         "doctor", "install", "status", "job", "probe", "watch", "trim", "crop",
-        "scale", "hd", "concat", "audio", "transcribe", "captions", "bg",
+        "scale", "blur", "hd", "concat", "audio", "transcribe", "captions", "bg",
         "download", "shorts",
     } <= actions
     assert params["required"] == ["action"]
@@ -168,6 +168,59 @@ def test_shorts_maps_tool_names_onto_cli_flags():
     )
     assert "--min 12" in cmd and "--max 40" in cmd
     assert "--captions" in cmd and "--focus face" in cmd
+
+
+def test_blur_maps_tool_names_onto_cli_flags():
+    """The blurred-background composite, including its one-pass trim flags."""
+    cmd = build_cli_command(
+        "blur", {"input": "long.mp4", "aspect": "9:16", "output_height": 1920,
+                 "blur": 28, "foreground": 0.92, "start": "00:12:00", "duration": "60"}
+    )
+    assert "blur long.mp4" in cmd
+    assert "--aspect 9:16" in cmd and "--output-height 1920" in cmd
+    assert "--start 00:12:00" in cmd and "--duration 60" in cmd
+
+
+def test_every_blur_flag_the_tool_renders_is_one_the_cli_accepts():
+    """Round-trip the rendered command through the real parser.
+
+    The flag names are exactly the thing that drifts between the tool's ``_FLAG_SPEC``
+    and the CLI's argparse, and the drift is silent: the tool renders a flag the CLI
+    does not know, argparse exits 2, and the model gets a usage dump instead of an
+    edit. Parsing the command the tool actually builds is the only check that cannot
+    be fooled by the two lists agreeing with themselves.
+    """
+    cli = _load_media_cli()
+    command = build_cli_command(
+        "blur", {"input": "long.mp4", "aspect": "9:16", "output_height": 1920,
+                 "blur": 28, "dim": 0.08, "foreground": 0.92,
+                 "start": "00:12:00", "duration": "60", "crf": 18, "preset": "slow",
+                 "out": "short.mp4"}
+    )
+    argv = command.split()[2:]          # drop "python3 $HOME/.media/bin/media_cli.py"
+    args = cli.build_parser().parse_args(argv)
+    assert args.func is cli.cmd_blur
+    assert (args.aspect, args.output_height, args.blur, args.foreground) == ("9:16", 1920, 28.0, 0.92)
+    assert (args.start, args.duration, args.out) == ("00:12:00", "60", "short.mp4")
+
+
+def test_fontconfig_fallback_is_not_reported_as_missing_captions():
+    """A benign ffmpeg line must not be turned into a caption failure.
+
+    MEASURED 2026-10-04: every burn-in on Freestyle prints "No usable fontconfig
+    configuration file found, using fallback." and the captions render correctly.
+    Reporting it as a failure makes the model apologise for captions that are on
+    screen — or burn them a second time for another full encode.
+    """
+    cli = _load_media_cli()
+    benign = (
+        "[Parsed_subtitles_0 @ 0x55c9a5fa5b80] No usable fontconfig configuration "
+        "file found, using fallback."
+    )
+    assert cli._caption_warnings(benign) == []
+    # ...and a real one still has to come through.
+    real = "fontselect: failed to find any fallback with glyph 0x20 for font (null)"
+    assert cli._caption_warnings(real) == [real]
 
 
 def test_concat_renders_each_input_as_a_positional():
