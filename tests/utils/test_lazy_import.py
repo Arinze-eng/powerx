@@ -78,6 +78,15 @@ WATCHED = (
     "sklearn",
     "aiohttp",
     "prompt_toolkit",
+    # Sandbox/browser backends. Each is tens of megabytes and each is needed on
+    # one code path only, but all three were imported at module scope from the
+    # tool registry, so every deployment paid them on every boot: measured at
+    # ~42 MB of the gateway's permanent floor (103.4 MB -> 61.8 MB when the
+    # three were deferred). Nothing in a turn that does not create a sandbox or
+    # drive a browser should pull them in.
+    "novita_sandbox",
+    "asyncssh",
+    "pydoll",
 )
 print(",".join(name for name in WATCHED if name in sys.modules))
 """

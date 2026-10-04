@@ -11,11 +11,16 @@ from urllib.parse import urlparse
 from loguru import logger
 
 from nanobot.utils.gofile import GoFileError, gofile_file_headers, resolve_gofile_download
+from nanobot.utils.lazy_import import optional_module
 
-try:
-    import asyncssh
-except ImportError:  # pragma: no cover - dependency is installed in production
-    asyncssh = None  # type: ignore[assignment]
+# AsyncSSH is only needed when the VPS backend is the selected execution
+# backend, which it is not by default. Importing it at module scope charged
+# ~30 MB of the gateway's permanent footprint on every boot -- including the
+# boots that never touch a VPS -- because this module is reached from the tool
+# registry through ``novita_sandbox.py``. The proxy defers the import to the
+# first real use and is falsy when the library is absent, so the guards below
+# read ``if not asyncssh`` rather than ``if asyncssh is None``.
+asyncssh = optional_module("asyncssh")
 
 _MAX_COMMAND_CHARS = 12_000
 _MAX_CONTENT_CHARS = 120_000
@@ -191,7 +196,7 @@ class VPSExecutionBackend:
         return kwargs
 
     async def _connect(self) -> Any:
-        if asyncssh is None:
+        if not asyncssh:
             raise RuntimeError("AsyncSSH is not installed")
         conn = await asyncssh.connect(**self._connect_kwargs())
         policy = str(self.config.host_key_policy or "fingerprint")

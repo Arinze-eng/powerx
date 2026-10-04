@@ -51,16 +51,15 @@ from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import ToolContext, current_request_context
 from nanobot.config_base import Base
 from nanobot.security.network import resolve_url_target
+from nanobot.utils.lazy_import import optional_attr, optional_installed
 
-try:  # pragma: no cover - exercised only where the dependency is installed
-    from pydoll.browser.chromium import Chrome
-except ImportError:  # pragma: no cover
-    Chrome = None  # type: ignore[assignment,misc]
-
-try:  # pragma: no cover - exercised only where the dependency is installed
-    from novita_sandbox import Novita
-except ImportError:  # pragma: no cover
-    Novita = None  # type: ignore[assignment,misc]
+# Pydoll and the Novita SDK are needed only when a human-browser turn actually
+# runs. Importing them at module scope put both on the boot path of every
+# deployment that merely *registers* this tool. The proxies resolve on first use
+# and are falsy when the library is absent, so the guards below read ``not
+# Chrome`` rather than ``Chrome is None``.
+Chrome = optional_attr("pydoll.browser.chromium", "Chrome")
+Novita = optional_attr("novita_sandbox", "Novita")
 
 
 class HumanBrowserToolConfig(Base):
@@ -383,14 +382,14 @@ class HumanBrowserTool(Tool):
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
         cfg = ctx.config.human_browser
-        if not cfg.enable or Chrome is None:
+        if not cfg.enable or not optional_installed("pydoll"):
             return False
         provider = str(cfg.provider or "novita").strip().lower()
         if provider == "cdp":
             return bool(str(cfg.cdp_url or "").strip())
         if provider == "novita":
             return bool(
-                Novita is not None
+                optional_installed("novita_sandbox")
                 and os.getenv(str(cfg.novita_api_key_env or ""), "").strip()
             )
         return False
@@ -567,14 +566,14 @@ class HumanBrowserTool(Tool):
         )
 
     async def _new_session(self, key: str) -> _HumanBrowserSession:
-        if Chrome is None:
+        if not Chrome:
             raise RuntimeError("the pydoll browser capability is unavailable in this deployment")
 
         sandbox = None
         browser = None
         try:
             if self.provider == "novita":
-                if Novita is None:
+                if not Novita:
                     raise RuntimeError("the Novita sandbox capability is unavailable")
                 api_key = os.getenv(self.novita_api_key_env, "").strip()
                 if not api_key:

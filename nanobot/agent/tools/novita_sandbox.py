@@ -41,6 +41,7 @@ from nanobot.agent.tools.freestyle_backend import (
 from nanobot.agent.tools.vercel_backend import VercelError, VercelExecutionBackend, vercel_sandbox_name
 from nanobot.agent.tools.vps_backend import VPSExecutionBackend
 from nanobot.config.paths import get_data_dir, get_workspace_path
+from nanobot.utils.lazy_import import optional_attr, optional_installed
 from nanobot.utils.file_share import (
     FileShareError,
     artifact_delivery_text,
@@ -57,10 +58,13 @@ from nanobot.utils.onlyfiles import OnlyFilesError
 from nanobot.utils.onlyfiles import upload_bytes as upload_onlyfile_bytes
 from nanobot.utils.onlyfiles import upload_path as upload_onlyfile_path
 
-try:
-    from novita_sandbox import Novita
-except ImportError:  # pragma: no cover - optional dependency is checked by enabled()
-    Novita = None  # type: ignore[assignment,misc]
+# The Novita SDK is ~38 MB with its transitive imports and is only needed when
+# a sandbox is actually created. This module is on the boot path of every
+# deployment (``nanobot.agent.loop`` imports it), so a module-scope import put
+# the SDK in the gateway's permanent footprint even for turns that never touch
+# a sandbox. The proxy resolves on first use and is falsy when the SDK is
+# absent, so the guards below read ``not Novita`` rather than ``Novita is None``.
+Novita = optional_attr("novita_sandbox", "Novita")
 
 _MAX_COMMAND_CHARS = 12_000
 _MAX_CONTENT_CHARS = 120_000
@@ -1263,7 +1267,7 @@ class NovitaSandboxTool(Tool):
             return _freestyle_key_configured(getattr(execution, "freestyle", None))
         if backend == "vercel":
             return bool(getattr(execution.vercel, "token", "").strip())
-        return bool(os.getenv("NOVITA_API_KEY", "").strip()) and Novita is not None
+        return bool(os.getenv("NOVITA_API_KEY", "").strip()) and optional_installed("novita_sandbox")
 
     @classmethod
     def create(cls, ctx: ToolContext) -> Tool:
@@ -1378,7 +1382,7 @@ class NovitaSandboxTool(Tool):
         }
 
     def _client(self) -> Any:
-        if Novita is None:
+        if not Novita:
             raise RuntimeError("Novita Sandbox SDK is not installed")
         return Novita(api_key=os.environ["NOVITA_API_KEY"])
 
@@ -2255,7 +2259,7 @@ class NovitaSandboxTool(Tool):
             if not local_images:
                 return "[No readable Telegram images were available to the VPS.]"
             return await self._analyze_telegram_images_vps(local_images, config=backend_config)
-        if Novita is None:
+        if not Novita:
             return "[Novita Sandbox Tesseract OCR is unavailable in this deployment; the sandbox will install it on first use.]"
         api_key = os.getenv("NOVITA_API_KEY", "").strip()
         if not api_key:

@@ -24,16 +24,15 @@ from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import ToolContext, current_request_context
 from nanobot.config_base import Base
 from nanobot.security.network import resolve_url_target
+from nanobot.utils.lazy_import import optional_attr, optional_installed, optional_module
 
-try:
-    import websockets
-except ImportError:  # pragma: no cover - dependency is installed in production images
-    websockets = None  # type: ignore[assignment]
-
-try:
-    from novita_sandbox import Novita
-except ImportError:  # pragma: no cover - dependency is installed in production images
-    Novita = None  # type: ignore[assignment,misc]
+# Both dependencies are needed only when the ephemeral browser actually runs.
+# Registering the tool must not pull the Novita SDK (~38 MB with its transitive
+# imports) into the gateway's permanent footprint. The proxies are falsy when a
+# library is absent, so the guards below read ``not Novita`` rather than
+# ``Novita is None``.
+websockets = optional_module("websockets")
+Novita = optional_attr("novita_sandbox", "Novita")
 
 
 class BrowserToolsConfig(Base):
@@ -325,7 +324,12 @@ class BrowserTool(Tool):
     @classmethod
     def enabled(cls, ctx: ToolContext) -> bool:
         cfg = ctx.config.browser
-        return bool(cfg.enable and cfg.provider.lower() == "novita" and Novita is not None and websockets is not None)
+        return bool(
+            cfg.enable
+            and cfg.provider.lower() == "novita"
+            and optional_installed("novita_sandbox")
+            and optional_installed("websockets")
+        )
 
     @classmethod
     def create(cls, ctx: ToolContext) -> Tool:
@@ -470,7 +474,7 @@ class BrowserTool(Tool):
     async def _new_session(self, key: str) -> _BrowserSession:
         if self.provider != "novita":
             raise RuntimeError("Only the Novita browser provider is supported")
-        if Novita is None or websockets is None:
+        if not Novita or not websockets:
             raise RuntimeError("Novita browser capability is unavailable in this deployment")
         api_key = __import__("os").getenv(self.novita_api_key_env, "").strip()
         if not api_key:
