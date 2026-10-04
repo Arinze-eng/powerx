@@ -1624,6 +1624,61 @@ def test_a_broker_switch_is_not_reported_as_done_before_it_has_started(
     assert captured["installing_target"] is None
 
 
+def test_a_running_installer_is_not_reported_as_done(monkeypatch, tmp_path):
+    """MEASURED 2026-10-04 (live Freestyle box, Deriv-Demo): ``status`` answered
+    ``stage="done"`` for ~2 minutes WHILE the installer was still running.
+
+    ``installed`` goes true as soon as ``terminal64.exe`` and the embeddable
+    ``python.exe`` exist, and on that box they appeared at +2m29s -- ~50 s before
+    the bridge is pip-installed and ~50 s before the MQL5 standard library is
+    materialised (real completion was +3m21s). ``done = installed or stage == "done"``
+    therefore reported done, with the still-in-progress stage's own message attached,
+    so the human line read:
+
+        stage=done: materialising MQL5 standard library (first terminal launch)
+
+    An agent polling for ``done`` stops there and calls start/login against a prefix
+    whose Wine-side Python bridge is not installed yet -- the same "reported success
+    over an unfinished install" the installer's own final-line gate exists to stop.
+    """
+    import argparse
+
+    cli = _broker_cli(
+        monkeypatch, tmp_path, broker_key="deriv", brands=("MetaTrader 5 Terminal",)
+    )
+    winpy = tmp_path / "python.exe"
+    winpy.write_bytes(b"MZ")
+    monkeypatch.setenv("MT5_WIN_PYTHON", str(winpy))
+    mt5_root = tmp_path / ".mt5"
+
+    captured: dict[str, Any] = {}
+
+    def _capture(payload: dict[str, Any], **_kw: Any) -> int:
+        captured.clear()
+        captured.update(payload)
+        return 0
+
+    monkeypatch.setattr(cli, "emit", _capture)
+    (mt5_root / "install.status").write_text(
+        "mql5stdlib|materialising MQL5 standard library", encoding="utf-8"
+    )
+
+    # The terminal is on disk AND the installer is still running: not done.
+    monkeypatch.setattr(cli, "_installer_alive", lambda: True)
+    cli.cmd_status(argparse.Namespace(lines=5))
+    assert captured["installed"] is True
+    assert captured["stage"] != "done", "a running installer is not a finished install"
+    assert captured["in_progress"] is True
+    assert "mql5" in captured["message"].lower()
+
+    # Once it exits and writes its own marker, done is correct again.
+    monkeypatch.setattr(cli, "_installer_alive", lambda: False)
+    (mt5_root / "install.status").write_text("done|install complete", encoding="utf-8")
+    cli.cmd_status(argparse.Namespace(lines=5))
+    assert captured["stage"] == "done"
+    assert captured["in_progress"] is False
+
+
 def test_the_generic_url_matches_the_installer_default():
     """A divergence would make every install look permanently pending.
 

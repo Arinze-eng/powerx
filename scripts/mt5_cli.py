@@ -1576,7 +1576,23 @@ def cmd_status(args: argparse.Namespace) -> int:
     running = terminal_running()
     installed = bool(terminal and winpy is not None)
     failed = stage == "failed"
-    done = installed or stage == "done"
+    # AN INSTALL THAT IS STILL RUNNING IS NOT DONE.
+    #
+    # MEASURED FAILURE (2026-10-04, live Freestyle box, Deriv-Demo): ``installed``
+    # goes true the moment ``terminal64.exe`` and the embeddable ``python.exe``
+    # exist -- which on this box was +2m29s, i.e. ~50 s BEFORE the bridge is
+    # pip-installed and ~50 s before the MQL5 standard library is materialised. With
+    # ``done = installed or stage == "done"`` the install therefore reported
+    # ``stage="done"`` for ~2 minutes while the installer was still running (real
+    # completion at +3m21s), and paired it with the in-progress stage's own message,
+    # so the human line read:
+    #   stage=done: materialising MQL5 standard library (first terminal launch)
+    # An agent polling for ``done`` stops there and calls start/login against a
+    # prefix whose Wine-side Python bridge is not installed yet -- the same
+    # "reported success over an unfinished install" this file's final-line gate
+    # exists to stop. The installer's own ``done`` marker still wins once written.
+    installer_alive = _installer_alive()
+    done = (installed or stage == "done") and not installer_alive
 
     # A DIFFERENT build is being installed than the one on disk: the terminal that
     # "installed" is describing is the previous broker's, so this install is not
@@ -1594,7 +1610,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     in_progress = (
         not done
         and not failed
-        and (bool(pending_target) or _installer_alive())
+        and (bool(pending_target) or installer_alive)
     )
 
     if not status_path.exists() and not done:
