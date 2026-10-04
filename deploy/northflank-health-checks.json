@@ -1,0 +1,25 @@
+{
+  "_comment": "Northflank health-check config for the powerx service. Applied to the live service via PATCH /v1/projects/minis/services/combined/powerx. Kept here so the setting is reproducible instead of living only in the platform UI.",
+  "healthChecks": [
+    {
+      "protocol": "HTTP",
+      "type": "startupProbe",
+      "port": 8765,
+      "path": "/api/health",
+      "initialDelaySeconds": 5,
+      "periodSeconds": 10,
+      "timeoutSeconds": 5,
+      "failureThreshold": 30
+    },
+    {
+      "protocol": "HTTP",
+      "type": "livenessProbe",
+      "port": 8765,
+      "path": "/api/health",
+      "initialDelaySeconds": 60,
+      "periodSeconds": 20,
+      "timeoutSeconds": 5,
+      "failureThreshold": 6
+    }
+  ]
+}
