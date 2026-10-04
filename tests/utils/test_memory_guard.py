@@ -305,4 +305,53 @@ def test_log_memory_line_separates_heap_from_cache(cgroup_v2) -> None:
     assert "used_mb=250.0" in line
     assert "cgroup_mb=488.0" in line
     assert "rss_mb=" in line
+    assert "oom_kill=-" in line
     assert "version=9.9.9" in line
+
+
+# --- memory.events: the kernel's own verdict, not our inference ----------------
+#
+# A container restarted at cgroup_pct=99.5 with no SIGTERM and no shutdown line
+# is *probably* an OOM kill, and "probably" cost a full day of wrong theories.
+# ``memory.events`` carries ``oom_kill``, which is not a inference: it counts the
+# processes this cgroup has already had killed for memory.
+
+
+def test_oom_kill_count_is_read_from_memory_events(cgroup_v2) -> None:
+    root = cgroup_v2(limit=str(488 * 1024 * 1024), current=str(486 * 1024 * 1024))
+    (root / "memory.events").write_text(
+        "low 0\nhigh 0\nmax 12\noom 0\noom_kill 3\noom_group_kill 0\n"
+    )
+
+    assert memory_guard.container_oom_kill_count() == 3
+
+
+def test_oom_kill_is_none_when_events_are_unreadable(cgroup_v2) -> None:
+    """Absent must not collapse into zero -- only one of them is evidence."""
+    cgroup_v2(limit=str(488 * 1024 * 1024), current=str(486 * 1024 * 1024))
+
+    assert memory_guard.container_oom_kill_count() is None
+    assert memory_guard.memory_snapshot()["oom_kill"] is None
+
+
+def test_a_nonzero_oom_kill_escalates_the_log_line_even_when_charge_is_low(
+    cgroup_v2,
+) -> None:
+    """A build subprocess reaped for memory is worth a WARNING at any charge.
+
+    The gateway itself can sit comfortably at 40% while the npm it shelled out to
+    has already been killed. Grading only the current charge hides exactly that.
+    """
+    root = cgroup_v2(limit=str(488 * 1024 * 1024), current=str(120 * 1024 * 1024))
+    (root / "memory.events").write_text("max 0\noom 1\noom_kill 1\n")
+    captured: list[str] = []
+    sink_id = logger.add(lambda message: captured.append(str(message)), level="INFO")
+
+    try:
+        memory_guard.log_memory("model_iteration_start")
+    finally:
+        logger.remove(sink_id)
+
+    line = "\n".join(captured)
+    assert "oom_kill=1" in line
+    assert "WARNING" in line, "a recorded OOM kill logged as informational"

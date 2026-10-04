@@ -87,6 +87,52 @@ _CGROUP_RECLAIM_MARGIN = 0.75
 _FADVISE_MAX_FILES = 512
 _FADVISE_MIN_FILE_BYTES = 1 * 1024 * 1024
 
+# ---------------------------------------------------------------------------
+# Sweep circuit breaker.
+#
+# The sweep is not free, and on this deployment it was measured as worthless.
+# Across one 6 h window of live traffic every single charge-guard sweep returned
+# the same result:
+#
+#     charge_guard_page_cache cgroup_ok=False asked_mb=1475.0 dropped_mb=0.0
+#     (x79, plus a handful at dropped_mb=5.1)
+#
+# i.e. ~240 files walked, ~1.4 GB *asked* about, and 0 MB handed back. The reason
+# is that ``POSIX_FADV_DONTNEED`` only drops clean, unreferenced pages, and on a
+# busy gateway the pages holding the charge are exactly the ones still in use --
+# so the ask is never satisfied. Meanwhile the walk itself ``stat``\ s and opens
+# every large file in the tree, and the kernel charges this cgroup for the
+# dentries and inodes that creates. The boot sweep recorded the same trade in
+# one line: 286 MB of cache out, 105 MB of unreclaimable slab in.
+#
+# So a futile sweep is worse than no sweep: it spends syscalls on the very
+# iteration that is racing the ceiling, and it converts reclaimable pages into
+# unreclaimable slab. The breaker opens after consecutive pointless walks and
+# stays open long enough for the working set to actually turn over.
+# ---------------------------------------------------------------------------
+
+#: A sweep dropping less than this is not paying for its syscalls.
+_SWEEP_MIN_USEFUL_MB = 8.0
+#: Consecutive futile sweeps (or rate-limited skips) before the breaker opens.
+_SWEEP_FUTILITY_LIMIT = 3
+#: How long the breaker stays open. Long enough that a build finishing and the
+#: cache churning can change the answer; short enough to try again on its own.
+_SWEEP_COOLDOWN_S = 900.0
+#: Shortest gap between two real walks. The charge guard runs per model
+#: iteration; heap trim is a few syscalls, a tree walk is not.
+_SWEEP_MIN_INTERVAL_S = 120.0
+
+_sweep_futilities = 0
+_sweep_open_until = 0.0
+_sweep_last_walk_at = 0.0
+
+#: Latched once the kernel refuses ``memory.reclaim`` for a permission or
+#: read-only reason. The gateway runs as an unprivileged user for its whole
+#: life, so a refusal never turns into a success mid-process; retrying the same
+#: failing write every iteration is pure noise.
+_cgroup_reclaim_denied = False
+_CGROUP_DENIAL_MARKERS = ("Permission denied", "Read-only", "Operation not permitted")
+
 #: Hard ceiling on *entries examined*, independent of how many files qualify.
 #: The file budget alone cannot bound the crawl once the size floor is applied
 #: inside the walker: a tree of 100k small modules would never reach
@@ -401,8 +447,15 @@ def reclaim_cgroup_charge(*, amount_bytes: int | None = None) -> dict[str, Any]:
     The kernel rejects a request larger than what is currently reclaimable, so
     the ask is the measured reclaimable figure less a margin, never "everything".
 
+    A permission-style refusal is latched for the life of the process: the
+    gateway drops its privileges once, at exec, and never gets them back, so
+    re-issuing a write the kernel already refused is per-iteration noise.
+
     Returns ``{"ok", "reason", "requested_mb"}``. Never raises.
     """
+    global _cgroup_reclaim_denied
+    if _cgroup_reclaim_denied:
+        return {"ok": False, "reason": "memory.reclaim refused (latched)", "requested_mb": 0.0}
     reclaimable = memory_snapshot().get("reclaimable_bytes")
     if amount_bytes is None:
         if not reclaimable:
@@ -420,13 +473,69 @@ def reclaim_cgroup_charge(*, amount_bytes: int | None = None) -> dict[str, Any]:
             with open(path, "w", encoding="ascii") as handle:
                 handle.write(str(amount_bytes))
         except OSError as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            # Latch only the refusals that cannot change while we run. A busy
+            # rejection (EIO on an oversize ask) is worth trying again.
+            if any(marker in reason for marker in _CGROUP_DENIAL_MARKERS):
+                _cgroup_reclaim_denied = True
             return {
                 "ok": False,
-                "reason": f"{type(exc).__name__}: {exc}",
+                "reason": reason,
                 "requested_mb": requested_mb,
             }
         return {"ok": True, "reason": "", "requested_mb": requested_mb}
     return {"ok": False, "reason": "memory.reclaim not present", "requested_mb": requested_mb}
+
+
+def _sweep_with_breaker(roots: Sequence[str | Path] | None) -> dict[str, Any]:
+    """Run the fadvise walk only while it is still earning its syscalls.
+
+    Returns the sweep result, or a ``skipped`` marker when the breaker is open
+    or the walk is inside its minimum interval. Skipping is deliberately quiet:
+    the caller logs the measured ``dropped_mb`` either way, so an operator can
+    see the pause and the reason for it.
+    """
+    global _sweep_futilities, _sweep_open_until, _sweep_last_walk_at
+    now = time.monotonic()
+    # The skipped shape carries every key a walked sweep returns. Callers read
+    # this dict as a result, not as a status: a missing ``roots``/``dropped_mb``
+    # would make a paused sweep indistinguishable from a crashed one.
+    skipped: dict[str, Any] = {
+        "files": 0,
+        "asked_mb": 0.0,
+        "dropped_mb": None,
+        "roots": [],
+    }
+    if now < _sweep_open_until:
+        return {**skipped, "skipped": f"breaker open for {round(_sweep_open_until - now)}s"}
+    if _sweep_last_walk_at and (now - _sweep_last_walk_at) < _SWEEP_MIN_INTERVAL_S:
+        return {**skipped, "skipped": "rate limited"}
+
+    _sweep_last_walk_at = now
+    sweep = fadvise_page_cache(roots)
+    dropped = sweep.get("dropped_mb")
+    if dropped is None or dropped < _SWEEP_MIN_USEFUL_MB:
+        _sweep_futilities += 1
+    else:
+        _sweep_futilities = 0
+    if _sweep_futilities >= _SWEEP_FUTILITY_LIMIT:
+        _sweep_futilities = 0
+        _sweep_open_until = now + _SWEEP_COOLDOWN_S
+        # One warning per cooldown, not one per iteration: this is the signal
+        # that the plan is too small for the working set, which no amount of
+        # sweeping inside the same cgroup can fix.
+        logger.warning(
+            "memory_reclaim: {} consecutive sweeps handed back under {} MB "
+            "(last asked_mb={}); pausing the page-cache walk for {} min. The "
+            "charge here is not clean page cache -- walking the tree buys "
+            "syscalls and slab instead.",
+            _SWEEP_FUTILITY_LIMIT,
+            _SWEEP_MIN_USEFUL_MB,
+            sweep.get("asked_mb"),
+            round(_SWEEP_COOLDOWN_S / 60),
+        )
+        return {**sweep, "skipped": "breaker opened"}
+    return sweep
 
 
 def reclaim_page_cache(
@@ -453,6 +562,7 @@ def reclaim_page_cache(
     because one syscall can return the whole charge; the sweep runs when it is
     refused, which is the normal case for an unprivileged gateway.
     """
+    global _sweep_futilities, _sweep_open_until, _sweep_last_walk_at
     cache_before = container_memory_file_cache_bytes()
     cgroup = reclaim_cgroup_charge()
     result: dict[str, Any] = {
@@ -470,7 +580,7 @@ def reclaim_page_cache(
             else None
         )
     else:
-        result.update(fadvise_page_cache(roots))
+        result.update(_sweep_with_breaker(roots))
     if log:
         if cgroup["ok"] or result.get("asked_mb", 0) >= 1.0:
             logger.info(
@@ -523,9 +633,14 @@ def reclaim_if_charge_high(
 
 
 def _reset_interval_for_tests() -> None:
-    """Clear the rate-limit clock. Tests only."""
-    global _last_reclaim_at
+    """Clear the rate-limit clock and the sweep breaker. Tests only."""
+    global _last_reclaim_at, _sweep_futilities, _sweep_open_until
+    global _sweep_last_walk_at, _cgroup_reclaim_denied
     _last_reclaim_at = 0.0
+    _sweep_futilities = 0
+    _sweep_open_until = 0.0
+    _sweep_last_walk_at = 0.0
+    _cgroup_reclaim_denied = False
 
 
 if sys.platform == "win32":  # pragma: no cover - documented, not exercised

@@ -50,6 +50,7 @@ __all__ = [
     "container_memory_file_cache_bytes",
     "container_memory_limit_bytes",
     "container_memory_used_bytes",
+    "container_oom_kill_count",
     "log_memory",
     "memory_pressure",
     "memory_snapshot",
@@ -165,6 +166,39 @@ def _parse_memory_stat(text: str) -> dict[str, int]:
         except ValueError:
             continue
     return values
+
+
+def container_oom_kill_count() -> int | None:
+    """Return how many times the kernel has OOM-killed a process in this cgroup.
+
+    ``memory.events`` is the one interface that answers the question an operator
+    actually asks after a silent restart: *was this container killed for memory?*
+    Until now the gateway could only infer it from the charge it happened to have
+    sampled last, which is why a container recycled at ``cgroup_pct=99.5`` could
+    still be argued about. The counter is not inferential.
+
+    It counts kills of *any* process in this cgroup, so a build subprocess reaped
+    by the kernel shows up here even when the gateway itself survives -- the
+    common shape for a task that shells out to npm. The counter belongs to the
+    cgroup and resets when the container is recreated, so a non-zero reading on
+    the very first line of a boot means the *previous* life ended that way only
+    where the platform reuses the cgroup; treat it as evidence, not provenance.
+
+    ``None`` means unreadable, never zero.
+    """
+    for events_path in (
+        _CGROUP_V2 / "memory.events",
+        _CGROUP_V2 / "memory.events.local",
+    ):
+        try:
+            text = events_path.read_text()
+        except OSError:
+            continue
+        values = _parse_memory_stat(text)
+        if "oom_kill" in values:
+            return values["oom_kill"]
+        return None
+    return None
 
 
 def container_memory_anonymous_bytes() -> int | None:
@@ -302,6 +336,9 @@ def memory_snapshot() -> dict[str, Any]:
         ),
         "anonymous_bytes": anonymous,
         "reclaimable_bytes": reclaimable,
+        # The kernel's own verdict, not our inference: how many processes this
+        # cgroup has already had killed for memory.
+        "oom_kill": container_oom_kill_count(),
         "rss_bytes": process_rss_bytes(),
         "rss_mb": round(process_rss_bytes() / _MB, 1),
         "pressure": memory_pressure(used, limit),
@@ -319,9 +356,10 @@ def log_memory(tag: str, **extra: Any) -> dict[str, Any]:
     """
     snapshot = memory_snapshot()
     fields = " ".join(f"{key}={value}" for key, value in extra.items())
+    oom_kill = snapshot.get("oom_kill")
     message = (
         "MEMORY tag={} pressure={} pct={} used_mb={} limit_mb={} rss_mb={}"
-        " cgroup_mb={} cgroup_pct={}{}"
+        " cgroup_mb={} cgroup_pct={} oom_kill={}{}"
     ).format(
         tag,
         snapshot["pressure"],
@@ -331,6 +369,10 @@ def log_memory(tag: str, **extra: Any) -> dict[str, Any]:
         snapshot["rss_mb"],
         snapshot["cgroup_used_mb"],
         snapshot["charge_pct"],
+        # "-" rather than 0 when unreadable: an absent counter and a counter that
+        # says "nothing has been killed" are different claims, and only one of
+        # them is evidence.
+        oom_kill if oom_kill is not None else "-",
         (" " + fields) if fields else "",
     )
     charge_pct = snapshot.get("charge_pct")
@@ -339,7 +381,9 @@ def log_memory(tag: str, **extra: Any) -> dict[str, Any]:
         and charge_pct >= MEMORY_CHARGE_WARN_RATIO * 100
     )
     try:
-        if snapshot["pressure"] == "critical" or charge_is_high:
+        # A non-zero oom_kill is not a threshold to watch, it is the answer:
+        # something in this cgroup has already been killed for memory.
+        if (oom_kill or 0) > 0 or snapshot["pressure"] == "critical" or charge_is_high:
             logger.warning(message)
         else:
             logger.info(message)
