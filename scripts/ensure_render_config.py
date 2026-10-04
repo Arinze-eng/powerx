@@ -556,6 +556,78 @@ def _ensure_deployment_timezone(data: dict[str, Any]) -> bool:
     return changed
 
 
+def _container_memory_limit_mb() -> float | None:
+    """The cgroup memory limit in MB, or ``None`` when it cannot be read.
+
+    Read directly rather than via ``nanobot.utils.memory_guard`` because this
+    script runs from the entrypoint before the package is importable.
+    """
+    for path in (
+        Path("/sys/fs/cgroup/memory.max"),
+        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ):
+        try:
+            raw = path.read_text().strip()
+        except OSError:
+            continue
+        if raw == "max":
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        # v1 reports "no limit" as a huge sentinel; ignore absurd readings
+        # rather than treating an unbounded host as a tiny container.
+        if value <= 0 or value > 1 << 40:
+            return None
+        return value / (1024 * 1024)
+    return None
+
+
+def _ensure_turn_budget_for_memory(data: dict[str, Any]) -> bool:
+    """Cap the in-RAM turn budget to what this container can actually hold.
+
+    A turn keeps its whole message list in RAM for its entire life, and the
+    runner's overflow handling exists but only engages *above*
+    ``maxToolResultChars`` — it spills the full output to disk and leaves the
+    model a path to read it back. With the ceiling set to 128 KB on a 512 MB
+    plan, ordinary results stay resident, the list grows unbounded, and the
+    kernel kills the container mid-turn: the measured death was at 99.5% of the
+    cgroup charge while the app's own grade reported ``ok`` (65%), because that
+    grade is anonymous memory and the ceiling is the whole charge.
+
+    So the ceiling is scaled to the container. Disk is the abundant resource
+    here (a multi-GB NVMe volume) and RAM is the scarce one, which is exactly
+    the trade the spill path was built to make -- it simply was never being
+    reached. Values are only ever lowered, and only when a limit is known, so a
+    host that genuinely has the memory keeps its configured budget.
+    """
+    agents = _object_field(data, "agents")
+    if agents is None:
+        return False
+    defaults = _object_field(agents, "defaults")
+    if defaults is None:
+        return False
+
+    limit_mb = _container_memory_limit_mb()
+    if limit_mb is None:
+        return False
+
+    # One result's worth of RAM at the cap, times the concurrent-turn gate
+    # (default 3), is what a single iteration can cost; the budget keeps that a
+    # small fraction of the plan so ordinary traffic never approaches the edge.
+    char_cap = 16_384 if limit_mb < 1024 else 65_536
+    iter_cap = 40 if limit_mb < 1024 else 120
+
+    changed = False
+    for key, cap in (("maxToolResultChars", char_cap), ("maxToolIterations", iter_cap)):
+        current = defaults.get(key)
+        if isinstance(current, int) and current > cap:
+            defaults[key] = cap
+            changed = True
+    return changed
+
+
 def ensure_render_defaults(config_path: Path) -> bool:
     """Apply attachment and deliberate-execution defaults without clobbering config."""
     data = _load_config(config_path)
@@ -572,6 +644,10 @@ def ensure_render_defaults(config_path: Path) -> bool:
     changed = _ensure_subagent_concurrency_cap(data) or changed
     changed = _ensure_execution_backend_selection(data) or changed
     changed = _ensure_deployment_timezone(data) or changed
+    # Runs last so it wins over any default above that raises the budget for
+    # context-quality reasons: those defaults were written without knowing the
+    # container's memory, and this is the step that does know it.
+    changed = _ensure_turn_budget_for_memory(data) or changed
     return _write_config(config_path, data) if changed else False
 
 
