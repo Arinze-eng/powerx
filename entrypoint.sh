@@ -36,6 +36,65 @@ _data_dir_is_mounted() {
 
 PERSISTENT_DISK=false
 mkdir -p "$dir" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# The persistent volume: everything durable lives under $HOME/.nanobot, so that
+# is the tree that has to be on the disk.
+#
+# Mounting the disk is not the same as using it, and every one of these has gone
+# wrong in production here:
+#
+#   1. `$HOME/.nanobot` is container filesystem even when a volume is mounted
+#      somewhere else. That tree is chat history, the admin's own configuration
+#      (config.json), the Telegram admin registry, the provider pool and the
+#      agent workspace -- so every deploy re-seeded config.json from
+#      render-config.json and dropped the rest. The whole tree is linked onto
+#      the volume here, BEFORE anything writes to it.
+#   2. The copy is no-clobber (`cp -an`). The volume holds the admin's edits; the
+#      image only ever supplies a first-boot default. A plain `cp` would let a
+#      container-seeded config.json overwrite the real one on the next boot.
+#   3. The platform mounts the disk **root-owned** while the gateway runs as
+#      nanobot, so a mounted volume is still one nothing can write. That chown,
+#      and the check below that runs as the nanobot user, is what makes it real.
+#
+# Doing this before the mount detection below also means that detection can see
+# the volume: it compares device ids, and $dir is now a link onto the disk.
+# ---------------------------------------------------------------------------
+VOLUME_ROOT=""
+if [ -n "${POWERX_DATA_DIR:-}" ]; then
+    VOLUME_ROOT="$POWERX_DATA_DIR"
+elif [ -d /data ]; then
+    VOLUME_ROOT=/data
+fi
+# >>> powerx:volume-link  (tests/test_entrypoint_image_contract.py lifts this block)
+VOLUME_DATA_DIR=""
+if [ -n "$VOLUME_ROOT" ] && [ ! -L "$dir" ] && [ -w "$dir" ]; then
+    VOLUME_DATA_DIR="$VOLUME_ROOT/powerx/nanobot"
+    if mkdir -p "$VOLUME_DATA_DIR" 2>/dev/null; then
+        if [ -d "$dir" ]; then
+            cp -an "$dir/." "$VOLUME_DATA_DIR/" 2>/dev/null \
+                || echo "[entrypoint] warning: could not copy $dir onto the volume" >&2
+            rm -rf "$dir"
+        fi
+        # An earlier revision linked only $dir/sessions at the volume root.
+        # Bring those chats in beside everything else rather than leave a hop
+        # behind a link that is about to be replaced.
+        [ -L "$VOLUME_DATA_DIR/sessions" ] && rm -f "$VOLUME_DATA_DIR/sessions"
+        if [ -d "$VOLUME_ROOT/powerx/sessions" ] && [ ! -e "$VOLUME_DATA_DIR/sessions" ]; then
+            mv "$VOLUME_ROOT/powerx/sessions" "$VOLUME_DATA_DIR/sessions" 2>/dev/null || true
+        fi
+        mkdir -p "$VOLUME_DATA_DIR/sessions" 2>/dev/null || true
+        if ln -s "$VOLUME_DATA_DIR" "$dir" 2>/dev/null; then
+            echo "[entrypoint] runtime data on the volume: $dir -> $VOLUME_DATA_DIR"
+            echo "[entrypoint]   (chat history, admin config, provider pool, workspace)"
+        else
+            mkdir -p "$dir" 2>/dev/null || true
+            echo "[entrypoint] warning: could not link $dir onto the volume" >&2
+        fi
+    fi
+fi
+# <<< powerx:volume-link
+
 if _data_dir_is_mounted "$dir"; then
     PERSISTENT_DISK=true
     echo "[entrypoint] persistent volume detected at $dir — cron jobs stay on disk"
@@ -74,29 +133,6 @@ elif [ -d /data ] && [ -w /data ]; then
     CRON_STORE="/data/powerx/cron/jobs.json"
 else
     CRON_STORE="$dir/persistent/cron/jobs.json"
-fi
-
-# ---------------------------------------------------------------------------
-# The persistent volume root, resolved the same way the cron store resolves it.
-#
-# Mounting the disk is not the same as using it, and both halves have gone wrong
-# in production before:
-#
-#   1. The platform mounts the volume **root-owned** while the gateway runs as
-#      nanobot. Without a chown the mount exists, every path resolves onto it,
-#      and every write fails as EACCES -- a deployment that looks durable and
-#      stores nothing. So the chown below is part of making the volume real, and
-#      it is verified as the nanobot user rather than assumed.
-#   2. Chat history is `$HOME/.nanobot/sessions`, which is container filesystem
-#      even when a volume is mounted somewhere else, so every deploy dropped it.
-#      The volume is the thing that should hold it, so the session mirror is
-#      pointed at the volume below.
-# ---------------------------------------------------------------------------
-VOLUME_ROOT=""
-if [ -n "${POWERX_DATA_DIR:-}" ]; then
-    VOLUME_ROOT="$POWERX_DATA_DIR"
-elif [ -d /data ]; then
-    VOLUME_ROOT=/data
 fi
 # print_cron_store.py used to create this directory as a side effect; make sure
 # the mount check below sees a real path on a first boot too.
@@ -257,6 +293,7 @@ if [ "$(id -u)" = "0" ]; then
     # the result needs checking: a root-owned mount is the failure that looks
     # exactly like success (paths resolve, writes fail, nothing says why).
     if [ -n "$VOLUME_ROOT" ]; then
+        # >>> powerx:volume-chown  (lifted by tests/test_entrypoint_image_contract.py)
         mkdir -p "$VOLUME_ROOT/powerx" 2>/dev/null || true
         chown -R nanobot:nanobot "$VOLUME_ROOT" 2>/dev/null \
             || echo "[entrypoint] warning: chown $VOLUME_ROOT failed" >&2
@@ -267,22 +304,7 @@ if [ "$(id -u)" = "0" ]; then
             echo "[entrypoint] WARNING: $VOLUME_ROOT/powerx is NOT writable by nanobot;" \
                  "anything written there will fail" >&2
         fi
-        # Chat history onto the volume. Existing files are copied over first, so
-        # the first boot after this change keeps the chats created before it.
-        if [ ! -L "$dir/sessions" ]; then
-            mkdir -p "$VOLUME_ROOT/powerx/sessions" 2>/dev/null || true
-            if [ -d "$dir/sessions" ]; then
-                cp -a "$dir/sessions/." "$VOLUME_ROOT/powerx/sessions/" 2>/dev/null \
-                    || echo "[entrypoint] warning: could not copy existing sessions onto the volume" >&2
-                rm -rf "$dir/sessions"
-            fi
-            chown -R nanobot:nanobot "$VOLUME_ROOT/powerx/sessions" 2>/dev/null || true
-            if ln -s "$VOLUME_ROOT/powerx/sessions" "$dir/sessions" 2>/dev/null; then
-                echo "[entrypoint] chat history: $dir/sessions -> $VOLUME_ROOT/powerx/sessions"
-            else
-                echo "[entrypoint] warning: could not link chat history onto the volume" >&2
-            fi
-        fi
+        # <<< powerx:volume-chown
     fi
 
     # [FIX 2026-10-03] Hand the kernel back the page cache this container charged
