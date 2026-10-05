@@ -51,6 +51,16 @@ class FakeTransport:
             if name.startswith(remote_dir.rstrip("/") + "/")
         )
 
+    def pull_head(self, remote: str, lines: int, key: str | None = None) -> bytes:
+        """The fake's ``head -n``: the first *lines* lines, never the body."""
+        self.calls.append(("head", remote))
+        self.keys.append(("head", key))
+        data = self.files.get(remote)
+        if data is None:
+            return b""
+        head = b"\n".join(data.split(b"\n")[: max(1, int(lines))])
+        return head if head.endswith(b"\n") else head + b"\n"
+
     def ops(self, name: str) -> list[str]:
         return [arg for op, arg in self.calls if op == name]
 
@@ -222,7 +232,109 @@ def test_hydrate_all_is_bounded(store, tmp_path, monkeypatch) -> None:
     cold = _cold(tmp_path, transport)
     cold.list_sessions()
 
-    assert len(transport.ops("pull")) == 2
+    assert len(transport.ops("head")) == 2
+
+
+def test_listing_never_pulls_a_session_body(store, tmp_path) -> None:
+    """The listing must fetch headers, not conversations.
+
+    Pulling every remote session whole put the entire chat history through the
+    process on the first list -- and the process is charged for the whole cgroup,
+    so with a 512 MB ceiling a large history was a memory cliff on every cold
+    start. Deleting the persistent volume made the footprint drop back to sane
+    for exactly this reason.
+    """
+    made, transport = store
+    for index in range(5):
+        made.save(_session(f"cli:{index}", "x" * 50_000))
+    assert made.flush(5.0)
+
+    cold = _cold(tmp_path, transport)
+    listed = cold.list_sessions()
+
+    assert {item["key"] for item in listed} == {f"cli:{index}" for index in range(5)}
+    assert transport.ops("pull") == [], "a listing must not transfer a session body"
+    assert len(transport.ops("head")) == 5
+
+
+def test_an_unreadable_header_falls_back_to_the_body(store, tmp_path, monkeypatch) -> None:
+    """A header the hydrate cannot trust must not cost the chat its sidebar row.
+
+    The header comes back through the shell exec plane, so it can be capped or
+    decorated. When it does not parse as the metadata record the listing takes the
+    whole file instead -- the pre-fix behaviour, and never worse than it.
+    """
+    made, transport = store
+    made.save(_session("cli:torn", "the whole conversation"))
+    assert made.flush(5.0)
+
+    cold = _cold(tmp_path, transport)
+    monkeypatch.setattr(
+        transport, "pull_head", lambda remote, lines, key=None: b"ls: not a session\n"
+    )
+    listed = cold.list_sessions()
+
+    assert [item["key"] for item in listed] == ["cli:torn"]
+    assert len(transport.ops("pull")) == 1, "an untrusted header must pull the body"
+    path = cold.local.get_session_path("cli:torn")
+    assert not path.with_name(path.name + sbx.PARTIAL_SUFFIX).exists(), (
+        "the fallback pull is a real body, so no stub marker may remain"
+    )
+    loaded = cold.load("cli:torn")
+    assert loaded is not None
+    assert [message["content"] for message in loaded.messages] == ["the whole conversation"]
+
+
+def test_a_missing_header_falls_back_to_the_body(store, tmp_path, monkeypatch) -> None:
+    """An empty head result means "ask for the whole file", not "no chat"."""
+    made, transport = store
+    made.save(_session("cli:gone", "the whole conversation"))
+    assert made.flush(5.0)
+
+    cold = _cold(tmp_path, transport)
+    monkeypatch.setattr(transport, "pull_head", lambda remote, lines, key=None: b"")
+    listed = cold.list_sessions()
+
+    assert [item["key"] for item in listed] == ["cli:gone"]
+    assert len(transport.ops("pull")) == 1
+
+
+def test_a_header_stub_is_never_served_as_the_conversation(store, tmp_path) -> None:
+    """A stub must be replaced by the real body before anything reads it."""
+    made, transport = store
+    made.save(_session("cli:long", "the whole conversation"))
+    assert made.flush(5.0)
+
+    cold = _cold(tmp_path, transport)
+    cold.list_sessions()  # writes the header stub
+
+    marker = cold.local.get_session_path("cli:long").with_name(
+        cold.local.get_session_path("cli:long").name + sbx.PARTIAL_SUFFIX
+    )
+    assert marker.exists(), "the listing should have left a stub marker"
+
+    loaded = cold.load("cli:long")
+    assert loaded is not None
+    assert [message["content"] for message in loaded.messages] == ["the whole conversation"]
+    assert not marker.exists(), "pulling the body must clear the stub marker"
+
+
+def test_a_stub_is_not_pushed_back_over_the_real_session(store, tmp_path) -> None:
+    """Metadata edits must not overwrite the stored conversation with a header."""
+    made, transport = store
+    made.save(_session("cli:long", "the whole conversation"))
+    assert made.flush(5.0)
+    remote = made.remote_root + "/" + made.local.get_session_path("cli:long").name
+    original = transport.files[remote]
+
+    cold = _cold(tmp_path, transport)
+    cold.list_sessions()
+    assert cold.update_metadata("cli:long", {"pinned": True}) is True
+    assert cold.flush(5.0)
+
+    body = transport.files[remote]
+    assert b"the whole conversation" in body, "the conversation was lost"
+    assert body != original
 
 
 # -- protocol and wiring ----------------------------------------------------

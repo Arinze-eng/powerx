@@ -63,11 +63,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import queue
 import shlex
 import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -96,6 +98,49 @@ NATIVE_WORKSPACE = "/workspace"
 #: Bound on how many sessions one rehydrate pass will pull. A first boot against
 #: a large history must not turn into an unbounded transfer.
 MAX_HYDRATE_FILES = 200
+
+#: How many lines of each remote session the sidebar hydrate fetches. One record
+#: is one physical line (``JsonlSessionStore.save`` writes ``json.dumps`` with no
+#: indent), and every listing reader -- ``session_headers_nolock``,
+#: ``read_metadata``, ``list_sessions`` -- stops at the FIRST line, the metadata
+#: record carrying key, created_at and title. So one line is the whole of what a
+#: listing needs; the second is there only in case a future format puts provider
+#: state above the metadata. The conversation below it is NOT fetched: pulling
+#: every body is what put an entire history in RAM on the first list, and it is
+#: why deleting the persistent volume made the process drop back to a sane
+#: footprint.
+HEADER_HYDRATE_LINES = 2
+
+#: Suffix marking a locally cached session as a *stub*: header and preview only,
+#: with the body still in the sandbox. Deliberately not ``*.jsonl``, so the
+#: session listings' glob never sees it. Anything that reads or rewrites a
+#: session body must pull the real file first -- otherwise a stub could be served
+#: to the model as if it were the whole conversation, or pushed back over it.
+PARTIAL_SUFFIX = ".partial"
+
+
+def is_session_metadata_head(data: bytes | bytearray) -> bool:
+    """True when *data* starts with a readable session metadata record.
+
+    The header is fetched through the shell exec plane, whose stdout can be
+    capped or decorated, so a header that does not parse is not trusted: the
+    hydrate falls back to a whole-file pull for that session rather than write a
+    stub that would hide the chat from the sidebar. The rule matches the readers
+    exactly -- ``read_metadata`` returns nothing unless the first non-blank
+    record is the metadata one.
+    """
+    if not data:
+        return False
+    for raw in bytes(data).decode("utf-8", "replace").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            return False
+        return isinstance(record, dict) and record.get("_type") == "metadata"
+    return False
 
 #: Refuse to push a single session file larger than this. A session file is a
 #: conversation, not an artifact; anything past this is a bug, not a session.
@@ -142,6 +187,8 @@ class SandboxTransport(Protocol):
     def remove(self, remote: str, key: str | None = None) -> bool: ...
 
     def list_remote(self, remote_dir: str, key: str | None = None) -> list[str]: ...
+
+    def pull_head(self, remote: str, lines: int, key: str | None = None) -> bytes: ...
 
 
 class _LoopThread:
@@ -395,6 +442,33 @@ class RemoteSandboxTransport:
             line.strip() for line in (out or "").splitlines() if line.strip().endswith(".jsonl")
         ]
 
+    async def _head(self, remote: str, lines: int, key: str | None) -> bytes:
+        """The first *lines* lines of *remote*, and nothing else.
+
+        Used by the listing hydrate, which needs a session's metadata record and
+        a preview but never its conversation. Reading it through the exec plane
+        is what keeps the body in the sandbox instead of in this process.
+        """
+        from nanobot.agent.tools.workspace_bridge import run_remote
+
+        executor = await self._executor(key)
+        if executor is None or not executor.available:
+            self._warn_unavailable(key)
+            return b""
+        head_lines = max(1, int(lines))
+        try:
+            ok, out = await run_remote(
+                f"head -n {head_lines} {shlex.quote(remote)} 2>/dev/null || true",
+                timeout=60,
+                executor=executor,
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed head reads as a miss
+            logger.debug("sandbox session head failed ({}): {}", remote, exc)
+            return b""
+        if not ok and not out:
+            return b""
+        return (out or "").encode("utf-8")
+
     # -- sync surface ------------------------------------------------------ #
     def push(self, local: Path, remote: str, key: str | None = None) -> bool:
         try:
@@ -419,6 +493,12 @@ class RemoteSandboxTransport:
             return list(self._loop.call(self._list(remote_dir, key), timeout=self._timeout))
         except Exception:  # noqa: BLE001
             return []
+
+    def pull_head(self, remote: str, lines: int, key: str | None = None) -> bytes:
+        try:
+            return bytes(self._loop.call(self._head(remote, lines, key), timeout=self._timeout))
+        except Exception:  # noqa: BLE001
+            return b""
 
 
 class SandboxSessionStore:
@@ -463,6 +543,7 @@ class SandboxSessionStore:
         self._remote_root = remote_root or os.getenv("NANOBOT_SANDBOX_SESSIONS_ROOT", "").strip()
         self._transport = transport or RemoteSandboxTransport()
         self._hydrated = False
+        self._warned_no_head = False
         self._lock = threading.Lock()
         # (op, session key, sandbox key). The sandbox key is captured on the
         # calling thread, where the request context still exists.
@@ -551,14 +632,67 @@ class SandboxSessionStore:
             return True
 
     # -- hydrate ----------------------------------------------------------- #
-    def _hydrate_one(self, key: str) -> bool:
+    def _partial_marker(self, path: Path) -> Path:
+        return path.with_name(path.name + PARTIAL_SUFFIX)
+
+    def _clear_partial(self, key: str) -> None:
+        marker = self._partial_marker(self._local.get_session_path(key))
+        with suppress(OSError):
+            marker.unlink(missing_ok=True)
+
+    def _full_body_is_local(self, key: str) -> bool:
+        """True when the local copy is a complete session, not a header stub."""
         path = self._local.get_session_path(key)
-        if path.exists():
+        if not path.exists():
             return False
+        return not self._partial_marker(path).exists()
+
+    def _hydrate_one(self, key: str) -> bool:
+        """Pull the FULL body of *key* unless a complete copy is already local.
+
+        A listing writes header-only stubs, so "a local file exists" is no longer
+        the same as "the body is here": the marker decides. On a successful pull
+        the marker is dropped, because the file now really is the session.
+        """
+        if self._full_body_is_local(key):
+            return False
+        path = self._local.get_session_path(key)
         skey = sandbox_key()
-        return bool(self._transport.pull(self._remote_path(key, skey), path, skey))
+        ok = bool(self._transport.pull(self._remote_path(key, skey), path, skey))
+        if ok:
+            self._clear_partial(key)
+        return ok
+
+    def _servable(self, key: str) -> bool:
+        """Guard for every path that reads or rewrites a session *body*.
+
+        A stub must never be served as a whole conversation, and must never be
+        pushed back over the real one -- so a failed pull with a stub present is
+        an honest miss, not a partial answer.
+        """
+        if self._full_body_is_local(key):
+            return True
+        if self._hydrate_one(key):
+            return True
+        if self._local.get_session_path(key).exists():
+            logger.warning(
+                "sandbox session {}: body could not be pulled, serving nothing "
+                "rather than the cached header stub",
+                key,
+            )
+        return False
 
     def _hydrate_all(self) -> None:
+        """Populate the session list from headers, never by replaying bodies.
+
+        Pulling each remote session whole put the entire chat history through
+        this process on the first listing -- and it is charged for the whole
+        cgroup, so a large history was a memory spike on every cold start. The
+        listing only ever needs the metadata record and a preview, so that is
+        all it fetches; the body is pulled on demand when the session is opened
+        (``_hydrate_one``) and the stub is marked so it cannot be confused with
+        the real file.
+        """
         with self._lock:
             if self._hydrated:
                 return
@@ -568,41 +702,101 @@ class SandboxSessionStore:
         names = self._transport.list_remote(root, skey)
         for name in names[:MAX_HYDRATE_FILES]:
             path = self._local.sessions_dir / name
+            marker = self._partial_marker(path)
             if path.exists():
                 continue
-            self._transport.pull(f"{root}/{name}", path, skey)
+            # A marker with no file is an interrupted stub write; clear it so the
+            # listing is not permanently short one chat.
+            with suppress(OSError):
+                marker.unlink(missing_ok=True)
+            data = self._fetch_head(f"{root}/{name}", skey)
+            if not is_session_metadata_head(data):
+                # No usable header: take the whole file, which is exactly what
+                # this listing did before. A fetch that cannot be trusted must
+                # never cost the chat its place in the sidebar.
+                if data:
+                    logger.debug(
+                        "sandbox session {}: header unusable, pulling the body", name
+                    )
+                self._transport.pull(f"{root}/{name}", path, skey)
+                continue
+            # Marker BEFORE the file: a listing on another thread must never see
+            # a header-only file that looks complete.
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.touch()
+                tmp = path.with_name(f".{path.name}.{os.getpid()}.stub")
+                tmp.write_bytes(data)
+                os.replace(tmp, path)
+            except OSError as exc:  # noqa: BLE001
+                logger.debug("sandbox session stub write failed ({}): {}", path.name, exc)
+                with suppress(OSError):
+                    marker.unlink(missing_ok=True)
+
+    def _fetch_head(self, remote: str, skey: str | None) -> bytes:
+        """The header lines of one remote session, via whichever API answers.
+
+        ``pull_head`` is the cheap path, and the only one used: falling back to a
+        whole-file pull would reintroduce exactly the transfer this avoids. A
+        transport without it yields no listing hydrate rather than a silent
+        stampede of full bodies, and says so once.
+        """
+        reader = getattr(self._transport, "pull_head", None)
+        if not callable(reader):
+            with self._lock:
+                if not self._warned_no_head:
+                    self._warned_no_head = True
+                    logger.warning(
+                        "sandbox session transport {} has no pull_head; the session "
+                        "list will not be hydrated from the sandbox",
+                        type(self._transport).__name__,
+                    )
+            return b""
+        try:
+            data = reader(remote, HEADER_HYDRATE_LINES, skey)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("sandbox session head failed ({}): {}", remote, exc)
+            return b""
+        if isinstance(data, (bytes, bytearray)) and data:
+            return bytes(data)
+        return b""
 
     # -- SessionStore protocol --------------------------------------------- #
     def load(self, key: str) -> Session | None:
-        session = self._local.load(key)
-        if session is None and self._hydrate_one(key):
-            session = self._local.load(key)
-        return session
+        if not self._servable(key):
+            return None
+        return self._local.load(key)
 
     def save(self, session: Session, *, fsync: bool = False) -> None:
         self._local.save(session, fsync=fsync)
+        # A saved session is a full body by construction, so any stub marker left
+        # over from a listing must not survive it.
+        self._clear_partial(session.key)
         self._enqueue("push", session.key)
 
     def delete(self, key: str) -> bool:
         removed = self._local.delete(key)
+        self._clear_partial(key)
         # The removal is enqueued even when the local file was already gone: the
         # sandbox is the durable copy, so the delete has to reach it either way.
         self._enqueue("remove", key)
         return removed
 
     def read(self, key: str) -> SessionPayload | None:
-        payload = self._local.read(key)
-        if payload is None and self._hydrate_one(key):
-            payload = self._local.read(key)
-        return payload
+        if not self._servable(key):
+            return None
+        return self._local.read(key)
 
     def read_metadata(self, key: str) -> SessionMetadataPayload | None:
-        payload = self._local.read_metadata(key)
-        if payload is None and self._hydrate_one(key):
-            payload = self._local.read_metadata(key)
-        return payload
+        if not self._servable(key):
+            return None
+        return self._local.read_metadata(key)
 
     def update_metadata(self, key: str, updates: dict[str, Any], *, fsync: bool = False) -> bool:
+        # Guarded like a read: rewriting a stub's metadata and pushing it would
+        # replace the real conversation in the sandbox with the header alone.
+        if not self._servable(key):
+            return False
         changed = self._local.update_metadata(key, updates, fsync=fsync)
         if changed:
             self._enqueue("push", key)
