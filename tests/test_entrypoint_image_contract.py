@@ -144,3 +144,80 @@ def test_entrypoint_does_not_start_python_for_the_cron_store() -> None:
     # Every call site must sit inside a backgrounded subshell, so the audit can
     # never hold up the exec of the gateway.
     assert ") &" in text[audit:], "the cron-store audit must be backgrounded"
+
+
+# ---------------------------------------------------------------------------
+# The persistent volume: mounting it is not the same as using it.
+#
+# Two production failures are guarded here, both of which look like success:
+# the platform mounts the disk root-owned while the gateway runs as nanobot, so
+# every write fails as EACCES; and chat history is `$HOME/.nanobot/sessions`,
+# which is container filesystem even when a volume is mounted elsewhere. This
+# executes the shipped block -- the text is extracted from entrypoint.sh, not
+# copied -- so the guards cannot drift from what actually runs.
+# ---------------------------------------------------------------------------
+
+_VOLUME_BLOCK_START = "    # The volume is a different tree from $dir"
+
+
+def volume_block() -> str:
+    """The shipped volume-root block, lifted verbatim out of entrypoint.sh."""
+    lines = ENTRYPOINT.read_text(encoding="utf-8").splitlines(keepends=True)
+    start = next(i for i, line in enumerate(lines) if line.startswith(_VOLUME_BLOCK_START))
+    end = next(i for i in range(start, len(lines)) if lines[i].rstrip("\n") == "    fi")
+    return "".join(lines[start : end + 1])
+
+
+def test_volume_sessions_are_linked_onto_the_mount(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    for name in ("chown", "setpriv"):
+        path = stub / name
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+    sessions = home / ".nanobot" / "sessions" / "ws-1"
+    sessions.mkdir(parents=True)
+    (sessions / "chat.jsonl").write_text('{"_type": "metadata"}\n')
+    volume = tmp_path / "data"
+
+    script = f"set -e\nHOME={home}\ndir={home}/.nanobot\nVOLUME_ROOT={volume}\n{volume_block()}\n"
+    env = {**os.environ, "PATH": f"{stub}:{os.environ['PATH']}"}
+    first = subprocess.run(
+        ["sh", "-c", script], capture_output=True, text=True, env=env, timeout=60
+    )
+    assert first.returncode == 0, first.stderr
+    assert "is writable by nanobot" in first.stdout, first.stdout
+    assert "chat history:" in first.stdout, first.stdout
+
+    link = home / ".nanobot" / "sessions"
+    assert link.is_symlink(), "chat history must be a link onto the volume"
+    assert link.resolve() == (volume / "powerx" / "sessions").resolve()
+    assert (volume / "powerx" / "sessions" / "ws-1" / "chat.jsonl").is_file(), (
+        "the chats that existed before the link must survive it"
+    )
+
+    # Idempotent: a second boot sees the link and must not re-copy or re-link.
+    (volume / "powerx" / "sessions" / "ws-1" / "later.jsonl").write_text("{}\n")
+    second = subprocess.run(
+        ["sh", "-c", script], capture_output=True, text=True, env=env, timeout=60
+    )
+    assert second.returncode == 0, second.stderr
+    assert "chat history:" not in second.stdout, "the link must be created once"
+    assert (volume / "powerx" / "sessions" / "ws-1" / "later.jsonl").is_file()
+
+
+def test_volume_root_follows_powerx_data_dir_and_check_defaults_to_data() -> None:
+    text = ENTRYPOINT.read_text(encoding="utf-8")
+    assert 'VOLUME_ROOT="$POWERX_DATA_DIR"' in text
+    assert "VOLUME_ROOT=/data" in text, "the platform's mount point is /data"
+    # No volume (Render, local dev) must not produce a link or a chown.
+    assert 'if [ -n "$VOLUME_ROOT" ]; then' in text
+
+
+def test_the_volume_is_chowned_and_checked_as_the_gateway_user() -> None:
+    """A root-owned mount is the failure that reads as success, so prove it."""
+    block = volume_block()
+    assert 'chown -R nanobot:nanobot "$VOLUME_ROOT"' in block
+    assert "setpriv --reuid=nanobot --regid=nanobot --init-groups" in block
+    assert 'test -w "$VOLUME_ROOT/powerx"' in block, "writability must be tested, not assumed"

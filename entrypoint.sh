@@ -75,6 +75,29 @@ elif [ -d /data ] && [ -w /data ]; then
 else
     CRON_STORE="$dir/persistent/cron/jobs.json"
 fi
+
+# ---------------------------------------------------------------------------
+# The persistent volume root, resolved the same way the cron store resolves it.
+#
+# Mounting the disk is not the same as using it, and both halves have gone wrong
+# in production before:
+#
+#   1. The platform mounts the volume **root-owned** while the gateway runs as
+#      nanobot. Without a chown the mount exists, every path resolves onto it,
+#      and every write fails as EACCES -- a deployment that looks durable and
+#      stores nothing. So the chown below is part of making the volume real, and
+#      it is verified as the nanobot user rather than assumed.
+#   2. Chat history is `$HOME/.nanobot/sessions`, which is container filesystem
+#      even when a volume is mounted somewhere else, so every deploy dropped it.
+#      The volume is the thing that should hold it, so the session mirror is
+#      pointed at the volume below.
+# ---------------------------------------------------------------------------
+VOLUME_ROOT=""
+if [ -n "${POWERX_DATA_DIR:-}" ]; then
+    VOLUME_ROOT="$POWERX_DATA_DIR"
+elif [ -d /data ]; then
+    VOLUME_ROOT=/data
+fi
 # print_cron_store.py used to create this directory as a side effect; make sure
 # the mount check below sees a real path on a first boot too.
 mkdir -p "$(dirname "$CRON_STORE")" 2>/dev/null || true
@@ -229,6 +252,38 @@ fi
 # performed, exit rather than run the agent as root.
 if [ "$(id -u)" = "0" ]; then
     chown -R nanobot:nanobot "$dir" 2>/dev/null || echo "[entrypoint] warning: chown $dir failed"
+
+    # The volume is a different tree from $dir, so it needs its own chown, and
+    # the result needs checking: a root-owned mount is the failure that looks
+    # exactly like success (paths resolve, writes fail, nothing says why).
+    if [ -n "$VOLUME_ROOT" ]; then
+        mkdir -p "$VOLUME_ROOT/powerx" 2>/dev/null || true
+        chown -R nanobot:nanobot "$VOLUME_ROOT" 2>/dev/null \
+            || echo "[entrypoint] warning: chown $VOLUME_ROOT failed" >&2
+        if setpriv --reuid=nanobot --regid=nanobot --init-groups \
+                test -w "$VOLUME_ROOT/powerx" 2>/dev/null; then
+            echo "[entrypoint] persistent volume $VOLUME_ROOT is writable by nanobot"
+        else
+            echo "[entrypoint] WARNING: $VOLUME_ROOT/powerx is NOT writable by nanobot;" \
+                 "anything written there will fail" >&2
+        fi
+        # Chat history onto the volume. Existing files are copied over first, so
+        # the first boot after this change keeps the chats created before it.
+        if [ ! -L "$dir/sessions" ]; then
+            mkdir -p "$VOLUME_ROOT/powerx/sessions" 2>/dev/null || true
+            if [ -d "$dir/sessions" ]; then
+                cp -a "$dir/sessions/." "$VOLUME_ROOT/powerx/sessions/" 2>/dev/null \
+                    || echo "[entrypoint] warning: could not copy existing sessions onto the volume" >&2
+                rm -rf "$dir/sessions"
+            fi
+            chown -R nanobot:nanobot "$VOLUME_ROOT/powerx/sessions" 2>/dev/null || true
+            if ln -s "$VOLUME_ROOT/powerx/sessions" "$dir/sessions" 2>/dev/null; then
+                echo "[entrypoint] chat history: $dir/sessions -> $VOLUME_ROOT/powerx/sessions"
+            else
+                echo "[entrypoint] warning: could not link chat history onto the volume" >&2
+            fi
+        fi
+    fi
 
     # [FIX 2026-10-03] Hand the kernel back the page cache this container charged
     # to itself before it has served anything. A fresh container reads its own
