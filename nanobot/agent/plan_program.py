@@ -48,6 +48,7 @@ Design guarantees:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -391,19 +392,106 @@ def parse_plan(arguments: Any) -> dict[str, Any]:
     return plan
 
 
+def plan_outline(plan: dict[str, Any], max_steps: int = 30) -> list[dict[str, str]]:
+    """Display outline (JSON-safe) of a plan's top-level steps for the UI."""
+    steps = plan.get("steps") if isinstance(plan, dict) else None
+    if not isinstance(steps, list):
+        return []
+    outline: list[dict[str, str]] = []
+    for index, raw in enumerate(steps[:max_steps]):
+        outline.append({"id": f"s{index}", "text": _step_text(raw)})
+    return outline
+
+
+def _short_text(value: Any, limit: int = 120) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
+
+
+def _step_text(raw: Any) -> str:
+    if not isinstance(raw, dict):
+        return "step"
+    if "foreach" in raw:
+        return "Loop over " + _short_text(raw.get("foreach"))
+    if "parallel" in raw:
+        branches = raw.get("parallel")
+        count = len(branches) if isinstance(branches, list) else 0
+        return f"Run {count} steps in parallel"
+    tool = raw.get("tool")
+    args = raw.get("args")
+    detail = ""
+    if isinstance(args, dict) and args:
+        first = next(iter(args.values()))
+        detail = _short_text(first)
+    if detail:
+        return f"{tool}: {detail}"
+    return str(tool or "step")
+
+
+def _plan_progress_payload(
+    outline: list[dict[str, str]],
+    statuses: list[str],
+    *,
+    phase: str,
+    current: int | None = None,
+    executed: int = 0,
+) -> dict[str, Any]:
+    steps = [
+        {"id": step["id"], "text": step["text"], "status": status}
+        for step, status in zip(outline, statuses, strict=False)
+    ]
+    payload: dict[str, Any] = {"phase": phase, "steps": steps, "executed": executed}
+    if current is not None:
+        payload["current"] = current
+    return payload
+
+
 async def execute_plan(
     plan: dict[str, Any],
     execute: ToolExecutor,
+    *,
+    on_step: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> PlanResult:
     """Run a parsed plan-program deterministically. Never calls the LLM.
 
     ``execute`` is an async callable ``(tool_name, args_dict) -> result`` —
     typically bound to the live ToolRegistry so real sandbox/file tools run.
+    ``on_step`` (optional) receives a live JSON-safe snapshot on start, on step
+    transition, and on plan completion so the UI can render Manus-style step progress.
     """
     outcomes: list[StepOutcome] = []
     scope: dict[str, Any] = {}
     budget = [0]
-    await _run_block(plan["steps"], scope, execute, outcomes, budget, depth=0)
+    steps = plan["steps"]
+    outline = plan_outline(plan)
+    statuses = ["pending"] * len(outline)
+
+    async def _emit(phase: str, current: int | None = None, status: str | None = None) -> None:
+        if on_step is None:
+            return
+        if status is not None and current is not None and current < len(statuses):
+            statuses[current] = status
+        with contextlib.suppress(Exception):
+            await on_step(
+                _plan_progress_payload(
+                    outline, statuses, phase=phase, current=current, executed=budget[0]
+                )
+            )
+
+    await _emit("start")
+    for index, raw in enumerate(steps):
+        await _emit("step", current=index, status="running")
+        before = len(outcomes)
+        try:
+            await _run_block([raw], scope, execute, outcomes, budget, depth=0)
+        except PlanProgramError:
+            await _emit("failed", current=index, status="failed")
+            raise
+        produced = outcomes[before:]
+        is_ok = all(o.ok for o in produced)
+        await _emit("step", current=index, status="done" if is_ok else "failed")
 
     final = plan.get("output")
     if isinstance(final, str):
@@ -412,4 +500,5 @@ async def execute_plan(
             final = _interpolate(final, scope)
         except PlanProgramError:
             pass  # cosmetic only; keep the literal if a ref is missing
+    await _emit("done")
     return PlanResult(outputs=outcomes, final=final, executed_steps=budget[0])

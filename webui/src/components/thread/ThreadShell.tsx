@@ -7,6 +7,7 @@ import { FilePreviewAvailabilityProvider } from "@/components/FilePreviewAvailab
 import { FilePreviewPanel } from "@/components/FilePreviewPanel";
 import { SessionHandleLabel } from "@/components/SessionHandleLabel";
 import { PromptNavigator } from "@/components/thread/PromptNavigator";
+import { PlanProgressPanel } from "@/components/thread/PlanProgressPanel";
 import { SessionInfoPopover } from "@/components/thread/SessionInfoPopover";
 import { ThreadComposer } from "@/components/thread/ThreadComposer";
 import type { ModelPresetOption } from "@/components/thread/ModelPresetBadge";
@@ -736,6 +737,7 @@ export function ThreadShell({
     isStreaming,
     runStartedAt,
     goalState,
+    planState,
     send,
     transcribeAudio,
     stop,
@@ -805,6 +807,7 @@ export function ThreadShell({
   const displayMessages = useMemo(() => projectWebuiThreadMessages(messages), [messages]);
   const currentRunStartedAt = messagesReady ? runStartedAt : null;
   const currentGoalState = messagesReady ? goalState : undefined;
+  const currentPlanState = messagesReady ? planState : undefined;
   const turnActive = messagesReady && (isStreaming || currentRunStartedAt !== null);
   const restoredViewportTurnId = useMemo(
     () => turnActive ? latestActiveTurnId(displayMessages, currentRunStartedAt) : null,
@@ -1600,7 +1603,8 @@ export function ThreadShell({
         <FilePreviewAvailabilityProvider
           resolve={historyKey ? resolveFilePreviewAvailability : undefined}
         >
-          <ThreadViewport
+        <PlanProgressPanel planState={currentPlanState} className="mx-auto max-w-3xl" />
+        <ThreadViewport
             ref={viewportRef}
             messages={displayMessages}
             temporary={temporary}

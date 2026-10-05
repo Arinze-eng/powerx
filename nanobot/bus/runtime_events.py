@@ -93,6 +93,14 @@ class GoalStateChanged:
 
 
 @dataclass(frozen=True)
+class PlanStateChanged:
+    """A deterministic plan program's live step progress changed (run_plan)."""
+
+    context: RuntimeEventContext
+    plan: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class RuntimeModelChanged:
     """The active runtime model/preset changed."""
 
@@ -108,6 +116,7 @@ RuntimeEvent = (
     | TurnRunStatusChanged
     | TurnCompleted
     | GoalStateChanged
+    | PlanStateChanged
     | RuntimeModelChanged
 )
 RuntimeEventType = (
@@ -118,6 +127,7 @@ RuntimeEventType = (
     | type[TurnRunStatusChanged]
     | type[TurnCompleted]
     | type[GoalStateChanged]
+    | type[PlanStateChanged]
     | type[RuntimeModelChanged]
 )
 RuntimeEventHandler = Callable[[Any], Awaitable[None] | None]

@@ -35,6 +35,7 @@ import type {
   OutboundMedia,
   SessionMention,
   GoalStateWsPayload,
+  PlanStateWsPayload,
   MessageDeliveryStatus,
   UIMediaAttachment,
   UIMessage,
@@ -255,6 +256,8 @@ export function useNanobotStream(
   runStartedAt: number | null;
   /** Latest sustained goal for this ``chatId`` (``goal_state`` WS events). */
   goalState: GoalStateWsPayload | undefined;
+  /** Latest deterministic plan progress for this ``chatId`` (``plan_state`` WS events). */
+  planState: PlanStateWsPayload | undefined;
   send: (
     content: string,
     images?: SendAttachment[],
@@ -284,6 +287,7 @@ export function useNanobotStream(
   /** Unix epoch seconds when the current user turn started; cleared on ``idle``. */
   const [runStartedAt, setRunStartedAt] = useState<number | null>(initialRunStartedAt);
   const [goalState, setGoalState] = useState<GoalStateWsPayload | undefined>(undefined);
+  const [planState, setPlanState] = useState<PlanStateWsPayload | undefined>(undefined);
   const [streamError, setStreamError] = useState<StreamError | null>(null);
   const buffer = useRef<StreamBuffer | null>(null);
   const activeAssistantRef = useRef<ActiveAssistantCursor | null>(null);
@@ -683,6 +687,7 @@ export function useNanobotStream(
     setStreamError(null);
     setRunStartedAt(restoredRunStartedAt);
     setGoalState(chatId ? client.getGoalState(chatId) : undefined);
+    setPlanState(chatId ? client.getPlanState(chatId) : undefined);
     buffer.current = null;
     activeAssistantRef.current = null;
     closedAssistantStreamIdsRef.current.clear();
@@ -852,6 +857,11 @@ export function useNanobotStream(
         return;
       }
 
+      if (ev.event === "plan_state") {
+        setPlanState(ev.plan);
+        return;
+      }
+
       if (ev.event === "goal_status") {
         if (ev.status === "running" && typeof ev.started_at === "number") {
           setRunStartedAt(ev.started_at);
@@ -867,6 +877,7 @@ export function useNanobotStream(
         if ("goal_state" in ev && ev.goal_state != null && typeof ev.goal_state === "object") {
           setGoalState(ev.goal_state);
         }
+        setPlanState(undefined);
         setRunStartedAt(null);
         // Definitive signal that the turn is fully complete.  Cancel any
         // pending debounce timer and stop the loading indicator immediately.
@@ -1249,6 +1260,7 @@ export function useNanobotStream(
     isStreaming,
     runStartedAt,
     goalState,
+    planState,
     send,
     transcribeAudio,
     stop,
