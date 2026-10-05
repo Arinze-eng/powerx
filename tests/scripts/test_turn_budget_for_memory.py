@@ -46,11 +46,29 @@ def _config(chars: int, iterations: int) -> dict:
 
 def test_small_container_gets_a_small_result_budget(module, monkeypatch) -> None:
     monkeypatch.setattr(module, "_container_memory_limit_mb", lambda: 488.3)
-    data = _config(131_072, 120)
+    data = _config(131_072, 400)
 
     assert module._ensure_turn_budget_for_memory(data) is True
     assert data["agents"]["defaults"]["maxToolResultChars"] == 16_384
-    assert data["agents"]["defaults"]["maxToolIterations"] == 40
+    assert data["agents"]["defaults"]["maxToolIterations"] == 150
+
+
+def test_the_turn_budget_does_not_scale_with_the_plan(module, monkeypatch) -> None:
+    """A turn's RAM is bounded per result, not per iteration.
+
+    ``maxToolResultChars`` is the in-RAM knob and it *does* track the plan. The
+    iteration ceiling only bounds how long a turn may run, so a 8 GB host must
+    get the same working budget as a 512 MB one -- pinning this so nobody
+    re-couples them and silently hands a small container a 150-iteration turn
+    budget while believing it scaled with memory.
+    """
+    monkeypatch.setattr(module, "_container_memory_limit_mb", lambda: 8192.0)
+    data = _config(1_048_576, 400)
+
+    module._ensure_turn_budget_for_memory(data)
+
+    assert data["agents"]["defaults"]["maxToolIterations"] == 150
+    assert data["agents"]["defaults"]["maxToolResultChars"] == 65_536
 
 
 def test_large_container_keeps_its_configured_budget(module, monkeypatch) -> None:
@@ -135,4 +153,4 @@ def test_deployed_template_is_already_within_the_small_budget(module) -> None:
     defaults = data["agents"]["defaults"]
 
     assert defaults["maxToolResultChars"] <= 16_384
-    assert defaults["maxToolIterations"] <= 40
+    assert defaults["maxToolIterations"] <= 150

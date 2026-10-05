@@ -18,6 +18,12 @@ _DEPLOYMENT_TIMEZONE = (
 
 _DEFAULT_MAX_TOOL_ITERATIONS = 120
 _LEGACY_DEFAULT_MAX_TOOL_ITERATIONS = 80
+#: Tool iterations one turn may take before it is cut off. This is a working
+#: budget, not a memory guard, and it deliberately does not scale with the plan:
+#: a turn's resident memory is set by ``maxToolResultChars`` (the per-iteration
+#: ceiling), not by how many iterations it takes, so a longer turn spends disk
+#: and wall-clock rather than RAM. 40 cut a real editing turn off mid-edit.
+_TURN_ITERATION_CAP = 150
 _DEFAULT_REASONING_EFFORT = "max"
 _DEFAULT_RENDER_MODEL = "gemini-3.1-flash-lite"
 
@@ -601,6 +607,10 @@ def _ensure_turn_budget_for_memory(data: dict[str, Any]) -> bool:
     the trade the spill path was built to make -- it simply was never being
     reached. Values are only ever lowered, and only when a limit is known, so a
     host that genuinely has the memory keeps its configured budget.
+
+    Only the *result* ceiling scales with the plan. The iteration ceiling is a
+    working budget (``_TURN_ITERATION_CAP``): it bounds how long a turn may run,
+    not how much of it stays resident, so it applies unchanged to every plan.
     """
     agents = _object_field(data, "agents")
     if agents is None:
@@ -617,7 +627,7 @@ def _ensure_turn_budget_for_memory(data: dict[str, Any]) -> bool:
     # (default 3), is what a single iteration can cost; the budget keeps that a
     # small fraction of the plan so ordinary traffic never approaches the edge.
     char_cap = 16_384 if limit_mb < 1024 else 65_536
-    iter_cap = 40 if limit_mb < 1024 else 120
+    iter_cap = _TURN_ITERATION_CAP
 
     changed = False
     for key, cap in (("maxToolResultChars", char_cap), ("maxToolIterations", iter_cap)):
