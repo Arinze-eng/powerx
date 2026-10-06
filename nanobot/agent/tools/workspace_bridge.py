@@ -735,12 +735,20 @@ async def _write_remote_text(executor: "RemoteExecutor", path: str, text: str) -
 async def _write_blob_without_a_file_api(
     executor: "RemoteExecutor", path: str, payload: str
 ) -> bool:
-    """Place an ASCII *payload* using **only** ``run``.
+    """Place an **already-encoded ASCII** *payload* using only ``run``.
 
     The tier that makes this work on a provider nobody has written a file API
     for. The payload travels as base64 chunks rather than a heredoc: base64 is
     byte-exact and immune to every quoting trap a project's own source contains,
     and a chunk is small enough to stay far inside every backend's command limit.
+
+    The bytes are written **verbatim** — the caller's payload is already encoded,
+    and decoding here is what broke the first live Freestyle run: the blob held
+    the raw gzip while the unpack still ran ``base64 -d`` over it, so every
+    archive push died with ``base64: invalid input`` / ``unexpected end of
+    file``. Placing the payload is all this function does; whoever encoded it
+    owns the decode, which is why every caller pairs this with an explicit
+    ``base64 -d`` of its own.
     """
     quoted = shlex.quote(path)
     ok, _out = await run_remote(f"rm -f {quoted}", timeout=60, executor=executor)
@@ -753,12 +761,7 @@ async def _write_blob_without_a_file_api(
         )
         if not ok:
             return False
-    ok, _out = await run_remote(
-        f"base64 -d {quoted} > {quoted}.bin && mv {quoted}.bin {quoted}",
-        timeout=120,
-        executor=executor,
-    )
-    return ok
+    return True
 
 
 async def _write_remote_bytes(executor: "RemoteExecutor", path: str, data: bytes) -> bool:
@@ -788,7 +791,7 @@ async def _write_remote_bytes(executor: "RemoteExecutor", path: str, data: bytes
 
 async def _push_file_by_file(
     executor: "RemoteExecutor", remote_dir: str, entries: list[tuple[Path, str]]
-) -> bool:
+) -> tuple[bool, str]:
     """Write each file straight into the sandbox. No shell, no archive.
 
     The preferred path: text goes through the backend's own writer, so nothing is
@@ -803,10 +806,10 @@ async def _push_file_by_file(
             text = None
         if text is not None:
             if not await _write_remote_text(executor, target, text):
-                return False
+                return False, f"the sandbox writer refused {target}"
         elif not await _write_remote_bytes(executor, target, data):
-            return False
-    return True
+            return False, f"the sandbox writer refused {target}"
+    return True, f"wrote {len(entries)} file(s) directly"
 
 
 async def _push_as_archive(
@@ -814,7 +817,7 @@ async def _push_as_archive(
     remote_dir: str,
     entries: list[tuple[Path, str]],
     root: str,
-) -> bool:
+) -> tuple[bool, str]:
     """Ship the project as one base64 tar and unpack it with a single command.
 
     Fewer round trips than file-by-file (which matters for a project with
@@ -827,19 +830,28 @@ async def _push_as_archive(
     if not await _write_remote_text(executor, blob_path, payload) and not (
         await _write_blob_without_a_file_api(executor, blob_path, payload)
     ):
-        return False
+        return False, f"the sandbox writer refused the transfer blob {blob_path}"
     blob = shlex.quote(blob_path)
     target = shlex.quote(remote_dir)
+    # MEASURED (Freestyle, real VM): this must NOT end in ``exit``. A backend that
+    # runs a long command *detached* wraps it in a shell that records the exit
+    # status AFTER the command returns — an ``exit`` inside the command kills that
+    # wrapper first, so the status file is never written and the caller polls out
+    # its whole budget (300 s, twice, in that run) before reporting a timeout for
+    # work that had already finished. Ending on ``[ "$_rc" = 0 ]`` reports the
+    # same success/failure through the command's own status instead.
     ok, out = await run_remote(
         f"mkdir -p {target} && "
         f"(base64 -d {blob} 2>/dev/null || base64 --decode {blob}) | tar xzf - -C {target}; "
-        f"_rc=$?; rm -f {blob}; exit $_rc",
+        f"_rc=$?; rm -f {blob}; [ \"$_rc\" = 0 ]",
         timeout=300,
         executor=executor,
     )
     if not ok:
-        logger.debug("workspace_bridge: remote unpack failed: {}", (out or "")[-400:])
-    return ok
+        tail = (out or "").strip()[-300:]
+        logger.debug("workspace_bridge: remote unpack failed: {}", tail)
+        return False, f"the sandbox could not unpack the archive ({tail or 'no output'})"
+    return True, f"unpacked one archive of {len(entries)} file(s)"
 
 
 async def stage_to_sandbox(
@@ -901,17 +913,19 @@ async def stage_to_sandbox(
         ("direct write", _push_file_by_file, (destination, entries)),
         ("archive", _push_as_archive, (destination, entries, root)),
     )
+    reasons: list[str] = []
     for label, push, args in order:
-        if await push(ex, *args):  # type: ignore[arg-type]
+        pushed, reason = await push(ex, *args)  # type: ignore[arg-type]
+        if pushed:
             return True, (
                 f"staged {len(entries)} file(s) into {destination} "
                 f"({getattr(ex, 'name', 'sandbox')}, {label})"
             )
+        reasons.append(f"{label}: {reason}")
 
     return False, (
         f"could not stage {source} into {destination} on the "
-        f"{getattr(ex, 'name', 'sandbox')} sandbox; "
-        "the sandbox may be unreachable or its workspace unwritable"
+        f"{getattr(ex, 'name', 'sandbox')} sandbox ({'; '.join(reasons)})"
     )
 
 

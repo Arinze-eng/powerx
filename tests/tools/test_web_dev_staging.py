@@ -158,6 +158,31 @@ def test_stage_to_sandbox_falls_back_to_an_archive_when_writing_raises(tmp_path:
     assert any(".nanobot-push.b64" in cmd for cmd in backend.commands)
     assert any("printf '%s'" in cmd for cmd in backend.commands)
     assert any("tar xzf -" in cmd for cmd in backend.commands)
+    # MEASURED (Freestyle, real VM): the last-resort writer must place the payload
+    # VERBATIM. Decoding it there left the blob holding raw gzip while the unpack
+    # still ran `base64 -d` over it, so every archive push died with
+    # "base64: invalid input / unexpected end of file".
+    assert not any(".nanobot-push.b64.bin" in cmd for cmd in backend.commands)
+    assert not any(
+        cmd.startswith("base64 -d /workspace/.nanobot-push.b64 >") for cmd in backend.commands
+    )
+
+
+def test_the_unpack_command_never_ends_in_exit(tmp_path: Path) -> None:
+    """MEASURED (Freestyle, real VM): an ``exit`` in the unpack command kills the
+    wrapper a backend uses to run a long command detached — the wrapper records
+    the exit status *after* the command returns, so the status file is never
+    written and the caller polls out its whole 300 s budget for work that had
+    already finished. The command must report status the ordinary way."""
+    root = _project(tmp_path / "app", {"index.html": "x"})
+    backend = _WritingBackend(write_ok=False)
+    asyncio.run(
+        stage_to_sandbox(root, "/workspace/app", executor=RemoteExecutor("fake", backend=backend))
+    )
+    unpack = [cmd for cmd in backend.commands if "tar xzf -" in cmd]
+    assert unpack, backend.commands
+    for command in unpack:
+        assert "exit" not in command.replace("exit_code", "")
 
 
 def test_stage_to_sandbox_works_with_only_run(tmp_path: Path) -> None:
