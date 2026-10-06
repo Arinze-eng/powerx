@@ -99,6 +99,12 @@ NATIVE_WORKSPACE = "/workspace"
 #: a large history must not turn into an unbounded transfer.
 MAX_HYDRATE_FILES = 200
 
+#: How long the session-listing hydrate stops calling a sandbox after one call
+#: timed out. The listing runs on the request thread (the event loop on WebUI),
+#: so a dead sandbox must not be re-tried on every refresh -- one timeout trips
+#: this breaker and the next few listings answer from local state instantly.
+_HYDRATE_FAIL_COOLDOWN_S = 60.0
+
 #: How many lines of each remote session the sidebar hydrate fetches. One record
 #: is one physical line (``JsonlSessionStore.save`` writes ``json.dumps`` with no
 #: indent), and every listing reader -- ``session_headers_nolock``,
@@ -224,14 +230,33 @@ class RemoteSandboxTransport:
     ``files.read``, the backend ``download`` path) stays in one place.
     """
 
-    def __init__(self, *, timeout: float = 120.0) -> None:
+    def __init__(self, *, timeout: float = 120.0, hydrate_timeout: float = 5.0) -> None:
         self._loop = _LoopThread()
         self._timeout = timeout
+        # The store's listing/hydrate reads run on the caller's thread -- which,
+        # on a WebUI request, is the event loop. A dead or unreachable sandbox
+        # otherwise holds that thread for the full transport timeout (120 s) on
+        # the first page load, which reads to a user as the whole site being
+        # down and to a liveness probe as death. Give those reads their own,
+        # short ceiling so they fail fast instead.
+        self._hydrate_timeout = hydrate_timeout
+        # A breaker: once a transport call has actually timed out, assume the
+        # sandbox is down and answer every call instantly (as an empty/failed
+        # result) for a cooldown, rather than stalling again on each refresh.
+        self._breaker_until = 0.0
         self._ready_dirs: set[str] = set()
         self._dirs_lock = threading.Lock()
         self._root: str | None = None
         self._root_lock = threading.Lock()
         self._warned_unavailable = False
+
+    def _breaker_open(self) -> bool:
+        return time.monotonic() < self._breaker_until
+
+    def _trip_breaker(self) -> None:
+        self._breaker_until = time.monotonic() + max(
+            _HYDRATE_FAIL_COOLDOWN_S, self._hydrate_timeout
+        )
 
     # -- executor ----------------------------------------------------------- #
     async def _executor(self, key: str | None) -> Any:
@@ -477,9 +502,12 @@ class RemoteSandboxTransport:
             return False
 
     def pull(self, remote: str, local: Path, key: str | None = None) -> bool:
+        if self._breaker_open():
+            return False
         try:
-            return bool(self._loop.call(self._pull(remote, local, key), timeout=self._timeout))
+            return bool(self._loop.call(self._pull(remote, local, key), timeout=self._hydrate_timeout))
         except Exception:  # noqa: BLE001
+            self._trip_breaker()
             return False
 
     def remove(self, remote: str, key: str | None = None) -> bool:
@@ -489,15 +517,25 @@ class RemoteSandboxTransport:
             return False
 
     def list_remote(self, remote_dir: str, key: str | None = None) -> list[str]:
+        if self._breaker_open():
+            return []
         try:
-            return list(self._loop.call(self._list(remote_dir, key), timeout=self._timeout))
+            return list(
+                self._loop.call(self._list(remote_dir, key), timeout=self._hydrate_timeout)
+            )
         except Exception:  # noqa: BLE001
+            self._trip_breaker()
             return []
 
     def pull_head(self, remote: str, lines: int, key: str | None = None) -> bytes:
+        if self._breaker_open():
+            return b""
         try:
-            return bytes(self._loop.call(self._head(remote, lines, key), timeout=self._timeout))
+            return bytes(
+                self._loop.call(self._head(remote, lines, key), timeout=self._hydrate_timeout)
+            )
         except Exception:  # noqa: BLE001
+            self._trip_breaker()
             return b""
 
 
