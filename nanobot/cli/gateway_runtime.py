@@ -399,6 +399,43 @@ async def _memory_reclaim_loop(shutdown_event: asyncio.Event) -> None:
             logger.debug("memory reclaim loop: {}", exc)
 
 
+def _configure_default_executor(loop: asyncio.AbstractEventLoop) -> None:
+    """Size the default thread pool so login/admin routes cannot queue forever.
+
+    Every ``asyncio.to_thread`` on a request path shares the loop's *default*
+    executor. Its stock size is ``min(32, os.cpu_count() + 4)`` -- on the small
+    deployment plan (``nf-compute-20``: 1-2 vCPU) that is only ~5 threads. The
+    same pool also carries long-blocking housekeeping: sandbox session pushes
+    (180 s exec timeout), ``workspace_bridge`` transfers (120 s), Supabase
+    writes, and the admin/provider probes (120 s). A handful of those occupy
+    every worker at once, so the *next* request -- a page load, a sign-in
+    (``/webui/bootstrap``), an admin read -- sits in the queue until one frees.
+    That is the observed freeze: the gateway stays alive and keeps logging while
+    its HTTP front accepts nothing for minutes, which a liveness probe then reads
+    as death and turns into a restart.
+
+    Raise the ceiling and bound how long an idle worker lingers, so a burst of
+    slow work cannot starve the routes users actually wait on.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        current = getattr(loop, "_default_executor", None)
+        if isinstance(current, ThreadPoolExecutor):
+            return
+        cpu = os.cpu_count() or 2
+        # Slack above the stock ``cpu + 4`` so several 120-180 s sandbox/Supabase
+        # calls can be in flight without denying a sign-in a worker. Bounded so a
+        # tiny instance is not oversubscribed into swap.
+        workers = max(16, min(48, cpu * 8))
+        loop.set_default_executor(
+            ThreadPoolExecutor(max_workers=workers, thread_name_prefix="nanobot-io")
+        )
+        logger.info("default executor sized for request fan-out: max_workers={}", workers)
+    except Exception as exc:  # noqa: BLE001 - sizing is best effort, never fails boot
+        logger.debug("could not size the default executor: {}", exc)
+
+
 def _run_gateway(
     config: Config,
     *,
@@ -1029,8 +1066,10 @@ def _run_gateway(
 
         if _sys.stdin.isatty():
             cli_terminal._ensure_interactive_tty_mode()
+        loop = asyncio.get_running_loop()
+        _configure_default_executor(loop)
         restore_shutdown_handlers = _install_gateway_shutdown_handlers(
-            asyncio.get_running_loop(),
+            loop,
             shutdown_event,
             tasks,
             console.print,
