@@ -26,8 +26,11 @@ specialized skills below — load whichever apply to the task; you don't need th
 
 The agent uses the `web_dev` tool to scaffold and deploy to Vercel:
 - `action=scaffold` — starter project (`project`, `type=frontend|backend|fullstack`).
+- `action=stage` — copy a project from the host workspace INTO the sandbox
+  (`project`, optional `source`). `deploy` does this automatically when needed.
 - `action=deploy` — ship a directory, get back the live `https://…vercel.app` URL.
-- `action=set_env` — add an env var (`name`,`value`,`environment`) BEFORE deploying.
+- `action=set_env` — add env vars (`name`,`value`,`environment`, or `env_file=<.env>`)
+  BEFORE deploying.
 - `action=status` / `action=inspect` — inspect deployments and env.
 - `action=install` — provision Node + the Vercel CLI in the sandbox (deploy does
   this automatically on first use, so you rarely call it).
@@ -41,6 +44,12 @@ and the CLI inside the sandbox and deploys from the sandbox copy. Nothing is bui
 or uploaded from the application host, and you never need to install tooling by
 hand. Pass `project` as the directory **as it exists in the sandbox**. Never present
 a host-vs-sandbox path mismatch as a reason the deploy cannot happen.
+
+The file tools write on the **host** while the deploy runs in the **sandbox**, so a
+project you just wrote is not automatically where the deploy looks. That gap is
+handled for you: `action=deploy` stages the host copy in first when the sandbox has
+no such directory, and `action=stage` does it on demand. This works on every
+backend — Novita, Daytona, Runloop, Tenki, Freestyle, Upstash, Vercel, VPS.
 
 ## Standard workflow (every web build)
 

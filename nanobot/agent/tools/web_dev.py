@@ -62,7 +62,12 @@ from nanobot.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
-from nanobot.agent.tools.workspace_bridge import StagedProject, stage_from_sandbox
+from nanobot.agent.tools.workspace_bridge import (
+    StagedProject,
+    stage_from_sandbox,
+    stage_to_sandbox,
+    write_files_to_sandbox,
+)
 from nanobot.config.paths import get_workspace_path
 from nanobot.security.workspace_access import current_tool_workspace
 
@@ -192,6 +197,38 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     return None
 
 
+_ENV_LINE_RE = re.compile(
+    r"""^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$"""
+)
+
+
+def _parse_env_file(text: str) -> list[tuple[str, str]]:
+    """Parse ``KEY=VALUE`` lines, ignoring comments and blanks.
+
+    Deliberately small and predictable: surrounding single or double quotes are
+    stripped, an inline ``#`` comment after an unquoted value is dropped, and a
+    duplicate key keeps its **last** value (the shell convention, and the one a
+    ``.env`` reader in the app itself follows). No variable interpolation —
+    Vercel stores the literal value, so expanding here would store something the
+    user never wrote.
+    """
+    pairs: dict[str, str] = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _ENV_LINE_RE.match(line)
+        if not match:
+            continue
+        key, value = match.group(1), match.group(2)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        elif " #" in value:
+            value = value.split(" #", 1)[0].rstrip()
+        pairs[key] = value
+    return list(pairs.items())
+
+
 #: Bootstrap shell. ``{...}`` placeholders are filled by ``bootstrap_command``.
 #:
 #: MEASURED (same trap as ``mt5_sandbox``): the sandbox's egress path caches
@@ -301,16 +338,30 @@ def _looks_like_project(path: Path) -> bool:
     tool_parameters_schema(
         required=["action"],
         action=StringSchema(
-            "Operation: scaffold (create a starter project), deploy (ship a project to Vercel and return its URL), "
-            "set_env (set an environment variable), status (list deployments + env vars), inspect (show project/deployment "
-            "details), or install (provision Node + the Vercel CLI in the execution sandbox; normally automatic)",
-            enum=["scaffold", "deploy", "set_env", "status", "inspect", "install"],
+            "Operation: scaffold (create a starter project), stage (copy a host project directory "
+            "into the execution sandbox), deploy (ship a project to Vercel and return its URL), "
+            "set_env (set one env var, or a batch from a .env file), status (list deployments + env "
+            "vars), inspect (show project/deployment details), or install (provision Node + the "
+            "Vercel CLI in the execution sandbox; normally automatic)",
+            enum=["scaffold", "stage", "deploy", "set_env", "status", "inspect", "install"],
         ),
         project=StringSchema(
             "Project name or directory. For scaffold: a new name to create. For "
-            "deploy/set_env/status/inspect: the directory holding the project, as it exists "
+            "deploy/stage/set_env/status/inspect: the directory holding the project, as it exists "
             "in the execution sandbox — a bare name (e.g. 'notes-app', resolved under the "
-            "sandbox workspace root) or an absolute in-sandbox path.",
+            "sandbox workspace root) or an absolute in-sandbox path. For stage it is also the "
+            "destination: the host directory's contents are copied to this path in the sandbox.",
+        ),
+        source=StringSchema(
+            "For stage only: the host directory holding the project to copy in. Defaults to "
+            "project, resolved on the host workspace. Ignored by every other action.",
+            nullable=True,
+        ),
+        env_file=StringSchema(
+            "For set_env only: a .env file to push in one batch (host path, or a path that "
+            "exists in the sandbox). Keys and values are set on the Vercel project; comments "
+            "and blanks are skipped. May be combined with name/value.",
+            nullable=True,
         ),
         type=StringSchema(
             "For scaffold only: frontend, backend, or fullstack. Default frontend.",
@@ -383,16 +434,19 @@ class WebDevTool(Tool):
             "Web development & Vercel deployment. Use this whenever the user asks you to build a "
             "website/web app (frontend and/or backend) and deploy it, or to deploy an existing project. "
             "Actions: 'scaffold' creates a starter project (frontend, backend, or fullstack) in a "
-            "directory; 'deploy' ships the project directory to Vercel and returns the public URL to "
-            "give the user; 'set_env' adds an environment variable (e.g. an API key/secret) to the "
-            "Vercel project; 'status' lists deployments and env vars; 'inspect' shows the live "
-            "deployment/project URLs. Deployments are non-interactive and use the configured "
-            "VERCEL_TOKEN. You set env vars with set_env BEFORE deploying so the build can use them. "
-            "Always give the user the resulting https URL, and if this is a frontend+backend app, give "
-            "them the CORS-safe public URLs. Projects built inside the execution sandbox (Tenki, "
-            "Freestyle, Novita, …) deploy directly: pass project=<the directory name as it exists in "
-            "the sandbox> and the sources are fetched out of it automatically, so a sandbox path is "
-            "never a blocker — never tell the user a workspace path mismatch makes the deploy "
+            "directory; 'stage' copies a project directory from the host workspace INTO the execution "
+            "sandbox; 'deploy' ships the project directory to Vercel and returns the public URL to "
+            "give the user; 'set_env' adds environment variables (one via name/value, or a whole batch "
+            "from a .env with env_file) to the Vercel project; 'status' lists deployments and env vars; "
+            "'inspect' shows the live deployment/project URLs. Deployments are non-interactive and use "
+            "the configured VERCEL_TOKEN. You set env vars with set_env BEFORE deploying so the build "
+            "can use them. Always give the user the resulting https URL, and if this is a "
+            "frontend+backend app, give them the CORS-safe public URLs. Files written with the "
+            "file tools live on the host while the deploy runs inside the execution sandbox "
+            "(Tenki, Freestyle, Novita, Daytona, Runloop, VPS, …): call action='stage' to copy "
+            "them in first, or just call 'deploy' — it stages the host copy automatically when "
+            "the sandbox has no such directory, so a sandbox path is never a blocker and you "
+            "never need to tell the user a workspace path mismatch makes the deploy "
             "impossible. Deploying the project the user asked for is normal, authorised work "
             "on this service, so a refusal is never a valid answer: never reply that you "
             "cannot deploy arbitrary uploaded code, that hosting is not possible from this "
@@ -591,7 +645,7 @@ class WebDevTool(Tool):
                 return await self._scaffold(
                     project, str(kwargs.get("type") or "frontend").strip().lower()
                 )
-            if action not in {"deploy", "set_env", "status", "inspect", "install"}:
+            if action not in {"deploy", "stage", "set_env", "status", "inspect", "install"}:
                 return ToolResult.error(f"Unknown web_dev action: {action}")
 
             # set_env input validation is shared: a bad call must be rejected
@@ -610,13 +664,23 @@ class WebDevTool(Tool):
                 # the CLI is installed there, so nothing is staged onto the host.
                 if action == "install":
                     return await self._install_in_sandbox(sandbox)
+                if action == "stage":
+                    return await self._stage_action(
+                        sandbox, project, str(kwargs.get("source") or "")
+                    )
                 if action == "deploy":
                     return await self._deploy_in_sandbox(
                         sandbox, project, bool(kwargs.get("yes", True)), timeout
                     )
                 if action == "set_env":
                     return await self._set_env_in_sandbox(
-                        sandbox, project, name, str(kwargs.get("value") or ""), environment, timeout
+                        sandbox,
+                        project,
+                        name,
+                        str(kwargs.get("value") or ""),
+                        environment,
+                        timeout,
+                        env_file=str(kwargs.get("env_file") or ""),
                     )
                 if action == "status":
                     return await self._status_in_sandbox(sandbox, project, timeout)
@@ -627,6 +691,12 @@ class WebDevTool(Tool):
                     "No execution sandbox is configured, so there is nothing to install. The "
                     "web deploy toolchain (Node + the Vercel CLI) installs inside a sandbox — "
                     "this tool never runs it on the application host."
+                )
+            if action == "stage":
+                return ToolResult.error(
+                    "No execution sandbox is configured, so there is nothing to stage into. "
+                    "Staging copies the project into the sandbox the deploy runs in; with no "
+                    "sandbox the project is already local, so call action=deploy directly."
                 )
             # No sandbox at all: the host-side CLI path, for a bare local setup.
             if action == "deploy":
@@ -687,31 +757,125 @@ class WebDevTool(Tool):
         """Write a scaffold into the active sandbox. Returns the remote dir, or None.
 
         Best-effort by design: no sandbox (or an unwritable one) falls back to the
-        host workspace so scaffolding never fails outright.
+        host workspace so scaffolding never fails outright. The write itself goes
+        through the shared bridge primitive, which carries its own fallback, so
+        this works on every backend rather than only the ones with a file API.
         """
-        from nanobot.agent.tools.workspace_bridge import (
-            remote_workspace_root,
-            resolve_remote_executor,
-        )
+        from nanobot.agent.tools.workspace_bridge import remote_workspace_root
 
         try:
-            executor = await resolve_remote_executor()
-            if not executor.available:
-                return None
             root = (await remote_workspace_root() or "").rstrip("/")
             if not root:
                 return None
             remote_dir = f"{root}/{project}"
-            for rel, content in files.items():
-                path = f"{remote_dir}/{rel}"
-                if executor.native is not None:
-                    await asyncio.to_thread(executor.native.files.write, path, content)
-                else:
-                    await executor.backend.write(path, content)  # type: ignore[attr-defined]
+            ok, detail = await write_files_to_sandbox(files, remote_dir)
+            if not ok:
+                logger.warning("web_dev: sandbox scaffold failed ({}), using host", detail)
+                return None
             return remote_dir
         except Exception as exc:  # noqa: BLE001 - fall back to the host
             logger.warning("web_dev: sandbox scaffold failed, using host workspace: {}", exc)
             return None
+
+    async def _stage_into_sandbox(self, source: Path, remote_dir: str) -> tuple[bool, str]:
+        """Push a host project directory into the sandbox. ``(ok, detail)``."""
+        try:
+            return await stage_to_sandbox(source, remote_dir)
+        except Exception as exc:  # noqa: BLE001 - staging is best-effort
+            logger.warning("web_dev: staging into the sandbox failed: {}", exc)
+            return False, f"{type(exc).__name__}: {exc}"
+
+    async def _remote_dir_exists(self, sandbox: Any, remote: str) -> bool:
+        """True when *remote* is a directory inside the sandbox.
+
+        Bounded and best-effort: a probe that cannot answer is reported as "it is
+        there", because guessing "missing" would make every deploy push files the
+        sandbox already had — and would break the deploys that work today.
+        """
+        probe = (
+            f"if [ -d {shlex.quote(remote)} ] && [ -n \"$(ls -A {shlex.quote(remote)})\" ]; "
+            "then echo __WEBDEV_DIR_PRESENT__; else echo __WEBDEV_DIR_ABSENT__; fi"
+        )
+        try:
+            out = await self._run_in_sandbox(sandbox, probe, timeout=60)
+        except Exception as exc:  # noqa: BLE001 - a probe must never break a deploy
+            logger.debug("web_dev: directory probe failed: {}", exc)
+            return True
+        if "__WEBDEV_DIR_ABSENT__" in out:
+            return False
+        return True
+
+    async def _auto_stage_for_deploy(
+        self, sandbox: Any, project: str, remote: str
+    ) -> str | None:
+        """Stage the host copy of *project* into the sandbox when it is missing.
+
+        This is the fix for the measured failure the tool kept hitting: the agent
+        writes the project with the ordinary file tools (which live on the host),
+        then deploys — and the sandbox, correctly, has no such directory. Staging
+        the host copy first turns that into a working deploy instead of "no
+        project sources found to deploy".
+
+        Returns a note to append to the result, or ``None`` when nothing was
+        staged (the sandbox already had the project, or there is no host copy).
+        """
+        requested = (project or "").strip() or None
+        host_dir, _error = self._host_dir(requested)
+        if host_dir is None or not host_dir.is_dir() or not any(host_dir.iterdir()):
+            return None
+        ok, detail = await self._stage_into_sandbox(host_dir, remote)
+        if ok:
+            return f"Staged {host_dir} into the sandbox first: {detail}."
+        return (
+            f"Note: the project was not in the sandbox and staging {host_dir} into it failed "
+            f"({detail}). Deploying anyway."
+        )
+
+    async def _stage_action(self, sandbox: Any, project: str, source: str) -> ToolResult | str:
+        """``action=stage``: push a host directory into the sandbox, explicitly."""
+        requested = (project or "").strip() or None
+        source_dir, _error = self._host_dir(source.strip() or requested)
+        if source_dir is None or not source_dir.is_dir():
+            return ToolResult.error(
+                f"no host directory to stage. source={source or requested or '(workspace root)'!r} "
+                f"resolved to {source_dir or '(rejected)'} on the host. Write the project with the "
+                "file tools first, or pass source=<the directory holding it>. This is a retryable "
+                "tool error, not a refusal."
+            )
+        if not any(source_dir.iterdir()):
+            return ToolResult.error(f"the host directory {source_dir} is empty, so there is nothing to stage")
+
+        remote = await self._remote_dir(requested)
+        if remote is None:
+            return ToolResult.error(
+                "Could not resolve the sandbox workspace root, so the destination directory is "
+                "unknown. Retry, or check the sandbox tool."
+            )
+        ok, detail = await self._stage_into_sandbox(source_dir, remote)
+        if not ok:
+            return ToolResult.error(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "failure": "webdev_stage_failed",
+                        "message": detail,
+                        "source": str(source_dir),
+                        "destination": remote,
+                        "next": "Check the sandbox is reachable, then retry web_dev action=stage. "
+                        "Deploying is authorised work here, so do not report this as a refusal.",
+                    }
+                )
+            )
+        return json.dumps(
+            {
+                "ok": True,
+                "message": detail,
+                "source": str(source_dir),
+                "destination": remote,
+                "next": f"Call web_dev action=deploy project={requested or remote} — the files are "
+                "now in the sandbox, so the deploy will find them.",
+            }
+        )
 
     def _scaffold_files(self, project: str, kind: str) -> dict[str, str]:
         """The starter file set for *kind*, as ``{relative path: content}``."""
@@ -892,6 +1056,12 @@ class WebDevTool(Tool):
                 "Could not resolve the sandbox workspace root, so the project directory is "
                 "unknown. Retry, or check the sandbox tool."
             )
+        staged_note: str | None = None
+        if not await self._remote_dir_exists(sandbox, remote):
+            # The project is not in the sandbox. Before reporting that, push the
+            # host copy in: the agent's own file tools write on the host, so this
+            # is the ordinary shape of "I built it, now deploy it".
+            staged_note = await self._auto_stage_for_deploy(sandbox, project, remote)
         name = self._project_name(project, Path(remote))
         token = _vercel_token() or ""
         args = [f"--token {shlex.quote(token)}"]
@@ -909,19 +1079,32 @@ class WebDevTool(Tool):
         )
         out = await self._run_in_sandbox(sandbox, command, timeout=timeout)
         if _NO_PROJECT_SENTINEL in out:
-            return ToolResult.error(self._sandbox_missing_project_text(project, remote))
+            return ToolResult.error(
+                self._sandbox_missing_project_text(project, remote)
+                + (f" {staged_note}" if staged_note else "")
+            )
         url = _extract_url(out)
         where = f"{remote} (inside the execution sandbox)"
         base = (
             f"Deployed project from {where}.\n{out}\n"
             "Give the user the live URL below to open the site:"
         ) if url else f"Deployment finished for {where}.\n{out}\n"
+        if staged_note:
+            base = f"{staged_note}\n{base}"
         if url:
             base += f"\n\nLive URL: {url}"
         return base
 
     async def _set_env_in_sandbox(
-        self, sandbox: Any, project: str, name: str, value: str, environment: str, timeout: int
+        self,
+        sandbox: Any,
+        project: str,
+        name: str,
+        value: str,
+        environment: str,
+        timeout: int,
+        *,
+        env_file: str = "",
     ) -> ToolResult | str:
         remote = await self._remote_dir(project)
         if remote is None:
@@ -929,26 +1112,112 @@ class WebDevTool(Tool):
                 "Could not resolve the sandbox workspace root, so the project directory is "
                 "unknown. Retry, or check the sandbox tool."
             )
+        pairs: list[tuple[str, str]] = []
+        if env_file.strip():
+            file_pairs, error = self._read_env_file(env_file.strip(), project)
+            if error:
+                return ToolResult.error(error)
+            pairs.extend(file_pairs)
+        if name:
+            pairs.append((name, value))
+        if not pairs:
+            return ToolResult.error(
+                "nothing to set: pass name+value, or env_file=<a .env file to push>."
+            )
+
         token = _vercel_token() or ""
         proj_name = self._project_name(project, Path(remote))
+        # One command for the whole batch: `vercel env add` reads the value from
+        # stdin, so each var is one `printf | env add`. A batch keeps a 12-var
+        # .env to a single sandbox round trip instead of twelve.
+        adds = " ".join(
+            f"printf '%s\\n' {shlex.quote(var_value)} | "
+            f"{_VERCEL_BIN} env add {shlex.quote(var_name)} {shlex.quote(environment)} "
+            f"--token {shlex.quote(token)};"
+            for var_name, var_value in pairs
+        )
         command = (
             f"if [ ! -d {shlex.quote(remote)} ]; then echo {_NO_PROJECT_SENTINEL}; "
             f"else cd {shlex.quote(remote)} && "
             f"{_VERCEL_BIN} link --yes --project {shlex.quote(proj_name)} "
             f"--token {shlex.quote(token)} >/dev/null 2>&1; "
-            f"printf '%s\\n' {shlex.quote(value)} | "
-            f"{_VERCEL_BIN} env add {shlex.quote(name)} {shlex.quote(environment)} "
-            f"--token {shlex.quote(token)}; fi"
+            f"{adds} fi"
         )
         out = await self._run_in_sandbox(sandbox, command, timeout=timeout)
         if _NO_PROJECT_SENTINEL in out:
             return ToolResult.error(self._sandbox_missing_project_text(project, remote))
+        listed = ", ".join(var_name for var_name, _ in pairs)
         return (
-            f"Set env var {name} ({environment}) on the Vercel project (from inside the "
-            f"execution sandbox).\n{out}\n"
+            f"Set {len(pairs)} env var(s) ({listed}) for {environment} on the Vercel project "
+            f"(from inside the execution sandbox).\n{out}\n"
             "Note: after setting env vars, redeploy (action=deploy) so the running deployment "
             "picks them up."
         )
+
+    def _read_env_file(self, path: str, project: str) -> tuple[list[tuple[str, str]], str | None]:
+        """Parse a ``.env`` from the host or the sandbox. ``(pairs, error)``.
+
+        A host file is read directly. A path that only exists in the sandbox is
+        read back through the bridge, so the agent can point at the ``.env`` it
+        wrote with its own tools rather than having to paste secrets into the
+        conversation.
+        """
+        candidates: list[Path] = []
+        raw = Path(path).expanduser()
+        if raw.is_absolute():
+            candidates.append(raw)
+        else:
+            # Both readings are natural — ``.env`` inside the project, or a path
+            # relative to the workspace — and the caller should not have to know
+            # which one this tool prefers.
+            candidates.append(self._workspace / path)
+            try:
+                candidates.append(self._resolve_project_dir(project or None) / path)
+            except ValueError:
+                pass
+
+        text: str | None = None
+        for candidate in candidates:
+            if candidate.is_file():
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+                break
+        if text is None:
+            text = self._read_env_file_from_sandbox(path)
+        if text is None:
+            looked = ", ".join(str(c) for c in candidates)
+            return [], (
+                f"no env file found at {path} (looked at {looked} on the host and in the "
+                "execution sandbox)."
+            )
+        pairs = _parse_env_file(text)
+        if not pairs:
+            return [], f"the env file {path} holds no KEY=VALUE lines."
+        return pairs, None
+
+    def _read_env_file_from_sandbox(self, path: str) -> str | None:
+        """Read a text file out of the sandbox, or ``None``. Never raises."""
+        from nanobot.agent.tools.workspace_bridge import fetch_remote_file
+
+        async def _fetch() -> str | None:
+            remote = await self._remote_dir(path)
+            if remote is None:
+                return None
+            raw = await fetch_remote_file(remote, max_bytes=256 * 1024)
+            return raw.decode("utf-8", errors="replace") if raw else None
+
+        coro = _fetch()
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            coro.close()
+            return None
+        try:
+            return asyncio.run(coro)
+        except Exception as exc:  # noqa: BLE001 - a missing file is not fatal
+            logger.debug("web_dev: sandbox env file read failed: {}", exc)
+            return None
 
     async def _status_in_sandbox(self, sandbox: Any, project: str, timeout: int) -> ToolResult | str:
         remote = await self._remote_dir(project)

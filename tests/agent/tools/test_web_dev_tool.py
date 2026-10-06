@@ -28,6 +28,7 @@ def test_web_dev_tool_schema() -> None:
     props = tool.parameters["properties"]
     assert props["action"]["enum"] == [
         "scaffold",
+        "stage",
         "deploy",
         "set_env",
         "status",
@@ -35,7 +36,17 @@ def test_web_dev_tool_schema() -> None:
         "install",
     ]
     assert tool.parameters["required"] == ["action"]
-    assert {"project", "type", "name", "value", "environment", "yes", "timeout"} <= set(props)
+    assert {
+        "project",
+        "type",
+        "source",
+        "env_file",
+        "name",
+        "value",
+        "environment",
+        "yes",
+        "timeout",
+    } <= set(props)
 
 
 def test_web_dev_enabled_requires_token(monkeypatch) -> None:

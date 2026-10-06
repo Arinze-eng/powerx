@@ -22,8 +22,11 @@ server components for reads, route handlers/server actions for writes, env for c
 2. **Build the API** (`backend-development`): Next route handler or server action with validation.
 3. **Wire the UI** (`frontend-development`): fetch data, render loading/error/empty, submit forms.
 4. **Style it well** (`web-design`): apply tokens/components so it doesn't look generic.
-5. **Configure env** (`vercel-deployment`): set `DATABASE_URL`, secrets via `web_dev set_env`.
-6. **Deploy & verify** (`vercel-deployment`): `web_dev action=deploy`, open the live URL.
+5. **Configure env** (`vercel-deployment`): set `DATABASE_URL`, secrets via `web_dev set_env`
+   (or push the whole file with `env_file=.env`).
+6. **Stage if needed**: `web_dev action=stage` copies the host copy into the sandbox;
+   `action=deploy` also does this automatically when the sandbox lacks the project.
+7. **Deploy & verify** (`vercel-deployment`): `web_dev action=deploy`, open the live URL.
 
 ## Project structure (Next full-stack)
 ```

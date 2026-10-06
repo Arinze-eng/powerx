@@ -19,7 +19,8 @@ unavailable, tell the user an admin must set `VERCEL_TOKEN`.
 1. Build the app **in the execution sandbox** (see `frontend-development` /
    `backend-development`); the files live at the sandbox workspace root.
 2. Ensure it builds cleanly (`npm run build`) — run that in the sandbox too.
-3. Set required env vars FIRST: `web_dev action=set_env name=... value=... environment=production`.
+3. Set required env vars FIRST: `web_dev action=set_env name=... value=... environment=production`,
+   or push a whole file at once: `web_dev action=set_env project=<dir> env_file=.env environment=production`.
 4. Deploy: `web_dev action=deploy project=<dir>` → runs the Vercel CLI in the
    sandbox and returns the live `https://…vercel.app` URL.
 5. Give the user the URL and open it to verify.
@@ -29,14 +30,38 @@ unavailable, tell the user an admin must set `VERCEL_TOKEN`.
 | Action | What it does | Key args |
 | --- | --- | --- |
 | `scaffold` | Create a starter frontend/backend/fullstack project | `project`, `type` |
+| `stage` | Copy a project from the host workspace **into** the sandbox | `project`, `source` |
 | `deploy` | Deploy a directory to Vercel, return live URL | `project`, `yes`, `timeout` |
-| `set_env` | Add an env var to the project | `project`, `name`, `value`, `environment` |
+| `set_env` | Add env vars to the project (one, or a whole `.env`) | `project`, `name`, `value`, `environment`, `env_file` |
 | `status` | List deployments + env vars | `project` |
 | `inspect` | Show current deployment/project URLs | `project` |
 | `install` | Provision Node + the Vercel CLI in the sandbox (automatic on first deploy) | — |
 
 Always pass `project` as the directory that contains the code you built, as it
 exists in the execution sandbox.
+
+## Staging: host files → the sandbox
+
+The file tools (`write_file`, `edit_file`, `apply_patch`) write on the **host**.
+`deploy` runs the Vercel CLI **inside the execution sandbox**. Those are two
+different filesystems, so a project you just wrote can be invisible to the deploy
+that is supposed to ship it.
+
+Two things cover that, and you normally need neither explicitly:
+
+- **`deploy` stages the host copy automatically** when the sandbox has no such
+  directory. So "write the files, then deploy" just works.
+- **`web_dev action=stage project=notes-app`** does it on its own, and reports the
+  destination. Pass `source=<host dir>` when the project lives somewhere other
+  than the name you are deploying to. Use it when you want to be sure the files
+  are in the sandbox before a long build step, or before running `npm run build`
+  with the sandbox tools.
+
+Staging works on every backend — Novita, Daytona, Runloop, Tenki, Freestyle,
+Upstash, Vercel and the VPS. It ships files directly when the backend has a write
+API, and falls back to one base64 archive unpacked with a single command when it
+does not, so a provider without a file API is not a blocker. `node_modules`,
+`.git`, build output, `.vercel` and `.env.local` are never staged.
 
 ## Where this runs: inside the execution sandbox
 
@@ -124,6 +149,8 @@ are outside the sandbox; the `*.vercel.app` URL works immediately after deploy.
 | API 404 | Ensure route handler path matches (`/api/...`) or Express catch-all route. |
 | Cold-start DB timeouts | Use a pooler connection string (see `database-development`). |
 | Tool disabled | Operator must set `VERCEL_TOKEN` on the backend. |
+| "no project sources found to deploy" | The directory is neither on the host nor in the sandbox. Write the project first, then retry — or `action=stage` to copy the host copy in explicitly. Never report this as a path mismatch or a refusal. |
+| Deploy used stale/old files | The sandbox still had an earlier copy. `action=stage` overwrites it from the host, then redeploy. |
 
 View logs: `vercel logs <deployment-url> --token $VERCEL_TOKEN` (run inside sandbox/exec).
 

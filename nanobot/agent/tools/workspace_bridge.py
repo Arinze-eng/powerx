@@ -80,6 +80,32 @@ DEFAULT_MAX_BYTES = 200 * 1024 * 1024
 _CHUNK_CHARS = 4 * 1024 * 1024
 _REMOTE_ARCHIVE = "/tmp/powerx-stage.tar.gz"
 
+#: Names never pushed **into** a sandbox. ``DEFAULT_EXCLUDES`` plus the two that
+#: only matter in this direction: ``.vercel`` is host-local link state that would
+#: pin the sandbox to the wrong project, and a local secrets file has no business
+#: travelling to a build machine.
+DEFAULT_STAGE_EXCLUDES: tuple[str, ...] = (
+    *DEFAULT_EXCLUDES,
+    ".vercel",
+    ".env.local",
+    ".DS_Store",
+)
+
+#: Transfer blob for the push direction. Workspace-relative for the same reason
+#: as ``_STAGE_ARCHIVE_NAME``: every backend guards its file APIs to the sandbox
+#: workspace root, so a ``/tmp`` blob cannot be written at all.
+_STAGE_PUSH_BLOB = ".nanobot-push.b64"
+
+#: Base64 characters per ``printf`` when a backend exposes nothing but ``run``.
+#: Small enough that one command stays far inside every backend's command limit.
+_PUSH_CHUNK_CHARS = 48 * 1024
+
+#: Past either of these, ship the project as one archive instead of one write per
+#: file. Chosen so the ordinary agent-authored project (a handful of source files)
+#: takes the direct path, and a real repository takes the archive.
+_DIRECT_WRITE_MAX_FILES = 120
+_DIRECT_WRITE_MAX_BYTES = 4 * 1024 * 1024
+
 #: Transfer archive used by the *backend-driven* staging path. It is deliberately
 #: a **workspace-relative** name: every backend guards its file APIs to the
 #: sandbox workspace root (``_safe_path`` raises ``path must remain inside the
@@ -613,6 +639,312 @@ async def _stage_novita_native(
     return _extract_into(local_archive, staging)
 
 
+# --------------------------------------------------------------------------- #
+# The push direction: host → sandbox
+#
+# ``stage_from_sandbox`` above reads a project *out* of the sandbox. This is the
+# mirror image, and it exists because the two filesystems are isolated in both
+# directions: a project the agent wrote with the ordinary file tools lives on the
+# host, while ``web_dev`` (correctly) runs the Vercel CLI inside the sandbox —
+# so the sandbox looked at an empty directory and answered "no project sources
+# found to deploy" on a project that existed, in full, a few inches away.
+#
+# It is deliberately built on the two primitives *every* backend has — ``run``
+# and a way to place bytes — so one implementation covers Novita, Daytona,
+# Runloop, Tenki, Freestyle, Upstash, Vercel and the VPS, rather than one
+# special case per provider.
+# --------------------------------------------------------------------------- #
+
+
+def _iter_stage_files(
+    source: Path, excludes: tuple[str, ...]
+) -> list[tuple[Path, str]]:
+    """Every file under *source* as ``(absolute path, relative posix name)``.
+
+    Directory names in *excludes* are pruned during the walk, so a ``node_modules``
+    is never even entered — walking a large tree to discard it is how a staging
+    step becomes slower than the deploy it feeds. Symlinks are skipped: a link out
+    of the tree is a path the sandbox cannot resolve.
+    """
+    skip = set(excludes)
+    entries: list[tuple[Path, str]] = []
+    for root, dirs, files in os.walk(source):
+        dirs[:] = sorted(name for name in dirs if name not in skip)
+        relative = os.path.relpath(root, source)
+        for name in sorted(files):
+            if name in skip:
+                continue
+            path = Path(root) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            rel = (
+                name
+                if relative in {".", ""}
+                else posixpath.join(relative.replace(os.sep, "/"), name)
+            )
+            entries.append((path, rel))
+    return entries
+
+
+def _tar_bytes(entries: list[tuple[Path, str]]) -> bytes:
+    """A gzipped tar of *entries*, named relative to the project root.
+
+    Ownership is normalised and permissions pinned: the archive is extracted by
+    whatever user the sandbox runs as, and a mode carried over from the host
+    (a ``0600`` secret file, a ``0755`` script) is a surprise nobody asked for.
+    """
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+        for path, rel in entries:
+            info = tf.gettarinfo(str(path), arcname=rel)
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            info.mode = 0o644
+            with open(path, "rb") as handle:
+                tf.addfile(info, handle)
+    return buffer.getvalue()
+
+
+async def _write_remote_text(executor: "RemoteExecutor", path: str, text: str) -> bool:
+    """Place *text* at *path* using the backend's own writer.
+
+    Two shapes because Novita's native SDK handle is not a backend: it exposes
+    ``files.write`` directly. Anything without either shape answers ``False`` so
+    the caller falls through to the archive path, which needs only ``run``.
+    """
+    if executor.native is not None:
+        try:
+            await asyncio.to_thread(executor.native.files.write, path, text)
+            return True
+        except Exception as exc:  # noqa: BLE001 - fall through to the archive path
+            logger.debug("workspace_bridge: native write of {} failed: {}", path, exc)
+            return False
+    writer = getattr(executor.backend, "write", None)
+    if not callable(writer):
+        return False
+    try:
+        await writer(path, text)
+        return True
+    except Exception as exc:  # noqa: BLE001 - fall through to the archive path
+        logger.debug("workspace_bridge: backend write of {} failed: {}", path, exc)
+        return False
+
+
+async def _write_blob_without_a_file_api(
+    executor: "RemoteExecutor", path: str, payload: str
+) -> bool:
+    """Place an ASCII *payload* using **only** ``run``.
+
+    The tier that makes this work on a provider nobody has written a file API
+    for. The payload travels as base64 chunks rather than a heredoc: base64 is
+    byte-exact and immune to every quoting trap a project's own source contains,
+    and a chunk is small enough to stay far inside every backend's command limit.
+    """
+    quoted = shlex.quote(path)
+    ok, _out = await run_remote(f"rm -f {quoted}", timeout=60, executor=executor)
+    if not ok:
+        return False
+    for start in range(0, len(payload), _PUSH_CHUNK_CHARS):
+        chunk = payload[start : start + _PUSH_CHUNK_CHARS]
+        ok, _out = await run_remote(
+            f"printf '%s' {shlex.quote(chunk)} >> {quoted}", timeout=120, executor=executor
+        )
+        if not ok:
+            return False
+    ok, _out = await run_remote(
+        f"base64 -d {quoted} > {quoted}.bin && mv {quoted}.bin {quoted}",
+        timeout=120,
+        executor=executor,
+    )
+    return ok
+
+
+async def _write_remote_bytes(executor: "RemoteExecutor", path: str, data: bytes) -> bool:
+    """Place raw *data* at *path*, using ``write_bytes`` when the backend has it."""
+    if executor.backend is not None:
+        writer = getattr(executor.backend, "write_bytes", None)
+        if callable(writer):
+            try:
+                await writer(path, data)
+                return True
+            except Exception as exc:  # noqa: BLE001 - fall through to base64
+                logger.debug("workspace_bridge: backend write_bytes of {} failed: {}", path, exc)
+    payload = base64.b64encode(data).decode("ascii")
+    staging = f"{path}.b64"
+    if not await _write_remote_text(executor, staging, payload) and not (
+        await _write_blob_without_a_file_api(executor, staging, payload)
+    ):
+        return False
+    quoted, staging_q = shlex.quote(path), shlex.quote(staging)
+    ok, _out = await run_remote(
+        f"base64 -d {staging_q} > {quoted} && rm -f {staging_q}",
+        timeout=120,
+        executor=executor,
+    )
+    return ok
+
+
+async def _push_file_by_file(
+    executor: "RemoteExecutor", remote_dir: str, entries: list[tuple[Path, str]]
+) -> bool:
+    """Write each file straight into the sandbox. No shell, no archive.
+
+    The preferred path: text goes through the backend's own writer, so nothing is
+    base64-wrapped and nothing needs ``tar`` to exist in the sandbox.
+    """
+    for path, rel in entries:
+        target = posixpath.join(remote_dir, rel)
+        data = path.read_bytes()
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+        if text is not None:
+            if not await _write_remote_text(executor, target, text):
+                return False
+        elif not await _write_remote_bytes(executor, target, data):
+            return False
+    return True
+
+
+async def _push_as_archive(
+    executor: "RemoteExecutor",
+    remote_dir: str,
+    entries: list[tuple[Path, str]],
+    root: str,
+) -> bool:
+    """Ship the project as one base64 tar and unpack it with a single command.
+
+    Fewer round trips than file-by-file (which matters for a project with
+    hundreds of files) and byte-exact for binaries. The blob is written inside
+    the sandbox workspace because every backend's file API refuses a path
+    outside its root.
+    """
+    blob_path = posixpath.join(str(root or "/").rstrip("/") or "/", _STAGE_PUSH_BLOB)
+    payload = base64.b64encode(_tar_bytes(entries)).decode("ascii")
+    if not await _write_remote_text(executor, blob_path, payload) and not (
+        await _write_blob_without_a_file_api(executor, blob_path, payload)
+    ):
+        return False
+    blob = shlex.quote(blob_path)
+    target = shlex.quote(remote_dir)
+    ok, out = await run_remote(
+        f"mkdir -p {target} && "
+        f"(base64 -d {blob} 2>/dev/null || base64 --decode {blob}) | tar xzf - -C {target}; "
+        f"_rc=$?; rm -f {blob}; exit $_rc",
+        timeout=300,
+        executor=executor,
+    )
+    if not ok:
+        logger.debug("workspace_bridge: remote unpack failed: {}", (out or "")[-400:])
+    return ok
+
+
+async def stage_to_sandbox(
+    source_dir: str | Path,
+    remote_dir: str,
+    *,
+    executor: "RemoteExecutor | None" = None,
+    excludes: tuple[str, ...] = DEFAULT_STAGE_EXCLUDES,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+) -> tuple[bool, str]:
+    """Copy a host directory **into** the active execution sandbox.
+
+    Returns ``(ok, detail)`` and never raises: a caller reporting a failed push is
+    far more useful than a traceback, and staging is a convenience over the
+    project already existing in the sandbox.
+
+    ``remote_dir`` is used verbatim (it must already be an absolute in-sandbox
+    path — ``web_dev`` resolves it against the sandbox workspace root).
+    """
+    source = Path(source_dir)
+    if not source.is_dir():
+        return False, f"{source} is not a directory on this host, so there is nothing to stage"
+
+    entries = _iter_stage_files(source, excludes)
+    if not entries:
+        return False, f"{source} holds no files to stage (after excluding {', '.join(excludes)})"
+
+    total = 0
+    for path, _rel in entries:
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    if total > max_bytes:
+        return False, (
+            f"{source} is {total} bytes, over the {max_bytes} byte staging ceiling; "
+            "stage a subdirectory or raise the limit"
+        )
+
+    ex = executor or await resolve_remote_executor()
+    if not ex.available:
+        return (
+            False,
+            "no execution sandbox is configured, so there is nothing to stage the files into",
+        )
+
+    root = await executor_workspace_root(ex) or posixpath.dirname(remote_dir.rstrip("/")) or "/"
+    destination = remote_dir.rstrip("/") or root
+
+    # Which strategy first is chosen up front, not discovered by failing: a
+    # project with hundreds of files costs hundreds of round trips file-by-file,
+    # and one archive is strictly cheaper for it. Small projects take the direct
+    # path because it needs no ``tar`` in the sandbox and no base64 anywhere.
+    prefer_archive = len(entries) > _DIRECT_WRITE_MAX_FILES or total > _DIRECT_WRITE_MAX_BYTES
+    order = (
+        ("archive", _push_as_archive, (destination, entries, root)),
+        ("direct write", _push_file_by_file, (destination, entries)),
+    ) if prefer_archive else (
+        ("direct write", _push_file_by_file, (destination, entries)),
+        ("archive", _push_as_archive, (destination, entries, root)),
+    )
+    for label, push, args in order:
+        if await push(ex, *args):  # type: ignore[arg-type]
+            return True, (
+                f"staged {len(entries)} file(s) into {destination} "
+                f"({getattr(ex, 'name', 'sandbox')}, {label})"
+            )
+
+    return False, (
+        f"could not stage {source} into {destination} on the "
+        f"{getattr(ex, 'name', 'sandbox')} sandbox; "
+        "the sandbox may be unreachable or its workspace unwritable"
+    )
+
+
+async def write_files_to_sandbox(
+    files: "dict[str, str] | list[tuple[str, str]]",
+    remote_dir: str,
+    *,
+    executor: "RemoteExecutor | None" = None,
+) -> tuple[bool, str]:
+    """Write an in-memory ``{relative path: content}`` set into the sandbox.
+
+    The scaffold path needs exactly this, and it must not go through the host
+    filesystem: a scaffold that lands on the host is a project the agent's own
+    sandbox tools cannot then edit.
+    """
+    items = list(files.items()) if isinstance(files, dict) else list(files)
+    if not items:
+        return False, "no files to write"
+    ex = executor or await resolve_remote_executor()
+    if not ex.available:
+        return False, "no execution sandbox is configured"
+    for rel, content in items:
+        target = posixpath.join(remote_dir.rstrip("/") or "/", rel.strip("/"))
+        if not await _write_remote_text(ex, target, content):
+            return False, (
+                f"could not write {rel} into {remote_dir} on the "
+                f"{getattr(ex, 'name', 'sandbox')} sandbox"
+            )
+    return True, (
+        f"wrote {len(items)} file(s) into {remote_dir} ({getattr(ex, 'name', 'sandbox')})"
+    )
+
+
 def _output_tail(result: object) -> str:
     text = str(getattr(result, "stdout", "") or "")
     err = str(getattr(result, "stderr", "") or "")
@@ -830,6 +1162,9 @@ async def remote_workspace_root(session_key: str | None = None) -> str | None:
 
 __all__ = [
     "stage_from_sandbox",
+    "stage_to_sandbox",
+    "write_files_to_sandbox",
+    "DEFAULT_STAGE_EXCLUDES",
     "sandbox_workspace_root",
     "remote_workspace_root",
     "resolve_remote_executor",

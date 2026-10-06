@@ -7,6 +7,30 @@
 
 Set with `web_dev action=set_env project=<dir> name=<VAR> value=<val> environment=<scope>`.
 
+### Pushing a whole `.env` in one call
+
+When the project already has a `.env` (or you just wrote one), set every var with a
+single call instead of one per key:
+
+```
+web_dev action=set_env project=./app env_file=.env environment=production
+```
+
+`env_file` is resolved against the workspace and then against the project
+directory, so both `.env` and `app/.env` work; a path that exists only in the
+execution sandbox is read back from there. Comments and blank lines are skipped,
+surrounding quotes are stripped, an inline ` #` comment is dropped, and a
+duplicate key keeps its **last** value. Values are stored literally — no `$VAR`
+interpolation, because Vercel would then hold something the user never wrote.
+
+`env_file` may be combined with `name`/`value` to add one more var to the same
+batch. The whole batch goes to the sandbox as one command.
+
+Note: `set_env` writes to the Vercel **project**, so it needs a linked directory —
+which is why it takes `project` even though it changes nothing on disk. If the
+project only exists on the host, `deploy` will stage it first; `set_env` reads the
+host `.env` itself, so it works either way.
+
 ## Public vs secret
 Anything the browser needs MUST be prefixed so it's inlined at build time:
 - Next.js: `NEXT_PUBLIC_*`
