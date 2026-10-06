@@ -14,6 +14,7 @@ from nanobot.session.goal_state import (
     sustained_goal_turn,
 )
 from nanobot.session.turn_continuation import (
+    _MAX_AUTO_RESUME_ROUNDS,
     INTERNAL_CONTINUATION_KIND_META,
     INTERNAL_CONTINUATION_META,
     INTERNAL_CONTINUATION_PENDING_META,
@@ -24,6 +25,7 @@ from nanobot.session.turn_continuation import (
     maybe_continue_turn,
     should_finalize_on_max_iterations,
     should_stream_budget_response,
+    stall_is_resumable,
 )
 
 
@@ -337,3 +339,83 @@ def test_stall_resume_budget_resets_for_a_new_run():
     meta2 = {"_auto_resume_continuation_rounds": 3}
     clear_internal_continuation_state(meta2)
     assert "_auto_resume_continuation_rounds" not in meta2
+
+
+# --------------------------------------------------------------------------- #
+# Provider blips: a transient API error is not a decision either. One           #
+# rate-limited call used to end a half-finished task with no message at all.    #
+# --------------------------------------------------------------------------- #
+
+
+def test_transient_provider_errors_are_resumable():
+    assert stall_is_resumable("error") is True
+    assert stall_is_resumable("unknown_error") is True
+
+
+def test_model_decisions_are_never_resumable():
+    assert stall_is_resumable("unknown_refusal") is False
+    assert stall_is_resumable("unknown_content_filter") is False
+    assert stall_is_resumable("completed") is False
+
+
+def test_provider_error_suppresses_the_dead_turn_message():
+    assert (
+        should_stream_budget_response(
+            stop_reason="unknown_error",
+            pending_queue_available=True,
+            session_metadata={},
+        )
+        is False
+    )
+    assert (
+        should_stream_budget_response(
+            stop_reason="unknown_error",
+            pending_queue_available=False,
+            session_metadata={},
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_error_resumes_an_ordinary_session_without_a_goal():
+    """No sustained goal: a 429 mid-task must still resume, not end the run."""
+    error_text = "Error: RateLimitError: 429"
+    pending: asyncio.Queue[InboundMessage] = asyncio.Queue()
+    ctx = SimpleNamespace(
+        session=SimpleNamespace(metadata={}),
+        msg=InboundMessage(
+            channel="webui", sender_id="u1", chat_id="c1", content="write the docx"
+        ),
+        session_key="webui:c1",
+        pending_queue=pending,
+        stop_reason="unknown_error",
+        final_content=error_text,
+        all_messages=[{"role": "assistant", "content": error_text}],
+        suppress_response=False,
+        visible_run_started_at=None,
+    )
+
+    assert await maybe_continue_turn(ctx) is True
+
+    queued = pending.get_nowait()
+    assert queued.metadata[INTERNAL_CONTINUATION_META] is True
+    assert queued.metadata[INTERNAL_CONTINUATION_KIND_META] == "stall_resume"
+    assert "transient error" in queued.content
+    assert ctx.suppress_response is True
+    assert ctx.final_content == ""
+    # The synthetic error turn is dropped, never replayed to the model as truth.
+    assert ctx.all_messages == []
+    assert ctx.session.metadata["_auto_resume_continuation_rounds"] == 1
+
+
+def test_stall_resume_budget_stops_a_pathological_error_loop():
+    meta = {"_auto_resume_continuation_rounds": _MAX_AUTO_RESUME_ROUNDS}
+    assert (
+        should_stream_budget_response(
+            stop_reason="unknown_error",
+            pending_queue_available=True,
+            session_metadata=meta,
+        )
+        is True
+    )

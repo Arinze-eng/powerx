@@ -35,11 +35,25 @@ _GOAL_CONTINUATION_ROUNDS_KEY = "_sustained_goal_continuation_rounds"
 _MAX_GOAL_CONTINUATION_ROUNDS = 12
 
 # Stop reasons that mean the run stalled rather than finished. The model never
-# decided it was done: it produced a blank message, or a tool failed hard. Long
-# coding tasks routinely end this way (a big test run, a long build), and before
-# this policy they were terminal, so the task silently died mid-flight. These are
-# treated as resumable so the work continues from the saved context.
-_STALL_STOP_REASONS = frozenset({"empty_final_response", "tool_error"})
+# decided it was done: it produced a blank message, a tool failed hard, or the
+# provider returned a transport-level error. Long coding tasks routinely end
+# this way (a big test run, a long build), and before this policy they were
+# terminal, so the task silently died mid-flight. These are treated as resumable
+# so the work continues from the saved context.
+#
+# ``error`` / ``unknown_error`` matter as much as the two originals: every
+# provider in ``nanobot/providers`` synthesises ``finish_reason="error"`` for a
+# rate limit, a timeout or a 5xx. That is transient, not a decision, so losing a
+# half-finished task to one API blip is the most common way a long run stops
+# without ever surfacing a reason.
+_STALL_STOP_REASONS = frozenset(
+    {"empty_final_response", "tool_error", "error", "unknown_error"}
+)
+# Finish reasons that ARE a decision by the model. A refusal or a content-filter
+# stop will reproduce itself if resumed, so resuming only burns the budget.
+_DELIBERATE_STOP_REASONS = frozenset(
+    {"unknown_refusal", "unknown_content_filter"}
+)
 _AUTO_RESUME_ROUNDS_KEY = "_auto_resume_continuation_rounds"
 _MAX_AUTO_RESUME_ROUNDS = 12
 _STRIPPED_INBOUND_META_KEYS = {
@@ -125,11 +139,20 @@ def stall_is_resumable(stop_reason: str) -> bool:
     """True when *stop_reason* means the run stalled instead of finishing.
 
     ``empty_final_response`` and ``tool_error`` are not decisions — the model
-    produced a blank reply, or a tool failed. Long coding tasks frequently end
-    this way, and treating them as terminal is what made long-running work stop
-    mid-task. Callers use this to continue instead of surfacing a dead turn.
+    produced a blank reply, or a tool failed. Neither is ``error`` /
+    ``unknown_error``: those are transport-level provider failures (rate limit,
+    timeout, 5xx) that usually succeed on the next attempt. Long coding tasks
+    frequently end this way, and treating them as terminal is what made
+    long-running work stop mid-task. Callers use this to continue instead of
+    surfacing a dead turn.
+
+    A reason listed in :data:`_DELIBERATE_STOP_REASONS` is a model decision and
+    is never resumed, because resuming a refusal only repeats the refusal.
     """
-    return str(stop_reason or "") in _STALL_STOP_REASONS
+    reason = str(stop_reason or "")
+    if reason in _DELIBERATE_STOP_REASONS:
+        return False
+    return reason in _STALL_STOP_REASONS
 
 
 def _auto_resume_available(
@@ -304,11 +327,12 @@ def auto_resume_enabled() -> bool:
 
 def _stall_resume_prompt(stop_reason: str) -> str:
     """Prompt used to resume a run that stalled without finishing."""
-    reason = (
-        "the previous step produced an empty response"
-        if stop_reason == "empty_final_response"
-        else "a tool call failed"
-    )
+    reason = {
+        "empty_final_response": "the previous step produced an empty response",
+        "tool_error": "a tool call failed",
+        "error": "the model provider returned a transient error",
+        "unknown_error": "the model provider returned a transient error",
+    }.get(stop_reason, "the previous step stopped unexpectedly")
     return (
         f"The previous step stopped unexpectedly because {reason}. The task is "
         "NOT finished. Resume it now from the saved context: re-check the "
