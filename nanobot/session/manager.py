@@ -50,6 +50,26 @@ _SESSION_PREVIEW_MAX_CHARS = 120
 _SESSION_LIST_PREVIEW_MAX_RECORDS = 200
 _SESSION_LIST_PREVIEW_MAX_CHARS = 1_000_000
 _SESSION_DATA_ERRORS = (ValueError, TypeError, AttributeError, KeyError)
+
+# [FIX 2026-10-06] One bad session file must not hang the whole site.
+#
+# The sidebar listing runs on first page load and opens EVERY session file on
+# the persistent volume, then calls an unbounded ``f.readline()`` for the header.
+# A single corrupt file whose first "line" is huge (no newline for megabytes), or
+# whose header is malformed -- makes ``readline`` slurp the whole thing and
+# ``json.loads`` it on the event loop, or triggers a full ``_repair_unlocked``
+# scan over the entire file on every load. On the slow ``/data`` volume that is
+# minutes of a blocked loop (the "telegram polling stalled: no getUpdates round
+# trip for 121s" line and the edge 503); it only clears when the offending file
+# is removed, which is exactly what wiping the volume did.
+#
+# Bound the work per file so the pathological case costs one skipped row, never a
+# stalled process: cap the header line read, skip absurdly large files from the
+# inline scan, and cap how many bytes a repair/load scan will read line by line.
+_SESSION_METADATA_LINE_MAX_BYTES = 2_000_000
+_SESSION_LINE_MAX_BYTES = 32_000_000
+_SESSION_LIST_MAX_FILE_BYTES = 64 * 1024 * 1024
+
 _PROVIDER_STATE_RECORD_TYPE = "provider_state"
 _PROVIDER_STATE_RECORD_PREFIX_RE = re.compile(r'^\s*\{\s*"_type"\s*:\s*"provider_state"\s*(?:,|\})')
 _FORK_VOLATILE_METADATA_KEYS = {
@@ -79,6 +99,37 @@ def _json_object(value: object) -> dict[str, Any]:
 def _is_provider_state_record_line(line: str) -> bool:
     """Recognize the canonical private record without decoding its opaque payload."""
     return _PROVIDER_STATE_RECORD_PREFIX_RE.match(line) is not None
+
+
+def _iter_lines_bounded(
+    handle: Any, *, max_total_bytes: int | None, max_line_bytes: int
+) -> Generator[str, None, None]:
+    """Yield complete lines from a text handle, bounded per line and optionally in total.
+
+    Unlike ``for line in handle``, ``readline(n)`` returns at most ``n`` characters
+    even when the record carries no newline, so a single pathological line inside a
+    corrupt session file can neither be slurped into memory nor pin the caller for
+    minutes. When ``max_total_bytes`` is given the pass also stops once that many
+    characters have been read; pass ``None`` to read a whole legitimate file, which
+    is what ``load``/``repair`` must do so a long-but-valid chat is never truncated.
+
+    A chunk that fills the line cap without ending in a newline is a corrupt or
+    absurdly oversized record: everything after it cannot be decoded as JSON either,
+    so the pass ends there rather than grinding on. Ordinary records are smaller than
+    the line cap, so they are yielded whole and unchanged -- only the pathological
+    single line is cut short, and it is cut short in bounded time.
+    """
+    total = 0
+    while True:
+        line = handle.readline(max_line_bytes)
+        if not line:
+            return
+        total += len(line)
+        if max_total_bytes is not None and total > max_total_bytes:
+            return
+        if len(line) >= max_line_bytes and not line.endswith("\n"):
+            return
+        yield line
 
 
 def _sanitize_assistant_replay_text(content: str) -> str:
@@ -1053,7 +1104,11 @@ class JsonlSessionStore:
             provider_state: ProviderConversationState | None = None
 
             with open(path, encoding="utf-8") as f:
-                for line in f:
+                for line in _iter_lines_bounded(
+                    f,
+                    max_total_bytes=None,
+                    max_line_bytes=_SESSION_LINE_MAX_BYTES,
+                ):
                     line = line.strip()
                     if not line:
                         continue
@@ -1134,7 +1189,11 @@ class JsonlSessionStore:
             skipped = 0
 
             with open(path, encoding="utf-8") as f:
-                for line in f:
+                for line in _iter_lines_bounded(
+                    f,
+                    max_total_bytes=None,
+                    max_line_bytes=_SESSION_LINE_MAX_BYTES,
+                ):
                     line = line.strip()
                     if not line:
                         continue
@@ -1269,7 +1328,7 @@ class JsonlSessionStore:
             tmp_path = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
             try:
                 with open(path, encoding="utf-8") as source:
-                    first_line = source.readline()
+                    first_line = source.readline(_SESSION_METADATA_LINE_MAX_BYTES)
                     data = _json_object(json.loads(first_line))
                     if data.get("_type") != "metadata":
                         return False
@@ -1333,7 +1392,9 @@ class JsonlSessionStore:
             updated_at: str | None = None
             stored_key: str | None = None
             with open(path, encoding="utf-8") as f:
-                for line in f:
+                for line in _iter_lines_bounded(
+                    f, max_total_bytes=None, max_line_bytes=_SESSION_LINE_MAX_BYTES
+                ):
                     line = line.strip()
                     if not line:
                         continue
@@ -1392,11 +1453,7 @@ class JsonlSessionStore:
                 continue
             try:
                 with open(path, encoding="utf-8") as f:
-                    first_line = ""
-                    for line in f:
-                        first_line = line.strip()
-                        if first_line:
-                            break
+                    first_line = f.readline(_SESSION_METADATA_LINE_MAX_BYTES).strip()
                 if not first_line:
                     continue
                 data = _json_object(json.loads(first_line))
@@ -1426,33 +1483,32 @@ class JsonlSessionStore:
             return None
         try:
             with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    raw_data: object = json.loads(line)
-                    data = _json_object(raw_data)
-                    if data.get("_type") != "metadata":
-                        return None
-                    metadata_value = cast(object, data.get("metadata", {}))
-                    key_value = cast(object, data.get("key"))
-                    created_at_value = cast(object, data.get("created_at"))
-                    updated_at_value = cast(object, data.get("updated_at"))
-                    return {
-                        "key": key_value if isinstance(key_value, str) and key_value else key,
-                        "created_at": (
-                            created_at_value if isinstance(created_at_value, str) else None
-                        ),
-                        "updated_at": (
-                            updated_at_value if isinstance(updated_at_value, str) else None
-                        ),
-                        "metadata": (
-                            cast(dict[str, Any], metadata_value)
-                            if isinstance(metadata_value, dict)
-                            else {}
-                        ),
-                    }
-            return None
+                first_line = f.readline(_SESSION_METADATA_LINE_MAX_BYTES)
+            line = first_line.strip()
+            if not line:
+                return None
+            raw_data: object = json.loads(line)
+            data = _json_object(raw_data)
+            if data.get("_type") != "metadata":
+                return None
+            metadata_value = cast(object, data.get("metadata", {}))
+            key_value = cast(object, data.get("key"))
+            created_at_value = cast(object, data.get("created_at"))
+            updated_at_value = cast(object, data.get("updated_at"))
+            return {
+                "key": key_value if isinstance(key_value, str) and key_value else key,
+                "created_at": (
+                    created_at_value if isinstance(created_at_value, str) else None
+                ),
+                "updated_at": (
+                    updated_at_value if isinstance(updated_at_value, str) else None
+                ),
+                "metadata": (
+                    cast(dict[str, Any], metadata_value)
+                    if isinstance(metadata_value, dict)
+                    else {}
+                ),
+            }
         except _SESSION_DATA_ERRORS as e:
             logger.warning("Failed to read session metadata {}: {}", key, e)
             repaired = self._repair_unlocked(key, path=path)
@@ -1477,9 +1533,23 @@ class JsonlSessionStore:
             storage_key = self.session_key_from_path(path)
             if storage_key is None:
                 continue
+            # Skip absurdly large files outright: on the network volume even
+            # opening + reading one stalls the loop, and no legitimate session
+            # is this big. The file still exists; it just does not cost the whole
+            # sidebar a freeze. Logged once per pass by the caller-facing count.
+            try:
+                if path.stat().st_size > _SESSION_LIST_MAX_FILE_BYTES:
+                    logger.warning(
+                        "session listing: skipping oversized file {} ({} bytes)",
+                        path.name,
+                        path.stat().st_size,
+                    )
+                    continue
+            except OSError:
+                continue
             try:
                 with open(path, encoding="utf-8") as f:
-                    first_line = f.readline().strip()
+                    first_line = f.readline(_SESSION_METADATA_LINE_MAX_BYTES).strip()
                     if first_line:
                         raw_data: object = json.loads(first_line)
                         data = _json_object(raw_data)
@@ -1496,17 +1566,18 @@ class JsonlSessionStore:
                             fallback_preview = ""
                             scanned_records = 0
                             scanned_chars = 0
-                            for line in f:
+                            for line in _iter_lines_bounded(
+                                f,
+                                max_total_bytes=_SESSION_LIST_PREVIEW_MAX_CHARS,
+                                max_line_bytes=_SESSION_METADATA_LINE_MAX_BYTES,
+                            ):
                                 if not line.strip():
                                     continue
                                 if _is_provider_state_record_line(line):
                                     continue
                                 scanned_records += 1
                                 scanned_chars += len(line)
-                                if (
-                                    scanned_records > _SESSION_LIST_PREVIEW_MAX_RECORDS
-                                    or scanned_chars > _SESSION_LIST_PREVIEW_MAX_CHARS
-                                ):
+                                if scanned_records > _SESSION_LIST_PREVIEW_MAX_RECORDS:
                                     break
                                 raw_item: object = json.loads(line)
                                 item = _json_object(raw_item)
