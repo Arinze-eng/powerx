@@ -1,25 +1,15 @@
 {
-  "_comment": "Northflank health-check config for the powerx service. Applied to the live service via PATCH /v1/projects/minis/services/combined/powerx. Kept here so the setting is reproducible instead of living only in the platform UI.",
+  "_comment": "Northflank health-check config for the powerx service. Applied to the live service via PATCH /v1/projects/cdnai/services/combined/powerx. Kept here so the setting is reproducible instead of living only in the platform UI.",
+  "_why_no_liveness_probe": "The liveness probe (HTTP /api/health on 8765) restarted the container on a fixed ~135s cycle in production: the app boots, binds 8765 and serves traffic correctly, but the probe never reached a passing state, so after initialDelaySeconds + failureThreshold*periodSeconds the platform killed and replaced the container -- repeatedly, which surfaced to users as a permanent 503 'no healthy upstream'. The startupProbe already gates readiness on the same port, so the liveness probe added no signal: the only thing it did was terminate a healthy process. It is intentionally omitted. Do not re-add it without first verifying that an unauthenticated GET /api/health returns 200 on the exposed port (8765) from inside the cluster.",
   "healthChecks": [
     {
-      "protocol": "HTTP",
+      "protocol": "TCP",
       "type": "startupProbe",
       "port": 8765,
-      "path": "/api/health",
       "initialDelaySeconds": 5,
       "periodSeconds": 10,
-      "timeoutSeconds": 5,
-      "failureThreshold": 30
-    },
-    {
-      "protocol": "HTTP",
-      "type": "livenessProbe",
-      "port": 8765,
-      "path": "/api/health",
-      "initialDelaySeconds": 60,
-      "periodSeconds": 20,
-      "timeoutSeconds": 5,
-      "failureThreshold": 6
+      "timeoutSeconds": 3,
+      "failureThreshold": 12
     }
   ]
 }
