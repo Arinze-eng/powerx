@@ -172,6 +172,31 @@ will never be edited or re-uploaded.
 than transcribing when they exist. One URL means one video: `playlist=true` is
 required for a whole channel, deliberately.
 
+`section="10:00-12:00"` downloads ONLY that range, which is how you clip a two-hour
+recording without pulling two gigabytes first. Both spellings are accepted
+(`10:00-12:00` and `*10:00-12:00`); exactly one `*` reaches yt-dlp either way.
+
+### "Sign in to confirm you're not a bot" is a missing JS runtime, not a blocked IP
+
+This is the single most common YouTube failure and it is misdiagnosed constantly.
+YouTube's player hands yt-dlp a **JavaScript** challenge (the `n`/`s` signature
+parameter and the PO token) that has to be *executed* before a playable stream URL
+exists. With no runtime to execute it in, extraction fails as "Sign in to confirm
+you're not a bot" or "Unable to extract any player response" — on a machine where
+the same link opens fine in a browser, which is exactly why it reads as a ban.
+
+The engine installs **deno** for this (skipping it when the image already ships
+`node`, `bun` or `quickjs`, all of which yt-dlp accepts via `--js-runtimes`), and
+`download` passes the runtime on every attempt. If you ever see that error anyway,
+the answer is `media_sandbox(action="install")` — never "YouTube has blocked us",
+and never a request for the user's cookies as a first resort.
+
+`download` also escalates on its own: a *refusal* (not a dropped connection) makes
+it retry with different YouTube player clients, refreshing yt-dlp with `-U` once in
+between, because an extraction break is usually fixed upstream within days. The
+result reports which path worked — `js_runtime`, `player_client`, `attempts` — and
+that is the early warning that the default client has broken again.
+
 ### The link → edit chain
 
 Download, then **watch it** before editing — a downloaded video's shape is rarely
@@ -226,6 +251,34 @@ Tighten `min_seconds`/`max_seconds` rather than raising `count` when the plan ke
 picking the same good section: the planner refuses to overlap clips, so asking for
 more than the recording has just returns fewer.
 
+### Branding the clips
+
+`shorts` burns a title at the top and overlays a logo, which is what a series of
+clips going out on a channel needs — a viewer scrolling past has to know which
+episode it is without the audio:
+
+```
+media_sandbox(action="shorts", input="/path/sermon.mp4", count=1,
+              min_seconds=55, max_seconds=62, captions=True,
+              title="ERASING FOUNDATIONAL CURSES PART 3",
+              logo="/home/ubuntu/brand/logo.png", logo_position="tr")
+```
+
+* `title` wraps to two lines and is centred **clear of the logo** — the two are
+  never drawn on top of each other. It refuses rather than emitting clips with no
+  title when no font is installed, so `branding` in the result is evidence the
+  text was actually drawn.
+* `logo` is any image inside the sandbox; `logo_position` is one of `tl tc tr bl bc
+  br` (default `tr`), `logo_width` defaults to 16% of the output width, and
+  `logo_opacity` fades it.
+* A branded clip is one `-filter_complex` encode with the audio mapped back
+  explicitly, so branding costs no extra pass and cannot silently produce a mute
+  clip.
+* A **1-minute** cut is `min_seconds=55, max_seconds=62`; a **2-minute** cut is
+  `min_seconds=110, max_seconds=130`. Asking for `min_seconds=60, max_seconds=60`
+  matches only a window that lands exactly on a sentence boundary and usually
+  returns nothing — leave the planner a few seconds to work with.
+
 ## Background removal
 
 ```
@@ -243,18 +296,26 @@ action there is — one pass per frame — so always route it through `job`.
 
 ## First run in a fresh sandbox
 
-`ffmpeg`, `yt-dlp`, `faster-whisper` and `rembg` are not in the base image. The
-first media action in a new sandbox must be:
+`ffmpeg`, `yt-dlp`, a JavaScript runtime, `faster-whisper` and `rembg` are not in
+the base image. The first media action in a new sandbox must be:
 
 ```
 media_sandbox(action="install")
 ```
 
-It fetches and installs the chain (~3-12 min: static ffmpeg, yt-dlp, OpenCV, the
-whisper and rembg weights) and **waits for it**. If it reports `stage="installing"`,
-the install is progressing normally: poll `action="status"` until `ready=true`, then
-run the action you wanted. Never hand the user ffmpeg commands to run locally, and
-never tell them to check back later — the waiting is the tool's job.
+It fetches and installs the chain (~3-12 min: static ffmpeg, yt-dlp, deno, OpenCV,
+the whisper and rembg weights) and **waits for it**. If it reports
+`stage="installing"`, the install is progressing normally: poll `action="status"`
+until `ready=true`, then run the action you wanted. Never hand the user ffmpeg
+commands to run locally, and never tell them to check back later — the waiting is
+the tool's job.
+
+**You usually do not have to do this by hand.** Every media action checks the
+engine BEFORE it runs and starts the install itself when it is missing, the same
+way the MT5/Wine engine is bootstrapped. When that happens the action is *not* run
+and the result says `failure="media_engine_not_ready"`: poll `action="status"`
+until `ready=true` and then run the action again. It is never a reason to tell the
+user video editing is unavailable.
 
 ## What Cloudinary owns, and where local ffmpeg stands
 

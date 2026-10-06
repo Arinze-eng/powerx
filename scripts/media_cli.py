@@ -50,6 +50,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -57,7 +58,7 @@ from typing import Any, Iterable
 #: ``nanobot/agent/tools/media.py`` greps for this exact assignment and refuses
 #: to run a sandbox copy that carries a different one, so a stale (CDN-cached)
 #: revision can never masquerade as the current one.
-CLI_VERSION = "1.1.1"
+CLI_VERSION = "1.2.0"
 
 #: Where heavy downloads live so they survive across calls in one sandbox.
 CACHE_DIR = Path(os.getenv("MEDIA_CACHE_DIR", str(Path.home() / ".cache" / "media_cli")))
@@ -244,6 +245,73 @@ def _require(tool: str) -> str:
             f"{tool} is not installed. Run: media_cli.py install  (then poll media_cli.py status)"
         )
     return path
+
+
+# --------------------------------------------------------------------------- #
+# The JavaScript runtime YouTube requires.
+#
+# MEASURED 2026-10-06 on Freestyle, yt-dlp 2026.08.19, on youtu.be/YLb1TpCKqrA:
+#
+#   [debug] JS runtimes: none
+#   WARNING: [youtube] No supported JavaScript runtime could be found. Only deno
+#   is enabled by default ... YouTube extraction without a JS runtime has been
+#   deprecated, and some formats may be missing.
+#
+# This is the mechanism behind what looks like a "bot block". YouTube's player
+# hands yt-dlp a JavaScript challenge -- the ``n``/``s`` signature parameter and
+# the PO token -- which has to be *executed* before a playable stream URL exists.
+# With no runtime to run it, yt-dlp cannot derive that URL: it either refuses
+# ("Sign in to confirm you're not a bot", "Unable to extract any player
+# response") or silently serves a reduced format list. The identical link
+# downloads fine from a home connection, which is exactly why it reads as "the
+# sandbox IP is blocked" rather than "the tool is missing a dependency".
+#
+# yt-dlp auto-detects ONLY ``deno`` -- the runtime upstream ships its challenge
+# solver against -- so the installer drops a deno binary into MEDIA_BIN. A
+# sandbox image that already carries node or bun must not pay for a second
+# runtime: yt-dlp accepts any of them through ``--js-runtimes``, and deno is
+# preferred only because it is the one upstream tests.
+_JS_RUNTIME_CANDIDATES: tuple[str, ...] = ("deno", "node", "bun", "qjs", "quickjs")
+
+#: The flag name doubles as the string grepped out of ``yt-dlp --help`` to decide
+#: whether this build understands it at all: ``--js-runtimes`` is recent, and a
+#: pip fallback in an old image would otherwise be handed an argument it rejects,
+#: which fails EVERY download with a usage error -- worse than the missing runtime
+#: it was meant to fix.
+_JS_RUNTIME_FLAG = "--js-runtimes"
+
+
+@lru_cache(maxsize=8)
+def _ytdlp_has_flag(ytdlp: str, flag: str) -> bool:
+    """Whether this yt-dlp build accepts ``flag`` (cached per binary path)."""
+    try:
+        proc = run([ytdlp, "--help"], timeout=60)
+    except MediaError:
+        return False
+    return flag in (proc.stdout or "")
+
+
+def js_runtime_args(ytdlp: str | None = None) -> list[str]:
+    """``--js-runtimes <name>`` for the first runtime present, else ``[]``.
+
+    Returning ``[]`` is not an error: an older yt-dlp that does not know the flag
+    must keep working exactly as before, and the caller still gets the
+    player-client rotation.
+    """
+    if ytdlp is not None and not _ytdlp_has_flag(ytdlp, _JS_RUNTIME_FLAG):
+        return []
+    for name in _JS_RUNTIME_CANDIDATES:
+        if _which(name):
+            return [_JS_RUNTIME_FLAG, name]
+    return []
+
+
+def js_runtime_name() -> str | None:
+    """The runtime ``js_runtime_args`` would pick, for reporting."""
+    for name in _JS_RUNTIME_CANDIDATES:
+        if _which(name):
+            return name
+    return None
 
 
 def _existing(path: str, *, kinds: str = "any") -> Path:
@@ -533,6 +601,27 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     whisper_models = sorted(p.name for p in CACHE_DIR.glob("whisper-*")) if CACHE_DIR.is_dir() else []
     gpu = Path("/dev/nvidia0").exists()
     ready = bool(_which("ffmpeg") and _which("ffprobe") and _which("yt-dlp"))
+
+    # A missing JS runtime is the single best predictor of the next YouTube
+    # refusal (see ``js_runtime_args``), and it is invisible in every other field
+    # here -- ffmpeg, yt-dlp and the Python stack all report present while
+    # downloads are one YouTube change away from failing. So it is surfaced as
+    # its own field and in the human-readable report, not left to be inferred.
+    js_runtime = js_runtime_name()
+    ytdlp_path = _which("yt-dlp") or ""
+    js_capable = bool(js_runtime) and bool(ytdlp_path) and _ytdlp_has_flag(ytdlp_path, _JS_RUNTIME_FLAG)
+
+    if not (ready and python_deps.get("faster_whisper") and python_deps.get("PIL")):
+        report = "incomplete: run media_cli.py install, then poll media_cli.py status"
+    elif not js_runtime:
+        report = (
+            "media workshop ready, but NO JavaScript runtime is installed: YouTube "
+            "downloads will fail as soon as YouTube asks for a signed challenge "
+            "(reported as a bot block). Run media_cli.py install to add deno."
+        )
+    else:
+        report = "media workshop ready"
+
     return ok(
         ready=ready,
         gpu=gpu,
@@ -541,11 +630,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         python=python_deps,
         caption_fonts=fonts,
         whisper_models=whisper_models,
-        report=(
-            "media workshop ready"
-            if ready and python_deps.get("faster_whisper") and python_deps.get("PIL")
-            else "incomplete: run media_cli.py install, then poll media_cli.py status"
-        ),
+        js_runtime=js_runtime,
+        yt_dlp_js_capable=js_capable,
+        report=report,
     )
 
 
@@ -1346,6 +1433,152 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 # --------------------------------------------------------------------------- #
+# branding: the sermon title at the top, and a logo
+#
+# WHY THESE ARE FILTER-GRAPH BUILDERS AND NOT `-vf` STRINGS: the logo is a second
+# INPUT, and ffmpeg cannot overlay one without `-filter_complex`. Mixing the two
+# (a `-vf` plus an extra input) is the classic way to get "Filtergraph 'x' was
+# defined, but codec copy was selected" or a silently dropped overlay, so when
+# branding is requested the whole chain moves to one graph and the audio is
+# mapped back explicitly.
+# --------------------------------------------------------------------------- #
+
+#: Logo corner -> (x, y) overlay expressions. Written against ``w``/``h``
+#: (the frame) and ``overlay_w``/``overlay_h`` (the scaled logo) so the placement
+#: is computed by ffmpeg at the OUTPUT size and stays correct whether the clip
+#: rendered at 404x718 or 1080x1920.
+_LOGO_POSITIONS: dict[str, tuple[str, str]] = {
+    "tl": ("{m}", "{m}"),
+    "tc": ("(w-overlay_w)/2", "{m}"),
+    "tr": ("w-overlay_w-{m}", "{m}"),
+    "bl": ("{m}", "h-overlay_h-{m}"),
+    "bc": ("(w-overlay_w)/2", "h-overlay_h-{m}"),
+    "br": ("w-overlay_w-{m}", "h-overlay_h-{m}"),
+}
+
+
+def _escape_filter_path(path: str | Path) -> str:
+    """Escape a path for a filtergraph argument.
+
+    ffmpeg's filtergraph parser splits on ``:``, ``,`` and ``'``, all of which are
+    legal in a POSIX path and in a sandbox home directory. Backslash is escaped
+    first because it is the escape character itself.
+    """
+    text = str(path).replace("\\", "\\\\")
+    for char in (":", ",", "'", "[", "]", ";"):
+        text = text.replace(char, "\\" + char)
+    return text
+
+
+def _title_textfile(text: str, *, stem: str) -> Path:
+    """Write the title where ``drawtext`` can read it, and return the path.
+
+    ``textfile=`` instead of ``text=`` is deliberate. drawtext's inline ``text=``
+    needs every ``:``, ``,``, ``'``, ``%`` and newline escaped by hand, and the
+    failure is silent: the filter parses to something plausible and burns the
+    wrong words, or nothing at all. A file sidesteps the whole escaping layer, and
+    a sermon title is exactly the kind of string that contains an apostrophe.
+    """
+    path = CACHE_DIR / "titles" / f"{stem}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def wrap_title(text: str, *, max_chars: int, max_lines: int = 2) -> str:
+    """Title wrapped for the frame, with an ellipsis when it truly will not fit.
+
+    A title that runs off the edge is worse than a shortened one: it is the first
+    thing a viewer sees and it looks like a rendering bug.
+    """
+    words = " ".join(str(text or "").split())
+    if not words:
+        return ""
+    lines = textwrap.wrap(words, width=max(8, max_chars))
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    kept = lines[:max_lines]
+    kept[-1] = kept[-1][: max(1, max_chars - 1)].rstrip() + "…"
+    return "\n".join(kept)
+
+
+def branding_filter(
+    *,
+    scale_w: int,
+    scale_h: int,
+    title: str = "",
+    logo: Path | None = None,
+    logo_position: str = "tr",
+    logo_width: int = 0,
+    logo_opacity: float = 1.0,
+    title_size: int = 0,
+) -> tuple[str, str, list[str], int]:
+    """Build the branding half of the filter graph.
+
+    Returns ``(graph_fragment, last_label, extra_input_args, logo_px)`` where
+    ``graph_fragment`` starts with a leading ``;`` so it can be appended to the
+    crop/scale chain, and ``last_label`` is the label to ``-map``.
+
+    The title is drawn LAST so it sits above the logo, and when both are present
+    it is centred in the space the logo leaves rather than across the whole frame —
+    an overlapping title/logo is the one arrangement that is unreadable no matter
+    how good the assets are.
+    """
+    margin = max(16, int(round(scale_w * 0.045)))
+    logo_px = 0
+    fragment = ""
+    label = "base"
+
+    if logo is not None:
+        logo_px = logo_width or max(72, int(round(scale_w * 0.16)))
+        logo_px = max(24, logo_px - (logo_px % 2))
+        x_expr, y_expr = _LOGO_POSITIONS.get(logo_position, _LOGO_POSITIONS["tr"])
+        x_expr = x_expr.format(m=margin)
+        y_expr = y_expr.format(m=margin)
+        chain = f"scale={logo_px}:-2"
+        if 0 < logo_opacity < 1:
+            chain += f",format=rgba,colorchannelmixer=aa={logo_opacity:.3f}"
+        fragment += (
+            f";[1:v]{chain}[logo];"
+            f"[{label}][logo]overlay={x_expr}:{y_expr}:format=auto[withlogo]"
+        )
+        label = "withlogo"
+
+    wrapped = wrap_title(title, max_chars=22, max_lines=2) if title else ""
+    if wrapped:
+        font = _caption_font()
+        if not font:
+            # Say so instead of producing a clip with no title and calling it done.
+            raise MediaError(
+                "cannot draw the title: no font file found (looked in "
+                "/usr/share/fonts, ~/.local/share/fonts and the media cache). "
+                "Run media_cli.py install to fetch DejaVu."
+            )
+        size = title_size or max(26, int(round(scale_w * 0.052)))
+        textfile = _title_textfile(wrapped, stem="title")
+        # Centre in the room the logo leaves: the title's region is
+        # [margin, scale_w - logo_px - margin], whose midpoint is
+        # (scale_w - logo_px) / 2 -- so the expression is a plain centre narrowed
+        # by the logo's own width, and it reduces to ``(w-text_w)/2`` when no logo
+        # is drawn. ``max`` keeps it off the left edge when the text is so wide it
+        # would otherwise be pushed past it; the two-line wrap above is what
+        # normally prevents that.
+        x_expr = f"max({margin}\\,(w-{logo_px}-text_w)/2)"
+        fragment += (
+            f";[{label}]drawtext=fontfile={_escape_filter_path(font)}"
+            f":textfile={_escape_filter_path(textfile)}"
+            f":fontsize={size}:fontcolor=white:borderw=3:bordercolor=black@0.85"
+            f":line_spacing=8:x={x_expr}:y={margin}[branded]"
+        )
+        label = "branded"
+
+    extra_inputs: list[str] = []
+    if logo is not None:
+        extra_inputs = ["-i", str(logo)]
+    return fragment, label, extra_inputs, logo_px
+
+
+# --------------------------------------------------------------------------- #
 # background removal
 # --------------------------------------------------------------------------- #
 def cmd_bg(args: argparse.Namespace) -> int:
@@ -1445,6 +1678,99 @@ def _bg_video(src: Path, args: argparse.Namespace, model: str) -> int:
 # --------------------------------------------------------------------------- #
 # download
 # --------------------------------------------------------------------------- #
+#: What yt-dlp prints when YouTube REFUSED the extraction, as opposed to the
+#: network failing. The two need opposite handling: a dropped connection is worth
+#: retrying as-is, a refusal is not (the same request will be refused again) and
+#: is only fixed by changing what we ask YouTube for.
+#:
+#: Every string here was taken from real yt-dlp output, not invented: "Sign in to
+#: confirm you're not a bot" is the classic, and "nsig extraction failed" /
+#: "No supported JavaScript runtime" are the same failure one layer down.
+_BOT_BLOCK_MARKERS: tuple[str, ...] = (
+    "sign in to confirm",
+    "confirm you're not a bot",
+    "confirm you’re not a bot",
+    "not a bot",
+    "unable to extract any player response",
+    "failed to extract any player response",
+    "unable to extract yt initial data",
+    "nsig extraction failed",
+    "no supported javascript runtime",
+    "some formats may be missing",
+    "requested format is not available",
+    "po token",
+    "http error 403",
+)
+
+
+def _looks_bot_blocked(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _BOT_BLOCK_MARKERS)
+
+
+def _is_youtube(url: str) -> bool:
+    host = (url or "").lower()
+    return "youtube.com" in host or "youtu.be" in host
+
+
+#: YouTube player clients to rotate through when the default set is refused.
+#:
+#: yt-dlp's default is "whatever works without a PO token right now", and that
+#: answer changes every few weeks when YouTube tightens a client. When it breaks,
+#: another client almost always still serves the stream, so the fix that does not
+#: require shipping a new yt-dlp is to ASK DIFFERENTLY. Ordered cheapest-first;
+#: the embedded clients come last because YouTube caps them at 720p on many
+#: videos, which is a worse download than the one we are trying to rescue.
+_CLIENT_ROTATIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("web_safari", ("--extractor-args", "youtube:player_client=default,web_safari")),
+    ("tv", ("--extractor-args", "youtube:player_client=tv,web_embedded")),
+    ("mweb", ("--extractor-args", "youtube:player_client=mweb,web_safari")),
+    ("embedded", ("--extractor-args", "youtube:player_client=web_embedded,tv_embedded")),
+)
+
+#: Retry/backoff flags that are safe on every yt-dlp that understands them. A
+#: datacenter IP sees far more throttled/truncated fragments than a home one, and
+#: yt-dlp's own defaults give up sooner than a long download can afford.
+#:
+#: ``--concurrent-fragments 8`` is the throughput fix rather than a resilience
+#: one. MEASURED 2026-10-06 on Freestyle: a 2-minute 720p range took 395 s at
+#: yt-dlp's default single connection -- about 59 KB/s -- which puts a 10-minute
+#: section of a sermon at half an hour. DASH fragments are independent, so eight
+#: connections multiply the rate on exactly the throttled-per-connection links a
+#: sandbox sits behind.
+_NETWORK_RESILIENCE_ARGS: tuple[str, ...] = (
+    "--retry", "10",
+    "--fragment-retries", "10",
+    "--file-access-retries", "3",
+    "--socket-timeout", "30",
+    "--concurrent-fragments", "8",
+)
+
+
+def _refresh_ytdlp(ytdlp: str) -> str | None:
+    """Best-effort ``yt-dlp -U``; returns the new version when it changed.
+
+    A YouTube extraction break is usually fixed upstream within days, so an image
+    that has been alive a while is running a yt-dlp that YouTube has already moved
+    past. Updating is therefore a real fix and not a superstition -- but only for
+    the stand-alone binary, which is the only form we can rewrite; a pip install
+    is left alone (``-U`` would need a writable site-packages and would race the
+    installer). Returns ``None`` when nothing changed or the update was refused.
+    """
+    try:
+        before = run([ytdlp, "--version"], timeout=60).stdout.strip()
+    except MediaError:
+        return None
+    if not before or not os.access(ytdlp, os.W_OK):
+        return None
+    try:
+        run([ytdlp, "-U"], timeout=300)
+        after = run([ytdlp, "--version"], timeout=60).stdout.strip()
+    except MediaError:
+        return None
+    return after if after and after != before else None
+
+
 def cmd_download(args: argparse.Namespace) -> int:
     """yt-dlp, the one tool that reliably turns a link into a file."""
     ytdlp = _require("yt-dlp")
@@ -1512,15 +1838,85 @@ def cmd_download(args: argparse.Namespace) -> int:
     if args.cookies:
         cmd += ["--cookies", args.cookies]
     if args.section:
-        cmd += ["--download-sections", f"*{args.section}"]
+        # The value is documented BOTH ways ("*00:01:00-00:02:00" in this CLI's
+        # help, "00:01:00-00:02:00" in yt-dlp's) and both spellings reach here.
+        # MEASURED 2026-10-06: passing the documented starred form produced
+        # ``**10:00-12:00`` and yt-dlp refused the whole download with "invalid
+        # --download-sections time range". Exactly one leading ``*`` is what
+        # yt-dlp wants, so strip any the caller supplied and add our own.
+        section = str(args.section).strip()
+        while section.startswith("*"):
+            section = section[1:]
+        cmd += ["--download-sections", f"*{section}"]
     if args.subtitles:
         cmd += ["--write-auto-subs", "--sub-langs", args.subtitles, "--convert-subs", "srt"]
-    cmd.append(args.url)
-    proc = run(cmd, timeout=int(args.timeout))
-    if proc.returncode != 0:
-        raise MediaError(
-            f"download failed: {_tail(proc.stderr or proc.stdout)}"
+
+    # --- the JavaScript runtime, and why the download used to fail ---------- #
+    #
+    # See ``js_runtime_args``. Without a runtime yt-dlp cannot execute YouTube's
+    # signature/PO-token challenge, and the download dies as "Sign in to confirm
+    # you're not a bot" on a machine where the same link works in a browser. This
+    # is the single most common cause of an unexplained YouTube refusal in a
+    # sandbox, so it is passed on EVERY attempt.
+    js_args = js_runtime_args(ytdlp)
+
+    # --- resilience, then client rotation ---------------------------------- #
+    #
+    # Ordered so the cheap, behaviour-preserving attempt comes first: the same
+    # command as before, plus a JS runtime and longer retries. Only a REFUSAL
+    # (not a network error) escalates to asking YouTube with a different player
+    # client, because rotating on a transient failure would just make a slow
+    # download slower. ``--no-warnings`` is dropped on the retries so the reason
+    # for the escalation is visible in the error we hand back.
+    attempts: list[tuple[str, list[str]]] = [("default", [])]
+    if _is_youtube(args.url) and _ytdlp_has_flag(ytdlp, "--extractor-args"):
+        attempts += [(label, list(extra)) for label, extra in _CLIENT_ROTATIONS]
+
+    timeout = int(args.timeout)
+    proc: subprocess.CompletedProcess[str] | None = None
+    used_client = "default"
+    tried: list[str] = []
+    refreshed: str | None = None
+
+    for index, (label, extra) in enumerate(attempts):
+        attempt_cmd = [*cmd, *js_args, *_NETWORK_RESILIENCE_ARGS, *extra, args.url]
+        proc = run(attempt_cmd, timeout=timeout)
+        if proc.returncode == 0:
+            used_client = label
+            break
+        text = (proc.stderr or "") + "\n" + (proc.stdout or "")
+        tried.append(label)
+        if not _looks_bot_blocked(text):
+            # A genuine network/permission/format error: retrying with another
+            # player client would only hide it.
+            break
+        if index + 1 >= len(attempts):
+            break
+        # Last resort before the embedded clients: YouTube has moved on and this
+        # image is running an older yt-dlp. Update once, then re-run the default.
+        if refreshed is None and index >= 1:
+            refreshed = _refresh_ytdlp(ytdlp)
+            if refreshed:
+                attempts.insert(index + 1, (f"yt-dlp {refreshed}", []))
+        print(
+            f"[media] {label} refused (looks like a bot block); trying "
+            f"{attempts[index + 1][0]}",
+            file=sys.stderr,
         )
+
+    if proc is None or proc.returncode != 0:
+        detail = _tail((proc.stderr if proc else "") or (proc.stdout if proc else ""), 900)
+        message = "download failed"
+        if len(tried) > 1:
+            message += f" (tried player clients: {', '.join(tried)})"
+        message += f": {detail}"
+        if _looks_bot_blocked(detail):
+            message += (
+                " — YouTube refused every player client. That is a YouTube-side change, "
+                "not a malformed request: retry later, pass --cookies with a signed-in "
+                "cookie jar, or run the download from a residential IP."
+            )
+        raise MediaError(message)
     # A named target file means "these files", not "everything in this folder":
     # the directory may already hold earlier downloads, and reporting a stale
     # one as this call's output is how a chained edit ends up operating on the
@@ -1543,7 +1939,16 @@ def cmd_download(args: argparse.Namespace) -> int:
         "url": args.url,
         "directory": str(out_dir),
         "files": [str(p) for p in produced[:6]],
+        # Which extraction path actually worked. Reported because "it downloaded"
+        # is not the whole answer when YouTube is the variable: a run that needed
+        # the tv client, or a yt-dlp self-update, is the early warning that the
+        # default client has broken again.
+        "js_runtime": js_runtime_name(),
+        "player_client": used_client,
+        "attempts": tried + [used_client],
     }
+    if refreshed:
+        result["yt_dlp_updated_to"] = refreshed
     if newest is not None:
         result["output"] = str(newest)
         if newest.suffix.lower() in VIDEO_EXT:
@@ -1724,14 +2129,41 @@ def cmd_shorts(args: argparse.Namespace) -> int:
             esc = str(ass_path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
             vf.append(f"subtitles='{esc}'")
         piece = out_dir / f"{stem}.mp4"
-        # ``-v warning`` (not ``error``) whenever we burn captions: the missing-font
-        # case exits 0 with no captions drawn, and its only tell is a warning line.
-        verbose = "warning" if ass_path else "error"
-        proc = run([
-            ffmpeg, "-v", verbose, "-ss", f"{window['start']:.3f}", "-i", str(src),
-            "-t", f"{window['duration']:.3f}", "-vf", ",".join(vf),
-            *_video_encoder_args(crf=args.crf, preset=args.preset), "-y", str(piece),
-        ], timeout=3600)
+        # ``-v warning`` (not ``error``) whenever we burn captions OR a title: both
+        # draw text through ffmpeg, and both fail SILENTLY when the font is missing
+        # — the command exits 0 with nothing drawn, and a warning line is the only
+        # tell. Without that flag the output looks like a perfectly good video.
+        branding, brand_label, brand_inputs, _logo_px = branding_filter(
+            scale_w=scale_w,
+            scale_h=scale_h,
+            title=str(getattr(args, "title", "") or ""),
+            logo=Path(args.logo).expanduser() if getattr(args, "logo", None) else None,
+            logo_position=str(getattr(args, "logo_position", "tr") or "tr"),
+            logo_width=int(getattr(args, "logo_width", 0) or 0),
+            logo_opacity=float(getattr(args, "logo_opacity", 1.0) or 1.0),
+            title_size=int(getattr(args, "title_size", 0) or 0),
+        )
+        verbose = "warning" if (ass_path or branding) else "error"
+        if branding:
+            # One graph, and the audio mapped back by hand: with -filter_complex
+            # ffmpeg stops auto-selecting streams, so omitting ``-map 0:a?`` is how
+            # a branded short silently comes out silent.
+            graph = f"[0:v]{','.join(vf)}[base]" + branding
+            proc = run([
+                ffmpeg, "-v", verbose,
+                "-ss", f"{window['start']:.3f}", "-i", str(src),
+                *brand_inputs,
+                "-filter_complex", graph,
+                "-map", f"[{brand_label}]", "-map", "0:a?",
+                "-t", f"{window['duration']:.3f}",
+                *_video_encoder_args(crf=args.crf, preset=args.preset), "-y", str(piece),
+            ], timeout=3600)
+        else:
+            proc = run([
+                ffmpeg, "-v", verbose, "-ss", f"{window['start']:.3f}", "-i", str(src),
+                "-t", f"{window['duration']:.3f}", "-vf", ",".join(vf),
+                *_video_encoder_args(crf=args.crf, preset=args.preset), "-y", str(piece),
+            ], timeout=3600)
         if proc.returncode != 0:
             raise MediaError(f"short {index} failed: {_tail(proc.stderr)}")
         verified = _verify(
@@ -1739,7 +2171,9 @@ def cmd_shorts(args: argparse.Namespace) -> int:
             expect={"width": scale_w, "height": scale_h,
                     "duration": {"value": round(window["duration"], 3), "tolerance": 0.4}},
         )
-        warnings = _caption_warnings(proc.stderr) if ass_path else []
+        # Applies to any burned text, not just captions: the same silent
+        # missing-font failure hits the title, and the same warning line reports it.
+        warnings = _caption_warnings(proc.stderr) if verbose == "warning" else []
         thumb = out_dir / f"{stem}.jpg"
         run([ffmpeg, "-v", "error", "-ss", "1", "-i", str(piece), "-frames:v", "1", "-q:v", "2",
              "-vf", "scale=480:-2", "-y", str(thumb)], timeout=300)
@@ -1773,6 +2207,12 @@ def cmd_shorts(args: argparse.Namespace) -> int:
         "input": str(src), "aspect": aspect, "crop": {"w": crop_w, "h": crop_h, "x": x, "y": y},
         "focus": args.focus, "focus_x": focus_x,
         "output_size": {"w": scale_w, "h": scale_h}, "upscaled": upscaled,
+        "branding": {
+            "title": str(getattr(args, "title", "") or "") or None,
+            "logo": str(Path(args.logo).expanduser()) if getattr(args, "logo", None) else None,
+            "logo_position": str(getattr(args, "logo_position", "tr") or "tr"),
+            "logo_width": int(getattr(args, "logo_width", 0) or 0),
+        },
         "clips": rendered,
     }, indent=1))
     return ok(input=str(src), directory=str(out_dir), count=len(rendered), aspect=aspect,

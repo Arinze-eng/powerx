@@ -53,6 +53,7 @@ import hashlib
 import json
 import os
 import shlex
+import time
 from typing import Any
 
 from loguru import logger
@@ -84,7 +85,7 @@ _REPO = os.getenv("MEDIA_SCRIPT_REPO", "Arinze-eng/powerx")
 #: that is no longer running, the caller gets a loud warning and a retry against a
 #: different source. Bump BOTH constants together whenever the CLI's contract with
 #: this tool changes.
-_CLI_VERSION = "1.1.1"
+_CLI_VERSION = "1.2.0"
 
 #: Where the CLI, its installer and its detached jobs live inside the sandbox.
 _MEDIA_HOME = "$HOME/.media"
@@ -263,6 +264,10 @@ _FLAG_SPEC: dict[str, dict[str, Any]] = {
             "output_height": "--output-height", "caption_style": "--caption-style",
             "transcript": "--transcript", "model": "--model", "language": "--language",
             "crf": "--crf", "preset": "--preset", "out": "--out",
+            # Branding: the title burned at the top of each clip and a logo mark.
+            "title": "--title", "title_size": "--title-size", "logo": "--logo",
+            "logo_position": "--logo-position", "logo_width": "--logo-width",
+            "logo_opacity": "--logo-opacity",
         },
         "bools": {"captions": "--captions", "no_transcribe": "--no-transcribe"},
     },
@@ -570,10 +575,27 @@ class MediaSandboxTool(Tool):
     config_key = "media_sandbox"
     _scopes = {"core", "subagent"}
 
+    #: How long a "the chain is ready" answer is trusted before the readiness
+    #: probe runs again.
+    #:
+    #: The probe is a sandbox round trip, so running it before EVERY action would
+    #: add seconds to a chained edit; running it never is how a half-installed
+    #: chain is discovered only after the action has already failed. 120 s is
+    #: short enough that a sandbox rebuilt mid-session is noticed, and long enough
+    #: that a burst of edits pays for the check once.
+    _READY_TTL_SECONDS = 120.0
+
+    #: Monotonic timestamp of the last confirmed-ready probe. 0.0 means "never
+    #: confirmed", which is what forces the first action of a session to check.
+    #: Declared on the CLASS as well as set in __init__, because this tool is
+    #: constructed through paths that do not run __init__.
+    _ready_checked_at: float = 0.0
+
     def __init__(self, ctx: ToolContext | None = None) -> None:
         # The ToolContext is retained so the sandbox tool can be resolved at
         # execute() time (the registry is not available during construction).
         self._ctx: ToolContext | None = ctx
+        self._ready_checked_at = 0.0
 
     @classmethod
     def create(cls, ctx: ToolContext) -> "MediaSandboxTool":
@@ -644,7 +666,10 @@ class MediaSandboxTool(Tool):
             "Shorts: action='shorts' transcribes (faster-whisper, local) when there is no "
             "sidecar transcript, scores sentence-boundary windows on words-per-second and "
             "hook words, and writes non-overlapping vertical clips with a thumbnail, an "
-            ".srt and burned captions plus a manifest.json. Captions: action='transcribe' "
+            ".srt and burned captions plus a manifest.json. shorts also BRANDS each clip: "
+            "title burns the text at the top of every clip and logo overlays a corner "
+            "mark — pass both when the clips are going out on a channel. Captions: "
+            "action='transcribe' "
             "writes .srt/.json/.vtt (the transcript is cached beside the media as "
             "<name>.transcript.json and reused), action='captions' burns them in. The "
             "result carries caption_warnings — ffmpeg exits 0 with NO captions drawn when "
@@ -722,6 +747,12 @@ class MediaSandboxTool(Tool):
                 "foreground": {"type": "number", "description": "action=blur: the sharp layer's width as a fraction of the output width (default 0.92). Lower it for a wider blurred border."},
                 "transcript": {"type": "string", "description": "action=shorts: an existing transcript json to plan from, instead of transcribing."},
                 "no_transcribe": {"type": "boolean", "description": "action=shorts: plan only from an existing transcript; refuse rather than transcribe."},
+                "title": {"type": "string", "description": "action=shorts: text burned at the TOP of every clip — a sermon or episode title. Wrapped to two lines and centred, clear of the logo. Refuses if no font is installed rather than emitting clips with no title."},
+                "title_size": {"type": "integer", "description": "action=shorts: title font size in px; 0 derives it from the output width."},
+                "logo": {"type": "string", "description": "action=shorts: image path inside the sandbox to overlay as a corner mark on every clip."},
+                "logo_position": {"type": "string", "enum": ["tl", "tc", "tr", "bl", "bc", "br"], "description": "action=shorts: where the logo sits (default tr, top-right)."},
+                "logo_width": {"type": "integer", "description": "action=shorts: logo width in px; 0 = 16% of the output width."},
+                "logo_opacity": {"type": "number", "description": "action=shorts: logo opacity, 0-1 (default 1)."},
                 "background_run": {"type": "boolean", "description": "Force a long action to run detached immediately instead of waiting inline for it."},
                 "job_id": {"type": "string", "description": "action=job: the id a previous call returned. Do NOT re-run the edit; poll this instead."},
                 "wait": {"type": "integer", "description": "How long to wait inline for a detached job or for the installer, in seconds (capped by the sandbox's own 900 s command ceiling)."},
@@ -786,6 +817,47 @@ class MediaSandboxTool(Tool):
         result = await self._wait_for_install(sandbox, wait)
         result.setdefault("install_started", started.get("started"))
         return result
+
+    async def _chain_ready(self, sandbox: Any) -> bool:
+        """Is the media engine installed in this sandbox right now?
+
+        THE PRE-TASK GATE. The engine is verified BEFORE an action runs, the same
+        way the MT5/Wine engine is, instead of letting ffmpeg's absence surface
+        as an ffmpeg error halfway through the request — which is how a model ends
+        up apologising for a missing tool it could have installed itself.
+
+        A probe that cannot answer returns True: the sandbox may simply not
+        support this call shape, and blocking every media action on a failed
+        *health check* would turn a diagnostic into an outage. The action's own
+        failure path still auto-provisions, so the worst case is the old
+        behaviour rather than a new one.
+        """
+        if time.monotonic() - self._ready_checked_at < self._READY_TTL_SECONDS:
+            return True
+        try:
+            rendered = await sandbox.execute(
+                action="run",
+                command=f"{bootstrap_command()} >/dev/null 2>&1 || true; "
+                        f"python3 {_CLI_PATH} status",
+                timeout=_TIMEOUTS["status"],
+            )
+        except Exception as exc:  # noqa: BLE001 - a probe failure must not block
+            logger.debug("media_sandbox: readiness probe failed ({})", exc)
+            return True
+        payload = _parse_payload(str(rendered))
+        if not isinstance(payload, dict):
+            return True
+        # Only a payload that is RECOGNISABLY a status report is allowed to say
+        # "not ready". Anything else — a bootstrap warning on stdout, a truncated
+        # read, a sandbox that answered some other command — is not evidence that
+        # the engine is missing, and treating it as such would turn a diagnostic
+        # into an outage that blocks every media action.
+        if not {"ready", "done", "installing"} & set(payload):
+            return True
+        if payload.get("ready"):
+            self._ready_checked_at = time.monotonic()
+            return True
+        return False
 
     async def _run_cli(self, sandbox: Any, command: str, timeout: int) -> str:
         """Run one CLI invocation, always refreshing the CLI first.
@@ -946,6 +1018,36 @@ class MediaSandboxTool(Tool):
                 "message": "Still running. Poll action='job' with the same job_id — do NOT "
                            "re-run the edit, that would start a second encode.",
             })
+
+        # --- the pre-task gate --------------------------------------------- #
+        #
+        # Runs BEFORE the command is built or launched, so a missing engine is
+        # reported as "the engine is being installed" rather than as an ffmpeg or
+        # yt-dlp error that the model then has to interpret. Everything below this
+        # point may assume the chain exists.
+        if not await self._chain_ready(sandbox):
+            provision = await self._provision(
+                sandbox, int(kwargs.get("wait") or _INSTALL_WAIT_SECONDS)
+            )
+            if provision.get("ready") or provision.get("done"):
+                self._ready_checked_at = time.monotonic()
+            else:
+                return ToolResult.error(json.dumps({
+                    "ok": False,
+                    "stage": provision.get("stage") or "installing",
+                    "failure": "media_engine_not_ready",
+                    "message": (
+                        "The media engine is not installed in this sandbox yet, so "
+                        f"action='{action}' was not run. The install is in progress "
+                        f"(last stage: {provision.get('stage') or 'installing'}) — this is "
+                        "normal for a fresh sandbox and takes a few minutes (ffmpeg, the "
+                        "whisper and rembg weights)."
+                    ),
+                    "next": "Poll media_sandbox(action='status') yourself until ready=true, "
+                            "then run this action. Do NOT install anything by hand and do "
+                            "NOT ask the user to.",
+                    "install": provision,
+                }))
 
         # --- a normal media action ----------------------------------------- #
         command = build_cli_command(action, kwargs)

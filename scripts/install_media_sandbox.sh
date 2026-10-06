@@ -15,6 +15,11 @@
 # WHAT IT INSTALLS (inside the sandbox only)
 #   - ffmpeg / ffprobe   static amd64 builds (no root, no shared libs to chase)
 #   - yt-dlp             stand-alone binary (its own bundled Python)
+#   - deno               a JavaScript runtime, which YouTube now requires yt-dlp
+#                        to have before it will hand over a playable stream. Not
+#                        installed if the image already ships node/bun/quickjs.
+#                        See the section-2b comment: its absence is the real
+#                        cause of the "bot block" on downloads.
 #   - Pillow, numpy      stills and frame maths
 #   - opencv-python-HEADLESS  face detection for the vertical crop. NOT
 #                        `opencv-python`, which links libGL/libX11 and fails to
@@ -399,6 +404,91 @@ install_ytdlp() {
 }
 
 # --------------------------------------------------------------------------- #
+# 2b. A JavaScript runtime, because YouTube now requires one to download.
+#
+# MEASURED 2026-10-06 on Freestyle, yt-dlp 2026.08.19, on youtu.be/YLb1TpCKqrA:
+#
+#   [debug] JS runtimes: none
+#   WARNING: [youtube] No supported JavaScript runtime could be found. Only deno
+#   is enabled by default ... YouTube extraction without a JS runtime has been
+#   deprecated, and some formats may be missing.
+#
+# That warning is the root cause of what the tool reports as a bot block.
+# YouTube's player returns a JavaScript challenge — the `n`/`s` signature
+# parameter and the PO token — which yt-dlp has to EXECUTE before a playable
+# stream URL exists. With nothing to execute it in, extraction either fails
+# outright ("Sign in to confirm you're not a bot", "Unable to extract any player
+# response") or quietly serves a reduced format list. The same link downloads
+# fine from a browser, which is why this reads as an IP ban when it is a missing
+# dependency.
+#
+# yt-dlp auto-detects ONLY `deno`, so deno is what gets installed when nothing
+# usable is already present. It is not installed blindly: `--js-runtimes` accepts
+# node/bun/quickjs too, so an image that already ships node (Freestyle does) must
+# not pay ~40 MB and ~25 s for a second runtime it will never use. Which one was
+# chosen is logged and reported in the summary, so `doctor` can say why downloads
+# are at risk instead of leaving it to be guessed.
+# --------------------------------------------------------------------------- #
+JS_RUNTIME=""
+
+js_runtime_present() {
+  local name
+  for name in deno node bun qjs quickjs; do
+    if have "${name}"; then
+      JS_RUNTIME="${name}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+install_js_runtime() {
+  export PATH="${MEDIA_BIN}:$PATH"
+  if js_runtime_present && [ "${MEDIA_FORCE_DENO:-0}" != "1" ]; then
+    log "JavaScript runtime already present: ${JS_RUNTIME} (yt-dlp will be told to use it)"
+    return 0
+  fi
+
+  status jsruntime "downloading deno (yt-dlp needs a JS runtime to solve YouTube's challenge)"
+  local arch="x86_64"
+  case "$(uname -m)" in
+    aarch64|arm64) arch="aarch64" ;;
+  esac
+  local zip="${CACHE_DIR}/deno.zip"
+  local url="https://github.com/denoland/deno/releases/latest/download/deno-${arch}-unknown-linux-gnu.zip"
+
+  # fetch_url's size floor is the whole point here: a GitHub release asset
+  # redirects to a signed CDN URL, and a truncated 200 from that hop unpacks to a
+  # broken binary that `have deno` would happily accept.
+  if fetch_url "${url}" "${zip}" 5000000; then
+    # `unzip` is NOT guaranteed in a slim image, but python3 always is — and this
+    # script already requires python3 for its own summary.
+    if ${PY} - "${zip}" "${MEDIA_BIN}" <<'PY' 2>/dev/null
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as zf:
+    zf.extractall(sys.argv[2])
+PY
+    then
+      chmod 0755 "${MEDIA_BIN}/deno" 2>/dev/null || true
+    fi
+  fi
+
+  if [ -x "${MEDIA_BIN}/deno" ]; then
+    JS_RUNTIME="deno"
+    log "deno ready: $("${MEDIA_BIN}/deno" --version 2>/dev/null | head -1)"
+    return 0
+  fi
+  # Fall back to whatever the image already had: a runtime we did not choose is
+  # still strictly better than none, and the CLI passes it explicitly.
+  if js_runtime_present; then
+    log "WARN: deno unavailable; falling back to ${JS_RUNTIME}"
+    return 0
+  fi
+  log "WARN: no JavaScript runtime — YouTube downloads will fail as soon as YouTube asks for a signed challenge"
+  return 1
+}
+
+# --------------------------------------------------------------------------- #
 # 3. Python pieces: Pillow + numpy (stills and frame maths), OpenCV headless
 #    (face detection for the vertical crop), faster-whisper (local ASR) and
 #    rembg (background removal).
@@ -569,6 +659,10 @@ status start "installing the media workshop into ${MEDIA_BIN}"
 
 install_ffmpeg || true
 install_ytdlp || true
+# Before the Python stack, and that order matters: the JS runtime is what makes
+# yt-dlp work at all, while the Python wheels are minutes of downloading. A
+# download becomes usable long before whisper/rembg finish.
+install_js_runtime || true
 install_python_stack || true
 install_fonts || true
 warm_models || true
@@ -615,12 +709,19 @@ for module in ("PIL", "numpy", "cv2", "faster_whisper", "rembg"):
     except Exception:
         deps[module] = False
 
+# The JavaScript runtime yt-dlp needs to solve YouTube's challenge. Reported
+# because its ABSENCE is invisible everywhere else in this summary -- ffmpeg and
+# yt-dlp both look fine while every download is one YouTube change from failing.
+js_runtime = next((n for n in ("deno", "node", "bun", "qjs", "quickjs") if shutil.which(n)), None)
+
 print(json.dumps({
     "ffmpeg": shutil.which("ffmpeg"),
     "ffprobe": shutil.which("ffprobe"),
     "yt_dlp": shutil.which("yt-dlp"),
     "ffmpeg_version": version("ffmpeg", "-version"),
     "yt_dlp_version": version("yt-dlp", "--version"),
+    "js_runtime": js_runtime,
+    "js_runtime_version": version(js_runtime, "--version") if js_runtime else None,
     "ffmpeg_filters": ffmpeg_filters(),
     "python_deps": deps,
 }))

@@ -471,8 +471,44 @@ async def test_missing_tool_failure_triggers_auto_provision_and_retry(monkeypatc
     A model offered a concrete alternative ("install ffmpeg yourself") takes it, so
     the tool provisions the chain itself and retries the action once.
     """
-    # probe fails -> install starts -> status reports ready -> the probe is retried.
+    # The pre-task gate probes status first -> not ready -> install starts ->
+    # status reports ready -> the action itself finally runs.
     responses = [
+        json.dumps({"ok": True, "ready": False, "done": False, "installing": False}),
+        json.dumps({"ok": True, "started": True}),
+        json.dumps({"ok": True, "ready": True, "done": True}),
+        json.dumps({"ok": True, "duration": 5.0}),
+    ]
+    sandbox = _FakeSandbox()
+    sandbox.response = responses[0]
+
+    async def _next(**_kwargs: Any) -> str:
+        sandbox.calls.append(_kwargs)
+        return responses.pop(0) if responses else json.dumps({"ok": True})
+
+    monkeypatch.setattr(sandbox, "execute", _next)
+    tool = MediaSandboxTool(_ctx({"novita_sandbox": sandbox}))
+    result = await tool.execute(action="probe", input="/tmp/a.mp4", wait=1)
+    payload = json.loads(str(result))
+    assert payload["duration"] == 5.0
+    # The install ran BEFORE the action, so the action's own command is last.
+    assert "status" in sandbox.calls[0]["command"]
+    assert "probe /tmp/a.mp4" in sandbox.calls[-1]["command"]
+
+
+@pytest.mark.asyncio
+async def test_an_action_that_fails_for_a_missing_tool_still_provisions_and_retries(
+    monkeypatch,
+):
+    """The pre-task gate is not the only safety net.
+
+    A sandbox can pass the readiness probe and still fail an action on a missing
+    tool — a half-finished install, or an engine that came up after the probe was
+    cached. That failure must still install and retry once rather than hand the
+    model a refusal.
+    """
+    responses = [
+        json.dumps({"ok": True, "ready": True, "done": True}),  # the gate: ready
         json.dumps({"ok": False, "error": "ffmpeg is not installed in this sandbox"}),
         json.dumps({"ok": True, "started": True}),
         json.dumps({"ok": True, "ready": True, "done": True}),
