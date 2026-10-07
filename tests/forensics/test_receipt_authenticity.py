@@ -128,3 +128,39 @@ def test_rail_inference_from_shape_only():
     assert t._guess_rail("NXG000014230811022605280674573281", False) == "access"
     assert t._guess_rail("090267260923120053981083702730", False) == "kuda"
     assert t._guess_rail("151421632972", False) == "remita"
+
+
+@pytest.mark.asyncio
+async def test_bill_payment_without_session_is_not_a_violation():
+    """A genuine AEDC receipt prints no Session ID. Absence is only evidence
+    within the transfer class - 'missing field' is never global proof."""
+    out = await _run(rail="opay", reference="260908090100819678111430",
+                     printed_date="Sep 8th, 2026", printed_time="16:51:43",
+                     txn_class="bill-payment")
+    assert out["state"] != "INVALID", out["violations"]
+    statuses = {c["rule"]: c["status"] for c in out["checks"]}
+    assert statuses["OPAY-SESSION"] == "not_applicable"
+
+
+@pytest.mark.asyncio
+async def test_transfer_without_session_is_still_flagged():
+    out = await _run(rail="opay", reference="261006020100941692514314",
+                     printed_date="Oct 6th, 2026", printed_time="05:43:36",
+                     txn_class="transfer")
+    assert "OPAY-SESSION" in {v["rule"] for v in out["violations"]}
+
+
+@pytest.mark.asyncio
+async def test_typography_catches_the_forgery_that_beats_every_clock_rule():
+    """OPAY-F1 satisfied length, date, type, 0100, session prefix and the clock
+    window. Only '₦43000.00' missing its separator exposed it."""
+    out = await _run(rail="opay", reference="260127020100619544950457",
+                     session_id="100004260127213139150916695873",
+                     printed_date="Jan 27th, 2026", printed_time="22:31:14",
+                     amount_text="₦43000.00")
+    assert "XX-AMO" in {v["rule"] for v in out["violations"]}
+    clean = await _run(rail="opay", reference="261006020100941692514314",
+                       session_id="100004261006044343173401664684",
+                       printed_date="Oct 6th, 2026", printed_time="05:43:36",
+                       amount_text="₦300.00")
+    assert clean["state"] != "INVALID"

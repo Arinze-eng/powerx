@@ -243,7 +243,8 @@ def _len_check(rule: str, ref: str, want: int) -> RuleResult:
 
 
 def assess_opay(reference: str = "", session_id: str = "",
-                printed_date: str = "", printed_time: str = "") -> ReceiptAssessment:
+                printed_date: str = "", printed_time: str = "",
+                txn_class: str = "") -> ReceiptAssessment:
     a = ReceiptAssessment(rail="opay")
     printed, has_time = _as_datetime(printed_date, printed_time)
     ref, sess = _digits(reference), _digits(session_id)
@@ -262,10 +263,21 @@ def assess_opay(reference: str = "", session_id: str = "",
         a.results.append(RuleResult("OPAY-TYPE", PASS, f"type block {ref[6:8]}"))
 
     if not sess:
-        a.results.append(RuleResult(
-            "OPAY-SESSION", FAIL,
-            "a bank transfer carries no Session ID; genuine OPay transfers "
-            "always print one (bill payments may not)"))
+        # A genuine AEDC bill payment prints NO Session ID (verified on a real
+        # receipt), so absence is only evidence within the transfer class.
+        # Treating "missing field" as global proof false-positives on real users.
+        lowered = (txn_class or "").lower()
+        # Substring, not equality: callers pass "bill-payment-AEDC", "data-Glo-4GB".
+        if any(k in lowered for k in ("bill", "airtime", "data", "recharge")):
+            a.results.append(RuleResult(
+                "OPAY-SESSION", NA,
+                f"{txn_class} receipts legitimately print no Session ID; "
+                "absence proves nothing"))
+        else:
+            a.results.append(RuleResult(
+                "OPAY-SESSION", FAIL,
+                "no Session ID on a transfer: genuine OPay transfers always "
+                "print one"))
         return a
 
     sd = sess

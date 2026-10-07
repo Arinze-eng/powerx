@@ -238,7 +238,8 @@ def length_check(rep: Report, rule: str, d: str, want: int) -> None:
 
 # ------------------------------------------------------------------- rails ----
 
-def check_opay(rep: Report, ref: str, session: str, printed, has_time: bool):
+def check_opay(rep: Report, ref: str, session: str, printed, has_time: bool,
+               txn_class: str = ""):
     d = digits(ref)
     length_check(rep, "OPAY-LEN", d, 24)
     if len(d) >= 6:
@@ -250,9 +251,14 @@ def check_opay(rep: Report, ref: str, session: str, printed, has_time: bool):
             rep.add("OPAY-TYPE", NA, f"type block {d[6:8]} unseen (02=transfer, "
                                      "09=bill); older formats may differ")
     if not session:
-        rep.add("OPAY-SESSION", FAIL,
-                "no Session ID on a bank transfer: genuine OPay transfers always "
-                "print one (bill payments legitimately do not)")
+        if txn_class == "bill-payment":
+            rep.add("OPAY-SESSION", NA,
+                    "bill payments legitimately print no Session ID (verified on a "
+                    "genuine AEDC receipt), so absence proves nothing here")
+        else:
+            rep.add("OPAY-SESSION", FAIL,
+                    "no Session ID on a TRANSFER: genuine OPay transfers always "
+                    "print one")
         return
     s = digits(session)
     if len(s) < 18 or s[:5] != "10000" or s[5] != "4":
@@ -393,6 +399,39 @@ def check_document_type(rep: Report, text: str):
         rep.add("DOC-TYPE", NA, "no recognisable payment language in the text")
 
 
+def check_typography(rep: Report, amount_text: str):
+    """Renderers group thousands and print 2 decimals. Humans editing a number
+    often do not. This rule is what caught the forgery that passed EVERY clock
+    and date check (OPAY-F1: "43000.00"), so it earns its place despite looking
+    trivial."""
+    if not amount_text:
+        rep.add("XX-AMO", NA, "pass --amount-text \"\u20a643,000.00\" to check "
+                              "thousands separators and decimal style")
+        return
+    t = amount_text.strip()
+    num = re.search(r"([\d,]+)(?:\.(\d{1,2}))?", t)
+    if not num:
+        rep.add("XX-AMO", NA, f"no amount found in '{t}'")
+        return
+    intpart, dec = num.group(1), num.group(2)
+    digits_only = intpart.replace(",", "")
+    problems = []
+    if len(digits_only) >= 4 and "," not in intpart:
+        problems.append(f"{digits_only} has no thousands separator "
+                        "(genuine renderers print 43,000)")
+    if "," in intpart:
+        groups = intpart.split(",")
+        if any(len(g) != 3 for g in groups[1:]) or len(groups[0]) > 3:
+            problems.append(f"separator grouping in '{intpart}' is not n,nNN,nNN")
+    if dec is None:
+        problems.append("no kobo/decimal part printed")
+    elif len(dec) != 2:
+        problems.append(f"{len(dec)} decimal place(s), genuine receipts print 2")
+    rep.add("XX-AMO", FAIL if problems else PASS,
+            f"'{t}' -> {intpart}.{dec or ''}: "
+            + ("; ".join(problems) if problems else "formatting consistent"))
+
+
 def check_arithmetic(rep: Report, amount, charges, vat, total, words):
     """Nigerian VAT applies to the SERVICE CHARGE only, never the principal.
     Lazy forgers change one field and leave the others."""
@@ -524,6 +563,12 @@ def main(argv=None) -> int:
     p.add_argument("--amount", type=float), p.add_argument("--charges", type=float)
     p.add_argument("--vat", type=float), p.add_argument("--total", type=float)
     p.add_argument("--words", default="", help="amount written out in words")
+    p.add_argument("--amount-text", default="",
+                   help="the amount EXACTLY as printed, e.g. 43000.00 - "
+                        "typography check (catches edits that pass clocks)")
+    p.add_argument("--txn-class", default="",
+                   help="transfer | bill-payment - bill payments legitimately "
+                        "print no Session ID on OPay")
     p.add_argument("--text", default="", help="document text (invoice/receipt check)")
     p.add_argument("--file", default="", help="read document text from a file")
     p.add_argument("--ledger", action="store_true",
@@ -552,7 +597,8 @@ def main(argv=None) -> int:
     rep = Report(rail=rail, reference=a.reference)
 
     if rail == "opay":
-        check_opay(rep, a.reference, a.session, printed, has_time)
+        check_opay(rep, a.reference, a.session, printed, has_time,
+                   (a.txn_class or "").lower())
     elif rail == "kuda":
         check_kuda(rep, a.reference, printed, has_time, a.account)
     elif rail in ("access", "gtbank"):
@@ -564,6 +610,7 @@ def main(argv=None) -> int:
 
     check_document_type(rep, text)
     check_arithmetic(rep, a.amount, a.charges, a.vat, a.total, a.words)
+    check_typography(rep, a.amount_text)
 
     ledger = None
     if a.ledger:

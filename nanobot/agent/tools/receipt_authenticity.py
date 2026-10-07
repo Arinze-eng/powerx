@@ -74,6 +74,12 @@ _SNOWFLAKE_EPOCH_MS = 1_288_834_974_657
             "type": "string",
             "description": "The amount spelled out on the document.",
         },
+        "document_text": {
+            "type": "string",
+            "description": "The receipt's own text. Decides INVOICE vs RECEIPT - "
+                           "the top institutional fraud is a genuine unpaid invoice "
+                           "shown as proof of payment, which no format rule can see.",
+        },
         "claimed_identity": {
             "type": "string",
             "description": "Name or matric/ID the presenter claims. Cross-checked "
@@ -85,6 +91,18 @@ _SNOWFLAKE_EPOCH_MS = 1_288_834_974_657
             "description": "'local' runs offline consistency rules (default, always "
                            "safe). 'ledger' also asks Remita whether the reference "
                            "was actually paid - requires configured consent.",
+        },
+        "txn_class": {
+            "type": "string",
+            "description": "transfer | bill-payment | airtime | data. Bill payments "
+                           "legitimately print no Session ID, so absence is only "
+                           "evidence within the transfer class.",
+        },
+        "amount_text": {
+            "type": "string",
+            "description": "The amount EXACTLY as printed (e.g. 43000.00). Missing "
+                           "thousands separators caught a forgery that passed every "
+                           "clock and date rule.",
         },
         "presented_by_claimant": {
             "type": "boolean",
@@ -152,7 +170,21 @@ class ReceiptAuthenticityTool(Tool):
             rail = self._guess_rail(reference, bool(str(kwargs.get("session_id") or "")))
 
         assessment = self._assess(rail, kwargs)
-        extra = self._arithmetic(kwargs) + self._identity(kwargs)
+        # Invoice-vs-receipt runs FIRST and dominates: an authentic invoice is the
+        # most common "clean" document that proves nothing.
+        doc = self._document_type(kwargs)
+        assessment.results.extend(doc)
+        if any(r.rule == "DOC-TYPE" and not r.passed for r in doc):
+            assessment.results.extend(self._arithmetic(kwargs))
+            assessment.results.append(rules.RuleResult(
+                "DOC-TYPE-BLOCK", rules.FAIL,
+                "classified as a payment REQUEST; verification would only confirm "
+                "an unpaid bill exists. Reject before further checking."))
+            payload_state = "INVALID"
+        else:
+            payload_state = None
+        extra = (self._arithmetic(kwargs) + self._identity(kwargs)
+                 + self._typography(kwargs))
         assessment.results.extend(extra)
 
         payload: dict[str, Any] = {
@@ -160,6 +192,8 @@ class ReceiptAuthenticityTool(Tool):
             "reference": reference,
             **assessment.to_dict(),
         }
+        if payload_state:
+            payload["state"] = payload_state
 
         mode = str(kwargs.get("mode") or "local").strip().lower()
         if mode == "ledger" and rail == "remita":
@@ -210,7 +244,8 @@ class ReceiptAuthenticityTool(Tool):
         pt = str(kw.get("printed_time") or "")
         if rail == "opay":
             return rules.assess_opay(
-                ref, str(kw.get("session_id") or ""), pd, pt)
+                ref, str(kw.get("session_id") or ""), pd, pt,
+                str(kw.get("txn_class") or ""))
         if rail == "kuda":
             return rules.assess_kuda(
                 ref, pd, pt, str(kw.get("sender_account") or ""))
@@ -267,6 +302,70 @@ class ReceiptAuthenticityTool(Tool):
             f"reference embeds {wat:%Y-%m-%d %H:%M:%S} WAT; receipt prints "
             f"{printed:%Y-%m-%d %H:%M:%S}"))
         return a
+
+    INVOICE_CUES = ("this is not a receipt", "amount payable", "payable in respect",
+                    "e-invoice", "invoice", "kindly pay", "to pay at any", "payable")
+    PAID_CUES = ("successful", "confirmed", "received by bank", "paid on", "debit",
+                 "transaction status", "settled")
+
+    @staticmethod
+    def _document_type(kw: dict) -> list[rules.RuleResult]:
+        """INVOICE vs RECEIPT. The biggest institutional fraud is not a forgery -
+        it is a genuine, free-to-generate payment REQUEST presented as proof of
+        payment. Remita prints 'This is not a Receipt' because it happens so
+        often. Runs first, because an authentic invoice proves nothing."""
+        text = str(kw.get("document_text") or "").lower()
+        if not text:
+            return [rules.RuleResult("DOC-TYPE", rules.NA,
+                                     "no document_text supplied; cannot tell an "
+                                     "invoice from a receipt - ask for the text")]
+        inv = [c for c in ReceiptAuthenticityTool.INVOICE_CUES if c in text]
+        paid = [c for c in ReceiptAuthenticityTool.PAID_CUES if c in text]
+        if "this is not a receipt" in text:
+            return [rules.RuleResult("DOC-TYPE", rules.FAIL,
+                "document self-declares 'This is not a Receipt' - it is a payment "
+                "request, not proof that anyone paid")]
+        if inv and not paid:
+            return [rules.RuleResult("DOC-TYPE", rules.FAIL,
+                f"request language only ({', '.join(inv[:3])}): nothing states the "
+                "money moved")]
+        if paid and not inv:
+            return [rules.RuleResult("DOC-TYPE", rules.PASS,
+                f"settlement language present ({', '.join(paid[:3])})")]
+        if inv and paid:
+            return [rules.RuleResult("DOC-TYPE", rules.NA,
+                f"mixed wording ({inv[:2]} vs {paid[:2]}); confirm a real status "
+                "line exists")]
+        return [rules.RuleResult("DOC-TYPE", rules.NA,
+                                 "no recognisable payment language")]
+
+    @staticmethod
+    def _typography(kw: dict) -> list[rules.RuleResult]:
+        """Renderers group thousands and print two decimals; humans editing a
+        number usually do not. Cheap, and it is the ONLY rule that caught OPAY-F1."""
+        raw = str(kw.get("amount_text") or "").strip()
+        if not raw:
+            return [rules.RuleResult("XX-AMO", rules.NA,
+                                     "pass amount_text to check separators/decimals")]
+        m = re.search(r"([\d,]+)(?:\.(\d{1,2}))?", raw)
+        if not m:
+            return [rules.RuleResult("XX-AMO", rules.NA, f"no amount in '{raw}'")]
+        intpart, dec = m.group(1), m.group(2)
+        bare = intpart.replace(",", "")
+        problems = []
+        if len(bare) >= 4 and "," not in intpart:
+            problems.append(f"{bare} lacks a thousands separator")
+        if "," in intpart:
+            groups = intpart.split(",")
+            if any(len(g) != 3 for g in groups[1:]) or len(groups[0]) > 3:
+                problems.append(f"grouping '{intpart}' is not n,nnn,nnn")
+        if dec is None:
+            problems.append("no decimal/kobo part")
+        elif len(dec) != 2:
+            problems.append(f"{len(dec)} decimals, genuine receipts print 2")
+        return [rules.RuleResult("XX-AMO", rules.FAIL if problems else rules.PASS,
+                                 f"'{raw}': " + ("; ".join(problems) if problems
+                                                 else "formatting consistent"))]
 
     @staticmethod
     def _arithmetic(kw: dict) -> list[rules.RuleResult]:
