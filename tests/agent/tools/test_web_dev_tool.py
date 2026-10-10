@@ -137,12 +137,14 @@ def test_deploy_with_no_sources_says_what_to_do(tmp_path: Path, monkeypatch) -> 
     assert "path mismatch" in text
 
 
-def test_set_env_requires_name(tmp_path: Path) -> None:
+def test_set_env_requires_something_to_set(tmp_path: Path) -> None:
+    """No name and no env_file is a caller mistake, on both the host and the
+    sandbox path — it must be rejected rather than silently setting nothing."""
     (tmp_path / "proj").mkdir()
     tool = WebDevTool(workspace=str(tmp_path))
     res = asyncio.run(tool.execute(action="set_env", project="proj", value="x"))
     assert res.is_error
-    assert "name" in str(res)
+    assert "name (env var name) is required" in str(res)
 
 
 def test_set_env_rejects_bad_env(tmp_path: Path) -> None:

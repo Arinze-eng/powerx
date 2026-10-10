@@ -653,8 +653,10 @@ class WebDevTool(Tool):
             name = str(kwargs.get("name") or "").strip()
             environment = str(kwargs.get("environment") or "production").strip().lower()
             if action == "set_env":
-                if not name:
-                    return ToolResult.error("name (env var name) is required for set_env")
+                if not name and not str(kwargs.get("env_file") or "").strip():
+                    return ToolResult.error(
+                        "name (env var name) is required for set_env, unless env_file is given"
+                    )
                 if environment not in {"production", "preview", "development"}:
                     return ToolResult.error(f"unsupported environment: {environment}")
 
@@ -705,7 +707,13 @@ class WebDevTool(Tool):
                 )
             if action == "set_env":
                 return await asyncio.to_thread(
-                    self._set_env, project, name, str(kwargs.get("value") or ""), environment, timeout
+                    self._set_env,
+                    project,
+                    name,
+                    str(kwargs.get("value") or ""),
+                    environment,
+                    timeout,
+                    env_file=str(kwargs.get("env_file") or ""),
                 )
             if action == "status":
                 return await asyncio.to_thread(self._status, project, timeout)
@@ -1300,11 +1308,30 @@ class WebDevTool(Tool):
                 staged.cleanup()
         return base
 
-    def _set_env(self, project: str, name: str, value: str, environment: str, timeout: int) -> ToolResult | str:
-        if not name:
-            return ToolResult.error("name (env var name) is required for set_env")
+    def _set_env(
+        self,
+        project: str,
+        name: str,
+        value: str,
+        environment: str,
+        timeout: int,
+        *,
+        env_file: str = "",
+    ) -> ToolResult | str:
         if environment not in {"production", "preview", "development"}:
             return ToolResult.error(f"unsupported environment: {environment}")
+        pairs: list[tuple[str, str]] = []
+        if env_file.strip():
+            file_pairs, error = self._read_env_file(env_file.strip(), project)
+            if error:
+                return ToolResult.error(error)
+            pairs.extend(file_pairs)
+        if name:
+            pairs.append((name, value))
+        if not pairs:
+            return ToolResult.error(
+                "nothing to set: pass name+value, or env_file=<a .env file to push>."
+            )
         requested = (project or "").strip() or None
         dest, staged, missing = self._with_source(project)
         if dest is None:
@@ -1325,14 +1352,26 @@ class WebDevTool(Tool):
                 cwd=dest,
                 timeout=timeout,
             )
-            args = ["env", "add", name, environment]
-            out = _run_cli(args, input_text=value + "\n", cwd=dest, timeout=timeout)
+            outs = []
+            for var_name, var_value in pairs:
+                outs.append(
+                    f"--- {var_name} ---\n"
+                    + _run_cli(
+                        ["env", "add", var_name, environment],
+                        input_text=var_value + "\n",
+                        cwd=dest,
+                        timeout=timeout,
+                    )
+                )
         finally:
             if staged is not None:
                 staged.cleanup()
+        listed = ", ".join(var_name for var_name, _ in pairs)
         return (
-            f"Setting env var {name} ({environment}) on the Vercel project.\n{out}\n"
-            "Note: after setting env vars, redeploy (action=deploy) so the running deployment picks them up."
+            f"Set {len(pairs)} env var(s) ({listed}) for {environment} on the Vercel project.\n"
+            + "\n".join(outs)
+            + "\nNote: after setting env vars, redeploy (action=deploy) so the running deployment "
+            "picks them up."
         )
 
     def _project_arg(self, project: str) -> tuple[Path, str, bool]:
