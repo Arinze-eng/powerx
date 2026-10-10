@@ -92,6 +92,7 @@ from nanobot.utils.runtime import (
     repeated_external_lookup_error,
     repeated_workspace_violation_error,
     stuck_pattern,
+    turn_budget_seconds,
 )
 
 GoalContinueMessage = str | Callable[[], str | None]
@@ -313,6 +314,10 @@ class AgentRunSpec:
     hook: AgentHook | None = None
     error_message: str | None = _DEFAULT_ERROR_MESSAGE
     max_iterations_message: str | None = None
+    #: What the user is told when the turn runs out of wall-clock time. Same
+    #: contract as ``max_iterations_message`` but a separate string, because the
+    #: two exits mean different things (see ``_turn_budget_fallback``).
+    turn_budget_message: str | None = None
     concurrent_tools: bool = False
     fail_on_tool_error: bool = False
     workspace: Path | None = None
@@ -325,6 +330,12 @@ class AgentRunSpec:
     checkpoint_callback: CheckpointCallback | None = None
     injection_callback: InjectionCallback | None = None
     llm_timeout_s: float | None = None
+    #: Wall-clock ceiling for the whole turn, in seconds. ``None`` reads the
+    #: deployment-wide default (``NANOBOT_TURN_BUDGET_S``, else 1800 s); ``0``
+    #: disables it. Enforced in the loop rather than around one provider request,
+    #: so it bounds a turn made of slow tool calls -- the shape that runs for
+    #: hours inside a 200-iteration budget. See ``turn_budget_seconds``.
+    turn_budget_s: float | None = None
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: GoalContinueMessage | None = None
     finalize_on_max_iterations: bool = True
@@ -762,6 +773,19 @@ class AgentRunner:
         # repeat guard -- round trips that executed nothing. See
         # _MAX_STALLED_ITERATIONS for why this ends the turn.
         stalled_iterations = 0
+        # Wall-clock deadline for the whole turn. max_iterations bounds a turn by
+        # COUNT, which is the wrong unit: 200 iterations of a browser session or a
+        # sandbox build is hours, not seconds, and the count never fires. Measured
+        # production turns ran 119 browser round trips (400 s) and past 2 h while
+        # staying inside the iteration budget. ``turn_budget_s=None`` reads the
+        # deployment default; 0 disables. Checked at the top of each iteration, so
+        # a turn that is out of time never starts another round trip.
+        turn_budget = (
+            spec.turn_budget_s if spec.turn_budget_s is not None else turn_budget_seconds()
+        )
+        turn_deadline = (
+            time.monotonic() + turn_budget if turn_budget and turn_budget > 0 else None
+        )
         pending_stream_content: str | None = None
         provider_state = spec.provider_state
         if spec.strip_image_content_before_provider:
@@ -927,6 +951,59 @@ class AgentRunner:
             )
 
         for iteration in range(spec.max_iterations):
+            # Built here, at the top of the iteration, so the budget check below
+            # can report through the same hook context as every other exit.
+            context = AgentHookContext(
+                iteration=iteration,
+                messages=messages,
+                session_key=spec.session_key,
+            )
+            # Paired with after_iteration on every exit path below, including the
+            # budget exit, so a hook never sees an "after" for an iteration whose
+            # "before" it was not told about.
+            await hook.before_iteration(context)
+            # Wall-clock budget. Checked BEFORE the round trip, not after, so a
+            # turn that is already out of time does not pay for one more model
+            # call and one more slow tool. The turn is not killed: it finalizes
+            # with what it has, exactly like the iteration ceiling, so the user
+            # gets a real answer describing the work done instead of a dead turn.
+            # This is the only bound in the loop expressed in time, which is what
+            # makes it independent of the model the admin configured.
+            if turn_deadline is not None and time.monotonic() >= turn_deadline:
+                over = time.monotonic() - turn_deadline
+                logger.warning(
+                    "Turn {} for {} exceeded its {:.0f}s wall-clock budget "
+                    "({:.0f}s over) at iteration {}; finalizing with the work done "
+                    "instead of continuing",
+                    iteration,
+                    spec.session_key or "default",
+                    turn_budget,
+                    over,
+                    iteration,
+                )
+                # Same shape as the iteration ceiling, including the
+                # goal-continuation courtesy: when the caller says a queued slice
+                # owns the user-visible reply, do not spend a finalization call
+                # here as well.
+                if spec.finalize_on_max_iterations:
+                    terminal_content = await self._try_finalize_after_max_iterations(
+                        spec,
+                        hook,
+                        messages,
+                        usage,
+                        conversation_state,
+                    )
+                else:
+                    terminal_content = None
+                if terminal_content is None:
+                    terminal_content = self._turn_budget_fallback(spec, turn_budget)
+                final_content = terminal_content
+                self._append_final_message(messages, terminal_content)
+                stop_reason = "turn_budget_exceeded"
+                context.final_content = final_content
+                context.stop_reason = stop_reason
+                await hook.after_iteration(context)
+                break
             # The container is killed by the kernel when it crosses its cgroup
             # memory limit, with no exception and no shutdown line, so a turn
             # that dies this way leaves nothing behind but a restart. Record
@@ -980,12 +1057,6 @@ class AgentRunner:
                 if steer_message is not None
                 else messages_for_model
             )
-            context = AgentHookContext(
-                iteration=iteration,
-                messages=messages,
-                session_key=spec.session_key,
-            )
-            await hook.before_iteration(context)
             provider_context = conversation_state.prepare_request(
                 messages,
                 context_window_tokens=spec.runtime.context_window_tokens,
@@ -2189,6 +2260,29 @@ class AgentRunner:
         retry_messages = list(messages)
         retry_messages.append(build_budget_exhausted_finalization_message())
         return retry_messages
+
+    @staticmethod
+    def _turn_budget_fallback(spec: AgentRunSpec, budget_s: float) -> str:
+        """What the user is told when the turn runs out of wall-clock time.
+
+        Deliberately NOT the iteration-ceiling text: that message blames the
+        model for splitting the task too finely, which is a specific diagnosis
+        and wrong here. A turn can exhaust its time budget while behaving
+        perfectly -- one slow tool, one big download -- so this says only what is
+        true: the turn stopped on time, the work so far is saved, and it resumes
+        from here.
+        """
+        if spec.turn_budget_message:
+            return spec.turn_budget_message.format(
+                minutes=max(1, round(budget_s / 60)),
+                seconds=int(budget_s),
+            )
+        return render_template(
+            "agent/turn_budget_message.md",
+            strip=True,
+            minutes=max(1, round(budget_s / 60)),
+            seconds=int(budget_s),
+        )
 
     @staticmethod
     def _max_iterations_fallback(spec: AgentRunSpec) -> str:

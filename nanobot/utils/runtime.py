@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any, Sequence, cast
@@ -19,6 +20,27 @@ _MAX_REPEAT_WORKSPACE_VIOLATIONS = 2
 #: refuses it. Three: the first two give a model that is genuinely retrying a
 #: fair chance, and by the third the call has demonstrably not changed anything.
 MAX_IDENTICAL_TOOL_CALLS = 2
+
+#: Wall-clock ceiling for a single turn, in seconds.
+#:
+#: ``max_iterations`` bounds a turn by COUNT, and a count is the wrong unit for
+#: the thing a user actually experiences. 200 iterations of a fast read-only
+#: lookup is seconds; 200 iterations of a browser session, a sandbox build or a
+#: video edit is hours, because each iteration's cost is set by the TOOL, not by
+#: the loop. MEASURED in production: one turn ran 119 consecutive browser calls
+#: over 400 s of pure round-trip time, and the reported video-edit turn ran past
+#: two hours -- both well inside a 200-iteration budget. The iteration count
+#: never fired, because it was never the binding constraint.
+#:
+#: This bounds the turn by TIME instead, and it is enforced in the loop, not in
+#: a provider client, so it applies to whatever model the admin configured.
+#: Crossing it does not kill the turn: the runner makes one final no-tools call
+#: and answers with what it already has, exactly as it does at the iteration
+#: ceiling. Default 1800 s (30 min) -- long enough that a genuinely long task
+#: finishes, short enough that "2h+" cannot happen. Override per deployment with
+#: ``NANOBOT_TURN_BUDGET_S``; a value of ``0`` disables the budget.
+TURN_BUDGET_SECONDS = 1800.0
+
 _LENGTH_RECOVERY_TAIL_CHARS = 64
 
 EMPTY_FINAL_RESPONSE_MESSAGE = (
@@ -50,6 +72,33 @@ SUSTAINED_GOAL_CONTINUE_PROMPT = (
     "objective using your tools, or call update_goal with action='complete' "
     "if the work is truly finished."
 )
+
+
+def turn_budget_seconds() -> float:
+    """Return the effective per-turn wall-clock budget in seconds.
+
+    Precedence: ``NANOBOT_TURN_BUDGET_S`` env override, else
+    :data:`TURN_BUDGET_SECONDS`. The module global is the fallback rather than a
+    literal so tests can monkeypatch one knob.
+
+    An explicit ``0`` (or any non-positive value) disables the budget -- the
+    documented opt-out for an operator who wants a turn to run unbounded. An
+    unparseable value is ignored with a warning and the default is used, so a
+    typo cannot silently remove the ceiling.
+    """
+    raw = os.environ.get("NANOBOT_TURN_BUDGET_S")
+    if raw is None or not raw.strip():
+        return TURN_BUDGET_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring invalid NANOBOT_TURN_BUDGET_S={!r}; using {}",
+            raw,
+            TURN_BUDGET_SECONDS,
+        )
+        return TURN_BUDGET_SECONDS
+    return value if value > 0 else 0.0
 
 
 def empty_tool_result_message(tool_name: str) -> str:
