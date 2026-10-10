@@ -80,14 +80,18 @@ from nanobot.utils.memory_reclaim import maybe_reclaim, reclaim_if_charge_high
 from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
+    MAX_IDENTICAL_TOOL_CALLS,
+    STUCK_WINDOW,
     build_budget_exhausted_finalization_message,
     build_finalization_retry_message,
     build_goal_continue_message,
     build_length_recovery_message,
     build_truncated_tool_call_message,
     is_blank_text,
+    normalize_tool_arguments,
     repeated_external_lookup_error,
     repeated_workspace_violation_error,
+    stuck_pattern,
 )
 
 GoalContinueMessage = str | Callable[[], str | None]
@@ -112,6 +116,29 @@ _MAX_LENGTH_RECOVERIES = 3
 #: the two failures need different prompts and neither should spend the other's
 #: budget.
 _MAX_TRUNCATED_TOOL_CALL_RECOVERIES = 2
+#: How many iterations in a row may consist ENTIRELY of tool calls the repeat
+#: guard refused before the turn stops and answers with what it has.
+#:
+#: A refused call is a soft error (``AgentLoop`` builds the spec without
+#: ``fail_on_tool_error``), so nothing else ends the turn: the model is handed
+#: "choose a different action" and is free to re-issue the same call. That is a
+#: full model round trip per iteration that executes nothing, and it runs until
+#: ``max_iterations`` -- 200 by default.
+#:
+#: MEASURED in production (2026-09-28): one turn emitted the byte-identical
+#: ``human_browser`` navigation 36 times back to back and ran to iteration 119.
+#: On the fast model serving it that was minutes; on a slow reasoning model the
+#: same turn is hours of round trips, which is the "a video edit takes 2h+" report.
+#: Two iterations of pure refusal is enough to tell a model that will not adapt
+#: from one that is merely retrying, and it caps the waste at two round trips.
+_MAX_STALLED_ITERATIONS = 2
+#: Tool-event details that mean "this call was refused and did no work". An
+#: iteration made only of these executed nothing, so it counts toward the stall
+#: budget above. Both are soft errors on purpose -- neither is fatal -- which is
+#: exactly why a loop over them needs its own way out.
+_REFUSED_CALL_DETAILS = frozenset(
+    {"identical tool call blocked", "repeated external lookup blocked"}
+)
 #: A ``finish_reason="length"`` response is only worth continuing when it made
 #: textual progress. A blank segment, or one byte-identical to the segment we
 #: just appended, means the model is re-emitting the same truncated prefix:
@@ -731,6 +758,10 @@ class AgentRunner:
         injection_cycles = 0
         compacted_tool_call_ids: set[str] = set()
         repeat_tool_state: dict[str, Any] = {"fingerprint": None, "count": 0}
+        # Consecutive iterations in which EVERY tool call was refused by the
+        # repeat guard -- round trips that executed nothing. See
+        # _MAX_STALLED_ITERATIONS for why this ends the turn.
+        stalled_iterations = 0
         pending_stream_content: str | None = None
         provider_state = spec.provider_state
         if spec.strip_image_content_before_provider:
@@ -1218,6 +1249,49 @@ class AgentRunner:
                     self._append_final_message(messages, final_content)
                     context.final_content = final_content
                     context.stop_reason = "completed"
+                    await hook.after_iteration(context)
+                    break
+
+                # --- Repeat-stall breaker ------------------------------------
+                # Every call this iteration was refused as an identical repeat,
+                # so this iteration executed nothing and cost a full model round
+                # trip. The refusal is a SOFT error, so nothing above ends the
+                # turn: the model gets "choose a different action" and simply
+                # re-issues the same call. Left alone that repeats until
+                # max_iterations -- see _MAX_STALLED_ITERATIONS for the measured
+                # production case (36 identical calls, iteration 119). Two such
+                # iterations in a row is a model that will not adapt, so the turn
+                # stops and answers with what it already has: one no-tools
+                # finalization call replaces up to 197 round trips.
+                if new_events and all(
+                    event.get("detail") in _REFUSED_CALL_DETAILS
+                    for event in new_events
+                ):
+                    stalled_iterations += 1
+                else:
+                    stalled_iterations = 0
+                if stalled_iterations >= _MAX_STALLED_ITERATIONS:
+                    logger.warning(
+                        "Turn {} for {} stalled on an identical repeated tool call for "
+                        "{} iteration(s); finalizing early instead of looping",
+                        iteration,
+                        spec.session_key or "default",
+                        stalled_iterations,
+                    )
+                    terminal_content = await self._try_finalize_after_max_iterations(
+                        spec,
+                        hook,
+                        messages,
+                        usage,
+                        conversation_state,
+                    )
+                    if terminal_content is None:
+                        terminal_content = self._max_iterations_fallback(spec)
+                    final_content = terminal_content
+                    self._append_final_message(messages, terminal_content)
+                    stop_reason = "repeat_stall"
+                    context.final_content = final_content
+                    context.stop_reason = stop_reason
                     await hook.after_iteration(context)
                     break
 
@@ -2426,15 +2500,24 @@ class AgentRunner:
 
     @staticmethod
     def _tool_fingerprint(tool_call: ToolCallRequest) -> str:
+        """Stable identity of a call, so a reformatted repeat still collides.
+
+        Key order is normalized by ``sort_keys`` and the arguments are
+        normalized by :func:`normalize_tool_arguments`, which drops keys that
+        were supplied empty. Both are needed: the guard's job is to compare what
+        a call *asks for*, and a model that pads its arguments with explicit
+        nulls is asking for exactly what it asked for last time.
+        """
+        arguments = normalize_tool_arguments(tool_call.name, tool_call.arguments)
         try:
             args = json.dumps(
-                tool_call.arguments,
+                arguments,
                 sort_keys=True,
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
         except (TypeError, ValueError):
-            args = repr(tool_call.arguments)
+            args = repr(arguments)
         return f"{tool_call.name}:{args}"
 
     async def _run_tool(
@@ -2457,6 +2540,13 @@ class AgentRunner:
         else:
             repeat_tool_state["fingerprint"] = fingerprint
             repeat_tool_state["count"] = 1
+        # Bounded trail of recent call identities, for the alternation check.
+        recent = repeat_tool_state.setdefault("recent", [])
+        if not isinstance(recent, list):  # a caller passed a hand-built state
+            recent = []
+            repeat_tool_state["recent"] = recent
+        recent.append(fingerprint)
+        del recent[:-STUCK_WINDOW]
         lookup_error = repeated_external_lookup_error(
             tool_call.name,
             tool_call.arguments,
@@ -2471,11 +2561,35 @@ class AgentRunner:
             if spec.fail_on_tool_error:
                 return lookup_error + hint, event, RuntimeError(lookup_error)
             return lookup_error + hint, event, None
-        if int(repeat_tool_state["count"]) > 2:
-            detail = (
-                "The exact same tool call was repeated without an intervening change. "
-                "This attempt was blocked; inspect the latest result and choose a different action."
-            )
+        alternation = stuck_pattern(recent)
+        if int(repeat_tool_state["count"]) > MAX_IDENTICAL_TOOL_CALLS or alternation:
+            if alternation:
+                detail = (
+                    f"This turn is looping through {alternation}: the last "
+                    f"{len(recent)} calls are the same two requests over and over, and "
+                    "neither of them is changing the situation. This attempt was blocked. "
+                    "Stop repeating them; use the results you already have and either "
+                    "answer the user or take a materially different step."
+                )
+            else:
+                detail = (
+                    "The exact same tool call was repeated without an intervening change. "
+                    "This attempt was blocked; inspect the latest result and choose a different action."
+                )
+            if alternation:
+                logger.warning(
+                    "Blocking {} call: this turn is looping through {} for {}",
+                    tool_call.name,
+                    alternation,
+                    spec.session_key or "default",
+                )
+            else:
+                logger.warning(
+                    "Blocking identical {} call (attempt {}) for {}",
+                    tool_call.name,
+                    repeat_tool_state["count"],
+                    spec.session_key or "default",
+                )
             event = {
                 "name": tool_call.name,
                 "status": "error",

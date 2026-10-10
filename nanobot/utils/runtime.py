@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Sequence, cast
 
 from loguru import logger
 
@@ -14,6 +14,11 @@ _MAX_REPEAT_EXTERNAL_LOOKUPS = 2
 
 # Third same-target workspace violation in a turn escalates to "stop retrying".
 _MAX_REPEAT_WORKSPACE_VIOLATIONS = 2
+
+#: How many times one call, spelled the same way, may run before the agent
+#: refuses it. Three: the first two give a model that is genuinely retrying a
+#: fair chance, and by the third the call has demonstrably not changed anything.
+MAX_IDENTICAL_TOOL_CALLS = 2
 _LENGTH_RECOVERY_TAIL_CHARS = 64
 
 EMPTY_FINAL_RESPONSE_MESSAGE = (
@@ -145,6 +150,70 @@ def external_lookup_signature(tool_name: str, arguments: Any) -> str | None:
         if query:
             return f"web_search:{query.lower()}"
     return None
+
+
+#: Argument values that mean "not supplied". An explicit empty string, an empty
+#: list and a null are the same request as a key that was left out entirely.
+_EMPTY_ARGUMENT_VALUES: tuple[Any, ...] = (None, "", [], {})
+
+#: How many of the most recent calls the alternation detector looks at, and how
+#: many full cycles of the pair it needs before calling it a loop. Six calls is
+#: three cycles of A, B -- high confidence, and deliberately more than the four
+#: calls a minimal A,B,A,B rule would need, because an agent legitimately
+#: alternating two probes early in a task must not be stopped.
+STUCK_WINDOW = 6
+
+
+def stuck_pattern(recent: Sequence[str]) -> str | None:
+    """Return a description when *recent* call identities are an unproductive loop.
+
+    Catches the shape a consecutive-repeat guard is blind to: **alternation**.
+    A model that re-issues A, B, A, B never repeats a call twice in a row, so a
+    guard that only compares against the previous call never fires -- while the
+    turn pays a full round trip per call and executes the same two things
+    forever. Standard agent frameworks (OpenHands' stuck detector, LangGraph's
+    ``StuckLoopDetection``) all carry this check alongside the consecutive one;
+    a consecutive-only guard is the gap that produced the measured 119-iteration
+    turn this module exists to bound.
+
+    Three full cycles (A, B, A, B, A, B) are required rather than the minimum
+    four calls, so a task that legitimately alternates two probes once or twice
+    is untouched. Returns a short reason, or None when nothing is stuck.
+    """
+    window = [item for item in recent][-STUCK_WINDOW:]
+    if len(window) < STUCK_WINDOW:
+        return None
+    even = window[0::2]
+    odd = window[1::2]
+    if len(set(even)) == 1 and len(set(odd)) == 1 and even[0] != odd[0]:
+        return "an alternating pair of calls repeated three times"
+    return None
+
+
+def normalize_tool_arguments(tool_name: str, arguments: Any) -> dict[str, Any]:
+    """Return *arguments* in the canonical spelling used to identify a call.
+
+    Two calls that ask for the same thing must normalize to the same mapping.
+    Without this the repeat guard compares *spellings* instead of intents, and a
+    model that only reformats its arguments -- ``{"url": X}`` one step,
+    ``{"url": X, "target": null}`` the next -- escapes it forever while issuing
+    the same request.
+
+    Normalization drops keys that were supplied empty (an omitted optional and an
+    explicit null are one request) and strips surrounding whitespace from string
+    values. It never reorders meaning: values that differ in substance stay
+    different, so a genuinely different call is still a different call.
+    """
+    if not isinstance(arguments, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    for key, value in cast(dict[str, Any], arguments).items():
+        if isinstance(value, str):
+            value = value.strip()
+        if value in _EMPTY_ARGUMENT_VALUES:
+            continue
+        normalized[str(key)] = value
+    return normalized
 
 
 def repeated_external_lookup_error(

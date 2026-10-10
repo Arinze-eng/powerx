@@ -1,14 +1,25 @@
 ---
 name: media-forensics
-description: Decide whether an image or document has been edited, and when it was taken. Use for receipts, payment screenshots, IDs, scans, contracts, and any "is this real / was this photoshopped / when was this taken" question.
+description: Judge whether a picture or document is fake, fabricated, tampered or photo-manipulated, and read when it was taken. Use for "is this receipt real", "was this photoshopped", "when was this taken", forged IDs and scans. This skill only INSPECTS a file - it never edits one. To change, fix, retouch or restyle an image, use the image-generation skill instead.
 ---
 
 # Media forensics — receipts, documents, and edited images
 
 Use `media_forensics` when the user asks whether a **receipt, payment screenshot,
-invoice, ID, scan, or photo is fake or edited**, or **when it was taken**. There is
-also a `document-images` skill for *placing* images into documents; this one is for
-*judging* them.
+invoice, ID, scan, or photo is fake or tampered with**, or **when it was taken**.
+There is also a `document-images` skill for *placing* images into documents; this one
+is for *judging* them.
+
+## Not this skill: editing
+
+This skill produces a **report**, never a changed file. If the ask is to **edit,
+change, fix, retouch, crop, recolour, restyle or clean up a picture** — including
+"remove the background", "change the text on this photo", "make this look like X" —
+that is `generate_image` with the picture passed as `reference_images`, not
+`media_forensics`. The word *edit* in a user's sentence is not a reason to open a
+forensics report, and answering an edit request with authenticity checks (or with
+anything about receipts) is a wrong answer even when the picture happens to be a
+receipt.
 
 ## The one rule
 

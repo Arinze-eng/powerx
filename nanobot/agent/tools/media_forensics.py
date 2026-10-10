@@ -1,9 +1,15 @@
-"""Agent tool: decide whether an image or document has been edited, and when it was taken.
+"""Agent tool: decide whether an image or document is fabricated or altered, and
+when it was taken.
 
 Use when the user hands over a receipt, a screenshot of a payment, an ID, a
 contract scan, or any picture whose authenticity matters. The tool reports
 weighted evidence plus its own limits; it never returns "genuine", because
 nothing observable in a file proves that.
+
+This tool is analysis ONLY. It is not the image editor: a request to change,
+fix, retouch or restyle a picture belongs to ``generate_image``, and answering
+one with a forensics report is the "I asked it to edit my photo and it started
+talking about receipts" failure.
 
 No model weights, no network, no GPU: Pillow + NumPy, and the ``tesseract``
 binary when text checks are wanted.
@@ -168,8 +174,16 @@ class MediaForensicsTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Forensic analysis of an image or document: has it been edited, and when was it "
-            "taken? Handles a fake or altered receipt, an edited screenshot of a payment, a "
+            "Forensic ANALYSIS of an image or document: is it fabricated, altered or "
+            "photo-manipulated, and when was it taken? "
+            "THIS TOOL ONLY INSPECTS. It never changes a picture and cannot edit, "
+            "retouch, crop, recolour, restyle or remove anything from one. If the user "
+            "asks you to EDIT, change, fix, retouch or alter an image — including "
+            "'remove the background', 'change the text on this picture', 'make this "
+            "look like X' — that is `generate_image` with the picture passed as "
+            "reference_images, NOT this tool. Asking whether a picture is REAL, FAKE, "
+            "GENUINE, TAMPERED or WHEN it was taken is this tool. "
+            "Handles a fake or altered receipt, an edited screenshot of a payment, a "
             "tampered ID or scan, and a photo whose date the user wants. Reads EXIF/XMP "
             "capture time, device, GPS and editing software; runs error-level analysis, "
             "noise-floor consistency, JPEG quantisation-table and repeated-block checks; "
