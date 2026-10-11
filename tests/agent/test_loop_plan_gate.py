@@ -374,3 +374,54 @@ class TestGateOff:
         assert _advertised_tools(loop) == [_advertised_tools(loop)[0]]
         assert _advertised_tools(loop)[0] is not None
         assert pending_plans().get("s1") is None
+
+
+class TestContinuationTurnsDoNotReplan:
+    """A "continue" is the user asking for the work, not for another plan.
+
+    Live traffic, verbatim: the user sent "Continue and give me zip" and then
+    "Continue implementing stop pausing". Both were gated, so the model replied
+    with a plan and the turn ended -- the same plan again, nothing done, however
+    many times the user asked.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_continuation_executes_without_a_plan_phase(self, tmp_path) -> None:
+        loop = _make_loop(tmp_path, [_text("Zipped it: /workspace/bundle.zip")])
+
+        final_content, _, _, stop_reason, _ = await _ask(loop, "Continue and give me zip")
+
+        assert stop_reason == "completed"
+        assert final_content == "Zipped it: /workspace/bundle.zip"
+        # One request, and it carried tools: no plan phase was spent.
+        assert _advertised_tools(loop) == [_advertised_tools(loop)[0]]
+        assert _advertised_tools(loop)[0] is not None
+        assert pending_plans().get("s1") is None
+
+    @pytest.mark.asyncio
+    async def test_a_continuation_releases_a_held_plan(self, tmp_path) -> None:
+        loop = _make_loop(tmp_path, [_text(PLAN_TEXT)])
+        await _ask(loop, BATCH_ASK)
+        assert pending_plans().get("s1") is not None
+
+        loop.provider.chat_with_retry = AsyncMock(side_effect=[_text("Renamed them.")])
+        final_content, _, _, stop_reason, _ = await _ask(
+            loop, "Continue implementing stop pausing"
+        )
+
+        assert stop_reason == "completed"
+        assert final_content == "Renamed them."
+        # Approved, so the gate is disarmed and the first request carries tools.
+        assert _advertised_tools(loop)[0] is not None
+        assert pending_plans().get("s1") is None
+
+    @pytest.mark.asyncio
+    async def test_new_work_is_still_gated(self, tmp_path) -> None:
+        """Only a continuation skips the gate. A fresh multi-step ask still
+        plans first and still stops for approval."""
+        loop = _make_loop(tmp_path, [_text(PLAN_TEXT)])
+
+        _, _, _, stop_reason, _ = await _ask(loop, BATCH_ASK)
+
+        assert stop_reason == PLAN_AWAITING_STOP_REASON
+        assert _advertised_tools(loop) == [None]

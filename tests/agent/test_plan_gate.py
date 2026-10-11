@@ -341,3 +341,79 @@ def test_approved_note_forbids_re_planning() -> None:
     note = plan_gate.plan_approved_note().lower()
     assert "approved" in note
     assert "do not restate or re-plan" in note
+
+
+# --- a plan wearing the answer marker ---------------------------------------
+
+
+def test_a_marked_plan_is_not_an_answer() -> None:
+    """Observed on live traffic: told only to reply with the plan, the model
+    wrote ``Answer: Plan: ...``. Taken at face value that ends the turn holding a
+    plan, with nothing done -- on every "Continue" the user sent."""
+    assert plan_gate.direct_answer("Answer: Plan: 1. Do X\n2. Do Y") is None
+    assert plan_gate.direct_answer("Answer: plan") is None
+    assert plan_gate.direct_answer("Answer: **Plan**\n1. Do X") is None
+    assert plan_gate.direct_answer("Answer: Planning to do X") is None
+
+
+def test_a_real_answer_after_the_marker_still_works() -> None:
+    """The refusal is about the word "plan", not about length or lists: a real
+    answer that enumerates is still delivered in one call."""
+    assert plan_gate.direct_answer("Answer: Paris") == "Paris"
+    assert plan_gate.direct_answer("Answer: 1. Paris 2. Lyon") == "1. Paris 2. Lyon"
+
+
+# --- continuations ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "continue",
+        "Continue",
+        "continue please",
+        "Continue and give me zip",
+        "Continue implementing stop pausing",
+        "carry on",
+        "carry on with the migration",
+        "keep going",
+        "resume",
+        "resume where you left off",
+        "go on",
+        "finish it",
+        "next step",
+        "next",
+        "proceed",
+    ],
+)
+def test_a_continuation_is_recognised(reply: str) -> None:
+    """Live traffic is why these exist: the user repeated "continue" and the
+    agent re-planned and handed back the same plan each time."""
+    assert plan_gate.is_continuation(reply) is True
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "rename all the .txt files",
+        "ok, also add a test",
+        "yes but use python",
+        "go ahead and rename the folder too",
+        "",
+        None,
+        "what files are in this repo?",
+    ],
+)
+def test_new_work_is_not_a_continuation(reply) -> None:
+    """A message carrying new work must still plan: releasing a held plan for it
+    would run the old plan and silently drop the new ask."""
+    assert plan_gate.is_continuation(reply) is False
+
+
+def test_a_continuation_releases_a_held_plan() -> None:
+    """The user saying "continue" is an approval of the plan they are looking at.
+    Without this the held plan is dropped and the task is planned all over
+    again, which is the repetition the user reported."""
+    assert parse_plan_approval("Continue and give me zip") == "approve"
+    assert parse_plan_approval("continue implementing stop pausing") == "approve"
+    assert parse_plan_approval("carry on") == "approve"

@@ -60,6 +60,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -121,9 +122,13 @@ _PLAN_GATE_NOTE = (
     "list of the steps you will take, in order.\n"
     "- If the task needs no tools -- a question you can answer from what you "
     "already know -- reply with `Answer:` followed by the answer and nothing "
-    "else. The turn ends there.\n"
-    "From your SECOND reply on, tools are restored and you execute the plan in "
-    "order. Never answer from memory a task that needs tools."
+    "else. The turn ends there. Never put a plan after `Answer:`: that is not an "
+    "answer, and it would be read as a plan anyway.\n"
+    "From your SECOND reply on, tools are restored and you EXECUTE the plan in "
+    "order. State the plan once: do not restate it, re-plan it, or narrate it "
+    "instead of acting. A reply that merely describes the work calls no tool and "
+    "does nothing, and the user just sees the same plan again. Never answer from "
+    "memory a task that needs tools."
 )
 
 #: Appended instead of the gate note when the user has already approved a plan
@@ -269,6 +274,18 @@ def approval_required(shape: str | None, mode: str, *, interactive: bool) -> boo
 #: finished answer". Public so tests and the runner agree on one spelling.
 PLAN_DIRECT_ANSWER_MARKER = "Answer:"
 
+#: A reply body that opens with the word "plan".
+#:
+#: Observed in production, on live traffic: told only to "reply with the PLAN
+#: ONLY", the model wrote ``Answer: Plan: 1. ...`` -- the escape marker glued to
+#: a plan. Taken at face value that body is the finished answer, so the turn
+#: ended holding a plan and nothing was done, on every "Continue" the user sent.
+#: A body that starts with the word "plan" is therefore never an answer, whatever
+#: marker precedes it. Only the word itself is rejected, not a numbered list,
+#: because a real answer may legitimately enumerate and the safe direction here
+#: is "read it as a plan" (the turn then continues instead of ending).
+_PLAN_SHAPED_RE = re.compile(r"^(?:\*\*|__|\s)*plan(?:ning)?\b", re.IGNORECASE)
+
 
 def direct_answer(text: str | None) -> str | None:
     """Return the answer body when a plan-phase reply is a direct answer.
@@ -278,6 +295,11 @@ def direct_answer(text: str | None) -> str | None:
     from the shape of the text: a short prose reply from a task that DOES need
     tools ("I would need to read the file first") is not an answer, and guessing
     wrong there would end the turn with the work undone.
+
+    A marked body that opens with the word "plan" is refused for the same reason
+    -- see ``_PLAN_SHAPED_RE``. That is a plan wearing the answer marker, and
+    accepting it ends the turn with the work undone, which is exactly what it did
+    on live traffic.
     """
     if not text:
         return None
@@ -285,7 +307,60 @@ def direct_answer(text: str | None) -> str | None:
     if not stripped.lower().startswith(PLAN_DIRECT_ANSWER_MARKER.lower()):
         return None
     body = stripped[len(PLAN_DIRECT_ANSWER_MARKER) :].strip()
-    return body or None
+    if not body:
+        return None
+    if _PLAN_SHAPED_RE.match(body):
+        return None
+    return body
+
+
+#: Openings that make a message a CONTINUATION of work already in flight rather
+#: than a new ask.
+#:
+#: Live traffic is why this exists. The user's turns were "Continue and give me
+#: zip" and "Continue implementing stop pausing"; both were treated as fresh
+#: multi-step asks, so the gate re-armed, the model re-planned, and the turn
+#: ended holding the plan -- over and over, with the user repeating "continue"
+#: and the agent never doing the work. A message that opens with one of these is
+#: the user asking the agent to get on with what it already planned, so it is not
+#: a turn to plan: it is a turn to execute.
+_CONTINUATION_LEADS = (
+    "continue",
+    "carry on",
+    "keep going",
+    "keep at it",
+    "resume",
+    "go on",
+    "finish it",
+    "next step",
+)
+
+#: Whole messages that are only a continuation, with none of the leads above.
+_CONTINUATION_EXACT = frozenset(
+    {
+        "finish",
+        "next",
+        "onwards",
+        "proceed",
+        "same again",
+    }
+)
+
+
+def is_continuation(text: str | None) -> bool:
+    """True when *text* asks the agent to continue work already in flight.
+
+    Deliberately generous at the start of a message and exact elsewhere: "continue
+    with the migration" and "Continue and give me zip" are continuations, while
+    "ok, also add a test" (which merely *contains* an approval word) is not, so a
+    held plan is still never released by a message carrying new work.
+    """
+    normalized = _normalize_reply(text)
+    if not normalized:
+        return False
+    if normalized in _CONTINUATION_EXACT:
+        return True
+    return normalized.startswith(_CONTINUATION_LEADS)
 
 
 def plan_gate_note() -> str:
@@ -316,6 +391,11 @@ def parse_plan_approval(text: str | None) -> str | None:
     Returns ``"approve"``, ``"reject"`` or ``None``. ``None`` means "not an
     answer to the plan" -- the caller treats the message as a fresh request,
     which is the only safe reading of an unrecognised reply.
+
+    A continuation ("Continue and give me zip") IS an approval: the user is
+    telling the agent to get on with the plan it is holding. Without that the
+    live failure repeats -- the user says continue, the reply is not an exact
+    approve phrase, the held plan is dropped and then re-planned.
     """
     normalized = _normalize_reply(text)
     if not normalized:
@@ -323,6 +403,8 @@ def parse_plan_approval(text: str | None) -> str | None:
     if normalized in _REJECT_PHRASES:
         return "reject"
     if normalized in _APPROVE_PHRASES:
+        return "approve"
+    if is_continuation(normalized):
         return "approve"
     return None
 

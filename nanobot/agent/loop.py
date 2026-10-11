@@ -35,6 +35,7 @@ from nanobot.agent.plan_gate import (
     PLAN_AWAITING_STOP_REASON,
     approval_prompt,
     approval_required,
+    is_continuation,
     parse_plan_approval,
     pending_plans,
     plan_approval_mode,
@@ -1496,6 +1497,12 @@ class AgentLoop:
         # the plan. Gated on exactly the plain-text task turns that receive the
         # standing rule, so the directive and the gate can never disagree about
         # which turns are governed.
+        # A CONTINUATION is not a turn to plan. "Continue and give me zip" and
+        # "Continue implementing stop pausing" are the user telling the agent to
+        # get on with work already planned; gating them re-plans the task and
+        # hands the plan back instead of doing it. That is the failure the user
+        # reported live: repeat "continue", receive the same plan, nothing done.
+        continuation = is_continuation(deterministic_router_text)
         plan_gate = plan_gate_enabled() and deterministic_router_text is not None
         approved_plan: str | None = None
         if plan_gate:
@@ -1517,6 +1524,16 @@ class AgentLoop:
                         decision or "a new request",
                     )
                 pending_plans().clear(active_session_key)
+            elif continuation:
+                # Nothing is held, so there is nothing to release: the user is
+                # asking the agent to get on with the task already in flight.
+                # Planning that again is the live failure, so the gate stands
+                # down and the model executes from its first reply.
+                logger.info(
+                    "Continuation for {}; skipping the plan gate",
+                    active_session_key,
+                )
+                plan_gate = False
 
         plan_approval_needed = False
         if plan_gate and approved_plan is None:
