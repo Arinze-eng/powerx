@@ -315,6 +315,117 @@ def shape_router_enabled() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+#: The standing rule: plan first, show it, then follow it. Injected on EVERY
+#: task turn, not only the batch-shaped ones.
+#:
+#: This is deliberately a DISCIPLINE about order and visibility, not an
+#: instruction to express the work as one ``run_plan`` call. The distinction is
+#: the whole reason it is safe to apply universally:
+#:
+#: * ``_STEER_MESSAGE`` / ``_PROJECT_STEER_MESSAGE`` / ``_LIBRARY_STEER_MESSAGE``
+#:   are ROUTING hints and are only safe for shapes this module recognises
+#:   positively. The module docstring is explicit that forcing those on
+#:   exploratory work "converts graceful partial progress into total failure",
+#:   because the plan path commits the whole graph before any observation.
+#: * This message commits nothing. It asks for a visible, ordered statement of
+#:   intent and for any change of course to be stated rather than silent. A task
+#:   that must observe a result before choosing its next step can still do that
+#:   -- it just has to say so.
+#:
+#: What it removes is the failure the user actually reported: an agent that
+#: "thinks anyhow and randomly", taking 119 browser calls with no stated plan
+#: and no visible reason for the next one. A plan the user can read is also what
+#: makes a wrong turn obvious early, instead of at the end.
+_PLAN_FIRST_MESSAGE = (
+    "[Standing rule — plan first, then follow the plan]\n"
+    "Every task is done in two phases. No exceptions.\n"
+    "1. PLAN. Before your first tool call, state a short numbered plan as your "
+    "VISIBLE reply to the user: what you will do, in order, and what each step "
+    "produces. The user must be able to read it and judge it. A plan the user "
+    "cannot see is not a plan.\n"
+    "2. FOLLOW IT. Then execute those steps in order, spending as few calls per "
+    "step as the work allows.\n"
+    "If a step fails, or something you learn changes the approach, SAY SO "
+    "PLAINLY, state the revised plan, and continue. Silently changing course is "
+    "the one thing that is not allowed.\n"
+    "This is a rule about ORDER and VISIBILITY, not about expressing everything "
+    "as a single plan call. If you genuinely need one result before you can "
+    "decide the next step, plan what you can, take that step, and update the "
+    "plan out loud."
+)
+
+
+def plan_first_enabled() -> bool:
+    """True when the universal plan-first rule may be injected (live env check).
+
+    Default on: the rule is a standing requirement, not an experiment. Read live
+    so an operator can turn it off without a restart, matching
+    ``shape_router_enabled``.
+    """
+    raw = os.environ.get("POWERX_PLAN_FIRST", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def plan_first_message() -> dict[str, str]:
+    """The standing plan-first directive, shaped for OpenAI-style message lists."""
+    return {"role": "user", "content": _PLAN_FIRST_MESSAGE}
+
+
+#: First line of every steering block. Public so callers can tell a steering
+#: directive apart from real conversation.
+STEER_HEADER = "[Standing rule"
+
+
+def is_steer_message(content: object) -> bool:
+    """True when *content* is a steering block rather than real user input.
+
+    The block is appended LAST to the request view -- after any messages injected
+    between iterations -- so it is the final ``user`` message on a steered turn.
+    Anything that inspects "the last user message" (attachment injection, prompt
+    assertions) must skip it, or it will read the directive instead of the
+    conversation.
+    """
+    return isinstance(content, str) and content.startswith(STEER_HEADER)
+
+
+def compose_steer_message(
+    text: str | None,
+    *,
+    plan_tool_available: bool = True,
+    code_tool_available: bool = True,
+) -> dict[str, str] | None:
+    """Build the per-request steering block for one turn.
+
+    Returns ``None`` when there is nothing to say, so a turn that needs no hint
+    pays nothing. Otherwise the block is the standing plan-first rule, plus the
+    shape-specific routing hint when this module positively recognises the shape
+    AND the tool that hint names is actually registered on this run.
+
+    Both are delivered in ONE message: they are injected into the request view of
+    every iteration of the turn, so a second message would be paid for again on
+    every call.
+
+    The routing hint is gated on tool availability because it names ``run_plan``
+    and ``python_code`` explicitly. A deployment that exposes neither must never
+    be told to call one -- the plan-first rule needs no tool and is unaffected.
+    """
+    parts: list[str] = []
+    if plan_first_enabled():
+        parts.append(_PLAN_FIRST_MESSAGE)
+    if shape_router_enabled() and should_steer_to_plan(
+        text,
+        plan_tool_available=plan_tool_available,
+        code_tool_available=code_tool_available,
+    ):
+        hint = steer_message_for(text)
+        if hint is not None:
+            parts.append(hint["content"])
+    if not parts:
+        return None
+    return {"role": "user", "content": "\n\n".join(parts)}
+
+
+
 def classify_task_shape(text: str | None) -> str:
     """Classify a user ask as ``"multi_step"``, ``"exploratory"`` or ``"single"``.
 
@@ -444,10 +555,22 @@ def prefer_project_workflow(text: str | None) -> bool:
     return len(_PROJECT_PART_RE.findall(raw)) >= 2
 
 
-def steer_message_for(text: str | None) -> dict[str, str]:
-    """Pick the right steering hint for this task's shape."""
+def steer_message_for(text: str | None) -> dict[str, str] | None:
+    """Pick the right steering hint for this task's shape.
+
+    Library and project shapes get their own workflow hint. Everything else
+    classified ``multi_step`` -- a plain batch/loop ask -- gets the generic
+    batching hint. That last fallback matters: ``should_steer_to_plan`` routes
+    every ``multi_step`` turn here, and before it existed a plain batch ask
+    ("rename every .txt file in this folder") matched neither of the two
+    specialist shapes, so it received NO hint at all and walked the loop one
+    model call per item -- exactly the cost the router exists to remove.
+    """
     if prefer_library_workflow(text):
         return {"role": "user", "content": _LIBRARY_STEER_MESSAGE}
     if prefer_project_workflow(text):
         return {"role": "user", "content": _PROJECT_STEER_MESSAGE}
+    if classify_task_shape(text) == "multi_step":
+        return {"role": "user", "content": _STEER_MESSAGE}
+    return None
     return plan_preference_message()

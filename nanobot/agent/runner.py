@@ -24,10 +24,10 @@ from nanobot.agent.context_governance import (
 )
 from nanobot.agent.deterministic_router import deterministic_plan, router_enabled
 from nanobot.agent.shape_router import (
+    compose_steer_message,
     plan_preference_message,
     shape_router_enabled,
     should_steer_to_plan,
-    steer_message_for,
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
@@ -932,23 +932,45 @@ class AgentRunner:
         # with an active sustained goal keep the full model path.
         steer_message: dict[str, Any] | None = None
         if (
-            shape_router_enabled()
-            and spec.deterministic_router_text is not None
+            spec.deterministic_router_text is not None
             and not spec.strip_image_content_before_provider
-            and should_steer_to_plan(
+        ):
+            # Universal: every task turn gets the standing plan-first rule, and
+            # a positively-recognised multi-step/project/library ask also gets
+            # its routing hint. Both travel in ONE message because the block is
+            # re-sent on every iteration of the turn.
+            #
+            # The plan-first rule commits nothing -- it asks for a visible,
+            # ordered statement of intent -- which is why it is safe on every
+            # shape, including the exploratory ones the routing hints must not
+            # touch (see _PLAN_FIRST_MESSAGE).
+            steer_message = compose_steer_message(
                 spec.deterministic_router_text,
                 plan_tool_available=spec.tools.get("run_plan") is not None,
                 code_tool_available=spec.tools.get("python_code") is not None,
             )
-        ):
-            steer_message = steer_message_for(spec.deterministic_router_text)
-            logger.info(
-                "shape router steering {} to the one-call plan path "
-                "(multi-step ask, plan_tool={}, code_tool={})",
-                spec.session_key or "default",
-                spec.tools.get("run_plan") is not None,
-                spec.tools.get("python_code") is not None,
-            )
+            if steer_message is not None:
+                logger.info(
+                    "plan-first steering active for {} (plan_tool={}, code_tool={})",
+                    spec.session_key or "default",
+                    spec.tools.get("run_plan") is not None,
+                    spec.tools.get("python_code") is not None,
+                )
+            if (
+                shape_router_enabled()
+                and should_steer_to_plan(
+                    spec.deterministic_router_text,
+                    plan_tool_available=spec.tools.get("run_plan") is not None,
+                    code_tool_available=spec.tools.get("python_code") is not None,
+                )
+            ):
+                logger.info(
+                    "shape router steering {} to the one-call plan path "
+                    "(multi-step ask, plan_tool={}, code_tool={})",
+                    spec.session_key or "default",
+                    spec.tools.get("run_plan") is not None,
+                    spec.tools.get("python_code") is not None,
+                )
 
         for iteration in range(spec.max_iterations):
             # Built here, at the top of the iteration, so the budget check below

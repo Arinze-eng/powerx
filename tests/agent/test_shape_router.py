@@ -388,9 +388,15 @@ class TestRunnerSteering:
         assert _steer_texts(provider) == []
         assert provider.calls == 1
 
-    async def test_no_steering_when_plan_tool_absent(self) -> None:
-        """Closed gate: a batch ask with no plan tool must cost what it did
-        before — no hint pointing at a tool that does not exist."""
+    async def test_no_routing_hint_when_plan_tool_absent(self) -> None:
+        """Closed gate: with no plan tool, no hint may point at a tool that does
+        not exist.
+
+        The standing plan-first rule is unaffected and still present: it asks for
+        a visible, ordered statement of intent in the model's own reply, and
+        needs no tool at all. Only the ROUTING hint (which names ``run_plan``) is
+        gated on the tool actually being registered.
+        """
         registry = ToolRegistry()
         registry.register(_ExecTool())
         provider = _RecordingProvider()
@@ -408,6 +414,21 @@ class TestRunnerSteering:
                 deterministic_router_text="for each of these files, add a header",
             )
         )
+        # ``_steer_texts`` filters for the routing hint specifically, so read the
+        # raw requests: the plan-first rule is not a routing hint and must not be
+        # confused with one.
+        sent = [
+            m["content"]
+            for request in provider.seen_messages
+            for m in request
+            if isinstance(m.get("content"), str)
+        ]
+        joined = "\n".join(sent)
+        # The plan-first rule rides on every turn...
+        assert "plan first" in joined.lower()
+        # ...but nothing may name a tool this registry does not expose.
+        assert "run_plan" not in joined
+        # And no routing hint was emitted, which is what this test is named for.
         assert _steer_texts(provider) == []
 
     async def test_steering_never_changes_the_call_count(self) -> None:
@@ -479,8 +500,15 @@ class TestStaticPrefixStability:
         """Byte-identical across calls, so it can itself be cached."""
         assert plan_preference_message() == plan_preference_message()
 
-    async def test_unsteered_turn_prefix_is_untouched(self) -> None:
-        """Control: with no hint, the request is exactly the input messages."""
+    async def test_steering_is_appended_after_the_original_messages(self) -> None:
+        """The steer block is appended LAST so the cached prefix survives.
+
+        Every turn is steered now, so this is the invariant that matters: the
+        original messages keep their order and their bytes, and anything added
+        goes on the end. That is what lets a provider's prompt cache still hit
+        across iterations -- a hint inserted before the history would invalidate
+        the prefix on every single call.
+        """
 
         class _PrefixProvider(_RecordingProvider):
             pass
@@ -502,8 +530,13 @@ class TestStaticPrefixStability:
             )
         )
         request = provider.seen_messages[0]
-        assert [m["role"] for m in request] == ["system", "user"]
+        # The original prefix is intact and in order...
+        assert [m["role"] for m in request[:2]] == ["system", "user"]
+        assert request[0]["content"] == "SYSTEM PREFIX"
         assert request[1]["content"] == "hello there"
+        # ...and the steering block is appended after it, not woven in.
+        assert len(request) == 3
+        assert "plan first" in request[2]["content"].lower()
 
 
 # --- Layer 3: the burn-loop guard -------------------------------------------
