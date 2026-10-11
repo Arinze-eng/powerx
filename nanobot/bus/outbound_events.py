@@ -29,6 +29,7 @@ class ProgressEvent(OutboundEvent):
     tool_events: list[dict[str, Any]] | None = None
     file_edit_events: list[dict[str, Any]] | None = None
     usage: dict[str, int] | None = None
+    plan: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,11 @@ class GoalStatusEvent(OutboundEvent):
 @dataclass(frozen=True)
 class GoalStateSyncEvent(OutboundEvent):
     goal_state: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PlanStateSyncEvent(OutboundEvent):
+    plan: dict[str, Any]
 
 
 @dataclass(frozen=True)
