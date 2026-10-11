@@ -31,7 +31,17 @@ from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.agent.owner import owner_from_metadata
+from nanobot.agent.plan_gate import (
+    PLAN_AWAITING_STOP_REASON,
+    approval_prompt,
+    approval_required,
+    parse_plan_approval,
+    pending_plans,
+    plan_approval_mode,
+    plan_gate_enabled,
+)
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
+from nanobot.agent.shape_router import classify_task_shape
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.exec_session import ExecSessionManager
@@ -1478,6 +1488,57 @@ class AgentLoop:
                 deterministic_router_text = None
             else:
                 deterministic_router_text = last_user_text(initial_messages)
+
+        # --- Hard plan gate + plan approval (nanobot.agent.plan_gate) ---------
+        # The plan-first rule shipped earlier is a DIRECTIVE the model can
+        # ignore. The gate makes it structural: the turn's first request goes out
+        # with no tools advertised, so the only reply the model can produce is
+        # the plan. Gated on exactly the plain-text task turns that receive the
+        # standing rule, so the directive and the gate can never disagree about
+        # which turns are governed.
+        plan_gate = plan_gate_enabled() and deterministic_router_text is not None
+        approved_plan: str | None = None
+        if plan_gate:
+            pending = pending_plans().get(active_session_key)
+            if pending is not None:
+                decision = parse_plan_approval(deterministic_router_text)
+                if decision == "approve":
+                    approved_plan = pending["plan"]
+                    logger.info(
+                        "Plan approved for {}; executing it", active_session_key
+                    )
+                else:
+                    # Anything else is a fresh ask, so the old plan is stale and
+                    # is dropped rather than silently executed later. A rejection
+                    # and an unrecognised reply take the same path: plan again.
+                    logger.info(
+                        "Dropping pending plan for {} (reply was {})",
+                        active_session_key,
+                        decision or "a new request",
+                    )
+                pending_plans().clear(active_session_key)
+
+        plan_approval_needed = False
+        if plan_gate and approved_plan is None:
+            # Waiting for approval is only meaningful when a human is present to
+            # give it. A cron job, a session trigger, a subagent result, an
+            # internal continuation slice and an ephemeral consolidation turn all
+            # have nobody to ask, so waiting would leave the session blocked
+            # until the pending plan expired. Those turns still get the plan gate
+            # -- the plan is stated -- but they proceed straight into the work.
+            _, automation_extra = automation_history_overrides(metadata)
+            interactive = (
+                not ephemeral
+                and channel not in {None, "", "system"}
+                and not automation_extra
+                and (metadata or {}).get("injected_event") != "subagent_result"
+                and not turn_continuation.internal_continuation_inbound(metadata)
+            )
+            plan_approval_needed = approval_required(
+                classify_task_shape(deterministic_router_text),
+                plan_approval_mode(),
+                interactive=interactive,
+            )
         try:
             for scope in turn_scopes or ():
                 turn_scope_stack.enter_context(scope)
@@ -1538,6 +1599,14 @@ class AgentLoop:
                 enable_replay_cache=True,
                 enable_deterministic_router=deterministic_router_text is not None,
                 deterministic_router_text=deterministic_router_text,
+                # Hard plan gate: the turn's first request carries no tools, so
+                # the model can only state a plan. On a turn whose plan the user
+                # already approved, the gate is disarmed and the approved plan is
+                # handed back so the model executes what it wrote instead of
+                # spending a call to plan again.
+                plan_gate=plan_gate,
+                plan_approval_required=plan_approval_needed,
+                approved_plan=approved_plan,
                 # Zero-call tool middleware: governed UniAbuja lookups get the
                 # short-TTL cache/singleflight treatment and, when the model's
                 # own call returns renderable structured data, the turn ends
@@ -1579,6 +1648,24 @@ class AgentLoop:
                 await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
+        if result.stop_reason == PLAN_AWAITING_STOP_REASON:
+            # The turn stopped so the user can read the plan before any work
+            # happens. Hold it against the session so the next message can
+            # release it, and tell the user how to. Nothing is persisted into the
+            # transcript here: the plan itself is already the turn's assistant
+            # message, which is what the resumed turn reads back.
+            plan_text = (result.final_content or "").strip()
+            if plan_text:
+                pending_plans().put(
+                    active_session_key,
+                    plan_text,
+                    shape=classify_task_shape(deterministic_router_text),
+                )
+                # Append rather than rewrite: the plan was already streamed to
+                # the user exactly as the model wrote it, so this tail is the
+                # only new text and a streaming channel sees no contradiction.
+                result.final_content = f"{plan_text}\n\n{approval_prompt()}"
+                logger.info("Plan for {} is awaiting approval", active_session_key)
         return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
 
     def _check_expired_sessions_if_due(self) -> None:

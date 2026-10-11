@@ -33,6 +33,23 @@ def _allow_session_model_presets(monkeypatch):
     monkeypatch.setenv("POWERX_FORCE_ENV_MODEL", "0")
 
 
+@pytest.fixture(autouse=True)
+def _disable_plan_gate(monkeypatch):
+    """Opt these tests out of the hard plan gate.
+
+    The gate is on by default and consumes the turn's FIRST model reply as the
+    plan, so every scripted provider in this suite would shift by one response --
+    a test that scripts a single answer would have that answer read as a plan and
+    then be asked again. That is the correct production behaviour; it is pinned
+    by tests/agent/test_runner_plan_gate.py (the loop), test_plan_gate.py (the
+    policy) and test_loop_plan_gate.py (the wiring). Turning it off here keeps an
+    unrelated test about streaming, injections or persistence testing what it is
+    actually about. A test that wants the gate sets the env back itself.
+    """
+    monkeypatch.setenv("POWERX_PLAN_GATE", "0")
+    monkeypatch.setenv("POWERX_PLAN_APPROVAL", "off")
+
+
 def make_provider(
     default_model: str = "test-model",
     *,

@@ -31,6 +31,12 @@ from nanobot.agent.shape_router import (
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
+from nanobot.agent.plan_gate import (
+    PLAN_AWAITING_STOP_REASON,
+    direct_answer,
+    plan_approved_note,
+    plan_gate_note,
+)
 from nanobot.agent.plan_cache import (
     _MAX_STEPS_PER_PLAN,
     make_plan_cache,
@@ -302,6 +308,12 @@ def _restore_outer_whitespace(content: str, original: str | None) -> str:
     return f"{leading}{content}{trailing}"
 
 
+#: Sentinel for "this request uses the run's own tool registry". A plain
+#: ``None`` cannot mean that, because ``None`` is exactly how the hard plan gate
+#: asks for a request with NO tools advertised.
+_USE_SPEC_TOOLS: Any = object()
+
+
 @dataclass(slots=True)
 class AgentRunSpec:
     """Configuration for a single agent execution."""
@@ -356,6 +368,23 @@ class AgentRunSpec:
     # The raw user text the deterministic router classifies. Kept as its own
     # field so the loop can pass the pre-runtime-context message exactly.
     deterministic_router_text: str | None = None
+    # --- Hard plan gate (nanobot.agent.plan_gate) ---------------------------
+    # When True, the FIRST provider call of this turn is sent with no tools, so
+    # the model cannot act before it has stated a plan: there is nothing to call.
+    # The reply is the plan; tools return on the next iteration and the plan is
+    # already in the transcript as the model's own message. Enforced
+    # structurally rather than by asking, which is why it cannot be ignored.
+    plan_gate: bool = False
+    # When True and the plan gate is armed, the turn STOPS after the plan and
+    # waits for the user to approve it, instead of proceeding straight to work.
+    # Never set on an autonomous turn (cron, trigger, subagent, continuation):
+    # there is no human to approve, so waiting would deadlock the session.
+    plan_approval_required: bool = False
+    # The plan the user approved earlier in this conversation. Its presence
+    # disarms the gate for this turn -- the plan is already stated and agreed, so
+    # re-planning would spend a call to ask a question that was just answered.
+    # The runner verifies it is still in the transcript before relying on it.
+    approved_plan: str | None = None
     # Opt-in for the zero-call tool middleware layer (nanobot.agent.tool_middleware):
     # short-TTL caching + singleflight for slow-changing read-only lookups, and
     # deterministic post-tool formatting that ends the turn without paying the
@@ -972,6 +1001,57 @@ class AgentRunner:
                     spec.tools.get("python_code") is not None,
                 )
 
+        # --- Hard plan gate (nanobot.agent.plan_gate) ------------------------
+        # The standing rule above is a DIRECTIVE: it asks for a plan first, and a
+        # model that ignores it -- or that emits a plan and tool calls in the same
+        # message, so the plan is never separately visible -- still acts. The gate
+        # makes the rule structural: the first request of the turn advertises no
+        # tools at all, so the only thing the model CAN produce is the plan.
+        #
+        # Armed on exactly the turns that receive the standing rule, so the
+        # directive and the gate can never disagree about which turns are
+        # governed.
+        plan_phase_armed = (
+            spec.plan_gate
+            and spec.approved_plan is None
+            and spec.deterministic_router_text is not None
+            and not spec.strip_image_content_before_provider
+        )
+        if plan_phase_armed or spec.approved_plan is not None:
+            # The note rides on the steering block, which is re-appended to the
+            # request view of EVERY iteration. It therefore has to be constant
+            # for the whole turn: a note that appeared only on the first request
+            # would change the request prefix on the second and cost the provider
+            # prompt cache on every step after it. Both notes are worded to be
+            # true on every call of the turn they belong to.
+            note = plan_gate_note() if plan_phase_armed else plan_approved_note()
+            if steer_message is None:
+                steer_message = {"role": "user", "content": note}
+            else:
+                steer_message = {
+                    "role": "user",
+                    "content": f"{steer_message['content']}\n\n{note}",
+                }
+            logger.info(
+                "plan gate armed for {} (approval_required={})",
+                spec.session_key or "default",
+                spec.plan_approval_required,
+            )
+
+        if spec.approved_plan:
+            # The plan was stated and approved on an earlier turn, so it should
+            # already be in the transcript. Re-anchor it only if it is not -- a
+            # reset session, or a caller that assembled its own messages -- since
+            # the model cannot execute a plan it cannot see.
+            approved_text = spec.approved_plan.strip()
+            already_present = any(
+                message.get("role") == "assistant"
+                and approved_text in str(message.get("content") or "")
+                for message in messages[-8:]
+            )
+            if not already_present:
+                messages.append({"role": "assistant", "content": approved_text})
+
         for iteration in range(spec.max_iterations):
             # Built here, at the top of the iteration, so the budget check below
             # can report through the same hook context as every other exit.
@@ -984,6 +1064,10 @@ class AgentRunner:
             # budget exit, so a hook never sees an "after" for an iteration whose
             # "before" it was not told about.
             await hook.before_iteration(context)
+            # The hard plan gate governs the FIRST request of the turn only.
+            # After that the plan is in the transcript as the model's own
+            # message and the tools are back, so the turn proceeds normally.
+            plan_phase = plan_phase_armed and iteration == 0
             # Wall-clock budget. Checked BEFORE the round trip, not after, so a
             # turn that is already out of time does not pay for one more model
             # call and one more slow tool. The turn is not killed: it finalizes
@@ -1094,6 +1178,11 @@ class AgentRunner:
                 context,
                 conversation_state=conversation_state,
                 provider_context=provider_context,
+                # The gate: no schemas are advertised for the plan request, so
+                # the model has nothing to call and its reply can only be text.
+                # That text is the plan. This is the enforcement -- there is no
+                # "did it state a plan?" check to get wrong.
+                tools=None if plan_phase else _USE_SPEC_TOOLS,
             )
             log_memory(
                 "model_iteration_end",
@@ -1129,6 +1218,110 @@ class AgentRunner:
                 await hook.emit_reasoning(reasoning_text)
                 await hook.emit_reasoning_end()
                 context.streamed_reasoning = True
+
+            # --- Hard plan gate: handle the plan request (plan_gate.py) ------
+            # No tool schemas were advertised for this request, so this reply
+            # cannot contain an executable action. It is the plan, and it is
+            # handled here rather than by the tool path below -- including when a
+            # provider returns tool calls anyway, which would otherwise slip an
+            # action in ahead of the plan it is supposed to follow.
+            if plan_phase:
+                plan_text = (response.content or "").strip()
+                if response.has_tool_calls:
+                    logger.warning(
+                        "Plan request for {} returned {} tool call(s) with no "
+                        "schemas advertised; discarding them",
+                        spec.session_key or "default",
+                        len(response.tool_calls),
+                    )
+                    response.tool_calls = []
+                    context.tool_calls = []
+                answer = direct_answer(plan_text)
+                if answer is not None:
+                    # The task needed no tools, so there was nothing for a plan to
+                    # authorise. This is the finished answer: deliver it and end
+                    # the turn, which is one request -- exactly what this turn
+                    # cost before the gate existed. Without this, a plain question
+                    # would be answered twice and billed twice.
+                    answer_message = build_assistant_message(
+                        answer,
+                        reasoning_content=response.reasoning_content,
+                        thinking_blocks=response.thinking_blocks,
+                    )
+                    messages.append(answer_message)
+                    await self._emit_checkpoint(
+                        spec,
+                        {
+                            "phase": "final_response",
+                            "iteration": iteration,
+                            "model": spec.runtime.model,
+                            "assistant_message": answer_message,
+                            "completed_tool_results": [],
+                            "pending_tool_calls": [],
+                        },
+                    )
+                    final_content = answer
+                    stop_reason = "completed"
+                    context.final_content = answer
+                    context.stop_reason = stop_reason
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=False)
+                    await hook.after_iteration(context)
+                    break
+                if not is_blank_text(plan_text):
+                    plan_message = build_assistant_message(
+                        plan_text,
+                        reasoning_content=response.reasoning_content,
+                        thinking_blocks=response.thinking_blocks,
+                    )
+                    messages.append(plan_message)
+                    await self._emit_checkpoint(
+                        spec,
+                        {
+                            "phase": "plan",
+                            "iteration": iteration,
+                            "model": spec.runtime.model,
+                            "assistant_message": plan_message,
+                            "completed_tool_results": [],
+                            "pending_tool_calls": [],
+                        },
+                    )
+                    if spec.plan_approval_required:
+                        # Stop and wait for the user to approve the plan. This is
+                        # a decision, not a stall, so the reason is deliberately
+                        # absent from turn_continuation's resumable set: the turn
+                        # must never be auto-resumed into execution before it has
+                        # been approved.
+                        final_content = plan_text
+                        context.final_content = plan_text
+                        stop_reason = PLAN_AWAITING_STOP_REASON
+                        context.stop_reason = stop_reason
+                        if hook.wants_streaming():
+                            await hook.on_stream_end(context, resuming=False)
+                        await hook.after_iteration(context)
+                        break
+                    logger.info(
+                        "Plan stated for {} ({} chars); executing with tools restored",
+                        spec.session_key or "default",
+                        len(plan_text),
+                    )
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=True)
+                    await hook.after_iteration(context)
+                    continue
+                # A blank plan reply disarms the gate and the turn runs the way
+                # this loop ran before the gate existed, rather than stranding a
+                # real task on one unusable response.
+                logger.warning(
+                    "Plan request for {} returned nothing usable; disarming the "
+                    "gate for this turn",
+                    spec.session_key or "default",
+                )
+                plan_phase_armed = False
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=True)
+                await hook.after_iteration(context)
+                continue
 
             if response.should_execute_tools:
                 context.tool_calls = list(response.tool_calls)
@@ -1801,7 +1994,12 @@ class AgentRunner:
         malformed_retry: bool = False,
         conversation_state: ProviderConversationStateController,
         provider_context: ProviderCallContext | None = None,
+        tools: Any = _USE_SPEC_TOOLS,
     ) -> LLMResponse:
+        # The hard plan gate calls this with ``tools=None`` for the first request
+        # of a turn: with no schemas advertised the model has nothing to call, so
+        # its reply can only be the plan. Every other caller leaves the sentinel
+        # in place and gets the run's own registry, exactly as before.
         timeout_s: float | None = spec.llm_timeout_s
         if timeout_s is None:
             # Default to a finite timeout to avoid per-session lock starvation when an LLM
@@ -1826,7 +2024,7 @@ class AgentRunner:
         kwargs = self._build_request_kwargs(
             spec,
             messages,
-            tools=spec.tools.get_definitions(),
+            tools=spec.tools.get_definitions() if tools is _USE_SPEC_TOOLS else tools,
         )
         wants_streaming = hook.wants_streaming()
         progress_callback = spec.progress_callback

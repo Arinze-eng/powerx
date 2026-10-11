@@ -13,6 +13,20 @@ from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
+@pytest.fixture(autouse=True)
+def _disable_plan_gate(monkeypatch):
+    """Opt this module out of the hard plan gate.
+
+    These tests drive a whole turn with a scripted provider and assert on what
+    the tools did. The gate (nanobot.agent.plan_gate) is on by default and
+    consumes the turn's FIRST reply as the plan, which would shift every scripted
+    reply by one and leave no tool ever executed. That is correct production
+    behaviour; it is pinned by tests/agent/test_loop_plan_gate.py instead.
+    """
+    monkeypatch.setenv("POWERX_PLAN_GATE", "0")
+    monkeypatch.setenv("POWERX_PLAN_APPROVAL", "off")
+
+
 def _make_loop(tmp_path: Path) -> AgentLoop:
     bus = MessageBus()
     provider = MagicMock()
