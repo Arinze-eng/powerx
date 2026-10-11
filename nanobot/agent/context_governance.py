@@ -7,6 +7,7 @@ mutate an existing session history list in place.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -29,6 +30,30 @@ if TYPE_CHECKING:
 SNIP_SAFETY_BUFFER = 1024
 MICROCOMPACT_MIN_CHARS = 500
 INFLIGHT_COMPACT_TARGET_RATIO = 0.85
+
+#: Hard ceiling on how many non-system messages one request may carry.
+#:
+#: Every step of the governance pipeline above is BUDGET-triggered: it fires only
+#: when the prompt would overflow the provider's context window. On a large
+#: window none of them fire, so a turn re-sends its entire growing transcript on
+#: every iteration -- the replay.
+#:
+#: MEASURED in production (cdnai/powerx, 2026-09-28): one turn reached 287
+#: messages by iteration 119 while re-sending all of them every step. The
+#: provider window was never going to stop it, because the turn did not die of
+#: context -- it died of MEMORY. The container is 512 MiB and the kernel recycled
+#: it mid-turn, with no exception and no shutdown line. Memory tracks the message
+#: COUNT and the bytes held, not the provider's token budget, so a token-budgeted
+#: guard cannot bound it.
+#:
+#: This cap is therefore UNCONDITIONAL, and it bounds the REQUEST VIEW only. The
+#: persisted transcript the caller saves is untouched, so session history, replay
+#: and later turns are unaffected -- the same contract every other step here has.
+MAX_REQUEST_MESSAGES = 40
+
+#: Env override for the cap above. A non-positive or unparseable value keeps the
+#: default, so a typo cannot silently remove the bound on a memory-limited host.
+ENV_MAX_REQUEST_MESSAGES = "NANOBOT_MAX_REQUEST_MESSAGES"
 COMPACTABLE_TOOLS = frozenset({
     "read_file", "exec", "grep", "find_files",
     "web_search", "web_fetch", "list_dir", "list_exec_sessions",
@@ -68,6 +93,9 @@ class ContextGovernanceConfig:
     context_block_limit: int | None = None
     max_tokens: int | None = None
     inflight_start_index: int = 0
+    #: Per-request message ceiling. ``None`` reads the env override, else
+    #: ``MAX_REQUEST_MESSAGES``. Bounds the request VIEW only.
+    max_request_messages: int | None = None
 
 
 class ContextGovernor:
@@ -87,7 +115,95 @@ class ContextGovernor:
         updated = self.compact_inflight_overflow(config, updated, compacted_tool_call_ids)
         updated = self.snip_history(config, updated)
         updated = self.drop_orphan_tool_results(updated)
-        return self.backfill_missing_tool_results(updated)
+        updated = self.backfill_missing_tool_results(updated)
+        # Last word, and unconditional on purpose: see MAX_REQUEST_MESSAGES.
+        # Everything above is budget-triggered and therefore silent on a large
+        # window, which is exactly the configuration that ran the memory over.
+        return self.cap_request_messages(updated)
+
+    @staticmethod
+    def request_message_cap(config: ContextGovernanceConfig) -> int:
+        """Effective per-request message ceiling for *config*.
+
+        Precedence: ``config.max_request_messages``, else the env override, else
+        :data:`MAX_REQUEST_MESSAGES`. A non-positive or unparseable value keeps
+        the default rather than removing the bound.
+        """
+        configured = getattr(config, "max_request_messages", None)
+        if isinstance(configured, int) and configured > 0:
+            return configured
+        raw = os.environ.get(ENV_MAX_REQUEST_MESSAGES)
+        if raw is not None and raw.strip():
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring invalid {}={!r}; using {}",
+                    ENV_MAX_REQUEST_MESSAGES,
+                    raw,
+                    MAX_REQUEST_MESSAGES,
+                )
+            else:
+                if value > 0:
+                    return value
+        return MAX_REQUEST_MESSAGES
+
+    def cap_request_messages(
+        self,
+        messages: list[dict[str, Any]],
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Bound the model-facing transcript by COUNT, not by token budget.
+
+        Keeps every system message (they are the pinned instruction block) and the
+        most recent ``limit - 1`` non-system messages, preferring a legal start so
+        the result is still a request the provider will accept. The original user
+        turn is re-anchored at the front when it would otherwise be cut, because a
+        tail with no stated task is worse than a few extra bytes.
+
+        Returns *messages* unchanged when it is already under the cap, so the
+        common short turn pays nothing for this.
+        """
+        cap = limit if isinstance(limit, int) and limit > 0 else MAX_REQUEST_MESSAGES
+        system_messages = [m for m in messages if m.get("role") == "system"]
+        non_system = [m for m in messages if m.get("role") != "system"]
+        if len(non_system) <= cap:
+            return messages
+
+        # Budget one slot for the re-anchored ask below, so the result lands at
+        # or under `cap` rather than cap + 1.
+        window = max(1, cap - 1) if cap > 1 else 1
+        kept = [dict(m) for m in non_system[-window:]]
+
+        # Legality is decided on the TRIMMED tail, not on the whole transcript:
+        # find_legal_message_start scans for a tool result whose declaring
+        # assistant call is missing, and a tool result at the head of the window
+        # is exactly that. (Deliberately not _legal_history_tail -- its fallback
+        # re-widens to the full list, which is right for snip_history's empty-kept
+        # case and wrong here.)
+        start = find_legal_message_start(kept)
+        if start:
+            kept = kept[start:]
+
+        # Re-anchor the original ask: the task statement lives in the first user
+        # turn, and losing it costs more than the bytes it saves.
+        anchor_index = next(
+            (i for i, m in enumerate(non_system) if m.get("role") == "user"),
+            None,
+        )
+        if anchor_index is not None:
+            anchor = non_system[anchor_index]
+            if anchor_index < len(non_system) - window or not kept:
+                kept = [dict(anchor), *kept]
+
+        dropped = len(non_system) - len(kept)
+        logger.info(
+            "Request view capped at {} messages: dropped {} older message(s); "
+            "the persisted transcript is unchanged",
+            cap,
+            dropped,
+        )
+        return [*system_messages, *kept]
 
     @staticmethod
     def input_budget(config: ContextGovernanceConfig) -> int:
