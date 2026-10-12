@@ -33,6 +33,7 @@ Usage (inside the sandbox):
     media_cli.py hd     in.mp4 --height 1080 --out hd.mp4
     media_cli.py bg     in.mp4 --model u2net_human_seg --out cutout.webm
     media_cli.py download 'https://youtu.be/...' --out downloads --quality 1080
+    media_cli.py download 'https://youtu.be/...' --via invidious   # skip yt-dlp
     media_cli.py transcribe in.mp4 --model base --format srt --out in.srt
     media_cli.py captions in.mp4 --srt in.srt --style shorts --out capped.mp4
     media_cli.py shorts in.mp4 --count 3 --captions --out shorts/
@@ -41,6 +42,9 @@ Usage (inside the sandbox):
 from __future__ import annotations
 
 import argparse
+import hashlib
+import http.client
+import http.cookiejar
 import json
 import math
 import os
@@ -48,8 +52,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
@@ -58,7 +66,7 @@ from typing import Any, Iterable
 #: ``nanobot/agent/tools/media.py`` greps for this exact assignment and refuses
 #: to run a sandbox copy that carries a different one, so a stale (CDN-cached)
 #: revision can never masquerade as the current one.
-CLI_VERSION = "1.2.0"
+CLI_VERSION = "1.3.0"
 
 #: Where heavy downloads live so they survive across calls in one sandbox.
 CACHE_DIR = Path(os.getenv("MEDIA_CACHE_DIR", str(Path.home() / ".cache" / "media_cli")))
@@ -1771,9 +1779,664 @@ def _refresh_ytdlp(ytdlp: str) -> str | None:
     return after if after and after != before else None
 
 
+# --------------------------------------------------------------------------- #
+# Invidious: the download that does not need YouTube to talk to this IP.
+#
+# yt-dlp asks YouTube for the stream itself, so when YouTube decides the calling
+# IP is a datacenter and refuses the player response, every flag in
+# ``_CLIENT_ROTATIONS`` fails the same way -- there is nothing left to rotate.
+# An Invidious instance is a third party that asks YouTube on ITS IP and hands
+# the resulting bytes back to us, which is a different network path rather than a
+# different argument, and is therefore the one escalation that can still work
+# once the extraction itself is refused.
+#
+# Two things about a live instance have to be handled or the download silently
+# produces garbage:
+#
+# 1. **The default stream URLs are useless to us.** ``/api/v1/videos/<id>``
+#    returns ``googlevideo.com`` URLs carrying ``ip=<instance ip>``; they are
+#    signed for the instance and fail from anywhere else. ``&local=true`` makes
+#    Invidious rewrite them to its own ``/videoplayback`` proxy, which is the only
+#    form that works from a sandbox.
+# 2. **Many instances put that proxy behind Anubis**, a proof-of-work wall
+#    (measured 2026-10-12: ``invidious.f5.si`` serves the API freely but answers
+#    ``/videoplayback`` with a 7 KB ``text/html`` challenge page and HTTP 200).
+#    A naive client writes that HTML to ``clip.mp4`` and reports success. So the
+#    challenge is solved -- it is a SHA-256 prefix search, cheap in the stdlib --
+#    and, more importantly, every byte count is checked before anything is
+#    claimed: the artifact is only accepted if ffprobe reads real streams.
+# --------------------------------------------------------------------------- #
+
+#: A browser User-Agent, not a bot one. Anubis binds a challenge to the
+#: User-Agent and client IP that requested it, so this must be identical on the
+#: challenge, the solution and the retry -- hence one constant used everywhere.
+_INVIDIOUS_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+#: Instances to try, best first. Ordered by measurement, not by the public list:
+#: MEASURED 2026-10-12 from a datacenter IP, of 31 candidates only
+#: ``invidious.f5.si`` answered the API at all (the rest were 401/403/404/451/502
+#: or failed DNS/TLS), so it leads. The others are kept because an instance's
+#: health changes weekly and a second candidate costs one request to rule out.
+#: ``_invidious_candidates`` appends whatever the public list currently offers.
+_INVIDIOUS_INSTANCES: tuple[str, ...] = (
+    "https://invidious.f5.si",
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://invidious.tiekoetter.com",
+    "https://yt.chocolatemoo53.com",
+)
+
+#: The community instance list. Used only to ADD candidates after the built-ins
+#: have failed, because it is slow and, as measured above, most of what it lists
+#: is unreachable from a datacenter.
+_INVIDIOUS_DISCOVERY = "https://api.invidious.io/instances.json?sort_by=type,users"
+
+_ANUBIS_CHALLENGE_RE = re.compile(
+    rb'<script id="anubis_challenge" type="application/json">(.*?)</script>', re.S
+)
+
+#: Anubis difficulty is a count of leading zero HEX digits in the SHA-256 of
+#: ``randomData + nonce``, so the work is ``16 ** difficulty`` hashes: trivial at
+#: 4 (what the wall served us), a few seconds at 6, minutes at 7. Refusing above
+#: this ceiling keeps a hostile instance from turning a download into a hang.
+_ANUBIS_MAX_DIFFICULTY = 6
+_ANUBIS_SOLVE_BUDGET = 60.0
+
+
+def _anubis_solve(random_data: str, difficulty: int) -> tuple[str, int]:
+    """Nonce whose ``sha256(randomData + nonce)`` has ``difficulty`` leading hex zeros.
+
+    This is Anubis's own definition, taken from the worker script the wall ships
+    (``sha256-webcrypto.mjs``), and the hash is returned as the lower-case hex
+    digest because that -- not the raw bytes -- is what the challenge endpoint
+    compares. ``nonce`` is a decimal string; it is concatenated, not added.
+    """
+    full, odd = divmod(int(difficulty), 2)
+    prefix = "0" * (full * 2)
+    nonce = 0
+    deadline = time.monotonic() + _ANUBIS_SOLVE_BUDGET
+    while True:
+        digest = hashlib.sha256(f"{random_data}{nonce}".encode()).hexdigest()
+        if digest.startswith(prefix) and (not odd or digest[full * 2] == "0"):
+            return digest, nonce
+        nonce += 1
+        if nonce % 4096 == 0 and time.monotonic() > deadline:
+            raise MediaError(
+                f"the Invidious proxy asked for a {difficulty}-difficulty proof of work "
+                f"and it did not finish in {_ANUBIS_SOLVE_BUDGET:.0f}s"
+            )
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect handler that refuses to follow.
+
+    Needed for ``pass-challenge``: solving the wall makes the endpoint redirect
+    straight to the media URL, and a following client would pull the entire video
+    into memory as the "response" to the challenge.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+#: host -> (following opener, non-following opener, cookie jar). One jar per
+#: instance so an Anubis cookie survives from the challenge to the media request
+#: without leaking across instances.
+_INVIDIOUS_SESSIONS: dict[str, tuple[Any, Any, Any]] = {}
+
+
+def _invidious_session(base: str) -> tuple[Any, Any, Any]:
+    cached = _INVIDIOUS_SESSIONS.get(base)
+    if cached is not None:
+        return cached
+    jar = http.cookiejar.CookieJar()
+    common = [("User-Agent", _INVIDIOUS_UA), ("Accept-Language", "en-US,en;q=0.9")]
+    following = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    following.addheaders = list(common)
+    plain = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar), _NoRedirect()
+    )
+    plain.addheaders = list(common)
+    session = (following, plain, jar)
+    _INVIDIOUS_SESSIONS[base] = session
+    return session
+
+
+def _is_anubis_page(headers: Any, body: bytes) -> bool:
+    """Whether a response is the proof-of-work wall rather than the thing we asked for."""
+    if "html" not in str((headers or {}).get("Content-Type") or "").lower():
+        return False
+    head = body[:40000]
+    return b"anubis_challenge" in head or b"not a bot" in head
+
+
+def _invidious_get(
+    base: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    rng: str | None = None,
+    timeout: int = 60,
+    limit: int | None = None,
+    follow: bool = True,
+    solve_anubis: bool = True,
+) -> tuple[int, Any, bytes]:
+    """One HTTP GET against an instance, passing the Anubis wall if it appears.
+
+    Returns ``(status, headers, body)``. A non-2xx status is returned rather than
+    raised, because "this instance is down" is a candidate to skip, not an error
+    to abort the download over. ``limit`` caps the read, which is what lets a
+    stream be sanity-checked from its first bytes instead of its full length.
+    """
+    following, plain, jar = _invidious_session(base)
+    opener = following if follow else plain
+
+    def _once() -> tuple[int, Any, bytes]:
+        req = urllib.request.Request(url)
+        for key, value in (headers or {}).items():
+            req.add_header(key, value)
+        if rng:
+            req.add_header("Range", rng)
+        try:
+            with opener.open(req, timeout=timeout) as response:
+                return response.status, response.headers, response.read(limit)
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers, exc.read(limit or 65536)
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+            return 0, {}, str(exc).encode()
+
+    status, response_headers, body = _once()
+    if not solve_anubis or not _is_anubis_page(response_headers, body):
+        return status, response_headers, body
+
+    match = _ANUBIS_CHALLENGE_RE.search(body)
+    if match is None:
+        return status, response_headers, body
+    try:
+        challenge = json.loads(match.group(1))
+        inner = challenge["challenge"]
+        difficulty = int(inner["difficulty"])
+        if difficulty > _ANUBIS_MAX_DIFFICULTY:
+            raise MediaError(
+                f"{base} asks for a {difficulty}-difficulty proof of work; refusing"
+            )
+        started = time.monotonic()
+        digest, nonce = _anubis_solve(inner["randomData"], difficulty)
+    except (KeyError, ValueError, TypeError) as exc:
+        raise MediaError(f"could not read the Anubis challenge from {base}: {exc}") from exc
+
+    query = urllib.parse.urlencode(
+        {
+            "id": inner["id"],
+            "response": digest,
+            "nonce": nonce,
+            "redir": url,
+            "elapsedTime": str(int((time.monotonic() - started) * 1000)),
+        }
+    )
+    # Deliberately not followed and not checked for a status code: the point of
+    # this call is the ``Set-Cookie`` it leaves in the jar. Any error it returns
+    # shows up as the retry below failing again, which is the honest report.
+    try:
+        _invidious_get(
+            base,
+            f"{base}/.within.website/x/cmd/anubis/api/pass-challenge?{query}",
+            timeout=timeout,
+            # Enough of the body to recognise a wall if the challenge was
+            # rejected -- one byte would make every response look like a success.
+            limit=262144,
+            follow=False,
+            solve_anubis=False,
+        )
+    except MediaError:
+        raise
+    print(f"[media] {base} served a proof-of-work wall; solved it, retrying", file=sys.stderr)
+    return _once()
+
+
+def _invidious_candidates(limit: int = 12) -> list[str]:
+    """Built-in instances first, then whatever the public list currently offers."""
+    seen: list[str] = []
+    for base in _INVIDIOUS_INSTANCES:
+        if base not in seen:
+            seen.append(base)
+    try:
+        status, _headers, body = _invidious_get(
+            "https://api.invidious.io",
+            _INVIDIOUS_DISCOVERY,
+            timeout=20,
+            limit=200000,
+            solve_anubis=False,
+        )
+        if status == 200:
+            for entry in json.loads(body or b"[]"):
+                if not isinstance(entry, list) or len(entry) < 2:
+                    continue
+                info = entry[1] or {}
+                api = str(info.get("uri") or "").rstrip("/")
+                if (
+                    api
+                    and info.get("type") == "https"
+                    and info.get("api") is not False
+                    and api not in seen
+                ):
+                    seen.append(api)
+    except (MediaError, ValueError, TypeError, OSError):
+        # Discovery is an optimisation. The built-ins above are the contract.
+        pass
+    return seen[:limit]
+
+
+def _invidious_video_id(url: str) -> str | None:
+    """The 11-character video id in any of YouTube's URL spellings, else ``None``."""
+    text = str(url or "").strip()
+    if not text:
+        return None
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", text):
+        return text
+    match = re.search(
+        r"(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|embed/|live/|v/))"
+        r"([A-Za-z0-9_-]{11})",
+        text,
+    )
+    return match.group(1) if match else None
+
+
+def _invidious_api(base: str, video_id: str) -> dict[str, Any]:
+    """``/api/v1/videos/<id>`` with ``local=true``, which is the whole point.
+
+    ``local=true`` is what rewrites the stream URLs from ``googlevideo.com``
+    (signed for the instance's IP, dead from ours) to the instance's own
+    ``/videoplayback`` proxy. Asking without it returns metadata that looks
+    perfectly good and URLs that cannot be fetched from anywhere else.
+    """
+    status, headers, body = _invidious_get(
+        base,
+        f"{base}/api/v1/videos/{video_id}"
+        "?fields=title,author,lengthSeconds,formatStreams,adaptiveFormats&local=true",
+        timeout=30,
+        limit=8000000,
+    )
+    if status != 200:
+        raise MediaError(f"{base} API returned HTTP {status}")
+    if _is_anubis_page(headers, body):
+        raise MediaError(f"{base} API is behind a proof-of-work wall")
+    if not body.strip():
+        # MEASURED 2026-10-12 on invidious.f5.si: a video the instance cannot
+        # resolve comes back as HTTP 200, ``application/json``, and zero bytes --
+        # not a 404. Reported as itself, because "no JSON" reads like a broken
+        # instance when the instance is fine and simply does not have this video.
+        raise MediaError(f"{base} API returned an empty body for {video_id}")
+    try:
+        payload = json.loads(body)
+    except ValueError as exc:
+        raise MediaError(f"{base} API did not return JSON: {exc}") from exc
+    if not isinstance(payload, dict) or not (
+        payload.get("adaptiveFormats") or payload.get("formatStreams")
+    ):
+        raise MediaError(f"{base} API returned no stream list for {video_id}")
+    return payload
+
+
+def _invidious_codec_rank(mime: str, codec: str) -> int:
+    """Lower is better for the requested codec family.
+
+    ``h264`` is the default for the same reason yt-dlp is given
+    ``-S vcodec:h264``: the sandbox decodes it cheaply and the social uploaders
+    accept it. ``best`` keeps every family equal and lets bitrate decide.
+    """
+    mime = (mime or "").lower()
+    if codec == "best":
+        return 0
+    if "avc1" in mime:
+        return 0
+    if "vp9" in mime or "vp09" in mime:
+        return 1
+    return 2
+
+
+def _invidious_audio_rank(fmt: dict[str, Any]) -> tuple[int, int, int]:
+    """Rank an audio stream: best first, in the same spirit as ``-S acodec:aac``.
+
+    AAC-in-MP4 leads because that is the pair every editor and social uploader
+    takes. Stereo is ranked ahead of surround on purpose: MEASURED 2026-10-12,
+    Big Buck Bunny offers itag 258, a 6-channel AAC track at three times the
+    bitrate of itag 140, and a naive "highest bitrate" pick hands a TikTok cut a
+    5.1 soundtrack that plays as silence on a phone. Dolby (``ec-3``/``ac-3``) is
+    last: ffmpeg copies it into an MP4 happily and almost nothing plays it back.
+    """
+    mime = str(fmt.get("type") or "").lower()
+    channels = int(fmt.get("audioChannels") or 2)
+    if "mp4a" in mime:
+        family = 0 if channels <= 2 else 1
+    elif "opus" in mime or "vorbis" in mime:
+        family = 2
+    else:
+        family = 3
+    return (family, 0 if channels <= 2 else 1, -int(fmt.get("bitrate") or 0))
+
+
+def _invidious_quality_label(fmt: dict[str, Any]) -> int:
+    label = str(fmt.get("qualityLabel") or fmt.get("resolution") or "")
+    match = re.search(r"(\d+)p", label)
+    return int(match.group(1)) if match else 0
+
+
+def _invidious_choose(
+    meta: dict[str, Any], *, height: int, audio_only: bool, codec: str
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Pick the (video, audio) pair to fetch out of an Invidious format list.
+
+    Adaptive formats are separate streams, which is how the higher resolutions
+    exist at all: YouTube stopped shipping muxed video above 360p years ago, so a
+    1080p download is a video-only stream plus an audio-only stream that ffmpeg
+    joins. ``formatStreams`` (the muxed ones) is the last resort for a video whose
+    adaptive list is empty, and it caps at 360p.
+    """
+    adaptive = [f for f in (meta.get("adaptiveFormats") or []) if f.get("url")]
+    muxed = [f for f in (meta.get("formatStreams") or []) if f.get("url")]
+
+    audio = sorted(
+        (f for f in adaptive if str(f.get("type") or "").startswith("audio/")),
+        key=_invidious_audio_rank,
+    )
+    if audio_only:
+        if not audio:
+            raise MediaError("this video has no audio-only stream to download")
+        return {}, audio[0]
+
+    video = [f for f in adaptive if str(f.get("type") or "").startswith("video/")]
+    if height:
+        capped = [f for f in video if _invidious_quality_label(f) <= height]
+        if capped:
+            video = capped
+    video.sort(
+        key=lambda f: (
+            -_invidious_quality_label(f),
+            _invidious_codec_rank(str(f.get("type") or ""), codec),
+            -int(f.get("bitrate") or 0),
+        )
+    )
+    if video:
+        return video[0], (audio[0] if audio else None)
+
+    # No adaptive video at all: take a muxed stream, which already carries audio.
+    best_muxed = sorted(
+        muxed,
+        key=lambda f: (
+            -_invidious_quality_label(f),
+            _invidious_codec_rank(str(f.get("type") or ""), codec),
+            -int(f.get("bitrate") or 0),
+        ),
+    )
+    if best_muxed:
+        return best_muxed[0], None
+    raise MediaError("this video has no downloadable video stream")
+
+
+def _invidious_filename(title: str, video_id: str, suffix: str) -> str:
+    """``<title> [<id>]<suffix>``, title trimmed to 120 BYTES like the yt-dlp template.
+
+    Bytes and not characters, because that is what ``%(title).120B`` means and
+    because a 120-character title can be 360 bytes of UTF-8 -- over the 255-byte
+    filename limit once the id and extension are added, which fails the write at
+    the very end of a long download.
+    """
+    cleaned = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", " ".join(str(title or "").split()))
+    cleaned = cleaned.strip(" .") or video_id
+    encoded = cleaned.encode("utf-8")
+    if len(encoded) > 120:
+        cleaned = encoded[:120].decode("utf-8", "ignore").strip()
+    return f"{cleaned or video_id} [{video_id}]{suffix}"
+
+
+def _invidious_stream(
+    base: str, fmt: dict[str, Any], dest: Path, *, timeout: int, label: str
+) -> int:
+    """Download one stream to ``dest``, refusing anything that is not media.
+
+    The Anubis wall answers HTTP **200** with an HTML page, so a status check
+    proves nothing here. The guard is the first four bytes: every container this
+    tool accepts (mp4/m4a/webm) begins with a size field followed by an ASCII tag,
+    and a wall page begins with ``<!doctype`` or ``<html``. A body that starts
+    like markup is a failure, not a video.
+    """
+    url = str(fmt.get("url") or "")
+    headers = {"Referer": f"{base}/", "Origin": base}
+    following, plain, _jar = _invidious_session(base)
+
+    def _fetch():
+        # Deliberately NOT a ``with`` block: the caller streams this body, and a
+        # context manager here closes the response the moment it is returned --
+        # which reads as an empty download rather than as the bug it is.
+        #
+        # And deliberately no ``Range`` header either. Asking for the first 64 KB
+        # to inspect is tempting, but the response then ENDS at that byte: the
+        # stream loop below reads nothing more and a 214-second video is written
+        # as a 4-second one. The head is read off the full response instead, which
+        # costs the same bytes and keeps the connection usable.
+        req = urllib.request.Request(url)
+        for key, value in headers.items():
+            req.add_header(key, value)
+        try:
+            response = following.open(req, timeout=timeout)
+            return response.status, response.headers, response
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers, exc
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+            raise MediaError(f"{label} download failed: {exc}") from exc
+
+    status, response_headers, response = _fetch()
+    head = response.read(65536)
+    if _is_anubis_page(response_headers, head):
+        response.close()
+        # Enough of the body for the wall to be recognised; a one-byte read would
+        # look like a page with no challenge in it and skip the solve entirely.
+        _invidious_get(base, url, headers=headers, timeout=timeout, limit=262144)
+        status, response_headers, response = _fetch()
+        head = response.read(65536)
+    if status not in (200, 206):
+        response.close()
+        raise MediaError(f"{label} download returned HTTP {status}")
+    if _is_anubis_page(response_headers, head) or head[:1] == b"<":
+        response.close()
+        raise MediaError(
+            f"{label} came back as a web page, not media — {base} is gating its proxy"
+        )
+    if len(head) < 12:
+        response.close()
+        raise MediaError(f"{label} came back empty ({len(head)} bytes)")
+
+    total = 0
+    with dest.open("wb") as handle:
+        handle.write(head)
+        total += len(head)
+        while True:
+            chunk = response.read(1 << 20)
+            if not chunk:
+                break
+            handle.write(chunk)
+            total += len(chunk)
+    response.close()
+    return total
+
+
+def download_via_invidious(
+    args: argparse.Namespace,
+    *,
+    out_dir: Path,
+    target_file: Path | None,
+    height: int,
+    timeout: int,
+) -> dict[str, Any]:
+    """Fetch a YouTube video through Invidious and return the verified result.
+
+    Every step that could hand back the wrong thing is checked: the instance must
+    answer the API, the chosen streams must arrive as media rather than a wall
+    page, the merge must exit 0, and the finished file must ffprobe into real
+    streams with a plausible duration. Anything less raises, so a caller never
+    sees a 7 KB HTML page reported as a downloaded video.
+    """
+    video_id = _invidious_video_id(args.url)
+    if not video_id:
+        raise MediaError(f"could not read a YouTube video id out of {args.url!r}")
+
+    wanted_audio = bool(getattr(args, "audio_only", False))
+    codec = str(getattr(args, "codec", "h264") or "h264").lower()
+    suffix = ".mp3" if wanted_audio else ".mp4"
+
+    failures: list[str] = []
+    meta: dict[str, Any] | None = None
+    base = ""
+    for candidate in _invidious_candidates():
+        try:
+            meta = _invidious_api(candidate, video_id)
+            base = candidate
+            break
+        except MediaError as exc:
+            failures.append(f"{candidate}: {exc}")
+            print(f"[media] invidious {candidate} unusable ({exc})", file=sys.stderr)
+    if meta is None:
+        raise MediaError(
+            "no Invidious instance served this video — " + "; ".join(failures[:4])
+        )
+
+    video_fmt, audio_fmt = _invidious_choose(
+        meta, height=height, audio_only=wanted_audio, codec=codec
+    )
+    title = str(meta.get("title") or video_id)
+    duration_hint = float(meta.get("lengthSeconds") or 0.0)
+
+    if target_file is not None:
+        final = target_file.with_suffix(suffix)
+    else:
+        final = out_dir / _invidious_filename(title, video_id, suffix)
+    final.parent.mkdir(parents=True, exist_ok=True)
+
+    work = Path(tempfile.mkdtemp(prefix="invidious-", dir=str(out_dir)))
+    try:
+        parts: list[Path] = []
+        if video_fmt:
+            part = work / f"video.{'webm' if 'webm' in str(video_fmt.get('type')) else 'mp4'}"
+            got = _invidious_stream(
+                base, video_fmt, part, timeout=timeout,
+                label=f"video {_invidious_quality_label(video_fmt)}p",
+            )
+            parts.append(part)
+            print(
+                f"[media] invidious {base}: {got} bytes of "
+                f"{_invidious_quality_label(video_fmt)}p video",
+                file=sys.stderr,
+            )
+        if audio_fmt:
+            part = work / f"audio.{'webm' if 'webm' in str(audio_fmt.get('type')) else 'm4a'}"
+            got = _invidious_stream(
+                base, audio_fmt, part, timeout=timeout, label="audio"
+            )
+            parts.append(part)
+            print(f"[media] invidious {base}: {got} bytes of audio", file=sys.stderr)
+        if not parts:
+            raise MediaError("nothing was downloaded")
+
+        ffmpeg = _require("ffmpeg")
+        if wanted_audio:
+            source = parts[-1]
+            proc = run([
+                ffmpeg, "-v", "error", "-i", str(source), "-vn",
+                "-c:a", "libmp3lame", "-b:a", "192k", "-y", str(final),
+            ], timeout=1800)
+        else:
+            if video_fmt is None or (audio_fmt is None and len(parts) < 2):
+                source = parts[0]
+                proc = run([
+                    ffmpeg, "-v", "error", "-i", str(source), "-c", "copy",
+                    "-movflags", "+faststart", "-y", str(final),
+                ], timeout=1800)
+            else:
+                proc = run([
+                    ffmpeg, "-v", "error", "-i", str(parts[0]), "-i", str(parts[1]),
+                    "-c", "copy", "-movflags", "+faststart", "-y", str(final),
+                ], timeout=1800)
+        if proc.returncode != 0:
+            raise MediaError(f"ffmpeg could not assemble the Invidious download: {_tail(proc.stderr)}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    # The WHOLE download is verified before anything is cut out of it, because
+    # the only honest thing to compare against ``lengthSeconds`` is the complete
+    # file. Checking after the trim compares a 10-second clip against a
+    # 4-minute video and rejects a perfectly good download as "truncated".
+    info = probe(final)
+    if info.get("bytes", 0) < 10240:
+        raise MediaError(f"the download is only {info.get('bytes')} bytes; that is not a video")
+    if not wanted_audio and not info.get("has_video"):
+        raise MediaError("the download carries no video stream")
+    if wanted_audio and not info.get("has_audio"):
+        raise MediaError("the download carries no audio stream")
+    if duration_hint and info.get("duration"):
+        # A truncated fetch is the failure this catches: the wall page is already
+        # refused above, but a proxy that drops the connection halfway leaves a
+        # file that ffprobe happily reads for the first few seconds.
+        if info["duration"] < duration_hint * 0.9:
+            raise MediaError(
+                f"the download is {info['duration']:.1f}s of a {duration_hint:.0f}s video — "
+                f"{base} truncated it"
+            )
+
+    # A section is honoured by trimming afterwards: the Invidious proxy serves a
+    # whole stream or a byte range, never a time range, so asking for one is a
+    # second step here rather than a flag on the fetch.
+    if getattr(args, "section", None):
+        section = str(args.section).strip().lstrip("*")
+        start_text, _, end_text = section.partition("-")
+        start = _seconds(start_text)
+        end = _seconds(end_text) if end_text else 0.0
+        trimmed = final.with_name(final.stem + ".section" + final.suffix)
+        # ``-ss`` BEFORE ``-i`` and the length as an OUTPUT ``-t``: both placed
+        # before the input they are input-side options, so ``-ss 10 -to 10`` reads
+        # as "start at 10 and stop at 10" and ffmpeg refuses the whole cut with
+        # "-to value smaller than -ss".
+        cmd = [_require("ffmpeg"), "-v", "error", "-ss", f"{start:.3f}", "-i", str(final)]
+        if end > start:
+            cmd += ["-t", f"{end - start:.3f}"]
+        cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart", "-y", str(trimmed)]
+        proc = run(cmd, timeout=1800)
+        if proc.returncode != 0:
+            raise MediaError(f"could not cut {section} out of the download: {_tail(proc.stderr)}")
+        trimmed.replace(final)
+        info = probe(final)
+        if info.get("bytes", 0) < 1024 or not info.get("has_video"):
+            raise MediaError(f"the cut came out empty ({info.get('bytes')} bytes)")
+
+    return {
+        "url": args.url,
+        "directory": str(out_dir),
+        "files": [str(final)],
+        "output": str(final),
+        "output_probe": info,
+        "video_id": video_id,
+        "title": title,
+        "via": "invidious",
+        "invidious_instance": base,
+        "invidious_streams": {
+            "video_itag": (video_fmt or {}).get("itag"),
+            "audio_itag": (audio_fmt or {}).get("itag"),
+        },
+        "player_client": "invidious",
+        "attempts": ["invidious"],
+    }
+
+
 def cmd_download(args: argparse.Namespace) -> int:
     """yt-dlp, the one tool that reliably turns a link into a file."""
-    ytdlp = _require("yt-dlp")
+    via = str(getattr(args, "via", "auto") or "auto").lower()
+    ytdlp: str | None = _which("yt-dlp")
+    if via != "invidious" and not ytdlp:
+        ytdlp = _require("yt-dlp")
 
     # ``--out`` is documented as "file or directory" and the model writes
     # ``--out clip.mp4`` because that is what the tool schema promises. This used
@@ -1858,7 +2521,7 @@ def cmd_download(args: argparse.Namespace) -> int:
     # you're not a bot" on a machine where the same link works in a browser. This
     # is the single most common cause of an unexplained YouTube refusal in a
     # sandbox, so it is passed on EVERY attempt.
-    js_args = js_runtime_args(ytdlp)
+    js_args = js_runtime_args(ytdlp) if ytdlp else []
 
     # --- resilience, then client rotation ---------------------------------- #
     #
@@ -1869,8 +2532,14 @@ def cmd_download(args: argparse.Namespace) -> int:
     # download slower. ``--no-warnings`` is dropped on the retries so the reason
     # for the escalation is visible in the error we hand back.
     attempts: list[tuple[str, list[str]]] = [("default", [])]
-    if _is_youtube(args.url) and _ytdlp_has_flag(ytdlp, "--extractor-args"):
+    if ytdlp and _is_youtube(args.url) and _ytdlp_has_flag(ytdlp, "--extractor-args"):
         attempts += [(label, list(extra)) for label, extra in _CLIENT_ROTATIONS]
+    if via == "invidious":
+        # Forced past yt-dlp entirely. The point of the flag is to be able to
+        # exercise and measure the Invidious path on a link yt-dlp would happily
+        # download, which is the only way to prove the fallback works rather than
+        # merely to observe that something did.
+        attempts = []
 
     timeout = int(args.timeout)
     proc: subprocess.CompletedProcess[str] | None = None
@@ -1894,7 +2563,7 @@ def cmd_download(args: argparse.Namespace) -> int:
             break
         # Last resort before the embedded clients: YouTube has moved on and this
         # image is running an older yt-dlp. Update once, then re-run the default.
-        if refreshed is None and index >= 1:
+        if refreshed is None and index >= 1 and ytdlp:
             refreshed = _refresh_ytdlp(ytdlp)
             if refreshed:
                 attempts.insert(index + 1, (f"yt-dlp {refreshed}", []))
@@ -1906,6 +2575,37 @@ def cmd_download(args: argparse.Namespace) -> int:
 
     if proc is None or proc.returncode != 0:
         detail = _tail((proc.stderr if proc else "") or (proc.stdout if proc else ""), 900)
+        # --- the escalation that can still work when every client is refused -- #
+        #
+        # Player rotation changes the ARGUMENT; it does not change the fact that
+        # YouTube is refusing to serve THIS IP. Invidious asks from a different
+        # IP entirely, so it is tried before giving up — but only for a YouTube
+        # link (nothing else has an Invidious mirror) and only after the refusal
+        # is a bot block, because a bad URL or a missing file should fail as
+        # itself rather than be retried down a second, slower path.
+        if (
+            via != "yt-dlp"
+            and _is_youtube(args.url)
+            and (via == "invidious" or _looks_bot_blocked(detail))
+        ):
+            print(
+                "[media] YouTube refused every player client; retrying through Invidious",
+                file=sys.stderr,
+            )
+            try:
+                return ok(**download_via_invidious(
+                    args, out_dir=out_dir, target_file=target_file,
+                    height=height, timeout=timeout,
+                ))
+            except MediaError as exc:
+                message = "download failed"
+                if len(tried) > 1:
+                    message += f" (tried player clients: {', '.join(tried)})"
+                message += (
+                    f": {detail} — YouTube refused every player client, and the "
+                    f"Invidious fallback did not work either: {exc}"
+                )
+                raise MediaError(message) from exc
         message = "download failed"
         if len(tried) > 1:
             message += f" (tried player clients: {', '.join(tried)})"
@@ -2390,6 +3090,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--codec", default="h264", choices=["h264", "best"])
     p.add_argument("--audio-only", action="store_true")
     p.add_argument("--playlist", action="store_true")
+    # ``auto`` is the only value that ever changes behaviour on its own: yt-dlp
+    # first, Invidious only if YouTube refuses. ``invidious`` exists so the
+    # fallback can be tested and measured on a link that is not blocked -- a
+    # fallback nobody has ever run is not a fallback.
+    p.add_argument("--via", default="auto", choices=["auto", "yt-dlp", "invidious"],
+                   help="fetch through yt-dlp, through an Invidious instance, or try "
+                        "yt-dlp and fall back to Invidious on a bot block")
     p.add_argument("--cookies")
     p.add_argument("--section", help="only this range, e.g. *00:01:00-00:02:00")
     p.add_argument("--subtitles", help="language code, e.g. en")

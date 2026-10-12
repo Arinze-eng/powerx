@@ -85,7 +85,7 @@ _REPO = os.getenv("MEDIA_SCRIPT_REPO", "Arinze-eng/powerx")
 #: that is no longer running, the caller gets a loud warning and a retry against a
 #: different source. Bump BOTH constants together whenever the CLI's contract with
 #: this tool changes.
-_CLI_VERSION = "1.2.0"
+_CLI_VERSION = "1.3.0"
 
 #: Where the CLI, its installer and its detached jobs live inside the sandbox.
 _MEDIA_HOME = "$HOME/.media"
@@ -253,6 +253,7 @@ _FLAG_SPEC: dict[str, dict[str, Any]] = {
         "flags": {
             "out": "--out", "quality": "--quality", "cookies": "--cookies",
             "section": "--section", "subtitles": "--subtitles", "codec": "--codec",
+            "via": "--via",
         },
         "bools": {"audio_only": "--audio-only", "playlist": "--playlist"},
     },
@@ -663,6 +664,11 @@ class MediaSandboxTool(Tool):
             "Downloading: action='download' takes a YouTube/other link and saves locally "
             "(yt-dlp) — quality 1080/720/480/best, audio_only for the soundtrack, "
             "section for a single range, subtitles to pull the platform's own captions. "
+            "When YouTube refuses the sandbox IP (\"Sign in to confirm you're not a "
+            "bot\"), the download automatically retries through a public Invidious "
+            "instance, which asks YouTube from its own IP; the result then says "
+            "via='invidious' and names the instance. Leave via='auto' unless you are "
+            "deliberately testing that fallback. "
             "Shorts: action='shorts' transcribes (faster-whisper, local) when there is no "
             "sidecar transcript, scores sentence-boundary windows on words-per-second and "
             "hook words, and writes non-overlapping vertical clips with a thumbnail, an "
@@ -699,6 +705,7 @@ class MediaSandboxTool(Tool):
                 "out": {"type": "string", "description": "Output path inside the sandbox. If it ends in a media extension (e.g. clip.mp4) it is the OUTPUT FILE and the result lands at exactly that path; otherwise it is a directory and the file is named from the source. Defaults to a sibling of the input with a sensible name."},
                 "quality": {"type": "string", "enum": ["1080", "720", "480", "360", "best", "worst"], "description": "action=download: max height to request (default 1080)."},
                 "codec": {"type": "string", "enum": ["h264", "best"], "description": "action=download: 'h264' (default) prefers H.264/AAC, which re-encodes fast and is accepted by TikTok/Instagram and every editor. 'best' takes the platform's raw preference instead (YouTube now serves AV1/Opus), which is only right for a file that will never be edited or re-uploaded."},
+                "via": {"type": "string", "enum": ["auto", "yt-dlp", "invidious"], "description": "action=download: 'auto' (default) uses yt-dlp and falls back to an Invidious instance when YouTube refuses this IP as a bot; 'yt-dlp' never falls back; 'invidious' skips yt-dlp entirely."},
                 "audio_only": {"type": "boolean", "description": "action=download: fetch only the audio track."},
                 "playlist": {"type": "boolean", "description": "action=download: allow a playlist/whole channel. Off by default — one URL means one video."},
                 "section": {"type": "string", "description": "action=download: a single range, e.g. '*00:01:00-00:02:30'."},

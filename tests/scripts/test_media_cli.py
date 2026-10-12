@@ -201,3 +201,182 @@ def test_filtergraph_paths_are_escaped():
     """``:`` and ``,`` are both legal in a POSIX path and both split a filtergraph."""
     escaped = cli._escape_filter_path("/home/a b/title:1,x.txt")
     assert escaped == "/home/a b/title\\:1\\,x.txt"
+
+
+# --------------------------------------------------------------------------- #
+# the Invidious fallback
+# --------------------------------------------------------------------------- #
+def test_the_youtube_id_is_read_out_of_every_url_spelling():
+    """One id, six spellings -- and a non-YouTube URL must not be mined for one."""
+    for url in (
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://m.youtube.com/watch?v=dQw4w9WgXcQ&t=42s",
+        "https://youtu.be/dQw4w9WgXcQ",
+        "https://youtu.be/dQw4w9WgXcQ?si=abc",
+        "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+        "https://www.youtube.com/embed/dQw4w9WgXcQ",
+        "dQw4w9WgXcQ",
+    ):
+        assert cli._invidious_video_id(url) == "dQw4w9WgXcQ", url
+    assert cli._invidious_video_id("https://vimeo.com/12345") is None
+    assert cli._invidious_video_id("") is None
+
+
+def test_the_anubis_proof_of_work_is_the_hash_the_wall_asks_for():
+    """Anubis wants sha256(randomData + nonce) with `difficulty` leading hex zeros.
+
+    The definition is taken from the wall's own ``sha256-webcrypto.mjs``: the
+    nonce is a decimal string that is CONCATENATED, and what is returned is the
+    hex digest, not the raw bytes. Getting either wrong yields a hash that looks
+    plausible and is rejected by the challenge endpoint.
+    """
+    import hashlib
+
+    random_data = "c84668ee51364db6e57b9fb86ab1e049e1a2fc603b462275da8950025f300e18"
+    digest, nonce = cli._anubis_solve(random_data, 4)
+    assert digest == hashlib.sha256(f"{random_data}{nonce}".encode()).hexdigest()
+    assert digest.startswith("0000")
+    assert nonce == int(nonce)
+
+
+def test_an_odd_anubis_difficulty_checks_the_half_byte():
+    """difficulty=3 is two zero bytes plus a zero HIGH NIBBLE, not three bytes."""
+    digest, _ = cli._anubis_solve("abc", 3)
+    assert digest.startswith("000")
+    assert int(digest[2], 16) == 0
+
+
+class _WallResponse:
+    """The Anubis interstitial, as an ``http.client`` response would deliver it."""
+
+    def __init__(self, body):
+        self.status = 200
+        self.headers = {"Content-Type": "text/html; charset=utf-8"}
+        self._body = body
+        self._sent = False
+
+    def read(self, size=None):
+        if self._sent:
+            return b""
+        self._sent = True
+        return self._body[:size] if size else self._body
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _WallOpener:
+    def __init__(self, body):
+        self._body = body
+
+    def open(self, request, timeout=None):  # noqa: ANN001
+        return _WallResponse(self._body)
+
+
+def test_a_proof_of_work_the_sandbox_cannot_afford_is_refused_not_attempted(monkeypatch):
+    """A hostile instance must not be able to turn a download into a hang.
+
+    The solver is never reached: the ceiling is checked first, because at
+    difficulty 7 the honest answer is "this instance is not usable", and spending
+    the sandbox's wall clock proving it is the failure being prevented.
+    """
+    body = (
+        b'<html><script id="anubis_challenge" type="application/json">'
+        b'{"challenge":{"difficulty":99,"randomData":"x","id":"1"}}</script></html>'
+    )
+    assert cli._is_anubis_page({"Content-Type": "text/html; charset=utf-8"}, body) is True
+
+    def _never(random_data, difficulty):
+        raise AssertionError("the solver should not have been reached")
+
+    monkeypatch.setattr(cli, "_anubis_solve", _never)
+    monkeypatch.setattr(cli, "_invidious_session", lambda base: (_WallOpener(body),) * 3)
+    with pytest.raises(cli.MediaError) as excinfo:
+        cli._invidious_get("https://example.invalid", "https://example.invalid/stream")
+    assert "proof of work" in str(excinfo.value)
+
+
+def test_a_media_response_is_never_mistaken_for_the_wall():
+    """The wall is HTML; real bytes must not be re-requested as if they were one."""
+    assert cli._is_anubis_page({"Content-Type": "video/mp4"}, b"\x00\x00\x00\x18ftypmp42") is False
+    assert cli._is_anubis_page({"Content-Type": "application/json"}, b'{"title":"x"}') is False
+    assert cli._is_anubis_page(
+        {"Content-Type": "text/html"},
+        b"<!doctype html><title>Making sure you&#39;re not a bot!</title>",
+    ) is True
+
+
+def _fmt(itag, mime, **extra):
+    return {"itag": itag, "type": mime, "url": f"https://x/{itag}", **extra}
+
+
+def _meta(adaptive=(), muxed=()):
+    return {"adaptiveFormats": list(adaptive), "formatStreams": list(muxed)}
+
+
+def test_the_video_pick_stays_under_the_requested_height():
+    meta = _meta([
+        _fmt("137", 'video/mp4; codecs="avc1.640028"', qualityLabel="1080p", bitrate=4334157),
+        _fmt("136", 'video/mp4; codecs="avc1.4D401F"', qualityLabel="720p", bitrate=1058310),
+        _fmt("135", 'video/mp4; codecs="avc1.4D401E"', qualityLabel="480p", bitrate=690764),
+        _fmt("140", 'audio/mp4; codecs="mp4a.40.2"', bitrate=130992, audioChannels=2),
+    ])
+    video, audio = cli._invidious_choose(meta, height=720, audio_only=False, codec="h264")
+    assert video["itag"] == "136"
+    assert audio["itag"] == "140"
+
+
+def test_h264_wins_over_av1_at_the_same_height():
+    """AV1 is slow to decode in the sandbox and several uploaders reject it."""
+    meta = _meta([
+        _fmt("399", 'video/mp4; codecs="av01.0.08M.08"', qualityLabel="1080p", bitrate=1594543),
+        _fmt("137", 'video/mp4; codecs="avc1.640028"', qualityLabel="1080p", bitrate=4334157),
+    ])
+    video, _ = cli._invidious_choose(meta, height=1080, audio_only=False, codec="h264")
+    assert video["itag"] == "137"
+    video, _ = cli._invidious_choose(meta, height=1080, audio_only=False, codec="best")
+    assert video["itag"] == "137"
+
+
+def test_stereo_aac_beats_surround_dolby_and_opus():
+    """The 5.1 trap: itag 258 has the highest bitrate and plays as silence on a phone."""
+    meta = _meta([
+        _fmt("258", 'audio/mp4; codecs="mp4a.40.2"', bitrate=389665, audioChannels=6),
+        _fmt("140", 'audio/mp4; codecs="mp4a.40.2"', bitrate=130992, audioChannels=2),
+        _fmt("251", 'audio/webm; codecs="opus"', bitrate=143908, audioChannels=2),
+        _fmt("380", 'audio/mp4; codecs="ac-3"', bitrate=385273, audioChannels=6),
+    ])
+    _, audio = cli._invidious_choose(meta, height=0, audio_only=True, codec="h264")
+    assert audio["itag"] == "140"
+
+
+def test_a_video_with_no_adaptive_formats_falls_back_to_a_muxed_stream():
+    """YouTube still ships a muxed 360p; it is the only option on some videos."""
+    meta = _meta(muxed=[_fmt("18", 'video/mp4; codecs="avc1.42001E"', qualityLabel="360p")])
+    video, audio = cli._invidious_choose(meta, height=1080, audio_only=False, codec="h264")
+    assert video["itag"] == "18"
+    assert audio is None
+
+
+def test_a_video_with_nothing_downloadable_fails_loudly():
+    with pytest.raises(cli.MediaError):
+        cli._invidious_choose(_meta(), height=1080, audio_only=False, codec="h264")
+
+
+def test_the_title_is_trimmed_to_120_bytes_not_characters():
+    """``%(title).120B`` is a byte limit, and a filename limit is in bytes too."""
+    name = cli._invidious_filename("é" * 200, "dQw4w9WgXcQ", ".mp4")
+    assert name.endswith(" [dQw4w9WgXcQ].mp4")
+    assert len(name.split(" [")[0].encode("utf-8")) <= 120
+    assert "é" in name
+
+
+def test_a_title_that_is_all_separators_still_produces_a_filename():
+    name = cli._invidious_filename("///", "dQw4w9WgXcQ", ".mp4")
+    assert name == "___ [dQw4w9WgXcQ].mp4"
