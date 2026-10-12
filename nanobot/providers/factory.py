@@ -296,6 +296,23 @@ def _pool_disabled() -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _admin_lane_disabled() -> bool:
+    """Whether the configured main provider must be kept out of the pool.
+
+    The admin lane is the *host's* own last-resort fallback, built from the
+    host's config. A sandbox that has been handed the host's lane set must not
+    append one of its own: the sandbox's config is not the administrator's
+    selection, so a lane built from it would rotate traffic over an endpoint and
+    a key nobody chose for that turn. The remote-turn worker sets this for the
+    turn it carries the pool into, after sending the host's own admin lane as
+    one of the entries.
+    """
+    raw = os.environ.get("PROVIDER_POOL_ADMIN_LANE")
+    if raw is None or not raw.strip():
+        return False
+    return raw.strip().lower() in {"0", "false", "no", "off"}
+
+
 def _pool_signature() -> tuple[object, ...]:
     """Signature of the admin pool's *active* lanes.
 
@@ -391,17 +408,18 @@ def _admin_pool_lane(
     return (entry, provider)
 
 
-def make_pool_provider(config: Config, *, preset: ModelPresetConfig) -> LLMProvider | None:
-    """Build a rotating provider over the admin pool, or None when unused."""
-    if _pool_disabled():
-        return None
-    from nanobot.provider_pool import enabled_entries
+def _pool_lanes(
+    config: Config,
+    *,
+    preset: ModelPresetConfig,
+    entries: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], LLMProvider]]:
+    """The lanes a pool over *entries* rotates across, in order.
 
-    entries = enabled_entries()
-    if not entries:
-        return None
+    One place decides what the pool is made of, so the provider the host builds
+    and the entries :func:`pool_lane_entries` hands to a sandbox cannot disagree.
+    """
     from nanobot.providers.openai_compat_provider import OpenAICompatProvider
-    from nanobot.providers.pool_provider import PoolProvider
 
     generation = preset.to_generation_settings()
     # The admin page's prompt-cache choice has to reach the pool's own lanes, not
@@ -424,12 +442,53 @@ def make_pool_provider(config: Config, *, preset: ModelPresetConfig) -> LLMProvi
         )
         lane.generation = generation
         lanes.append((entry, lane))
-    admin_lane = _admin_pool_lane(config, preset=preset, entries=entries)
-    if admin_lane is not None:
-        lanes.append(admin_lane)
+    if not _admin_lane_disabled():
+        admin_lane = _admin_pool_lane(config, preset=preset, entries=entries)
+        if admin_lane is not None:
+            lanes.append(admin_lane)
+    return lanes
+
+
+def pool_lane_entries(
+    config: Config,
+    *,
+    preset: ModelPresetConfig | None = None,
+) -> list[dict[str, Any]]:
+    """Every lane the active pool would rotate over, as plain entries.
+
+    The full set, including the main provider's last-resort lane, so a caller
+    that has to reproduce the rotation elsewhere -- the remote-turn worker in a
+    sandbox -- can be handed the lanes rather than the *source* of them. A caller
+    given only the admin's saved entries would silently drop the fallback lane,
+    and the same turn would have one fewer place to land depending on where it
+    ran.
+    """
+    if _pool_disabled():
+        return []
+    from nanobot.provider_pool import enabled_entries
+
+    entries = enabled_entries()
+    if not entries:
+        return []
+    resolved = _resolve_model_preset(config, preset=preset)
+    return [dict(entry) for entry, _ in _pool_lanes(config, preset=resolved, entries=entries)]
+
+
+def make_pool_provider(config: Config, *, preset: ModelPresetConfig) -> LLMProvider | None:
+    """Build a rotating provider over the admin pool, or None when unused."""
+    if _pool_disabled():
+        return None
+    from nanobot.provider_pool import enabled_entries
+
+    entries = enabled_entries()
+    if not entries:
+        return None
+    from nanobot.providers.pool_provider import PoolProvider
+
+    lanes = _pool_lanes(config, preset=preset, entries=entries)
     if not lanes:
         return None
-    return PoolProvider(lanes, generation=generation)
+    return PoolProvider(lanes, generation=preset.to_generation_settings())
 
 
 def make_provider(

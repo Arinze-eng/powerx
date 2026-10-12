@@ -86,6 +86,14 @@ class RemoteTurnRequest:
     session_key: str
     messages: list[dict[str, Any]]
     credentials: ProviderCredentials
+    #: The administrator's provider pool, if one is active.
+    #:
+    #: It travels as its own field because a pool is not a credential: the host
+    #: rotates across several endpoints, so "which provider" has no single
+    #: answer, and a sandbox given only ``credentials`` would run on one lane of
+    #: the pool instead of the pool. Repr-suppressed for the same reason
+    #: ``api_key`` is -- every entry carries a key.
+    pool: list[dict[str, Any]] = field(default_factory=list, repr=False)
     tools_config: dict[str, Any] = field(default_factory=dict)
     workspace: str | None = None
     max_iterations: int = 0
@@ -102,6 +110,7 @@ class RemoteTurnRequest:
             "session_key": self.session_key,
             "messages": self.messages,
             "credentials": self.credentials.to_dict(),
+            "pool": list(self.pool or []),
             "tools_config": self.tools_config,
             "workspace": self.workspace,
             "max_iterations": self.max_iterations,
@@ -122,6 +131,7 @@ class RemoteTurnRequest:
             session_key=str(payload.get("session_key") or ""),
             messages=list(payload.get("messages") or []),
             credentials=ProviderCredentials.from_dict(credentials),
+            pool=list(payload.get("pool") or []),
             tools_config=dict(payload.get("tools_config") or {}),
             workspace=payload.get("workspace") or None,
             max_iterations=int(payload.get("max_iterations") or 0),

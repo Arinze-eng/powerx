@@ -7,6 +7,9 @@ rather than raised, and a turn that produced nothing is still a finished turn.
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,7 +18,23 @@ import pytest
 from nanobot.agent import runner as runner_module
 from nanobot.agent.runner import AgentRunResult
 from nanobot.remote_turn.protocol import ProviderCredentials, RemoteTurnEvent, RemoteTurnRequest
-from nanobot.remote_turn.worker import LocalLoop, _config_for, build_loop, run_turn
+from nanobot.remote_turn.worker import (
+    ADMIN_LANE_ENV_VAR,
+    LocalLoop,
+    _config_for,
+    apply_pool,
+    build_loop,
+    run_turn,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_pool_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test in this file inherits a pool from the one before it."""
+    from nanobot.provider_pool import POOL_ENV_VAR
+
+    for name in (POOL_ENV_VAR, "PROVIDER_POOL_PATH", ADMIN_LANE_ENV_VAR):
+        monkeypatch.delenv(name, raising=False)
 
 
 class _Provider:
@@ -173,6 +192,85 @@ def test_the_sandbox_workspace_comes_from_the_host() -> None:
     config = _config_for(_request(workspace="/workspace/telegram-42"))
 
     assert config.agents.defaults.workspace == "/workspace/telegram-42"
+
+
+_LANES = [
+    {
+        "id": "lane-a",
+        "baseUrl": "https://one.test/v1",
+        "apiKey": "key-one",
+        "model": "nvidia/nemotron-3-super-120b-a12b",
+        "label": "one",
+        "enabled": True,
+    },
+    {
+        "id": "lane-b",
+        "baseUrl": "https://two.test/v1",
+        "apiKey": "key-two",
+        "model": "nvidia/nemotron-3-super-120b-a12b",
+        "label": "two",
+        "enabled": True,
+    },
+]
+
+
+def test_the_pool_is_installed_where_the_project_expects_to_find_it() -> None:
+    from nanobot.provider_pool import POOL_ENV_VAR, load_pool
+
+    installed = apply_pool(_request(pool=list(_LANES)))
+
+    assert installed == 2
+    assert json.loads(os.environ[POOL_ENV_VAR])["entries"][0]["id"] == "lane-a"
+    # The file is pointed at explicitly because load_pool prefers it over the
+    # env var, and a stale file from an earlier turn would otherwise win.
+    assert Path(os.environ["PROVIDER_POOL_PATH"]).exists()
+    assert [e["id"] for e in load_pool()] == ["lane-a", "lane-b"]
+
+
+def test_no_pool_in_the_request_changes_nothing() -> None:
+    from nanobot.provider_pool import POOL_ENV_VAR
+
+    os.environ.pop(POOL_ENV_VAR, None)
+
+    assert apply_pool(_request()) == 0
+    assert POOL_ENV_VAR not in os.environ
+
+
+def test_a_pooled_turn_gets_the_real_rotating_provider() -> None:
+    # The point of carrying the pool: the sandbox must rotate over the *same*
+    # lanes the host does. Not one lane of it, and not one lane more -- the
+    # turn's credentials name a provider this sandbox can build, so a lane it
+    # added by itself would be an endpoint and a key nobody chose for this turn.
+    loop = build_loop(
+        _request(
+            workspace="/tmp/powerx-remote-turn-pool-test",
+            pool=list(_LANES),
+        )
+    )
+
+    assert type(loop.provider).__name__ == "PoolProvider"
+    assert [entry["id"] for entry, _ in loop.provider.lanes] == ["lane-a", "lane-b"]
+
+
+def test_the_switch_that_keeps_the_sandboxs_own_lane_out_is_what_does_it() -> None:
+    # Guards the test above against passing for the wrong reason: the ambient
+    # lane is real, and it is the switch -- not an unbuildable config -- that
+    # keeps it out of the rotation.
+    from nanobot.providers.factory import make_provider
+
+    request = _request(pool=list(_LANES))
+    apply_pool(request)
+    config = _config_for(request)
+
+    assert [e["id"] for e, _ in make_provider(config).lanes] == ["lane-a", "lane-b"]
+
+    os.environ.pop(ADMIN_LANE_ENV_VAR, None)
+
+    assert [e["id"] for e, _ in make_provider(config).lanes] == [
+        "lane-a",
+        "lane-b",
+        "admin-main",
+    ]
 
 
 def test_build_loop_composes_the_real_agent() -> None:

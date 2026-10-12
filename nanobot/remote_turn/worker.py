@@ -31,7 +31,10 @@ anyway, so the contract is enforced twice.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -49,6 +52,10 @@ from nanobot.remote_turn.protocol import (
 #: back-pressure rather than buffering a whole turn in memory.
 Emit = Callable[[RemoteTurnEvent], Awaitable[None]]
 
+#: Read by ``providers.factory``; see :func:`apply_pool` for why a carried pool
+#: turns the sandbox's own last-resort lane off.
+ADMIN_LANE_ENV_VAR = "PROVIDER_POOL_ADMIN_LANE"
+
 
 @dataclass
 class LocalLoop:
@@ -62,6 +69,46 @@ class LocalLoop:
     provider: Any
     tools: Any
     config: Any = None
+
+
+def apply_pool(request: RemoteTurnRequest) -> int:
+    """Reconstitute the administrator's provider pool inside the sandbox.
+
+    The pool is not rebuilt by hand -- that would be a second implementation of
+    the rotation, free to drift from the host's. It is *installed* the way the
+    admin panel installs it, and the project's own ``make_pool_provider`` finds
+    it. Both ends then rotate over the same lanes by construction.
+
+    ``PROVIDER_POOL_PATH`` is set alongside the env var on purpose: ``load_pool``
+    prefers the on-disk copy, so a pool file left behind by an earlier turn on a
+    long-lived sandbox would otherwise outrank the pool the host just sent.
+
+    The ambient admin lane is switched off at the same time, because the host
+    sends its own as one of the entries. ``make_pool_provider`` would otherwise
+    append a lane built from *this* sandbox's config -- an endpoint and a key the
+    administrator never chose for this turn -- and the sandbox would rotate over
+    it. With the switch off the lane set installed here is exactly the lane set
+    the host rotates over, which is the whole point of carrying it.
+
+    Returns the number of lanes installed.
+    """
+    entries = list(request.pool or [])
+    if not entries:
+        return 0
+
+    from nanobot.provider_pool import POOL_ENV_VAR
+
+    payload = json.dumps({"entries": entries}, separators=(",", ":"), default=str)
+    os.environ[POOL_ENV_VAR] = payload
+    path = Path(tempfile.gettempdir()) / "nanobot_turn_provider_pool.json"
+    try:
+        path.write_text(payload, encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError as exc:  # noqa: PERF203 - the env var alone may still work
+        logger.warning("remote turn: could not write the pool file ({}); using env only", exc)
+    os.environ["PROVIDER_POOL_PATH"] = str(path)
+    os.environ[ADMIN_LANE_ENV_VAR] = "0"
+    return len(entries)
 
 
 def _config_for(request: RemoteTurnRequest) -> Any:
@@ -117,6 +164,9 @@ def build_loop(request: RemoteTurnRequest) -> LocalLoop:
     from nanobot.agent.loop import AgentLoop
     from nanobot.agent.tools.registry import ToolRegistry
 
+    lanes = apply_pool(request)
+    if lanes:
+        logger.info("remote turn: installed {} provider pool lane(s)", lanes)
     config = _config_for(request)
     loop = AgentLoop.from_config(config, tool_registry=ToolRegistry())
     return LocalLoop(provider=loop.provider, tools=loop.tools, config=config)
