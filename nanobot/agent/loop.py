@@ -2490,11 +2490,89 @@ class AgentLoop:
         if ctx.on_retry_wait is None:
             ctx.on_retry_wait = ctx.delivery.retry_wait_callback()
 
+    async def _run_turn_in_sandbox(self, ctx: TurnContext) -> bool:
+        """Run this whole turn inside the configured sandbox, or say we did not.
+
+        Returns ``True`` only when the sandbox ran the turn *and* handed back a
+        transcript the host can adopt. Every other answer -- the switch is off, no
+        sandbox is configured, the worker died, the result came home incomplete --
+        returns ``False``, and the caller runs the turn here exactly as it did
+        before this existed.
+
+        That is the whole contract: moving the turns must never be able to lose
+        one. The cost of a fallback is a turn that ran on the host; the cost of
+        the alternative is a user whose message vanished.
+        """
+        from nanobot.remote_turn import (
+            SandboxTurnDispatcher,
+            sandbox_turns_enabled,
+        )
+        from nanobot.remote_turn.host import active_config, build_turn_request
+        from nanobot.utils.runtime import turn_budget_seconds
+
+        if not sandbox_turns_enabled() or not ctx.initial_messages:
+            return False
+
+        try:
+            request = build_turn_request(
+                active_config(),
+                session_key=ctx.session_key,
+                messages=ctx.initial_messages,
+                workspace=str(self.workspace),
+                channel=ctx.delivery.route.channel,
+                chat_id=ctx.delivery.route.chat_id,
+                max_iterations=self.max_iterations,
+                max_tool_result_chars=self.max_tool_result_chars,
+                turn_budget_s=turn_budget_seconds(),
+                metadata={
+                    "turn_id": ctx.turn_id,
+                    "message_id": ctx.msg.metadata.get("message_id"),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - never lose a turn over the relay
+            logger.warning("Sandbox turn setup failed; running on the host: {}", exc)
+            return False
+
+        if request is None:
+            return False
+
+        async def _forward(event: Any) -> None:
+            # Deltas go to the same place a host turn's deltas go, so a streaming
+            # channel streams identically whether the turn ran here or there.
+            if event.kind == "delta" and ctx.on_stream is not None and event.text:
+                await ctx.on_stream(event.text)
+
+        outcome = await SandboxTurnDispatcher().dispatch(request, on_event=_forward)
+        if not outcome.ok:
+            logger.warning(
+                "Sandbox turn fell back to the host ({}): {}",
+                outcome.backend or "no backend",
+                outcome.error,
+            )
+            return False
+
+        ctx.final_content = outcome.final_content
+        ctx.all_messages = outcome.messages
+        ctx.stop_reason = outcome.stop_reason or "completed"
+        ctx.had_injections = False
+        ctx.streamed_content = bool(ctx.streamed_content)
+        if outcome.usage:
+            self._last_usage = dict(outcome.usage)
+        logger.info(
+            "Turn for {} ran in the {} sandbox ({} tool(s))",
+            ctx.session_key,
+            outcome.backend,
+            len(outcome.tools_used),
+        )
+        return True
+
     async def _run_turn(self, ctx: TurnContext) -> None:
         runtime = ctx.require_runtime()
         if ctx.visible_run_started_at is None:
             ctx.visible_run_started_at = time.time()
         await ctx.delivery.running(started_at=ctx.visible_run_started_at)
+        if await self._run_turn_in_sandbox(ctx):
+            return
         result = await self._run_agent_loop(
             ctx.initial_messages,
             runtime=runtime,

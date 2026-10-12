@@ -1,0 +1,285 @@
+"""What runs inside the sandbox: ``python3 -m nanobot.remote_turn.worker <request>``.
+
+It reads the staged request, builds the model client and the tools *locally* --
+which is the whole point, because "locally" now means the sandbox, beside the
+workspace the turn is about -- runs the turn, and writes JSONL events to stdout.
+
+The turn-running core takes its loop as an argument. That is not decoration: it
+is what lets the dispatch path be tested end to end without a sandbox, a network
+or an API key, and it keeps the one piece that genuinely cannot be tested
+in-process -- reaching a real provider from a real sandbox -- isolated in
+:func:`build_loop`.
+
+WHY THE LOOP IS BUILT BY ``AgentLoop.from_config``
+--------------------------------------------------
+The sandbox must run the *same* agent the host would have run, or a turn would
+behave differently depending on where it landed: a different tool set, a
+different prompt, a different model default. So :func:`build_loop` does not
+assemble a provider and a registry by hand -- it takes the project's own
+composition root, with a config carrying the administrator's selection, and
+reads ``.provider`` and ``.tools`` off the result. There is exactly one place
+that knows how an agent is wired, and this is not a second one.
+
+Output contract
+---------------
+stdout carries *only* JSONL events. Everything else goes to stderr, because the
+host parses stdout and a stray print from a tool or a library would otherwise be
+indistinguishable from a turn result. The dispatcher skips non-event lines
+anyway, so the contract is enforced twice.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from loguru import logger
+
+from nanobot.remote_turn.protocol import (
+    RemoteTurnEvent,
+    RemoteTurnRequest,
+    decode_request,
+    encode_event,
+)
+
+#: Called for each event as it happens. Awaited, so a slow consumer applies
+#: back-pressure rather than buffering a whole turn in memory.
+Emit = Callable[[RemoteTurnEvent], Awaitable[None]]
+
+
+@dataclass
+class LocalLoop:
+    """The two things a turn needs: a model client and a tool registry.
+
+    Returned by :func:`build_loop` rather than a whole ``AgentLoop`` so the
+    runner is given exactly the surface it uses, and so a test can hand back a
+    fake without standing up a loop.
+    """
+
+    provider: Any
+    tools: Any
+    config: Any = None
+
+
+def _config_for(request: RemoteTurnRequest) -> Any:
+    """Build the config the sandbox will run the turn under.
+
+    Loaded from whatever the sandbox has (env and a config file if the operator
+    put one there), then *overridden* with the administrator's selection as the
+    host recorded it. The override is the point: the host owns the model choice,
+    so a sandbox that happens to carry a stale config of its own must not be able
+    to change which model a user's turn runs on.
+    """
+    from nanobot.config.loader import load_config
+    from nanobot.config.schema import ProviderConfig
+
+    config = load_config()
+    defaults = config.agents.defaults
+    creds = request.credentials
+
+    if request.workspace:
+        defaults.workspace = request.workspace
+
+    # A named preset on the sandbox would outrank the fields below
+    # (``resolve_preset`` prefers it), so clear it: the host's selection wins.
+    defaults.model_preset = None
+    if creds.model:
+        defaults.model = creds.model
+    if creds.provider:
+        defaults.provider = creds.provider
+
+    name = (creds.provider or defaults.provider or "auto").strip()
+    if name and name != "auto":
+        existing = getattr(config.providers, name, None)
+        provider_config = existing if isinstance(existing, ProviderConfig) else ProviderConfig()
+        if creds.api_key:
+            provider_config.api_key = creds.api_key
+        if creds.api_base:
+            provider_config.api_base = creds.api_base
+        if creds.extra_headers:
+            provider_config.extra_headers = dict(creds.extra_headers)
+        # ``ProvidersConfig`` allows extra fields, so this also works for a
+        # custom provider the administrator named themselves.
+        setattr(config.providers, name, provider_config)
+
+    for key, value in (request.tools_config or {}).items():
+        if hasattr(config.tools, key):
+            setattr(config.tools, key, value)
+
+    return config
+
+
+def build_loop(request: RemoteTurnRequest) -> LocalLoop:
+    """Compose the agent inside the sandbox, with the host's selection applied."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.agent.tools.registry import ToolRegistry
+
+    config = _config_for(request)
+    loop = AgentLoop.from_config(config, tool_registry=ToolRegistry())
+    return LocalLoop(provider=loop.provider, tools=loop.tools, config=config)
+
+
+class _EventHook:
+    """Turn runner lifecycle into wire events.
+
+    Text the model produces is streamed by the runner's own ``progress_callback``
+    (that is what it carries: assistant deltas, not tool names), so this hook
+    covers the other half -- what the agent is *doing*. Without it the host would
+    see the answer arrive with no sign that any tool ran until the turn ended,
+    which is exactly the frozen-label problem the host's own hooks exist to fix.
+    """
+
+    def __init__(self, emit: Emit) -> None:
+        self._emit = emit
+
+    def wants_streaming(self) -> bool:
+        return False
+
+    async def before_execute_tools(self, context: Any) -> None:
+        for call in getattr(context, "tool_calls", None) or []:
+            name = str(getattr(call, "name", "") or "")
+            if name:
+                await self._emit(
+                    RemoteTurnEvent(
+                        kind="tool",
+                        text=name,
+                        data={"phase": "start", "name": name},
+                    )
+                )
+
+    async def after_execute_tool(self, context: Any, tool_call: Any, tool: Any, params: Any, result: Any) -> None:
+        name = str(getattr(tool_call, "name", "") or getattr(tool, "name", "") or "")
+        await self._emit(
+            RemoteTurnEvent(
+                kind="tool",
+                text=name,
+                data={"phase": "end", "name": name},
+            )
+        )
+
+
+async def run_turn(
+    request: RemoteTurnRequest,
+    *,
+    emit: Emit,
+    loop_factory: Callable[[RemoteTurnRequest], Any] | None = None,
+) -> RemoteTurnEvent:
+    """Run *request* to completion, emitting events. Returns the final event.
+
+    Never raises: a turn that cannot start, or that dies mid-way, is reported as
+    an ``error`` event so the host can fall back to running it itself. A turn
+    that ran and produced nothing is a ``final`` event with empty text -- a
+    different thing, and not a reason to re-run the work.
+    """
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.utils.llm_runtime import LLMRuntime
+
+    try:
+        loop = (loop_factory or build_loop)(request)
+        provider = loop.provider
+        tools = loop.tools
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        logger.exception("remote turn: could not build the turn")
+        final = RemoteTurnEvent(kind="error", text=f"could not build the turn: {exc}")
+        await emit(final)
+        return final
+
+    # ``capture`` rather than a bare constructor: it derives the model's true
+    # context window, which is what makes compaction fire on a small-window
+    # model. A sandbox that guessed 200k would let a long turn grow unbounded.
+    runtime = LLMRuntime.capture(
+        provider,
+        request.credentials.model,
+        context_window_tokens=0,
+    )
+
+    async def on_progress(content: str) -> None:
+        if content:
+            await emit(RemoteTurnEvent(kind="delta", text=content))
+
+    workspace = Path(request.workspace) if request.workspace else None
+
+    spec = AgentRunSpec(
+        initial_messages=list(request.messages),
+        tools=tools,
+        runtime=runtime,
+        max_iterations=request.max_iterations or 0,
+        max_tool_result_chars=request.max_tool_result_chars or 0,
+        workspace=workspace,
+        session_key=request.session_key or None,
+        progress_callback=on_progress,
+        hook=_EventHook(emit),  # type: ignore[arg-type]
+        # The turn budget is enforced in here, on the clock that matters: the
+        # sandbox's, where the work is actually happening. The host's outer
+        # timeout is only the transport bound.
+        turn_budget_s=request.turn_budget_s or None,
+    )
+
+    try:
+        result = await AgentRunner().run(spec)
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        logger.exception("remote turn: the run failed")
+        final = RemoteTurnEvent(kind="error", text=f"the turn failed: {exc}")
+        await emit(final)
+        return final
+
+    final = RemoteTurnEvent(
+        kind="final",
+        text=result.final_content or "",
+        data={
+            "stop_reason": result.stop_reason,
+            "tools_used": list(result.tools_used),
+            "usage": dict(result.usage or {}),
+            # The transcript the host will persist. It travels back with the
+            # result because the host is still the system of record: a turn whose
+            # messages never came home would be a turn the user can see and the
+            # session cannot remember, and the next turn would start from a
+            # transcript that disagrees with the screen.
+            "messages": list(result.messages or []),
+        },
+    )
+    await emit(final)
+    return final
+
+
+async def _amain(request_path: str) -> int:
+    with open(request_path, "r", encoding="utf-8") as handle:
+        request = decode_request(handle.read())
+
+    async def emit(event: RemoteTurnEvent) -> None:
+        sys.stdout.write(encode_event(event) + "\n")
+        sys.stdout.flush()
+
+    final = await run_turn(request, emit=emit)
+    return 0 if final.kind == "final" else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if len(args) != 1:
+        print("usage: python3 -m nanobot.remote_turn.worker <request.json>", file=sys.stderr)
+        return 2
+    try:
+        return asyncio.run(_amain(args[0]))
+    except Exception as exc:  # noqa: BLE001 - the host falls back on a non-zero exit
+        # Last-resort error event: a request that cannot even be parsed still has
+        # to tell the host why, or the host retries the same broken payload.
+        try:
+            sys.stdout.write(
+                encode_event(
+                    RemoteTurnEvent(kind="error", text=f"worker failed to start: {exc}")
+                )
+                + "\n"
+            )
+            sys.stdout.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"worker failed: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised as a subprocess
+    raise SystemExit(main())
