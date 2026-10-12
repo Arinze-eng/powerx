@@ -112,6 +112,106 @@ async def test_a_complete_turn_is_adopted(monkeypatch: pytest.MonkeyPatch) -> No
     assert "-m nanobot.remote_turn.worker" in seen["command"]
 
 
+def _host_request(workspace: str | None) -> RemoteTurnRequest:
+    return RemoteTurnRequest(
+        session_key="telegram:7",
+        messages=[{"role": "user", "content": "hi"}],
+        credentials=ProviderCredentials(
+            provider="deepseek", model="deepseek-chat", api_key="sk-secret"
+        ),
+        workspace=workspace,
+    )
+
+
+async def _dispatch(monkeypatch, request, root: str | None) -> dict[str, Any]:
+    """Dispatch with the sandbox root faked to *root*; return the staged JSON.
+
+    The root is stubbed at ``executor_workspace_root`` because that is the real
+    seam. The dispatcher holds a ``RemoteExecutor`` wrapper rather than a backend,
+    so an attribute on the double would have tested nothing about the production
+    shape.
+    """
+    seen = _patch(monkeypatch, output=_final())
+
+    async def _root(executor: Any, session_key: str | None = None) -> str | None:
+        return root
+
+    monkeypatch.setattr(workspace_bridge, "executor_workspace_root", _root)
+
+    outcome = await _dispatcher(_Executor(name="freestyle")).dispatch(request)
+    assert outcome.ok is True
+    return json.loads(seen["files"]["nanobot_turn_request.json"])
+
+
+async def test_the_host_workspace_is_replaced_by_the_sandboxs_own_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # THE production bug this file covers. The host fills `workspace` with its own
+    # data directory -- /home/nanobot under the gateway image. Handed verbatim to a
+    # freestyle VM that path belongs to a user the worker is not, so composing the
+    # agent raised "[Errno 13] Permission denied: '/home/nanobot'" and every turn
+    # fell back to the host. The switch looked dead even after the package got
+    # installed, because this was the next wall.
+    staged = await _dispatch(
+        monkeypatch, _host_request("/home/nanobot"), "/home/ubuntu/workspace"
+    )
+
+    assert staged["workspace"] == "/home/ubuntu/workspace"
+    assert "/home/nanobot" not in json.dumps(staged)
+
+
+async def test_an_executor_without_a_root_leaves_the_request_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A backend that does not advertise its root is a reason to guess nothing, not
+    # a reason to guess wrong: the worker resolves its own default.
+    staged = await _dispatch(monkeypatch, _host_request("/srv/somewhere"), None)
+
+    assert staged["workspace"] == "/srv/somewhere"
+
+
+async def test_a_missing_workspace_still_gets_the_sandbox_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The host sends no workspace here. Pinning it anyway is the point: a turn's
+    # files must land in the directory the sandbox's own tools are jailed to, not
+    # in a config default those tools will not look at.
+    staged = await _dispatch(monkeypatch, _host_request(None), "/home/ubuntu/workspace")
+
+    assert staged["workspace"] == "/home/ubuntu/workspace"
+
+
+async def test_no_root_and_no_workspace_stays_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nothing is known about where this box keeps files, so nothing is invented.
+    staged = await _dispatch(monkeypatch, _host_request(None), None)
+
+    assert staged["workspace"] is None
+
+
+async def test_a_failing_root_lookup_does_not_lose_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Resolving a root touches the backend, so it can raise. That must not become a
+    # new way to fail a turn: the request goes out as the host wrote it and the
+    # worker's own guard decides what to do with the path.
+    seen = _patch(monkeypatch, output=_final())
+
+    async def _boom(executor: Any, session_key: str | None = None) -> str | None:
+        raise RuntimeError("backend exploded")
+
+    monkeypatch.setattr(workspace_bridge, "executor_workspace_root", _boom)
+
+    outcome = await _dispatcher(_Executor(name="freestyle")).dispatch(
+        _host_request("/home/nanobot")
+    )
+
+    assert outcome.ok is True
+    staged = json.loads(seen["files"]["nanobot_turn_request.json"])
+    assert staged["workspace"] == "/home/nanobot"
+
+
 async def test_the_credentials_travel_in_a_file_not_in_argv(monkeypatch: pytest.MonkeyPatch) -> None:
     # argv lands in the sandbox's process list, where anything on the box can
     # read it. The transcript is also far too large for a command line.

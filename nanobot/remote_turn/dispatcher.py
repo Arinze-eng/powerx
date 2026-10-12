@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import os
 import posixpath
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable
 
 from loguru import logger
@@ -94,6 +94,43 @@ class TurnOutcome:
     events: list[RemoteTurnEvent] = field(default_factory=list)
     error: str = ""
     backend: str = ""
+
+
+async def _sandbox_request(executor: Any, request: RemoteTurnRequest) -> RemoteTurnRequest:
+    """Re-point the request's workspace at the *sandbox's* root.
+
+    ``request.workspace`` is filled in on the host, where it is the host's own data
+    directory -- ``/home/nanobot`` under the gateway image. That path is not the
+    sandbox's: it belongs to a user the worker does not run as, and building the
+    agent on it raised ``[Errno 13] Permission denied: '/home/nanobot'``, which
+    sent every single turn back to the host. The three "fell back to the host"
+    lines in production at 10:05, 10:06 and 10:07 are that bug, and it is why the
+    switch looked dead even once the package was installed.
+
+    A path only means something to the machine that opens it, so the sandbox's view
+    of its workspace is the only one that can be sent. ``executor_workspace_root``
+    is used rather than an attribute read because the dispatcher holds a
+    :class:`RemoteExecutor` wrapper, not a backend, and the two shapes -- plus
+    Novita and VPS, whose roots are configuration-derived -- resolve differently.
+    This also keeps the sandbox's workspace and the workspace its tools are jailed
+    to in step, which is the promise in ``RemoteTurnRequest``'s docstring: a turn
+    run in the sandbox sees the same files the host's tool calls would have written.
+
+    When the host sent no workspace the root is still applied, because a turn's
+    files have to land where the sandbox's own tools look. If the root cannot be
+    resolved, nothing is invented: the request goes out unchanged and the worker
+    falls back to its own default rather than to the host.
+    """
+    from nanobot.agent.tools.workspace_bridge import executor_workspace_root
+
+    try:
+        root = await executor_workspace_root(executor, session_key=request.session_key)
+    except Exception as exc:  # noqa: BLE001 - an unknown root must not lose a turn
+        logger.debug("remote turn: workspace root lookup failed: {}", exc)
+        return request
+    if not root or request.workspace == root:
+        return request
+    return replace(request, workspace=str(root))
 
 
 class SandboxTurnDispatcher:
@@ -182,6 +219,8 @@ class SandboxTurnDispatcher:
             run_remote,
             write_files_to_sandbox,
         )
+
+        request = await _sandbox_request(executor, request)
 
         # The worker reads its request from a file, not from argv: a transcript is
         # far too large for a command line, and an argument would land in the

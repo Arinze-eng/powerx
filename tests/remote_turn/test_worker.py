@@ -188,10 +188,25 @@ def test_the_admin_selection_overrides_a_stale_sandbox_config() -> None:
     assert config.providers.openrouter.api_base == "https://example.test/v1"
 
 
-def test_the_sandbox_workspace_comes_from_the_host() -> None:
-    config = _config_for(_request(workspace="/workspace/telegram-42"))
+def test_the_sandbox_workspace_comes_from_the_host(tmp_path: Any) -> None:
+    # It used to be an unconditional copy, which is how a host path -- meaningful
+    # only to the host -- reached the sandbox and blew up on permission denied. The
+    # dispatcher now sends the sandbox's own root; this asserts the worker applies
+    # a workspace it is actually given, on a directory this box can use.
+    wanted = tmp_path / "telegram-42"
 
-    assert config.agents.defaults.workspace == "/workspace/telegram-42"
+    config = _config_for(_request(workspace=str(wanted)))
+
+    assert config.agents.defaults.workspace == str(wanted)
+
+
+def test_an_unusable_workspace_does_not_override_the_sandbox_default() -> None:
+    # A path the worker cannot open must not be written into the config: leaving
+    # the sandbox's own value in place is what keeps the turn running in the
+    # sandbox instead of failing back to the host.
+    config = _config_for(_request(workspace="/proc/definitely-not-writable/x"))
+
+    assert config.agents.defaults.workspace != "/proc/definitely-not-writable/x"
 
 
 _LANES = [
@@ -271,6 +286,27 @@ def test_the_switch_that_keeps_the_sandboxs_own_lane_out_is_what_does_it() -> No
         "lane-b",
         "admin-main",
     ]
+
+
+def test_the_worker_survives_a_workspace_it_cannot_use(tmp_path: Any) -> None:
+    # The dispatcher rewrites the path, but a backend that exposes no root, an
+    # operator-pinned request, or a read-only mount can still deliver a directory
+    # the worker cannot open. That used to raise straight out of build_loop and
+    # fail the turn; now it degrades to the sandbox's own default.
+    from nanobot.remote_turn.worker import _usable_workspace
+
+    good = tmp_path / "workspace"
+    assert _usable_workspace(str(good)) == str(good)
+    assert good.is_dir(), "the workspace is created if the sandbox lacks it"
+
+    # A path *through* a regular file cannot be mkdir'd for anyone, root included,
+    # so this exercises the failure without depending on the uid the suite runs as.
+    obstacle = tmp_path / "afile"
+    obstacle.write_text("not a directory", encoding="utf-8")
+    assert _usable_workspace(str(obstacle / "nested")) is None
+
+    assert _usable_workspace(None) is None
+    assert _usable_workspace("") is None
 
 
 def test_build_loop_composes_the_real_agent() -> None:

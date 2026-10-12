@@ -112,6 +112,38 @@ def apply_pool(request: RemoteTurnRequest) -> int:
     return len(entries)
 
 
+def _usable_workspace(raw: str | None) -> str | None:
+    """The requested workspace if *this* box can actually use it, else ``None``.
+
+    The dispatcher rewrites the path to the sandbox's own root, so reaching the
+    worker with a path the worker cannot open means something is off -- a backend
+    that does not expose a root, an operator who pinned a request by hand, a
+    read-only mount. Every one of those used to raise out of ``build_loop`` and
+    fail the whole turn.
+
+    ``None`` is the graceful answer, because both consumers already treat it as
+    "use the sandbox's own default". A turn that runs in a directory the operator
+    did not name is a much better outcome than a turn that runs on the host
+    because a path was wrong, and the fallback stays visible in the log.
+    """
+    if not raw:
+        return None
+    path = Path(raw)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".nanobot-turn-write-test"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "remote turn: workspace {} is unusable ({}); using the sandbox default",
+            raw,
+            exc,
+        )
+        return None
+    return str(path)
+
+
 def _config_for(request: RemoteTurnRequest) -> Any:
     """Build the config the sandbox will run the turn under.
 
@@ -128,8 +160,9 @@ def _config_for(request: RemoteTurnRequest) -> Any:
     defaults = config.agents.defaults
     creds = request.credentials
 
-    if request.workspace:
-        defaults.workspace = request.workspace
+    sandbox_workspace = _usable_workspace(request.workspace)
+    if sandbox_workspace:
+        defaults.workspace = sandbox_workspace
 
     # A named preset on the sandbox would outrank the fields below
     # (``resolve_preset`` prefers it), so clear it: the host's selection wins.
@@ -275,7 +308,9 @@ async def run_turn(
         if content:
             await emit(RemoteTurnEvent(kind="delta", text=content))
 
-    workspace = Path(request.workspace) if request.workspace else None
+    # Resolved the same way _config_for resolves it, so the runner and the config
+    # cannot end up pointing the turn at two different directories.
+    workspace = Path(w) if (w := _usable_workspace(request.workspace)) else None
 
     spec = AgentRunSpec(
         initial_messages=list(request.messages),
