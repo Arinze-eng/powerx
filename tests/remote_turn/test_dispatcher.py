@@ -16,7 +16,12 @@ from typing import Any
 import pytest
 
 from nanobot.agent.tools import workspace_bridge
-from nanobot.remote_turn.dispatcher import SandboxTurnDispatcher, TurnEventConsumerError
+from nanobot.remote_turn.dispatcher import (
+    DIAGNOSTIC_TAIL_CHARS,
+    SandboxTurnDispatcher,
+    TurnEventConsumerError,
+    _no_final_reason,
+)
 from nanobot.remote_turn.protocol import (
     REQUEST_PATH,
     ProviderCredentials,
@@ -413,3 +418,109 @@ async def test_a_broken_event_consumer_is_not_swallowed(monkeypatch: pytest.Monk
 
     with pytest.raises(TurnEventConsumerError, match="consumer is broken"):
         await _dispatcher(_Executor()).dispatch(_request(), on_event=_boom)
+
+
+# --------------------------------------------------- the fallback reason itself
+#
+# A silent worker used to be reported as "the sandbox worker produced no final
+# event (ok=True)". Production then showed a Freestyle 409 -- the VM had spent its
+# whole runtime budget -- sitting in the output that message discarded, and the
+# line was still pointing at the worker. These tests hold the reason to what the
+# box actually said.
+
+
+def test_the_reason_quotes_the_sandbox_output_that_was_discarded() -> None:
+    conflict = (
+        'Freestyle POST /v5/vms/vm-f313a/exec-await returned 409: '
+        '{"code":"CONFLICT","message":"has used its total runtime budget of 6600s"}'
+    )
+
+    reason = _no_final_reason(
+        ok=True, output=conflict, events=[], provision_failed=False
+    )
+
+    # The sentence that names the real cause must survive into the log line.
+    assert "409" in reason
+    assert "runtime budget" in reason
+    # ok=True is preserved: it is the fact that makes this interesting.
+    assert "ok=True" in reason
+
+
+def test_the_reason_distinguishes_silence_from_a_backend_answer() -> None:
+    # An empty output means the command ran and printed nothing. A non-empty one
+    # means something answered -- usually the backend, not the worker -- and those
+    # are two different incidents for whoever is on call.
+    empty = _no_final_reason(ok=True, output="", events=[], provision_failed=False)
+    assert "no output at all" in empty
+
+    answered = _no_final_reason(
+        ok=True, output="vm is paused", events=[], provision_failed=False
+    )
+    assert "vm is paused" in answered
+
+
+def test_the_reason_says_so_when_provisioning_already_failed() -> None:
+    # "the package never installed" and "the worker went quiet on a good box" are
+    # fixed by different people; the reason should not make the reader guess.
+    reason = _no_final_reason(
+        ok=True, output="", events=[], provision_failed=True
+    )
+
+    assert "provisioning the sandbox had already failed" in reason
+
+
+def test_the_reason_stays_a_single_bounded_log_line() -> None:
+    # The tail is quoted, not the whole transcript: this goes into a log line and
+    # a sandbox can emit megabytes.
+    long_output = "y" * 20_000
+
+    reason = _no_final_reason(
+        ok=False, output=long_output, events=[], provision_failed=False
+    )
+
+    quoted = reason.split(": ", 1)[1]
+    assert quoted == "…" + long_output[-DIAGNOSTIC_TAIL_CHARS:]
+    assert len(reason) <= DIAGNOSTIC_TAIL_CHARS + 200
+
+
+async def test_a_silent_sandbox_reports_what_the_backend_said(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # End to end through dispatch(): the reason the host logs is the provider's
+    # own words, not a summary of the worker's absence.
+    async def _write(files: Any, remote_dir: str, *, executor: Any = None) -> tuple[bool, str]:
+        return True, "ok"
+
+    async def _run(command: str, *, timeout: int = 120, executor: Any = None) -> tuple[bool, str]:
+        if "-m nanobot.remote_turn.worker" in command:
+            return True, "exec-await returned 409: budget spent"
+        return True, ""
+
+    monkeypatch.setattr(workspace_bridge, "write_files_to_sandbox", _write)
+    monkeypatch.setattr(workspace_bridge, "run_remote", _run)
+
+    outcome = await _dispatcher(_Executor(name="freestyle")).dispatch(_request())
+
+    assert outcome.ok is False
+    assert "409" in outcome.error
+    assert "budget spent" in outcome.error
+
+
+async def test_a_provisioning_failure_is_named_in_the_fallback_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _write(files: Any, remote_dir: str, *, executor: Any = None) -> tuple[bool, str]:
+        return True, "ok"
+
+    async def _run(command: str, *, timeout: int = 120, executor: Any = None) -> tuple[bool, str]:
+        if "-m nanobot.remote_turn.worker" in command:
+            return True, ""          # the worker said nothing
+        return False, "no uv on this box"   # provisioning failed
+
+    monkeypatch.setattr(workspace_bridge, "write_files_to_sandbox", _write)
+    monkeypatch.setattr(workspace_bridge, "run_remote", _run)
+
+    outcome = await _dispatcher(_Executor(name="freestyle")).dispatch(_request())
+
+    assert outcome.ok is False
+    assert "provisioning the sandbox had already failed" in outcome.error

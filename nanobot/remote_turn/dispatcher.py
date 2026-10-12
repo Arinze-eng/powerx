@@ -133,6 +133,42 @@ async def _sandbox_request(executor: Any, request: RemoteTurnRequest) -> RemoteT
     return replace(request, workspace=str(root))
 
 
+#: How much of the sandbox's own output gets quoted when a turn brings back no
+#: result. Small enough to stay a log line, large enough to hold a provider error.
+DIAGNOSTIC_TAIL_CHARS = 400
+
+
+def _no_final_reason(
+    *, ok: bool, output: str, events: list[RemoteTurnEvent], provision_failed: bool
+) -> str:
+    """Explain a turn with no result using what the sandbox actually said.
+
+    Production made the cost of a vague reason concrete. A dispatch reported
+    "the sandbox worker produced no final event (ok=True)" while the real cause --
+    a Freestyle 409 saying the VM had spent its entire runtime budget -- was
+    sitting in the very output that got discarded, and surfaced only from an
+    unrelated code path. Reading that line sent someone hunting a worker bug that
+    did not exist.
+
+    So quote the output. Two distinctions are worth preserving. ``ok=True`` with
+    non-JSONL prose is not "the worker said nothing", it is the *backend*
+    answering the command, which is why a zero exit code is not evidence of
+    success. And a completely empty output is its own signal -- the command ran
+    and printed nothing -- so it is named rather than rendered as a bare quote.
+
+    A failed provision is mentioned because it separates "the package is not on
+    this box" from "the box is fine and the worker went quiet", which are fixed by
+    different people.
+    """
+    head = f"sandbox worker returned no final event ({ok=}, {len(events)} event(s))"
+    if provision_failed:
+        head += " -- provisioning the sandbox had already failed"
+    tail = " ".join((output or "").split())
+    if not tail:
+        return f"{head}: the sandbox produced no output at all"
+    return f"{head}: …{tail[-DIAGNOSTIC_TAIL_CHARS:]}"
+
+
 class SandboxTurnDispatcher:
     """Runs one turn in the configured sandbox and streams its events back.
 
@@ -239,6 +275,10 @@ class SandboxTurnDispatcher:
         # rate limit, no uv) is logged and the worker is tried anyway. A box
         # that genuinely could not be provisioned then fails at the worker step
         # and falls back to the host -- the same outcome as before this existed.
+        # Remembered for the fallback reason only. A turn that cannot install its
+        # package and a turn whose worker went silent are different incidents, and
+        # the log line should not make the reader guess which one it is looking at.
+        provision_failed = False
         if bootstrap_enabled():
             provisioned, provision_output = await run_remote(
                 provision_command(),
@@ -246,6 +286,7 @@ class SandboxTurnDispatcher:
                 executor=executor,
             )
             if not provisioned:
+                provision_failed = True
                 logger.warning(
                     "Remote turn: could not provision the {} sandbox; trying the "
                     "worker anyway: {}",
@@ -284,7 +325,13 @@ class SandboxTurnDispatcher:
             return TurnOutcome(
                 ok=False,
                 events=events,
-                error=error_text or f"the sandbox worker produced no final event ({ok=})",
+                error=error_text
+                or _no_final_reason(
+                    ok=ok,
+                    output=output or "",
+                    events=events,
+                    provision_failed=provision_failed,
+                ),
             )
 
         messages = list(final.data.get("messages") or [])
