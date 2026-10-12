@@ -283,3 +283,64 @@ def test_build_loop_composes_the_real_agent() -> None:
     definitions = loop.tools.get_definitions()
     assert definitions
     assert any(d.get("function", {}).get("name") == "exec" for d in definitions)
+
+
+def test_the_event_hook_satisfies_the_runners_whole_contract() -> None:
+    """Guards the bug that made every failing turn look like a broken worker.
+
+    ``_EventHook`` implemented only the two methods this file calls by hand.
+    ``AgentRunner`` calls more than that, and its ``on_error`` fires on every
+    failed provider call -- so a bad API key, a rate limit or a 5xx raised
+    ``AttributeError`` inside the worker instead of reporting the failure, and
+    the host saw a crashed worker where it should have seen a fallback.
+
+    Asserting the methods exist is the point: this is a duck-typing contract with
+    a caller in another module, so the only thing that keeps it from regressing is
+    a test that enumerates the surface.
+    """
+    from nanobot.remote_turn.worker import _EventHook
+
+    hook = _EventHook(emit=None)
+    for name in (
+        "before_run",
+        "after_run",
+        "on_error",
+        "on_finally",
+        "before_iteration",
+        "after_iteration",
+        "on_stream",
+        "on_stream_end",
+        "on_provider_tool_event",
+        "before_execute_tools",
+        "before_execute_tool",
+        "after_execute_tool",
+        "wants_streaming",
+        "finalize_content",
+        "emit_reasoning",
+    ):
+        assert hasattr(hook, name), f"_EventHook is missing {name}"
+
+
+async def test_a_provider_failure_comes_back_as_an_error_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The behavioural half of the test above: a failed turn is reported, not
+    # raised, so the host falls back instead of losing the turn.
+    async def _boom(self: Any, spec: Any) -> AgentRunResult:
+        await spec.hook.on_error(
+            SimpleNamespace(error="Error: bad api key", exception=None)
+        )
+        raise RuntimeError("Error: bad api key")
+
+    monkeypatch.setattr(runner_module.AgentRunner, "run", _boom)
+    events: list[RemoteTurnEvent] = []
+
+    async def _emit(event: RemoteTurnEvent) -> None:
+        events.append(event)
+
+    final = await run_turn(_request(), emit=_emit, loop_factory=lambda _r: _loop())
+
+    assert final.kind == "error"
+    assert any(e.kind == "error" and "bad api key" in e.text for e in events)
+    # The hook must not swallow the failure into an apparent success.
+    assert all(e.kind != "final" for e in events)

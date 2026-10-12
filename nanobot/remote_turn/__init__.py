@@ -18,12 +18,21 @@ becomes a relay.
 WHAT IS IN HERE
 ---------------
 ``protocol``    the wire format: one JSON request in, JSONL events out.
+``bootstrap``   provisioning the sandbox so a worker can run there at all.
 ``worker``      what runs inside the sandbox: ``python -m nanobot.remote_turn.worker``.
-``dispatcher``  the host side: stage the request, run the worker, re-emit events.
+``dispatcher``  the host side: stage the request, provision, run, re-emit events.
 
 The split is deliberate: the protocol has no imports from the agent, so it can be
 tested as plain data, and the dispatcher talks to an *executor* rather than to any
 one provider, so it works unchanged for every backend the admin can select.
+
+WHY PROVISIONING IS PART OF THIS
+--------------------------------
+The worker imports the ``nanobot`` package, and a sandbox image is a bare Linux
+userland. Something has to put the package there, and baking it into the sandbox
+template would put the gateway's whole dependency tree -- the memory cost this
+feature exists to remove -- on every box. So the turn provisions the box it is
+about to run on. See ``bootstrap``.
 
 FAIL-OPEN
 ---------
@@ -36,6 +45,13 @@ never be able to lose a turn.
 
 from __future__ import annotations
 
+from nanobot.remote_turn.bootstrap import (
+    BOOTSTRAP_ENV,
+    bootstrap_enabled,
+    dispatch_command,
+    provision_command,
+    worker_command,
+)
 from nanobot.remote_turn.dispatcher import (
     TURN_HOST_ENV,
     SandboxTurnDispatcher,
@@ -45,8 +61,8 @@ from nanobot.remote_turn.dispatcher import (
 )
 from nanobot.remote_turn.protocol import (
     PROTOCOL_VERSION,
-    RemoteTurnRequest,
     RemoteTurnEvent,
+    RemoteTurnRequest,
     TurnEventKind,
     decode_event,
     decode_request,
@@ -55,6 +71,7 @@ from nanobot.remote_turn.protocol import (
 )
 
 __all__ = [
+    "BOOTSTRAP_ENV",
     "PROTOCOL_VERSION",
     "RemoteTurnEvent",
     "RemoteTurnRequest",
@@ -63,9 +80,13 @@ __all__ = [
     "TurnEventConsumerError",
     "TurnEventKind",
     "TurnOutcome",
+    "bootstrap_enabled",
     "decode_event",
     "decode_request",
+    "dispatch_command",
     "encode_event",
     "encode_request",
+    "provision_command",
     "sandbox_turns_enabled",
+    "worker_command",
 ]

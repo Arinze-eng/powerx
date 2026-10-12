@@ -6,6 +6,15 @@ which is the same resolver every other sandbox tool already uses, so a turn move
 to novita, freestyle, tenki, runloop or vps by changing the admin's selection and
 nothing else.
 
+THREE STEPS, NOT ONE
+--------------------
+Staging, provisioning, running. The middle step is what makes the feature work at
+all: the worker is ``python -m nanobot.remote_turn.worker``, which needs the
+package on the box, and the sandbox images do not ship it. Provisioning is the
+turn's own responsibility (see :mod:`nanobot.remote_turn.bootstrap`) because the
+alternative -- baking this dependency tree into every sandbox template -- is the
+memory cost the feature exists to remove.
+
 It never raises. Every failure returns a :class:`TurnOutcome` with ``ok=False``,
 because the caller's correct response to "the sandbox could not run this turn" is
 to run it on the host exactly as before -- not to fail the user's request.
@@ -21,9 +30,14 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.remote_turn.bootstrap import (
+    BOOTSTRAP_TIMEOUT_S,
+    bootstrap_enabled,
+    provision_command,
+    worker_command,
+)
 from nanobot.remote_turn.protocol import (
     REQUEST_PATH,
-    WORKER_COMMAND,
     RemoteTurnEvent,
     RemoteTurnRequest,
     decode_event,
@@ -180,7 +194,27 @@ class SandboxTurnDispatcher:
         if not staged:
             return TurnOutcome(ok=False, error=f"could not stage the turn: {detail}")
 
-        command = WORKER_COMMAND.format(request_path=REQUEST_PATH)
+        # Provision the box before the worker needs the package. Best-effort on
+        # purpose: a sandbox left provisioned by an earlier turn must still be
+        # able to run this one, so a refresh that fails (GitHub unreachable, a
+        # rate limit, no uv) is logged and the worker is tried anyway. A box
+        # that genuinely could not be provisioned then fails at the worker step
+        # and falls back to the host -- the same outcome as before this existed.
+        if bootstrap_enabled():
+            provisioned, provision_output = await run_remote(
+                provision_command(),
+                timeout=BOOTSTRAP_TIMEOUT_S,
+                executor=executor,
+            )
+            if not provisioned:
+                logger.warning(
+                    "Remote turn: could not provision the {} sandbox; trying the "
+                    "worker anyway: {}",
+                    getattr(executor, "name", "") or "configured",
+                    (provision_output or "").strip()[-300:],
+                )
+
+        command = worker_command(REQUEST_PATH)
         ok, output = await run_remote(
             command, timeout=self._timeout_s, executor=executor
         )

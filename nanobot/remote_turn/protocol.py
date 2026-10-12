@@ -32,8 +32,13 @@ PROTOCOL_VERSION = 1
 #: into "the turn could not be staged" for no reason.
 REQUEST_PATH = "/tmp/nanobot_turn_request.json"
 
-#: The sandbox command the dispatcher runs. ``python3`` rather than ``python``:
-#: the backends' base images ship the former.
+#: The sandbox command that runs a turn, once the box is provisioned.
+#:
+#: Every backend's base image ships ``python3``, so the fallback is safe; the
+#: preferred interpreter is the venv the installer builds, because that is where
+#: the ``nanobot`` package lives. Historical note: this used to be a bare
+#: ``python3 -m nanobot.remote_turn.worker``, which could never succeed because
+#: nothing put the package on the box -- see ``nanobot.remote_turn.bootstrap``.
 WORKER_COMMAND = "python3 -m nanobot.remote_turn.worker {request_path}"
 
 TurnEventKind = Literal["delta", "tool", "final", "error", "log"]

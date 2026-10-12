@@ -62,7 +62,12 @@ def _final(text: str = "done", messages: list[dict[str, Any]] | None = None) -> 
 
 
 def _patch(monkeypatch: pytest.MonkeyPatch, *, output: str, staged: bool = True) -> dict[str, Any]:
-    seen: dict[str, Any] = {}
+    """Stub the two remote calls a dispatch makes: provision, then the worker.
+
+    ``seen["commands"]`` is every command in order; ``seen["command"]`` stays the
+    worker's alone, because that is the one most tests care about.
+    """
+    seen: dict[str, Any] = {"commands": []}
 
     async def _write(files: Any, remote_dir: str, *, executor: Any = None) -> tuple[bool, str]:
         seen["files"] = dict(files)
@@ -71,9 +76,14 @@ def _patch(monkeypatch: pytest.MonkeyPatch, *, output: str, staged: bool = True)
         return (staged, "ok" if staged else "nope")
 
     async def _run(command: str, *, timeout: int = 120, executor: Any = None) -> tuple[bool, str]:
-        seen["command"] = command
+        seen["commands"].append(command)
         seen["timeout"] = timeout
-        return True, output
+        # Only the worker produces the turn's output; the provisioning step
+        # reports success without emitting events.
+        if "-m nanobot.remote_turn.worker" in command:
+            seen["command"] = command
+            return True, output
+        return True, ""
 
     monkeypatch.setattr(workspace_bridge, "write_files_to_sandbox", _write)
     monkeypatch.setattr(workspace_bridge, "run_remote", _run)
@@ -99,7 +109,7 @@ async def test_a_complete_turn_is_adopted(monkeypatch: pytest.MonkeyPatch) -> No
     assert outcome.usage == {"input_tokens": 3, "output_tokens": 4}
     assert outcome.backend == "novita"
     assert outcome.messages == [{"role": "assistant", "content": "done"}]
-    assert seen["command"].startswith("python3 -m nanobot.remote_turn.worker")
+    assert "-m nanobot.remote_turn.worker" in seen["command"]
 
 
 async def test_the_credentials_travel_in_a_file_not_in_argv(monkeypatch: pytest.MonkeyPatch) -> None:

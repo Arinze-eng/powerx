@@ -41,6 +41,7 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.agent.hook import AgentHook
 from nanobot.remote_turn.protocol import (
     RemoteTurnEvent,
     RemoteTurnRequest,
@@ -172,7 +173,7 @@ def build_loop(request: RemoteTurnRequest) -> LocalLoop:
     return LocalLoop(provider=loop.provider, tools=loop.tools, config=config)
 
 
-class _EventHook:
+class _EventHook(AgentHook):
     """Turn runner lifecycle into wire events.
 
     Text the model produces is streamed by the runner's own ``progress_callback``
@@ -180,13 +181,37 @@ class _EventHook:
     covers the other half -- what the agent is *doing*. Without it the host would
     see the answer arrive with no sign that any tool ran until the turn ended,
     which is exactly the frozen-label problem the host's own hooks exist to fix.
+
+    It inherits ``AgentHook`` rather than duck-typing the two methods this file
+    happens to use. It did not, and the runner's ``on_error`` call -- which fires
+    on every failed provider call -- raised ``AttributeError`` instead of
+    reporting the failure: a bad API key, a rate limit or a 5xx turned into a
+    worker crash rather than a clean error event. Inheriting the base makes the
+    runner's full contract satisfied by construction, so adding a hook call
+    upstream cannot silently brick the worker again.
     """
 
     def __init__(self, emit: Emit) -> None:
+        super().__init__()
         self._emit = emit
 
     def wants_streaming(self) -> bool:
         return False
+
+    async def on_error(self, context: Any) -> None:
+        """Report a failed run as an error event instead of crashing the worker.
+
+        The dispatcher falls back to the host on an ``error`` event, which is the
+        right outcome for a provider failure: the turn is not lost, it is simply
+        run where it would have run before this feature existed.
+        """
+        error = str(getattr(context, "error", "") or "").strip()
+        exception = getattr(context, "exception", None)
+        if not error and exception is not None:
+            error = f"the turn failed: {type(exception).__name__}: {exception}"
+        await self._emit(
+            RemoteTurnEvent(kind="error", text=error or "the turn failed")
+        )
 
     async def before_execute_tools(self, context: Any) -> None:
         for call in getattr(context, "tool_calls", None) or []:
@@ -224,7 +249,7 @@ async def run_turn(
     that ran and produced nothing is a ``final`` event with empty text -- a
     different thing, and not a reason to re-run the work.
     """
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
     from nanobot.utils.llm_runtime import LLMRuntime
 
     try:
