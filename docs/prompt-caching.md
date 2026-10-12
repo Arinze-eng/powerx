@@ -269,3 +269,19 @@ asserted in `test_extract_usage_cached_tokens_zero_should_not_be_included` — s
 the meter has no way to distinguish them without a change to that shape. This is
 left as a known gap rather than papered over: read a `0.0` on a *cold* turn as
 "nothing to cache yet", not as a measurement.
+
+## The other lever on the same page: reasoning effort
+
+Caching makes a repeated prefix cheaper; it does not make the model *write* less.
+The cost that dominates a slow reasoning model is the tokens it emits before it
+acts, and the admin page exposes that as **Reasoning effort** (`none` …
+`max`, or unset for the endpoint's own default). It is saved on the live preset
+(`agents.defaults.reasoningEffort`, or the active named preset's), so no
+environment variable is needed, and it applies to every call of a task — the
+tool-call steps included, which is where a hundred-step task pays it.
+
+It reaches the pool lanes as well: the runner reads the effort off the runtime's
+generation settings and passes it to `provider.chat`, and every lane is built
+with those same settings. `POWERX_SPEED_PROFILE` still wins over the saved value
+when it is set, and the page reports the value that is actually in force rather
+than the one that is merely saved.

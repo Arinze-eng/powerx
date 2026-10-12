@@ -404,12 +404,23 @@ def make_pool_provider(config: Config, *, preset: ModelPresetConfig) -> LLMProvi
     from nanobot.providers.pool_provider import PoolProvider
 
     generation = preset.to_generation_settings()
+    # The admin page's prompt-cache choice has to reach the pool's own lanes, not
+    # just the last-resort admin lane.
+    #
+    # The select is saved to ``providers.custom.prompt_cache``, and only the
+    # admin lane was built from that provider (via ``_make_provider_core``).
+    # Every other lane was built here with no ``prompt_cache`` at all, so it fell
+    # back to the environment/default mode. On a pool-backed deployment the lanes
+    # are what serve every request, so an operator who chose "markers" got "auto"
+    # on the path that actually carries the traffic and the setting was dead.
+    pool_cache_mode = getattr(config.providers.custom, "prompt_cache", None)
     lanes: list[tuple[dict[str, Any], LLMProvider]] = []
     for entry in entries:
         lane = OpenAICompatProvider(
             api_key=str(entry.get("apiKey") or ""),
             api_base=str(entry.get("baseUrl") or ""),
             default_model=str(entry.get("model") or preset.model),
+            prompt_cache=pool_cache_mode,
         )
         lane.generation = generation
         lanes.append((entry, lane))

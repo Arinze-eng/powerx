@@ -163,3 +163,101 @@ def test_provider_signature_tracks_pool_lane_changes(
 
     monkeypatch.setenv("PROVIDER-POOL-DISABLED", "1")
     assert provider_signature(config) != with_lane
+
+
+def _config_with_prompt_cache(tmp_path: Path, cache_mode: str) -> object:
+    path = tmp_path / f"config-{cache_mode}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "agents": {"defaults": {"model": f"custom/{_MAIN_MODEL}"}},
+                "providers": {
+                    "custom": {
+                        "apiBase": _MAIN_BASE,
+                        "apiKey": _MAIN_KEY,
+                        "promptCache": cache_mode,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return load_config(path)
+
+
+def test_pool_lanes_inherit_the_admin_prompt_cache_choice(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The admin page's cache choice must reach the lanes that serve traffic.
+
+    It is saved to ``providers.custom.prompt_cache`` and only the last-resort
+    admin lane was built from that provider; the pool's own lanes were built
+    with no ``prompt_cache`` at all and fell back to the default mode. On a
+    pool-backed deployment those lanes answer every request, so the setting was
+    dead exactly where it mattered.
+    """
+    _pool_env(monkeypatch, [_POOL_LANE])
+    provider = make_provider(_config_with_prompt_cache(tmp_path, "markers"))
+
+    assert isinstance(provider, PoolProvider)
+    pool_entry, pool_lane = provider.lanes[0]
+    assert pool_entry["id"] == "lane-1"
+    assert pool_lane._cache_markers_for("pool-model") is True
+
+
+def test_pool_lanes_leave_markers_off_when_the_admin_chose_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The control: with no saved mode the lane stays at the safe default."""
+    _pool_env(monkeypatch, [_POOL_LANE])
+    provider = make_provider(_config_with_prompt_cache(tmp_path, "auto"))
+
+    assert isinstance(provider, PoolProvider)
+    _, pool_lane = provider.lanes[0]
+    assert pool_lane._cache_markers_for("pool-model") is False
+
+
+def _config_with_effort(tmp_path: Path, effort: str) -> object:
+    path = tmp_path / f"config-effort-{effort}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "agents": {"defaults": {"model": f"custom/{_MAIN_MODEL}", "reasoningEffort": effort}},
+                "providers": {"custom": {"apiBase": _MAIN_BASE, "apiKey": _MAIN_KEY}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return load_config(path)
+
+
+def test_pool_carries_the_admin_reasoning_effort_to_a_lane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The provider page's effort control has to reach a pool lane's call.
+
+    The runner reads the effort off the runtime's generation settings and passes
+    it to ``provider.chat``, so a pool that dropped it would leave the lanes
+    thinking at the endpoint default while the admin page reported the saved
+    value as live.
+    """
+    _pool_env(monkeypatch, [_POOL_LANE])
+    provider = make_provider(_config_with_effort(tmp_path, "none"))
+
+    assert isinstance(provider, PoolProvider)
+    assert provider.generation.reasoning_effort == "none"
+
+    _, pool_lane = provider.lanes[0]
+    seen: dict[str, object] = {}
+
+    async def _chat(**kwargs: object) -> LLMResponse:
+        seen.update(kwargs)
+        return LLMResponse(content="ok")
+
+    monkeypatch.setattr(pool_lane, "chat", _chat)
+    response = asyncio.run(
+        provider.chat(_MESSAGES, reasoning_effort=provider.generation.reasoning_effort)
+    )
+
+    assert response.content == "ok"
+    assert seen["reasoning_effort"] == "none"

@@ -1557,3 +1557,183 @@ def test_the_freestyle_page_does_not_overclaim_what_rotation_buys(monkeypatch) -
     body = bytes(response.body).decode()
     assert "a key only adds capacity when it belongs to a DIFFERENT account" in body
     assert "two lanes reporting the same VM count" in body
+
+
+def _deployment_config(tmp_path: Path) -> Path:
+    """A config file shaped the way the deployment persists one."""
+    config_path = tmp_path / "config.json"
+    source = Path(__file__).parents[1] / "render-config.json"
+    config_path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    return config_path
+
+
+def test_admin_provider_settings_save_persists_reasoning_effort(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The biggest wall-clock lever has to be settable from this page.
+
+    ``nanobot.agent.speed`` documents reasoning effort as the single largest
+    cost in a turn, and the deployment ships ``medium``. Until this control
+    existed the only way to change it was a config file or an environment
+    variable, neither of which the admin page could reach.
+    """
+    config_path = _deployment_config(tmp_path)
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+    monkeypatch.delenv("POWERX_SPEED_PROFILE", raising=False)
+
+    request = _request("/api/admin/provider-settings/save")
+    request._nanobot_webui_mutation_payload = {
+        "apiBase": "https://example.test/v1",
+        "apiKey": "secret-value",
+        "model": "example-model",
+        "reasoningEffort": "none",
+    }
+    response = admin_registry.admin_route(
+        request,
+        "/api/admin/provider-settings/save",
+        refresh_runtime_config=lambda: None,
+    )
+
+    assert response is not None
+    assert response.status_code == 200
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["agents"]["defaults"]["reasoningEffort"] == "none"
+    body = json.loads(bytes(response.body).decode())
+    assert body["reasoningEffort"] == "none"
+    assert body["effectiveReasoningEffort"] == "none"
+
+
+def test_admin_provider_settings_reject_an_unknown_reasoning_effort(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A typo must be refused, not written through to the model call."""
+    config_path = _deployment_config(tmp_path)
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+
+    request = _request("/api/admin/provider-settings/save")
+    request._nanobot_webui_mutation_payload = {
+        "apiBase": "https://example.test/v1",
+        "apiKey": "secret-value",
+        "model": "example-model",
+        "reasoningEffort": "turbo",
+    }
+    response = admin_registry.admin_route(
+        request,
+        "/api/admin/provider-settings/save",
+        refresh_runtime_config=lambda: None,
+    )
+
+    assert response is not None
+    assert response.status_code == 400
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["agents"]["defaults"]["reasoningEffort"] == "medium"
+    assert saved["providers"]["custom"]["apiBase"] != "https://example.test/v1"
+
+
+def test_admin_provider_settings_keep_the_saved_effort_when_it_is_omitted(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """An older page that does not send the field must not clear it."""
+    config_path = _deployment_config(tmp_path)
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+
+    request = _request("/api/admin/provider-settings/save")
+    request._nanobot_webui_mutation_payload = {
+        "apiBase": "https://example.test/v1",
+        "apiKey": "secret-value",
+        "model": "example-model",
+    }
+    response = admin_registry.admin_route(
+        request,
+        "/api/admin/provider-settings/save",
+        refresh_runtime_config=lambda: None,
+    )
+
+    assert response is not None
+    assert response.status_code == 200
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["agents"]["defaults"]["reasoningEffort"] == "medium"
+
+
+def test_admin_provider_settings_write_into_the_active_named_preset(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """With a named preset selected, ``agents.defaults`` is not what runs.
+
+    ``Config.resolve_preset`` reads generation settings from the named preset,
+    so a control that only wrote the default would look saved and change
+    nothing.
+    """
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {"defaults": {"model": "custom/example-model", "modelPreset": "primary"}},
+                "modelPresets": {
+                    "primary": {
+                        "model": "custom/example-model",
+                        "provider": "custom",
+                        "reasoningEffort": "high",
+                    }
+                },
+                "providers": {"custom": {"apiBase": "https://example.test/v1", "apiKey": "k"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+    monkeypatch.delenv("POWERX_SPEED_PROFILE", raising=False)
+
+    request = _request("/api/admin/provider-settings/save")
+    request._nanobot_webui_mutation_payload = {
+        "apiBase": "https://example.test/v1",
+        "apiKey": "secret-value",
+        "model": "example-model",
+        "reasoningEffort": "low",
+    }
+    response = admin_registry.admin_route(
+        request,
+        "/api/admin/provider-settings/save",
+        refresh_runtime_config=lambda: None,
+    )
+
+    assert response is not None
+    assert response.status_code == 200
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["modelPresets"]["primary"]["reasoningEffort"] == "low"
+    body = json.loads(bytes(response.body).decode())
+    assert body["reasoningEffort"] == "low"
+
+
+def test_provider_settings_report_a_forced_speed_profile(monkeypatch, tmp_path: Path) -> None:
+    """The page must not present the saved value as the one in force."""
+    config_path = _deployment_config(tmp_path)
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: config_path)
+    monkeypatch.setenv("POWERX_SPEED_PROFILE", "fast")
+
+    response = admin_registry.admin_route(
+        _request("/api/admin/provider-settings"),
+        "/api/admin/provider-settings",
+    )
+
+    assert response is not None
+    body = json.loads(bytes(response.body).decode())
+    assert body["reasoningEffort"] == "medium"
+    assert body["effectiveReasoningEffort"].startswith("none")
+    assert "fast" in body["effectiveReasoningEffort"]
+
+
+def test_provider_page_exposes_the_reasoning_effort_control(monkeypatch) -> None:
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    response = admin_registry.admin_route(_request(), "/admin")
+
+    assert response is not None
+    body = bytes(response.body).decode()
+    assert "id='reasoningEffort'" in body
+    assert "Reasoning effort" in body
+    assert "it reaches the pool lanes too" in body.lower()
