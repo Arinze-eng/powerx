@@ -3,6 +3,7 @@ import { ChevronLeft, Loader2 } from "lucide-react";
 import { SkillsCatalogSettings } from "@/components/settings/SkillsCatalogSettings";
 import { ApiPlatformSettings } from "@/components/settings/api/ApiPlatformSettings";
 import { ImageGenerationSettings } from "@/components/settings/capabilities/ImageGenerationSettings";
+import { BrokersSettings } from "@/components/settings/brokers/BrokersSettings";
 import { AdvancedSettings } from "@/components/settings/capabilities/SecuritySettings";
 import { TranscriptionSettings } from "@/components/settings/capabilities/TranscriptionSettings";
 import { WebSettings } from "@/components/settings/capabilities/WebSettings";
@@ -372,6 +373,8 @@ export function SettingsPage({
             capabilityError={nanobotFeaturesError}
           />
         );
+      case "brokers":
+        return <BrokersSettings />;
       case "channels":
         return (
           <ChannelsSettings

@@ -1,5 +1,9 @@
 """Concrete agent hook implementations."""
 
+from nanobot.agent.hooks.access_gate import (
+    AccessGateHook,
+    create_access_gate_hook,
+)
 from nanobot.agent.hooks.file_edit_activity import (
     FileEditActivityHook,
     create_file_edit_activity_hook,
@@ -18,6 +22,8 @@ from nanobot.agent.hooks.user_cost_meter import (
 )
 
 __all__ = [
+    "AccessGateHook",
+    "create_access_gate_hook",
     "FileEditActivityHook",
     "create_file_edit_activity_hook",
     "ApiCreditHook",

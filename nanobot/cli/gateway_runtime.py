@@ -15,6 +15,7 @@ from rich.console import Console
 
 from nanobot import __logo__, __version__
 from nanobot.agent.hooks import (
+    create_access_gate_hook,
     create_api_credit_hook,
     create_file_edit_activity_hook,
     create_supabase_credit_hook,
@@ -593,6 +594,9 @@ def _run_gateway(
         hooks=[TokenUsageHook(timezone_name=config.agents.defaults.timezone)],
         local_trigger_store=trigger_store,
         hook_factories=[
+            # The access gate runs first: an operator's switch must decide a turn
+            # before it is billed for a step it is not allowed to take.
+            create_access_gate_hook,
             create_file_edit_activity_hook,
             create_supabase_credit_hook,
             create_api_credit_hook,

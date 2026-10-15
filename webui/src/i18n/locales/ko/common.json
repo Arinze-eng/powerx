@@ -98,6 +98,7 @@
       "voice": "음성",
       "browser": "웹",
       "channels": "채널",
+      "brokers": "브로커",
       "runtime": "시스템",
       "advanced": "보안",
       "cliApps": "CLI 앱",

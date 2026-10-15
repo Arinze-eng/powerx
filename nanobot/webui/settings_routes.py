@@ -165,6 +165,13 @@ _API_PLATFORM_ROUTES = {
     "/api/settings/api-platform/revoke": "revoke",
 }
 
+_BROKER_ROUTES = {
+    "/api/settings/brokers": "list",
+    "/api/settings/brokers/save": "save",
+    "/api/settings/brokers/delete": "delete",
+    "/api/settings/brokers/test": "test",
+}
+
 _SYSTEM_ROUTES = {
     "/api/settings/cli-apps": "cli-list",
     "/api/settings/cli-apps/install": "cli-install",
@@ -213,6 +220,8 @@ _SETTINGS_MUTATION_PATHS = frozenset({
     "/api/settings/cli-apps/test",
     "/api/settings/nanobot-features/enable",
     "/api/settings/nanobot-features/disable",
+    "/api/settings/brokers/save",
+    "/api/settings/brokers/delete",
     "/api/settings/channels/validate",
     "/api/settings/channels/configure",
     "/api/settings/pairing/approve",
@@ -392,6 +401,8 @@ class WebUISettingsRouter:
             return "models", action
         if action := _CAPABILITY_ROUTES.get(path):
             return "capabilities", action
+        if action := _BROKER_ROUTES.get(path):
+            return "brokers", action
         if action := _API_PLATFORM_ROUTES.get(path):
             return "api-platform", action
         if action := _SYSTEM_ROUTES.get(path):
@@ -887,6 +898,50 @@ class WebUISettingsRouter:
         except Exception as exc:
             return self._youtube_error_response(exc, action="disconnect")
         return self._json_response(payload)
+
+    # -- Brokers ------------------------------------------------------------
+
+    async def _handle_brokers(
+        self,
+        action: str,
+        domain_request: SettingsRequest,
+        request: WsRequest,
+    ) -> SettingsRouteResult:
+        """Per-user MT5 broker logins for the Brokers method.
+
+        The identity comes from the signed-in Supabase user, resolved the same
+        way every other per-user setting resolves it, so one account cannot
+        read or overwrite another's broker credentials.
+        """
+        from nanobot.webui.brokers_api import (
+            BrokerSettingsError,
+            brokers_action_async,
+        )
+
+        user_id = self._request_user_id(request)
+        # A read (`list`, `test`) arrives as a GET, so its arguments are in the
+        # query string; a write arrives over the WebSocket with a payload. Both
+        # spellings are presented as one dict so the domain has a single input.
+        params: dict[str, Any] = {
+            key: values[0] for key, values in domain_request.query.items() if values
+        }
+        if domain_request.payload:
+            params.update(domain_request.payload)
+        try:
+            payload = await brokers_action_async(
+                action,
+                user_id=user_id,
+                payload=params,
+            )
+        except BrokerSettingsError as exc:
+            return SettingsRouteResult.failure(exc.status, exc.message)
+        except Exception as exc:  # noqa: BLE001 - reported, never a bare traceback
+            self.logger.exception("Brokers '{}' failed", action)
+            return SettingsRouteResult.failure(
+                500,
+                f"Broker settings {action} failed: {exc}",
+            )
+        return SettingsRouteResult.success(payload)
 
     def _youtube_error_response(self, exc: Exception, *, action: str) -> Response:
         raw_status = getattr(exc, "status", 500)

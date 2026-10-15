@@ -30,6 +30,7 @@ from nanobot.agent.shape_router import (
     steer_message_for,
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
+from nanobot.access_policy import AccessDeniedError
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
 from nanobot.agent.plan_cache import (
     _MAX_STEPS_PER_PLAN,
@@ -692,6 +693,23 @@ class AgentRunner:
                     final_content=message,
                     messages=messages,
                     stop_reason="credit_exhausted",
+                    error=message,
+                )
+            if isinstance(exc, AccessDeniedError):
+                # An administrator switch refused the turn. That is a product
+                # decision, not a fault: it must reach the user as the reason
+                # they were stopped, exactly like a billing refusal, and it must
+                # not be logged or rendered as a crashed task.
+                message = str(exc)
+                context.messages = deepcopy(messages)
+                context.stop_reason = "access_denied"
+                context.error = message
+                context.final_content = message
+                context.exception = None
+                return AgentRunResult(
+                    final_content=message,
+                    messages=messages,
+                    stop_reason="access_denied",
                     error=message,
                 )
             context.messages = deepcopy(messages)

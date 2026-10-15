@@ -98,6 +98,7 @@
       "voice": "Voice",
       "browser": "Web",
       "channels": "Channels",
+      "brokers": "Brokers",
       "cliApps": "CLI Apps",
       "mcp": "MCP",
       "runtime": "System",

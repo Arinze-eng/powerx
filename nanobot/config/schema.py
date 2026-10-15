@@ -752,11 +752,43 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class AccessConfig(Base):
+    """Administrator-controlled switches over what a *user* may do.
+
+    Two independent gates, deliberately not one:
+
+    * ``general_task_enabled`` is the product switch. With it off, a turn that
+      is not a broker/trading turn is refused before its first model iteration,
+      so an operator can sell a trading-only product on the same deployment.
+      This one is *not* absolute: a per-user override (see
+      :mod:`nanobot.access_policy`) can force it back on for named users, which
+      is what makes "global off, these three accounts excepted" expressible.
+    * ``mt5_trading_enabled`` is a kill switch, and absolute. It removes the
+      Wine/MT5 sandbox tool from the agent's schema entirely and refuses it at
+      execute() time, for every caller including administrators. There is no
+      per-user override, because the reason to flip it is usually that the
+      method itself is being retired in favour of the separate broker flow.
+    """
+
+    general_task_enabled: bool = True
+    mt5_trading_enabled: bool = True
+    #: The separate broker flow (users enter their own Exness/Deriv MT5
+    #: credentials in Settings and trade through them). Off hides the Settings
+    #: section and refuses the tool, so the feature can be staged per deployment.
+    brokers_enabled: bool = True
+    #: Broker/server an operator wants offered by default. A user may still
+    #: override both from Settings; these only prefill the form and let the
+    #: admin page state the intended broker for this deployment.
+    default_broker: str = ""
+    default_server: str = ""
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
     _source_path: Path | None = PrivateAttr(default=None)
 
+    access: AccessConfig = Field(default_factory=AccessConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)

@@ -1,71 +1,49 @@
-# Task — Live GUI screen panel (tier 2: frames over the existing WebSocket)
+# Task — admin feature gates + separate broker method
 
-User decisions (2026-09-24):
-- **Tier 2** — frames pushed over the existing WebSocket. View-only (no input).
-- **Capture service host-side** — "decide for me, most robust across Novita/Runloop/VPS"
-  → decided: host-side daemon in the gateway process. Reasoning below.
-- **Generic** — any GUI app in the sandbox, NOT MT5-only.
-
-## Why host-side, not in-sandbox
-
-The gateway process is the SAME process as the agent loop
-(`nanobot/cli/gateway_runtime.py` builds `AgentLoop` at :431 and `ChannelManager` at :725),
-so it already holds the sandbox handles (`_STORE`, `_RUNLOOP_STORE`, ...).
-
-A detached in-sandbox loop (the `guard` pattern) would have to survive Novita's
-TTL'd sandbox and would need its own re-attach logic per backend. Host-side is one
-implementation for every backend, and it dies with the process instead of leaking
-a watcher into a sandbox that is about to be recycled.
-
-## Measured facts this design rests on (verified on the live box, 2026-09-24)
-
-| Fact | Value | Consequence |
-|---|---|---|
-| 1080p PNG of the live MT5 terminal | **85 KB** | wire format = PNG |
-| Same frame as JPEG q60 | 272 KB | **do not use JPEG for UI content** |
-| 720p PNG (downscaled) | 293 KB | **never downscale** — interpolation noise defeats deflate |
-| ffmpeg x11grab cost | 181 ms/frame | spawn-per-frame caps at ~5 fps; acceptable at 1–2 fps |
-| Idle desktop pixel change over 4 s | 1.26 % | frame dedup is the big win |
-| Static screen → byte-identical capture | **confirmed** (ffmpeg AND ImageMagick) | byte-compare is a valid change detector |
-| `xdpyinfo`, `x11vnc`, `xdotool` | MISSING in sandbox | must not be required; `ffmpeg` + `import` present |
-| `matchbox-window-manager` | present | WM available if tier 3 ever needs it |
+Decisions (2026-10-15, from the user's answers):
+1. General-task switch: **global kill switch + per-user override** (tri-state override:
+   inherit / force-allow / force-deny).
+2. MT5 (Wine) switch: **off for everyone, admins included** — pure global kill switch.
+3. Broker method: **direct MT5 server login with the user's own login/password/server**,
+   broker build auto-installed in the sandbox, as a NEW `broker_trade` flow that leaves
+   `mt5_sandbox` untouched.
+4. Brokers section: **per-user credentials in Settings**, plus a global admin default/override
+   on the admin page.
+5. Finish: commit + push to main, then deploy to Northflank.
 
 ## Files
 
-1. `nanobot/agent/tools/workspace_bridge.py`
-   - add public `fetch_remote_file(remote_path, *, max_bytes) -> bytes | None`
-   - reuses the two existing fetch paths (`download()` for vps/upstash/daytona/runloop/vercel,
-     chunked base64 `files.read` for native Novita). One place knows how to move bytes.
-
-2. `nanobot/webui/screen_stream.py`  **NEW**
-   - `ScreenGeometry`, `ScreenFrame`
-   - `ScreenSource` protocol; `SandboxScreenSource` (remote), `LocalScreenSource` (tests/host)
-   - `ScreenStream` — pump loop, dedup by byte compare, subscriber fan-out
-   - `ScreenStreamManager` — per-session streams, refcounted start/stop
-
-3. `nanobot/channels/websocket/runtime.py`
-   - inbound envelope `screen_subscribe` / `screen_unsubscribe`
-   - push `screen_frame` events (JSON text, base64 payload — client already parses
-     JSON envelopes; no binary-protocol work, and base64 costs 33 % on an 85 KB frame)
-   - stop streams on connection cleanup
-
-4. WebUI
-   - `webui/src/lib/nanobot-client.ts` — `screen_frame` event → subscribers
-   - new live-view component + sidebar entry ("a separate section they can tap to view")
-
-## Non-goals (explicitly, this round)
-
-- No input / interaction (that is tier 3 — needs a duplex byte channel on the gateway)
-- No public artifact host (`file_share.py` → catbox/onlyfiles) — would publish a live
-  broker terminal to a public URL. Disqualified on privacy grounds.
-- No tile-diff yet (measured opportunity, phase 2)
-- Not an `mt5_sandbox` action — the panel is generic
+| File | Change |
+|---|---|
+| `nanobot/config/schema.py` | `AccessConfig` (general_task_enabled, mt5_trading_enabled) on root `Config` |
+| `nanobot/access_policy.py` | NEW — resolve global + per-user overrides, JSON-backed store |
+| `nanobot/agent/hooks/access_gate.py` | NEW — `AccessGateHook` refuses a general task at turn start |
+| `nanobot/agent/hooks/__init__.py` | export the new hook factory |
+| `nanobot/cli/gateway_runtime.py` | register the access-gate hook |
+| `nanobot/agent/tools/mt5_sandbox.py` | honour the MT5 kill switch |
+| `nanobot/admin_registry.py` | "Access control" section + routes + save |
+| `nanobot/webui/ws_http.py` | action map for the new admin routes |
+| `supabase/broker_credentials.sql` | NEW table (mirrors alpaca_credentials.sql) |
+| `nanobot/trading/broker_credentials.py` | NEW — encrypted per-user broker credential store |
+| `nanobot/agent/tools/broker_trade.py` | NEW — the separate broker flow |
+| `nanobot/webui/brokers_api.py` | NEW — Settings → Brokers REST/WS endpoints |
+| `webui/src/...` | Settings → Brokers section |
+| `tests/...` | unit tests for the policy, the gate, the store |
 
 ## Status
+- [x] config + policy + hook
+- [x] admin UI + routes
+- [x] mt5 gate
+- [x] broker store + tool + settings API
+- [x] frontend Brokers section
+- [x] tests
+- [ ] push + deploy
 
-- [ ] workspace_bridge: fetch_remote_file
-- [ ] screen_stream.py
-- [ ] runtime wiring
-- [ ] webui client + panel + sidebar
-- [ ] tests
-- [ ] verify live, commit, push
+## Notes
+- The general-task switch exempts a turn that either declares itself trading
+  (`turn_kind="trading"`) or whose opening message reads as a trade
+  (`message_is_trading`). Without the second signal a trading user would be
+  refused before the model could ever reach `broker_trade`.
+- `broker_trade` reuses `mt5_sandbox`'s CLI plumbing (command build, bootstrap,
+  JSON extraction, sandbox resolution) by import; the sandbox tool itself is
+  unchanged.

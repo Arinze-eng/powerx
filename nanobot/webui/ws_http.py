@@ -221,6 +221,10 @@ _WEBUI_MUTATION_PATHS = {
     # implemented but was unreachable over the mutation channel.
     "settings.youtube.connect": "/api/settings/youtube/start",
     "settings.youtube.disconnect": "/api/settings/youtube/disconnect",
+    "settings.brokers.list": "/api/settings/brokers",
+    "settings.brokers.save": "/api/settings/brokers/save",
+    "settings.brokers.delete": "/api/settings/brokers/delete",
+    "settings.brokers.test": "/api/settings/brokers/test",
     # Authenticated checkout: mints a unique single-use payment link for the
     # signed-in user. Exposed over the WebUI mutation channel so the client
     # never needs a raw payment URL — the gateway returns one tied to the buyer.
@@ -237,6 +241,8 @@ _WEBUI_MUTATION_PATHS = {
     "admin.provider.pool.models": "/api/admin/provider-pool/models",
     "admin.execution.save": "/api/admin/execution-settings",
     "admin.execution.test": "/api/admin/execution-test",
+    "admin.access.save": "/api/admin/access-settings",
+    "admin.access.override": "/api/admin/access-overrides",
     "admin.dbq.execute": "/api/admin/dbq/action",
     "admin.dbq.ping": "/api/admin/dbq/status",
     "admin.supabase.action": "/api/admin/supabase/action",

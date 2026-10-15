@@ -12,6 +12,7 @@ import {
   Mic,
   Palette,
   SlidersHorizontal,
+  TrendingUp,
   type LucideIcon,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -39,6 +40,7 @@ const SETTINGS_NAV_ITEMS: Array<{ key: SettingsSectionKey; icon: LucideIcon; fal
   { key: "voice", icon: Mic, fallback: "Voice" },
   { key: "browser", icon: Globe2, fallback: "Web" },
   { key: "channels", icon: MessageCircle, fallback: "Channels" },
+  { key: "brokers", icon: TrendingUp, fallback: "Brokers" },
   // "System" (runtime) intentionally hidden from the settings navigation.
   // "Security" ("advanced") is intentionally hidden from it as well: the panel
   // still renders for a deep link to #/settings?section=advanced, it is simply

@@ -47,6 +47,7 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.access_policy import access_policy
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import ToolContext
 from nanobot.utils.live_label import clear_live_label, live_label_for, publish_live_label
@@ -1450,8 +1451,13 @@ class MT5SandboxTool(Tool):
         The tool is harmless when no sandbox is configured: ``execute()``
         resolves the sandbox per call and returns a clear error instead of
         falling back to the host. Advertising the capability is what matters.
+
+        The ONE thing that does gate here is the administrator's kill switch for
+        the MT5/Wine method: with it off the tool is dropped from the schema
+        entirely, so the model cannot offer a method the deployment has retired
+        and cannot spend a turn apologising for a tool it can see but not call.
         """
-        return True
+        return access_policy().mt5_trading().allowed
 
     @property
     def name(self) -> str:
@@ -1952,6 +1958,29 @@ class MT5SandboxTool(Tool):
         return json.dumps(result, default=str)
 
     async def execute(self, **kwargs: Any) -> ToolResult | str:  # type: ignore[override]
+        # The administrator's MT5 kill switch, re-checked per call. `enabled()`
+        # only runs when the tool schema is built at startup, so an operator who
+        # flips the switch while the gateway is up would otherwise keep a working
+        # tool until the next restart. This is the live check, and it is absolute:
+        # no per-user override can re-enable the method (see AccessPolicy).
+        _mt5_access = access_policy().mt5_trading()
+        if not _mt5_access.allowed:
+            return ToolResult.error(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "mt5_trading_disabled",
+                        "message": _mt5_access.reason,
+                        "next": (
+                            "Tell the user the MT5 (Wine) method is switched off on this "
+                            "deployment and that the broker connection in Settings is the "
+                            "supported route. Do not attempt an install or a workaround."
+                        ),
+                    },
+                    indent=2,
+                )
+            )
+
         action = str(kwargs.get("action") or "").strip().lower()
         if action not in _ALL_ACTIONS:
             return ToolResult.error(

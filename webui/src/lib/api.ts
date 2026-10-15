@@ -1211,3 +1211,102 @@ export async function updateTranscriptionSettings(
     },
   );
 }
+
+// -- Brokers (Settings -> Brokers) ------------------------------------------ //
+
+export interface BrokerServerProfile {
+  server: string;
+  recognised: boolean;
+  verified: boolean;
+  install_dir: string;
+  installer_slugs?: string[];
+}
+
+export interface BrokerAccount {
+  id?: number | string;
+  broker: string;
+  server: string;
+  login: string;
+  is_default: boolean;
+  updated_at?: string;
+  has_password?: boolean;
+  server_profile?: BrokerServerProfile;
+}
+
+export interface BrokersPayload {
+  available: boolean;
+  enabled: boolean;
+  accounts: BrokerAccount[];
+  count?: number;
+  default_broker: string;
+  default_server: string;
+  message?: string;
+  last_action?: string;
+}
+
+export interface BrokerSaveInput {
+  login: string;
+  password?: string;
+  server: string;
+  broker?: string;
+  isDefault?: boolean;
+}
+
+export async function fetchBrokerAccounts(
+  token: string,
+  base: string = "",
+): Promise<BrokersPayload> {
+  return request<BrokersPayload>(
+    `${base}/api/settings/brokers`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
+}
+
+export async function saveBrokerAccount(
+  transport: WebUIMutationTransport,
+  input: BrokerSaveInput,
+): Promise<BrokersPayload> {
+  return mutation<BrokersPayload>(transport, "settings.brokers.save", {
+    login: input.login,
+    ...(input.password ? { password: input.password } : {}),
+    server: input.server,
+    broker: input.broker ?? "",
+    is_default: !!input.isDefault,
+  });
+}
+
+export async function deleteBrokerAccount(
+  transport: WebUIMutationTransport,
+  account: { login: string; server?: string },
+): Promise<BrokersPayload> {
+  return mutation<BrokersPayload>(transport, "settings.brokers.delete", {
+    login: account.login,
+    server: account.server ?? "",
+  });
+}
+
+export interface BrokerTestInput {
+  server: string;
+}
+
+export interface BrokerTestResult {
+  ok: boolean;
+  profile: BrokerServerProfile;
+  message: string;
+}
+
+export async function testBrokerServer(
+  token: string,
+  base: string,
+  input: BrokerTestInput,
+): Promise<BrokerTestResult> {
+  const query = new URLSearchParams({ server: input.server });
+  return request<BrokerTestResult>(
+    `${base}/api/settings/brokers/test?${query.toString()}`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
+}

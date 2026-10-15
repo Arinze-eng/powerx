@@ -98,6 +98,7 @@
       "voice": "Suara",
       "browser": "Internet",
       "channels": "Kanal",
+      "brokers": "Broker",
       "runtime": "Sistem",
       "advanced": "Keamanan",
       "cliApps": "Aplikasi CLI",
