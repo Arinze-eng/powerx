@@ -37,7 +37,8 @@ Decisions (2026-10-15, from the user's answers):
 - [x] broker store + tool + settings API
 - [x] frontend Brokers section
 - [x] tests
-- [ ] push + deploy
+- [x] push + deploy
+- [x] run `supabase/broker_credentials.sql` (see "Database" below)
 
 ## Notes
 - The general-task switch exempts a turn that either declares itself trading
@@ -47,3 +48,19 @@ Decisions (2026-10-15, from the user's answers):
 - `broker_trade` reuses `mt5_sandbox`'s CLI plumbing (command build, bootstrap,
   JSON extraction, sandbox resolution) by import; the sandbox tool itself is
   unchanged.
+
+## Database
+The table has to exist in the Supabase project the *deployed* service points at.
+`SUPABASE_URL` on Northflank (project `cdnai`, service `powerx`) is
+`https://mitrbmjxriqvfacaefvg.supabase.co` — that is the production project, and
+it is the one that matters. Its pooler region is `aws-1-eu-west-1`.
+
+`supabase/broker_credentials.sql` was executed and verified against
+`fmsytqzjixcumjnzishm.supabase.co` (the credentials pasted in chat), which is a
+different project holding another app's schema. Verified there: 10 columns,
+`UNIQUE(user_key, login, server)`, `updated_at` trigger, RLS enabled,
+`service_role` grants, and a REST insert/select/delete round-trip
+(201/200/204) leaving the table empty. The file is now re-runnable
+(`DROP POLICY IF EXISTS` + `DROP TRIGGER IF EXISTS`) and carries the
+`service_role` grants it needs — without them PostgREST answers
+`42501 permission denied for table broker_credentials`.

@@ -38,8 +38,18 @@ ALTER TABLE public.broker_credentials ENABLE ROW LEVEL SECURITY;
 -- Only the service role can access this table (the bot uses the service role key).
 -- Users never read their own broker passwords back out of the database directly;
 -- the gateway masks them.
+-- Dropped first so this file can be re-run: CREATE POLICY has no IF NOT EXISTS.
+DROP POLICY IF EXISTS "Service role full access" ON public.broker_credentials;
 CREATE POLICY "Service role full access" ON public.broker_credentials
     FOR ALL TO service_role USING (true) WITH CHECK (true);
+
+-- The gateway talks to this table over PostgREST with the service role key, and
+-- Supabase does not always carry default table privileges over to service_role:
+-- without these the REST call fails with
+--   42501 permission denied for table broker_credentials
+-- The identity sequence needs USAGE too, or inserts fail on the id default.
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.broker_credentials TO service_role;
+GRANT USAGE, SELECT ON SEQUENCE public.broker_credentials_id_seq TO service_role;
 
 -- Create an index for fast lookups by user_key
 CREATE INDEX IF NOT EXISTS idx_broker_credentials_user_key
