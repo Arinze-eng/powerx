@@ -64,3 +64,15 @@ different project holding another app's schema. Verified there: 10 columns,
 (`DROP POLICY IF EXISTS` + `DROP TRIGGER IF EXISTS`) and carries the
 `service_role` grants it needs — without them PostgREST answers
 `42501 permission denied for table broker_credentials`.
+
+### Production run — done
+`broker_credentials` now exists in the project the deployed service actually uses,
+`mitrbmjxriqvfacaefvg` (`aws-1-eu-west-1` pooler). Created with the file as
+committed; verified in the database (10 columns, `UNIQUE(user_key, login, server)`,
+`updated_at` trigger, RLS on, service_role grants, `idx_broker_credentials_user_key`)
+and then over the live REST API, and finally by running the shipped
+`BrokerCredentialStore` itself against it: store / list / decrypt / switch default /
+re-save-corrects-password / partial delete / full delete, 16 checks, all pass, table
+left empty. `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and
+`SUPABASE_TOKEN_ENCRYPTION_KEY` on the Northflank service already point at that
+project, so no env change was needed.
