@@ -5820,3 +5820,59 @@ def test_handle_webui_thread_get_does_not_backfill_hidden_subagent_result(
     body = json.loads(resp.body.decode())
     assert [message["role"] for message in body["messages"]] == ["assistant"]
     assert [message["content"] for message in body["messages"]] == ["subagent summary"]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_webui_mutation_is_logged_with_its_lock_wait(
+    bus: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settings pane that "timed out" has to leave a number behind.
+
+    Mutations on one connection are serialized, so a slow one delays every later
+    one; the log splits the wait for the lock from the handler time, which is
+    what says whether the user waited on the store, on the queue, or on the loop.
+    """
+    from loguru import logger
+
+    monkeypatch.setattr(
+        "nanobot.channels.websocket.runtime._SLOW_WEBUI_MUTATION_LOG_MS",
+        0,
+    )
+    channel = _ch(bus)
+    conn = AsyncMock()
+    channel._webui_connections.add(conn)
+
+    async def slow_dispatch(
+        _connection: object,
+        _action: str,
+        _payload: dict[str, object],
+        **_kwargs: object,
+    ) -> Any:
+        await asyncio.sleep(0.05)
+        return _http_json_response({"saved": True})
+
+    channel.gateway.http.dispatch_webui_mutation = slow_dispatch
+    lines: list[str] = []
+    sink = logger.add(lambda message: lines.append(message.record["message"]), level="WARNING")
+    try:
+        await channel._dispatch_envelope(
+            conn,
+            "webui-client",
+            {
+                "type": "webui_request",
+                "request_id": "request-slow",
+                "action": "settings.brokers.save",
+                "payload": {"login": "41261482"},
+            },
+        )
+        await asyncio.gather(*tuple(channel._webui_request_tasks.values()))
+    finally:
+        logger.remove(sink)
+
+    slow = [line for line in lines if line.startswith("slow webui mutation")]
+    assert len(slow) == 1, lines
+    assert "action=settings.brokers.save" in slow[0]
+    assert "status=200" in slow[0]
+    assert "waited_ms=" in slow[0]
+    assert "duration_ms=" in slow[0]

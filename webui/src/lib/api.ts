@@ -49,6 +49,13 @@ import { fetchWithTimeout } from "./http";
 const API_READ_TIMEOUT_MS = 20_000;
 const API_MUTATION_TIMEOUT_MS = 20_000;
 const PACKAGE_MUTATION_TIMEOUT_MS = 150_000;
+// A broker save is several statements against Supabase in a row (clear the
+// default flag, write the row, read the list back) and it is serialized behind
+// every other mutation on the same socket, so on a small deployment it can take
+// well over the 20s a plain mutation gets. Giving up on it does not undo it --
+// the write has usually already landed -- so the budget is set high enough to
+// outlast the work rather than to bound it.
+const BROKER_MUTATION_TIMEOUT_MS = 45_000;
 const SLASH_COMMAND_LIFECYCLES = new Set<SlashCommandLifecycle>([
   "side_channel",
   "finalize_active_turn",
@@ -1268,23 +1275,33 @@ export async function saveBrokerAccount(
   transport: WebUIMutationTransport,
   input: BrokerSaveInput,
 ): Promise<BrokersPayload> {
-  return mutation<BrokersPayload>(transport, "settings.brokers.save", {
-    login: input.login,
-    ...(input.password ? { password: input.password } : {}),
-    server: input.server,
-    broker: input.broker ?? "",
-    is_default: !!input.isDefault,
-  });
+  return mutation<BrokersPayload>(
+    transport,
+    "settings.brokers.save",
+    {
+      login: input.login,
+      ...(input.password ? { password: input.password } : {}),
+      server: input.server,
+      broker: input.broker ?? "",
+      is_default: !!input.isDefault,
+    },
+    BROKER_MUTATION_TIMEOUT_MS,
+  );
 }
 
 export async function deleteBrokerAccount(
   transport: WebUIMutationTransport,
   account: { login: string; server?: string },
 ): Promise<BrokersPayload> {
-  return mutation<BrokersPayload>(transport, "settings.brokers.delete", {
-    login: account.login,
-    server: account.server ?? "",
-  });
+  return mutation<BrokersPayload>(
+    transport,
+    "settings.brokers.delete",
+    {
+      login: account.login,
+      server: account.server ?? "",
+    },
+    BROKER_MUTATION_TIMEOUT_MS,
+  );
 }
 
 export interface BrokerTestInput {

@@ -113,6 +113,10 @@ from nanobot.webui.websocket_logging import websockets_server_logger
 _WEBUI_HTTP_OPEN_TIMEOUT_S = 360.0
 _WEBUI_REQUEST_CACHE_TTL_S = 5 * 60.0
 _WEBUI_REQUEST_CACHE_MAX = 256
+#: A WebUI mutation that takes longer than this is logged with its lock wait and
+#: its handler time. The client gives a mutation 20s by default, so anything
+#: here is either a stalled loop or a slow downstream call.
+_SLOW_WEBUI_MUTATION_LOG_MS = 2_000
 
 
 _ROUTING_ASSERTION_HEADERS = frozenset(
@@ -1942,9 +1946,13 @@ class WebSocketChannel(BaseChannel):
         action: str,
         payload: dict[str, Any],
     ) -> _WebUIRequestResult:
+        started = time.perf_counter()
+        waited_ms = 0
+        status: int | None = None
         try:
             lock = self._webui_request_locks.setdefault(connection, asyncio.Lock())
             async with lock:
+                waited_ms = int((time.perf_counter() - started) * 1000)
                 response = await self._http_router.dispatch_webui_mutation(
                     connection,
                     action,
@@ -1979,6 +1987,21 @@ class WebSocketChannel(BaseChannel):
                 status=500,
                 message="WebUI mutation failed",
             )
+        finally:
+            # Mutations on one connection are serialized by the lock above, so a
+            # slow one delays every later one on the same socket. Splitting the
+            # wait from the handler time says which of the two the user is
+            # actually waiting on -- the difference between "the settings pane
+            # timed out" being the store, the lock, or the loop.
+            total_ms = int((time.perf_counter() - started) * 1000)
+            if total_ms >= _SLOW_WEBUI_MUTATION_LOG_MS:
+                self.logger.warning(
+                    "slow webui mutation action={} status={} waited_ms={} duration_ms={}",
+                    action,
+                    status if status is not None else "none",
+                    waited_ms,
+                    total_ms,
+                )
 
     async def _send_webui_response(
         self,

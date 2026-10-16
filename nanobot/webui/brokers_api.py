@@ -39,10 +39,25 @@ class BrokerSettingsError(ValueError):
         self.status = status
 
 
-def _store():
-    from nanobot.trading.broker_credentials import BrokerCredentialStore
+#: The store behind :func:`_store`; see its docstring for why it is kept.
+_STORE: Any = None
 
-    return BrokerCredentialStore()
+
+def _store():
+    """The process-wide broker credential store.
+
+    One instance is kept rather than building one per action so the store's
+    HTTP client -- and therefore its TLS connection to Supabase -- survives
+    between actions. The deployment's Supabase settings are container
+    environment, read when the process starts, so there is nothing to
+    re-read; tests replace this function outright.
+    """
+    global _STORE
+    if _STORE is None:
+        from nanobot.trading.broker_credentials import BrokerCredentialStore
+
+        _STORE = BrokerCredentialStore()
+    return _STORE
 
 
 def _require_user(user_id: str) -> str:

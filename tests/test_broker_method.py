@@ -338,3 +338,170 @@ def test_message_is_trading_ignores_ordinary_prose():
         "fix the error in my script",
     ):
         assert message_is_trading(text) is False, text
+
+
+# --------------------------------------------------- storage statement shape
+
+
+class _RecordingResponse:
+    def __init__(self, status_code: int = 200, payload: object = None) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.content = b"" if payload is None else b"[]"
+        self.text = ""
+
+    def json(self):
+        return self._payload
+
+
+class _RecordingClient:
+    """Stands in for ``httpx.AsyncClient``: records statements, answers canned rows.
+
+    A save is several statements in a row against Supabase, and how many of them
+    there are is what the user waits on, so the sequence is asserted directly
+    rather than inferred from a fake store that cannot show it.
+    """
+
+    instances: list["_RecordingClient"] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.calls: list[dict] = []
+        self.is_closed = False
+        self.kwargs = kwargs
+        _RecordingClient.instances.append(self)
+
+    async def request(self, method, url, *, headers=None, params=None, json=None):
+        self.calls.append(
+            {"method": method, "url": url, "params": dict(params or {}), "body": json}
+        )
+        if method == "PATCH":
+            return _RecordingResponse(204)
+        if method == "POST":
+            return _RecordingResponse(
+                201,
+                [
+                    {
+                        "id": 7,
+                        "user_key": (json or {}).get("user_key"),
+                        "broker": "",
+                        "server": (json or {}).get("server"),
+                        "login": (json or {}).get("login"),
+                        "is_default": bool((json or {}).get("is_default")),
+                    }
+                ],
+            )
+        return _RecordingResponse(
+            200,
+            [
+                {
+                    "id": 7,
+                    "broker": "",
+                    "server": "Deriv-Demo",
+                    "login": "41261482",
+                    "is_default": True,
+                    "updated_at": "2026-10-16T00:00:00+00:00",
+                }
+            ],
+        )
+
+
+@pytest.fixture()
+def recording_store(monkeypatch):
+    """A real store whose HTTP client records what it was asked to do."""
+    import base64
+
+    import httpx
+
+    from nanobot.trading import broker_credentials as module
+
+    _RecordingClient.instances = []
+    monkeypatch.setattr(httpx, "AsyncClient", _RecordingClient)
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-key")
+    monkeypatch.setenv(
+        "SUPABASE_TOKEN_ENCRYPTION_KEY",
+        base64.b64encode(b"0" * 32).decode(),
+    )
+    return module.BrokerCredentialStore()
+
+
+def test_a_default_save_clears_the_flag_before_it_writes(recording_store):
+    """One PATCH, then the write. Four statements became three, and no window
+    exists in which two accounts are both the default."""
+    store = recording_store
+    _run(
+        store.store_credentials(
+            user_key="u1",
+            login="41261482",
+            password="secret",
+            server="Deriv-Demo",
+            make_default=True,
+        )
+    )
+    calls = _RecordingClient.instances[0].calls
+    assert [call["method"] for call in calls] == ["PATCH", "POST"]
+    assert calls[0]["params"] == {"user_key": "eq.u1"}
+    assert calls[0]["body"] == {"is_default": False}
+    assert calls[1]["body"]["is_default"] is True
+    assert calls[1]["params"]["on_conflict"] == "user_key,login,server"
+
+
+def test_a_plain_save_is_one_statement(recording_store):
+    store = recording_store
+    _run(
+        store.store_credentials(
+            user_key="u1",
+            login="41261482",
+            password="secret",
+            server="Deriv-Demo",
+        )
+    )
+    calls = _RecordingClient.instances[0].calls
+    assert [call["method"] for call in calls] == ["POST"]
+
+
+def test_a_save_reuses_one_http_client(recording_store):
+    """The TLS handshake is paid once per store, not once per statement.
+
+    Two saves on the gateway's one long-lived loop, which is the shape the
+    deployment runs: one client, and so one handshake for both.
+    """
+    store = recording_store
+
+    async def save_twice():
+        for login in ("1", "2"):
+            await store.store_credentials(
+                user_key="u1",
+                login=login,
+                password="secret",
+                server="Deriv-Demo",
+            )
+
+    _run(save_twice())
+    assert len(_RecordingClient.instances) == 1
+    assert len(_RecordingClient.instances[0].calls) == 2
+
+
+def test_a_store_survives_a_second_event_loop(recording_store):
+    """Tests and scripts drive the store from a new ``asyncio.run`` each time;
+    a client carried across loops would fail with "Event loop is closed"."""
+    store = recording_store
+    for _ in range(2):
+        _run(
+            store.store_credentials(
+                user_key="u1",
+                login="41261482",
+                password="secret",
+                server="Deriv-Demo",
+            )
+        )
+    assert len(_RecordingClient.instances) == 2
+
+
+def test_the_brokers_pane_keeps_one_store(monkeypatch):
+    from nanobot.webui import brokers_api
+
+    monkeypatch.setattr(brokers_api, "_STORE", None)
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-key")
+    assert brokers_api._store() is brokers_api._store()

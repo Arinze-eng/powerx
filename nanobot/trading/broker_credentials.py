@@ -18,12 +18,15 @@ own broker configuration rather than failing.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import os
+import time
 from typing import Any
 
 import httpx
+from loguru import logger as module_logger
 
 from nanobot.utils.lazy_import import lazy_attr
 
@@ -34,6 +37,11 @@ AESGCM = lazy_attr("cryptography.hazmat.primitives.ciphers.aead", "AESGCM")
 
 #: How a broker account is identified when the caller does not name one.
 DEFAULT_ROW_LIMIT = 20
+
+#: A single statement to Supabase slower than this is logged. Saving an account
+#: is several statements in a row, so one slow line here is what turns "the
+#: settings pane timed out" into a number.
+_SLOW_REQUEST_LOG_MS = 2_000
 
 
 class BrokerCredentialError(RuntimeError):
@@ -57,6 +65,8 @@ class BrokerCredentialStore:
         self.url = _env("SUPABASE_URL").rstrip("/")
         self.service_key = _env("SUPABASE_SERVICE_ROLE_KEY")
         self._crypto = self._build_crypto()
+        self._client: httpx.AsyncClient | None = None
+        self._client_loop: Any = None
 
     def _build_crypto(self):
         token_key = _env("SUPABASE_TOKEN_ENCRYPTION_KEY")
@@ -87,6 +97,31 @@ class BrokerCredentialStore:
             "Content-Type": "application/json",
         }
 
+    def _http_client(self) -> httpx.AsyncClient:
+        """The store's HTTP client, kept for the store's lifetime.
+
+        A fresh ``AsyncClient`` per statement paid a DNS lookup and a TLS
+        handshake for every one of them, and saving an account is up to three
+        statements in a row -- on a small deployment that handshake is a large
+        share of the round trip the user waits on. The client is kept per event
+        loop because a pooled connection belongs to the loop that opened it:
+        tests drive this store from a new ``asyncio.run`` per case, and a
+        client carried across loops would fail with "Event loop is closed".
+        """
+        try:
+            loop: Any = asyncio.get_running_loop()
+        except RuntimeError:  # a caller outside any loop: nothing to key on
+            loop = None
+        client = self._client
+        if client is None or client.is_closed or self._client_loop is not loop:
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(20.0, connect=10.0),
+                limits=httpx.Limits(max_keepalive_connections=8, max_connections=8),
+            )
+            self._client = client
+            self._client_loop = loop
+        return client
+
     async def _request(
         self,
         method: str,
@@ -101,13 +136,22 @@ class BrokerCredentialStore:
         headers = self._headers()
         if prefer:
             headers["Prefer"] = prefer
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.request(
+        started = time.perf_counter()
+        response = await self._http_client().request(
+            method,
+            f"{self.url}{path}",
+            headers=headers,
+            params=params,
+            json=body,
+        )
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if elapsed_ms >= _SLOW_REQUEST_LOG_MS:
+            module_logger.warning(
+                "slow supabase broker request method={} path={} status={} duration_ms={}",
                 method,
-                f"{self.url}{path}",
-                headers=headers,
-                params=params,
-                json=body,
+                path,
+                response.status_code,
+                elapsed_ms,
             )
         if response.status_code >= 400:
             raise BrokerCredentialError(
@@ -163,6 +207,13 @@ class BrokerCredentialStore:
         if not password:
             raise BrokerCredentialError("A broker password is required.")
         enc_password, iv_password = self._encrypt(password)
+        if make_default:
+            # The flag is cleared on the user's other rows *before* the write
+            # that sets it, rather than after it: the same single statement
+            # leaves no window in which two accounts are the default, and it
+            # keeps a save to three statements instead of four. The write below
+            # carries is_default=True for the row being saved.
+            await self._clear_default(user_key)
         rows = await self._request(
             "POST",
             "/rest/v1/broker_credentials",
@@ -184,9 +235,16 @@ class BrokerCredentialStore:
             prefer="resolution=merge-duplicates,return=representation",
         )
         row = rows[0] if isinstance(rows, list) and rows else None
-        if make_default:
-            await self.set_default(user_key, login=login, server=server)
         return row or {"user_key": user_key, "broker": broker, "server": server, "login": login}
+
+    async def _clear_default(self, user_key: str) -> None:
+        """Drop the default flag from every account *user_key* has."""
+        await self._request(
+            "PATCH",
+            "/rest/v1/broker_credentials",
+            params={"user_key": f"eq.{user_key}"},
+            body={"is_default": False},
+        )
 
     async def list_credentials(self, user_key: str) -> list[dict[str, Any]]:
         """Every stored broker account for *user_key*, without passwords."""
@@ -250,18 +308,10 @@ class BrokerCredentialStore:
         """Make one account the user's default and clear the flag on the rest."""
         if not user_key:
             raise BrokerCredentialError("A user key is required.")
-        await self._request(
-            "PATCH",
-            "/rest/v1/broker_credentials",
-            params={
-                "user_key": f"eq.{user_key}",
-                # Every other row loses the flag first: a partial unique index is
-                # not assumed, so two defaults must not be able to coexist even
-                # briefly between the two statements.
-                "login": f"neq.{login}",
-            },
-            body={"is_default": False},
-        )
+        # Every other row loses the flag first: a partial unique index is not
+        # assumed, so two defaults must not be able to coexist even briefly
+        # between the two statements.
+        await self._clear_default(user_key)
         await self._request(
             "PATCH",
             "/rest/v1/broker_credentials",

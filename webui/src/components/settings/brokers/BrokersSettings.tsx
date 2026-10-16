@@ -48,18 +48,33 @@ export function BrokersSettings() {
 
   const accounts = payload?.accounts ?? [];
 
+  /** The accounts as the server has them. One retry: a read issued right after
+   * a stalled save can queue behind the same slow work and time out too. */
+  const readAccounts = useCallback(async (): Promise<BrokersPayload> => {
+    const authToken = token || getToken();
+    try {
+      return await fetchBrokerAccounts(authToken);
+    } catch (err) {
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      try {
+        return await fetchBrokerAccounts(authToken);
+      } catch {
+        throw err;
+      }
+    }
+  }, [getToken, token]);
+
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      const authToken = token || getToken();
-      setPayload(await fetchBrokerAccounts(authToken));
+      setPayload(await readAccounts());
       setError(null);
     } catch (err) {
       setError((err as Error).message);
     } finally {
       setLoading(false);
     }
-  }, [getToken, token]);
+  }, [readAccounts]);
 
   useEffect(() => {
     void reload();
@@ -75,37 +90,56 @@ export function BrokersSettings() {
     setBusy("save");
     setError(null);
     setNotice(null);
+    const saved = form.login.trim();
+    const server = form.server.trim();
+    let mutationError: Error | null = null;
     try {
-      const saved = form.login.trim();
       await saveBrokerAccount(client, {
         login: saved,
         password: form.password,
-        server: form.server.trim(),
+        server,
         broker: form.broker.trim(),
         isDefault: form.isDefault,
       });
+    } catch (err) {
+      // Not necessarily a failure: a mutation the client gave up on has
+      // usually already been written on the server. The stored list decides,
+      // below, and that is the only answer worth showing.
+      mutationError = err as Error;
+    }
+    try {
       // Read the list back from the server rather than trusting the mutation's
       // own echo: what the user sees must be the row that is actually stored,
       // so a save that did not land says so instead of showing a green notice.
-      const reread = await fetchBrokerAccounts(token || getToken());
+      const reread = await readAccounts();
       setPayload(reread);
       const stored = (reread.accounts ?? []).some(
         (account) => account.login === saved,
       );
       if (!stored) {
         setError(
-          `The server did not return ${saved} after saving. Reopen Settings and check again before trading.`,
+          mutationError
+            ? mutationError.message
+            : `The server did not return ${saved} after saving. Reopen Settings and check again before trading.`,
         );
         return;
       }
       setForm(EMPTY_FORM);
-      setNotice(`Saved and stored: ${saved} on ${form.server.trim()}.`);
-    } catch (err) {
-      setError((err as Error).message);
+      setNotice(
+        mutationError
+          ? `Saved and stored: ${saved} on ${server}. The confirmation did not arrive in time, so the app checked the server and found it.`
+          : `Saved and stored: ${saved} on ${server}.`,
+      );
+    } catch (readErr) {
+      setError(
+        mutationError
+          ? `${mutationError.message} Could not read the saved accounts back to check: ${(readErr as Error).message}`
+          : (readErr as Error).message,
+      );
     } finally {
       setBusy(null);
     }
-  }, [busy, canSave, client, form, getToken, token]);
+  }, [busy, canSave, client, form, getToken, readAccounts, token]);
 
   const handleDelete = useCallback(
     async (account: BrokerAccount) => {
@@ -113,20 +147,45 @@ export function BrokersSettings() {
       setBusy(`delete:${account.login}`);
       setError(null);
       setNotice(null);
+      let mutationError: Error | null = null;
       try {
-        const next = await deleteBrokerAccount(client, {
-          login: account.login,
-          server: account.server,
-        });
-        setPayload(next);
-        setNotice(`Removed account ${account.login}.`);
+        setPayload(
+          await deleteBrokerAccount(client, {
+            login: account.login,
+            server: account.server,
+          }),
+        );
       } catch (err) {
-        setError((err as Error).message);
+        mutationError = err as Error;
+      }
+      try {
+        // Same rule as a save: the stored list is the truth, so a delete the
+        // client gave up on is not reported as failed when the row is gone.
+        const reread = await readAccounts();
+        setPayload(reread);
+        const stillThere = (reread.accounts ?? []).some(
+          (row) => row.login === account.login,
+        );
+        if (stillThere) {
+          setError(mutationError ? mutationError.message : `Account ${account.login} is still stored.`);
+          return;
+        }
+        setNotice(
+          mutationError
+            ? `Removed account ${account.login}. The confirmation did not arrive in time, so the app checked the server and found it gone.`
+            : `Removed account ${account.login}.`,
+        );
+      } catch (readErr) {
+        setError(
+          mutationError
+            ? `${mutationError.message} Could not read the saved accounts back to check: ${(readErr as Error).message}`
+            : (readErr as Error).message,
+        );
       } finally {
         setBusy(null);
       }
     },
-    [busy, client],
+    [busy, client, readAccounts],
   );
 
   const handleTest = useCallback(async () => {

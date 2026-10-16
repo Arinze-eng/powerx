@@ -130,3 +130,63 @@ see.
   13 failed — the same 13 that fail on a stashed tree (attachment ingress, codex
   OAuth, build, version shape), so pre-existing and untouched by this change.
 - `npx tsc -p tsconfig.build.json --noEmit` clean; `npm run build` succeeds.
+
+## Fix round 3 — the save that times out after it has already been written
+
+The user reported the save still failing *after* `a192b2d` deployed: "when user
+enter credentials and want to save it not working and timing out". Different
+failure, same pane.
+
+### What the evidence says
+- The write lands. Read straight off production PostgREST: one row for the
+  signed-in user (`user_key c9c56243-…`, `login 41261482`, `server Deriv-Demo`,
+  `id 6`, `updated_at 05:28:35Z`). So the server side of the save works; the
+  client gives up before the reply arrives.
+- No broker error is in the production logs at all in the 90 minutes spanning
+  that save, and `_execute_webui_request` answers `500` (never a timeout) if the
+  handler throws, so the failure is not a server error.
+- A save was **four** sequential statements (POST, PATCH, PATCH, GET list), each
+  on a **fresh `httpx.AsyncClient`** — four DNS lookups and four TLS handshakes.
+  From the sandbox that was 1.9s cold / 1.2s warm; the container is 0.2 vCPU and
+  its egress is the part that does not transfer.
+- Mutations on one socket are serialized by a per-connection `asyncio.Lock`, and
+  a reconnect mid-save replays the frame while the client's 20s timer keeps
+  running.
+
+### What changed
+- `nanobot/trading/broker_credentials.py`: one pooled `httpx.AsyncClient` per
+  store (per event loop, so a test's second `asyncio.run` does not inherit a
+  closed loop), and a save with "make default" now clears the flag **before** the
+  write instead of patching twice after it — three statements, not four, and no
+  window in which two accounts are both the default. Cold 1.9s -> 1.3s, warm
+  1.2s -> 0.5s against production Supabase.
+- `nanobot/webui/brokers_api.py`: `_store()` keeps one store per process so the
+  TLS connection survives between actions.
+- `nanobot/channels/websocket/runtime.py`: a mutation over
+  `_SLOW_WEBUI_MUTATION_LOG_MS` logs `waited_ms` (the lock) separately from
+  `duration_ms` (the handler) — the line that says whether the user waited on the
+  store, on the queue, or on the loop. The store logs its own slow statements.
+- `webui/src/lib/api.ts`: broker save/delete get `BROKER_MUTATION_TIMEOUT_MS`
+  (45s). Giving up does not undo a write, so the budget is set to outlast the
+  work rather than to bound it.
+- `webui/src/components/settings/brokers/BrokersSettings.tsx`: the stored list is
+  the only thing that decides success. A mutation that timed out is not reported
+  as failed when the row is there — the pane says it saved and that it checked.
+  Same for a delete whose row is gone. The read-back retries once.
+
+### Tests
+- `tests/test_broker_method.py`: a real store on a recording HTTP client — a
+  default save is `["PATCH", "POST"]` with the clear first, a plain save is one
+  statement, two saves on one loop build one client, a second loop rebuilds it,
+  and `_store()` is a singleton. 20 passed.
+- `nanobot/channels/websocket/tests/test_websocket_channel.py`: a slow mutation
+  logs one line carrying the action, status, wait and duration. (That file has a
+  pre-existing failure — a stale `assert_awaited_once_with` missing
+  `supabase_user_id=''` — and a test after it that hangs; both reproduce on a
+  clean `a192b2d` worktree.)
+- `tests/webui tests/test_broker_method.py tests/test_access_policy.py`: 507
+  passed, 14 failed — the same 13 as before plus
+  `test_session_list_index.py::test_webui_session_scan_does_not_overlap_session_save`,
+  which passes on its own in both trees (thread-overlap timing test, flaky under
+  load).
+- `npx tsc -p tsconfig.build.json --noEmit` clean; `npm run build` succeeds.
