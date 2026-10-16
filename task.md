@@ -190,3 +190,34 @@ failure, same pane.
   which passes on its own in both trees (thread-overlap timing test, flaky under
   load).
 - `npx tsc -p tsconfig.build.json --noEmit` clean; `npm run build` succeeds.
+
+## Fix round 4 — the 401 the pane was really showing (found in a real browser)
+
+Drove the actual pane in Chrome (a throwaway Supabase user, a seeded session, the
+real site): Settings -> Brokers renders, the form fills, Save is clicked. The
+save itself works end to end — the frame goes out over the authenticated socket
+and the answer comes back `ok: true` with the row in **1.8s** — but the pane
+answered **"Sign in to manage broker accounts"** for a signed-in user, and the
+console showed the reads failing 401.
+
+Cause: `fetchBrokerAccounts` / `testBrokerServer` sent only
+`Authorization: Bearer <gateway token>`. The broker routes key every action off
+the signed-in Supabase user, which the gateway reads from `X-Nanobot-Auth`
+(`_request_user_id` -> `_supabase_user_id_for_request`), so the read arrived
+anonymous and `_require_user` refused it — while the save, which travels over the
+socket and carries the identity, landed fine. The row was there and the pane said
+it was not signed in.
+
+That also matters for round 3's verify-by-read: a read-back that 401s would report
+a landed save as failed.
+
+- `webui/src/lib/api.ts`: both broker reads take `authValue` and send
+  `X-Nanobot-Auth`, the same way `listSessions` already does.
+- `BrokersSettings.tsx`: passes `authValue`/`getAuthValue()` from `useClient`.
+- `webui/src/tests/api.test.ts`: both reads carry the identity, and neither sends
+  the header when there is no Supabase session.
+
+Measured in the deployed container (throwaway user, real socket):
+list cold 5.1s (first broker action in a cold process), save cold 0.90s, save
+warm 0.43s, list warm 0.18s, delete 0.53s. Container egress to Supabase is not
+slow, so the store was never what a 20s client timeout was waiting on.

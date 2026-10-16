@@ -38,7 +38,7 @@ const EMPTY_FORM: FormState = {
  * credentials.
  */
 export function BrokersSettings() {
-  const { client, token, getToken } = useClient();
+  const { client, token, getToken, authValue, getAuthValue } = useClient();
   const [payload, setPayload] = useState<BrokersPayload | null>(null);
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [busy, setBusy] = useState<string | null>(null);
@@ -52,17 +52,22 @@ export function BrokersSettings() {
    * a stalled save can queue behind the same slow work and time out too. */
   const readAccounts = useCallback(async (): Promise<BrokersPayload> => {
     const authToken = token || getToken();
+    // The broker routes key everything off the signed-in Supabase user, and a
+    // plain `Authorization` header does not carry that identity: without
+    // `X-Nanobot-Auth` the gateway answers 401 "Sign in to manage broker
+    // accounts" for a user who is signed in.
+    const identity = authValue || getAuthValue();
     try {
-      return await fetchBrokerAccounts(authToken);
+      return await fetchBrokerAccounts(authToken, "", identity);
     } catch (err) {
       await new Promise((resolve) => setTimeout(resolve, 750));
       try {
-        return await fetchBrokerAccounts(authToken);
+        return await fetchBrokerAccounts(authToken, "", identity);
       } catch {
         throw err;
       }
     }
-  }, [getToken, token]);
+  }, [authValue, getAuthValue, getToken, token]);
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -196,14 +201,14 @@ export function BrokersSettings() {
     setNotice(null);
     try {
       const authToken = token || getToken();
-      const result = await testBrokerServer(authToken, "", { server });
+      const result = await testBrokerServer(authToken, "", { server }, authValue || getAuthValue());
       setNotice(result.message);
     } catch (err) {
       setError((err as Error).message);
     } finally {
       setBusy(null);
     }
-  }, [busy, form.server, getToken, token]);
+  }, [authValue, busy, form.server, getAuthValue, getToken, token]);
 
   const update = (patch: Partial<FormState>) => setForm((prev) => ({ ...prev, ...patch }));
 

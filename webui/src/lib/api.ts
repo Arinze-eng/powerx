@@ -1262,11 +1262,12 @@ export interface BrokerSaveInput {
 export async function fetchBrokerAccounts(
   token: string,
   base: string = "",
+  authValue: string = "",
 ): Promise<BrokersPayload> {
   return request<BrokersPayload>(
     `${base}/api/settings/brokers`,
     token,
-    undefined,
+    authValue ? { headers: { "X-Nanobot-Auth": authValue } } : undefined,
     API_READ_TIMEOUT_MS,
   );
 }
@@ -1318,12 +1319,13 @@ export async function testBrokerServer(
   token: string,
   base: string,
   input: BrokerTestInput,
+  authValue: string = "",
 ): Promise<BrokerTestResult> {
   const query = new URLSearchParams({ server: input.server });
   return request<BrokerTestResult>(
     `${base}/api/settings/brokers/test?${query.toString()}`,
     token,
-    undefined,
+    authValue ? { headers: { "X-Nanobot-Auth": authValue } } : undefined,
     API_READ_TIMEOUT_MS,
   );
 }

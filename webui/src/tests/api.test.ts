@@ -14,6 +14,7 @@ import {
   fetchFilePreview,
   fetchFilePreviewAvailability,
   fetchAutomations,
+  fetchBrokerAccounts,
   fetchApiPlatform,
   fetchApiService,
   fetchCliApps,
@@ -52,6 +53,7 @@ import {
   cancelChannelConnect,
   pollChannelConnect,
   startChannelConnect,
+  testBrokerServer,
   updateAutomation,
   updateSidebarState,
   updateImageGenerationSettings,
@@ -1210,6 +1212,63 @@ describe("webui API helpers", () => {
       expect.objectContaining({
         headers: { Authorization: "Bearer tok" },
       }),
+    );
+  });
+});
+
+describe("broker settings reads", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ available: true, enabled: true, accounts: [] }),
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  // The broker routes key every action off the signed-in Supabase user. A
+  // bearer token alone is not that identity: without X-Nanobot-Auth the gateway
+  // answers 401 "Sign in to manage broker accounts" for a user who is signed
+  // in, which is what the pane showed while the account was already stored.
+  it("sends the Supabase identity when listing broker accounts", async () => {
+    await fetchBrokerAccounts("tok", "", "supabase-access-token");
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/brokers",
+      expect.objectContaining({
+        headers: {
+          Authorization: "Bearer tok",
+          "X-Nanobot-Auth": "supabase-access-token",
+        },
+      }),
+    );
+  });
+
+  it("sends the Supabase identity when checking a broker server", async () => {
+    await testBrokerServer("tok", "", { server: "Deriv-Demo" }, "supabase-access-token");
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/brokers/test?server=Deriv-Demo",
+      expect.objectContaining({
+        headers: {
+          Authorization: "Bearer tok",
+          "X-Nanobot-Auth": "supabase-access-token",
+        },
+      }),
+    );
+  });
+
+  it("sends no identity header when there is no Supabase session", async () => {
+    await fetchBrokerAccounts("tok");
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/brokers",
+      expect.objectContaining({ headers: { Authorization: "Bearer tok" } }),
     );
   });
 });
