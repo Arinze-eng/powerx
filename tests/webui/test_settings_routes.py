@@ -528,3 +528,177 @@ async def test_root_settings_routes_answer_and_resolve_the_signed_in_user(
         assert resolved[-1] is request
 
     assert len(resolved) == 2
+
+
+class _FakeBrokerStore:
+    """A stand-in for the Supabase-backed credential store."""
+
+    enabled = True
+
+    def __init__(self) -> None:
+        self.rows: list[dict[str, object]] = []
+
+    async def list_credentials(self, user_key: str) -> list[dict[str, object]]:
+        return [dict(row) for row in self.rows if row["user_key"] == user_key]
+
+    async def store_credentials(
+        self,
+        *,
+        user_key: str,
+        login: str,
+        password: str,
+        server: str,
+        broker: str,
+        make_default: bool,
+    ) -> None:
+        self.rows = [
+            row
+            for row in self.rows
+            if (row["user_key"], row["login"], row["server"]) != (user_key, login, server)
+        ]
+        self.rows.append(
+            {
+                "id": len(self.rows) + 1,
+                "user_key": user_key,
+                "login": login,
+                "password": password,
+                "server": server,
+                "broker": broker,
+                "is_default": make_default,
+                "updated_at": "2026-01-01T00:00:00Z",
+            }
+        )
+
+    async def delete_credentials(self, user_key: str, *, login: str, server: str) -> int:
+        before = len(self.rows)
+        self.rows = [
+            row
+            for row in self.rows
+            if (row["user_key"], row["login"], row["server"]) != (user_key, login, server)
+        ]
+        return before - len(self.rows)
+
+
+@pytest.mark.asyncio
+async def test_every_brokers_route_reaches_the_brokers_handler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All four Settings -> Brokers routes must reach ``_handle_brokers``.
+
+    ``_route`` mapped the four broker paths to the ``brokers`` domain from the
+    day the method shipped, but the dispatch chain in ``dispatch`` never grew a
+    branch for that domain. Every broker request therefore fell through to the
+    system domain, which knows no ``list``/``save``/``delete``/``test`` action
+    and answered ``404 {"error": "unknown settings action"}`` -- the exact error
+    the pane showed when a user pressed "Save account". ``_handle_brokers`` was
+    dead code, and the suite stayed green because every existing broker test
+    called ``brokers_action_async`` directly and skipped the router.
+    """
+    from nanobot.webui import brokers_api
+
+    store = _FakeBrokerStore()
+    monkeypatch.setattr(brokers_api, "_store", lambda: store)
+
+    router = _router(config_path=tmp_path / "config.json")
+    router._youtube_user_id = lambda _request: "supabase:user-1"
+
+    async def call(path: str, payload: dict[str, object] | None = None) -> tuple[int, dict]:
+        request = (
+            _mutation_request(path, payload)
+            if payload is not None
+            else SimpleNamespace(path=path, headers=Headers())
+        )
+        response = await router.dispatch(None, request, path)
+        assert response is not None, path
+        return response.status_code, json.loads(response.body)
+
+    status, body = await call(
+        "/api/settings/brokers/save",
+        {
+            "login": "477199408",
+            "password": "Miracle123@",
+            "server": "Exness-MT5Trial9",
+            "broker": "exness",
+            "is_default": True,
+        },
+    )
+    assert status == 200, body
+    assert body["last_action"] == "saved"
+    assert [row["login"] for row in body["accounts"]] == ["477199408"]
+    assert body["accounts"][0]["has_password"] is True
+    assert "password" not in body["accounts"][0]
+
+    status, body = await call("/api/settings/brokers")
+    assert status == 200, body
+    assert [row["login"] for row in body["accounts"]] == ["477199408"]
+
+    status, body = await call("/api/settings/brokers/test", {"server": "Exness-MT5Trial9"})
+    assert status == 200, body
+    assert body["profile"]["recognised"] is True
+
+    status, body = await call(
+        "/api/settings/brokers/delete",
+        {"login": "477199408", "server": "Exness-MT5Trial9"},
+    )
+    assert status == 200, body
+    assert body["accounts"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_unauthenticated_brokers_save_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The broker pane fails closed: no signed-in user, no write."""
+    from nanobot.webui import brokers_api
+
+    store = _FakeBrokerStore()
+    monkeypatch.setattr(brokers_api, "_store", lambda: store)
+
+    router = _router(config_path=tmp_path / "config.json")
+    router._youtube_user_id = lambda _request: ""
+
+    request = _mutation_request(
+        "/api/settings/brokers/save",
+        {"login": "1", "password": "p", "server": "s"},
+    )
+    response = await router.dispatch(None, request, "/api/settings/brokers/save")
+
+    assert response is not None
+    assert response.status_code == 401
+    assert store.rows == []
+
+
+def test_every_routed_domain_has_a_dispatch_branch() -> None:
+    """A domain ``_route`` can return must be handled, never fall to ``system``.
+
+    ``_route`` is a table of tables and ``dispatch`` is a chain of branches; the
+    two are edited in different places, so a new domain added to one and not the
+    other silently misroutes. That is what happened to ``brokers``. This asserts
+    the two lists agree, so adding a domain to ``_route`` alone fails here.
+    """
+    from nanobot.webui import settings_routes as module
+
+    tables = (
+        module._MODEL_ROUTES,
+        module._CAPABILITY_ROUTES,
+        module._BROKER_ROUTES,
+        module._API_PLATFORM_ROUTES,
+        module._SYSTEM_ROUTES,
+    )
+    domains = {
+        domain
+        for table in tables
+        for path in table
+        if (route := module.WebUISettingsRouter._route(path)) is not None
+        for domain in (route[0],)
+    }
+
+    # ``root`` is answered before the chain (it is not in any table), and
+    # ``system`` is the chain's ``else``, so neither needs a named branch.
+    assert domains == {"models", "capabilities", "brokers", "api-platform", "system"}
+
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    for domain in sorted(domains - {"system"}):
+        assert f'domain == "{domain}"' in source, domain

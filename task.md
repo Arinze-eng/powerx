@@ -76,3 +76,57 @@ re-save-corrects-password / partial delete / full delete, 16 checks, all pass, t
 left empty. `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and
 `SUPABASE_TOKEN_ENCRYPTION_KEY` on the Northflank service already point at that
 project, so no env change was needed.
+
+## Fix round 2 — the "unknown action" error and the admin switches
+
+### The bug: Settings -> Brokers never reached its own handler
+`settings_routes._route()` mapped the four broker paths to the `brokers` domain
+(`/api/settings/brokers` -> `list`, `.../save` -> `save`, `.../delete` -> `delete`,
+`.../test` -> `test`), but the dispatch chain in `WebUISettingsRouter.dispatch`
+had no `elif domain == "brokers"` branch. Every broker request therefore fell
+through to the chain's `else`, which hands the action to the **system** domain.
+`settings_system.handle` knows no `list`/`save`/`delete`/`test` action and answers
+`404 {"error": "unknown settings action"}` — the error the pane showed when a user
+pressed *Save account*. `_handle_brokers` (settings_routes.py:904) was dead code:
+nothing called it, so the whole Brokers feature was unreachable over the mutation
+channel and over the plain read path alike.
+
+Reproduced at the router level before the fix (all four paths, 404 + that exact
+message), and the same code is what `0b609e1` deploys.
+
+Fixed by adding the missing branch. After it, all four routes answer 200 and a
+saved credential round-trips: `save` returns `last_action: "saved"` with the row
+(`login`, `server`, `has_password: true`, no password), `list` returns it, `test`
+resolves the server profile, `delete` returns an empty list.
+
+### The admin switches — verified live, not changed
+Driven over the real production admin socket (Basic-auth `/api/admin/ws-bootstrap`
+-> `wss://...?token=...&client_id=admin` -> `{type:"webui_request", action:
+"admin.access.save"}`): all three switches flipped off, read back off over
+`GET /api/admin/access-settings`, restored, read back on; a per-user override set
+and cleared. Production is left exactly as it was (all three switches on, no
+overrides). So the switches themselves work; what looked broken was the broker
+flow they gate, which was unreachable for the reason above.
+
+### Seeing the credential truly
+`BrokersSettings` now re-reads the account list from the server after a save
+instead of trusting the mutation's own echo, and says so plainly ("Saved and
+stored: <login> on <server>") — or shows an error if the row did not come back.
+Each account row also states whether a password is stored ("password stored
+(encrypted)" / "no password stored"), which is what the user asked to be able to
+see.
+
+### Tests
+- `tests/webui/test_settings_routes.py`: every broker route reaches the broker
+  handler (fails on `0b609e1`), an unauthenticated save is refused and writes
+  nothing, and a structural guard that every domain `_route` can return has a
+  dispatch branch — the class of bug this was.
+- `tests/test_access_policy.py`: the admin access routes through `admin_route`
+  itself — auth required, all three switches read/write/read-back, a partial write
+  leaves unrendered switches alone, overrides set and clear, a keyless override is
+  a 400.
+- `tests/test_access_policy.py` + `tests/test_broker_method.py` +
+  `tests/webui/test_settings_routes.py`: 62 passed. Full `tests/webui`: 503 passed,
+  13 failed — the same 13 that fail on a stashed tree (attachment ingress, codex
+  OAuth, build, version shape), so pre-existing and untouched by this change.
+- `npx tsc -p tsconfig.build.json --noEmit` clean; `npm run build` succeeds.

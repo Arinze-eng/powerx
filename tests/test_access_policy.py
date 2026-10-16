@@ -201,3 +201,154 @@ def test_trading_turn_detection():
     assert turn_is_trading({"turn_kind": "general"}) is False
     assert turn_is_trading({}) is False
     assert turn_is_trading(None) is False
+
+
+# ------------------------------------------------------- the admin page's route
+#
+# The switches are only real if the admin page can read and write them. These
+# cases drive ``admin_route`` -- the exact entry point the admin WebSocket's
+# mutation channel and the dashboard's own fetches land on -- so a broken route
+# cannot pass while the policy underneath is healthy.
+
+
+def _admin_request(path, *, payload=None, password="nethunter", basic=True):
+    import base64
+
+    headers = {}
+    if basic:
+        encoded = base64.b64encode(f"admin:{password}".encode()).decode()
+        headers["Authorization"] = f"Basic {encoded}"
+    request = SimpleNamespace(path=path, headers=headers)
+    if payload is not None:
+        request._nanobot_webui_mutation_payload = payload
+    return request
+
+
+def _call_admin(monkeypatch, tmp_path, path, payload=None, *, password="nethunter", basic=True):
+    import json
+
+    from nanobot import admin_registry
+
+    monkeypatch.setenv("ADMIN_PASSWORD", password)
+    monkeypatch.setattr(admin_registry, "_config_path", lambda: tmp_path / "config.json")
+    refreshes: list[int] = []
+    response = admin_registry.admin_route(
+        _admin_request(path, payload=payload, password=password, basic=basic),
+        path,
+        issue_admin_token=lambda: "tok",
+        ws_path="/",
+        refresh_runtime_config=lambda: refreshes.append(1),
+    )
+    assert response is not None, path
+    raw = bytes(response.body).decode()
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        # The auth failure answers a plain-text body, not JSON.
+        body = raw
+    return response.status_code, body, refreshes
+
+
+def test_admin_access_route_requires_a_password(monkeypatch, tmp_path):
+    status, body, _ = _call_admin(
+        monkeypatch, tmp_path, "/api/admin/access-settings", basic=False
+    )
+    assert status == 401, body
+
+
+def test_admin_access_switches_read_write_and_read_back(monkeypatch, tmp_path):
+    """Every switch round-trips: the save is the read the page renders next."""
+    status, body, refreshes = _call_admin(
+        monkeypatch, tmp_path, "/api/admin/access-settings"
+    )
+    assert status == 200, body
+    assert body["global"] == {
+        "general_task_enabled": True,
+        "mt5_trading_enabled": True,
+        "brokers_enabled": True,
+        "default_broker": "",
+        "default_server": "",
+    }
+
+    status, body, refreshes = _call_admin(
+        monkeypatch,
+        tmp_path,
+        "/api/admin/access-settings",
+        {
+            "action": "admin.access.save",
+            "generalTaskEnabled": False,
+            "mt5TradingEnabled": False,
+            "brokersEnabled": True,
+            "defaultBroker": "Exness",
+            "defaultServer": "Exness-MT5Trial9",
+        },
+    )
+    assert status == 200, body
+    assert body["global"] == {
+        "general_task_enabled": False,
+        "mt5_trading_enabled": False,
+        "brokers_enabled": True,
+        "default_broker": "exness",
+        "default_server": "Exness-MT5Trial9",
+    }
+    assert body["features"]["general_task"]["allowed"] is False
+    assert body["features"]["mt5_trading"]["allowed"] is False
+    assert body["features"]["brokers"]["allowed"] is True
+    assert refreshes == [1]
+
+    # A fresh read of the same route must show what was just saved, or the
+    # page snaps back to the old value on reload and the switch looks dead.
+    status, body, _ = _call_admin(monkeypatch, tmp_path, "/api/admin/access-settings")
+    assert status == 200, body
+    assert body["global"]["general_task_enabled"] is False
+    assert body["global"]["default_broker"] == "exness"
+
+
+def test_admin_access_switch_write_is_partial(monkeypatch, tmp_path):
+    """A page that does not render a switch cannot silently reset it."""
+    _call_admin(
+        monkeypatch,
+        tmp_path,
+        "/api/admin/access-settings",
+        {"mt5TradingEnabled": False},
+    )
+    status, body, _ = _call_admin(monkeypatch, tmp_path, "/api/admin/access-settings")
+    assert status == 200, body
+    assert body["global"]["mt5_trading_enabled"] is False
+    assert body["global"]["general_task_enabled"] is True
+    assert body["global"]["brokers_enabled"] is True
+
+
+def test_admin_access_override_sets_and_clears(monkeypatch, tmp_path):
+    status, body, _ = _call_admin(
+        monkeypatch,
+        tmp_path,
+        "/api/admin/access-overrides",
+        {
+            "action": "admin.access.override",
+            "userKey": "supabase:user-1",
+            "generalTask": True,
+            "brokers": False,
+        },
+    )
+    assert status == 200, body
+    assert body["overrides"]["supabase:user-1"] == {"general_task": True, "brokers": False}
+
+    status, body, _ = _call_admin(
+        monkeypatch,
+        tmp_path,
+        "/api/admin/access-overrides",
+        {"action": "admin.access.override", "userKey": "supabase:user-1", "clear": True},
+    )
+    assert status == 200, body
+    assert body["overrides"] == {}
+
+
+def test_admin_access_override_needs_a_key(monkeypatch, tmp_path):
+    status, body, _ = _call_admin(
+        monkeypatch,
+        tmp_path,
+        "/api/admin/access-overrides",
+        {"action": "admin.access.override", "clear": True},
+    )
+    assert status == 400, body

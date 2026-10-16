@@ -76,22 +76,36 @@ export function BrokersSettings() {
     setError(null);
     setNotice(null);
     try {
-      const next = await saveBrokerAccount(client, {
-        login: form.login.trim(),
+      const saved = form.login.trim();
+      await saveBrokerAccount(client, {
+        login: saved,
         password: form.password,
         server: form.server.trim(),
         broker: form.broker.trim(),
         isDefault: form.isDefault,
       });
-      setPayload(next);
+      // Read the list back from the server rather than trusting the mutation's
+      // own echo: what the user sees must be the row that is actually stored,
+      // so a save that did not land says so instead of showing a green notice.
+      const reread = await fetchBrokerAccounts(token || getToken());
+      setPayload(reread);
+      const stored = (reread.accounts ?? []).some(
+        (account) => account.login === saved,
+      );
+      if (!stored) {
+        setError(
+          `The server did not return ${saved} after saving. Reopen Settings and check again before trading.`,
+        );
+        return;
+      }
       setForm(EMPTY_FORM);
-      setNotice("Broker account saved. You can trade it from a chat now.");
+      setNotice(`Saved and stored: ${saved} on ${form.server.trim()}.`);
     } catch (err) {
       setError((err as Error).message);
     } finally {
       setBusy(null);
     }
-  }, [busy, canSave, client, form]);
+  }, [busy, canSave, client, form, getToken, token]);
 
   const handleDelete = useCallback(
     async (account: BrokerAccount) => {
@@ -244,6 +258,7 @@ export function BrokersSettings() {
                 title={`${account.broker || "Broker"} · ${account.login}`}
                 description={[
                   account.server,
+                  account.has_password ? "password stored (encrypted)" : "no password stored",
                   account.is_default ? "default" : "",
                   account.server_profile?.recognised
                     ? "server recognised"

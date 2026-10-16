@@ -376,6 +376,14 @@ class WebUISettingsRouter:
                 domain_request,
                 self._capability_operations(),
             )
+        elif domain == "brokers":
+            # Settings -> Brokers. ``_route`` has mapped the four broker paths
+            # to this domain since the method shipped, but the dispatch chain
+            # never had a branch for it: every broker request fell through to
+            # the system domain below, which has no ``list``/``save``/``delete``
+            # /``test`` action, so all four answered 404 "unknown settings
+            # action" and the pane could neither list nor save a credential.
+            result = await self._handle_brokers(action, domain_request, request)
         else:
             channel_connect = _channel_connect_route(path)
             result = await self._system.handle(
