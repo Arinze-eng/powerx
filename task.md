@@ -221,3 +221,47 @@ Measured in the deployed container (throwaway user, real socket):
 list cold 5.1s (first broker action in a cold process), save cold 0.90s, save
 warm 0.43s, list warm 0.18s, delete 0.53s. Container egress to Supabase is not
 slow, so the store was never what a 20s client timeout was waiting on.
+
+## Fix round 5 — the credential the pane saved was unreachable by the tool that trades it
+
+**Symptom.** "credential me I'll can't see it ... use that tool to trade real time ... exness and deriv test it trade".
+
+**Root cause (found, and it is the whole of "use that tool to trade").** One
+signed-in user reached the credential table under two spellings of one identity.
+Settings -> Brokers keys off the Supabase user id the socket authenticated with
+-- the bare `<uuid>` (verified in production: row id 6 is
+`user_key = c9c56243-7cd3-4fa5-b91d-736ee4364b16`). `broker_trade` keys off
+`nanobot.access_policy.turn_user_key`, which namespaces the same id as
+`supabase:<uuid>`. Stored verbatim those are two different rows, so the tool
+answered `broker_not_connected` for a user looking at the account on screen.
+
+Fix: `broker_credentials.credential_user_key()` folds the `supabase:` prefix
+away at the storage boundary, so both callers reach one row and neither has to
+know the other's shape. A Telegram key (`telegram:<id>`) is untouched.
+
+**Verified against production Supabase, before deploying:**
+```
+pane   list(bare)         -> [('41261482', 'Deriv-Demo', '')]
+tool   get(supabase:uid)  -> login=41261482 server=Deriv-Demo password_len=14
+record_connection         -> True [('41261482', 'connected', '2026-10-17T07:38:43+00:00')]
+```
+
+**"Know when it connected."** Whether an account is *connected* is a fact only
+the terminal knows, and the terminal only runs inside the execution sandbox --
+so the settings pane could never have answered it. `broker_trade` now writes the
+outcome of every action that proves a login (`connect`/`account`/`positions`/
+`order`/`close`) onto the row (`connection_status`/`connection_message`/
+`connection_at`), and the pane reads it back as a status badge: green
+"Connected <time>", red "Not connected -- last login failed: <reason>", grey
+"Not connected yet -- connect from a chat". An account that is saved but never
+used is never reported as connected. `install`/`status`/`doctor` are excluded on
+purpose: a working install is not a login.
+
+Migration applied to production and committed in `supabase/broker_credentials.sql`
+(additive, `ADD COLUMN IF NOT EXISTS`); `list_credentials` falls back to the
+pre-column select on a 42703 so a deployment that has not run it still lists.
+
+Also: `broker_trade` now resolves the process-wide store
+(`broker_credentials.shared_store()`), the same instance the pane uses, so a
+trade inherits its pooled Supabase connection instead of paying a fresh DNS
+lookup and TLS handshake per call.

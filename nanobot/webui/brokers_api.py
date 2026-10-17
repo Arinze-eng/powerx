@@ -39,25 +39,18 @@ class BrokerSettingsError(ValueError):
         self.status = status
 
 
-#: The store behind :func:`_store`; see its docstring for why it is kept.
-_STORE: Any = None
-
-
 def _store():
     """The process-wide broker credential store.
 
-    One instance is kept rather than building one per action so the store's
-    HTTP client -- and therefore its TLS connection to Supabase -- survives
-    between actions. The deployment's Supabase settings are container
-    environment, read when the process starts, so there is nothing to
-    re-read; tests replace this function outright.
+    Delegated to ``nanobot.trading.broker_credentials.shared_store`` so the
+    settings pane and ``broker_trade`` share one instance -- and therefore one
+    pooled HTTP client -- instead of each holding its own. The deployment's
+    Supabase settings are container environment, read when the process starts,
+    so there is nothing to re-read; tests replace this function outright.
     """
-    global _STORE
-    if _STORE is None:
-        from nanobot.trading.broker_credentials import BrokerCredentialStore
+    from nanobot.trading.broker_credentials import shared_store
 
-        _STORE = BrokerCredentialStore()
-    return _STORE
+    return shared_store()
 
 
 def _require_user(user_id: str) -> str:
@@ -122,6 +115,7 @@ def _server_profile(server: str) -> dict[str, Any]:
 def _row_payload(row: dict[str, Any]) -> dict[str, Any]:
     """One stored account, as the pane is allowed to see it."""
     server = str(row.get("server") or "")
+    status = str(row.get("connection_status") or "")
     return {
         "id": row.get("id"),
         "broker": str(row.get("broker") or ""),
@@ -132,6 +126,17 @@ def _row_payload(row: dict[str, Any]) -> dict[str, Any]:
         # Never the password: only that one exists.
         "has_password": True,
         "server_profile": _server_profile(server),
+        # Whether the account is actually *connected* is a fact only the
+        # terminal knows, so it is reported here rather than guessed from "a
+        # password is stored": an account can be saved and still never have
+        # authorized. ``status`` is "connected"/"failed"/"" and ``at`` is when
+        # the last real login attempt happened.
+        "connection": {
+            "status": status,
+            "connected": status == "connected",
+            "message": str(row.get("connection_message") or ""),
+            "at": row.get("connection_at") or "",
+        },
     }
 
 

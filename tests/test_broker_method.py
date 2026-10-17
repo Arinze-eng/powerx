@@ -499,9 +499,224 @@ def test_a_store_survives_a_second_event_loop(recording_store):
 
 
 def test_the_brokers_pane_keeps_one_store(monkeypatch):
+    from nanobot.trading import broker_credentials as module
     from nanobot.webui import brokers_api
 
-    monkeypatch.setattr(brokers_api, "_STORE", None)
+    monkeypatch.setattr(module, "_SHARED_STORE", None)
     monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
     monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-key")
     assert brokers_api._store() is brokers_api._store()
+    # The pane and the trade tool resolve the same instance, so a trade pays no
+    # second TLS handshake to reach the row the pane just read.
+    assert brokers_api._store() is module.shared_store()
+
+
+# ------------------------------------- one identity, two spellings of one key
+
+
+def test_a_web_turn_key_and_the_pane_key_reach_the_same_row():
+    """The regression that made a saved account untradeable.
+
+    Settings -> Brokers stores the bare Supabase user id; ``broker_trade``
+    resolves the same user through ``turn_user_key``, which namespaces it as
+    ``supabase:<uuid>``. Written verbatim those are two different rows, so the
+    tool answered ``broker_not_connected`` for a user looking at the account on
+    screen. Both spellings must fold onto one row.
+    """
+    from nanobot.trading.broker_credentials import credential_user_key
+
+    assert credential_user_key("supabase:c9c56243-7cd3-4fa5-b91d-736ee4364b16") == (
+        "c9c56243-7cd3-4fa5-b91d-736ee4364b16"
+    )
+    assert credential_user_key("c9c56243-7cd3-4fa5-b91d-736ee4364b16") == (
+        "c9c56243-7cd3-4fa5-b91d-736ee4364b16"
+    )
+    # A Telegram key is a different namespace and is left alone.
+    assert credential_user_key("telegram:12345") == "telegram:12345"
+    assert credential_user_key("") == ""
+    assert credential_user_key("  supabase:u1  ") == "u1"
+
+
+def test_a_save_under_the_prefixed_key_is_readable_under_the_bare_one(recording_store):
+    store = recording_store
+    _run(
+        store.store_credentials(
+            user_key="supabase:u1",
+            login="41261482",
+            password="secret",
+            server="Deriv-Demo",
+        )
+    )
+    post = _RecordingClient.instances[0].calls[-1]
+    assert post["body"]["user_key"] == "u1"
+
+    # A fresh event loop per ``_run`` means a fresh client (see
+    # test_a_store_survives_a_second_event_loop), so the read is on the last one.
+    _run(store.list_credentials("u1"))
+    read = _RecordingClient.instances[-1].calls[-1]
+    assert read["params"]["user_key"] == "eq.u1"
+    assert read["params"]["select"].startswith("id,broker,server,login,is_default,updated_at")
+
+
+def test_the_tool_finds_an_account_the_pane_saved(monkeypatch):
+    """End to end across the two entry points, at the identity boundary."""
+    from nanobot.agent.tools.broker_trade import BrokerTradeTool
+    from nanobot.trading import broker_credentials as module
+
+    saved: list[dict] = []
+
+    class _Store:
+        enabled = True
+
+        async def get_credentials(self, user_key, *, login="", server=""):
+            saved.append({"user_key": user_key, "login": login})
+            if module.credential_user_key(user_key) != "u1":
+                return None
+            return {"login": "41261482", "password": "secret", "server": "Deriv-Demo"}
+
+    monkeypatch.setattr(module, "shared_store", lambda: _Store())
+    monkeypatch.setattr(BrokerTradeTool, "_current_user_key", staticmethod(lambda: "supabase:u1"))
+
+    tool = BrokerTradeTool()
+    found = _run(tool._account_credentials())
+    assert found == {"login": "41261482", "password": "secret", "server": "Deriv-Demo"}
+    # The tool still speaks the access-policy shape; only the store folds it.
+    assert saved == [{"user_key": "supabase:u1", "login": ""}]
+
+
+# --------------------------------------------- the connection state on the row
+
+
+def test_connection_outcome_reads_ok_not_just_that_the_command_ran():
+    from nanobot.agent.tools.broker_trade import _connection_outcome
+
+    assert _connection_outcome({"ok": True, "account_login": 41261482}) == ("connected", "")
+    status, message = _connection_outcome(
+        {"ok": False, "hint": "Terminal is up but has no account."}
+    )
+    assert status == "failed"
+    assert "no account" in message
+    # `failure` is the terminal's own diagnosis and outranks the generic hint.
+    assert _connection_outcome({"ok": False, "failure": "server mismatch", "hint": "x"}) == (
+        "failed",
+        "server mismatch",
+    )
+
+
+def test_only_actions_that_prove_a_login_record_a_connection():
+    from nanobot.agent.tools.broker_trade import _CONNECTION_EVIDENCE
+
+    assert "connect" in _CONNECTION_EVIDENCE
+    assert "order" in _CONNECTION_EVIDENCE
+    # A working install is not a login: recording it would show an account that
+    # never authorized as connected.
+    assert "install" not in _CONNECTION_EVIDENCE
+    assert "status" not in _CONNECTION_EVIDENCE
+    assert "doctor" not in _CONNECTION_EVIDENCE
+
+
+def test_recording_a_connection_writes_the_state_and_the_time(recording_store):
+    store = recording_store
+    ok = _run(
+        store.record_connection(
+            "supabase:u1",
+            login="41261482",
+            server="Deriv-Demo",
+            status="connected",
+        )
+    )
+    assert ok is True
+    call = _RecordingClient.instances[0].calls[-1]
+    assert call["method"] == "PATCH"
+    assert call["params"] == {
+        "user_key": "eq.u1",
+        "login": "eq.41261482",
+        "server": "eq.Deriv-Demo",
+    }
+    assert call["body"]["connection_status"] == "connected"
+    assert call["body"]["connection_at"]
+
+
+def test_a_failed_connection_record_never_fails_the_trade(recording_store):
+    """A report about a trade is not a condition of it: a Supabase hiccup while
+    writing the status must not turn a filled order into a failed tool call."""
+    store = recording_store
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("supabase down")
+
+    store._request = boom  # type: ignore[assignment]
+    assert _run(store.record_connection("u1", login="1", status="connected")) is False
+    assert _run(store.record_connection("u1", login="", status="connected")) is False
+
+
+def test_a_row_payload_carries_the_connection_state():
+    from nanobot.webui.brokers_api import _row_payload
+
+    row = {
+        "id": 6,
+        "broker": "Deriv",
+        "server": "Deriv-Demo",
+        "login": "41261482",
+        "is_default": True,
+        "updated_at": "2026-10-16T05:28:35+00:00",
+        "connection_status": "connected",
+        "connection_message": "",
+        "connection_at": "2026-10-17T07:00:00+00:00",
+    }
+    payload = _row_payload(row)
+    assert payload["connection"]["status"] == "connected"
+    assert payload["connection"]["connected"] is True
+    assert payload["connection"]["at"] == "2026-10-17T07:00:00+00:00"
+    # Never the password, and never the ciphertext.
+    assert "password" not in json.dumps(payload).replace("has_password", "")
+
+    # An account saved but never used is not reported as connected.
+    never = _row_payload({"login": "1", "server": "Exness-MT5Trial9"})
+    assert never["connection"] == {
+        "status": "",
+        "connected": False,
+        "message": "",
+        "at": "",
+    }
+
+
+def test_listing_survives_a_table_without_the_connection_columns(monkeypatch):
+    """A deployment whose table predates the columns still has to list: the
+    pane shows "not connected yet" instead of an error."""
+    import base64
+
+    import httpx
+
+    from nanobot.trading import broker_credentials as module
+
+    class _OldTableClient(_RecordingClient):
+        """A table created before the connection columns existed."""
+
+        async def request(self, method, url, *, headers=None, params=None, json=None):
+            if "connection_status" in (params or {}).get("select", ""):
+                self.calls.append({"method": method, "params": dict(params or {})})
+                refusal = _RecordingResponse(400, None)
+                refusal.content = b"{}"
+                refusal.text = (
+                    '{"code":"42703","message":"column broker_credentials.'
+                    'connection_status does not exist"}'
+                )
+                return refusal
+            return await super().request(
+                method, url, headers=headers, params=params, json=json
+            )
+
+    _RecordingClient.instances = []
+    monkeypatch.setattr(httpx, "AsyncClient", _OldTableClient)
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-key")
+    monkeypatch.setenv("SUPABASE_TOKEN_ENCRYPTION_KEY", base64.b64encode(b"0" * 32).decode())
+
+    store = module.BrokerCredentialStore()
+    rows = _run(store.list_credentials("u1"))
+    assert rows and rows[0]["login"] == "41261482"
+    selects = [call["params"]["select"] for call in _RecordingClient.instances[0].calls]
+    assert len(selects) == 2
+    assert "connection_status" in selects[0]
+    assert "connection_status" not in selects[1]

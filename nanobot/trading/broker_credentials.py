@@ -43,9 +43,61 @@ DEFAULT_ROW_LIMIT = 20
 #: settings pane timed out" into a number.
 _SLOW_REQUEST_LOG_MS = 2_000
 
+#: The prefix ``nanobot.access_policy.turn_user_key`` puts on a signed-in web
+#: user's key. See :func:`credential_user_key` for why it is stripped here.
+_WEB_USER_PREFIX = "supabase:"
+
+#: The columns that carry the last real login attempt's outcome, kept in one
+#: place because two call sites (the list read and the write) must agree.
+_CONNECTION_COLUMNS = "connection_status,connection_message,connection_at"
+
 
 class BrokerCredentialError(RuntimeError):
     """A broker credential could not be read, written or decrypted."""
+
+
+def credential_user_key(user_key: str) -> str:
+    """The one shape a credential row is keyed by: the bare Supabase user id.
+
+    One signed-in user reaches this store under two spellings of the same
+    identity. The settings pane keys off the user id the socket authenticated
+    with -- ``<uuid>``. ``broker_trade`` keys off
+    ``nanobot.access_policy.turn_user_key``, which namespaces it as
+    ``supabase:<uuid>`` so it can never collide with a Telegram chat id. Stored
+    verbatim, those two are *different rows*: an account the user saved in the
+    pane is invisible to the tool that is supposed to trade it, and the tool
+    answers ``broker_not_connected`` for a user who is looking at the account
+    on screen.
+
+    So the prefix is folded away at the storage boundary, and both callers
+    reach the same row without either having to know the other's shape. A
+    Telegram key (``telegram:<chat id>``) carries no such prefix and is
+    returned unchanged.
+    """
+    key = str(user_key or "").strip()
+    if key.startswith(_WEB_USER_PREFIX):
+        return key[len(_WEB_USER_PREFIX) :].strip()
+    return key
+
+
+#: The store behind :func:`shared_store`; see its docstring for why it is kept.
+_SHARED_STORE: BrokerCredentialStore | None = None
+
+
+def shared_store() -> BrokerCredentialStore:
+    """The process-wide credential store.
+
+    Both the settings pane and ``broker_trade`` resolve their account rows
+    through here rather than each building a store of its own, so the pooled
+    HTTP client (and therefore the TLS connection to Supabase) is shared
+    instead of re-established per call. The deployment's Supabase settings are
+    container environment read at process start, so there is nothing to
+    re-read and nothing to invalidate.
+    """
+    global _SHARED_STORE
+    if _SHARED_STORE is None:
+        _SHARED_STORE = BrokerCredentialStore()
+    return _SHARED_STORE
 
 
 def _env(name: str, default: str = "") -> str:
@@ -197,6 +249,7 @@ class BrokerCredentialStore:
         same account corrects the password instead of creating a second row --
         which is what a user fixing a typo in their password expects.
         """
+        user_key = credential_user_key(user_key)
         if not user_key:
             raise BrokerCredentialError("A user key is required to store broker credentials.")
         login = (login or "").strip()
@@ -239,6 +292,7 @@ class BrokerCredentialStore:
 
     async def _clear_default(self, user_key: str) -> None:
         """Drop the default flag from every account *user_key* has."""
+        user_key = credential_user_key(user_key)
         await self._request(
             "PATCH",
             "/rest/v1/broker_credentials",
@@ -248,18 +302,33 @@ class BrokerCredentialStore:
 
     async def list_credentials(self, user_key: str) -> list[dict[str, Any]]:
         """Every stored broker account for *user_key*, without passwords."""
+        user_key = credential_user_key(user_key)
         if not user_key:
             return []
-        rows = await self._request(
-            "GET",
-            "/rest/v1/broker_credentials",
-            params={
-                "user_key": f"eq.{user_key}",
-                "order": "is_default.desc,updated_at.desc",
-                "limit": str(DEFAULT_ROW_LIMIT),
-                "select": "id,broker,server,login,is_default,updated_at",
-            },
-        )
+        base = {
+            "user_key": f"eq.{user_key}",
+            "order": "is_default.desc,updated_at.desc",
+            "limit": str(DEFAULT_ROW_LIMIT),
+        }
+        legacy = "id,broker,server,login,is_default,updated_at"
+        try:
+            rows = await self._request(
+                "GET",
+                "/rest/v1/broker_credentials",
+                params={**base, "select": f"{legacy},{_CONNECTION_COLUMNS}"},
+            )
+        except BrokerCredentialError as exc:
+            # A table created before the connection columns existed must still
+            # list: the pane then shows "not connected yet" rather than an
+            # error. Only that specific refusal is retried, so a real outage is
+            # still reported.
+            if "connection_status" not in str(exc):
+                raise
+            rows = await self._request(
+                "GET",
+                "/rest/v1/broker_credentials",
+                params={**base, "select": legacy},
+            )
         return rows if isinstance(rows, list) else []
 
     async def get_credentials(
@@ -275,6 +344,7 @@ class BrokerCredentialStore:
         to the most recently updated row), so ``broker_trade`` can be called
         without naming an account every time.
         """
+        user_key = credential_user_key(user_key)
         if not user_key:
             return None
         params: dict[str, str] = {
@@ -306,6 +376,7 @@ class BrokerCredentialStore:
 
     async def set_default(self, user_key: str, *, login: str, server: str = "") -> None:
         """Make one account the user's default and clear the flag on the rest."""
+        user_key = credential_user_key(user_key)
         if not user_key:
             raise BrokerCredentialError("A user key is required.")
         # Every other row loses the flag first: a partial unique index is not
@@ -331,6 +402,7 @@ class BrokerCredentialStore:
         server: str = "",
     ) -> bool:
         """Remove one account, or every account for *user_key* when none is named."""
+        user_key = credential_user_key(user_key)
         if not user_key:
             raise BrokerCredentialError("A user key is required.")
         params: dict[str, str] = {"user_key": f"eq.{user_key}"}
@@ -341,4 +413,50 @@ class BrokerCredentialStore:
         await self._request("DELETE", "/rest/v1/broker_credentials", params=params)
         # _request raises on any transport or HTTP failure, so reaching here means
         # the delete landed; there is no separate row count to check.
+        return True
+
+    async def record_connection(
+        self,
+        user_key: str,
+        *,
+        login: str,
+        server: str = "",
+        status: str,
+        message: str = "",
+    ) -> bool:
+        """Record the outcome of the last real login attempt for one account.
+
+        Whether an account is *connected* is a fact only the terminal knows,
+        and the terminal only runs inside the execution sandbox -- so the answer
+        is written here, on the row, the moment a ``broker_trade`` call learns
+        it, and the settings pane reads it back. That is the only way a user can
+        see "it connected" without a sandbox of their own.
+
+        Best effort by design: recording is a report *about* a trade, never a
+        condition of it, so a Supabase hiccup here must not turn a filled order
+        into a failed tool call.
+        """
+        key = credential_user_key(user_key)
+        login = str(login or "").strip()
+        if not key or not login:
+            return False
+        params: dict[str, str] = {"user_key": f"eq.{key}", "login": f"eq.{login}"}
+        if server:
+            params["server"] = f"eq.{server}"
+        try:
+            await self._request(
+                "PATCH",
+                "/rest/v1/broker_credentials",
+                params=params,
+                body={
+                    "connection_status": str(status or "")[:32],
+                    "connection_message": str(message or "")[:500],
+                    "connection_at": _now(),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - a report is not a condition of the trade
+            module_logger.warning(
+                "broker credentials: could not record the connection state ({})", exc
+            )
+            return False
         return True

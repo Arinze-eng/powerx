@@ -1229,6 +1229,21 @@ export interface BrokerServerProfile {
   installer_slugs?: string[];
 }
 
+/**
+ * What the last real login attempt against this account proved.
+ *
+ * `status` is `"connected"`, `"failed"`, or `""` for an account that has never
+ * been used. It is written by the agent's `broker_trade` tool, which is the
+ * only thing that can reach a broker terminal, and read back here — the pane
+ * itself cannot log in to anything.
+ */
+export interface BrokerAccountConnection {
+  status: "connected" | "failed" | "";
+  connected: boolean;
+  message: string;
+  at: string;
+}
+
 export interface BrokerAccount {
   id?: number | string;
   broker: string;
@@ -1238,6 +1253,7 @@ export interface BrokerAccount {
   updated_at?: string;
   has_password?: boolean;
   server_profile?: BrokerServerProfile;
+  connection?: BrokerAccountConnection;
 }
 
 export interface BrokersPayload {

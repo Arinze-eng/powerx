@@ -71,6 +71,31 @@ _ACTIONS = (
 #: Which stored account a call applies to when the caller names none.
 _DEFAULT_ACCOUNT = ""
 
+#: The actions whose success can only be true once the terminal has actually
+#: authorized with the broker. ``install``/``status``/``doctor`` say nothing
+#: about a login, so they are deliberately absent: recording them would let a
+#: working install read as "connected" on an account that never authorized.
+_CONNECTION_EVIDENCE = ("connect", "account", "positions", "order", "close")
+
+
+def _connection_outcome(payload: dict[str, Any]) -> tuple[str, str]:
+    """The connection state a terminal payload proves, and the reason if not.
+
+    ``ok`` is what ``scripts/mt5_cli.py`` sets from a live bridge probe that
+    returned an account, so it is the one field that means "logged in" rather
+    than "the command ran".
+    """
+    if payload.get("ok") is True:
+        return "connected", ""
+    detail = (
+        payload.get("failure")
+        or payload.get("hint")
+        or payload.get("error")
+        or payload.get("message")
+        or ""
+    )
+    return "failed", str(detail)[:400]
+
 
 @tool_parameters(
     {
@@ -177,9 +202,14 @@ class BrokerTradeTool(Tool):
 
         Mirrors the key shape the access policy uses (see
         ``nanobot.access_policy.turn_user_key``) so one identity resolves both
-        the feature gate and the credential row. An empty answer is a real
-        answer: without it there is no account to trade, and the tool refuses
-        rather than falling back to a shared deployment account.
+        the feature gate and the credential row. That shape is
+        ``supabase:<uuid>`` while Settings -> Brokers stores the bare uuid, so
+        the credential store folds the prefix away on the way in
+        (``nanobot.trading.broker_credentials.credential_user_key``) rather
+        than this tool and the pane having to agree on a spelling. An empty
+        answer is a real answer: without it there is no account to trade, and
+        the tool refuses rather than falling back to a shared deployment
+        account.
         """
         try:
             from nanobot.access_policy import turn_user_key
@@ -213,15 +243,52 @@ class BrokerTradeTool(Tool):
         if not user_key:
             return None
         try:
-            from nanobot.trading.broker_credentials import BrokerCredentialStore
+            # The process-wide store, not a fresh one per call: the settings
+            # pane reads the same rows through the same instance, so this
+            # inherits its pooled Supabase connection instead of paying a DNS
+            # lookup and a TLS handshake on every trade.
+            from nanobot.trading.broker_credentials import shared_store
 
-            store = BrokerCredentialStore()
+            store = shared_store()
             if not store.enabled:
                 return None
             return await store.get_credentials(user_key, login=login)
         except Exception as exc:  # noqa: BLE001 - a store outage is a refusal, not a 500
             logger.warning("broker_trade: credential lookup failed ({})", exc)
             return None
+
+    async def _record_connection(
+        self,
+        credentials: dict[str, str],
+        payload: dict[str, Any],
+    ) -> None:
+        """Write what the terminal just proved about the login onto the row.
+
+        The settings pane has no way to ask a broker anything itself -- the
+        terminal only runs in the execution sandbox -- so "is this account
+        connected" is answered here, once per call that actually touched the
+        terminal, and read back by the pane. Best effort: a report about a
+        trade is never a condition of it.
+        """
+        status, message = _connection_outcome(payload)
+        user_key = self._current_user_key()
+        if not user_key:
+            return
+        try:
+            from nanobot.trading.broker_credentials import shared_store
+
+            store = shared_store()
+            if not store.enabled:
+                return
+            await store.record_connection(
+                user_key,
+                login=credentials.get("login") or "",
+                server=credentials.get("server") or "",
+                status=status,
+                message=message,
+            )
+        except Exception:  # noqa: BLE001 - a report is not a condition of the trade
+            logger.debug("broker_trade: could not record the connection state")
 
     # -- execution --------------------------------------------------------- #
 
@@ -263,9 +330,12 @@ class BrokerTradeTool(Tool):
                             "store is unavailable."
                         ),
                         "next": (
-                            "Ask the user to open Settings -> Brokers and add their broker "
-                            "account number, password and server. Do NOT ask them for the "
-                            "password in chat."
+                            "Ask the user to open Settings -> Brokers. If an account "
+                            "is already listed there, read its status line back to "
+                            "them and retry -- a listed account is reachable by this "
+                            "tool. If none is listed, have them add their broker "
+                            "account number, password and server. Do NOT ask them "
+                            "for the password in chat."
                         ),
                     }
                 )
@@ -319,6 +389,13 @@ class BrokerTradeTool(Tool):
                 "The broker command produced no JSON result. Raw output tail:\n"
                 f"{rendered_text[-1200:]}"
             )
+        if action in _CONNECTION_EVIDENCE:
+            # The pane cannot ask a broker anything itself, so the one place a
+            # login is ever proved is here. Written before the result is
+            # returned, but awaited on a failure path that swallows its own
+            # errors, so a Supabase hiccup cannot turn a filled order into a
+            # failed tool call.
+            await self._record_connection(credentials, payload)
         return ToolResult(json.dumps(payload, ensure_ascii=False, indent=2))
 
     @staticmethod

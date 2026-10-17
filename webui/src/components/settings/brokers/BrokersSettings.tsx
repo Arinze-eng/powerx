@@ -11,6 +11,7 @@ import {
   type BrokerAccount,
   type BrokersPayload,
 } from "@/lib/api";
+import { brokerConnectionLabel } from "@/lib/broker-connection";
 import { useClient } from "@/providers/ClientProvider";
 
 interface FormState {
@@ -20,6 +21,14 @@ interface FormState {
   broker: string;
   isDefault: boolean;
 }
+
+/** The one place the status badge colours live, so a state reads the same
+ * wherever it appears. */
+const CONNECTION_TONE_CLASS: Record<"connected" | "failed" | "idle", string> = {
+  connected: "text-emerald-600 dark:text-emerald-500",
+  failed: "text-destructive",
+  idle: "text-muted-foreground",
+};
 
 const EMPTY_FORM: FormState = {
   login: "",
@@ -219,7 +228,9 @@ export function BrokersSettings() {
         <p className="mt-1 max-w-[42rem] text-[13px] leading-5 text-muted-foreground">
           Trade your own MT5 broker account directly. Enter the account number, password and
           server your terminal shows, and the agent can log in and trade it for you. Your
-          password is encrypted before it is stored and is never shown again.
+          password is encrypted before it is stored and is never shown again. The status
+          beside each account is what the last real login proved — an account can be
+          saved and still never have connected.
         </p>
       </div>
 
@@ -316,36 +327,57 @@ export function BrokersSettings() {
           </p>
         ) : (
           <SettingsGroup>
-            {accounts.map((account) => (
-              <SettingsRow
-                key={`${account.login}:${account.server}`}
-                title={`${account.broker || "Broker"} · ${account.login}`}
-                description={[
-                  account.server,
-                  account.has_password ? "password stored (encrypted)" : "no password stored",
-                  account.is_default ? "default" : "",
-                  account.server_profile?.recognised
-                    ? "server recognised"
-                    : "server unknown — the agent will search for its installer",
-                ]
-                  .filter(Boolean)
-                  .join(" · ")}
-              >
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => handleDelete(account)}
-                  disabled={busy !== null}
+            {accounts.map((account) => {
+              const connection = brokerConnectionLabel(account);
+              return (
+                <SettingsRow
+                  key={`${account.login}:${account.server}`}
+                  title={`${account.broker || "Broker"} · ${account.login}`}
+                  description={[
+                    account.server,
+                    account.has_password ? "password stored (encrypted)" : "no password stored",
+                    account.is_default ? "default" : "",
+                    account.server_profile?.recognised
+                      ? "server recognised"
+                      : "server unknown — the agent will search for its installer",
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
                 >
-                  {busy === `delete:${account.login}` ? (
-                    <Loader2 className="size-4 animate-spin" />
-                  ) : (
-                    <Trash2 className="size-4" />
-                  )}
-                  Remove
-                </Button>
-              </SettingsRow>
-            ))}
+                  <div className="flex items-center gap-3">
+                    <span
+                      title={connection.detail}
+                      className={`inline-flex max-w-[22rem] items-center gap-1.5 text-[12px] font-medium ${CONNECTION_TONE_CLASS[connection.tone]}`}
+                    >
+                      <span
+                        aria-hidden
+                        className={`size-2 shrink-0 rounded-full ${
+                          connection.tone === "connected"
+                            ? "bg-emerald-500"
+                            : connection.tone === "failed"
+                              ? "bg-destructive"
+                              : "bg-muted-foreground/45"
+                        }`}
+                      />
+                      {connection.text}
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => handleDelete(account)}
+                      disabled={busy !== null}
+                    >
+                      {busy === `delete:${account.login}` ? (
+                        <Loader2 className="size-4 animate-spin" />
+                      ) : (
+                        <Trash2 className="size-4" />
+                      )}
+                      Remove
+                    </Button>
+                  </div>
+                </SettingsRow>
+              );
+            })}
           </SettingsGroup>
         )}
       </div>

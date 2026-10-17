@@ -27,10 +27,27 @@ CREATE TABLE IF NOT EXISTS public.broker_credentials (
     password_iv TEXT NOT NULL,
     -- Whether this row is the user's default broker for broker_trade calls.
     is_default BOOLEAN NOT NULL DEFAULT false,
+    -- The outcome of the last REAL login attempt, written by the broker_trade
+    -- tool and read back by the settings pane. Whether an account is connected
+    -- is a fact only the terminal knows, and the terminal only runs inside the
+    -- execution sandbox -- so it is recorded here when the agent learns it.
+    -- '' means "never tried"; 'connected'/'failed' are the two answers.
+    connection_status TEXT NOT NULL DEFAULT '',
+    -- The terminal's own reason when the login failed, trimmed for display.
+    connection_message TEXT NOT NULL DEFAULT '',
+    connection_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(user_key, login, server)
 );
+
+-- The connection columns were added after the table shipped, so a deployment
+-- created from an earlier copy of this file needs them added rather than only
+-- declared above. Idempotent, like the rest of this file.
+ALTER TABLE public.broker_credentials
+    ADD COLUMN IF NOT EXISTS connection_status TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS connection_message TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS connection_at TIMESTAMPTZ;
 
 -- Enable Row Level Security
 ALTER TABLE public.broker_credentials ENABLE ROW LEVEL SECURITY;
