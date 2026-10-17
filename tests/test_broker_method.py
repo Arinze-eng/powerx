@@ -511,6 +511,31 @@ def test_the_brokers_pane_keeps_one_store(monkeypatch):
     assert brokers_api._store() is module.shared_store()
 
 
+def test_the_trade_tool_keeps_the_context_it_was_created_with():
+    """The loader instantiates every tool through ``create(ctx)``, and the base
+    implementation is ``cls()`` -- which drops the context. Without an override
+    ``getattr(self, "_ctx", None)`` was always None, ``_sandbox_tool(None)``
+    always returned None, and broker_trade answered "No execution sandbox is
+    configured" on every deployment, sandbox up or not."""
+    from types import SimpleNamespace
+
+    from nanobot.agent.tools.broker_trade import BrokerTradeTool, _sandbox_tool
+
+    class _Sandbox:
+        name = "novita_sandbox"
+
+    class _Registry:
+        def get(self, name):
+            return _Sandbox() if name == "novita_sandbox" else None
+
+    ctx = SimpleNamespace(tool_registry=_Registry())
+    tool = BrokerTradeTool.create(ctx)
+    assert tool._ctx is ctx
+    assert _sandbox_tool(tool._ctx) is not None
+    # The default create() would not have carried it: this is the regression.
+    assert _sandbox_tool(getattr(BrokerTradeTool(), "_ctx", None)) is None
+
+
 # ------------------------------------- one identity, two spellings of one key
 
 

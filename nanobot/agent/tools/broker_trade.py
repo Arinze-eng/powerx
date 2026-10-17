@@ -168,6 +168,25 @@ class BrokerTradeTool(Tool):
 
     _scopes = {"core"}
 
+    def __init__(self, ctx: ToolContext | None = None) -> None:
+        # The ToolContext is retained so the execution sandbox can be resolved at
+        # execute() time: the loader calls ``create(ctx)`` while it is still
+        # populating the registry, so a lookup during construction finds nothing.
+        #
+        # WITHOUT THIS the tool could never reach a terminal on ANY deployment.
+        # ``Tool.create`` defaults to ``cls()``, which drops the context, so
+        # ``getattr(self, "_ctx", None)`` in execute() was always None,
+        # ``_sandbox_tool(None)`` always returned None, and every single call
+        # answered "No execution sandbox is configured" -- including on a
+        # deployment whose sandbox was up. Verified in production: the agent's
+        # own reply to "connect to my broker account" was that refusal.
+        self._ctx: ToolContext | None = ctx
+
+    @classmethod
+    def create(cls, ctx: ToolContext) -> "BrokerTradeTool":
+        """Carry the tool context so the sandbox can be resolved later."""
+        return cls(ctx)
+
     @property
     def name(self) -> str:
         return "broker_trade"

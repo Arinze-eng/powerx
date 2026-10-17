@@ -265,3 +265,29 @@ Also: `broker_trade` now resolves the process-wide store
 (`broker_credentials.shared_store()`), the same instance the pane uses, so a
 trade inherits its pooled Supabase connection instead of paying a fresh DNS
 lookup and TLS handshake per call.
+
+**Second bug, found by driving a real production turn.** A probe turn asked the
+agent to connect and report the balance. The agent's own reply:
+
+> "Broker trading isn't available in your current setup. `broker_trade` runs the
+> MT5 terminal inside an execution sandbox (novita/vps/runloop/daytona), but
+> **no execution sandbox is configured** on this deployment"
+
+That refusal came from `_sandbox_tool(getattr(self, "_ctx", None))`. The tool
+loader instantiates every tool through `Tool.create(ctx)` (loader.py:104), and
+`Tool.create` defaults to `cls()` -- so `BrokerTradeTool` had no `_ctx` at all,
+`_sandbox_tool(None)` always returned None, and **every call on every deployment
+refused before it could reach a terminal**. Fixed with `__init__(ctx)` +
+`create(ctx)`, the same pair `mt5_sandbox` and `media` already carry.
+
+So "use that tool to trade" had two independent causes: the tool could not find
+the credential (identity mismatch, above) and, even having found it, could not
+find a sandbox.
+
+**Still blocking a live login, and not fixable from here:** the deployment's
+execution backend is `freestyle` and Freestyle is refusing new VMs --
+`Freestyle POST /v5/vms returned 429 {"code":"LIMIT_EXCEEDED"}` every few
+seconds, both lanes parked. The terminal can only run in that sandbox, so an
+Exness/Deriv login cannot be attempted until capacity is back (or
+`NANOBOT_EXECUTION_BACKEND` is pointed at another provider). No Exness account
+is stored for any user either; the one real row is Deriv-Demo.
