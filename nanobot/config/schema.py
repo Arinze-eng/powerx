@@ -752,11 +752,27 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class AccessConfig(Base):
+    """Administrator-controlled switches over what a *user* may do.
+
+    Schema only: the config file on the production volume carries an ``access``
+    block written by the 90bbe08 build, and the loader rejects unknown keys.
+    The gate that reads these flags lives in commit 36383c9 and is not on main.
+    """
+
+    general_task_enabled: bool = True
+    mt5_trading_enabled: bool = True
+    brokers_enabled: bool = True
+    default_broker: str = ""
+    default_server: str = ""
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
     _source_path: Path | None = PrivateAttr(default=None)
 
+    access: AccessConfig = Field(default_factory=AccessConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)
