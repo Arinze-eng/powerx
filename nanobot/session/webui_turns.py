@@ -18,6 +18,7 @@ from nanobot.bus.events import InboundMessage
 from nanobot.bus.outbound_events import (
     GoalStateSyncEvent,
     GoalStatusEvent,
+    PlanStateSyncEvent,
     RuntimeModelUpdatedEvent,
     SessionUpdatedEvent,
     TurnEndEvent,
@@ -28,6 +29,7 @@ from nanobot.bus.outbound_events import (
 from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import (
     GoalStateChanged,
+    PlanStateChanged,
     RuntimeEventBus,
     RuntimeEventContext,
     RuntimeModelChanged,
@@ -539,6 +541,10 @@ class WebuiTurnCoordinator:
                 GoalStateChanged,
             ),
             runtime_events.subscribe(
+                self._handle_plan_state_changed,
+                PlanStateChanged,
+            ),
+            runtime_events.subscribe(
                 self._handle_runtime_model_changed,
                 RuntimeModelChanged,
             ),
@@ -667,6 +673,23 @@ class WebuiTurnCoordinator:
                 chat_id=cid,
                 event=GoalStateSyncEvent(
                     goal_state=goal_state_ws_blob(event.session_metadata),
+                ),
+                metadata=event.context.metadata,
+            ),
+        )
+
+    async def _handle_plan_state_changed(self, event: PlanStateChanged) -> None:
+        if not self._is_websocket_event(event.context):
+            return
+        cid = str(event.context.chat_id or "").strip()
+        if not cid:
+            return
+        await self.bus.publish_outbound(
+            outbound_message_for_event(
+                channel=event.context.channel,
+                chat_id=cid,
+                event=PlanStateSyncEvent(
+                    plan=dict(event.plan),
                 ),
                 metadata=event.context.metadata,
             ),

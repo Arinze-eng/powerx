@@ -120,6 +120,12 @@ function fakeClient() {
       getGoalState(chatId: string) {
         return goalStateByChatId.get(chatId);
       },
+      getPlanState(chatId: string) {
+        return undefined as never;
+      },
+      clearPlanState(chatId: string) {
+        /* noop */
+      },
       hasUnsettledRun(chatId: string) {
         return unsettledRunByChatId.get(chatId) === true;
       },
