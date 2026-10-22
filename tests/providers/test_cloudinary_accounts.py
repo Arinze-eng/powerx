@@ -398,3 +398,46 @@ async def test_the_provider_reports_missing_credentials_instead_of_crashing(
 
     with pytest.raises(ImageGenerationError, match="Cloudinary is not configured"):
         await client.generate(prompt="a teapot", model="auto")
+
+
+@pytest.mark.asyncio
+async def test_the_image_provider_refuses_a_fifth_reference_instead_of_dropping_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Five pictures named in the prompt must not reach Cloudinary as four.
+
+    The provider used to keep the first four and drop the fifth silently, which
+    left "image 5" in the instructions pointing at nothing.
+    """
+    from nanobot.providers.image_generation import ImageGenerationError
+
+    refs: list[str] = []
+    for i in range(5):
+        path = tmp_path / f"ref{i}.png"
+        path.write_bytes(PNG_BYTES)
+        refs.append(str(path))
+    uploads: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/image/upload"):
+            uploads.append(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "asset_id": f"ref-{len(uploads)}",
+                    "public_id": f"ref-{len(uploads)}",
+                    "resource_type": "image",
+                    "secure_url": f"https://res.cloudinary.com/cloud-a/image/upload/v1/ref-{len(uploads)}.png",
+                },
+            )
+        raise AssertionError("no generation should be requested for five references")
+
+    media = cld.CloudinaryClient(
+        pool=cld.CloudinaryPool([_ACCOUNT_A]), client=_mock_client(handler)
+    )
+    client = CloudinaryImageGenerationClient(api_key=None, api_base=None)
+    monkeypatch.setattr(client, "_media_client", lambda: media)
+
+    with pytest.raises(ImageGenerationError, match="at most 4"):
+        await client.generate(prompt="combine image 1 to image 5", model="auto", reference_images=refs)

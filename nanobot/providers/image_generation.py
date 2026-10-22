@@ -2203,6 +2203,9 @@ class ModelScopeImageGenerationClient(ImageGenerationProvider):
         return images
 
 
+_CLOUDINARY_MAX_REFERENCES = 4
+
+
 class CloudinaryImageGenerationClient(ImageGenerationProvider):
     """Cloudinary's Image Generation API, with the account pool behind it.
 
@@ -2293,7 +2296,14 @@ class CloudinaryImageGenerationClient(ImageGenerationProvider):
             raise ImageGenerationError(self.missing_key_message)
 
         chosen = self._cloudinary_model(model)
-        refs = [str(p) for p in (reference_images or []) if p][:4]
+        # Refused rather than truncated: a dropped fifth reference would leave
+        # "image 5" in the prompt pointing at nothing.
+        refs = [str(p) for p in (reference_images or []) if p]
+        if len(refs) > _CLOUDINARY_MAX_REFERENCES:
+            raise ImageGenerationError(
+                f"Cloudinary takes at most {_CLOUDINARY_MAX_REFERENCES} reference images "
+                f"(got {len(refs)}); pass fewer pictures"
+            )
 
         if refs:
             urls: list[str] = []

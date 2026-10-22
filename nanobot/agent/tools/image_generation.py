@@ -95,6 +95,31 @@ class ImageGenerationToolConfig(Base):
         return primary_image_provider_available(providers or {}, preferred=self.provider)
 
 
+_ORDINALS = ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth")
+
+
+def _numbered_reference_prompt(prompt: str, count: int) -> str:
+    """Name each reference picture in the prompt sent to the provider.
+
+    Providers receive the reference images in attachment order but no labels,
+    so a prompt such as "take the bag from the first picture and put it in the
+    second" cannot be bound to anything. With two or more references, prefix
+    the instructions with the numbering the agent was asked to use. A single
+    reference is unambiguous and is passed through unchanged.
+    """
+    if count < 2:
+        return prompt
+    labels = "; ".join(
+        f"image {i} is the {_ORDINALS[i - 1] if i <= len(_ORDINALS) else f'number {i}'} reference picture"
+        for i in range(1, count + 1)
+    )
+    return (
+        f"The reference pictures are numbered in the order they were attached: {labels}. "
+        "Where the instructions say 'image N' or name a picture by position, they mean the "
+        "reference picture with that number.\n\nInstructions: " + prompt
+    )
+
+
 @tool_parameters(
     tool_parameters_schema(
         prompt=StringSchema(
@@ -105,9 +130,15 @@ class ImageGenerationToolConfig(Base):
             StringSchema(
                 "Local path of an existing image artifact or user-provided image to use as an edit "
                 "reference. An https:// link to a user-uploaded file works too — it is downloaded "
-                "automatically, so never tell the user to re-upload a file that is already attached."
+                "automatically, so never tell the user to re-upload a file that is already attached. "
+                "For a picture found online, pass the direct image file link, not the web page around it."
             ),
-            description="Optional image references: local paths, or https:// links to uploaded files.",
+            description=(
+                "Optional image references: local paths, or https:// links to uploaded files. "
+                "Order matters: the first entry is image 1, the second is image 2, and so on. "
+                "When there is more than one, say which image each instruction refers to by number "
+                "in prompt (e.g. 'take the watch from image 1 and put it on the person in image 2')."
+            ),
         ),
         aspect_ratio=StringSchema(
             "Optional output aspect ratio, e.g. 1:1, 16:9, 9:16, 4:3.",
@@ -315,6 +346,10 @@ class ImageGenerationTool(Tool):
         except (ArtifactError, ImageGenerationError, OSError) as exc:
             return ToolResult.error(f"Error: {exc}")
 
+        # The provider receives the references in order but no names for them:
+        # without this, "take X from the first picture" has nothing to bind to.
+        provider_prompt = _numbered_reference_prompt(prompt, len(refs))
+
         chain = self._provider_chain()
         if not chain:
             # Name the provider the operator asked for and what it is missing,
@@ -343,7 +378,7 @@ class ImageGenerationTool(Tool):
             try:
                 while len(artifacts) < requested:
                     response = await client.generate(
-                        prompt=prompt,
+                        prompt=provider_prompt,
                         model=self.config.model,
                         reference_images=refs,
                         aspect_ratio=aspect_ratio or self.config.default_aspect_ratio,

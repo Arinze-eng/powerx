@@ -367,3 +367,67 @@ async def test_generate_image_tool_does_not_fetch_a_local_reference(
     result = await tool.execute(prompt="edit", reference_images=[str(ref)])
 
     assert json.loads(result)["artifacts"]
+
+
+@pytest.mark.asyncio
+async def test_generate_image_tool_numbers_the_references_for_the_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two pictures in, the provider must be told which one is image 1 and image 2.
+
+    The references keep their attachment order, and the stored artifact keeps
+    the instructions the user wrote, not the numbering preamble.
+    """
+    set_config_path(tmp_path / "config.json")
+    FakeImageClient.instances = []
+    monkeypatch.setattr(
+        "nanobot.agent.tools.image_generation.get_image_gen_provider",
+        lambda name: FakeImageClient if name == "openrouter" else None,
+    )
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    first.write_bytes(PNG_BYTES)
+    second.write_bytes(PNG_BYTES)
+    tool = ImageGenerationTool(
+        workspace=tmp_path,
+        config=ImageGenerationToolConfig(enabled=True),
+        provider_config=ProviderConfig(api_key="sk-or-test"),
+    )
+    instruction = "take the watch from image 1 and put it on the person in image 2"
+
+    result = await tool.execute(
+        prompt=instruction, reference_images=["first.png", "second.png"]
+    )
+
+    call = FakeImageClient.instances[0].calls[0]
+    assert call["reference_images"] == [str(first.resolve()), str(second.resolve())]
+    sent = call["prompt"]
+    assert "image 1 is the first reference picture" in sent
+    assert "image 2 is the second reference picture" in sent
+    assert sent.endswith(instruction)
+    payload = json.loads(result)
+    assert payload["artifacts"][0]["prompt"] == instruction
+
+
+@pytest.mark.asyncio
+async def test_generate_image_tool_leaves_a_single_reference_prompt_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_config_path(tmp_path / "config.json")
+    FakeImageClient.instances = []
+    monkeypatch.setattr(
+        "nanobot.agent.tools.image_generation.get_image_gen_provider",
+        lambda name: FakeImageClient if name == "openrouter" else None,
+    )
+    (tmp_path / "ref.png").write_bytes(PNG_BYTES)
+    tool = ImageGenerationTool(
+        workspace=tmp_path,
+        config=ImageGenerationToolConfig(enabled=True),
+        provider_config=ProviderConfig(api_key="sk-or-test"),
+    )
+
+    await tool.execute(prompt="make this blue", reference_images=["ref.png"])
+
+    assert FakeImageClient.instances[0].calls[0]["prompt"] == "make this blue"
