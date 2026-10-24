@@ -60,6 +60,7 @@ from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.config.timezone import DEFAULT_TIMEZONE
 from nanobot.providers.base import LLMProvider, ProviderConversationState
 from nanobot.providers.factory import ProviderSnapshot
+from nanobot.providers.registry import model_accepts_images
 from nanobot.runtime_context import (
     RUNTIME_CONTEXT_HISTORY_META,
     RUNTIME_CONTEXT_MESSAGE_META,
@@ -1287,6 +1288,7 @@ class AgentLoop:
                         if isinstance(path, str) and path and is_image_file(path)
                     ]
                     if ocr_images:
+                        keep_pixels = model_accepts_images(runtime.model)
                         analyzer = NovitaSandboxTool()
                         backend_name = analyzer.backend_name()
                         analysis = await analyzer.analyze_telegram_images(
@@ -1315,9 +1317,10 @@ class AgentLoop:
                         # that only ever existed here, then asking the user to
                         # re-upload it.
                         content = reference_host_images(content, ocr_images)
-                        image_paths = [
-                            path for path in image_paths if path not in ocr_images
-                        ]
+                        if not keep_pixels:
+                            image_paths = [
+                                path for path in image_paths if path not in ocr_images
+                            ]
                 if image_paths:
                     content, image_paths = reference_non_image_attachments(
                         content,
@@ -2151,6 +2154,23 @@ class AgentLoop:
             ctx.session_key,
         )
 
+    def _model_accepts_channel_images(self, session_key: str | None) -> bool:
+        """Whether the model resolved for this session can take image input.
+
+        Fails closed to OCR-only when the runtime cannot be resolved.
+        """
+        try:
+            session = self.sessions.get_cached(session_key) if session_key else None
+            runtime = (
+                self.runtime_for_session(session)
+                if session is not None
+                else self.runtime_resolver.runtime
+            )
+            return model_accepts_images(runtime.model)
+        except Exception:
+            logger.exception("could not resolve model vision capability; using OCR only")
+            return False
+
     async def _prepare_sandbox_images(self, ctx: TurnContext) -> None:
         """Move channel images through the selected backend before the model sees the turn."""
         msg = ctx.msg
@@ -2199,7 +2219,11 @@ class AgentLoop:
         # already used this safe OCR-only handoff; VPS must use it too because
         # the configured LLM may not support image input. Never expose an image
         # path in the model-visible text after the atomic OCR handoff.
-        visible_media: list[str] = []
+        # OCR text is always provided. A vision-capable model also receives the
+        # raw pixels so it can answer questions OCR cannot (layout, colours,
+        # diagrams, edits). Text-only models keep the OCR-only handoff.
+        keep_pixels = self._model_accepts_channel_images(ctx.session_key)
+        visible_media: list[str] = list(image_paths) if keep_pixels else []
         ctx.msg = dataclasses.replace(
             msg,
             content=content,
@@ -2482,7 +2506,7 @@ class AgentLoop:
             # prompt assembly and the first model checkpoint.
             self.sessions.save(session)
         ctx.initial_messages = self._build_initial_messages(ctx)
-        if sandbox_image_ocr_turn:
+        if sandbox_image_ocr_turn and not model_accepts_images(runtime.model):
             self._strip_telegram_image_blocks(ctx.initial_messages)
 
         if ctx.on_progress is None:

@@ -786,3 +786,42 @@ def create_dynamic_spec(
         strip_model_prefixes=strip_prefixes,
         thinking_style=thinking_style,
     )
+
+
+# ---------------------------------------------------------------------------
+# Vision capability
+# ---------------------------------------------------------------------------
+
+# Model-id fragments known to accept image input. Matched case-insensitively
+# against the full model id (so "openrouter/anthropic/claude-..." matches).
+# Deliberately conservative: an unlisted model is treated as text-only, which
+# keeps the OCR-only path for it. A false positive would send image blocks to a
+# model that rejects them, so only add families known to be multimodal.
+_VISION_MODEL_MARKERS: tuple[str, ...] = (
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-4-turbo",
+    "gpt-5",
+    "claude-3",
+    "claude-4",
+    "claude-opus",
+    "claude-sonnet",
+    "claude-haiku",
+    "gemini",
+    "-vision",
+    "vision-",
+    "-vl",
+    "llava",
+    "pixtral",
+    "grok-2-vision",
+    "grok-4",
+    "llama-4",
+)
+
+
+def model_accepts_images(model: str | None) -> bool:
+    """Return whether the chat model id is known to accept image input."""
+    if not model:
+        return False
+    normalized = model.strip().lower()
+    return any(marker in normalized for marker in _VISION_MODEL_MARKERS)
