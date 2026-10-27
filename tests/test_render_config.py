@@ -3,9 +3,11 @@ from pathlib import Path
 
 from scripts.ensure_render_config import (
     _DEPLOYMENT_TIMEZONE,
+    _URL_SHAPE,
     _ensure_deployment_timezone,
     _ensure_image_generation_defaults,
     _ensure_provider_defaults,
+    _is_placeholder_model,
     ensure_file_tool_enabled,
     ensure_render_defaults,
 )
@@ -454,3 +456,117 @@ def test_the_snake_case_mode_is_dropped_so_one_spelling_wins() -> None:
     assert _ensure_deployment_timezone(data) is True
     assert "timezone_mode" not in data["agents"]["defaults"]
     assert data["agents"]["defaults"]["timezoneMode"] == "manual"
+
+
+# --- a placeholder in the platform env must not clobber a working config -----
+
+
+def _admin_config() -> dict:
+    """A provider the operator configured correctly, e.g. from the admin panel."""
+    return {
+        "agents": {"defaults": {"model": "custom/real-model"}},
+        "providers": {
+            "custom": {
+                "apiBase": "https://real.example/api",
+                "apiKey": "real-key-1234567890abcdef",
+            }
+        },
+    }
+
+
+_REAL_KEY = "sk-" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4"
+_PLACEHOLDERS = {
+    "LLM_MODEL": "Hdhhdhdhdhdhhd",
+    "LLM_BASE_URL": "Fhhfhfhhfhfh",
+    "LLM_API_KEY": "Nendjjdbdhdb",
+}
+
+
+def test_a_placeholder_base_url_is_not_treated_as_a_configured_provider(
+    monkeypatch,
+) -> None:
+    """The measured fault: a mashed value force-refreshed the config every boot.
+
+    With ``LLM_BASE_URL=Fhhfhfhhfhfh`` the boot script rewrote the persisted
+    provider to reference a host that does not resolve, so a correct provider
+    (admin-set or committed) was discarded on restart and every model call
+    failed. The retry policy absorbed those failures across the turn: a
+    45-minute run that did no work.
+    """
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-flash")
+    monkeypatch.setenv("LLM_BASE_URL", "Fhhfhfhhfhfh")
+    monkeypatch.setenv("LLM_API_KEY", _REAL_KEY)
+
+    data = _admin_config()
+
+    assert _ensure_provider_defaults(data) is False
+    assert data == _admin_config()
+
+
+def test_a_placeholder_key_is_not_treated_as_a_configured_provider(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-flash")
+    monkeypatch.setenv("LLM_BASE_URL", "https://kymaapi.com/v1")
+    monkeypatch.setenv("LLM_API_KEY", "Nendjjdbdhdb")
+
+    data = _admin_config()
+
+    assert _ensure_provider_defaults(data) is False
+    assert data == _admin_config()
+
+
+def test_a_placeholder_model_is_not_treated_as_a_configured_provider(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LLM_MODEL", "Hdhhdhdhdhdhhd")
+    monkeypatch.setenv("LLM_BASE_URL", "https://kymaapi.com/v1")
+    monkeypatch.setenv("LLM_API_KEY", _REAL_KEY)
+
+    data = _admin_config()
+
+    assert _ensure_provider_defaults(data) is False
+    assert data == _admin_config()
+
+
+def test_a_valid_environment_provider_still_wins(monkeypatch) -> None:
+    """The original contract must survive the guard: env is source of truth.
+
+    The guard exists to reject *placeholder* values, not to weaken the migration
+    that stops a stale on-disk model surviving a deploy.
+    """
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-flash")
+    monkeypatch.setenv("LLM_BASE_URL", "https://kymaapi.com/v1")
+    monkeypatch.setenv("LLM_API_KEY", _REAL_KEY)
+
+    data = _admin_config()
+
+    assert _ensure_provider_defaults(data) is True
+    assert data["agents"]["defaults"]["model"] == "custom/${LLM_MODEL}"
+    assert data["providers"]["custom"]["apiBase"] == "${LLM_BASE_URL}"
+    assert data["providers"]["custom"]["apiKey"] == "${LLM_API_KEY}"
+
+
+def test_a_rejected_placeholder_is_logged_not_silent(monkeypatch, capsys) -> None:
+    """A misconfiguration must be visible, or the slowness is un-diagnosable."""
+    for key, value in _PLACEHOLDERS.items():
+        monkeypatch.setenv(key, value)
+
+    assert _ensure_provider_defaults(_admin_config()) is False
+    assert "LLM_BASE_URL" in capsys.readouterr().err
+
+
+def test_real_model_ids_are_not_mistaken_for_placeholders() -> None:
+    """The guard must not reject the ids operators actually use."""
+    for model in (
+        "deepseek-v4-flash",
+        "anthropic/claude-sonnet-4",
+        "gemini-3.1-flash-lite:free",
+        "gpt-4o",
+    ):
+        assert not _is_placeholder_model(model), model
+
+
+def test_real_looking_urls_are_accepted() -> None:
+    for url in ("https://kymaapi.com/v1", "http://api.example.io/v2"):
+        assert _URL_SHAPE.match(url), url
