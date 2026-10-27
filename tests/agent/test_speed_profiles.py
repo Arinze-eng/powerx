@@ -17,15 +17,63 @@ from nanobot.agent import speed
 def _no_ambient_profile(monkeypatch: pytest.MonkeyPatch) -> None:
     """No test inherits a profile another test, or the shell, left behind."""
     monkeypatch.delenv(speed.ENV_VAR, raising=False)
+    monkeypatch.delenv(speed.DEFAULT_ENV_VAR, raising=False)
 
 
 _GENERATION = {"temperature": 0.1, "max_tokens": 8192, "reasoning_effort": None}
 
 
-def test_with_nothing_forced_the_generation_is_untouched() -> None:
-    """The unforced deployment must be byte-identical to its configuration."""
-    assert speed.resolve_profile() is None
+def test_with_nothing_forced_the_deployment_still_has_a_pace() -> None:
+    """An unset deployment gets the shipped default, not the provider's default.
+
+    Leaving the pace to the provider measured out as turns that ran to the
+    wall-clock ceiling without finishing: every step paid for unbounded thinking.
+    """
+    assert speed.resolve_profile() == speed.DEFAULT_PROFILE
+    assert speed.resolve_profile() == "fast"
+
+    tuned = speed.apply_to_generation(_GENERATION)
+
+    assert tuned["reasoning_effort"] == "none"
+    assert tuned["max_tokens"] == 2_048
+
+
+def test_the_opt_out_restores_the_unforced_behaviour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``off`` is the documented way back to the configured settings."""
+    monkeypatch.setenv(speed.ENV_VAR, "off")
+
+    assert speed.resolve_profile() == speed.PROFILE_NONE
     assert speed.apply_to_generation(_GENERATION) == _GENERATION
+
+
+def test_the_deployment_default_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deployment picks its pace with POWERX_SPEED_PROFILE_DEFAULT."""
+    monkeypatch.setenv(speed.DEFAULT_ENV_VAR, "balanced")
+
+    assert speed.resolve_profile() == "balanced"
+    assert speed.apply_to_generation(_GENERATION)["reasoning_effort"] == "low"
+
+
+def test_an_explicit_force_still_beats_the_deployment_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(speed.DEFAULT_ENV_VAR, "balanced")
+    monkeypatch.setenv(speed.ENV_VAR, "fast")
+
+    assert speed.resolve_profile() == "fast"
+
+
+def test_a_typo_in_the_deployment_default_does_not_uncap_the_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The safe failure is the default pace, not no pace at all."""
+    monkeypatch.setenv(speed.DEFAULT_ENV_VAR, "turb0")
+
+    assert speed.resolve_profile() == speed.DEFAULT_PROFILE
 
 
 def test_the_environment_variable_forces_a_profile_for_the_whole_deployment(
@@ -74,11 +122,15 @@ def test_an_explicit_argument_beats_both_ambient_forces(
 def test_a_typo_in_the_environment_variable_is_no_profile_not_a_crash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A performance knob must never be the thing that takes the agent down."""
+    """A performance knob must never be the thing that takes the agent down.
+
+    An unrecognised force is skipped and the deployment default stands -- it does
+    not fall through to "off", or a typo would silently uncap the agent.
+    """
     monkeypatch.setenv(speed.ENV_VAR, "turb0")
 
-    assert speed.resolve_profile() is None
-    assert speed.apply_to_generation(_GENERATION) == _GENERATION
+    assert speed.resolve_profile() == speed.DEFAULT_PROFILE
+    assert speed.apply_to_generation(_GENERATION)["reasoning_effort"] == "none"
 
 
 def test_a_profile_never_invents_a_key_the_caller_did_not_have() -> None:
@@ -161,5 +213,34 @@ def test_every_named_profile_is_describable() -> None:
         assert name in described or name == speed.PROFILE_NONE
 
 
-def test_the_unforced_description_names_the_switch_to_set() -> None:
-    assert speed.ENV_VAR in speed.describe()
+def test_the_unforced_description_names_the_profile_and_the_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With nothing forced the page still has to name the pace in force."""
+    described = speed.describe()
+
+    assert speed.DEFAULT_PROFILE in described
+    assert speed.ENV_VAR in described
+
+
+def test_the_opt_out_description_gives_the_switch_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(speed.ENV_VAR, "off")
+
+    described = speed.describe()
+
+    assert speed.ENV_VAR in described
+
+
+def test_the_description_distinguishes_a_force_from_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator must be able to tell a set profile from the shipped one."""
+    monkeypatch.setenv(speed.ENV_VAR, "balanced")
+
+    assert "forced" in speed.describe()
+
+    monkeypatch.delenv(speed.ENV_VAR, raising=False)
+
+    assert "deployment default" in speed.describe()

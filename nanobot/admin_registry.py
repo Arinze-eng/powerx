@@ -261,9 +261,10 @@ def _effective_reasoning_effort(saved: str) -> str:
     from nanobot.agent import speed
 
     profile = speed.resolve_profile()
-    if profile is not None:
+    if profile != speed.PROFILE_NONE:
         forced = speed.SPEED_PROFILES.get(profile, {}).get("reasoning_effort")
-        return f"{forced} (forced by the {profile} speed profile)"
+        source = "forced" if speed._is_forced(None) else "deployment default"
+        return f"{forced} ({source} by the {profile} speed profile)"
     return saved or "the endpoint's own default"
 
 

@@ -464,4 +464,27 @@ fi
 # Set NANOBOT_MAX_CONCURRENT_REQUESTS on the platform to override.
 export NANOBOT_MAX_CONCURRENT_REQUESTS="${NANOBOT_MAX_CONCURRENT_REQUESTS:-2}"
 
+# ---------------------------------------------------------------------------
+# Task pace: the profile the agent runs when the platform has set nothing.
+#
+# The pace levers existed but nothing set them, so every deployment ran at the
+# provider default -- unbounded thinking on every step of every turn. That is
+# the shape that measured out as "48 minutes and the task still was not
+# finished": the turn paid for reasoning tokens it did not need, on each of
+# many round trips, and crossed the wall-clock ceiling before the work landed.
+#
+# "fast" is the shipped default and each value is overridable on the platform:
+#
+#   POWERX_SPEED_PROFILE          -- a whole deployment, wins over everything.
+#                                    "off" restores the old unforced behaviour.
+#   POWERX_SPEED_PROFILE_DEFAULT  -- what "unset" means ("fast"/"balanced"/
+#                                    "steady"). Set it, do not delete the var.
+#   NANOBOT_TURN_BUDGET_S         -- per-turn wall clock. 0 = unbounded.
+#   NANOBOT_MAX_PARALLEL_TOOLS    -- independent tool calls in flight (default 6).
+#   NANOBOT_LLM_TIMEOUT_S         -- ceiling for one model call (default 1800).
+# ---------------------------------------------------------------------------
+export POWERX_SPEED_PROFILE_DEFAULT="${POWERX_SPEED_PROFILE_DEFAULT:-fast}"
+export NANOBOT_MAX_PARALLEL_TOOLS="${NANOBOT_MAX_PARALLEL_TOOLS:-6}"
+export NANOBOT_TURN_BUDGET_S="${NANOBOT_TURN_BUDGET_S:-900}"
+
 exec /app/scripts/nanobot_launcher.sh "$@"

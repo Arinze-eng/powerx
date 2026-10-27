@@ -96,6 +96,13 @@ RUNTIME_KEYS: tuple[str, ...] = (
     "NANOBOT_RUNLOOP_ARCHITECTURE",
     "NANOBOT_RUNLOOP_KEEP_ALIVE",
     "NANOBOT_RUNLOOP_FETCH_ALLOW_HOSTS",
+    # Task pace (see entrypoint.sh). Snapshotted so a platform env wipe does
+    # not silently drop back to the unforced provider default.
+    "POWERX_SPEED_PROFILE",
+    "POWERX_SPEED_PROFILE_DEFAULT",
+    "NANOBOT_TURN_BUDGET_S",
+    "NANOBOT_MAX_PARALLEL_TOOLS",
+    "NANOBOT_LLM_TIMEOUT_S",
 )
 
 # Storage prefix for runtime config keys. Using a prefix avoids clashing with
