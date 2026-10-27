@@ -118,10 +118,41 @@ identical under `git stash -u` in the previous task. **No new failures.**
 
 | want | set |
 |---|---|
-| default (30 min) | nothing |
-| shorter, e.g. 10 min | `NANOBOT_TURN_BUDGET_S=600` |
+| the shipped pace (`fast`) | nothing |
+| a different default pace | `POWERX_SPEED_PROFILE_DEFAULT=balanced` (or `steady`) |
+| force a profile for the deployment | `POWERX_SPEED_PROFILE=fast` |
+| shorter, e.g. 15 min | `NANOBOT_TURN_BUDGET_S=900` |
 | longer, e.g. 1 h | `NANOBOT_TURN_BUDGET_S=3600` |
 | no cap (old behaviour) | `NANOBOT_TURN_BUDGET_S=0` |
 
 `max_iterations` is unchanged at 200. The two bounds are complementary: the
 budget stops a turn that is slow, the count stops one that is thrashing.
+
+## The pace profile is not opt-in
+
+A wall-clock ceiling bounds a turn, but it does not make one *fast*: it only
+decides when to stop paying. The cost being paid, per step, is generation the
+step does not need -- reasoning tokens first, then a long preamble -- and on a
+slow model every round trip pays it again.
+
+`nanobot/agent/speed.py` is the lever for that, and it used to be opt-in: with
+no profile forced, the model ran at the provider default. MEASURED consequence:
+a turn spent its whole 30-minute budget on thinking it did not need and was
+stopped with the task unfinished -- the reported "48 minutes and it still had
+not done it".
+
+The default is now a profile. Resolution order, first hit wins:
+
+1. `force_profile(...)` in-process, for one scoped turn;
+2. `POWERX_SPEED_PROFILE`, for a whole deployment;
+3. the deployment default: `POWERX_SPEED_PROFILE_DEFAULT`, or `fast` if unset.
+
+`POWERX_SPEED_PROFILE=off` is the explicit opt-out and restores the old
+unforced behaviour. An unrecognised value at *any* level is skipped and the
+default stands -- never "off" -- because a typo must not silently uncap the
+agent. The `max_tokens` cap from a profile is still withheld from a request
+that carries tools, so a tool call's own payload is never truncated.
+
+`entrypoint.sh` exports `fast`, `NANOBOT_MAX_PARALLEL_TOOLS=6` and
+`NANOBOT_TURN_BUDGET_S=900` as deployment defaults, each overridable from the
+platform.

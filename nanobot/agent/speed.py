@@ -19,9 +19,13 @@ Resolution order, first hit wins:
 2. The ``POWERX_SPEED_PROFILE`` environment variable, which is how an operator
    forces it for a whole deployment -- including for a model they cannot
    configure per-request, like a self-hosted GLM endpoint.
+3. The deployment default (:func:`deployment_default`), named by
+   ``POWERX_SPEED_PROFILE_DEFAULT`` and ``fast`` when that is unset.
 
-With neither set, ``apply_to_generation`` returns its input unchanged. The
-default deployment behaves exactly as it did before this module existed.
+There is always a profile in force. That is deliberate: leaving the pace to the
+provider default measured out as turns that ran to the 30-minute wall-clock
+ceiling without finishing. An operator restores the old behaviour explicitly
+with ``POWERX_SPEED_PROFILE=off``.
 """
 
 from __future__ import annotations
@@ -60,32 +64,84 @@ SPEED_PROFILES: dict[str, dict[str, Any]] = {
         "reasoning_effort": "low",
         "max_tokens": 4_096,
     },
+    # Sustained work on a conversational model: enough reasoning for a real
+    # multi-step task, none of the unbounded rambling that made a turn drag.
+    # The text ceiling matches the configured default (8192): this profile
+    # restricts thinking, not the answer -- capping prose to a number below what
+    # the deployment chose is how a long answer gets truncated mid-file.
+    "steady": {
+        "reasoning_effort": "medium",
+    },
 }
+
+#: The profile a deployment runs when it has not chosen one.
+#:
+#: This used to be ``None`` -- "no profile, run at the configured settings".
+#: MEASURED problem with that default: the configured settings are the provider
+#: default, and on a slow reasoning model that means every step pays for
+#: unbounded thinking before it does anything. The result was a turn that ran
+#: to the wall-clock ceiling (30 min) without finishing the task. A pace is
+#: therefore a property of the deployment, not an opt-in: "fast" is the shipped
+#: default, and an operator who wants the old behaviour sets
+#: ``POWERX_SPEED_PROFILE=off``.
+DEFAULT_PROFILE = "fast"
 
 _FORCED: ContextVar[str | None] = ContextVar("powerx_speed_profile", default=None)
 
 #: The environment variable an operator sets to force a profile deployment-wide.
 ENV_VAR = "POWERX_SPEED_PROFILE"
 
+#: The env var that names the deployment default. Read once at import so a
+#: deployment can point at ``balanced`` without the module guessing at it.
+DEFAULT_ENV_VAR = "POWERX_SPEED_PROFILE_DEFAULT"
+
 
 def known_profiles() -> list[str]:
     return sorted(SPEED_PROFILES)
 
 
-def resolve_profile(explicit: str | None = None) -> str | None:
-    """The active profile, or None when nothing is forcing one.
+def deployment_default() -> str:
+    """The profile a deployment runs when it has chosen nothing.
 
-    An unrecognised value is treated as no profile rather than raising: a typo
-    in an environment variable must not take the agent down, and silently
-    running at normal speed is a safe failure for a performance knob.
+    ``POWERX_SPEED_PROFILE_DEFAULT`` names it, so a deployment can pick
+    ``balanced``/``steady`` without also being unable to loosen it later. An
+    unparseable or unknown name falls back to :data:`DEFAULT_PROFILE` rather
+    than to "off": a typo must not silently uncap the agent, which is the exact
+    failure this constant exists to prevent.
+    """
+    raw = os.getenv(DEFAULT_ENV_VAR)
+    if raw is not None:
+        name = str(raw).strip().lower()
+        if name in SPEED_PROFILES:
+            return name
+    return DEFAULT_PROFILE
+
+
+def resolve_profile(explicit: str | None = None) -> str:
+    """The active profile. Always a profile -- never None.
+
+    A deployment always has a pace now: the forced value wins, then an
+    in-process force, then ``POWERX_SPEED_PROFILE``, then the deployment default
+    (:func:`deployment_default`, itself overridable with
+    ``POWERX_SPEED_PROFILE_DEFAULT``, and ``fast`` if neither is set).
+
+    ``POWERX_SPEED_PROFILE=off`` is the documented opt-out and is honoured
+    explicitly: an operator who writes "off" gets the old unforced behaviour,
+    and no other unrecognised value is allowed to reach it by accident.
+
+    An unrecognised value at any level is skipped rather than raising: a typo in
+    an environment variable must not take the agent down, and the safe failure
+    for a performance knob is the default pace, not no pace at all.
     """
     for candidate in (explicit, _FORCED.get(), os.getenv(ENV_VAR)):
         if candidate is None:
             continue
         name = str(candidate).strip().lower()
+        if name == PROFILE_NONE:
+            return PROFILE_NONE
         if name in SPEED_PROFILES:
             return name
-    return None
+    return deployment_default()
 
 
 @contextmanager
@@ -123,7 +179,7 @@ def apply_to_generation(
     other profile key (``reasoning_effort``, the bigger lever) still applies.
     """
     active = resolve_profile(profile)
-    if active is None:
+    if active == PROFILE_NONE:
         return dict(generation)
     overlay = SPEED_PROFILES[active]
     result = dict(generation)
@@ -137,16 +193,37 @@ def apply_to_generation(
 
 
 def describe(profile: str | None = None) -> str:
-    """One line the model or the user can read."""
+    """One line the model or the user can read.
+
+    Always names a profile, because there always is one in force. The only
+    "off" is the explicit opt-out, and it says so and gives the switch back.
+    The counterfactual -- what is *forced*, if anything, versus what the
+    deployment default merely is -- is reported so an operator can tell a lever
+    they set from the shipped one.
+    """
     active = resolve_profile(profile)
-    if active is None:
+    if active == PROFILE_NONE:
         return (
-            f"no speed profile is forced; the model runs at its configured "
-            f"settings (set {ENV_VAR} to one of: {', '.join(known_profiles())})"
+            f"no speed profile is in force ({ENV_VAR}=off); the model runs at "
+            f"its configured settings (set {ENV_VAR} to one of: "
+            f"{', '.join(known_profiles())})"
         )
     overlay = ", ".join(f"{k}={v}" for k, v in SPEED_PROFILES[active].items())
+    source = "forced" if _is_forced(profile) else "deployment default"
     return (
-        f"speed profile {active!r} is forced, overriding: {overlay} "
-        "(the max_tokens cap is skipped on requests that carry tools, so a tool "
-        "call's own payload is never truncated)"
+        f"speed profile {active!r} ({source}) is in force, overriding: {overlay} "
+        f"(set {ENV_VAR}=<profile> to change it, {ENV_VAR}={PROFILE_NONE} to opt "
+        "out; the max_tokens cap is skipped on requests that carry tools, so a "
+        "tool call's own payload is never truncated)"
     )
+
+
+def _is_forced(profile: str | None) -> bool:
+    """Whether an explicit/env/context force picked the profile, not the default."""
+    for candidate in (profile, _FORCED.get(), os.getenv(ENV_VAR)):
+        if candidate is None:
+            continue
+        name = str(candidate).strip().lower()
+        if name == PROFILE_NONE or name in SPEED_PROFILES:
+            return True
+    return False

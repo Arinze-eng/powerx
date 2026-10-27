@@ -1601,7 +1601,10 @@ def test_admin_provider_settings_save_persists_reasoning_effort(
     assert saved["agents"]["defaults"]["reasoningEffort"] == "none"
     body = json.loads(bytes(response.body).decode())
     assert body["reasoningEffort"] == "none"
-    assert body["effectiveReasoningEffort"] == "none"
+    # A deployment always has a pace now, so the page names the profile in force
+    # rather than echoing the saved value as if nothing were overriding it.
+    assert body["effectiveReasoningEffort"].startswith("none")
+    assert "speed profile" in body["effectiveReasoningEffort"]
 
 
 def test_admin_provider_settings_reject_an_unknown_reasoning_effort(
