@@ -217,6 +217,37 @@ if [ "$PLATFORM_BOOTSTRAP" = "true" ]; then
     fi
     python3 /app/scripts/ensure_render_config.py "$config" || \
         echo "[entrypoint] warning: config migration failed"
+    # Prove the configured endpoint resolves before the agent starts serving.
+    # A host that does not resolve turns every model call into a retryable
+    # failure, and the retry policy absorbs those across the whole turn -- the
+    # symptom is a 45-minute run that did no work, not an error. Resolving here
+    # costs one DNS lookup at boot and makes the real fault obvious in the logs
+    # instead of leaving the operator to infer it from a slow turn.
+    /app/.venv/bin/python3 - "$config" <<'PREFLIGHT' || true
+import json, socket, sys
+from urllib.parse import urlparse
+try:
+    cfg = json.load(open(sys.argv[1]))
+    base = ((cfg.get("providers") or {}).get("custom") or {}).get("apiBase") or ""
+except Exception:
+    sys.exit(0)
+if not base or "${" in base:
+    sys.exit(0)
+host = urlparse(base).hostname
+if not host:
+    print(f"[preflight] WARNING: provider apiBase is not a URL: {base!r}", flush=True)
+    sys.exit(0)
+try:
+    socket.getaddrinfo(host, None)
+    print(f"[preflight] provider endpoint resolves: {host}", flush=True)
+except OSError as exc:
+    print(
+        f"[preflight] ERROR: provider host {host!r} does not resolve ({exc}). "
+        "Every model call will fail; check LLM_BASE_URL. The agent will start "
+        "but tasks will not complete.",
+        file=sys.stderr, flush=True,
+    )
+PREFLIGHT
     set -- "$@" --config "$config"
     # Legacy restore flows (cron jobs + chat history from Supabase). These only
     # make sense when the local disk is ephemeral (Render free tier). With a

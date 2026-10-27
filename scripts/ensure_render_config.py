@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, TypeGuard
@@ -26,6 +27,44 @@ _LEGACY_DEFAULT_MAX_TOOL_ITERATIONS = 80
 _TURN_ITERATION_CAP = 150
 _DEFAULT_REASONING_EFFORT = "max"
 _DEFAULT_RENDER_MODEL = "gemini-3.1-flash-lite"
+
+#: Keys that look like a real provider URL: a scheme, a host with a dot, and no
+#: whitespace. Anything else (``"Fhhfhfhhfhfh"``) is a placeholder someone pasted
+#: into the platform env, and treating it as an endpoint is how every model call
+#: becomes a DNS failure that the retry policy spreads across the whole turn.
+_URL_SHAPE = re.compile(r"^https?://[^\s/]+\.[^\s/]+", re.IGNORECASE)
+
+#: A model id has to be a single path segment or two, not free text with spaces,
+#: and it must not be a run of one repeated character (``"Hdhhdhdhdhdhhd"``,
+#: ``"xxx"``) -- the shape a placeholder keyboard-mash takes.
+_MODEL_SHAPE = re.compile(r"^[A-Za-z0-9._:\-/]+$")
+
+
+def _is_placeholder_model(value: str) -> bool:
+    """Whether a model id looks typed rather than chosen.
+
+    Deliberately conservative: real model ids are dotted, hyphenated and
+    colon-suffixed (``deepseek-v4-flash``, ``anthropic/claude-sonnet-4``,
+    ``gemini-3.1-flash-lite:free``), so the only thing rejected is a string that
+    is not a plausible identifier at all.
+    """
+    if not value or not _MODEL_SHAPE.match(value):
+        return True
+    # One repeated character (ignoring case) is a placeholder, never a model.
+    return len(set(value.lower())) <= 2
+
+
+def _is_placeholder_key(value: str) -> bool:
+    """Whether an API key looks typed rather than issued.
+
+    Real keys are long and mixed-case with digits. A 12-character lowercase-ish
+    mash (``"Nendjjdbdhdb"``) is not one, and passing it to a provider yields a
+    401 on every call -- which the retry policy turns into a slow turn rather
+    than a fast failure.
+    """
+    if len(value) < 20:
+        return True
+    return len(set(value.lower())) <= 3
 
 _VALID_EXECUTION_BACKENDS = (
     "novita",
@@ -236,6 +275,42 @@ def _ensure_provider_defaults(data: dict[str, Any]) -> bool:
     render_key = os.environ.get("LLM_API_KEY", "").strip()
     if not render_model or not render_base or not render_key:
         # Operator has not wired the environment-backed provider; do not touch.
+        return False
+
+    # A *set but malformed* value is not a configured provider. Treating one as
+    # configured is how a placeholder in the platform env ("LLM_BASE_URL=
+    # Fhhfhfhhfhfh") becomes authoritative: the boot script force-refreshes the
+    # persisted config to reference it, so a perfectly good provider the operator
+    # set in the admin panel is clobbered on every restart, and every model call
+    # then fails against a host that does not resolve. The retry policy spreads
+    # those failures across the turn -- a 45-minute run that did no work.
+    #
+    # Refusing to migrate is the safe failure: the admin config (or the committed
+    # default) stands, and the operator sees a working agent rather than a slow
+    # one. The rejection is logged loudly so the misconfiguration is not silent.
+    if not _URL_SHAPE.match(render_base):
+        print(
+            "[entrypoint] LLM_BASE_URL is set but is not an http(s) URL "
+            f"({render_base!r}); leaving the persisted provider config alone. "
+            "Fix the value or unset it.",
+            file=sys.stderr,
+        )
+        return False
+    if _is_placeholder_model(render_model):
+        print(
+            f"[entrypoint] LLM_MODEL looks like a placeholder ({render_model!r}); "
+            "leaving the persisted provider config alone. Fix the value or "
+            "unset it.",
+            file=sys.stderr,
+        )
+        return False
+    if _is_placeholder_key(render_key):
+        print(
+            "[entrypoint] LLM_API_KEY looks like a placeholder "
+            f"({len(render_key)} chars); leaving the persisted provider config "
+            "alone. Fix the value or unset it.",
+            file=sys.stderr,
+        )
         return False
 
     agents = data.setdefault("agents", {})
