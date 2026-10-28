@@ -89,9 +89,11 @@ EOF
 fi
 # >>> powerx:volume-link  (tests/test_entrypoint_image_contract.py lifts this block)
 VOLUME_DATA_DIR=""
-if [ -n "$VOLUME_ROOT" ] && [ ! -L "$dir" ] && [ -w "$dir" ]; then
+if [ -n "$VOLUME_ROOT" ]; then
     PERSIST_ROOT="${PERSIST_ROOT:-$VOLUME_ROOT/persist}"
     VOLUME_DATA_DIR="$PERSIST_ROOT/nanobot"
+fi
+if [ -n "$VOLUME_DATA_DIR" ] && [ ! -L "$dir" ] && [ -w "$dir" ]; then
     if mkdir -p "$VOLUME_DATA_DIR" 2>/dev/null; then
         # Migrate the previous layout once, without deleting the old copy. A
         # later operator can remove /data/powerx after verifying the new tree.
