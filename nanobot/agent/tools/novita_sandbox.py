@@ -39,8 +39,10 @@ from nanobot.agent.tools.freestyle_backend import (
     freestyle_sandbox_name,
 )
 from nanobot.agent.tools.vercel_backend import VercelError, VercelExecutionBackend, vercel_sandbox_name
+from nanobot.agent.tools.path_utils import resolve_workspace_path
 from nanobot.agent.tools.vps_backend import VPSExecutionBackend
-from nanobot.config.paths import get_data_dir, get_workspace_path
+from nanobot.config.paths import get_data_dir, get_media_dir, get_workspace_path
+from nanobot.security.workspace_policy import WorkspaceBoundaryError
 from nanobot.utils.lazy_import import optional_attr, optional_installed
 from nanobot.utils.file_share import (
     FileShareError,
@@ -972,6 +974,18 @@ _UPLOAD_NOTE = (
 )
 
 
+def _host_safe_name(remote: str) -> str:
+    """A filename for a sandbox path, safe to create on this host."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", posixpath.basename(remote))[:120] or "sandbox-file.bin"
+
+
+def _write_host_file(destination: Path, payload: bytes) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destination.with_name(f".{destination.name}.part")
+    tmp.write_bytes(payload)
+    tmp.replace(destination)
+
+
 def _upload_destination(source: Path, requested: Any, *, root: str = _WORKSPACE) -> str:
     """Where an ``upload`` of *source* lands inside the remote sandbox.
 
@@ -1206,8 +1220,10 @@ async def _publish_signed_artifact(
         required=["action"],
         additional_properties=None,
         action=StringSchema(
-            "Operation: run, read, write, upload, fetch_url, install, list, download_url, apk_toolchain, apk_decompile, apk_build, or reset",
-            enum=["run", "read", "write", "upload", "fetch_url", "install", "list", "download_url",
+            "Operation: run, read, write, upload, pull, fetch_url, install, list, download_url, "
+            "apk_toolchain, apk_decompile, apk_build, or reset. upload copies a file FROM this host "
+            "INTO the sandbox; pull copies a file FROM the sandbox ONTO this host.",
+            enum=["run", "read", "write", "upload", "pull", "fetch_url", "install", "list", "download_url",
                   "apk_toolchain", "apk_decompile", "apk_build", "reset"],
         ),
         command=StringSchema(
@@ -1222,7 +1238,16 @@ async def _publish_signed_artifact(
         url=StringSchema("Remote HTTPS URL to fetch into the sandbox (onlyfiles.com or gofile.io)"),
         content=StringSchema("Text content for write"),
         timeout=IntegerSchema(description="Command timeout in seconds", minimum=1, maximum=_MAX_TIMEOUT),
-        source=StringSchema("Local media path to upload into the remote sandbox"),
+        source=StringSchema(
+            "Local file path on this host to upload into the sandbox (action=upload). "
+            "It must be inside the media/data directory. A path that exists only in the "
+            "sandbox is NOT a source: copy it out with action=pull instead."
+        ),
+        host_path=StringSchema(
+            "Optional for action=pull: where on this host to save the file. Must be inside the "
+            "agent workspace or the media directory. A directory, or a path ending in /, keeps "
+            "the file's own name. Omitted, the file goes to the media directory."
+        ),
         apk_path=StringSchema("APK path inside the sandbox workspace (apk_decompile)"),
         src=StringSchema("Decompiled APK source dir to rebuild (apk_build)"),
         out=StringSchema("Output APK path (apk_build)"),
@@ -1327,6 +1352,11 @@ class NovitaSandboxTool(Tool):
             "link is fetched), so gofile.io links always work and do NOT require the user "
             "to attach the file or provide any API token. After fetching, inspect or "
             "process the downloaded file with action=read or run commands. "
+            "Moving files: upload copies a file from this host into the sandbox (source = the "
+            "host path). pull copies a file from the sandbox onto this host (path = the sandbox "
+            "file, optional host_path); the result is a local path you can pass to the message "
+            "tool's media parameter or to local tools. Never answer that a file cannot be moved "
+            "to the host: pull does it. "
             "When the user message contains an [Attachment: local path], use the upload "
             "action first with that exact source path and a safe destination under /workspace "
             "before running or reading the uploaded file remotely. In VPS mode, upload "
@@ -1366,7 +1396,7 @@ class NovitaSandboxTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["run", "read", "write", "upload", "fetch_url", "install", "list", "download_url", "apk_toolchain", "apk_decompile", "apk_build", "reset"]},
+                "action": {"type": "string", "enum": ["run", "read", "write", "upload", "pull", "fetch_url", "install", "list", "download_url", "apk_toolchain", "apk_decompile", "apk_build", "reset"]},
                 "command": {"type": "string", "description": "The shell command to execute, for action=run. action=install ignores it — use packages there."},
                 "packages": {"type": "string", "description": "Required for action=install: bare distro package names, space- or comma-separated (e.g. \"nmap curl jq\"). Not a shell command."},
                 "path": {"type": "string"},
@@ -1374,6 +1404,7 @@ class NovitaSandboxTool(Tool):
                 "content": {"type": "string"},
                 "timeout": {"type": "integer", "minimum": 1, "maximum": _MAX_TIMEOUT},
                 "source": {"type": "string"},
+                "host_path": {"type": "string", "description": "Optional for action=pull: host destination inside the workspace or media directory."},
                 "apk_path": {"type": "string", "description": "APK path inside the sandbox workspace (apk_decompile)."},
                 "src": {"type": "string", "description": "Decompiled APK source dir to rebuild (apk_build)."},
                 "out": {"type": "string", "description": "Output APK path (apk_build)."},
@@ -2738,6 +2769,75 @@ class NovitaSandboxTool(Tool):
 
         return await self._stage_upload(kwargs, _noop, label=label)
 
+    async def _pull(self, kwargs: dict[str, Any]) -> ToolResult | str:
+        """Copy one file out of the active sandbox onto this host.
+
+        The inverse of ``upload``. The bytes come through the same backend-aware
+        reader the Cloudinary and image tools use (``fetch_remote_file``), so every
+        sandbox backend works, and binary files arrive intact. The destination is
+        either ``host_path`` (inside the agent workspace or the media directory,
+        the same boundary the message tool's media parameter reads from) or a
+        fresh file in the media directory.
+        """
+        from nanobot.agent.tools.workspace_bridge import (  # noqa: PLC2701
+            fetch_remote_file,
+            sandbox_workspace_root,
+        )
+
+        raw = str(kwargs.get("path") or "").strip()
+        if not raw:
+            return ToolResult.error(
+                "pull needs 'path': the file inside the sandbox to copy onto this host "
+                "(for example /workspace/report.pdf or report.pdf)."
+            )
+        if raw.startswith("/"):
+            remote = raw
+        else:
+            root = (await sandbox_workspace_root()) or _WORKSPACE
+            remote = f"{root.rstrip('/')}/{raw}"
+        try:
+            destination = self._pull_destination(remote, kwargs.get("host_path"))
+        except WorkspaceBoundaryError as exc:
+            return ToolResult.error(f"host_path refused: {exc}")
+        payload = await fetch_remote_file(remote, max_bytes=_MAX_UPLOAD_BYTES)
+        if not payload:
+            return ToolResult.error(
+                f"{remote} could not be copied from the sandbox: it does not exist there, "
+                "it is larger than 200 MiB, or the sandbox is not reachable right now. "
+                "Check the exact path with action=list or action=run (ls -la), then retry."
+            )
+        try:
+            await asyncio.to_thread(_write_host_file, destination, payload)
+        except OSError as exc:
+            return ToolResult.error(
+                f"copied {remote} from the sandbox but could not write {destination}: "
+                f"{type(exc).__name__}: {str(exc)[:200]}"
+            )
+        return (
+            f"Copied {remote} from the sandbox to {destination} on this host "
+            f"({len(payload)} bytes). Send it to the user with the message tool's media "
+            "parameter, or pass this path to local tools such as generate_image or "
+            "cloudinary_video_edit."
+        )
+
+    @staticmethod
+    def _pull_destination(remote: str, requested: Any) -> Path:
+        """Where a ``pull`` lands on this host. Raises WorkspaceBoundaryError if refused."""
+        ctx = current_request_context()
+        workspace = (
+            Path(ctx.workspace).expanduser().resolve()
+            if ctx is not None and ctx.workspace is not None
+            else get_workspace_path().expanduser().resolve()
+        )
+        requested_text = str(requested or "").strip()
+        if requested_text:
+            target = resolve_workspace_path(requested_text, workspace=workspace, allowed_dir=workspace)
+            if requested_text.endswith(("/", os.sep)) or target.is_dir():
+                target = target / _host_safe_name(remote)
+            return target
+        media = get_media_dir().expanduser().resolve() / "sandbox"
+        return media / f"{uuid4().hex[:12]}-{_host_safe_name(remote)}"
+
     async def _stage_upload(
         self,
         kwargs: dict[str, Any],
@@ -2764,10 +2864,16 @@ class NovitaSandboxTool(Tool):
         if not self._local_attachment_allowed(source):
             return ToolResult.error(
                 f"source must be inside the nanobot media/data directory (got {source}). "
-                "An attachment the user sent is already there — use the path exactly as given."
+                "An attachment the user sent is already there — use the path exactly as given. "
+                "If the file is in the sandbox instead, upload cannot read it: use "
+                "action=pull with path=<sandbox path> to copy it onto this host."
             )
         if not source.is_file():
-            return ToolResult.error(f"source file does not exist: {source}")
+            return ToolResult.error(
+                f"source file does not exist on this host: {source}. upload copies a file FROM "
+                "this host INTO the sandbox. A file that lives in the sandbox is copied out "
+                "with action=pull, path=<sandbox path>."
+            )
         if source.stat().st_size > _MAX_UPLOAD_BYTES:
             return ToolResult.error("source file exceeds 200 MiB")
         path = _upload_destination(source, kwargs.get("path"))
@@ -4357,6 +4463,10 @@ class NovitaSandboxTool(Tool):
 
     async def _dispatch(self, **kwargs: Any) -> ToolResult | str:
         action = str(kwargs.get("action", "")).strip().lower()
+        if action == "pull":
+            # Backend-agnostic: pull reads through fetch_remote_file, which already
+            # dispatches to whichever sandbox is configured.
+            return await self._pull(kwargs)
         selected_backend, backend_config = self._selected_backend()
         if selected_backend == "vps":
             if backend_config is None or not str(backend_config.host or "").strip():

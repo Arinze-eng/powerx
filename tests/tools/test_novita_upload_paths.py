@@ -187,3 +187,174 @@ def test_the_success_message_says_the_local_path_still_works() -> None:
     assert "local file remains readable" in _UPLOAD_NOTE
     assert "generate_image" in _UPLOAD_NOTE
     assert "cloudinary_video_edit" in _UPLOAD_NOTE
+
+
+# --- action=pull: sandbox -> host -------------------------------------------
+#
+# upload could only copy host -> sandbox, so an agent asked to put a sandbox
+# file "on the host" had no action to call. pull is that action. These tests
+# pin its destination rules, its refusal of paths outside the workspace and
+# media directory, and the byte-exact write.
+
+from nanobot.agent.tools import novita_sandbox as _ns  # noqa: E402
+
+
+@pytest.fixture()
+def pull_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
+    """Isolated workspace + data dir, with no request context and no backend."""
+    data = tmp_path / "data"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("NANOBOT_DATA_DIR", str(data))
+    monkeypatch.setattr(_ns, "get_workspace_path", lambda *a, **k: workspace)
+    monkeypatch.setattr(_ns, "current_request_context", lambda: None)
+    monkeypatch.setattr(_ns, "get_media_dir", lambda *a, **k: data / "media")
+
+    async def _no_root() -> None:
+        return None
+
+    import nanobot.agent.tools.workspace_bridge as bridge
+
+    monkeypatch.setattr(bridge, "sandbox_workspace_root", _no_root)
+    return {"tmp": tmp_path, "data": data, "workspace": workspace}
+
+
+def test_pull_destination_defaults_into_the_media_directory(pull_env: dict[str, Path]) -> None:
+    target = NovitaSandboxTool._pull_destination("/workspace/out/report.pdf", None)
+
+    assert target.parent == (pull_env["data"] / "media" / "sandbox").resolve()
+    assert re.fullmatch(r"[0-9a-f]{12}-report\.pdf", target.name)
+
+
+def test_pull_destination_host_path_inside_the_workspace_is_kept(pull_env: dict[str, Path]) -> None:
+    target = NovitaSandboxTool._pull_destination(
+        "/workspace/out/report.pdf", "exports/final.pdf"
+    )
+
+    assert target == (pull_env["workspace"] / "exports" / "final.pdf").resolve()
+
+
+def test_pull_destination_directory_keeps_the_remote_filename(pull_env: dict[str, Path]) -> None:
+    (pull_env["workspace"] / "exports").mkdir()
+
+    by_dir = NovitaSandboxTool._pull_destination("/workspace/out/report.pdf", "exports")
+    by_slash = NovitaSandboxTool._pull_destination("/workspace/out/report.pdf", "exports/")
+
+    assert by_dir.name == "report.pdf" and by_dir.parent.name == "exports"
+    assert by_slash == by_dir
+
+
+def test_pull_destination_outside_the_workspace_is_refused(pull_env: dict[str, Path]) -> None:
+    from nanobot.security.workspace_policy import WorkspaceBoundaryError
+
+    with pytest.raises(WorkspaceBoundaryError):
+        NovitaSandboxTool._pull_destination(
+            "/workspace/out/report.pdf", str(pull_env["tmp"] / "elsewhere" / "x.pdf")
+        )
+    with pytest.raises(WorkspaceBoundaryError):
+        NovitaSandboxTool._pull_destination("/workspace/out/report.pdf", "../escape.pdf")
+
+
+def test_pull_with_a_refused_host_path_is_an_error_result(
+    pull_env: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import nanobot.agent.tools.workspace_bridge as bridge
+
+    async def _must_not_fetch(*a, **k):
+        raise AssertionError("a refused destination must not read the sandbox")
+
+    monkeypatch.setattr(bridge, "fetch_remote_file", _must_not_fetch)
+
+    result = asyncio.run(
+        NovitaSandboxTool()._pull(
+            {"path": "/workspace/out/report.pdf", "host_path": "../escape.pdf"}
+        )
+    )
+
+    assert isinstance(result, ToolResult) and result.is_error
+    assert "host_path refused" in result
+
+
+def test_pull_writes_the_sandbox_bytes_exactly(
+    pull_env: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import nanobot.agent.tools.workspace_bridge as bridge
+
+    payload = bytes(range(256)) * 40  # binary, includes NUL and high bytes
+    seen: list[tuple[str, int]] = []
+
+    async def _fetch(remote, *, max_bytes):
+        seen.append((remote, max_bytes))
+        return payload
+
+    monkeypatch.setattr(bridge, "fetch_remote_file", _fetch)
+
+    result = asyncio.run(
+        NovitaSandboxTool()._pull({"path": "out/report.pdf", "host_path": "exports/report.pdf"})
+    )
+
+    assert not isinstance(result, ToolResult), result
+    assert seen == [("/workspace/out/report.pdf", _ns._MAX_UPLOAD_BYTES)]
+    written = pull_env["workspace"] / "exports" / "report.pdf"
+    assert written.read_bytes() == payload
+    assert not (written.parent / f".{written.name}.part").exists()
+    assert str(written.resolve()) in result
+
+
+def test_pull_of_a_missing_remote_file_is_an_actionable_error(
+    pull_env: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import nanobot.agent.tools.workspace_bridge as bridge
+
+    async def _nothing(remote, *, max_bytes):
+        return None
+
+    monkeypatch.setattr(bridge, "fetch_remote_file", _nothing)
+
+    result = asyncio.run(NovitaSandboxTool()._pull({"path": "/workspace/missing.pdf"}))
+
+    assert isinstance(result, ToolResult) and result.is_error
+    assert "/workspace/missing.pdf" in result
+    assert "action=list" in result
+    assert not (pull_env["data"] / "media" / "sandbox").exists()
+
+
+def test_pull_needs_a_path() -> None:
+    result = asyncio.run(NovitaSandboxTool()._pull({}))
+
+    assert isinstance(result, ToolResult) and result.is_error
+    assert "pull needs 'path'" in result
+
+
+def test_the_missing_source_message_points_the_agent_at_pull(media_file: Path) -> None:
+    result = asyncio.run(
+        NovitaSandboxTool()._stage_upload(
+            {"source": str(media_file.parent / "gone.jpg")}, _Recorder(), label="a sandbox"
+        )
+    )
+
+    assert isinstance(result, ToolResult) and result.is_error
+    assert "does not exist on this host" in result
+    assert "action=pull" in result
+
+
+def test_the_outside_media_message_points_the_agent_at_pull(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("NANOBOT_DATA_DIR", str(tmp_path / "data"))
+    outside = tmp_path / "sandbox-report.pdf"
+    outside.write_bytes(b"x")
+
+    result = asyncio.run(
+        NovitaSandboxTool()._stage_upload({"source": str(outside)}, _Recorder(), label="a sandbox")
+    )
+
+    assert isinstance(result, ToolResult) and result.is_error
+    assert "action=pull" in result
+
+
+def test_pull_is_in_the_action_enum_and_routes_before_backend_selection() -> None:
+    tool = NovitaSandboxTool()
+    schema = tool.to_schema()
+    assert "pull" in schema["function"]["parameters"]["properties"]["action"]["enum"]
+    assert "host_path" in schema["function"]["parameters"]["properties"]
+    source_text = Path(SOURCE_PATH).read_text()
+    assert source_text.count('if action == "pull":') == 1
