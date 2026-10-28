@@ -53,7 +53,7 @@ _REPO = os.getenv("DOCUMENT_FORGE_REPO", "Arinze-eng/powerx")
 
 #: MUST equal ``CLI_VERSION`` in ``scripts/document_forge_cli.py``. The bootstrap
 #: refuses a cached CLI that does not carry this marker. Bump both together.
-_CLI_VERSION = "document-forge-2026.1"
+_CLI_VERSION = "document-forge-2026.2"
 
 _DF_HOME = "$HOME/.document_forge"
 _CLI_PATH = f"{_DF_HOME}/bin/document_forge_cli.py"

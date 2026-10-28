@@ -35,7 +35,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-CLI_VERSION = "document-forge-2026.1"
+CLI_VERSION = "document-forge-2026.2"
 
 HOME = Path(os.environ.get("DOCUMENT_FORGE_HOME") or (Path.home() / ".document_forge"))
 SITE = HOME / "site"
@@ -1573,7 +1573,17 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
     handler = handlers.get(action)
     if handler is None:
         raise CliError("unknown_action", f"Unknown action {action!r}.")
-    return handler()
+    try:
+        return handler()
+    except ImportError as exc:
+        # Lazy imports (e.g. ``from docx import Document``) bypass ``_module``;
+        # map them to the same JSON contract instead of a raw traceback.
+        raise CliError(
+            "missing_dependency",
+            f"A required Python package is not installed ({exc}).",
+            "Run document_forge action='install' with background=true, poll action='job' "
+            "until it reports done, then retry.",
+        ) from exc
 
 
 def _run_child(args: argparse.Namespace) -> int:

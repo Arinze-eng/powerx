@@ -249,3 +249,32 @@ def test_the_tool_is_always_enabled_and_named() -> None:
 def test_payload_parser_reads_the_cli_last_line() -> None:
     text = "Matplotlib is building the font cache\n" + json.dumps({"ok": True, "action": "chart"})
     assert _parse_payload(text) == {"ok": True, "action": "chart"}
+
+
+def test_missing_docx_returns_json_not_a_traceback(tmp_path) -> None:
+    """A lazy ``from docx import ...`` must surface as missing_dependency JSON."""
+    import subprocess
+    import sys
+
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({"title": "t", "blocks": [{"type": "paragraph", "text": "x"}]}))
+    # ``sys.modules[name] = None`` makes any import of it raise ImportError.
+    bootstrap = (
+        "import sys, runpy; sys.modules['docx'] = None; "
+        "sys.argv = ['document_forge_cli', 'create', '--spec', sys.argv[1], "
+        "'--out-dir', sys.argv[2]]; "
+        "runpy.run_path(%r, run_name='__main__')" % str(CLI_SCRIPT)
+    )
+    env = {"DOCUMENT_FORGE_HOME": str(tmp_path / "home"), "PATH": "/usr/bin:/bin"}
+    proc = subprocess.run(
+        [sys.executable, "-c", bootstrap, str(spec), str(tmp_path / "out")],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert "Traceback" not in proc.stderr
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert payload["ok"] is False
+    assert payload["error"] == "missing_dependency"
+    assert proc.returncode == 1
