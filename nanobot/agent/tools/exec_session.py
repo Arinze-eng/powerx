@@ -140,6 +140,7 @@ class _ExecSession:
         self._timed_out = False
         self._stdout_task = asyncio.create_task(self._read_stream(process.stdout, self._stdout))
         self._stderr_task = asyncio.create_task(self._read_stream(process.stderr, self._stderr))
+        self._deadline_task: asyncio.Task[None] | None = None
 
     async def _read_stream(
         self,
@@ -203,6 +204,8 @@ class _ExecSession:
             await self.kill()
 
         if self.process.returncode is not None:
+            if self._deadline_task is not None and not self._deadline_task.done():
+                self._deadline_task.cancel()
             with suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(
                     asyncio.gather(self._stdout_task, self._stderr_task),
@@ -256,6 +259,18 @@ class _ExecSession:
                     ),
                     timeout=2.0,
                 )
+
+    def arm_deadline(self) -> None:
+        """Kill the process at its deadline even if no one polls the session."""
+        if self._deadline_task is not None or self.deadline == float("inf"):
+            return
+        self._deadline_task = asyncio.create_task(self._enforce_deadline())
+
+    async def _enforce_deadline(self) -> None:
+        await asyncio.sleep(max(0.0, self.deadline - time.monotonic()))
+        if self.process.returncode is None:
+            self._timed_out = True
+            await self.kill()
 
     async def _wait_for_buffered_output(self) -> None:
         deadline = time.monotonic() + OUTPUT_DRAIN_GRACE_S
@@ -311,6 +326,23 @@ class ExecSessionManager:
             async with self._lock:
                 self._sessions.pop(session_id, None)
         return session_id, poll
+
+    async def adopt(self, session: _ExecSession) -> None:
+        """Register a session whose process outlived its foreground wait.
+
+        The slot limit is checked here, not at spawn, so a command that finishes
+        in the foreground never counts against ``max_sessions``. Raises
+        ``RuntimeError`` when the manager is closed or full; the caller must then
+        terminate the process itself.
+        """
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("exec session manager is closed")
+            await self._cleanup_locked()
+            if len(self._sessions) >= self.max_sessions:
+                raise RuntimeError(f"maximum exec sessions reached ({self.max_sessions})")
+            self._sessions[session.session_id] = session
+        session.arm_deadline()
 
     async def write(
         self,
@@ -458,6 +490,27 @@ class ExecSessionManager:
 
 
 DEFAULT_EXEC_SESSION_MANAGER = ExecSessionManager()
+
+
+def new_detached_session(
+    *,
+    session_id: str,
+    process: asyncio.subprocess.Process,
+    command: str,
+    cwd: str,
+    timeout: int | None,
+    owner_session_key: str | None,
+) -> _ExecSession:
+    """Wrap an already-running one-shot process so it can be handed to a session."""
+    return _ExecSession(
+        session_id=session_id,
+        process=process,
+        command=command,
+        cwd=cwd,
+        timeout=timeout,
+        owner_session_key=owner_session_key,
+        process_tree=True,
+    )
 
 
 def clamp_session_int(value: int | None, default: int, minimum: int, maximum: int) -> int:

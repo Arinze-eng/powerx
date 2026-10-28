@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
@@ -30,6 +31,7 @@ from nanobot.agent.tools.exec_session import (
     ExecSessionManager,
     clamp_session_int,
     format_session_poll,
+    new_detached_session,
 )
 from nanobot.agent.tools.sandbox import wrap_command
 from nanobot.agent.tools.sandbox_shell import (
@@ -52,16 +54,6 @@ from nanobot.security.workspace_policy import is_path_within
 
 _IS_WINDOWS = sys.platform == "win32"
 _PROCESS_TREE_OWNER_ATTR = "_nanobot_process_tree_owner"
-# Compilation and document-generation tools often produce no stdout while
-# working. They must still be bounded, but the ordinary command default is too
-# short for a real PDF build and causes the model to retry the same work.
-_BUILD_TIMEOUT_SECONDS = 600
-_BUILD_COMMAND_RE = re.compile(
-    r"(?:pdflatex|xelatex|lualatex|latexmk|tectonic|pandoc|typst|weasyprint|"
-    r"wkhtmltopdf|prince|make|cmake\s+--build|gradle|gradlew|mvn|cargo\s+build|"
-    r"npm\s+(?:run\s+)?build|pnpm\s+(?:run\s+)?build|yarn\s+build)",
-    re.IGNORECASE,
-)
 
 
 class _ProcessTreeOwner(Protocol):
@@ -138,6 +130,11 @@ class _PreparedCommand:
     #: the remote path can map the working directory onto the sandbox's own
     #: workspace instead of re-deriving it and disagreeing with the guards.
     workspace_root: str | None = None
+    #: For commands without an explicit timeout: seconds to wait in the foreground
+    #: before the still-running process is handed to a background exec session
+    #: instead of being killed. ``None`` means no handoff (explicit timeout, or
+    #: no limit configured).
+    background_after_s: int | None = None
 
 
 @tool_parameters(
@@ -148,8 +145,9 @@ class _PreparedCommand:
         workdir=StringSchema("Compatibility alias for working_dir"),
         timeout=IntegerSchema(
             description=(
-                "Timeout in seconds. Increase for long-running commands "
-                "like compilation or installation (default 60, max 600)."
+                "Hard timeout in seconds for this command (max 600). Omit it to "
+                "let the command run up to 600s; a command still running after "
+                "60s is moved to a background session instead of being killed."
             ),
             minimum=1,
             maximum=600,
@@ -325,9 +323,11 @@ class ExecTool(Tool):
             f"{platform_note}"
             "For long-running or interactive commands, pass yield_time_ms; "
             "if the command keeps running, exec returns a session_id that can "
-            "be polled or written to with write_stdin. Output is truncated at "
-            "10 000 chars; ordinary commands timeout after 60s, while recognized "
-            "build commands get up to 600s unless an explicit timeout is supplied."
+            "be polled or written to with write_stdin. Commands without an "
+            "explicit timeout may run up to 600s: if one is still running after "
+            "60s, exec returns a session_id instead of blocking or killing it, "
+            "so keep working and poll it with write_stdin (terminate=true stops it). "
+            "Output is truncated at 10 000 chars."
         )
 
     @property
@@ -367,6 +367,9 @@ class ExecTool(Tool):
 
         if yield_time_ms is not None:
             return await self._execute_session(prepared, yield_time_ms, max_output_chars)
+
+        if prepared.background_after_s is not None:
+            return await self._execute_with_handoff(prepared, max_output_chars)
 
         process: asyncio.subprocess.Process | None = None
         try:
@@ -425,6 +428,80 @@ class ExecTool(Tool):
         except Exception as e:
             # Kill and reap the child if it was spawned but an unexpected
             # error prevented communicate() from completing.
+            if process is not None:
+                await self._kill_process_tree(process)
+            return ToolResult.error(f"Error executing command: {str(e)}")
+
+    async def _execute_with_handoff(
+        self, prepared: _PreparedCommand, max_output_chars: int | None
+    ) -> str:
+        """Run a default-timeout command; hand it to a session if it is still busy.
+
+        The command runs in the foreground for ``background_after_s``. If it has
+        exited by then, the result is the same one-shot result as before. If it
+        has not, the process is registered as an exec session and the call
+        returns its session_id right away, so the agent is never parked behind a
+        silent command. The session keeps the hard ``prepared.timeout`` and is
+        killed when that deadline passes, whether or not anyone polls it.
+        """
+        assert prepared.background_after_s is not None
+        max_chars = clamp_session_int(max_output_chars, self._MAX_OUTPUT, 1000, MAX_OUTPUT_CHARS)
+        session_id = uuid.uuid4().hex[:12]
+        process: asyncio.subprocess.Process | None = None
+        try:
+            process = await self._spawn(
+                prepared.command,
+                prepared.cwd,
+                prepared.env,
+                prepared.shell_program,
+                prepared.login,
+                process_tree=True,
+            )
+            session = new_detached_session(
+                session_id=session_id,
+                process=process,
+                command=prepared.command,
+                cwd=prepared.cwd,
+                timeout=prepared.timeout,
+                owner_session_key=current_request_session_key(),
+            )
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=prepared.background_after_s)
+            if process.returncode is not None:
+                # Finished in the foreground: format exactly like the one-shot path.
+                # The session buffer is not truncated here; the one-shot truncation
+                # below applies instead, so the marker and head/tail split match.
+                poll = await session.poll(0, MAX_OUTPUT_CHARS)
+                result = (
+                    f"{poll.output}\nExit code: {poll.exit_code}"
+                    if poll.output
+                    else f"\nExit code: {poll.exit_code}"
+                )
+                if len(result) > max_chars:
+                    half = max_chars // 2
+                    result = (
+                        result[:half]
+                        + f"\n\n... ({len(result) - max_chars:,} chars truncated) ...\n\n"
+                        + result[-half:]
+                    )
+                return result
+            poll = await session.poll(0, max_chars)
+            try:
+                await self._session_manager.adopt(session)
+            except RuntimeError as exc:
+                await session.kill()
+                return ToolResult.error(
+                    f"Error: command is still running after {prepared.background_after_s}s "
+                    f"and could not be moved to a background session ({exc}); it was terminated."
+                )
+            return "\n".join([
+                f"Command still running after {prepared.background_after_s}s; it was moved to "
+                "a background session instead of being killed. Keep working, then check it "
+                "with write_stdin(session_id=..., yield_time_ms=..., wait_for=...) or stop it "
+                "with terminate=true.",
+                format_session_poll(session_id, poll),
+            ])
+        except Exception as e:
             if process is not None:
                 await self._kill_process_tree(process)
             return ToolResult.error(f"Error executing command: {str(e)}")
@@ -522,22 +599,22 @@ class ExecTool(Tool):
         except Exception as exc:
             return ToolResult.error(f"Error executing command: {exc}")
 
-    def _resolve_timeout(self, timeout: int | None, command: str = "") -> int | None:
+    def _resolve_timeout(self, timeout: int | None) -> int | None:
         """Resolve the effective hard timeout in seconds (None = no limit).
 
         A per-call timeout supplied by the model stays capped at _MAX_TIMEOUT so
-        the LLM cannot request unbounded execution. The config-level default
-        (self.timeout) may exceed that cap, and 0 disables the limit entirely
-        for trusted long-running tasks (#3595). Recognized build commands get a
-        longer bounded default because PDF and compilation tools can be silent
-        while making healthy progress.
+        the LLM cannot request unbounded execution and is enforced by killing the
+        command. Without one, every command gets the bounded _MAX_TIMEOUT ceiling,
+        because silent but healthy work (PDF builds, installs, test suites) must not
+        be cut at the short foreground budget. ``self.timeout`` is that foreground
+        budget: see ``_prepare_command``, which hands the command to a background
+        session at that point rather than killing it. 0 disables the limit entirely
+        for trusted long-running tasks (#3595).
         """
         if timeout:
             return min(timeout, self._MAX_TIMEOUT)
         if self.timeout and self.timeout > 0:
-            if _BUILD_COMMAND_RE.search(command):
-                return max(self.timeout, _BUILD_TIMEOUT_SECONDS)
-            return self.timeout
+            return max(self.timeout, self._MAX_TIMEOUT)
         return None
 
     def _prepare_command(
@@ -609,7 +686,10 @@ class ExecTool(Tool):
                 # there, so the remote path refuses it instead (see execute).
                 host_only = True
 
-        effective_timeout = self._resolve_timeout(timeout, command)
+        effective_timeout = self._resolve_timeout(timeout)
+        background_after_s: int | None = None
+        if not timeout and effective_timeout is not None and 0 < self.timeout < effective_timeout:
+            background_after_s = self.timeout
         env = self._build_env()
 
         if self.path_prepend or self.path_append:
@@ -631,6 +711,7 @@ class ExecTool(Tool):
             login=False if login is None else login,
             host_only=host_only,
             workspace_root=workspace_root,
+            background_after_s=background_after_s,
         )
 
     def _compose_path(self, current_path: str) -> str:

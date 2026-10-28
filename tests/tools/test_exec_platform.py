@@ -499,7 +499,7 @@ class TestSandboxPlatform:
             patch.object(ExecTool, "_guard_command", return_value=None),
         ):
             tool = ExecTool(sandbox="bwrap")
-            result = await tool.execute(command="dir")
+            result = await tool.execute(command="dir", timeout=60)
 
         assert "ok" in result
         spawned_cmd = mock_spawn.call_args[0][0]
@@ -576,7 +576,7 @@ class TestExecuteEndToEnd:
             patch.object(ExecTool, "_guard_command", return_value=None),
         ):
             tool = ExecTool()
-            result = await tool.execute(command="echo hello world")
+            result = await tool.execute(command="echo hello world", timeout=60)
 
         assert "hello world" in result
         assert "Exit code: 0" in result
@@ -594,7 +594,7 @@ class TestExecuteEndToEnd:
             patch.object(ExecTool, "_guard_command", return_value=None),
         ):
             tool = ExecTool()
-            result = await tool.execute(command="echo hello world")
+            result = await tool.execute(command="echo hello world", timeout=60)
 
         assert "hello world" in result
         assert "Exit code: 0" in result
@@ -705,7 +705,7 @@ class TestWindowsMultilineExec:
         ):
             mock_exec.return_value = mock_proc
             tool = ExecTool()
-            result = await tool.execute(command='python -c "print(1)\nprint(2)"')
+            result = await tool.execute(command='python -c "print(1)\nprint(2)"', timeout=60)
 
         assert "1" in result
         assert "2" in result
@@ -727,7 +727,7 @@ class TestWindowsMultilineExec:
         ):
             mock_exec.return_value = mock_proc
             tool = ExecTool()
-            result = await tool.execute(command='node -e "console.log(1)\nconsole.log(2)"')
+            result = await tool.execute(command='node -e "console.log(1)\nconsole.log(2)"', timeout=60)
 
         assert "1" in result
         args = mock_exec.call_args[0]
@@ -746,7 +746,7 @@ class TestWindowsMultilineExec:
             patch.object(ExecTool, "_guard_command", return_value=None),
         ):
             tool = ExecTool()
-            result = await tool.execute(command='python -c "print(1)"')
+            result = await tool.execute(command='python -c "print(1)"', timeout=60)
 
         assert "1" in result
         mock_spawn.assert_called_once()
@@ -763,7 +763,7 @@ class TestWindowsMultilineExec:
             patch.object(ExecTool, "_guard_command", return_value=None),
         ):
             tool = ExecTool()
-            result = await tool.execute(command='python -c "print(1)\nprint(2)"')
+            result = await tool.execute(command='python -c "print(1)\nprint(2)"', timeout=60)
 
         assert "1" in result
         mock_spawn.assert_called_once()
@@ -791,7 +791,7 @@ class TestResolveShellWindows:
         ):
             mock_exec.return_value = mock_proc
             tool = ExecTool()
-            result = await tool.execute(command="echo hello", shell="powershell")
+            result = await tool.execute(command="echo hello", shell="powershell", timeout=60)
 
         assert "hello" in result
         args = mock_exec.call_args[0]
@@ -813,7 +813,7 @@ class TestResolveShellWindows:
         ):
             mock_shell.return_value = mock_proc
             tool = ExecTool()
-            result = await tool.execute(command='echo "a & b"', shell="cmd")
+            result = await tool.execute(command='echo "a & b"', shell="cmd", timeout=60)
 
         assert '"a & b"' in result
         args = mock_shell.call_args[0]

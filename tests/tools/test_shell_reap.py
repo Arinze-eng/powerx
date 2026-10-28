@@ -108,7 +108,7 @@ async def test_execute_reaps_after_normal_completion():
         patch("nanobot.agent.tools.shell._reap_pid") as reap,
     ):
         tool = ExecTool()
-        result = await tool.execute(command="echo ok")
+        result = await tool.execute(command="echo ok", timeout=60)
 
     assert "ok" in result
     assert "Exit code: 0" in result
@@ -148,7 +148,7 @@ async def test_execute_cancellation_kills_process_tree():
         patch.object(ExecTool, "_kill_process_tree", new_callable=AsyncMock) as kill_tree,
     ):
         with pytest.raises(asyncio.CancelledError):
-            await ExecTool().execute(command="sleep 99")
+            await ExecTool().execute(command="sleep 99", timeout=60)
 
     kill_tree.assert_awaited_once_with(mock_proc)
     assert spawn.await_args.kwargs["process_tree"] is True
@@ -173,7 +173,7 @@ async def test_execute_exception_after_success_does_not_raise_on_dead_process():
         ),
     ):
         tool = ExecTool()
-        result = await tool.execute(command="echo out")
+        result = await tool.execute(command="echo out", timeout=60)
 
     assert "Error executing command" in result
     assert "boom after exit" in result
@@ -194,7 +194,7 @@ async def test_execute_exception_during_communicate_kills_live_process():
         patch.object(ExecTool, "_kill_process_tree", new_callable=AsyncMock) as kill_tree,
     ):
         tool = ExecTool()
-        result = await tool.execute(command="broken")
+        result = await tool.execute(command="broken", timeout=60)
 
     assert "Error executing command" in result
     assert "pipe broken" in result
