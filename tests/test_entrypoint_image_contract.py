@@ -309,9 +309,9 @@ def test_the_volume_root_prefers_powerx_data_dir_then_the_platform_mount() -> No
 def test_the_volume_is_chowned_and_checked_as_the_gateway_user() -> None:
     """A root-owned mount is the failure that reads as success, so prove it."""
     block = volume_chown_block()
-    assert 'chown -R nanobot:nanobot "$VOLUME_DATA_DIR"' in block
+    assert 'chown -R nanobot:nanobot "$PERSIST_ROOT"' in block
     assert "setpriv --reuid=nanobot --regid=nanobot --init-groups" in block
-    assert 'test -w "$VOLUME_DATA_DIR"' in block, "writability must be tested, not assumed"
+    assert 'test -w "$PERSIST_ROOT"' in block, "writability must be tested, not assumed"
 
 
 def test_the_tree_is_linked_before_anything_writes_to_it() -> None:

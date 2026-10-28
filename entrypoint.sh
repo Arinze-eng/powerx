@@ -351,19 +351,21 @@ fi
 if [ "$(id -u)" = "0" ]; then
     chown -R nanobot:nanobot "$dir" 2>/dev/null || echo "[entrypoint] warning: chown $dir failed"
 
-    # Only the durable application subtree needs ownership repair. Recursing
-    # over the entire mounted disk makes boot time and memory scale with every
-    # old artifact on the volume, and can make a deployment look frozen.
+    # Only the durable application subtree needs ownership repair. Cron,
+    # provider state, memories, and the nanobot config are siblings under
+    # PERSIST_ROOT, so chowning only VOLUME_DATA_DIR leaves cron root-owned.
+    # Recursing over the entire mounted disk would make boot time and memory
+    # scale with every unrelated artifact on the volume.
     if [ -n "$VOLUME_DATA_DIR" ]; then
         # >>> powerx:volume-chown  (lifted by tests/test_entrypoint_image_contract.py)
-        mkdir -p "$VOLUME_DATA_DIR" 2>/dev/null || true
-        chown -R nanobot:nanobot "$VOLUME_DATA_DIR" 2>/dev/null \
-            || echo "[entrypoint] warning: chown $VOLUME_DATA_DIR failed" >&2
+        mkdir -p "$PERSIST_ROOT" "$VOLUME_DATA_DIR" 2>/dev/null || true
+        chown -R nanobot:nanobot "$PERSIST_ROOT" 2>/dev/null \
+            || echo "[entrypoint] warning: chown $PERSIST_ROOT failed" >&2
         if setpriv --reuid=nanobot --regid=nanobot --init-groups \
-                test -w "$VOLUME_DATA_DIR" 2>/dev/null; then
-            echo "[entrypoint] durable state $VOLUME_DATA_DIR is writable by nanobot"
+                test -w "$PERSIST_ROOT" 2>/dev/null; then
+            echo "[entrypoint] durable state $PERSIST_ROOT is writable by nanobot"
         else
-            echo "[entrypoint] WARNING: $VOLUME_DATA_DIR is NOT writable by nanobot;" \
+            echo "[entrypoint] WARNING: $PERSIST_ROOT is NOT writable by nanobot;" \
                  "anything written there will fail" >&2
         fi
         # <<< powerx:volume-chown
