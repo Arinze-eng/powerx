@@ -550,5 +550,9 @@ export NANOBOT_MAX_CONCURRENT_REQUESTS="${NANOBOT_MAX_CONCURRENT_REQUESTS:-2}"
 export POWERX_SPEED_PROFILE_DEFAULT="${POWERX_SPEED_PROFILE_DEFAULT:-fast}"
 export NANOBOT_MAX_PARALLEL_TOOLS="${NANOBOT_MAX_PARALLEL_TOOLS:-6}"
 export NANOBOT_TURN_BUDGET_S="${NANOBOT_TURN_BUDGET_S:-900}"
+# Visible pacing: a status line before each tool step, with no added pause.
+# POWERX_PACE_SECONDS=0 keeps the "understanding" line and costs no wall clock.
+export POWERX_PACE_STATUS="${POWERX_PACE_STATUS:-1}"
+export POWERX_PACE_SECONDS="${POWERX_PACE_SECONDS:-0}"
 
 exec /app/scripts/nanobot_launcher.sh "$@"
