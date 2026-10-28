@@ -85,6 +85,7 @@ from nanobot.utils.runtime import (
     build_finalization_retry_message,
     build_goal_continue_message,
     build_length_recovery_message,
+    build_promised_action_message,
     build_truncated_tool_call_message,
     is_blank_text,
     normalize_tool_arguments,
@@ -116,6 +117,38 @@ _MAX_LENGTH_RECOVERIES = 3
 #: the two failures need different prompts and neither should spend the other's
 #: budget.
 _MAX_TRUNCATED_TOOL_CALL_RECOVERIES = 2
+#: How many times a turn may nudge the model that announced a next step ("Let me
+#: create the report") but made no tool call, so the turn ended with the work
+#: unfinished and the user had to send "continue". Two nudges: the first covers a
+#: model that simply forgot to call the tool, the second a model that repeats the
+#: announcement. Reset after real tool work, like the truncated-call budget.
+_MAX_PROMISED_ACTION_RECOVERIES = 2
+#: Only the end of a reply is checked for an announced step, so a long final
+#: answer that mentions "I will" earlier in the text is not mistaken for one.
+_PROMISED_ACTION_TAIL_CHARS = 400
+_PROMISED_ACTION_RE = re.compile(
+    r"\b(?:let me|let's|i'll|i will|i'm going to|i am going to|now i'll|next,? i'll|"
+    r"next i will|now let me|i need to|i'm now going to)\s+"
+    r"(?:now\s+|go ahead and\s+|first\s+|then\s+)?"
+    r"(?:create|make|build|write|generate|run|read|check|fetch|open|pull|upload|send|"
+    r"fix|update|continue|look|inspect|download|convert|compile|verify|test|render|"
+    r"produce|gather|search|analy[sz]e|start|proceed|finish|complete|add|edit|save|"
+    r"export|prepare|install|list|deliver|attach|refactor|rewrite|implement|debug|"
+    r"apply|reproduce|validate|parse|scan|sync|generate|load|finalize|wire|hook up)\b",
+    re.IGNORECASE,
+)
+
+
+def _announces_unfinished_step(text: str) -> bool:
+    """True when a reply ends by announcing a tool action it did not perform.
+
+    A reply that ends in a question is handing the turn to the user, so it is not
+    an unfinished step, even if it names one.
+    """
+    stripped = (text or "").strip()
+    if not stripped or stripped.endswith("?"):
+        return False
+    return _PROMISED_ACTION_RE.search(stripped[-_PROMISED_ACTION_TAIL_CHARS:]) is not None
 #: How many iterations in a row may consist ENTIRELY of tool calls the repeat
 #: guard refused before the turn stops and answers with what it has.
 #:
@@ -761,6 +794,7 @@ class AgentRunner:
         # _MAX_TRUNCATED_TOOL_CALL_RECOVERIES; reset whenever tool work actually
         # lands, so a long task is not killed by two early truncations.
         truncated_tool_recoveries = 0
+        promised_action_recoveries = 0
         # Segments from one uninterrupted length-recovery chain. Tool work or
         # injected user input starts a new logical answer and clears the chain.
         length_recovery_parts: list[str] = []
@@ -1329,6 +1363,7 @@ class AgentRunner:
                 # oversized call early must not be finished off by a second one
                 # forty steps later.
                 truncated_tool_recoveries = 0
+                promised_action_recoveries = 0
                 length_recovery_parts.clear()
 
                 # --- Zero-extra-call terminal completion --------------------
@@ -1565,6 +1600,43 @@ class AgentRunner:
                     _restore_outer_whitespace(clean or "", original_content),
                 )
                 context.streamed_content = True
+
+            # --- announced step with no tool call -----------------------------
+            # The model said "Let me create the report" and then returned text
+            # with no call, so the turn ended and the user had to ask again. Put
+            # the announcement back in the transcript and ask for the call.
+            if (
+                response.finish_reason not in {"error", "length", "refusal", "content_filter"}
+                and not response.has_tool_calls
+                and not is_blank_text(clean)
+                and promised_action_recoveries < _MAX_PROMISED_ACTION_RECOVERIES
+                and spec.tools.get_definitions()
+                and _announces_unfinished_step(clean)
+            ):
+                promised_action_recoveries += 1
+                logger.warning(
+                    "Reply announced a step without a tool call on turn {} for {} "
+                    "({}/{}); asking for the call",
+                    iteration,
+                    spec.session_key or "default",
+                    promised_action_recoveries,
+                    _MAX_PROMISED_ACTION_RECOVERIES,
+                )
+                length_recovery_parts.clear()
+                if hook.wants_streaming():
+                    context.stream_continues_current_message = True
+                    await hook.on_stream_end(context, resuming=True)
+                messages.append(conversation_state.project_response_message(
+                    build_assistant_message(
+                        clean,
+                        reasoning_content=response.reasoning_content,
+                        thinking_blocks=response.thinking_blocks,
+                    ),
+                    response,
+                ))
+                messages.append(build_promised_action_message())
+                await hook.after_iteration(context)
+                continue
 
             assistant_message: dict[str, Any] | None = None
             if response.finish_reason != "error" and not is_blank_text(clean):

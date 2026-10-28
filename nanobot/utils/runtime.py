@@ -180,6 +180,20 @@ def build_truncated_tool_call_message(tool_name: str | None = None) -> dict[str,
     return {"role": "user", "content": f"{prefix} {TRUNCATED_TOOL_CALL_PROMPT}"}
 
 
+PROMISED_ACTION_PROMPT = (
+    "Your last reply said what you were about to do, but it made no tool call, so "
+    "nothing was executed and the turn has stopped with the work unfinished.\n\n"
+    "Do the step you described now: make the tool call that performs it. If the work "
+    "is already complete, reply with the result and do not announce further steps. "
+    "Do not ask the user to restart or continue."
+)
+
+
+def build_promised_action_message() -> dict[str, str]:
+    """Prompt the model to perform a step it announced but never called a tool for."""
+    return {"role": "user", "content": PROMISED_ACTION_PROMPT}
+
+
 def build_goal_continue_message(custom: str | None = None) -> dict[str, str]:
     """Prompt the model to continue when a sustained goal is still active."""
     return {"role": "user", "content": custom or SUSTAINED_GOAL_CONTINUE_PROMPT}
