@@ -265,6 +265,29 @@ class AgentProgressHook(AgentHook):
             usage=self._live_usage(context),
         )
 
+    async def on_pace_pause(
+        self,
+        context: AgentHookContext,
+        tool_call: Any,
+        seconds: float,
+    ) -> None:
+        """Show "understanding: <step>" while the runner paces a tool step.
+
+        Reuses the tool-hint channel, like the heartbeats do, so every surface
+        that renders tool hints renders this without a new message shape.
+        """
+        if not self._on_progress:
+            return
+        name = getattr(tool_call, "name", None)
+        base = self._strip_think(self._tool_hint([tool_call]))
+        label = base or (name if isinstance(name, str) and name else "next step")
+        await invoke_on_progress(
+            self._on_progress,
+            f"understanding: {label}",
+            tool_hint=True,
+            usage=self._live_usage(context),
+        )
+
     async def on_model_heartbeat(
         self,
         context: AgentHookContext,

@@ -25,6 +25,7 @@ from nanobot.agent.context_governance import (
 from nanobot.agent.deterministic_router import deterministic_plan, router_enabled
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
+from nanobot.agent.pace import pace_enabled, pace_seconds
 from nanobot.agent.plan_cache import (
     _MAX_STEPS_PER_PLAN,
     make_plan_cache,
@@ -2539,6 +2540,29 @@ class AgentRunner:
                 task.cancel()
 
     @staticmethod
+    async def _pace_before_tool(
+        hook: AgentHook,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+    ) -> None:
+        """Show a status line for a tool step, then pause before running it.
+
+        Only called when ``POWERX_PACE_STATUS`` is on (see ``nanobot.agent.pace``).
+        The status is sent first so the pause has something visible to show.
+        A hook that throws must not block the step, so its failure is logged and
+        the pause still happens. Cancellation propagates unchanged.
+        """
+        seconds = pace_seconds()
+        try:
+            await hook.on_pace_pause(context, tool_call, seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a status line must never block the step
+            logger.debug("pace status hook failed for {}", tool_call.name, exc_info=True)
+        if seconds > 0:
+            await asyncio.sleep(seconds)
+
+    @staticmethod
     async def _watch_model_wait(
         hook: AgentHook,
         context: AgentHookContext,
@@ -2820,6 +2844,8 @@ class AgentRunner:
             return prep_error + hint, event, (
                 RuntimeError(prep_error) if spec.fail_on_tool_error else None
             )
+        if pace_enabled():
+            await self._pace_before_tool(hook, context, tool_call)
         await hook.before_execute_tool(context, tool_call, tool, params)
         try:
             if tool is not None:

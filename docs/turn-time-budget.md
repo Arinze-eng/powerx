@@ -156,3 +156,18 @@ that carries tools, so a tool call's own payload is never truncated.
 `entrypoint.sh` exports `fast`, `NANOBOT_MAX_PARALLEL_TOOLS=6` and
 `NANOBOT_TURN_BUDGET_S=900` as deployment defaults, each overridable from the
 platform.
+
+## Visible pacing between tool steps (opt-in)
+
+Off by default. With `POWERX_PACE_STATUS=1` the agent shows `understanding: <step>`
+before each tool step and pauses briefly before running it, so a fast step does not
+flash past unseen and the turn does not look frozen. The pause is applied in the
+runner, not by the model, and is cancellable like any other wait.
+
+| setting | effect |
+|---|---|
+| `POWERX_PACE_STATUS=1` | turn pacing on (`true`, `yes`, `on` also work; anything else is off) |
+| `POWERX_PACE_SECONDS=1.5` | pause before each tool step; default 1.5, clamped to 0..10; `0` keeps the status line but drops the pause |
+
+Pacing adds `seconds` of wall-clock time per tool step. Leave it off on latency-sensitive
+deployments.

@@ -156,6 +156,20 @@ class AgentHook:
         """
         pass
 
+    async def on_pace_pause(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        seconds: float,
+    ) -> None:
+        """A tool step is about to run and the runner will pause ``seconds``
+        before executing it (see ``nanobot.agent.pace``).
+
+        Only fired when pacing is enabled. Implementations should show a status
+        line for the pause. Must stay cheap and must not raise.
+        """
+        pass
+
     async def on_model_heartbeat(
         self,
         context: AgentHookContext,
