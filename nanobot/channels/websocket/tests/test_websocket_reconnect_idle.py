@@ -69,3 +69,45 @@ async def test_hydrate_after_subscribe_pushes_running_when_turn_active():
     assert len(running_events) == 1
     assert running_events[0][3]["started_at"] == 1234567890.0
     assert running_events[0][3]["turn_id"] == "turn-active"
+
+
+@pytest.mark.asyncio
+async def test_hydrate_after_subscribe_refreshes_thread_for_reconnecting_client():
+    """A reconnect gets persisted progress without waiting for the next step."""
+    channel = WebSocketChannel.__new__(WebSocketChannel)
+    channel.gateway = MagicMock()
+    channel.gateway.session_manager = MagicMock()
+    channel.gateway.session_manager.read_session_file = MagicMock(return_value={})
+    channel._turn_models = {}
+    sent_events = []
+
+    async def mock_send_goal_state(chat_id, blob):
+        sent_events.append(("goal_state", chat_id, blob))
+
+    async def mock_send_goal_status(chat_id, status, **kwargs):
+        sent_events.append(("goal_status", chat_id, status, kwargs))
+
+    async def mock_send_event(connection, event, **fields):
+        sent_events.append(("control", connection, event, fields))
+
+    channel.send_goal_state = mock_send_goal_state
+    channel.send_goal_status = mock_send_goal_status
+    channel._send_event = mock_send_event
+    connection = object()
+
+    with (
+        patch(
+            "nanobot.channels.websocket.runtime.websocket_turn_wall_started_at",
+            return_value=1234567890.0,
+        ),
+        patch(
+            "nanobot.channels.websocket.runtime.websocket_turn_id",
+            return_value="turn-active",
+        ),
+    ):
+        await channel._hydrate_after_subscribe("test-chat", connection=connection)
+
+    assert ("control", connection, "session_updated", {
+        "chat_id": "test-chat",
+        "scope": "thread",
+    }) in sent_events

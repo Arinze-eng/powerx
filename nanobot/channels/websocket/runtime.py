@@ -94,6 +94,8 @@ from nanobot.webui.metadata import (
 )
 from nanobot.webui.screen_stream import (
     DEFAULT_INTERVAL_S as SCREEN_DEFAULT_INTERVAL_S,
+)
+from nanobot.webui.screen_stream import (
     ErrorSink,
     FrameSink,
     ScreenStreamManager,
@@ -770,7 +772,7 @@ class WebSocketChannel(BaseChannel):
             scope="metadata",
             workspace_scope=scope.payload(),
         )
-        await self._hydrate_after_subscribe(fork_id)
+        await self._hydrate_after_subscribe(fork_id, connection=connection)
 
     async def _cleanup_connection(self, connection: ServerConnection) -> None:
         """Remove *connection* from every subscription set; safe to call multiple times."""
@@ -856,22 +858,51 @@ class WebSocketChannel(BaseChannel):
             return
         await self.send_goal_state(chat_id, blob)
 
-    async def _maybe_push_turn_run_wall_clock(self, chat_id: str) -> None:
+    async def _maybe_push_turn_run_wall_clock(self, chat_id: str) -> bool:
         """Replay ``goal_status: running`` when a turn is still active (same-process refresh)."""
         t0 = websocket_turn_wall_started_at(chat_id)
         if t0 is None:
-            return
+            return False
         await self.send_goal_status(
             chat_id,
             "running",
             started_at=t0,
             turn_id=websocket_turn_id(chat_id),
         )
+        return True
 
-    async def _hydrate_after_subscribe(self, chat_id: str) -> None:
+    async def _send_session_updated_to(
+        self,
+        connection: ServerConnection,
+        chat_id: str,
+        *,
+        scope: str = "thread",
+    ) -> None:
+        """Ask one newly attached WebUI client to reload its canonical thread.
+
+        Live progress is persisted as it is emitted, but a reconnecting browser
+        does not receive the events that happened while its socket was closed.
+        A targeted refresh avoids waiting for the next model/tool boundary and
+        avoids making every other open client reload the same transcript.
+        """
+        await self._send_event(
+            connection,
+            "session_updated",
+            chat_id=chat_id,
+            scope=scope,
+        )
+
+    async def _hydrate_after_subscribe(
+        self,
+        chat_id: str,
+        *,
+        connection: ServerConnection | None = None,
+    ) -> None:
         """Replay persisted or actively running per-chat state after subscribe."""
         await self._maybe_push_persisted_goal_state(chat_id)
-        await self._maybe_push_turn_run_wall_clock(chat_id)
+        active = await self._maybe_push_turn_run_wall_clock(chat_id)
+        if active and connection is not None:
+            await self._send_session_updated_to(connection, chat_id)
 
     async def _send_event(
         self,
@@ -1181,7 +1212,7 @@ class WebSocketChannel(BaseChannel):
                             "webui default-chat claim failed for chat_id={}", default_chat_id
                         )
             self._attach(connection, default_chat_id)
-            await self._hydrate_after_subscribe(default_chat_id)
+            await self._hydrate_after_subscribe(default_chat_id, connection=connection)
 
             async for raw in connection:
                 if isinstance(raw, bytes):
@@ -1280,7 +1311,7 @@ class WebSocketChannel(BaseChannel):
                 scope="metadata",
                 workspace_scope=scope.payload(),
             )
-            await self._hydrate_after_subscribe(new_id)
+            await self._hydrate_after_subscribe(new_id, connection=connection)
             return
         if t == "new_temporary_chat":
             try:
@@ -1337,7 +1368,7 @@ class WebSocketChannel(BaseChannel):
                 chat_id=cid,
                 **self._attached_model_fields(cid),
             )
-            await self._hydrate_after_subscribe(cid)
+            await self._hydrate_after_subscribe(cid, connection=connection)
             return
         if t == "set_sidebar_state":
             if connection not in self._webui_connections:
@@ -1559,7 +1590,7 @@ class WebSocketChannel(BaseChannel):
             # Auto-attach on first use so clients can one-shot without a separate attach.
             self._attach(connection, cid)
             if temporary_policy is None or temporary_policy.hydrate_transcript:
-                await self._hydrate_after_subscribe(cid)
+                await self._hydrate_after_subscribe(cid, connection=connection)
 
             # Resolve after hydration so a concurrent downgrade cannot be overwritten.
             scope = await self._workspace_scope_or_error(
