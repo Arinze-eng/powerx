@@ -101,6 +101,7 @@ from nanobot.utils.document import (
     reference_host_images,
     reference_non_image_attachments,
 )
+from nanobot.utils.ephemeral_cleanup import cleanup_ephemeral_work
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.llm_runtime import LLMRuntime
@@ -1810,6 +1811,13 @@ class AgentLoop:
                         # sandbox running — kill the session box immediately.
                         with suppress(Exception):
                             await NovitaSandboxTool().release_upstash_sandbox(session_key)
+                        # Remove only the deployment-owned ephemeral scratch
+                        # tree. Persistent sessions, memories, artifacts, and
+                        # user files stay untouched.
+                        with suppress(Exception):
+                            removed = cleanup_ephemeral_work()
+                            if removed:
+                                logger.debug("cleaned {} ephemeral task path(s)", removed)
                     await self._publish_next_deferred_automation_turn(session_key)
         finally:
             if pending is None:

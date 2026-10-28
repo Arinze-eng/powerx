@@ -217,19 +217,19 @@ def _seed_home(home: Path) -> Path:
 
 
 def test_the_runtime_tree_is_linked_onto_the_volume(tmp_path: Path) -> None:
-    """Chat history, admin config, the workspace -- all of it, behind one link."""
+    """Durable app state is linked under the dedicated persist subtree."""
     home = tmp_path / "home"
     data = _seed_home(home)
     volume = tmp_path / "data"
 
     done = _run_tree(tmp_path, home, volume)
     assert done.returncode == 0, done.stderr
-    assert "runtime data on the volume" in done.stdout, done.stdout
+    assert "durable state on the volume" in done.stdout, done.stdout
 
     assert data.is_symlink(), "the runtime data dir must be the link onto the volume"
-    assert data.resolve() == (volume / "powerx" / "nanobot").resolve()
-    assert (volume / "powerx" / "nanobot" / "config.json").is_file()
-    assert (volume / "powerx" / "nanobot" / "workspace" / "notes.md").is_file()
+    assert data.resolve() == (volume / "persist" / "nanobot").resolve()
+    assert (volume / "persist" / "nanobot" / "config.json").is_file()
+    assert (volume / "persist" / "nanobot" / "workspace" / "notes.md").is_file()
 
 
 def test_a_boot_never_clobbers_the_admins_config(tmp_path: Path) -> None:
@@ -242,7 +242,7 @@ def test_a_boot_never_clobbers_the_admins_config(tmp_path: Path) -> None:
     home = tmp_path / "home"
     data = _seed_home(home)
     volume = tmp_path / "data"
-    edited = volume / "powerx" / "nanobot"
+    edited = volume / "persist" / "nanobot"
     edited.mkdir(parents=True)
     (edited / "config.json").write_text('{"model": "the admin chose this"}\n')
 
@@ -257,16 +257,15 @@ def test_an_older_sessions_only_link_is_migrated(tmp_path: Path) -> None:
     home = tmp_path / "home"
     data = _seed_home(home)
     volume = tmp_path / "data"
-    old_sessions = volume / "powerx" / "sessions" / "ws-1"
+    old_sessions = volume / "powerx" / "nanobot" / "sessions" / "ws-1"
     old_sessions.mkdir(parents=True)
     (old_sessions / "chat.jsonl").write_text('{"_type": "metadata"}\n')
     data.mkdir(parents=True, exist_ok=True)
-    (data / "sessions").symlink_to(old_sessions.parent)
 
     done = _run_tree(tmp_path, home, volume)
     assert done.returncode == 0, done.stderr
 
-    migrated = volume / "powerx" / "nanobot" / "sessions" / "ws-1" / "chat.jsonl"
+    migrated = volume / "persist" / "nanobot" / "sessions" / "ws-1" / "chat.jsonl"
     assert migrated.is_file(), "the chats must move in beside the rest of the tree"
     assert not (data / "sessions").is_symlink(), "no dangling hop may be left behind"
     assert (data / "sessions").is_dir()
@@ -279,8 +278,8 @@ def test_the_link_is_created_once(tmp_path: Path) -> None:
 
     first = _run_tree(tmp_path, home, volume)
     second = _run_tree(tmp_path, home, volume)
-    assert "runtime data on the volume" in first.stdout
-    assert "runtime data on the volume" not in second.stdout, "linking must be idempotent"
+    assert "durable state on the volume" in first.stdout
+    assert "durable state on the volume" not in second.stdout, "linking must be idempotent"
 
 
 def test_without_a_volume_nothing_is_linked(tmp_path: Path) -> None:
@@ -310,15 +309,15 @@ def test_the_volume_root_prefers_powerx_data_dir_then_the_platform_mount() -> No
 def test_the_volume_is_chowned_and_checked_as_the_gateway_user() -> None:
     """A root-owned mount is the failure that reads as success, so prove it."""
     block = volume_chown_block()
-    assert 'chown -R nanobot:nanobot "$VOLUME_ROOT"' in block
+    assert 'chown -R nanobot:nanobot "$VOLUME_DATA_DIR"' in block
     assert "setpriv --reuid=nanobot --regid=nanobot --init-groups" in block
-    assert 'test -w "$VOLUME_ROOT/powerx"' in block, "writability must be tested, not assumed"
+    assert 'test -w "$VOLUME_DATA_DIR"' in block, "writability must be tested, not assumed"
 
 
 def test_the_tree_is_linked_before_anything_writes_to_it() -> None:
     """The order is the point: a boot that seeded config.json first would write
     the default into the container and then copy it over the real one."""
     text = ENTRYPOINT.read_text(encoding="utf-8")
-    link = text.index("runtime data on the volume")
+    link = text.index("durable state on the volume")
     assert link < text.index("initializing $config from render-config.json")
     assert link < text.index("supabase-env-$$.sh"), "the env sync writes under $dir too"

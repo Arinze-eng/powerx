@@ -38,8 +38,9 @@ PERSISTENT_DISK=false
 mkdir -p "$dir" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# The persistent volume: everything durable lives under $HOME/.nanobot, so that
-# is the tree that has to be on the disk.
+# The persistent volume: only the application state subtree is used. The volume
+# itself may be mounted at /data by Northflank, but the gateway writes durable
+# state under /data/persist and keeps task scratch under /tmp/powerx-work.
 #
 # Mounting the disk is not the same as using it, and every one of these has gone
 # wrong in production here:
@@ -66,11 +67,39 @@ if [ -n "${POWERX_DATA_DIR:-}" ]; then
 elif [ -d /data ]; then
     VOLUME_ROOT=/data
 fi
+PERSIST_ROOT=""
+if [ -n "$VOLUME_ROOT" ]; then
+    PERSIST_ROOT="$VOLUME_ROOT/persist"
+    export POWERX_DATA_DIR="$PERSIST_ROOT"
+    export POWERX_EPHEMERAL_WORK_DIR="${POWERX_EPHEMERAL_WORK_DIR:-/tmp/powerx-work}"
+    export TMPDIR="$POWERX_EPHEMERAL_WORK_DIR"
+    export XDG_CACHE_HOME="$POWERX_EPHEMERAL_WORK_DIR/cache"
+    export PIP_CACHE_DIR="$POWERX_EPHEMERAL_WORK_DIR/pip-cache"
+    export npm_config_cache="$POWERX_EPHEMERAL_WORK_DIR/npm-cache"
+    mkdir -p "$POWERX_EPHEMERAL_WORK_DIR" "$PERSIST_ROOT" 2>/dev/null || true
+    : > "$PERSIST_ROOT/.ignore" 2>/dev/null || true
+    cat > "$PERSIST_ROOT/.ignore" <<'EOF'
+# Scratch and package caches must never be treated as durable application data.
+*.log
+*.aux
+*.tmp
+node_modules/
+__pycache__/
+EOF
+fi
 # >>> powerx:volume-link  (tests/test_entrypoint_image_contract.py lifts this block)
 VOLUME_DATA_DIR=""
 if [ -n "$VOLUME_ROOT" ] && [ ! -L "$dir" ] && [ -w "$dir" ]; then
-    VOLUME_DATA_DIR="$VOLUME_ROOT/powerx/nanobot"
+    PERSIST_ROOT="${PERSIST_ROOT:-$VOLUME_ROOT/persist}"
+    VOLUME_DATA_DIR="$PERSIST_ROOT/nanobot"
     if mkdir -p "$VOLUME_DATA_DIR" 2>/dev/null; then
+        # Migrate the previous layout once, without deleting the old copy. A
+        # later operator can remove /data/powerx after verifying the new tree.
+        if [ -d "$VOLUME_ROOT/powerx/nanobot" ] && [ ! -f "$VOLUME_DATA_DIR/.migrated-from-powerx" ]; then
+            cp -an "$VOLUME_ROOT/powerx/nanobot/." "$VOLUME_DATA_DIR/" 2>/dev/null || \
+                echo "[entrypoint] warning: could not migrate legacy /powerx/nanobot" >&2
+            : > "$VOLUME_DATA_DIR/.migrated-from-powerx"
+        fi
         if [ -d "$dir" ]; then
             cp -an "$dir/." "$VOLUME_DATA_DIR/" 2>/dev/null \
                 || echo "[entrypoint] warning: could not copy $dir onto the volume" >&2
@@ -85,8 +114,8 @@ if [ -n "$VOLUME_ROOT" ] && [ ! -L "$dir" ] && [ -w "$dir" ]; then
         fi
         mkdir -p "$VOLUME_DATA_DIR/sessions" 2>/dev/null || true
         if ln -s "$VOLUME_DATA_DIR" "$dir" 2>/dev/null; then
-            echo "[entrypoint] runtime data on the volume: $dir -> $VOLUME_DATA_DIR"
-            echo "[entrypoint]   (chat history, admin config, provider pool, workspace)"
+            echo "[entrypoint] durable state on the volume: $dir -> $VOLUME_DATA_DIR"
+            echo "[entrypoint]   scratch: ${POWERX_EPHEMERAL_WORK_DIR:-/tmp/powerx-work}"
         else
             mkdir -p "$dir" 2>/dev/null || true
             echo "[entrypoint] warning: could not link $dir onto the volume" >&2
@@ -97,7 +126,7 @@ fi
 
 if _data_dir_is_mounted "$dir"; then
     PERSISTENT_DISK=true
-    echo "[entrypoint] persistent volume detected at $dir — cron jobs stay on disk"
+    echo "[entrypoint] persistent volume detected at $PERSIST_ROOT — cron jobs stay on disk"
 fi
 # An explicit operator setting always wins, in either direction.
 [ "$NANOBOT_PERSISTENT_DISK" = "true" ] && PERSISTENT_DISK=true
@@ -320,19 +349,19 @@ fi
 if [ "$(id -u)" = "0" ]; then
     chown -R nanobot:nanobot "$dir" 2>/dev/null || echo "[entrypoint] warning: chown $dir failed"
 
-    # The volume is a different tree from $dir, so it needs its own chown, and
-    # the result needs checking: a root-owned mount is the failure that looks
-    # exactly like success (paths resolve, writes fail, nothing says why).
-    if [ -n "$VOLUME_ROOT" ]; then
+    # Only the durable application subtree needs ownership repair. Recursing
+    # over the entire mounted disk makes boot time and memory scale with every
+    # old artifact on the volume, and can make a deployment look frozen.
+    if [ -n "$VOLUME_DATA_DIR" ]; then
         # >>> powerx:volume-chown  (lifted by tests/test_entrypoint_image_contract.py)
-        mkdir -p "$VOLUME_ROOT/powerx" 2>/dev/null || true
-        chown -R nanobot:nanobot "$VOLUME_ROOT" 2>/dev/null \
-            || echo "[entrypoint] warning: chown $VOLUME_ROOT failed" >&2
+        mkdir -p "$VOLUME_DATA_DIR" 2>/dev/null || true
+        chown -R nanobot:nanobot "$VOLUME_DATA_DIR" 2>/dev/null \
+            || echo "[entrypoint] warning: chown $VOLUME_DATA_DIR failed" >&2
         if setpriv --reuid=nanobot --regid=nanobot --init-groups \
-                test -w "$VOLUME_ROOT/powerx" 2>/dev/null; then
-            echo "[entrypoint] persistent volume $VOLUME_ROOT is writable by nanobot"
+                test -w "$VOLUME_DATA_DIR" 2>/dev/null; then
+            echo "[entrypoint] durable state $VOLUME_DATA_DIR is writable by nanobot"
         else
-            echo "[entrypoint] WARNING: $VOLUME_ROOT/powerx is NOT writable by nanobot;" \
+            echo "[entrypoint] WARNING: $VOLUME_DATA_DIR is NOT writable by nanobot;" \
                  "anything written there will fail" >&2
         fi
         # <<< powerx:volume-chown
