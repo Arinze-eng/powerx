@@ -52,6 +52,16 @@ from nanobot.security.workspace_policy import is_path_within
 
 _IS_WINDOWS = sys.platform == "win32"
 _PROCESS_TREE_OWNER_ATTR = "_nanobot_process_tree_owner"
+# Compilation and document-generation tools often produce no stdout while
+# working. They must still be bounded, but the ordinary command default is too
+# short for a real PDF build and causes the model to retry the same work.
+_BUILD_TIMEOUT_SECONDS = 600
+_BUILD_COMMAND_RE = re.compile(
+    r"(?:pdflatex|xelatex|lualatex|latexmk|tectonic|pandoc|typst|weasyprint|"
+    r"wkhtmltopdf|prince|make|cmake\s+--build|gradle|gradlew|mvn|cargo\s+build|"
+    r"npm\s+(?:run\s+)?build|pnpm\s+(?:run\s+)?build|yarn\s+build)",
+    re.IGNORECASE,
+)
 
 
 class _ProcessTreeOwner(Protocol):
@@ -316,7 +326,8 @@ class ExecTool(Tool):
             "For long-running or interactive commands, pass yield_time_ms; "
             "if the command keeps running, exec returns a session_id that can "
             "be polled or written to with write_stdin. Output is truncated at "
-            "10 000 chars; timeout defaults to 60s."
+            "10 000 chars; ordinary commands timeout after 60s, while recognized "
+            "build commands get up to 600s unless an explicit timeout is supplied."
         )
 
     @property
@@ -511,17 +522,21 @@ class ExecTool(Tool):
         except Exception as exc:
             return ToolResult.error(f"Error executing command: {exc}")
 
-    def _resolve_timeout(self, timeout: int | None) -> int | None:
+    def _resolve_timeout(self, timeout: int | None, command: str = "") -> int | None:
         """Resolve the effective hard timeout in seconds (None = no limit).
 
         A per-call timeout supplied by the model stays capped at _MAX_TIMEOUT so
         the LLM cannot request unbounded execution. The config-level default
         (self.timeout) may exceed that cap, and 0 disables the limit entirely
-        for trusted long-running tasks (#3595).
+        for trusted long-running tasks (#3595). Recognized build commands get a
+        longer bounded default because PDF and compilation tools can be silent
+        while making healthy progress.
         """
         if timeout:
             return min(timeout, self._MAX_TIMEOUT)
         if self.timeout and self.timeout > 0:
+            if _BUILD_COMMAND_RE.search(command):
+                return max(self.timeout, _BUILD_TIMEOUT_SECONDS)
             return self.timeout
         return None
 
@@ -594,7 +609,7 @@ class ExecTool(Tool):
                 # there, so the remote path refuses it instead (see execute).
                 host_only = True
 
-        effective_timeout = self._resolve_timeout(timeout)
+        effective_timeout = self._resolve_timeout(timeout, command)
         env = self._build_env()
 
         if self.path_prepend or self.path_append:
