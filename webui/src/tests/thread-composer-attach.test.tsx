@@ -77,7 +77,7 @@ function ingressLimits({
     },
     message: { max_text_bytes: maxTextBytes },
     attachments: {
-      max_count: 4,
+      max_count: 20,
       max_file_bytes: maxFileBytes,
       max_total_bytes: maxTotalBytes,
     },

@@ -59,7 +59,7 @@ export type AttachmentError =
   | "too_large"          // even after normalization we exceed the budget
   | "io";                // file read failed at the browser layer
 
-export const MAX_ATTACHMENTS_PER_MESSAGE = 4;
+export const MAX_ATTACHMENTS_PER_MESSAGE = 20;
 export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 export const MAX_TOTAL_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 

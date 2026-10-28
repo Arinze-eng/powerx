@@ -2266,7 +2266,7 @@ export function ThreadComposer({
         ) : null}
         {images.length > 0 ? (
           <div
-            className="flex flex-wrap gap-2 px-3 pt-3"
+            className="flex max-h-32 flex-wrap content-start gap-2 overflow-y-auto px-3 pt-3"
             aria-label={t("thread.composer.attachImage")}
           >
             {images.map((img) => (
