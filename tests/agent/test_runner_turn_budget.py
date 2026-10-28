@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from nanobot.agent import runner as runner_module
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.runtime import TURN_BUDGET_SECONDS, turn_budget_seconds
@@ -282,3 +282,42 @@ async def test_budget_check_happens_before_the_next_model_call() -> None:
     # Exactly one provider call: the second iteration was refused before it paid
     # for another round trip.
     assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_raw_cgroup_charge_stops_before_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 512 MB deployment must not let the next request become an OOM kill."""
+    tools = MagicMock()
+    tools.prepare_call.side_effect = lambda name, params: (SimpleNamespace(execute=AsyncMock(return_value="ok")), params, None)
+    tools.get_definitions.return_value = []
+    calls = {"n": 0}
+    runner = AgentRunner()
+
+    async def fake_request_model(spec, messages, hook, *args, **kwargs):
+        calls["n"] += 1
+        return LLMResponse(content="unexpected", tool_calls=[], finish_reason="stop")
+
+    runner._request_model = fake_request_model  # type: ignore[assignment]
+    monkeypatch.setattr(runner_module, "reclaim_if_charge_high", lambda **kwargs: None)
+    monkeypatch.setattr(
+        runner_module,
+        "memory_snapshot",
+        lambda: {"charge_pct": 96.0, "pressure": "ok", "oom_kill": 0},
+    )
+    spec = AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        runtime=_runtime(),
+        max_iterations=3,
+        max_tool_result_chars=1000,
+        concurrent_tools=False,
+        turn_budget_s=0,
+    )
+
+    result = await runner.run(spec)
+
+    assert result.stop_reason == "memory_charge_exceeded"
+    assert calls["n"] == 0
+    assert "memory limit" in result.final_content.lower()

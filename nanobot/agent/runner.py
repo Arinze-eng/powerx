@@ -23,12 +23,6 @@ from nanobot.agent.context_governance import (
     ContextGovernor,
 )
 from nanobot.agent.deterministic_router import deterministic_plan, router_enabled
-from nanobot.agent.shape_router import (
-    plan_preference_message,
-    shape_router_enabled,
-    should_steer_to_plan,
-    steer_message_for,
-)
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.hooks.supabase_credit import CreditExhaustedError
 from nanobot.agent.plan_cache import (
@@ -39,6 +33,11 @@ from nanobot.agent.plan_cache import (
     plan_is_safe,
     substitute_variables,
     variables_compatible,
+)
+from nanobot.agent.shape_router import (
+    shape_router_enabled,
+    should_steer_to_plan,
+    steer_message_for,
 )
 from nanobot.agent.task_cache import make_replay_cache, task_fingerprint_text
 from nanobot.agent.task_router import task_recipe_plan
@@ -75,7 +74,7 @@ from nanobot.utils.helpers import (
     strip_think,
 )
 from nanobot.utils.llm_runtime import LLMRuntime
-from nanobot.utils.memory_guard import log_memory
+from nanobot.utils.memory_guard import MEMORY_CHARGE_STOP_RATIO, log_memory, memory_snapshot
 from nanobot.utils.memory_reclaim import maybe_reclaim, reclaim_if_charge_high
 from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.runtime import (
@@ -1033,6 +1032,34 @@ class AgentRunner:
             # platform's /api/health probe -- the very thing whose failure gets
             # the container replaced under the user mid-task.
             await asyncio.to_thread(reclaim_if_charge_high, tag="charge_guard")
+            # The platform enforces the raw cgroup charge, including page cache,
+            # while the ordinary pressure grade is based on anonymous memory.
+            # If reclaim could not create headroom, do not start another request:
+            # on the 512 MB Northflank plan that request is otherwise liable to
+            # receive SIGKILL and make the task look frozen. Returning a normal
+            # turn result preserves the transcript and lets the user retry after
+            # the container sheds cache or is moved to a larger plan.
+            charge_snapshot = memory_snapshot()
+            charge_pct = charge_snapshot.get("charge_pct")
+            if isinstance(charge_pct, (int, float)) and charge_pct >= MEMORY_CHARGE_STOP_RATIO * 100:
+                logger.error(
+                    "Stopping turn before provider request: raw cgroup charge is {}% "
+                    "of limit (stop threshold {}%); preserving work instead of risking OOM",
+                    charge_pct,
+                    round(MEMORY_CHARGE_STOP_RATIO * 100, 1),
+                )
+                terminal_content = (
+                    "This task was paused before the next AI request because the container "
+                    "is near its memory limit. The work already completed is saved; retry "
+                    "after the service recovers or increase the deployment memory."
+                )
+                final_content = terminal_content
+                self._append_final_message(messages, terminal_content)
+                stop_reason = "memory_charge_exceeded"
+                context.final_content = final_content
+                context.stop_reason = stop_reason
+                await hook.after_iteration(context)
+                break
             if spec.strip_image_content_before_provider:
                 # Injections and recovery/finalization messages are appended
                 # between iterations, so scrub again immediately before model

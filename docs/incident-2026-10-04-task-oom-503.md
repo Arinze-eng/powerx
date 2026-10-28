@@ -73,6 +73,15 @@ Tests: `tests/utils/test_memory_sweep_breaker.py`, plus three `oom_kill` specs i
 test, because the module keeps monotonic state on purpose and that made specs
 order-dependent.
 
+## Code safeguard and still-needed capacity change
+
+The runner now performs a raw cgroup-charge check after the reclaim pass and
+stops before another provider request when the charge is at least 94% of the
+limit. It records `stop_reason=memory_charge_exceeded` and preserves the work
+already completed, so the user receives a recoverable pause instead of a silent
+SIGKILL/restart. This protects the 512 MB plan but does not create additional
+headroom.
+
 ## Still needed — and it is not free
 
 The charge guard, the breaker and the trim all operate *inside* a 488 MiB cgroup.

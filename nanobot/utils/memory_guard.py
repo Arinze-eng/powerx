@@ -43,6 +43,7 @@ from loguru import logger
 
 __all__ = [
     "MEMORY_CHARGE_WARN_RATIO",
+    "MEMORY_CHARGE_STOP_RATIO",
     "MEMORY_CRITICAL_RATIO",
     "MEMORY_WARN_RATIO",
     "container_memory_anonymous_bytes",
@@ -81,6 +82,12 @@ MEMORY_CRITICAL_RATIO = 0.92
 #: process measured 46.7%). Tripping there costs one collection, which is the
 #: same thing ``idle_reclaim`` would have done a moment later anyway.
 MEMORY_CHARGE_WARN_RATIO = 0.85
+#: Stop starting another provider request when the whole cgroup is this full
+#: after the best-effort reclaim pass. The kernel kills at 1.0; leaving 6% for
+#: request construction and shutdown is safer than letting a task disappear
+#: with no traceback. This is deliberately based on raw charge, not anonymous
+#: memory, because the platform enforces the raw cgroup limit.
+MEMORY_CHARGE_STOP_RATIO = 0.94
 
 _CGROUP_V2 = Path("/sys/fs/cgroup")
 _CGROUP_V1 = Path("/sys/fs/cgroup/memory")
