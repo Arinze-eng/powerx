@@ -168,6 +168,18 @@ Future<void> settleFrames() async {
   await pumpEventQueue();
 }
 
+/// Waits until a frame matching [test] reaches the fake gateway, then returns
+/// the newest one. A fixed delay raced on slow CI runners; polling does not.
+Future<Map<String, dynamic>> awaitInbound(
+    FakeGateway gw, bool Function(Map<String, dynamic>) test) async {
+  for (var i = 0; i < 300; i++) {
+    final hits = gw.inbound.where(test).toList();
+    if (hits.isNotEmpty) return hits.last;
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+  throw StateError('the expected frame never reached the gateway');
+}
+
 void main() {
   late FakeGateway gw;
   late NanobotSocket sock;
@@ -468,7 +480,8 @@ void main() {
     // server, and the /stop command is a plain message (no turn id).
     expect(rec.turnEnds.length, 1);
     expect(sock.isTurnActive(chatId), isFalse);
-    final stopFrame = gw.inbound.lastWhere((f) => f['content'] == '/stop');
+    final stopFrame =
+        await awaitInbound(gw, (f) => f['content'] == '/stop');
     expect(stopFrame['type'], 'message');
     expect(stopFrame.containsKey('turn_id'), isFalse);
   });
@@ -622,8 +635,7 @@ void main() {
     // chat. Delete must go out as a webui_request envelope.
     await sock.connect();
     final future = sock.deleteSession('websocket:chat-1');
-    await pumpEventQueue();
-    final frame = gw.inbound.lastWhere(
+    final frame = await awaitInbound(gw,
         (f) => f['type'] == 'webui_request' && f['action'] == 'session.delete');
     expect(frame['payload']['key'], 'websocket:chat-1');
 
@@ -640,8 +652,7 @@ void main() {
   test('a blocked delete is reported with its automation names', () async {
     await sock.connect();
     final future = sock.deleteSession('websocket:chat-2');
-    await pumpEventQueue();
-    final frame = gw.inbound.lastWhere(
+    final frame = await awaitInbound(gw,
         (f) => f['type'] == 'webui_request' && f['action'] == 'session.delete');
     gw.send({
       'event': 'webui_response',
@@ -662,8 +673,7 @@ void main() {
   test('a refused mutation surfaces as an ApiException', () async {
     await sock.connect();
     final future = sock.deleteSession('websocket:chat-3');
-    await pumpEventQueue();
-    final frame = gw.inbound.lastWhere(
+    final frame = await awaitInbound(gw,
         (f) => f['type'] == 'webui_request' && f['action'] == 'session.delete');
     gw.send({
       'event': 'webui_response',
@@ -772,7 +782,8 @@ void main() {
     // Drive a transcription request through the gateway stub.
     final pending = sock.transcribeAudio(dataUrl: 'data:audio/m4a;base64,AAAA', durationMs: 1200);
     await Future<void>.delayed(const Duration(milliseconds: 50));
-    final sent = gw.inbound.lastWhere((f) => f['type'] == 'transcribe_audio');
+    final sent =
+        await awaitInbound(gw, (f) => f['type'] == 'transcribe_audio');
     expect(sent['data_url'], 'data:audio/m4a;base64,AAAA');
     expect(sent['duration_ms'], 1200);
     expect(sent['request_id'], isA<String>());
@@ -787,7 +798,8 @@ void main() {
     // An error frame completes with a user-readable message.
     final failing = sock.transcribeAudio(dataUrl: 'data:audio/m4a;base64,AAAA', durationMs: 1200);
     await Future<void>.delayed(const Duration(milliseconds: 50));
-    final sent2 = gw.inbound.lastWhere((f) => f['type'] == 'transcribe_audio');
+    final sent2 =
+        await awaitInbound(gw, (f) => f['type'] == 'transcribe_audio');
     gw.send({
       'event': 'transcription_error',
       'request_id': sent2['request_id'],
