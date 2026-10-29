@@ -64,6 +64,16 @@ jobs:
             cp -R /tmp/ios_scaffold/ios ./ios
           fi
 
+      - name: Install app icon
+        # The approved CDNAI icon set is committed in the repo. Copy it over the
+        # Flutter placeholder icons so the unsigned IPA carries the real icon.
+        working-directory: android_app
+        run: |
+          DEST=ios/Runner/Assets.xcassets/AppIcon.appiconset
+          test -d "$DEST"
+          cp -R assets/icon/ios/AppIcon.appiconset/. "$DEST/"
+          ls "$DEST" | wc -l
+
       - name: Set app name and permission text
         working-directory: android_app/ios/Runner
         run: |
