@@ -1,9 +1,32 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:crypto/crypto.dart';
 import 'package:device_info_plus/device_info_plus.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
+/// Identity vector for an Android install, built from Settings.Secure.ANDROID_ID
+/// (read natively in MainActivity). device_info_plus `androidInfo.id` is
+/// Build.ID, a firmware label shared by every phone on the same build, so it
+/// must not be used here. When ANDROID_ID is unavailable a per-install secure
+/// random id is used instead.
+String androidIdentityVector(String? androidId) {
+  final id = androidId?.trim() ?? '';
+  if (id.isNotEmpty) return 'android-id:$id';
+  return 'rand:${_secureRandomHex()}';
+}
+
+/// sha256 hex of an identity vector.
+String fingerprintOf(String rawIdentity) =>
+    sha256.convert(utf8.encode(rawIdentity)).toString();
+
+String _secureRandomHex() {
+  final rng = Random.secure();
+  final bytes = List<int>.generate(32, (_) => rng.nextInt(256));
+  return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+}
 
 /// Stable per-device signup fingerprint + local "already signed up" lock.
 ///
@@ -22,6 +45,7 @@ class DeviceId {
 
   final FlutterSecureStorage _storage = const FlutterSecureStorage(
       aOptions: AndroidOptions(encryptedSharedPreferences: true));
+  static const _deviceChannel = MethodChannel('powerx/device');
   String? _cached;
 
   /// Stable fingerprint for this install. Falls back to a persisted random id
@@ -34,28 +58,18 @@ class DeviceId {
       return stored;
     }
     final raw = await _identityVector();
-    final fp = sha256.convert(utf8.encode(raw)).toString();
+    final fp = fingerprintOf(raw);
     await _storage.write(key: _fpKey, value: fp);
     _cached = fp;
     return fp;
   }
 
   Future<String> _identityVector() async {
+    if (Platform.isAndroid) {
+      return androidIdentityVector(await _androidId());
+    }
     try {
-      if (Platform.isAndroid) {
-        final info = await DeviceInfoPlugin().androidInfo;
-        final parts = [
-          info.id,
-          info.brand,
-          info.model,
-          info.device,
-          info.manufacturer,
-          info.version.release,
-          info.version.sdkInt.toString(),
-        ];
-        final joined = parts.where((p) => p.trim().isNotEmpty).join('|');
-        if (joined.trim().isNotEmpty) return 'android:$joined';
-      } else if (Platform.isIOS) {
+      if (Platform.isIOS) {
         final info = await DeviceInfoPlugin().iosInfo;
         final joined = [info.identifierForVendor ?? '', info.model, info.name]
             .where((p) => p.trim().isNotEmpty)
@@ -65,13 +79,17 @@ class DeviceId {
     } catch (_) {
       // Fall through to the random fallback below.
     }
-    // Random fallback persisted per install (unique, just not hardware-bound).
-    var rand = await _storage.read(key: _fpKey);
-    if (rand == null || rand.isEmpty) {
-      final bytes = List<int>.generate(32, (_) => DateTime.now().microsecondsSinceEpoch % 256 + DateTime.now().millisecondsSinceEpoch % 97);
-      rand = sha256.convert(bytes).toString();
+    return 'rand:${_secureRandomHex()}';
+  }
+
+  /// Settings.Secure.ANDROID_ID via MainActivity; null if unavailable.
+  Future<String?> _androidId() async {
+    try {
+      final id = await _deviceChannel.invokeMethod<String>('androidId');
+      return (id == null || id.trim().isEmpty) ? null : id.trim();
+    } catch (_) {
+      return null;
     }
-    return 'rand:$rand';
   }
 
   /// True if an account was created on this device before (local best-effort
