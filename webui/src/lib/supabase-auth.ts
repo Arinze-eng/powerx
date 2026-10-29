@@ -405,3 +405,80 @@ export async function claimReferral(
     return { ok: false, error: "Referral claim failed." };
   }
 }
+
+export interface RecoveryCodeResult {
+  ok: boolean;
+  recoveryCode?: string;
+  error?: string;
+}
+
+interface RecoveryPayload {
+  ok?: boolean;
+  recovery_code?: string;
+  error?: string;
+}
+
+async function readRecoveryPayload(res: Response): Promise<RecoveryPayload> {
+  try {
+    return (await res.json()) as RecoveryPayload;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Issue the signed-in account's one-time recovery code. Called right after
+ * signUp with the new user's access token. The plain code comes back once;
+ * the server keeps only its hash. A 409 means the account already has a code.
+ */
+export async function issueRecoveryCode(
+  url: string,
+  anonKey: string,
+  accessToken: string,
+): Promise<RecoveryCodeResult> {
+  const fallback = "Could not create your recovery code. Please try again.";
+  const base = url.replace(/\/+$/, "");
+  try {
+    const res = await fetch(`${base}/functions/v1/recovery-code-issue`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: anonKey,
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({}),
+    });
+    const data = await readRecoveryPayload(res);
+    if (res.ok && data.recovery_code) return { ok: true, recoveryCode: data.recovery_code };
+    return { ok: false, error: data.error || fallback };
+  } catch {
+    return { ok: false, error: fallback };
+  }
+}
+
+/**
+ * Set a new password for a signed-out user using their recovery code. Codes
+ * are single use, so a new code comes back and must be shown to the user.
+ */
+export async function resetPasswordWithCode(
+  url: string,
+  anonKey: string,
+  email: string,
+  code: string,
+  password: string,
+): Promise<RecoveryCodeResult> {
+  const fallback = "Could not reset your password. Please try again.";
+  const base = url.replace(/\/+$/, "");
+  try {
+    const res = await fetch(`${base}/functions/v1/recovery-password-reset`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: anonKey },
+      body: JSON.stringify({ email: email.trim().toLowerCase(), code, password }),
+    });
+    const data = await readRecoveryPayload(res);
+    if (res.ok && data.recovery_code) return { ok: true, recoveryCode: data.recovery_code };
+    return { ok: false, error: data.error || fallback };
+  } catch {
+    return { ok: false, error: fallback };
+  }
+}

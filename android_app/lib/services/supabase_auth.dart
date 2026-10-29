@@ -108,6 +108,49 @@ class SupabaseAuth {
     return SupabaseSession.fromJson(body);
   }
 
+  /// Issues the account's one-time recovery code. Called right after sign-up
+  /// with the new user's access token. The plain code is returned once and
+  /// only its hash is stored server-side.
+  Future<String> issueRecoveryCode(String accessToken) async {
+    final res = await _client.post(
+      _base.replace(path: '/functions/v1/recovery-code-issue'),
+      headers: {..._headers, 'Authorization': 'Bearer $accessToken'},
+      body: jsonEncode({}),
+    );
+    return _recoveryCodeFrom(res, 'Could not create your recovery code.');
+  }
+
+  /// Sets a new password using the recovery code (signed-out "Forgot password").
+  /// Codes are single use, so this returns the NEW recovery code, which the
+  /// caller must show the user to copy.
+  Future<String> resetPasswordWithCode(
+      String email, String code, String password) async {
+    final res = await _client.post(
+      _base.replace(path: '/functions/v1/recovery-password-reset'),
+      headers: _headers,
+      body: jsonEncode({
+        'email': email.trim().toLowerCase(),
+        'code': code,
+        'password': password,
+      }),
+    );
+    return _recoveryCodeFrom(res, 'Could not reset your password.');
+  }
+
+  String _recoveryCodeFrom(http.Response res, String fallback) {
+    Map<String, dynamic>? payload;
+    try {
+      payload = jsonDecode(res.body) as Map<String, dynamic>;
+    } catch (_) {
+      payload = null;
+    }
+    final code = payload?['recovery_code'];
+    if (_isOk(res) && code is String && code.isNotEmpty) return code;
+    final error = payload?['error'];
+    throw AuthException(
+        error is String && error.trim().isNotEmpty ? error : fallback);
+  }
+
   /// Refresh an access token using the stored refresh token.
   Future<SupabaseSession> refresh(String refreshToken) async {
     final res = await _client.post(

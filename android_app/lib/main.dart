@@ -8,6 +8,7 @@ import 'package:provider/provider.dart';
 import 'config.dart';
 import 'screens/auth_screen.dart';
 import 'screens/home_screen.dart';
+import 'screens/recovery_code_screen.dart';
 import 'screens/settings_screen.dart';
 import 'state/app_state.dart';
 import 'state/theme_controller.dart';
@@ -137,6 +138,20 @@ class _RootGate extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
+    // The recovery code must be copied before the user gets into the app,
+    // so this check comes before the status switch.
+    if (state.recoveryCodeStep) {
+      return RecoveryCodeScreen(
+        code: state.pendingRecoveryCode,
+        error: state.recoveryCodeError,
+        continueLabel: state.status == AppStatus.authenticated
+            ? 'I have copied it, continue'
+            : 'I have copied it, sign in',
+        onContinue: state.acknowledgeRecoveryCode,
+        onRetry: state.retryRecoveryCode,
+        onSignOut: state.signOut,
+      );
+    }
     switch (state.status) {
       case AppStatus.loading:
       case AppStatus.authenticating:

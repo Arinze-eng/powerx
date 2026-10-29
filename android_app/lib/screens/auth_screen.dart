@@ -18,7 +18,9 @@ class _AuthScreenState extends State<AuthScreen> {
   final _password = TextEditingController();
   final _name = TextEditingController();
   final _referral = TextEditingController();
+  final _code = TextEditingController();
   bool _isSignUp = false;
+  bool _forgot = false;
   bool _obscure = true;
 
   @override
@@ -27,11 +29,16 @@ class _AuthScreenState extends State<AuthScreen> {
     _password.dispose();
     _name.dispose();
     _referral.dispose();
+    _code.dispose();
     super.dispose();
   }
 
   Future<void> _submit() async {
     FocusScope.of(context).unfocus();
+    if (_forgot) {
+      await _submitReset();
+      return;
+    }
     final state = context.read<AppState>();
     final em = _email.text.trim();
     final pw = _password.text;
@@ -57,6 +64,38 @@ class _AuthScreenState extends State<AuthScreen> {
         nav.popUntil((route) => route.isFirst);
       }
     }
+  }
+
+  /// "Forgot password": email + recovery code + new password. On success the
+  /// gate shows the new recovery code, which must be copied before sign-in.
+  Future<void> _submitReset() async {
+    final state = context.read<AppState>();
+    final em = _email.text.trim();
+    final code = _code.text.trim();
+    final pw = _password.text;
+    if (em.isEmpty || !em.contains('@')) {
+      _toast('Enter a valid email');
+      return;
+    }
+    if (code.isEmpty) {
+      _toast('Enter your recovery code');
+      return;
+    }
+    if (pw.length < 6) {
+      _toast('New password must be at least 6 characters');
+      return;
+    }
+    final error = await state.resetPasswordWithCode(em, code, pw);
+    if (!mounted) return;
+    if (error != null) {
+      _toast(error);
+      return;
+    }
+    // Success: RootGate now shows the new recovery code. Clear the form so
+    // the old code and password are not left on screen.
+    _code.clear();
+    _password.clear();
+    setState(() => _forgot = false);
   }
 
   void _toast(String msg) {
@@ -105,7 +144,9 @@ class _AuthScreenState extends State<AuthScreen> {
                     const SizedBox(height: 6),
                     Center(
                       child: Text(
-                        _isSignUp
+                        _forgot
+                            ? 'Reset your password with your recovery code'
+                            : _isSignUp
                             ? 'Create your account'
                             : 'Welcome back — sign in to continue',
                         style:  TextStyle(
@@ -121,13 +162,29 @@ class _AuthScreenState extends State<AuthScreen> {
                     ],
                     _field(_email, 'Email', Icons.alternate_email, false),
                     const SizedBox(height: 14),
+                    if (_forgot) ...[
+                      TextField(
+                        controller: _code,
+                        textCapitalization: TextCapitalization.characters,
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        decoration: InputDecoration(
+                          labelText: 'Recovery code',
+                          prefixIcon: Icon(
+                            Icons.key_outlined,
+                            color: Palette.textTertiary,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                    ],
                     TextField(
                       controller: _password,
                       obscureText: _obscure,
                       textInputAction: TextInputAction.done,
                       onSubmitted: (_) => _submit(),
                       decoration: InputDecoration(
-                        labelText: 'Password',
+                        labelText: _forgot ? 'New password' : 'Password',
                         prefixIcon:  Icon(
                           Icons.lock_outline,
                           color: Palette.textTertiary,
@@ -182,13 +239,46 @@ class _AuthScreenState extends State<AuthScreen> {
                                 ),
                               )
                               : Text(
-                                _isSignUp ? 'Sign up' : 'Sign in',
+                                _forgot
+                                    ? 'Reset password'
+                                    : _isSignUp
+                                    ? 'Sign up'
+                                    : 'Sign in',
                                 style: const TextStyle(
                                   fontSize: 16,
                                   fontWeight: FontWeight.w700,
                                 ),
                               ),
                     ),
+                    if (!_isSignUp && !_forgot)
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: TextButton(
+                          onPressed: () => setState(() {
+                            _forgot = true;
+                            state.errorMessage = null;
+                          }),
+                          child: Text(
+                            'Forgot password?',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w600,
+                              color: Palette.accentSoft,
+                            ),
+                          ),
+                        ),
+                      ),
+                    if (_forgot)
+                      TextButton(
+                        onPressed: () => setState(() => _forgot = false),
+                        child: Text(
+                          'Back to sign in',
+                          style: TextStyle(
+                            fontWeight: FontWeight.w700,
+                            color: Palette.accentSoft,
+                          ),
+                        ),
+                      )
+                    else ...[
                     const SizedBox(height: 14),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
@@ -218,6 +308,7 @@ class _AuthScreenState extends State<AuthScreen> {
                         ),
                       ],
                     ),
+                    ],
                   ],
                 ),
               ),

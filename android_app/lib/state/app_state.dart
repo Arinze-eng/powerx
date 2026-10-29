@@ -301,6 +301,8 @@ class AppState extends ChangeNotifier {
         return false;
       }
       await _persist(s, overwriteIdentity: true);
+      recoveryCodeStep = true;
+      await _issueRecoveryCode();
       unawaited(DeviceId.instance.markSignedUp(em));
       final ref = (referral ?? '').trim();
       if (ref.isNotEmpty) {
@@ -337,6 +339,9 @@ class AppState extends ChangeNotifier {
     await chatCache.clearAll();
     await pendingSends.clear();
     await _storage.delete(key: _kOpenChat);
+    recoveryCodeStep = false;
+    pendingRecoveryCode = null;
+    recoveryCodeError = null;
     status = AppStatus.unauthenticated;
     notifyListeners();
   }

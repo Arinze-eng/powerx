@@ -13,8 +13,9 @@ import {
 
 import { guardSignup } from "@/lib/anti-loot";
 import { CdnaiLogo, CdnaiMark } from "@/components/brand/CdnaiBrand";
+import { RECOVERY_ADMIN_CONTACT } from "@/components/RecoveryCodeScreen";
 
-type Mode = "signin" | "signup";
+type Mode = "signin" | "signup" | "forgot";
 
 const HIGHLIGHTS = [
   { icon: FileText, text: "Write documents, reports & emails" },
@@ -29,6 +30,7 @@ export function SupabaseAuthPage({
   message,
   onSignIn,
   onSignUp,
+  onResetPassword,
   onBack,
   onPrivacy,
   initialMode = "signin",
@@ -39,6 +41,8 @@ export function SupabaseAuthPage({
   message?: string;
   onSignIn: (email: string, password: string) => Promise<{ error?: string }>;
   onSignUp: (name: string, email: string, password: string, referral?: string) => Promise<{ error?: string }>;
+  /** Forgot-password submit. On success the caller takes over (shows the new recovery code). */
+  onResetPassword?: (email: string, code: string, password: string) => Promise<{ error?: string }>;
   onBack?: () => void;
   onPrivacy?: () => void;
   initialMode?: Mode;
@@ -48,6 +52,7 @@ export function SupabaseAuthPage({
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [referral, setReferral] = useState("");
+  const [recoveryCode, setRecoveryCode] = useState("");
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [success, setSuccess] = useState<string | null>(null);
@@ -59,6 +64,25 @@ export function SupabaseAuthPage({
     e.preventDefault();
     const cleanEmail = email.trim();
     const cleanName = name.trim();
+    if (mode === "forgot") {
+      if (!cleanEmail || !recoveryCode.trim() || !password) {
+        setLocalError("Please fill in your email, recovery code and new password.");
+        return;
+      }
+      if (password.length < 6) {
+        setLocalError("Password must be at least 6 characters.");
+        return;
+      }
+      if (!onResetPassword) return;
+      setSubmitting(true);
+      setLocalError(null);
+      const res = await onResetPassword(cleanEmail, recoveryCode.trim(), password);
+      if (res.error) {
+        setLocalError(res.error);
+        setSubmitting(false);
+      }
+      return;
+    }
     if (!cleanEmail || !password) {
       setLocalError("Please fill in all required fields.");
       return;
@@ -91,6 +115,13 @@ export function SupabaseAuthPage({
   };
 
   const togglePasswordVisibility = () => setPasswordVisible((v) => !v);
+
+  const switchMode = (next: Mode) => {
+    setMode(next);
+    setLocalError(null);
+    setSuccess(null);
+    setPassword("");
+  };
 
   const inputCls =
     "h-11 w-full rounded-control border border-white/10 bg-white/[0.04] px-3.5 text-sm text-white placeholder:text-white/35 outline-none transition-colors focus:border-[#7C5CFF]/60 focus:bg-white/[0.06] focus:ring-2 focus:ring-[#7C5CFF]/25 disabled:opacity-60";
@@ -157,15 +188,21 @@ export function SupabaseAuthPage({
           <div className="mb-7">
             <span className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/5 px-3 py-1 text-xs font-medium text-white/70">
               <Sparkles className="h-3.5 w-3.5 text-[#a78bff]" />
-              {mode === "signin" ? "Welcome back" : "Get started free"}
+              {mode === "signin" ? "Welcome back" : mode === "forgot" ? "Account recovery" : "Get started free"}
             </span>
             <h1 className="mt-4 text-2xl font-bold tracking-tight">
-              {mode === "signin" ? "Sign in to CDNAI" : "Create your account"}
+              {mode === "signin"
+                ? "Sign in to CDNAI"
+                : mode === "forgot"
+                  ? "Reset your password"
+                  : "Create your account"}
             </h1>
             <p className="mt-1.5 text-sm text-white/55">
               {mode === "signin"
                 ? "Access your AI workspace."
-                : "New accounts get free credits to explore."}
+                : mode === "forgot"
+                  ? "Enter your email, the recovery code you saved at sign-up, and a new password."
+                  : "New accounts get free credits to explore."}
             </p>
           </div>
 
@@ -206,8 +243,40 @@ export function SupabaseAuthPage({
               />
             </div>
 
+            {mode === "forgot" ? (
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium text-white/80" htmlFor="supabase-recovery-code">Recovery code</label>
+                <input
+                  id="supabase-recovery-code"
+                  name="recoveryCode"
+                  type="text"
+                  value={recoveryCode}
+                  onChange={(e) => { setRecoveryCode(e.target.value); setLocalError(null); }}
+                  disabled={submitting}
+                  placeholder="XXXX-XXXX-XXXX-XXXX-XXXX"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className={`${inputCls} font-mono uppercase tracking-wider`}
+                />
+              </div>
+            ) : null}
+
             <div className="space-y-1.5">
-              <label className="text-sm font-medium text-white/80" htmlFor="supabase-password">Password</label>
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-medium text-white/80" htmlFor="supabase-password">
+                  {mode === "forgot" ? "New password" : "Password"}
+                </label>
+                {mode === "signin" ? (
+                  <button
+                    type="button"
+                    disabled={submitting}
+                    onClick={() => switchMode("forgot")}
+                    className="text-xs font-medium text-white/55 underline-offset-4 hover:text-white hover:underline"
+                  >
+                    Forgot password?
+                  </button>
+                ) : null}
+              </div>
               <div className="relative">
                 <input
                   id="supabase-password"
@@ -217,7 +286,7 @@ export function SupabaseAuthPage({
                   onChange={(e) => { setPassword(e.target.value); setLocalError(null); }}
                   disabled={submitting}
                   placeholder="••••••••"
-                  autoComplete={mode === "signup" ? "new-password" : "current-password"}
+                  autoComplete={mode === "signin" ? "current-password" : "new-password"}
                   className={`${inputCls} pr-10`}
                 />
                 <button
@@ -271,8 +340,24 @@ export function SupabaseAuthPage({
               disabled={submitting}
               className="mt-1 inline-flex h-11 w-full items-center justify-center rounded-control bg-gradient-to-r from-[#7C5CFF] to-[#22D3EE] text-sm font-semibold text-white shadow-lg shadow-[#7C5CFF]/25 transition-all hover:brightness-110 disabled:opacity-60"
             >
-              {submitting ? "Please wait…" : mode === "signin" ? "Sign in" : "Create account"}
+              {submitting
+                ? "Please wait…"
+                : mode === "signin"
+                  ? "Sign in"
+                  : mode === "forgot"
+                    ? "Reset password"
+                    : "Create account"}
             </button>
+
+            {mode === "forgot" ? (
+              <p className="text-center text-xs text-white/50">
+                Lost your recovery code? Contact admin at{" "}
+                <a className="font-medium text-white/75 underline-offset-2 hover:underline" href={`mailto:${RECOVERY_ADMIN_CONTACT}`}>
+                  {RECOVERY_ADMIN_CONTACT}
+                </a>
+                .
+              </p>
+            ) : null}
 
             {mode === "signup" ? (
               <p className="flex items-center justify-center gap-1.5 text-xs text-white/50">
@@ -286,14 +371,21 @@ export function SupabaseAuthPage({
             {mode === "signin" ? (
               <>
                 Don't have an account?{" "}
-                <button type="button" disabled={submitting} onClick={() => { setMode("signup"); setLocalError(null); }} className="font-semibold text-white underline-offset-4 hover:underline">
+                <button type="button" disabled={submitting} onClick={() => switchMode("signup")} className="font-semibold text-white underline-offset-4 hover:underline">
                   Sign up
+                </button>
+              </>
+            ) : mode === "forgot" ? (
+              <>
+                Remembered it?{" "}
+                <button type="button" disabled={submitting} onClick={() => switchMode("signin")} className="font-semibold text-white underline-offset-4 hover:underline">
+                  Back to sign in
                 </button>
               </>
             ) : (
               <>
                 Already have an account?{" "}
-                <button type="button" disabled={submitting} onClick={() => { setMode("signin"); setLocalError(null); }} className="font-semibold text-white underline-offset-4 hover:underline">
+                <button type="button" disabled={submitting} onClick={() => switchMode("signin")} className="font-semibold text-white underline-offset-4 hover:underline">
                   Sign in
                 </button>
               </>

@@ -64,11 +64,14 @@ import {
   fetchCredits,
   getCurrentUser,
   getSessionToken,
+  issueRecoveryCode,
   onSupabaseAuthLifecycle,
+  resetPasswordWithCode,
   signIn,
   signOut,
   signUp,
 } from "@/lib/supabase-auth";
+import { RecoveryCodeScreen } from "@/components/RecoveryCodeScreen";
 import {
   SupabaseUserContext,
 } from "@/lib/supabase-user-context";
@@ -867,10 +870,53 @@ function formatPairingExpiry(seconds: number | null | undefined): string {
   return `${Math.ceil(seconds / 60)} min`;
 }
 
+/**
+ * A recovery code is shown once and must be copied before the user moves on.
+ * `next` says where Continue goes: "app" after sign-up, "login" after a reset.
+ * `retry` is set only when issuing the code failed and can be retried.
+ */
+interface RecoveryGate {
+  code: string | null;
+  error: string | null;
+  next: "app" | "login";
+  retry?: { url: string; anonKey: string; accessToken: string };
+}
+
+const RECOVERY_GATE_KEY = "px_recovery_gate";
+
+/** Restore a code that was shown but not yet confirmed, so a reload cannot lose it. */
+function readRecoveryGate(): RecoveryGate | null {
+  try {
+    const raw = window.sessionStorage.getItem(RECOVERY_GATE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { code?: unknown; next?: unknown };
+    if (typeof parsed.code !== "string" || !parsed.code) return null;
+    return { code: parsed.code, error: null, next: parsed.next === "login" ? "login" : "app" };
+  } catch {
+    return null;
+  }
+}
+
 export default function App() {
   const { t } = useTranslation();
   const [state, setState] = useState<BootState>({ status: "loading" });
   const bootstrapSecretRef = useRef("");
+  const [recoveryGate, setRecoveryGate] = useState<RecoveryGate | null>(readRecoveryGate);
+
+  useEffect(() => {
+    try {
+      if (recoveryGate?.code) {
+        window.sessionStorage.setItem(
+          RECOVERY_GATE_KEY,
+          JSON.stringify({ code: recoveryGate.code, next: recoveryGate.next }),
+        );
+      } else if (recoveryGate === null) {
+        window.sessionStorage.removeItem(RECOVERY_GATE_KEY);
+      }
+    } catch {
+      // storage unavailable: the code is still shown for this page view
+    }
+  }, [recoveryGate]);
 
   // CDNAI marketing routes (hash-based, no router dependency): #/ → landing,
   // #/login → sign in, #/signup → create account, #/privacy → privacy policy.
@@ -1285,6 +1331,15 @@ export default function App() {
         );
         return { verifyEmail: true };
       }
+      // Issue the recovery code before the user reaches the app. The gate
+      // covers the app until they confirm they have copied it.
+      const issued = await issueRecoveryCode(url, anonKey, session.access_token);
+      setRecoveryGate({
+        code: issued.recoveryCode ?? null,
+        error: issued.ok ? null : (issued.error ?? "Could not create your recovery code."),
+        next: "app",
+        retry: { url, anonKey, accessToken: session.access_token },
+      });
       bootstrapWithSupabaseToken(session.access_token, session.user?.email);
       // Referral claim: a referral code IS the referrer's email; a valid,
       // still-unused code grants the new account 700 bonus credits. Run AFTER
@@ -1306,6 +1361,19 @@ export default function App() {
       return { error: undefined };
     },
     [bootstrapWithSupabaseToken],
+  );
+
+  const handleResetPassword = useCallback(
+    async (url: string, anonKey: string, email: string, code: string, password: string) => {
+      const res = await resetPasswordWithCode(url, anonKey, email, code, password);
+      if (!res.ok || !res.recoveryCode) {
+        return { error: res.error ?? "Could not reset your password." };
+      }
+      // Codes are single use: show the replacement before the user signs in.
+      setRecoveryGate({ code: res.recoveryCode, error: null, next: "login" });
+      return { error: undefined };
+    },
+    [],
   );
 
   useEffect(() => {
@@ -1371,6 +1439,45 @@ export default function App() {
     return unsubscribe;
   }, [state, refreshReadyClient]);
 
+  if (recoveryGate) {
+    const gate = recoveryGate;
+    const retryIssue = () => {
+      const retry = gate.retry;
+      if (!retry) return;
+      void issueRecoveryCode(retry.url, retry.anonKey, retry.accessToken).then((res) => {
+        setRecoveryGate((current) =>
+          current
+            ? {
+                ...current,
+                code: res.recoveryCode ?? null,
+                error: res.ok ? null : (res.error ?? "Could not create your recovery code."),
+              }
+            : current,
+        );
+      });
+    };
+    const signOutFromRecovery = () => {
+      void signOut().finally(() => {
+        setRecoveryGate(null);
+        window.location.hash = "#/login";
+        window.location.reload();
+      });
+    };
+    return (
+      <RecoveryCodeScreen
+        code={gate.code}
+        error={gate.error}
+        continueLabel={gate.next === "login" ? "I have copied it, sign in" : "I have copied it, continue"}
+        onContinue={() => {
+          setRecoveryGate(null);
+          if (gate.next === "login") window.location.hash = "#/login";
+        }}
+        onRetry={gate.retry ? retryIssue : undefined}
+        onSignOut={gate.retry ? signOutFromRecovery : undefined}
+      />
+    );
+  }
+
   if (state.status === "loading") {
     return (
       <div className="flex h-full w-full items-center justify-center">
@@ -1414,6 +1521,9 @@ export default function App() {
           }
           onSignUp={(name, email, password) =>
             handleSupabaseSignUp(state.supabaseUrl, state.anonKey, name, email, password)
+          }
+          onResetPassword={(email, code, password) =>
+            handleResetPassword(state.supabaseUrl, state.anonKey, email, code, password)
           }
           onBack={() => navigate("#/")}
           onPrivacy={() => navigate("#/privacy")}
