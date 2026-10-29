@@ -1719,13 +1719,11 @@ class _Bubble extends StatelessWidget {
             padding: const EdgeInsets.only(top: 6),
             child: Icon(Icons.error_outline, size: 16, color: Palette.danger),
           ),
-        if (!message.streaming && _footer(message) != null)
+        // Web: a quiet copy action under a finished reply (MessageCopyButton).
+        if (!message.streaming && message.text.trim().isNotEmpty)
           Padding(
-            padding: const EdgeInsets.only(top: 6),
-            child: Text(
-              _footer(message)!,
-              style: TextStyle(color: Palette.textTertiary, fontSize: 12),
-            ),
+            padding: const EdgeInsets.only(top: 4),
+            child: _CopyReplyButton(text: message.text),
           ),
       ],
     );
@@ -1739,20 +1737,65 @@ class _Bubble extends StatelessWidget {
     );
   }
 
-  static String? _footer(ChatMessage m) {
-    final parts = <String>[];
-    final calls = m.usage?['llm_calls'];
-    if (calls != null && calls > 0) parts.add('API calls: ${calls.toInt()}');
-    if (m.latencyMs != null && m.latencyMs! > 0) {
-      parts.add('${(m.latencyMs! / 1000).toStringAsFixed(1)}s');
-    }
-    return parts.isEmpty ? null : parts.join(' · ');
-  }
-
   static String _basename(String path) {
     final clean = path.split('?').first;
     final segs = clean.split('/');
     return segs.last.isEmpty ? clean : segs.last;
+  }
+}
+
+/// Web parity (MessageCopyButton): a 32px ghost icon that swaps to a check
+/// for two seconds after the reply is copied.
+class _CopyReplyButton extends StatefulWidget {
+  const _CopyReplyButton({required this.text});
+  final String text;
+  @override
+  State<_CopyReplyButton> createState() => _CopyReplyButtonState();
+}
+
+class _CopyReplyButtonState extends State<_CopyReplyButton> {
+  bool _copied = false;
+  Timer? _reset;
+
+  @override
+  void dispose() {
+    _reset?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _copy() async {
+    await Clipboard.setData(ClipboardData(text: widget.text));
+    if (!mounted) return;
+    setState(() => _copied = true);
+    _reset?.cancel();
+    _reset = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _copied = false);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final label = _copied ? 'Copied' : 'Copy reply';
+    return Tooltip(
+      message: label,
+      child: Semantics(
+        button: true,
+        label: label,
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: _copy,
+          child: SizedBox(
+            width: 32,
+            height: 32,
+            child: Icon(
+              _copied ? Icons.check_rounded : Icons.copy_rounded,
+              size: 16,
+              color: Palette.textSecondary,
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -2225,6 +2268,23 @@ class _ComposerState extends State<_Composer> {
   /// input instead of dumping the user straight into a system file picker.
   bool _toolsOpen = false;
 
+  /// Tracks focus so the pill fills to the web's focused tint (bg-muted/50).
+  final FocusNode _focus = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    _focus.addListener(() {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _focus.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return SafeArea(
@@ -2364,9 +2424,10 @@ class _ComposerState extends State<_Composer> {
             // One elevated pill holds attach + input + send.
             Container(
               decoration: BoxDecoration(
-                color: Palette.bg3,
-                borderRadius: BorderRadius.circular(24),
-                border: Border.all(color: Palette.border),
+                color: _focus.hasFocus
+                    ? Palette.active.composerSurfaceFocused
+                    : Palette.active.composerSurface,
+                borderRadius: BorderRadius.circular(22),
               ),
               padding: const EdgeInsets.fromLTRB(4, 4, 6, 4),
               child: Row(
@@ -2385,6 +2446,7 @@ class _ComposerState extends State<_Composer> {
                   Expanded(
                     child: TextField(
                       controller: widget.controller,
+                      focusNode: _focus,
                       minLines: 1,
                       maxLines: 5,
                       textInputAction: TextInputAction.newline,
@@ -2428,30 +2490,41 @@ class _ComposerState extends State<_Composer> {
                           ? 'Stop and transcribe'
                           : 'Record a voice note',
                     ),
-                  // Send arrow when idle; stop square while the agent works.
-                  Material(
-                    color: widget.busy ? Palette.danger : Palette.accent,
-                    shape: const CircleBorder(),
-                    child: InkWell(
-                      customBorder: const CircleBorder(),
-                      onTap:
-                          widget.busy
-                              ? widget.onStop
-                              : widget.onSend,
-                      child: Padding(
-                        padding: const EdgeInsets.all(11),
-                        child:
+                  // Matches the web composer: a 36px circle. Send is the
+                  // strong (foreground) disc; while the agent works it becomes
+                  // a quiet bordered disc with a small square stop glyph.
+                  SizedBox(
+                    width: 36,
+                    height: 36,
+                    child: Material(
+                      color: widget.busy ? Palette.bg2 : Palette.textPrimary,
+                      shape: CircleBorder(
+                        side: BorderSide(
+                          color: widget.busy ? Palette.border : Palette.textPrimary,
+                        ),
+                      ),
+                      shadowColor: const Color(0x2E0F172A),
+                      elevation: widget.busy ? 1 : 2,
+                      child: InkWell(
+                        customBorder: const CircleBorder(),
+                        onTap:
                             widget.busy
-                                ? const Icon(
-                                  Icons.stop_rounded,
-                                  color: Colors.white,
-                                  size: 22,
-                                )
-                                : const Icon(
-                                  Icons.arrow_upward_rounded,
-                                  color: Colors.white,
-                                  size: 22,
-                                ),
+                                ? widget.onStop
+                                : widget.onSend,
+                        child: Center(
+                          child:
+                              widget.busy
+                                  ? Icon(
+                                    Icons.stop_rounded,
+                                    color: Palette.textPrimary.withValues(alpha: 0.85),
+                                    size: 14,
+                                  )
+                                  : Icon(
+                                    Icons.arrow_upward_rounded,
+                                    color: Palette.bg0,
+                                    size: 16,
+                                  ),
+                        ),
                       ),
                     ),
                   ),
