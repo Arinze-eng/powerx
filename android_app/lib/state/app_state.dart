@@ -783,41 +783,35 @@ class AppState extends ChangeNotifier {
     } catch (_) {}
   }
 
-  /// Load one conversation. The local cache is returned immediately as
-  /// [ThreadHistory.messages] is merged with the authoritative server copy, so
-  /// reopening the app shows prior answers even when the turn was still
-  /// streaming (the gateway does not replay delta history over the socket).
+  /// Load one conversation from the authoritative server copy.
+  ///
+  /// The server rows are returned UNMERGED. The screen folds its local cache
+  /// into them exactly once (see `ChatScreen._applyServerHistory`); merging the
+  /// cache here as well folded the same rows twice and produced duplicates.
+  /// The cache is only returned when the server cannot be reached.
   Future<ThreadHistory> openSession(SessionSummary s) async {
-    final cached = await chatCache.load(s.chatId);
     if (_apiToken == null) {
       // Not bootstrapped yet: better a cached transcript than a blank screen.
-      return ThreadHistory(messages: cached);
+      return ThreadHistory(messages: await chatCache.load(s.chatId));
     }
     try {
       final server = await api.fetchThread(_apiToken!, s.key,
           supabaseToken: accessToken);
       await _storeSessionCache(sessions);
-      return ThreadHistory(
-        messages: mergeThreadHistory(server: server.messages, cached: cached),
-        activeTurnId: server.activeTurnId,
-        hasPendingToolCalls: server.hasPendingToolCalls,
-      );
+      return server;
     } on ApiException catch (e) {
       if (e.status == 401) {
         await rebootstrap();
         try {
-          final server = await api.fetchThread(_apiToken!, s.key,
+          return await api.fetchThread(_apiToken!, s.key,
               supabaseToken: accessToken);
-          return ThreadHistory(
-            messages: mergeThreadHistory(server: server.messages, cached: cached),
-            activeTurnId: server.activeTurnId,
-            hasPendingToolCalls: server.hasPendingToolCalls,
-          );
         } catch (_) {
+          final cached = await chatCache.load(s.chatId);
           if (cached.isNotEmpty) return ThreadHistory(messages: cached);
           rethrow;
         }
       }
+      final cached = await chatCache.load(s.chatId);
       if (cached.isNotEmpty) return ThreadHistory(messages: cached);
       rethrow;
     }

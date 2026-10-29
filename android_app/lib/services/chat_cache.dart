@@ -267,6 +267,11 @@ List<ChatMessage> mergeThreadHistory({
     for (final m in merged)
       if (m.role == Role.user && m.text.trim().isNotEmpty) m.text.trim(),
   };
+  final serverUserTurns = <String>{
+    for (final m in merged)
+      if (m.role == Role.user && (m.turnId ?? '').trim().isNotEmpty)
+        m.turnId!.trim(),
+  };
   final serverAssistantByTurn = <String, ChatMessage>{};
   final serverAssistantTexts = <String>{};
   for (final m in merged) {
@@ -298,10 +303,16 @@ List<ChatMessage> mergeThreadHistory({
   for (var i = 0; i < cached.length; i++) {
     final c = cached[i];
     if (c.role == Role.user) {
+      // Same turn id = same question. Text is only the fallback for a row
+      // without one, so the same words sent again in a later turn are kept.
       final t = c.text.trim();
-      if (t.isEmpty || serverUserTexts.contains(t)) continue;
+      final cTurn = (c.turnId ?? '').trim();
+      if (cTurn.isNotEmpty && serverUserTurns.contains(cTurn)) continue;
+      if (cTurn.isEmpty && (t.isEmpty || serverUserTexts.contains(t))) continue;
+      if (t.isEmpty && c.media.isEmpty) continue;
       merged.add(c);
-      serverUserTexts.add(t);
+      if (cTurn.isNotEmpty) serverUserTurns.add(cTurn);
+      if (t.isNotEmpty) serverUserTexts.add(t);
       continue;
     }
 
@@ -317,14 +328,18 @@ List<ChatMessage> mergeThreadHistory({
     final cachedText = normalizeAssistantText(c.text);
 
     // 2) The server already holds this exact answer — fold, never append.
+    //    Only into a row that is compatible: an answer from a DIFFERENT turn
+    //    with the same words (a repeated question gets the same reply) must
+    //    not be folded, or the new turn's answer silently disappears.
     if (cachedText.isNotEmpty && serverAssistantTexts.contains(cachedText)) {
       ChatMessage? twin;
       for (final m in merged) {
-        if (m.role == Role.assistant &&
-            normalizeAssistantText(m.text) == cachedText) {
-          twin = m;
-          break;
-        }
+        if (m.role != Role.assistant) continue;
+        if (normalizeAssistantText(m.text) != cachedText) continue;
+        final mTurn = (m.turnId ?? '').trim();
+        if (turnId.isNotEmpty && mTurn.isNotEmpty && mTurn != turnId) continue;
+        twin = m;
+        break;
       }
       if (twin != null) {
         twin.mergeFrom(c);

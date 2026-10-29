@@ -67,6 +67,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   DateTime _lastEventAt = DateTime.now();
   Timer? _resyncTimer;
   bool _resyncInFlight = false;
+  /// A forced reconcile arrived while another pass was running. That pass may
+  /// have read the transcript before the answer was persisted, so one more
+  /// pass runs as soon as it finishes (see [_resync]).
+  bool _resyncQueued = false;
+  /// Turn id of the most recent send. Hydration is satisfied only once the
+  /// server holds an answer for THIS turn; an older answer does not count.
+  String? _pendingTurnId;
   /// Short post-completion reconcile window (see [_armSettleWatch]).
   Timer? _settleWatch;
 
@@ -304,9 +311,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final chatId = _chatId;
     if (chatId == null) return;
     if (_resyncInFlight) {
-      if (!force) return;
-      // A pass is already running; it will fetch the same authoritative
-      // history, so there is nothing left to do.
+      // Never drop a forced pass: the running one may have fetched the
+      // transcript before the answer was written. Queue exactly one rerun.
+      if (force) _resyncQueued = true;
       return;
     }
     _resyncInFlight = true;
@@ -316,7 +323,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _socket = sock;
       _wireSocket(sock);
       _registerView();
-      await sock.attach(chatId);
+      // A stalled attach must not block the transcript fetch: the history
+      // comes over HTTP and does not need the socket.
+      try {
+        await sock.attach(chatId).timeout(const Duration(seconds: 15));
+      } catch (_) {}
       if (!mounted) return;
       setState(() => _connected = sock.isConnected);
 
@@ -333,6 +344,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       // Offline: keep the transcript we have and let the socket retry.
     } finally {
       _resyncInFlight = false;
+      if (_resyncQueued && mounted) {
+        _resyncQueued = false;
+        unawaited(_resync(force: true));
+      }
     }
   }
 
@@ -476,10 +491,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     // The server's own transcript now carries a settled answer and no run this
     // client believes in: hydration has nothing left to recover until the next
     // turn starts.
-    if (!believeActive &&
-        history.messages.any(
-            (m) => m.role == Role.assistant && m.text.trim().isNotEmpty)) {
+    // "Done" means the answer for the turn we are waiting on is on the server.
+    // An older answer in the transcript must not end the wait: that is exactly
+    // how a finished task stayed invisible until the user sent something else.
+    final pendingTurn = _pendingTurnId;
+    final answered = history.messages.any((m) =>
+        m.role == Role.assistant &&
+        m.text.trim().isNotEmpty &&
+        (pendingTurn == null || (m.turnId ?? '') == pendingTurn));
+    if (!believeActive && answered) {
       _hydrateSatisfied = true;
+      _pendingTurnId = null;
       _stopHydration();
     }
     _scheduleCacheWrite();
@@ -1039,8 +1061,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _settleWatch?.cancel();
     // The short window is for a terminal event we actually saw: the answer is
     // usually in the transcript within a few seconds then. The long hydration
-    // retry covers the cases where the write lands much later.
-    _startHydration();
+    // retry covers the cases where the write lands much later. Restart it so
+    // an exhausted or satisfied retry from an earlier turn cannot block this one.
+    _startHydration(restart: true);
     var ticks = 0;
     _settleWatch = Timer.periodic(const Duration(seconds: 6), (t) {
       ticks++;
@@ -1173,8 +1196,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final state = context.read<AppState>();
     final wireMedia = readyMedia.map((a) => a.toWireMedia()).toList();
     // One id names this turn end to end: the question row, the answer bubble
-    // and the gateway run. Stored on the rows, so an echo or replay of this
-    // turn matches them instead of opening another bubble.
+    // and the gateway run. The SAME id goes on the wire below; a second id
+    // here made the persisted answer never match its bubble, so it was shown
+    // twice after a reopen.
     final turnId = newTurnId();
 
     setState(() {
@@ -1191,6 +1215,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   .toList(),
         ),
       );
+      // A fresh answer bubble for THIS question, after its question row. The
+      // previous turn's bubble is retired so late events cannot write into it.
+      _liveTurn = beginLiveTurn(
+        messages: _messages,
+        stale: _liveTurn,
+        turnId: turnId,
+      );
+      _pendingTurnId = turnId;
+      _hydrateSatisfied = false;
       _pending.clear();
       _sending = true;
       _lastEventAt = DateTime.now();
@@ -1198,6 +1231,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _updateWakelock();
     _scrollToBottom(force: true);
     _scheduleCacheWrite();
+    _startHydration(restart: true);
 
     try {
       _socket ??= await state.ensureSocket();
@@ -1225,7 +1259,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _chatId!,
       text,
       media: wireMedia.isEmpty ? null : wireMedia,
-      turnId: newTurnId(),
+      turnId: turnId,
     );
   }
 
