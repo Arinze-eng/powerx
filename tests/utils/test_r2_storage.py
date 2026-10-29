@@ -176,3 +176,24 @@ def test_upload_public_artifact_requires_public_url(monkeypatch) -> None:
     monkeypatch.delenv("R2_PUBLIC_BASE_URL", raising=False)
     with pytest.raises(r2_storage.R2PublicUnavailableError):
         r2_storage.upload_public_artifact(b"x", "a.txt")
+
+
+def test_mirror_failure_never_breaks_inbound_save(tmp_path, monkeypatch) -> None:
+    """A missing boto3 (optional extra) must not reject the user's image."""
+    import base64
+
+    from nanobot.utils import r2_storage
+    from nanobot.utils.media_decode import save_base64_data_url
+
+    def boom(*_a, **_k):
+        raise ModuleNotFoundError("No module named 'boto3'")
+
+    monkeypatch.setattr(r2_storage, "_build_storage", boom)
+    r2_storage.reset_r2_storage_for_tests()
+    try:
+        png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 16).decode()
+        saved = save_base64_data_url(f"data:image/png;base64,{png}", tmp_path)
+        assert saved is not None
+        assert Path(saved).is_file()
+    finally:
+        r2_storage.reset_r2_storage_for_tests()

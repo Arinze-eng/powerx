@@ -110,7 +110,11 @@ def _build_storage() -> R2Storage | None:
 @lru_cache(maxsize=1)
 def get_r2_storage() -> R2Storage | None:
     """Return the shared R2 storage, or ``None`` when it is not configured."""
-    storage = _build_storage()
+    try:
+        storage = _build_storage()
+    except Exception as exc:  # noqa: BLE001 - mirroring must never break ingest
+        logger.warning("R2 storage unavailable; attachments stay local only: {}", exc)
+        return None
     if storage is None:
         logger.debug("R2 storage not configured; attachments stay local only")
     return storage
@@ -178,16 +182,20 @@ def schedule_attachment_upload(
     place for the current turn. Failures are logged, not raised.
     """
     global _upload_pool
-    storage = get_r2_storage()
-    if storage is None:
+    try:
+        storage = get_r2_storage()
+        if storage is None:
+            return None
+        if _upload_pool is None:
+            _upload_pool = ThreadPoolExecutor(
+                max_workers=_UPLOAD_WORKERS, thread_name_prefix="r2-upload"
+            )
+        key = attachment_key(local_name)
+        _upload_pool.submit(_upload_one, storage, key, data, content_type)
+        return key
+    except Exception as exc:  # noqa: BLE001 - the local copy is what the turn needs
+        logger.warning("R2 mirror skipped for {}: {}", local_name, exc)
         return None
-    if _upload_pool is None:
-        _upload_pool = ThreadPoolExecutor(
-            max_workers=_UPLOAD_WORKERS, thread_name_prefix="r2-upload"
-        )
-    key = attachment_key(local_name)
-    _upload_pool.submit(_upload_one, storage, key, data, content_type)
-    return key
 
 
 def reset_r2_storage_for_tests() -> None:
