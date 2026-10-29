@@ -17,6 +17,7 @@ transparently fall back to catbox if onlyfiles rejects them.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from nanobot.utils.lazy_import import lazy_module
 aiohttp = lazy_module("aiohttp")
 
 from nanobot.utils.onlyfiles import OnlyFilesError
+from nanobot.utils.r2_storage import R2PublicUnavailableError, upload_public_artifact
 from nanobot.utils.onlyfiles import upload_bytes as _onlyfiles_upload_bytes
 
 # Routing thresholds (bytes).
@@ -109,7 +111,7 @@ def artifact_delivery_text(shared: dict[str, Any], downloaded: Any) -> str:
     raw = str(shared.get("download_url") or "").strip()
     gateway = str(shared.get("gateway_url") or "").strip()
 
-    if host_label == "catbox":
+    if host_label in ("catbox", "r2"):
         # One permanent, direct file URL: it downloads and it never expires.
         primary = url or raw or page
     else:
@@ -175,6 +177,27 @@ async def _upload_onlyfiles(
     return _normalize_onlyfiles(result)
 
 
+def _normalize_r2(url: str) -> dict[str, Any]:
+    # Public R2 object: one permanent direct URL, same shape as catbox.
+    return {
+        "url": url,
+        "page_url": url,
+        "download_url": url,
+        "gateway_url": "",
+        "host": "r2",
+    }
+
+
+async def _upload_r2(data: bytes, *, filename: str, content_type: str | None) -> dict[str, Any]:
+    try:
+        url = await asyncio.to_thread(upload_public_artifact, data, filename, content_type)
+    except R2PublicUnavailableError as exc:
+        raise FileShareError(str(exc)) from None
+    except Exception as exc:  # noqa: BLE001 - any R2 failure falls through to catbox
+        raise FileShareError(f"R2 upload failed: {type(exc).__name__}") from None
+    return _normalize_r2(url)
+
+
 async def _upload_catbox(
     data: bytes,
     *,
@@ -221,9 +244,11 @@ async def upload_artifact_bytes(
 ) -> dict[str, Any]:
     """Upload one artifact and return ``{url, page_url, host}``.
 
-    Chooses the host by size: <100 MiB → onlyfiles; >100 MiB → catbox; if
-    onlyfiles rejects a mid-size file it falls back to catbox. Raises
-    :class:`FileShareError` if neither host accepts it.
+    Chooses the host by size: <100 MiB → onlyfiles (primary). If onlyfiles
+    rejects or fails, the file goes to Cloudflare R2 (permanent public link).
+    If R2 is also unavailable, it falls back to catbox. Files over 100 MiB go
+    straight to catbox, as before. Raises :class:`FileShareError` if no host
+    accepts it.
     """
     if not data:
         raise FileShareError("cannot upload an empty file")
@@ -237,18 +262,24 @@ async def upload_artifact_bytes(
         remember_artifact(result, filename=name)
         return result
 
-    if size <= _ONLYFILES_MAX_BYTES:
-        try:
-            result = await _upload_onlyfiles(
-                data, filename=name, content_type=content_type, timeout_seconds=timeout_seconds
-            )
-            remember_artifact(result, filename=name)
-            return result
-        except OnlyFilesError:
-            # Fall through to catbox for any onlyfiles rejection.
-            pass
+    try:
+        result = await _upload_onlyfiles(
+            data, filename=name, content_type=content_type, timeout_seconds=timeout_seconds
+        )
+        remember_artifact(result, filename=name)
+        return result
+    except OnlyFilesError:
+        # OnlyFiles rejected or failed: back up to Cloudflare R2.
+        pass
 
-    # Mid-size (>100 MiB or onlyfiles rejected): use catbox.
+    try:
+        result = await _upload_r2(data, filename=name, content_type=content_type)
+        remember_artifact(result, filename=name)
+        return result
+    except FileShareError:
+        # R2 unavailable or failed: last resort is catbox.
+        pass
+
     result = await _upload_catbox(
         data, filename=name, content_type=content_type, timeout_seconds=timeout_seconds
     )

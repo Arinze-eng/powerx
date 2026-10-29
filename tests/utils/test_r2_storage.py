@@ -150,3 +150,29 @@ def test_base64_upload_reaches_r2(monkeypatch, tmp_path) -> None:
     assert len(keys) == 1
     assert keys[0].endswith("/" + local_name)
     assert client.objects[("cdnai", keys[0])]["Body"] == raw
+
+
+def test_public_artifact_key_is_dated_and_unguessable() -> None:
+    a = r2_storage.public_artifact_key("report.pdf", uploaded_on=date(2026, 5, 1))
+    b = r2_storage.public_artifact_key("report.pdf", uploaded_on=date(2026, 5, 1))
+    assert a.startswith("artifacts/2026-05-01/") and a.endswith("_report.pdf")
+    assert a != b
+
+
+def test_upload_public_artifact_returns_public_url(monkeypatch) -> None:
+    client = FakeS3()
+    _configure(monkeypatch, client)
+    monkeypatch.setenv("R2_PUBLIC_BASE_URL", "https://pub-test.r2.dev/")
+
+    url = r2_storage.upload_public_artifact(b"pdf-bytes", "out.pdf", "application/pdf")
+
+    key = url.removeprefix("https://pub-test.r2.dev/")
+    assert key.startswith("artifacts/")
+    assert client.objects[("cdnai", key)]["Body"] == b"pdf-bytes"
+
+
+def test_upload_public_artifact_requires_public_url(monkeypatch) -> None:
+    _configure(monkeypatch, FakeS3())
+    monkeypatch.delenv("R2_PUBLIC_BASE_URL", raising=False)
+    with pytest.raises(r2_storage.R2PublicUnavailableError):
+        r2_storage.upload_public_artifact(b"x", "a.txt")

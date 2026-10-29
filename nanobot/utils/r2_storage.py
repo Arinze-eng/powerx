@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
 from functools import lru_cache
@@ -113,6 +114,44 @@ def get_r2_storage() -> R2Storage | None:
     if storage is None:
         logger.debug("R2 storage not configured; attachments stay local only")
     return storage
+
+
+PUBLIC_ARTIFACT_PREFIX = "artifacts"
+
+
+class R2PublicUnavailableError(RuntimeError):
+    """Raised when R2 or its public base URL is not configured."""
+
+
+def public_base_url() -> str:
+    """Public r2.dev (or custom domain) base URL for the bucket, no trailing slash."""
+    return _env("R2_PUBLIC_BASE_URL").rstrip("/")
+
+
+def public_artifact_key(local_name: str, uploaded_on: date | None = None) -> str:
+    """Key for a file the agent produced: ``artifacts/<YYYY-MM-DD>/<name>``.
+
+    The bucket is public, so the name carries a random uuid to keep the link
+    hard to guess.
+    """
+    day = (uploaded_on or datetime.now(UTC).date()).isoformat()
+    name = _KEY_SAFE_RE.sub("_", local_name).strip("._")[:160] or "artifact.bin"
+    return f"{PUBLIC_ARTIFACT_PREFIX}/{day}/{uuid.uuid4().hex[:12]}_{name}"
+
+
+def upload_public_artifact(data: bytes, filename: str, content_type: str | None = None) -> str:
+    """Write a produced file to R2 and return its permanent public URL.
+
+    Raises :class:`R2PublicUnavailableError` when R2 or ``R2_PUBLIC_BASE_URL``
+    is not set, and lets upload errors propagate to the caller.
+    """
+    storage = get_r2_storage()
+    base = public_base_url()
+    if storage is None or not base:
+        raise R2PublicUnavailableError("R2 public storage is not configured")
+    key = public_artifact_key(filename)
+    storage.put_bytes(key, data, content_type)
+    return f"{base}/{key}"
 
 
 _UPLOAD_WORKERS = 4
