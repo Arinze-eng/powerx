@@ -174,6 +174,23 @@ class GatewayApi {
     return GatewayBootstrap.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
   }
 
+  /// `GET /api/webui/sidebar-state` — pins, archives, renames and view prefs.
+  Future<Map<String, dynamic>> fetchSidebarState(String apiToken,
+      {String? supabaseToken}) async {
+    final res = await _client.get(
+      Uri.parse('$origin/api/webui/sidebar-state'),
+      headers: {
+        'Authorization': 'Bearer $apiToken',
+        if (supabaseToken != null) 'X-Nanobot-Auth': supabaseToken,
+      },
+    );
+    if (res.statusCode != 200) {
+      throw ApiException(res.statusCode, 'Could not load sidebar state');
+    }
+    final body = jsonDecode(res.body);
+    return body is Map<String, dynamic> ? body : <String, dynamic>{};
+  }
+
   Future<List<SessionSummary>> listSessions(String apiToken,
       {String? supabaseToken}) async {
     final res = await _client.get(

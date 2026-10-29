@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models.dart';
 import '../theme/palette.dart';
 import '../theme/tokens.dart';
+import '../utils/session_groups.dart';
 
 /// The five utility actions in `webui/src/components/Sidebar.tsx`, plus the
 /// archive toggle that only appears once something has been archived.
@@ -11,7 +12,7 @@ import '../theme/tokens.dart';
 /// rather than separate screens (`onOpenApps` → `onSettingsIntent`), so the
 /// enum carries the matching `SettingsSection` id instead of a route.
 enum SidebarAction {
-  newChat('New chat', Icons.edit_square),
+  newChat('New topic', Icons.edit_square),
   search('Search', Icons.search_rounded),
   apps('Apps', Icons.widgets_outlined),
   skills('Skills', Icons.psychology_outlined),
@@ -192,25 +193,38 @@ class _SidebarActionButton extends StatelessWidget {
   }
 }
 
-/// One conversation row.
+/// One conversation row, following `ChatList.tsx`.
 ///
-/// Matches the ChatList row: `rounded-control`, 13px medium title, 82% opacity
-/// when idle, `bg-sidebar-selected` when it is the open thread.
+/// Title (override first), an optional relative time, a pin mark when pinned,
+/// a spinner while the agent runs, and a row menu with Pin / Rename / Archive /
+/// Delete, the same five-item set the web offers.
 class SessionTile extends StatelessWidget {
   const SessionTile({
     super.key,
     required this.session,
     required this.onTap,
+    this.title,
     this.active = false,
-    this.onDelete,
     this.running = false,
+    this.pinned = false,
+    this.archived = false,
+    this.onTogglePin,
+    this.onRename,
+    this.onToggleArchive,
+    this.onDelete,
   });
 
   final SessionSummary session;
+  final String? title;
   final bool active;
-  final VoidCallback onTap;
-  final VoidCallback? onDelete;
   final bool running;
+  final bool pinned;
+  final bool archived;
+  final VoidCallback onTap;
+  final VoidCallback? onTogglePin;
+  final VoidCallback? onRename;
+  final VoidCallback? onToggleArchive;
+  final VoidCallback? onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -218,6 +232,16 @@ class SessionTile extends StatelessWidget {
     final titleColor = active
         ? p.sidebarAccentForeground
         : p.sidebarForeground.withValues(alpha: 0.82);
+    final shown = (title != null && title!.trim().isNotEmpty)
+        ? title!.trim()
+        : session.displayTitle;
+    final when = session.updatedAt == null
+        ? null
+        : relativeDayLabel(session.updatedAt!);
+    final hasMenu = onTogglePin != null ||
+        onRename != null ||
+        onToggleArchive != null ||
+        onDelete != null;
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 2),
@@ -239,6 +263,7 @@ class SessionTile extends StatelessWidget {
                     child: CircularProgressIndicator(
                       strokeWidth: 1.6,
                       color: p.highlight,
+                      semanticsLabel: 'Agent running',
                     ),
                   ),
                   const SizedBox(width: 6),
@@ -247,16 +272,41 @@ class SessionTile extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        session.displayTitle,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w500,
-                          height: 1.25,
-                          color: titleColor,
-                        ),
+                      Row(
+                        children: [
+                          if (pinned) ...[
+                            Icon(
+                              Icons.push_pin_outlined,
+                              size: 11,
+                              color: p.mutedForeground,
+                            ),
+                            const SizedBox(width: 4),
+                          ],
+                          Expanded(
+                            child: Text(
+                              shown,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w500,
+                                height: 1.25,
+                                color: titleColor,
+                              ),
+                            ),
+                          ),
+                          if (when != null)
+                            Padding(
+                              padding: const EdgeInsets.only(left: 6),
+                              child: Text(
+                                when,
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: p.mutedForeground.withValues(alpha: 0.8),
+                                ),
+                              ),
+                            ),
+                        ],
                       ),
                       if (session.preview.isNotEmpty) ...[
                         const SizedBox(height: 2),
@@ -273,8 +323,16 @@ class SessionTile extends StatelessWidget {
                     ],
                   ),
                 ),
-                if (onDelete != null)
-                  _RowMenu(onDelete: onDelete!, destructive: p.destructive),
+                if (hasMenu)
+                  _RowMenu(
+                    pinned: pinned,
+                    archived: archived,
+                    onTogglePin: onTogglePin,
+                    onRename: onRename,
+                    onToggleArchive: onToggleArchive,
+                    onDelete: onDelete,
+                    destructive: p.destructive,
+                  ),
               ],
             ),
           ),
@@ -285,10 +343,37 @@ class SessionTile extends StatelessWidget {
 }
 
 class _RowMenu extends StatelessWidget {
-  const _RowMenu({required this.onDelete, required this.destructive});
+  const _RowMenu({
+    required this.pinned,
+    required this.archived,
+    required this.destructive,
+    this.onTogglePin,
+    this.onRename,
+    this.onToggleArchive,
+    this.onDelete,
+  });
 
-  final VoidCallback onDelete;
+  final bool pinned;
+  final bool archived;
   final Color destructive;
+  final VoidCallback? onTogglePin;
+  final VoidCallback? onRename;
+  final VoidCallback? onToggleArchive;
+  final VoidCallback? onDelete;
+
+  PopupMenuItem<String> _item(String value, IconData icon, String label,
+      {Color? color}) {
+    return PopupMenuItem(
+      value: value,
+      child: Row(
+        children: [
+          Icon(icon, size: 17, color: color),
+          const SizedBox(width: 8),
+          Text(label, style: TextStyle(color: color)),
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -298,24 +383,34 @@ class _RowMenu extends StatelessWidget {
         size: 18,
         color: context.palette.mutedForeground.withValues(alpha: 0.7),
       ),
-      tooltip: 'Options',
+      tooltip: 'Topic actions',
       padding: EdgeInsets.zero,
       iconSize: 18,
       splashRadius: 16,
       onSelected: (v) {
-        if (v == 'delete') onDelete();
+        switch (v) {
+          case 'pin':
+            onTogglePin?.call();
+          case 'rename':
+            onRename?.call();
+          case 'archive':
+            onToggleArchive?.call();
+          case 'delete':
+            onDelete?.call();
+        }
       },
       itemBuilder: (_) => [
-        PopupMenuItem(
-          value: 'delete',
-          child: Row(
-            children: [
-              Icon(Icons.delete_outline_rounded, size: 17, color: destructive),
-              const SizedBox(width: 8),
-              const Text('Delete'),
-            ],
-          ),
-        ),
+        if (onTogglePin != null)
+          _item('pin', pinned ? Icons.push_pin : Icons.push_pin_outlined,
+              pinned ? 'Unpin' : 'Pin'),
+        if (onRename != null)
+          _item('rename', Icons.edit_outlined, 'Rename'),
+        if (onToggleArchive != null)
+          _item('archive', Icons.inventory_2_outlined,
+              archived ? 'Unarchive' : 'Archive'),
+        if (onDelete != null)
+          _item('delete', Icons.delete_outline_rounded, 'Delete',
+              color: destructive),
       ],
     );
   }

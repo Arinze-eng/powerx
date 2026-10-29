@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models.dart';
 import '../services/supabase_auth.dart';
 import '../state/app_state.dart';
+import '../state/sidebar_state.dart';
 import '../theme/palette.dart';
 import '../theme/tokens.dart';
 import '../utils/session_groups.dart';
@@ -36,6 +37,11 @@ class SidebarPanel extends StatefulWidget {
     this.archivedCount = 0,
     this.onToggleArchived,
     this.onRequestDelete,
+    this.onTogglePin,
+    this.onRename,
+    this.onToggleArchiveChat,
+    this.sidebar = SidebarState.empty,
+    this.runningChatIds = const {},
     this.newChatActive = false,
     this.credits,
     this.footer,
@@ -60,6 +66,15 @@ class SidebarPanel extends StatefulWidget {
   final VoidCallback onCloseDrawer;
   final VoidCallback? onToggleArchived;
   final ValueChanged<SessionSummary>? onRequestDelete;
+  final ValueChanged<SessionSummary>? onTogglePin;
+  final void Function(SessionSummary session, String title)? onRename;
+  final ValueChanged<SessionSummary>? onToggleArchiveChat;
+
+  /// Pins, archives and renames from the gateway (see [SidebarState]).
+  final SidebarState sidebar;
+
+  /// Chat ids with a turn running right now; each gets a spinner.
+  final Set<String> runningChatIds;
 
   @override
   State<SidebarPanel> createState() => _SidebarPanelState();
@@ -81,19 +96,69 @@ class _SidebarPanelState extends State<SidebarPanel> {
     if (!_searchFocus.hasFocus) _searchFocus.requestFocus();
   }
 
+  String _titleOf(SessionSummary s) =>
+      widget.sidebar.titleOverride(s.key) ?? s.displayTitle;
+
   List<SessionSummary> get _visible {
     final q = _filter.trim().toLowerCase();
     if (q.isEmpty) return widget.sessions;
     return widget.sessions.where((s) {
-      return s.displayTitle.toLowerCase().contains(q) ||
+      return _titleOf(s).toLowerCase().contains(q) ||
           s.preview.toLowerCase().contains(q);
     }).toList();
+  }
+
+  Future<void> _rename(SessionSummary s) async {
+    final controller = TextEditingController(text: _titleOf(s));
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Rename topic'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Choose a local sidebar name for this topic.',
+              style: TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              decoration: const InputDecoration(hintText: 'Topic name'),
+              onSubmitted: (v) => Navigator.of(ctx).pop(v),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(controller.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (result != null) widget.onRename?.call(s, result);
   }
 
   @override
   Widget build(BuildContext context) {
     final p = context.palette;
-    final groups = groupSessions(_visible);
+    final groups = groupSidebarSessions(
+      _visible,
+      pinnedKeys: widget.sidebar.pinnedKeys.toSet(),
+      archivedKeys: widget.sidebar.archivedKeys.toSet(),
+      titleOverrides: widget.sidebar.titleOverrides,
+      sessionOrder: widget.sidebar.sessionOrder,
+      showArchived: widget.sidebar.showArchived,
+      sort: widget.sidebar.sort,
+    );
     final activeAction = widget.newChatActive || widget.activeKey == null
         ? SidebarAction.newChat
         : null;
@@ -152,6 +217,7 @@ class _SidebarPanelState extends State<SidebarPanel> {
                 },
                 archivedCount: widget.archivedCount,
                 onToggleArchived: widget.onToggleArchived,
+                showArchived: widget.sidebar.showArchived,
               ),
             ),
 
@@ -165,7 +231,7 @@ class _SidebarPanelState extends State<SidebarPanel> {
                 style: const TextStyle(fontSize: 13.5),
                 decoration: InputDecoration(
                   isDense: true,
-                  hintText: 'Search chats',
+                  hintText: 'Search',
                   filled: true,
                   fillColor: p.background.withValues(alpha: 0.55),
                   prefixIcon: Icon(
@@ -233,8 +299,21 @@ class _SidebarPanelState extends State<SidebarPanel> {
                                   SessionTile(
                                     key: ValueKey(s.key),
                                     session: s,
+                                    title: widget.sidebar.titleOverride(s.key),
                                     active: s.key == widget.activeKey,
+                                    running: widget.runningChatIds.contains(s.chatId),
+                                    pinned: widget.sidebar.isPinned(s.key),
+                                    archived: widget.sidebar.isArchived(s.key),
                                     onTap: () => widget.onOpenSession(s),
+                                    onTogglePin: widget.onTogglePin == null
+                                        ? null
+                                        : () => widget.onTogglePin!(s),
+                                    onRename: widget.onRename == null
+                                        ? null
+                                        : () => _rename(s),
+                                    onToggleArchive: widget.onToggleArchiveChat == null
+                                        ? null
+                                        : () => widget.onToggleArchiveChat!(s),
                                     onDelete: widget.onRequestDelete == null
                                         ? null
                                         : () => widget.onRequestDelete!(s),

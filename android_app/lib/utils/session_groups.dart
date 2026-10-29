@@ -179,3 +179,115 @@ const List<StarterPrompt> starterPrompts = [
         'writes a summary CSV.',
   ),
 ];
+
+/// Sidebar labels, matching `chat.groups.*` in the web locale.
+const kPinnedLabel = 'Pinned';
+const kTodayLabel = 'Today';
+const kYesterdayLabel = 'Yesterday';
+const kEarlierLabel = 'Earlier';
+const kArchivedLabel = 'Archived';
+
+/// Group the drawer the way `webui/src/lib/chat-groups.ts` does: Pinned first,
+/// then Today / Yesterday / Earlier, then Archived (only when [showArchived]).
+/// Pinned and archived chats never appear in the date buckets.
+///
+/// [sort] follows `SidebarState.sort`: `updated_desc` / `created_desc` sort by
+/// time, `title_asc` by title, `manual` by [sessionOrder] then time.
+List<SessionGroup> groupSidebarSessions(
+  List<SessionSummary> sessions, {
+  required Set<String> pinnedKeys,
+  required Set<String> archivedKeys,
+  Map<String, String> titleOverrides = const {},
+  List<String> sessionOrder = const [],
+  bool showArchived = false,
+  String sort = 'updated_desc',
+  DateTime? now,
+}) {
+  final ref = now ?? DateTime.now();
+  final today = DateTime(ref.year, ref.month, ref.day);
+  final yesterday = today.subtract(const Duration(days: 1));
+
+  final pinned = <SessionSummary>[];
+  final archived = <SessionSummary>[];
+  final unlabelled = <SessionSummary>[];
+  final buckets = <String, List<SessionSummary>>{
+    kTodayLabel: [],
+    kYesterdayLabel: [],
+    kEarlierLabel: [],
+  };
+
+  for (final s in sessions) {
+    if (archivedKeys.contains(s.key)) {
+      if (showArchived) archived.add(s);
+      continue;
+    }
+    if (pinnedKeys.contains(s.key)) {
+      pinned.add(s);
+      continue;
+    }
+    if (sort == 'title_asc' || sort == 'manual') {
+      unlabelled.add(s);
+      continue;
+    }
+    final at = s.updatedAt?.toLocal();
+    if (at == null) {
+      buckets[kEarlierLabel]!.add(s);
+      continue;
+    }
+    final day = DateTime(at.year, at.month, at.day);
+    if (!day.isBefore(today)) {
+      buckets[kTodayLabel]!.add(s);
+    } else if (!day.isBefore(yesterday)) {
+      buckets[kYesterdayLabel]!.add(s);
+    } else {
+      buckets[kEarlierLabel]!.add(s);
+    }
+  }
+
+  List<SessionSummary> order(List<SessionSummary> rows) {
+    final copy = [...rows];
+    final idx = <String, int>{
+      for (var i = 0; i < sessionOrder.length; i++) sessionOrder[i]: i,
+    };
+    int time(SessionSummary s) =>
+        (s.updatedAt ?? DateTime.fromMillisecondsSinceEpoch(0))
+            .millisecondsSinceEpoch;
+    String title(SessionSummary s) =>
+        (titleOverrides[s.key]?.trim().isNotEmpty ?? false)
+            ? titleOverrides[s.key]!.trim().toLowerCase()
+            : s.displayTitle.toLowerCase();
+    copy.sort((a, b) {
+      if (sort == 'manual') {
+        final ai = idx[a.key], bi = idx[b.key];
+        if (ai != null && bi != null) return ai.compareTo(bi);
+        if (ai == null && bi != null) return -1;
+        if (ai != null && bi == null) return 1;
+        return time(b).compareTo(time(a));
+      }
+      if (sort == 'title_asc') {
+        final c = title(a).compareTo(title(b));
+        return c != 0 ? c : time(b).compareTo(time(a));
+      }
+      return time(b).compareTo(time(a));
+    });
+    return copy;
+  }
+
+  final groups = <SessionGroup>[];
+  if (pinned.isNotEmpty) {
+    groups.add(SessionGroup(label: kPinnedLabel, rows: order(pinned)));
+  }
+  if (unlabelled.isNotEmpty) {
+    groups.add(SessionGroup(label: 'Topics', rows: order(unlabelled)));
+  }
+  for (final label in [kTodayLabel, kYesterdayLabel, kEarlierLabel]) {
+    final rows = buckets[label]!;
+    if (rows.isNotEmpty) {
+      groups.add(SessionGroup(label: label, rows: order(rows)));
+    }
+  }
+  if (archived.isNotEmpty) {
+    groups.add(SessionGroup(label: kArchivedLabel, rows: order(archived)));
+  }
+  return groups;
+}

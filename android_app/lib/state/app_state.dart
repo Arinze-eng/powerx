@@ -12,6 +12,7 @@ import '../services/nanobot_socket.dart';
 import '../services/pending_sends.dart';
 import '../services/settings_api.dart';
 import '../services/supabase_auth.dart';
+import 'sidebar_state.dart';
 
 enum AppStatus { loading, unauthenticated, authenticating, authenticated, error }
 
@@ -105,6 +106,83 @@ class AppState extends ChangeNotifier {
 
   List<SessionSummary> sessions = [];
   bool sessionsLoading = false;
+
+  /// Pins, archives, renames and view prefs, shared with the web through the
+  /// gateway (`/api/webui/sidebar-state`, `sidebar.update`).
+  SidebarState sidebar = SidebarState.empty;
+
+  /// Chat ids with a turn currently running, for the sidebar spinner.
+  Set<String> get runningChatIds => _socket?.activeChatIds ?? const <String>{};
+
+  Future<void> _loadSidebarState() async {
+    final token = _apiToken;
+    if (token == null) return;
+    try {
+      sidebar = SidebarState.fromJson(
+          await api.fetchSidebarState(token, supabaseToken: accessToken));
+      notifyListeners();
+    } catch (_) {
+      // Keep the last known state; the drawer still works without it.
+    }
+  }
+
+  void _applyServerSidebar(Map<String, dynamic> raw) {
+    if (raw.isEmpty) return;
+    sidebar = SidebarState.fromJson(raw);
+    notifyListeners();
+  }
+
+  /// Apply [change] locally at once, then save it on the gateway. The server
+  /// reply (canonical state) replaces the local copy when it arrives.
+  Future<void> updateSidebar(SidebarState Function(SidebarState) change) async {
+    final next = change(sidebar);
+    sidebar = next;
+    notifyListeners();
+    try {
+      final sock = await ensureSocket();
+      final saved = await sock.mutate('sidebar.update', {'state': next.toJson()});
+      final state = saved['state'];
+      _applyServerSidebar(state is Map<String, dynamic>
+          ? state
+          : state is Map
+              ? Map<String, dynamic>.from(state)
+              : const {});
+    } catch (_) {
+      // Offline: the change stays on screen and is re-sent on the next save.
+    }
+  }
+
+  Future<void> togglePin(String key) => updateSidebar((s) {
+        final pins = [...s.pinnedKeys];
+        pins.contains(key) ? pins.remove(key) : pins.add(key);
+        return s.copyWith(pinnedKeys: pins);
+      });
+
+  Future<void> toggleArchive(String key) => updateSidebar((s) {
+        final arch = [...s.archivedKeys];
+        final pins = [...s.pinnedKeys];
+        if (arch.contains(key)) {
+          arch.remove(key);
+        } else {
+          arch.add(key);
+          pins.remove(key);
+        }
+        return s.copyWith(archivedKeys: arch, pinnedKeys: pins);
+      });
+
+  Future<void> renameSession(String key, String title) => updateSidebar((s) {
+        final next = {...s.titleOverrides};
+        final t = title.trim();
+        if (t.isEmpty) {
+          next.remove(key);
+        } else {
+          next[key] = t;
+        }
+        return s.copyWith(titleOverrides: next);
+      });
+
+  Future<void> setShowArchived(bool show) =>
+      updateSidebar((s) => s.copyWith(showArchived: show));
 
   String? lastChatId;
 
@@ -670,6 +748,7 @@ class AppState extends ChangeNotifier {
       sessionsLoading = false;
       notifyListeners();
     }
+    unawaited(_loadSidebarState());
   }
 
   Future<void> _storeSessionCache(List<SessionSummary> rows) async {
@@ -817,6 +896,8 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     };
     sock.onSessionsChanged = () => unawaited(loadSessions());
+    sock.onActivityChanged = () => notifyListeners();
+    sock.onSidebarState = _applyServerSidebar;
     sock.onModelUpdated = (m) {
       modelName = m;
       notifyListeners();

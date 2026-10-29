@@ -186,6 +186,16 @@ class _HomeScreenState extends State<HomeScreen> {
         onOpenSession: _openSession,
         onCloseDrawer: () => _scaffold.currentState?.closeDrawer(),
         onRequestDelete: _delete,
+        sidebar: state.sidebar,
+        runningChatIds: state.runningChatIds,
+        archivedCount: state.sidebar.archivedKeys
+            .where((k) => state.sessions.any((s) => s.key == k))
+            .length,
+        onToggleArchived: () =>
+            state.setShowArchived(!state.sidebar.showArchived),
+        onTogglePin: (s) => state.togglePin(s.key),
+        onRename: (s, title) => state.renameSession(s.key, title),
+        onToggleArchiveChat: (s) => state.toggleArchive(s.key),
         onOpenSection: (action) {
           _scaffold.currentState?.closeDrawer();
           switch (action) {

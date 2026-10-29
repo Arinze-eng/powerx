@@ -159,4 +159,63 @@ void main() {
       expect(prompts.length, starterPrompts.length);
     });
   });
+group('sidebar grouping (web chat-groups.ts)', () {
+  final now = DateTime(2026, 10, 29, 12);
+  final today = session(key: 'websocket:a', title: 'A', updatedAt: now);
+  final yday = session(
+    key: 'websocket:b',
+    title: 'B',
+    updatedAt: now.subtract(const Duration(days: 1)),
+  );
+  final old = session(
+    key: 'websocket:c',
+    title: 'C',
+    updatedAt: now.subtract(const Duration(days: 9)),
+  );
+  final pinned = session(
+    key: 'websocket:d',
+    title: 'D',
+    updatedAt: now.subtract(const Duration(days: 20)),
+  );
+  final archived = session(key: 'websocket:e', title: 'E', updatedAt: now);
+
+  test('pinned first, then Today / Yesterday / Earlier, archived hidden', () {
+    final groups = groupSidebarSessions(
+      [today, yday, old, pinned, archived],
+      pinnedKeys: {'websocket:d'},
+      archivedKeys: {'websocket:e'},
+      now: now,
+    );
+    expect(groups.map((g) => g.label).toList(),
+        ['Pinned', 'Today', 'Yesterday', 'Earlier']);
+    expect(groups.first.rows.single.key, 'websocket:d');
+  });
+
+  test('archived group appears only when showArchived is on', () {
+    final groups = groupSidebarSessions(
+      [today, archived],
+      pinnedKeys: const {},
+      archivedKeys: {'websocket:e'},
+      showArchived: true,
+      now: now,
+    );
+    expect(groups.last.label, 'Archived');
+    expect(groups.last.rows.single.key, 'websocket:e');
+  });
+
+  test('title sort orders rows by the renamed title', () {
+    final a = session(key: 'websocket:x', title: 'Zeta', updatedAt: now);
+    final b = session(key: 'websocket:y', title: 'Alpha', updatedAt: now);
+    final groups = groupSidebarSessions(
+      [a, b],
+      pinnedKeys: const {},
+      archivedKeys: const {},
+      titleOverrides: {'websocket:x': 'Aardvark'},
+      sort: 'title_asc',
+      now: now,
+    );
+    expect(groups.single.rows.map((s) => s.key).toList(),
+        ['websocket:x', 'websocket:y']);
+  });
+});
 }

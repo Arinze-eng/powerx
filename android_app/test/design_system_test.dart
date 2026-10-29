@@ -406,7 +406,7 @@ void main() {
         ),
       );
       for (final label in [
-        'New chat',
+        'New topic',
         'Search',
         'Apps',
         'Skills',
