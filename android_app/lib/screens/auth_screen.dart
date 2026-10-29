@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../config.dart';
 import '../theme/palette.dart';
 import '../state/app_state.dart';
 import '../widgets/brand.dart';
+import 'recovery_code_screen.dart' show kRecoveryAdminContact;
 
 class AuthScreen extends StatefulWidget {
   const AuthScreen({super.key});
@@ -264,6 +266,21 @@ class _AuthScreenState extends State<AuthScreen> {
                               fontWeight: FontWeight.w600,
                               color: Palette.accentSoft,
                             ),
+                          ),
+                        ),
+                      ),
+                    if (_forgot)
+                      TextButton(
+                        onPressed: () => launchUrl(
+                          Uri(scheme: 'mailto', path: kRecoveryAdminContact),
+                          mode: LaunchMode.externalApplication,
+                        ),
+                        child: Text(
+                          'Lost your recovery code? Contact admin at $kRecoveryAdminContact',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Palette.textTertiary,
                           ),
                         ),
                       ),
