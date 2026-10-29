@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 
 from nanobot.utils.helpers import safe_filename
+from nanobot.utils.r2_storage import schedule_attachment_upload
 
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 MAX_FILE_SIZE = DEFAULT_MAX_BYTES
@@ -90,4 +91,5 @@ def save_base64_data_url(
     saved_name = f"{uuid.uuid4().hex[:12]}_{stem}{ext}" if stem else f"{uuid.uuid4().hex[:12]}{ext}"
     dest = media_dir / safe_filename(saved_name)
     dest.write_bytes(raw)
+    schedule_attachment_upload(raw, dest.name, mime_type)
     return str(dest)

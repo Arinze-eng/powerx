@@ -37,6 +37,7 @@ from nanobot.utils.media_decode import (
 from nanobot.utils.media_decode import (
     save_base64_data_url as _save_base64_data_url,
 )
+from nanobot.utils.r2_storage import schedule_attachment_upload
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 if TYPE_CHECKING:
@@ -281,6 +282,7 @@ async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | 
             filename = f"{uuid.uuid4().hex[:12]}_{base}"
             dest = media_dir / filename
             dest.write_bytes(raw)
+            schedule_attachment_upload(raw, dest.name, part.headers.get("Content-Type"))
             media_paths.append(str(dest))
 
     if not text:
