@@ -161,6 +161,13 @@ class Recorder {
       );
 }
 
+/// Frames cross a real loopback WebSocket, so a single event-queue pump can
+/// return before the frame is handled on a slow runner. Give them a moment.
+Future<void> settleFrames() async {
+  await Future<void>.delayed(const Duration(milliseconds: 100));
+  await pumpEventQueue();
+}
+
 void main() {
   late FakeGateway gw;
   late NanobotSocket sock;
@@ -842,22 +849,22 @@ void main() {
       sock.listen(chatId, rec.view());
 
       sock.sendMessage(chatId, 'do the thing');
-      await pumpEventQueue();
+      await settleFrames();
       gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
       gw.send({'event': 'delta', 'chat_id': chatId, 'text': 'done'});
       gw.send({'event': 'turn_end', 'chat_id': chatId, 'turn_id': 't-1'});
-      await pumpEventQueue();
+      await settleFrames();
       expect(sock.isTurnActive(chatId), isFalse);
 
       // The stale replay is uncorroborated by anything recent -> it expires.
       gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
-      await pumpEventQueue();
+      await settleFrames();
       expect(sock.isTurnActive(chatId), isTrue,
           reason: 'the claim is believed while it is still fresh');
       expect(sock.hasUnconfirmedRun(chatId), isTrue);
 
       await Future<void>.delayed(const Duration(milliseconds: 1500));
-      await pumpEventQueue();
+      await settleFrames();
       expect(sock.isTurnActive(chatId), isFalse,
           reason: 'a finished run replayed as running must not hang the app');
       expect(rec.turnEnds.length, greaterThanOrEqualTo(2));
@@ -917,14 +924,14 @@ void main() {
         'chat_id': chatId,
         'scope': 'metadata',
       });
-      await pumpEventQueue();
+      await settleFrames();
       expect(sessionRefreshes, 1);
       expect(threadRefreshes, 0);
 
       // A real transcript write must.
       gw.send(
           {'event': 'session_updated', 'chat_id': chatId, 'scope': 'thread'});
-      await pumpEventQueue();
+      await settleFrames();
       expect(threadRefreshes, 1);
     });
   });
