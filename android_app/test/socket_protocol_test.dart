@@ -729,7 +729,7 @@ void main() {
     // to be written first.
     await sock.connect();
     sock.sendMessage('chat-A', 'run the task');
-    await pumpEventQueue();
+    await settleFrames();
 
     final iAttach = gw.inbound.indexWhere(
         (f) => f['type'] == 'attach' && f['chat_id'] == 'chat-A');
