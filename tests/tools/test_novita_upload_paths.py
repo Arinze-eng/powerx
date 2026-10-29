@@ -358,3 +358,75 @@ def test_pull_is_in_the_action_enum_and_routes_before_backend_selection() -> Non
     assert "host_path" in schema["function"]["parameters"]["properties"]
     source_text = Path(SOURCE_PATH).read_text()
     assert source_text.count('if action == "pull":') == 1
+
+
+# --- action=upload on VPS: OnlyFiles first, Cloudflare R2 as the backup -------
+#
+# The LLM-side upload used to call OnlyFiles directly, so a OnlyFiles outage
+# failed the whole upload. It now goes through upload_artifact_path, which falls
+# back to R2 and catbox. These tests pin that the success message names the host
+# that actually published the file.
+
+
+class _FakeVPSBackend:
+    uploads: list[tuple[str, str, bytes]] = []
+
+    def __init__(self, _config: object) -> None:
+        pass
+
+    async def upload(self, local: str, remote: str, data: bytes) -> None:
+        self.uploads.append((local, remote, data))
+
+
+def _run_vps_upload(
+    monkeypatch: pytest.MonkeyPatch, media_file: Path, shared: dict[str, object] | BaseException
+) -> object:
+    from types import SimpleNamespace
+
+    async def _fake_share(_source: Path) -> dict[str, object]:
+        if isinstance(shared, BaseException):
+            raise shared
+        return shared
+
+    _FakeVPSBackend.uploads = []
+    monkeypatch.setattr(_ns, "VPSExecutionBackend", _FakeVPSBackend)
+    monkeypatch.setattr(_ns, "upload_shared_artifact", _fake_share)
+    tool = NovitaSandboxTool()
+    return asyncio.run(
+        tool._execute_vps(
+            "upload",
+            {"source": str(media_file), "path": "/workspace/uploads/photo.jpg"},
+            SimpleNamespace(workspace_dir="/workspace"),
+        )
+    )
+
+
+def test_vps_upload_reports_r2_when_onlyfiles_failed(
+    monkeypatch: pytest.MonkeyPatch, media_file: Path
+) -> None:
+    r2_url = "https://pub-example.r2.dev/artifacts/2025-01-01/abc_photo.jpg"
+    result = _run_vps_upload(
+        monkeypatch,
+        media_file,
+        {"url": r2_url, "page_url": r2_url, "download_url": r2_url, "gateway_url": "", "host": "r2"},
+    )
+    text = str(getattr(result, "content", result))
+    assert "via Cloudflare R2" in text
+    assert "onlyfiles.com" not in text
+    assert r2_url in text
+    assert len(_FakeVPSBackend.uploads) == 1
+
+
+def test_vps_upload_reports_onlyfiles_when_it_succeeds(
+    monkeypatch: pytest.MonkeyPatch, media_file: Path
+) -> None:
+    page = "https://onlyfiles.com/abc123/photo.jpg"
+    result = _run_vps_upload(
+        monkeypatch,
+        media_file,
+        {"url": page, "page_url": page, "gateway_url": "https://host/f/abc123", "host": "onlyfiles"},
+    )
+    text = str(getattr(result, "content", result))
+    assert "via onlyfiles.com" in text
+    assert page in text
+    assert "/f/abc123" not in text

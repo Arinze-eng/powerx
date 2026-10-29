@@ -967,6 +967,14 @@ def _annotate_foreign_workspace_root(
 #: ``_stage_upload``); with nothing in the sandbox it concluded the media
 #: directory was off limits. The attachment was never unreachable — both
 #: Cloudinary entry points read a local path straight off this host.
+#: Human-readable name of the host that published a shared link. OnlyFiles is
+#: primary; R2 and catbox only take over when it fails.
+_UPLOAD_HOST_LABELS = {
+    "onlyfiles": "onlyfiles.com",
+    "r2": "Cloudflare R2",
+    "catbox": "catbox.moe",
+}
+
 _UPLOAD_NOTE = (
     " The local file remains readable on this host, so generate_image "
     "(reference_images) and cloudinary_video_edit (source) can take its path "
@@ -1360,7 +1368,8 @@ class NovitaSandboxTool(Tool):
             "When the user message contains an [Attachment: local path], use the upload "
             "action first with that exact source path and a safe destination under /workspace "
             "before running or reading the uploaded file remotely. In VPS mode, upload "
-            "the local file through onlyfiles.com, then fetch it into the VPS workspace with "
+            "the local file through onlyfiles.com (Cloudflare R2 is the backup if onlyfiles "
+            "fails), then fetch it into the VPS workspace with "
             "curl before using the staged path. If a required Linux command is missing "
             "(nmap, ffmpeg, a compiler, ...), use action=install and put the distro "
             "package names in the packages argument — space- or comma-separated, bare "
@@ -1371,9 +1380,12 @@ class NovitaSandboxTool(Tool):
             "password in a command. When a finished file should be returned to the user, "
             "ALWAYS call download_url with its remote workspace path; this downloads the "
             "artifact and publishes a public link automatically — files under ~100 MB go to "
-            "onlyfiles.com, larger files (up to ~200 MB) go to catbox.moe. The published "
-            "link is permanent and third-party (an onlyfiles.com page URL), so give the user "
-            "exactly that link and never substitute another one: not a gateway /f/ link on "
+            "onlyfiles.com; if onlyfiles fails they go to Cloudflare R2 (a permanent direct "
+            "file link), and only if R2 also fails do they go to catbox.moe. Files larger than "
+            "~100 MB go to catbox.moe (up to ~200 MB). The published "
+            "link is permanent and third-party (an onlyfiles.com page URL, or the R2/catbox "
+            "link when a backup was used), so give the user "
+            "exactly the link the tool returns and never substitute another one: not a gateway /f/ link on "
             "this deployment's own host, not a signed or preview URL, not a raw transfer "
             "token. Use the local path in the message tool's media parameter when direct "
             "attachment delivery is available. "
@@ -2988,13 +3000,16 @@ class NovitaSandboxTool(Tool):
                     return prepared
                 source, path = prepared
                 try:
-                    shared = await upload_onlyfile_path(source)
+                    # OnlyFiles first; Cloudflare R2, then catbox, if it fails.
+                    shared = await upload_shared_artifact(source)
                     await backend.upload(str(source), path, await asyncio.to_thread(source.read_bytes))
                 except Exception as exc:  # noqa: BLE001 - report it, never crash the turn
                     return ToolResult.error(_upload_failure(source, path, "the remote VPS workspace", exc))
-                link = str(shared.get("gateway_url") or shared.get("url") or "").strip()
+                host = str(shared.get("host") or "onlyfiles")
+                host_label = _UPLOAD_HOST_LABELS.get(host, host)
+                link = str(shared.get("page_url") or shared.get("url") or "").strip()
                 return (
-                    f"Uploaded {source.name} via onlyfiles.com to {path} in the remote VPS workspace."
+                    f"Uploaded {source.name} via {host_label} to {path} in the remote VPS workspace."
                     + (f" Public link: {link}." if link else "")
                     + _UPLOAD_NOTE
                 )
