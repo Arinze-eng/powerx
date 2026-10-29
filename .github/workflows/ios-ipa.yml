@@ -1,0 +1,110 @@
+name: Build PowerX iOS IPA
+
+# Builds an UNSIGNED iOS .ipa from the same Flutter project as the Android app
+# (android_app/). The IPA must be signed before it can be installed on a phone.
+# Runs on pushes to main that touch the app, or manually from the Actions tab.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android_app/**'
+      - '.github/workflows/ios-ipa.yml'
+  workflow_dispatch:
+    inputs:
+      powerx_url:
+        description: 'PowerX backend base URL (leave blank for the default)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build IPA
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.29.3'
+          cache: true
+
+      - name: Install dependencies
+        working-directory: android_app
+        run: flutter pub get
+
+      - name: Analyze Dart code
+        working-directory: android_app
+        run: flutter analyze
+
+      - name: Run tests
+        working-directory: android_app
+        run: flutter test
+
+      - name: Generate iOS project
+        # The repo has no ios/ folder yet. Generate one in a scratch directory
+        # so existing lib/ files are never touched, then copy only ios/ across.
+        working-directory: android_app
+        run: |
+          flutter create --platforms=ios --project-name powerx_android \
+            --org com.powerx --no-pub /tmp/ios_scaffold
+          if [ ! -d ios ]; then
+            cp -R /tmp/ios_scaffold/ios ./ios
+          fi
+
+      - name: Set app name and permission text
+        working-directory: android_app/ios/Runner
+        run: |
+          PB=/usr/libexec/PlistBuddy
+          set_key() {
+            $PB -c "Delete :$1" Info.plist >/dev/null 2>&1 || true
+            $PB -c "Add :$1 $2 '$3'" Info.plist
+          }
+          set_key CFBundleDisplayName string CDNAI
+          set_key NSMicrophoneUsageDescription string "PowerX uses the microphone to record voice notes for your messages."
+          set_key NSPhotoLibraryUsageDescription string "PowerX lets you attach photos from your library to a message."
+          set_key ITSAppUsesNonExemptEncryption bool false
+          plutil -lint Info.plist
+
+      - name: Build unsigned iOS app
+        working-directory: android_app
+        env:
+          POWERX_URL: ${{ github.event.inputs.powerx_url }}
+        run: |
+          if [ -n "$POWERX_URL" ]; then
+            flutter build ios --release --no-codesign --dart-define=POWERX_URL="$POWERX_URL"
+          else
+            flutter build ios --release --no-codesign
+          fi
+
+      - name: Package IPA
+        working-directory: android_app/build/ios/iphoneos
+        run: |
+          rm -rf Payload PowerX-unsigned.ipa
+          mkdir Payload
+          cp -R Runner.app Payload/
+          # Strip any leftover signing state so the signer starts clean.
+          rm -rf Payload/Runner.app/_CodeSignature
+          zip -qr PowerX-unsigned.ipa Payload
+          rm -rf Payload
+          ls -lh PowerX-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: powerx-ios-unsigned-ipa
+          path: android_app/build/ios/iphoneos/PowerX-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
