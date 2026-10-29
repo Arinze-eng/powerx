@@ -624,6 +624,41 @@ class PaymentPackage {
 /// One parsed `tool_events[]` / persisted trace entry.
 ///
 /// Shared by the live WebSocket parser and the persisted-history parser.
+/// Orders rows by `turnSeq` inside each run of rows that share a turn id.
+///
+/// Rows without a turn id are never reordered. A run is only sorted when every
+/// row in it carries a numeric `turnSeq`, otherwise its array order is kept.
+List<Map<String, dynamic>> _orderWithinTurns(List<Map<String, dynamic>> rows) {
+  final out = <Map<String, dynamic>>[];
+  var start = 0;
+  while (start < rows.length) {
+    final turnId = rows[start]['turnId'];
+    var end = start + 1;
+    if (turnId is String && turnId.isNotEmpty) {
+      while (end < rows.length && rows[end]['turnId'] == turnId) {
+        end++;
+      }
+    }
+    final run = rows.sublist(start, end);
+    if (run.length > 1 && run.every((r) => r['turnSeq'] is num)) {
+      final indexed = <MapEntry<int, Map<String, dynamic>>>[
+        for (var i = 0; i < run.length; i++) MapEntry(i, run[i]),
+      ];
+      indexed.sort((a, b) {
+        final bySeq = (a.value['turnSeq'] as num)
+            .toInt()
+            .compareTo((b.value['turnSeq'] as num).toInt());
+        return bySeq != 0 ? bySeq : a.key - b.key;
+      });
+      out.addAll(indexed.map((e) => e.value));
+    } else {
+      out.addAll(run);
+    }
+    start = end;
+  }
+  return out;
+}
+
 class ThreadHistory {
   final List<ChatMessage> messages;
   final String? activeTurnId;
@@ -660,24 +695,17 @@ class ThreadHistory {
     // arrive mostly sorted already, but a reasoning row can be stamped after an
     // activity row it actually precedes. Sorting is only safe when EVERY row
     // carries a finite `turnSeq`; otherwise the array order is all we have.
-    final rows = raw
-        .whereType<Map>()
-        .map((e) => Map<String, dynamic>.from(e))
-        .toList();
-    if (rows.isNotEmpty && rows.every((r) => r['turnSeq'] is num)) {
-      final indexed = <MapEntry<int, Map<String, dynamic>>>[
-        for (var i = 0; i < rows.length; i++) MapEntry(i, rows[i]),
-      ];
-      indexed.sort((a, b) {
-        final bySeq = (a.value['turnSeq'] as num)
-            .toInt()
-            .compareTo((b.value['turnSeq'] as num).toInt());
-        return bySeq != 0 ? bySeq : a.key - b.key;
-      });
-      rows
-        ..clear()
-        ..addAll(indexed.map((e) => e.value));
-    }
+    //
+    // turnSeq is counted PER TURN (it restarts at 1 for every turn), so it is
+    // only ever compared inside one turn. A transcript-wide sort put every
+    // question at the top and every answer at the bottom. Turns keep their
+    // transcript order, exactly like the WebUI's per-turn orderMessagesByTurnSeq.
+    final rows = _orderWithinTurns(
+      raw
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList(),
+    );
 
     void flush() {
       if (curAssistant != null && !curAssistant!.isEmpty) {

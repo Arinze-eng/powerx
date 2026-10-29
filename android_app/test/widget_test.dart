@@ -183,6 +183,34 @@ void main() {
       expect(assistant.latencyMs, 163285);
     });
 
+    test('keeps each question above its own answer across turns', () {
+      // turnSeq is counted per turn (it restarts at 1 for every turn). A global
+      // sort by it put every question at the top and every answer at the
+      // bottom ("my request is lumped with the previous request").
+      final history = ThreadHistory.parse({
+        'messages': [
+          {'role': 'user', 'content': 'what is power', 'turnId': 't1', 'turnPhase': 'user', 'turnSeq': 1},
+          {'role': 'assistant', 'content': 'power is rate of work', 'turnId': 't1', 'turnPhase': 'answer', 'turnSeq': 2},
+          {'role': 'user', 'content': 'hello', 'turnId': 't2', 'turnPhase': 'user', 'turnSeq': 1},
+          {'role': 'assistant', 'content': 'Hello Arinze', 'turnId': 't2', 'turnPhase': 'answer', 'turnSeq': 2},
+          {'role': 'user', 'content': 'find the engine picture', 'turnId': 't3', 'turnPhase': 'user', 'turnSeq': 1},
+          {'role': 'tool', 'kind': 'trace', 'content': 'web_search({"q": "engine"})', 'turnId': 't3', 'turnPhase': 'activity', 'turnSeq': 2},
+          {'role': 'assistant', 'content': 'Here is the pdf', 'turnId': 't3', 'turnPhase': 'answer', 'turnSeq': 3},
+        ],
+      });
+      final order = [
+        for (final m in history.messages) '${m.role.name}:${m.text.isEmpty ? m.turnId : m.text}',
+      ];
+      expect(order, [
+        'user:what is power',
+        'assistant:power is rate of work',
+        'user:hello',
+        'assistant:Hello Arinze',
+        'user:find the engine picture',
+        'assistant:Here is the pdf',
+      ]);
+    });
+
     test('orders a turn by turnSeq when every row carries one', () {
       final history = ThreadHistory.parse({
         'messages': [
