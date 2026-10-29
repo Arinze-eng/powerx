@@ -356,6 +356,26 @@ List<ChatMessage> mergeThreadHistory({
   return merged;
 }
 
+/// The trailing assistant bubble a resumed turn may continue, or null.
+///
+/// Only the tail can be continued, and only when it belongs to [serverTurnId]
+/// or was captured without a turn id (an answer killed mid-stream). An UNKNOWN
+/// turn id ([serverTurnId] empty) never adopts a row: a `goal_status: running`
+/// replay without a turn id used to re-open the finished answer above it, and
+/// a fresh empty streaming bubble was appended after it. The real answer then
+/// landed a second time, which is the reported "mid-task and duplicated" bug.
+ChatMessage? resumableTailFor({
+  required List<ChatMessage> messages,
+  required String serverTurnId,
+}) {
+  final tid = serverTurnId.trim();
+  if (tid.isEmpty || messages.isEmpty) return null;
+  final last = messages.last;
+  if (last.role != Role.assistant) return null;
+  final rowTurn = (last.turnId ?? '').trim();
+  return (rowTurn.isEmpty || rowTurn == tid) ? last : null;
+}
+
 /// Re-link [live] — the bubble currently receiving streamed deltas — back into
 /// a freshly merged transcript, and return the list the UI should render.
 ///

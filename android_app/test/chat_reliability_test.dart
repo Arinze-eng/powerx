@@ -283,4 +283,75 @@ void main() {
       expect(merged, [server]);
     });
   });
+
+  group('resumableTailFor (no re-opened finished answers)', () {
+    ChatMessage finishedAnswer({String? turnId}) => ChatMessage(
+          id: 'a-1',
+          role: Role.assistant,
+          segments: ['The guide is ready.'],
+          turnId: turnId,
+        );
+
+    test('an unknown turn id never adopts the finished answer above', () {
+      // The reported bug: a goal_status running replay without a turn id
+      // re-opened the finished answer and the answer landed a second time.
+      final messages = [
+        ChatMessage(id: 'u-1', role: Role.user, text: 'build the guide'),
+        finishedAnswer(turnId: 't1'),
+      ];
+      expect(resumableTailFor(messages: messages, serverTurnId: ''), isNull);
+      expect(resumableTailFor(messages: messages, serverTurnId: '  '), isNull);
+    });
+
+    test('an unknown turn id does not adopt a bubble without a turn id', () {
+      final messages = [finishedAnswer()];
+      expect(resumableTailFor(messages: messages, serverTurnId: ''), isNull);
+    });
+
+    test('the same turn continues its own tail bubble', () {
+      final tail = finishedAnswer(turnId: 't2');
+      final messages = [
+        ChatMessage(id: 'u-2', role: Role.user, text: 'next'),
+        tail,
+      ];
+      expect(
+        identical(
+          resumableTailFor(messages: messages, serverTurnId: 't2'),
+          tail,
+        ),
+        isTrue,
+      );
+    });
+
+    test('a killed mid-stream answer without a turn id is still continued', () {
+      final tail = finishedAnswer();
+      final messages = [tail];
+      expect(
+        identical(
+          resumableTailFor(messages: messages, serverTurnId: 't3'),
+          tail,
+        ),
+        isTrue,
+      );
+    });
+
+    test('a different turn never adopts an earlier answer', () {
+      final messages = [finishedAnswer(turnId: 't1')];
+      expect(resumableTailFor(messages: messages, serverTurnId: 't9'), isNull);
+    });
+
+    test('a user message at the tail is never adopted', () {
+      final messages = [
+        ChatMessage(id: 'u-3', role: Role.user, text: 'hi', turnId: 't4'),
+      ];
+      expect(resumableTailFor(messages: messages, serverTurnId: 't4'), isNull);
+    });
+
+    test('an empty transcript adopts nothing', () {
+      expect(
+        resumableTailFor(messages: const [], serverTurnId: 't1'),
+        isNull,
+      );
+    });
+  });
 }

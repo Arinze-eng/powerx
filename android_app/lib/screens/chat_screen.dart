@@ -499,6 +499,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   /// Also guarantees the socket is subscribed to this chat: a resume must not
   /// depend on the UI having got as far as `_registerView`.
   void _resumeLiveTurn(String serverTurnId) {
+    // Without a turn id there is nothing to attach to. Opening a bubble for it
+    // appended an empty streaming row after an already finished answer.
+    if (serverTurnId.trim().isEmpty) return;
     final chatId = _chatId;
     final existing = _liveTurn;
     if (existing != null) {
@@ -506,13 +509,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     } else {
       // Reuse the trailing assistant bubble when it is the paused/streamed
       // turn rather than the server's persisted copy of it.
-      ChatMessage? target;
-      final last = _messages.isNotEmpty ? _messages.last : null;
-      if (last != null &&
-          last.role == Role.assistant &&
-          ((last.turnId ?? '').isEmpty || last.turnId == serverTurnId)) {
-        target = last;
-      }
+      ChatMessage? target = resumableTailFor(
+        messages: _messages,
+        serverTurnId: serverTurnId,
+      );
       if (target == null) {
         target = ChatMessage(
           id: 'live-${DateTime.now().microsecondsSinceEpoch}',
