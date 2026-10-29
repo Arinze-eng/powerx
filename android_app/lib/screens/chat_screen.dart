@@ -17,6 +17,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../models.dart';
 import '../utils/turn_fence.dart';
+import '../utils/turn_id.dart';
 import '../services/chat_cache.dart';
 import '../services/gateway_api.dart';
 import '../services/nanobot_socket.dart';
@@ -1212,12 +1213,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     _ensureLiveTurn();
     // Mark the turn before the frame hits the wire so an early terminal event
-    // is still attributed to this turn.
+    // is still attributed to this turn. The client names the turn (WebUI
+    // parity) so the gateway can tag its run and replays with the same id.
     _socket!.markUserTurn(_chatId!);
     _socket!.sendMessage(
       _chatId!,
       text,
       media: wireMedia.isEmpty ? null : wireMedia,
+      turnId: newTurnId(),
     );
   }
 

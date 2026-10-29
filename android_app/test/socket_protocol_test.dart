@@ -115,11 +115,16 @@ class FakeGateway {
   /// nothing else ever follows it.
   bool staleRunningReplay = false;
 
+  /// When set, the replayed running claim names its turn (the gateway does
+  /// this for a run started by a client that sent a `turn_id`).
+  String? replayTurnId;
+
   void sendStaleRunning(String chatId) => send({
         'event': 'goal_status',
         'chat_id': chatId,
         'status': 'running',
         'started_at': 1000.0,
+        if (replayTurnId != null) 'turn_id': replayTurnId,
       });
 
   void send(Map<String, dynamic> ev) => _conn?.sink.add(jsonEncode(ev));
@@ -860,6 +865,41 @@ void main() {
           reason: 'an unbacked claim must not leave the app busy forever');
       expect(rec.turnEnds, isNotEmpty,
           reason: 'the UI has to be told the ghost turn is over');
+    });
+
+    test('a turn-id-bearing running replay survives a reopen, no ghost release',
+        () async {
+      // The client names every turn it submits (WebUI parity), so the gateway
+      // tags its run wall-clock with that id. A reopened app can then prove the
+      // run is its own, and the busy state and live progress are kept.
+      gw.staleRunningReplay = true;
+      await sock.connect();
+      final chatId = await sock.newChat();
+      sock.close();
+      gw.replayTurnId = 'turn-abc';
+
+      final rec = Recorder();
+      final app = await reopen(chatId, rec);
+      expect(app.isTurnActive(chatId), isTrue);
+      expect(app.hasUnconfirmedRun(chatId), isFalse,
+          reason: 'a claim that names its turn is corroborated at once');
+
+      await Future<void>.delayed(const Duration(milliseconds: 1500));
+      await pumpEventQueue();
+      expect(app.isTurnActive(chatId), isTrue,
+          reason: 'a reopened task must still be running in the app');
+      expect(rec.turnEnds, isEmpty);
+    });
+
+    test('sendMessage puts the client turn id on the wire', () async {
+      await sock.connect();
+      final chatId = await sock.newChat();
+      sock.listen(chatId, Recorder().view());
+      sock.sendMessage(chatId, 'build it', turnId: 'turn-xyz');
+      final frame = await awaitInbound(
+          gw, (m) => m['type'] == 'message' && m['chat_id'] == chatId);
+      expect(frame['turn_id'], 'turn-xyz');
+      expect(frame['webui'], isTrue);
     });
 
     test('a real turn frame corroborates the replay so the run survives',
