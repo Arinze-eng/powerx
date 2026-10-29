@@ -613,7 +613,9 @@ void main() {
     gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running',
       'started_at': 1000.0});
     gw.send({'event': 'delta', 'chat_id': chatId, 'text': 'resumed output'});
-    await pumpEventQueue();
+    // Frames cross a real loopback socket; a queue pump alone races on slow
+    // CI runners (this exact assertion failed there, passed locally).
+    await settleFrames();
     expect(rec.deltas, contains('resumed output'));
   });
 
