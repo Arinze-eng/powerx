@@ -144,7 +144,7 @@ class _RootGate extends StatelessWidget {
       return RecoveryCodeScreen(
         code: state.pendingRecoveryCode,
         error: state.recoveryCodeError,
-        continueLabel: state.status == AppStatus.authenticated
+        continueLabel: state.recoveryFromSignUp
             ? 'I have copied it, continue'
             : 'I have copied it, sign in',
         onContinue: state.acknowledgeRecoveryCode,

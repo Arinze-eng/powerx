@@ -68,6 +68,20 @@ class AppState extends ChangeNotifier {
   String? email;
   String? displayName;
 
+  /// Recovery-code screen is showing (after sign-up or a password reset).
+  bool recoveryCodeStep = false;
+
+  /// The one-time code to show and make the user copy. Null while issuing.
+  String? pendingRecoveryCode;
+
+  /// Set when issuing or resetting failed; shown with a retry action.
+  String? recoveryCodeError;
+
+  /// True when the recovery step came from sign-up, so the user is already
+  /// signed in once they copy the code. False after a password reset, where
+  /// they must sign in again.
+  bool recoveryFromSignUp = false;
+
   // Gateway bootstrap material
   String? _apiToken;
 
@@ -301,6 +315,7 @@ class AppState extends ChangeNotifier {
         return false;
       }
       await _persist(s, overwriteIdentity: true);
+      recoveryFromSignUp = true;
       recoveryCodeStep = true;
       await _issueRecoveryCode();
       unawaited(DeviceId.instance.markSignedUp(em));
@@ -320,6 +335,67 @@ class AppState extends ChangeNotifier {
     } catch (e) {
       _fail('$e');
       return false;
+    }
+  }
+
+  /// Asks the server for this account's recovery code. Does not touch
+  /// [status]: sign-up owns that. Failures land in [recoveryCodeError].
+  Future<void> _issueRecoveryCode() async {
+    final token = accessToken;
+    if (_auth == null || token == null) {
+      recoveryCodeError = 'Could not create your recovery code.';
+      notifyListeners();
+      return;
+    }
+    recoveryCodeError = null;
+    pendingRecoveryCode = null;
+    notifyListeners();
+    try {
+      pendingRecoveryCode = await _auth!.issueRecoveryCode(token);
+    } on AuthException catch (e) {
+      recoveryCodeError = e.message;
+    } catch (_) {
+      recoveryCodeError = 'Could not create your recovery code. Check your connection and try again.';
+    }
+    notifyListeners();
+  }
+
+  /// Called once the user has copied the code and tapped continue.
+  void acknowledgeRecoveryCode() {
+    recoveryCodeStep = false;
+    pendingRecoveryCode = null;
+    recoveryCodeError = null;
+    // After a password reset the user is signed out and must sign in.
+    // After sign-up, leave status alone: sign-up sets it when it finishes.
+    if (!recoveryFromSignUp) {
+      status = AppStatus.unauthenticated;
+    }
+    recoveryFromSignUp = false;
+    notifyListeners();
+  }
+
+  Future<void> retryRecoveryCode() async {
+    await _issueRecoveryCode();
+  }
+
+  /// Signed-out "Forgot password": sets a new password from the recovery
+  /// code. On success the new recovery code is shown next. Returns an error
+  /// message, or null on success.
+  Future<String?> resetPasswordWithCode(
+      String em, String code, String pw) async {
+    if (_auth == null) return 'Service not initialized';
+    try {
+      final next = await _auth!.resetPasswordWithCode(em, code, pw);
+      recoveryFromSignUp = false;
+      pendingRecoveryCode = next;
+      recoveryCodeError = null;
+      recoveryCodeStep = true;
+      notifyListeners();
+      return null;
+    } on AuthException catch (e) {
+      return e.message;
+    } catch (_) {
+      return 'Could not reset your password. Check your connection and try again.';
     }
   }
 
