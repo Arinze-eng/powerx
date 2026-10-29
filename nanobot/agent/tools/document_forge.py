@@ -31,9 +31,12 @@ record turns to ``done`` (with output paths) or ``failed`` (with the error).
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import posixpath
 import shlex
+import uuid
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, ToolResult
@@ -132,6 +135,65 @@ def _as_json(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, default=str)
+
+
+#: A spec longer than this is staged as a file in the sandbox instead of being
+#: passed inline. The sandbox refuses any command over 12,000 characters, and the
+#: bootstrap plus the CLI call use about 1,000 of them.
+_SPILL_THRESHOLD_CHARS = 8_000
+
+#: Raw bytes per staged chunk. Base64 grows them by a third, so one chunk is about
+#: 8,000 characters of command, well under the cap.
+_SPILL_CHUNK_BYTES = 6_000
+
+#: Where staged specs live, inside the sandbox workspace.
+_SPEC_DIR = "/workspace/.document_forge/specs"
+
+
+def _is_inline_spec(value: Any) -> bool:
+    """True when the spec is JSON itself (not a path to a file)."""
+    if isinstance(value, (dict, list)):
+        return True
+    return isinstance(value, str) and value.lstrip().startswith(("{", "["))
+
+
+def spill_commands(data: bytes, path: str) -> list[str]:
+    """Shell commands that rebuild ``data`` at ``path``, each under the command cap.
+
+    Base64 rather than a heredoc: a heredoc always ends a chunk with a newline, and
+    a newline inside a JSON string is invalid. Each chunk is encoded on its own, so
+    the decoded pieces concatenate to exactly the original bytes.
+    """
+    pieces = [
+        data[i : i + _SPILL_CHUNK_BYTES] for i in range(0, len(data), _SPILL_CHUNK_BYTES)
+    ] or [b""]
+    commands: list[str] = []
+    directory = posixpath.dirname(path)
+    for index, piece in enumerate(pieces):
+        redirect = ">" if index == 0 else ">>"
+        encoded = base64.b64encode(piece).decode("ascii")
+        commands.append(
+            f"mkdir -p {shlex.quote(directory)} && "
+            f"printf '%s' '{encoded}' | base64 -d {redirect} {shlex.quote(path)}"
+        )
+    return commands
+
+
+async def stage_spec(sandbox: Any, text: str) -> str:
+    """Write a long spec into the sandbox and return its absolute path.
+
+    Raises ``RuntimeError`` when the file is not there with the expected size
+    afterwards, so a half-written spec is never handed to the engine.
+    """
+    data = text.encode("utf-8")
+    path = f"{_SPEC_DIR}/{uuid.uuid4().hex}.json"
+    for command in spill_commands(data, path):
+        await sandbox.execute(action="run", command=command, timeout=120)
+    check = f'test "$(wc -c < {shlex.quote(path)})" -eq {len(data)} && echo PX_SPEC_OK'
+    output = await sandbox.execute(action="run", command=check, timeout=60)
+    if "PX_SPEC_OK" not in str(output):
+        raise RuntimeError(f"staged spec {path} is missing or the wrong size")
+    return path
 
 
 def build_cli_command(action: str, kwargs: dict[str, Any]) -> str:
@@ -264,7 +326,9 @@ class DocumentForgeTool(Tool):
                         '"series":{"Sales":[3,5]},"title":"Sales"}]}. '
                         'For chart: {"kind":"bar|line|pie|scatter","labels":[...],'
                         '"series":{"name":[values]},"title":"...","x_label":"...",'
-                        '"y_label":"..."}. Also accepts a path to a .json file.'
+                        '"y_label":"..."}. Also accepts a path to a .json file. '
+                        "Specs of any size are fine: long ones are staged to the sandbox "
+                        "automatically."
                     ),
                 },
                 "to": {
@@ -367,6 +431,27 @@ class DocumentForgeTool(Tool):
                 "this deployment. Enable one of: novita_sandbox, vps_exec, "
                 "runloop_sandbox or daytona_sandbox. Nothing was done."
             )
+
+        if action in ("create", "chart") and _is_inline_spec(kwargs.get("spec")):
+            text = _as_json(kwargs["spec"])
+            if len(text) > _SPILL_THRESHOLD_CHARS:
+                # Too long to pass on the command line: stage it as a file and hand
+                # the engine the path. The engine already accepts a .json path.
+                try:
+                    staged = await stage_spec(sandbox, text)
+                except Exception as exc:  # noqa: BLE001 - surfaced to the model as a retry
+                    return ToolResult.error(
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": "spec_staging_failed",
+                                "action": action,
+                                "detail": f"{type(exc).__name__}: {exc}",
+                                "next": "Nothing was built. Retry the same call.",
+                            }
+                        )
+                    )
+                kwargs = {**kwargs, "spec": staged}
 
         command = _with_bootstrap(build_cli_command(action, kwargs))
         return await self._run(sandbox, action, command, timeout)

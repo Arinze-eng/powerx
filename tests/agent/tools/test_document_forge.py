@@ -10,15 +10,20 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from nanobot.agent.tools.document_forge import (
     _CLI_VERSION,
+    _SPEC_DIR,
+    _SPILL_THRESHOLD_CHARS,
     DocumentForgeTool,
     bootstrap_command,
     build_cli_command,
+    spill_commands,
+    stage_spec,
 )
 from nanobot.agent.tools.engineering_draw import _parse_payload
 
@@ -278,3 +283,115 @@ def test_missing_docx_returns_json_not_a_traceback(tmp_path) -> None:
     assert payload["ok"] is False
     assert payload["error"] == "missing_dependency"
     assert proc.returncode == 1
+
+
+# --------------------------------------------------------------------------- #
+# Large specs are staged to a file, not pushed through the command line
+# --------------------------------------------------------------------------- #
+MAX_COMMAND_CHARS = 12_000  # the sandbox refuses anything longer
+
+
+class LocalSandbox:
+    """Runs the staging commands for real in a temp dir; canned output otherwise.
+
+    ``/workspace`` is rewritten to a temp root so the file operations land on disk
+    where the test can read them back.
+    """
+
+    name = "novita_sandbox"
+
+    def __init__(self, root: Path, payload: str = "", check_override: str | None = None):
+        self.root = root
+        self.commands: list[str] = []
+        self._payload = payload
+        self._check_override = check_override
+
+    async def execute(self, **kwargs):
+        command = kwargs["command"]
+        self.commands.append(command)
+        if "base64 -d" in command or "wc -c" in command:
+            if "wc -c" in command and self._check_override is not None:
+                return self._check_override
+            local = command.replace("/workspace", str(self.root))
+            done = subprocess.run(["bash", "-c", local], capture_output=True, text=True, timeout=60)
+            return done.stdout + done.stderr
+        return self._payload
+
+
+def _big_spec(chars: int = 60_000) -> str:
+    """A spec of roughly ``chars`` characters with quotes, backslashes and unicode."""
+    blocks: list[dict] = []
+    size = 0
+    while size < chars:
+        block = {"type": "paragraph", "text": f"Line {len(blocks)}: \"q\" 'x' \\ $HOME é ✓\n\ttab"}
+        blocks.append(block)
+        size += len(json.dumps(block, ensure_ascii=False)) + 2
+    return json.dumps({"title": "Big report", "blocks": blocks}, ensure_ascii=False)
+
+
+def test_spill_commands_stay_under_the_command_cap(tmp_path) -> None:
+    data = bytes(range(256)) * 2000  # 512,000 bytes, every byte value
+    commands = spill_commands(data, f"{tmp_path}/x.json")
+    assert len(commands) > 1
+    assert all(len(c) < MAX_COMMAND_CHARS for c in commands)
+
+
+@pytest.mark.asyncio
+async def test_staged_spec_reproduces_the_input_exactly(tmp_path) -> None:
+    text = _big_spec(90_000)
+    sandbox = LocalSandbox(tmp_path)
+    path = await stage_spec(sandbox, text)
+    assert path.startswith(_SPEC_DIR + "/") and path.endswith(".json")
+    on_disk = (tmp_path / path[len("/workspace/") :]).read_bytes()
+    assert on_disk == text.encode("utf-8")
+    assert all(len(c) < MAX_COMMAND_CHARS for c in sandbox.commands)
+
+
+@pytest.mark.asyncio
+async def test_big_create_spec_is_passed_as_a_staged_path(tmp_path) -> None:
+    text = _big_spec()
+    assert len(text) > _SPILL_THRESHOLD_CHARS
+    sandbox = LocalSandbox(tmp_path, payload=_payload_text({"ok": True, "action": "create"}))
+    result = await _run(sandbox, action="create", spec=text, to="docx")
+    assert not result.is_error
+    final = sandbox.commands[-1]
+    assert "create --spec /workspace/.document_forge/specs/" in final.replace("'", "")
+    assert all(len(c) < MAX_COMMAND_CHARS for c in sandbox.commands)
+    staged = re.search(r"/workspace/\.document_forge/specs/[0-9a-f]+\.json", final)
+    assert staged is not None
+    assert (tmp_path / staged.group(0)[len("/workspace/") :]).read_text(encoding="utf-8") == text
+
+
+@pytest.mark.asyncio
+async def test_short_spec_stays_inline(tmp_path) -> None:
+    spec = {"title": "Short", "blocks": [{"type": "paragraph", "text": "hi"}]}
+    sandbox = LocalSandbox(tmp_path, payload=_payload_text({"ok": True, "action": "create"}))
+    await _run(sandbox, action="create", spec=spec)
+    assert not any("base64 -d" in c for c in sandbox.commands)
+    assert "create --spec" in sandbox.commands[-1]
+    assert "specs/" not in sandbox.commands[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_size_check_refuses_to_run_the_engine(tmp_path) -> None:
+    sandbox = LocalSandbox(tmp_path, check_override="0\n", payload=_payload_text({"ok": True}))
+    result = await _run(sandbox, action="create", spec=_big_spec())
+    assert result.is_error
+    body = json.loads(str(result))
+    assert body["error"] == "spec_staging_failed"
+    assert not any("create --spec" in c for c in sandbox.commands)
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_error_while_staging_is_reported_not_raised(tmp_path) -> None:
+    class Broken(LocalSandbox):
+        async def execute(self, **kwargs):
+            if "base64 -d" in kwargs["command"]:
+                raise RuntimeError("sandbox offline")
+            return await super().execute(**kwargs)
+
+    result = await _run(Broken(tmp_path), action="chart", spec=_big_spec())
+    assert result.is_error
+    body = json.loads(str(result))
+    assert body["error"] == "spec_staging_failed"
+    assert "sandbox offline" in body["detail"]

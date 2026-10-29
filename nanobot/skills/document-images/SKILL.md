@@ -12,6 +12,29 @@ A document with no pictures is usually a failed brief. A document with a **broke
 The rule: **an image must exist as a file on disk with a path you have read back, before
 the document is built.** Anything else produces a document that references nothing.
 
+## Making a DOCX or PDF: use `document_forge`
+
+Do not `pip install` anything and do not write python-docx scripts for this. The
+`document_forge` tool builds the file in the sandbox with the libraries already set up.
+
+1. `document_forge` with `action: "doctor"`. If it says the core is not ready, run
+   `action: "install"` (it runs in the background), poll `action: "job"` with the returned
+   `job_id` until it is `done`, then continue.
+2. `action: "create"`, `spec` = a JSON object `{"title": "...", "blocks": [...]}`, and
+   `to: "docx"` or `to: "docx,pdf"`. The spec can be any length: long specs are staged to a
+   file automatically. Build the whole report as one spec. Do not split it and merge.
+3. Give the user the `path` values from `outputs` in the result.
+
+Block types: `heading` (level, text), `paragraph` (text, supports **bold** and *italic*),
+`bullets` and `numbered` (items), `table` (headers, rows), `image` (url or path, width_cm,
+caption), `chart` (kind, labels, series, title), `code` (text), `page_break`.
+
+Rules:
+- Put deliverables under `/workspace` or the default `~/document_outputs`. Do not write them to `/tmp`.
+- For an image, fetch it first (see step 1 below), then use its path or URL in an `image` block.
+- If a `document_forge` call returns `ok: false`, read its `error` and `next` fields and fix that
+  before retrying. Do not fall back to python-docx.
+
 ## 1. Get the image onto disk
 
 | Source | How | Result |
@@ -41,7 +64,7 @@ path = payload["saved_to"]          # this exact string goes into the document b
 
 Use the path from step 1. Never re-download inside the document script.
 
-**DOCX — `python-docx`**
+**DOCX — `python-docx`** (only when `document_forge` is unavailable; prefer its `image` block)
 
 ```python
 from docx import Document
