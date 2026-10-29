@@ -294,6 +294,11 @@ class NanobotSocket {
   void Function(String chatId, String status)? onGoalStatus;
   /// Session list should refresh.
   void Function()? onSessionsChanged;
+  /// The set of chats with a running turn changed (sidebar spinners follow it).
+  void Function()? onActivityChanged;
+  /// The server pushed the canonical sidebar state (pins, archive, renames,
+  /// view prefs). Raw map, exactly as the web client receives it.
+  void Function(Map<String, dynamic> state)? onSidebarState;
   /// A chat's *transcript* changed server-side (a turn produced persisted
   /// rows). The WebUI refreshes its canonical history here, so the native app
   /// does the same instead of waiting for the user to type again.
@@ -333,6 +338,28 @@ class NanobotSocket {
 
   /// Whether a turn is currently believed to be running for [chatId].
   bool isTurnActive(String chatId) => _activeTurns.contains(chatId);
+
+  /// Every chat with a turn currently believed to be running. The sidebar
+  /// shows a spinner beside each of these, like the web ChatList does.
+  Set<String> get activeChatIds => Set.unmodifiable(_activeTurns);
+
+  void _markActive(String chatId) {
+    if (_activeTurns.add(chatId)) _notifyActivity();
+  }
+
+  bool _markInactive(String chatId) {
+    final removed = _activeTurns.remove(chatId);
+    if (removed) _notifyActivity();
+    return removed;
+  }
+
+  void _notifyActivity() {
+    try {
+      onActivityChanged?.call();
+    } catch (_) {
+      // A UI listener fault must never break transport bookkeeping.
+    }
+  }
 
   /// The server turn id currently believed to own [chatId]'s run, if known.
   String? activeTurnId(String chatId) => _currentTurnIds[chatId];
@@ -562,7 +589,7 @@ class NanobotSocket {
         ..clear()
         ..addAll(loaded);
       for (final s in _pendingSends) {
-        _activeTurns.add(s.chatId);
+        _markActive(s.chatId);
       }
       await queue.save(_pendingSends);
     } catch (_) {
@@ -589,7 +616,7 @@ class NanobotSocket {
         written = false;
       }
       if (written) {
-        _activeTurns.add(s.chatId);
+        _markActive(s.chatId);
       } else {
         remaining.add(s);
       }
@@ -787,7 +814,7 @@ class NanobotSocket {
         // client already rendered the optimistic bubble, so we only adopt the
         // run state (never echo the text back as a second user bubble).
         if (chatId != null) {
-          _activeTurns.add(chatId);
+          _markActive(chatId);
           _lastActedChatId = chatId;
           final acceptedTurnId = ev['turn_id'] as String?;
           if (acceptedTurnId != null && acceptedTurnId.isNotEmpty) {
@@ -840,7 +867,7 @@ class NanobotSocket {
             }
             // A turn started server-side (ours or a backgrounded one):
             // mark active so the eventual turn_end/idle closes it exactly once.
-            _activeTurns.add(chatId);
+            _markActive(chatId);
             // The gateway is executing this chat's turn — stop re-sending.
             _confirmPendingSend(chatId, null);
             // Corroboration, three ways: we are about to send this chat's
@@ -892,7 +919,7 @@ class NanobotSocket {
           final turnId = ev['turn_id'] as String?;
           if (text.isNotEmpty) v.onUserMessage(text, turnId);
           if (ev['starts_turn'] == true || ev['active_turn_id'] != null) {
-            _activeTurns.add(chatId!);
+            _markActive(chatId!);
           }
         }
         break;
@@ -900,6 +927,12 @@ class NanobotSocket {
       case 'runtime_model_updated':
         final model = ev['model'] as String?;
         if (model != null && model.isNotEmpty) onModelUpdated?.call(model);
+        break;
+      case 'sidebar_state_updated':
+        final st = ev['state'];
+        if (st is Map) {
+          onSidebarState?.call(Map<String, dynamic>.from(st));
+        }
         break;
       case 'webui_response':
         _handleWebuiResponse(ev);
@@ -1055,7 +1088,7 @@ class NanobotSocket {
     // by definition stale (probe-measured: the gateway replays a finished run
     // on the next attach), so it must not count as corroborated.
     _lastTurnFrameAt.remove(chatId);
-    if (!_activeTurns.remove(chatId)) {
+    if (!_markInactive(chatId)) {
       // Terminal event for a turn we did not think was active. Two cases:
       // (a) duplicate/late terminal event — already finalized, ignore;
       // (b) the attach replay of goal_status idle for a turn that finished
@@ -1158,7 +1191,7 @@ class NanobotSocket {
     _views.remove(chatId);
     _attachedChats.remove(chatId);
     _wantedChats.remove(chatId);
-    _activeTurns.remove(chatId);
+    _markInactive(chatId);
     _finalizedTurns.remove(chatId);
     _completedTurnIds.remove(chatId);
     _currentTurnIds.remove(chatId);
@@ -1173,7 +1206,7 @@ class NanobotSocket {
   /// Mark a turn as started for [chatId] before the server confirms it, so a
   /// terminal event that arrives first is still attributed correctly.
   void markUserTurn(String chatId) {
-    _activeTurns.add(chatId);
+    _markActive(chatId);
     _finalizedTurns.remove(chatId);
     _stoppedChats.remove(chatId);
   }
@@ -1185,7 +1218,7 @@ class NanobotSocket {
     List<Map<String, dynamic>>? media,
     String? turnId,
   }) {
-    _activeTurns.add(chatId);
+    _markActive(chatId);
     _finalizedTurns.remove(chatId);
     _stoppedChats.remove(chatId);
     _lastActedChatId = chatId;
@@ -1224,7 +1257,7 @@ class NanobotSocket {
       _completedTurnIds[chatId] = stoppedTurnId;
     }
     _stoppedChats.add(chatId);
-    _activeTurns.remove(chatId);
+    _markInactive(chatId);
     _finalizedTurns.add(chatId);
     _unconfirmedRuns.remove(chatId)?.cancel();
     _lastTurnFrameAt.remove(chatId);
@@ -1259,7 +1292,7 @@ class NanobotSocket {
       // gone (the socket that owned it was killed). Release the UI and tell the
       // app to pull the authoritative transcript, so the finished answer still
       // lands instead of the screen hanging on a ghost turn.
-      _activeTurns.remove(chatId);
+      _markInactive(chatId);
       _currentTurnIds.remove(chatId);
       _lastTurnFrameAt.remove(chatId);
       _finalizedTurns.add(chatId);
@@ -1470,6 +1503,7 @@ class NanobotSocket {
     _wantedChats.clear();
     _attachedChats.clear();
     _activeTurns.clear();
+    _notifyActivity();
     _completedTurnIds.clear();
     _outbox.clear();
   }
