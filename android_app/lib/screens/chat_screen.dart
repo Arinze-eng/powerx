@@ -77,8 +77,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Timer? _hydrateTimer;
   int _hydrateAttempt = 0;
   bool _hydrateSatisfied = false;
-  bool _justCompleted = false; // shows the settled "done" check in the pill
-  Timer? _completedFadeTimer;
   Timer? _cacheTimer; // debounced local transcript persistence
 
   // ---- Voice notes -------------------------------------------------------
@@ -754,7 +752,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             _lastEventAt = DateTime.now();
           });
           _updateWakelock();
-          _flashCompleted();
           _scrollToBottom();
           _scheduleCacheWrite(immediate: true);
           // Guarantee the completed result actually lands: pull the
@@ -1102,18 +1099,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (reason != null) _toast(reason);
   }
 
-  /// Settle the status pill on a STATIC green check after a turn completes.
-  /// It fades away after a few seconds — it never keeps spinning.
-  void _flashCompleted() {
-    _completedFadeTimer?.cancel();
-    if (!mounted) return;
-    setState(() => _justCompleted = true);
-    _completedFadeTimer = Timer(const Duration(seconds: 4), () {
-      if (mounted) setState(() => _justCompleted = false);
-    });
-  }
-
-
   // ---- File / image attachment -----------------------------------------
 
   Future<void> _pickFiles() async {
@@ -1391,7 +1376,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       unawaited(_recorder.stop().then(_deleteQuietly).catchError((_) => ''));
     }
     unawaited(_recorder.dispose());
-    _completedFadeTimer?.cancel();
     _cacheTimer?.cancel();
     // Detach the UI listener and persist the transcript, which keeps the
     // result visible on reopen. The chat's socket WINDOW is deliberately kept
@@ -1419,8 +1403,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    final userInitial = state.greetingName;
-
     return Scaffold(
       backgroundColor: Palette.bg0,
       appBar: AppBar(
@@ -1460,10 +1442,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ),
         centerTitle: false,
         actions: [
-          _StatusPill(
-            busy: _busy,
-            completed: _justCompleted,
-          ),
           if (!_connected)
              Padding(
               padding: EdgeInsets.only(right: 2),
@@ -1535,7 +1513,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                             // scratch on each streaming flush.
                             key: ValueKey(_messages[i].id),
                             message: _messages[i],
-                            userInitial: userInitial,
                             onOpenArtifact: (p) => _openArtifact(p),
                           ),
                     ),
@@ -1552,6 +1529,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             recording: _recording,
             transcribing: _transcribing,
             recordSeconds: _recordSeconds,
+            hint:
+                _busy
+                    ? 'Model is responding…'
+                    : (_messages.isEmpty
+                        ? 'Ask anything...'
+                        : 'Type your message…'),
           ),
         ],
       ),
@@ -1606,190 +1589,154 @@ class _Bubble extends StatelessWidget {
     super.key,
     required this.message,
     this.onOpenArtifact,
-    this.userInitial = '',
   });
   final ChatMessage message;
   final void Function(String path)? onOpenArtifact;
-  final String userInitial;
 
   @override
   Widget build(BuildContext context) {
-    final isUser = message.role == Role.user;
-    final maxWidth = MediaQuery.of(context).size.width * 0.86;
+    return message.role == Role.user
+        ? _userTurn(context)
+        : _assistantTurn(context);
+  }
 
-    final bubble = Container(
-      constraints: BoxConstraints(maxWidth: maxWidth),
-      decoration: BoxDecoration(
-        // The user surface is the warm brown gradient (the "brown chat
-        // section"); the assistant reads as a flat card so answers stay the
-        // visual focus.
-        color: isUser ? null : Palette.bg2,
-        gradient: isUser ? Palette.userBubbleGradient : null,
-        borderRadius: BorderRadius.only(
-          topLeft: const Radius.circular(18),
-          topRight: const Radius.circular(18),
-          bottomLeft: Radius.circular(isUser ? 18 : 5),
-          bottomRight: Radius.circular(isUser ? 5 : 18),
-        ),
-        border: isUser ? null : Border.all(color: Palette.borderSoft),
-      ),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
-      child: _content(context, isUser),
-    );
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 7),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisAlignment:
-            isUser ? MainAxisAlignment.end : MainAxisAlignment.start,
-        children: [
-          if (!isUser) ...[
-            const Padding(
-              padding: EdgeInsets.only(top: 2),
-              child: ChatAvatar(isAssistant: true, size: 28),
-            ),
-            const SizedBox(width: 9),
-          ],
-          Flexible(
-            child: Align(
-              alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-              // Long-press copies the message text — handy for short answers
-              // and error reports on a phone.
-              child: GestureDetector(
-                onLongPress:
-                    message.text.trim().isEmpty
-                        ? null
-                        : () {
-                          Clipboard.setData(ClipboardData(text: message.text));
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text('Copied to clipboard'),
-                              duration: Duration(seconds: 1),
-                            ),
-                          );
-                        },
-                child: bubble,
-              ),
-            ),
-          ),
-          if (isUser) ...[
-            const SizedBox(width: 9),
-            Padding(
-              padding: const EdgeInsets.only(top: 2),
-              child: ChatAvatar(
-                isAssistant: false,
-                initial: userInitial,
-                size: 28,
-              ),
-            ),
-          ],
-        ],
+  void _copy(BuildContext context) {
+    if (message.text.trim().isEmpty) return;
+    Clipboard.setData(ClipboardData(text: message.text));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Copied to clipboard'),
+        duration: Duration(seconds: 1),
       ),
     );
   }
 
-  Widget _content(BuildContext context, bool isUser) {
-    return isUser
-        ? Column(
-          crossAxisAlignment: CrossAxisAlignment.end,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (message.text.isNotEmpty)
-              SelectableText(
-                message.text,
-                style:  TextStyle(
-                  color: Palette.userText,
-                  fontSize: 15,
-                  height: 1.4,
-                ),
-              ),
-            if (message.media.isNotEmpty)
-              Padding(
-                padding: EdgeInsets.only(top: message.text.isNotEmpty ? 8 : 0),
-                child: Wrap(
-                  spacing: 6,
-                  runSpacing: 6,
-                  alignment: WrapAlignment.end,
-                  children: [
-                    for (final m in message.media)
-                      _AttachmentChip(label: _basename(m), url: m),
-                  ],
-                ),
-              ),
-          ],
-        )
-        : Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (message.activity.isNotEmpty)
-              _ActivityPanel(
-                steps: message.activity,
-                turnStreaming: message.streaming,
-              ),
-            if (message.artifactPaths.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: _FileChips(
-                  paths: message.artifactPaths,
-                  onOpen: onOpenArtifact,
-                ),
-              ),
-            if (message.reasoning.trim().isNotEmpty)
-              _ThinkingPanel(
-                reasoning: message.reasoning,
-                streaming: message.reasoningStreaming,
-              ),
-            for (var i = 0; i < message.segments.length; i++)
-              Padding(
-                padding: EdgeInsets.only(top: i == 0 ? 0 : 8),
-                child: MarkdownBody(
-                  data: message.segments[i],
-                  selectable: true,
-                  styleSheet: AppTheme.markdown(context),
-                ),
-              ),
-            if (message.streaming &&
-                message.isEmpty &&
-                message.activity.isEmpty)
-              const Padding(
-                padding: EdgeInsets.only(top: 2),
-                child: _TypingDots(compact: true),
-              ),
-            if (message.viewableMedia.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    for (final u in message.viewableMedia) _MediaLink(url: u),
-                  ],
-                ),
-              ),
-            if (!message.streaming && message.hasError)
-               Padding(
-                padding: EdgeInsets.only(top: 6),
-                child: Icon(
-                  Icons.error_outline,
-                  size: 16,
-                  color: Palette.danger,
-                ),
-              ),
-            if (!message.streaming && _footer(message) != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 6),
-                child: Text(
-                  _footer(message)!,
-                  style:  TextStyle(
-                    color: Palette.textTertiary,
-                    fontSize: 11,
+  /// Web: the user turn is a right-aligned pill capped at 85% width (36rem).
+  Widget _userTurn(BuildContext context) {
+    final width = MediaQuery.of(context).size.width;
+    final maxWidth = width * 0.85 < 576 ? width * 0.85 : 576.0;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Align(
+        alignment: Alignment.centerRight,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxWidth: maxWidth),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (message.text.isNotEmpty)
+                GestureDetector(
+                  onLongPress: () => _copy(context),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 9,
+                    ),
+                    decoration: BoxDecoration(
+                      gradient: Palette.userBubbleGradient,
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: SelectableText(
+                      message.text,
+                      style: TextStyle(
+                        color: Palette.userText,
+                        fontSize: 16,
+                        height: 1.5,
+                      ),
+                    ),
                   ),
                 ),
-              ),
-          ],
-        );
+              if (message.media.isNotEmpty)
+                Padding(
+                  padding: EdgeInsets.only(
+                    top: message.text.isNotEmpty ? 8 : 0,
+                  ),
+                  child: Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    alignment: WrapAlignment.end,
+                    children: [
+                      for (final m in message.media)
+                        _AttachmentChip(label: _basename(m), url: m),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Web: the assistant turn is flat, full-width prose with no avatar or card.
+  Widget _assistantTurn(BuildContext context) {
+    final hasActivity =
+        message.activity.isNotEmpty || message.reasoning.trim().isNotEmpty;
+    final body = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (hasActivity) _ActivityCluster(message: message),
+        if (message.artifactPaths.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: _FileChips(
+              paths: message.artifactPaths,
+              onOpen: onOpenArtifact,
+            ),
+          ),
+        for (var i = 0; i < message.segments.length; i++)
+          Padding(
+            padding: EdgeInsets.only(top: i == 0 ? 0 : 8),
+            child: MarkdownBody(
+              data: message.segments[i],
+              selectable: true,
+              styleSheet: AppTheme.markdown(context),
+            ),
+          ),
+        if (message.streaming && message.isEmpty && !hasActivity)
+          Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Text(
+              'Thinking…',
+              style: TextStyle(fontSize: 13, color: Palette.textTertiary),
+            ),
+          ),
+        if (message.viewableMedia.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final u in message.viewableMedia) _MediaLink(url: u),
+              ],
+            ),
+          ),
+        if (!message.streaming && message.hasError)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Icon(Icons.error_outline, size: 16, color: Palette.danger),
+          ),
+        if (!message.streaming && _footer(message) != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(
+              _footer(message)!,
+              style: TextStyle(color: Palette.textTertiary, fontSize: 12),
+            ),
+          ),
+      ],
+    );
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: GestureDetector(
+        // Long-press copies the answer text, handy on a phone.
+        onLongPress: () => _copy(context),
+        child: SizedBox(width: double.infinity, child: body),
+      ),
+    );
   }
 
   static String? _footer(ChatMessage m) {
@@ -1809,176 +1756,321 @@ class _Bubble extends StatelessWidget {
   }
 }
 
-/// Ordered list of tool/activity steps for a turn, live-updated.
-///
-/// The step list is *ordered by the merge*, so it is stable across replays: a
-/// replayed copy of an existing step updates that row in place instead of
-/// appending a second one. This is what stopped the duplicated
-/// `write_file · power_bank_guide.tex` / `edit · …` / `novita_sandbox · …`
-/// blocks in the screenshot.
-class _ActivityPanel extends StatelessWidget {
-  const _ActivityPanel({required this.steps, required this.turnStreaming});
-  final List<ActivityStep> steps;
-  final bool turnStreaming;
+/// Web parity (AgentActivityCluster): one collapsible row above the answer
+/// reading "Working for 12s" / "Worked for 12s" (or "Thinking for" /
+/// "Thought for" when the turn had no tool calls). It opens while the turn
+/// streams, closes about 300 ms after the turn ends, and the user can toggle
+/// it at any time. Reasoning and tool steps are rows inside it.
+class _ActivityCluster extends StatefulWidget {
+  const _ActivityCluster({required this.message});
+  final ChatMessage message;
+
+  @override
+  State<_ActivityCluster> createState() => _ActivityClusterState();
+}
+
+class _ActivityClusterState extends State<_ActivityCluster> {
+  bool? _userOpen; // null = follow the live turn state
+  bool _holdOpen = false; // stays open briefly after the turn ends
+  bool _wasLive = false;
+  Timer? _holdTimer;
+  Timer? _ticker; // refreshes the live duration once a second
+  final ScrollController _scroll = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    _sync();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ActivityCluster old) {
+    super.didUpdateWidget(old);
+    _sync();
+  }
+
+  void _sync() {
+    final live = widget.message.streaming;
+    if (live) {
+      _holdTimer?.cancel();
+      _holdOpen = false;
+      _ticker ??= Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+      // Keep the newest row in view while the turn streams.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _scroll.hasClients) {
+          _scroll.jumpTo(_scroll.position.maxScrollExtent);
+        }
+      });
+    } else {
+      _ticker?.cancel();
+      _ticker = null;
+      if (_wasLive && _userOpen == null) {
+        _holdOpen = true;
+        _holdTimer?.cancel();
+        _holdTimer = Timer(const Duration(milliseconds: 300), () {
+          if (mounted) setState(() => _holdOpen = false);
+        });
+      }
+    }
+    _wasLive = live;
+  }
+
+  @override
+  void dispose() {
+    _holdTimer?.cancel();
+    _ticker?.cancel();
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  bool get _expanded =>
+      _userOpen ?? (widget.message.streaming || _holdOpen);
+
+  int get _durationMs {
+    final m = widget.message;
+    if (m.streaming) {
+      return DateTime.now().difference(m.createdAt).inMilliseconds;
+    }
+    return m.latencyMs ?? 0;
+  }
+
+  static String _formatDuration(int ms) {
+    final seconds = ms > 0 && ms < 1000 ? 1 : (ms / 1000).round();
+    if (seconds < 60) return '${seconds}s';
+    final minutes = seconds ~/ 60;
+    final rest = seconds % 60;
+    return rest > 0 ? '${minutes}m ${rest}s' : '${minutes}m';
+  }
+
+  String get _label {
+    final m = widget.message;
+    final hasTools = m.activity.isNotEmpty;
+    final ms = _durationMs;
+    final dur = _formatDuration(ms);
+    if (m.streaming) {
+      return hasTools ? 'Working for $dur' : 'Thinking for $dur';
+    }
+    if (hasTools) return ms <= 0 ? 'Worked' : 'Worked for $dur';
+    return ms <= 0 ? 'Thought' : 'Thought for $dur';
+  }
 
   @override
   Widget build(BuildContext context) {
+    final m = widget.message;
+    final expanded = _expanded;
+    final hasDetails =
+        m.activity.isNotEmpty || m.reasoning.trim().isNotEmpty;
+    final hasBodyBelow = m.segments.any((s) => s.trim().isNotEmpty);
+
+    final header = Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Flexible(
+            child: Text(
+              _label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 13,
+                height: 1.4,
+                fontWeight: FontWeight.w500,
+                color: Palette.textTertiary.withValues(alpha: 0.8),
+              ),
+            ),
+          ),
+          if (hasDetails) ...[
+            const SizedBox(width: 4),
+            AnimatedRotation(
+              turns: expanded ? 0.5 : 0,
+              duration: const Duration(milliseconds: 220),
+              child: Icon(
+                Icons.keyboard_arrow_down_rounded,
+                size: 15,
+                color: Palette.textTertiary,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+
     return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
+      padding: EdgeInsets.only(bottom: hasBodyBelow ? 8 : 0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          for (final s in steps)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 3),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  _StepStatus(status: s.status),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      s.detail.isNotEmpty ? '${s.name} · ${s.detail}' : s.name,
-                      style: TextStyle(
-                        color:
-                            s.isDone
-                                ? Palette.textTertiary
-                                : Palette.textSecondary,
-                        fontSize: 12.5,
-                        decoration: TextDecoration.none,
-                      ),
-                    ),
-                  ),
-                ],
+          if (hasDetails)
+            InkWell(
+              borderRadius: BorderRadius.circular(6),
+              onTap: () => setState(() => _userOpen = !expanded),
+              child: header,
+            )
+          else
+            header,
+          if (hasDetails)
+            AnimatedSize(
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOut,
+              alignment: Alignment.topCenter,
+              child: expanded ? _body() : const SizedBox.shrink(),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _body() {
+    final m = widget.message;
+    final reasoning = m.reasoning.trim();
+    return Container(
+      margin: const EdgeInsets.only(top: 4),
+      constraints: const BoxConstraints(maxHeight: 180),
+      child: SingleChildScrollView(
+        controller: _scroll,
+        padding: const EdgeInsets.only(right: 4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (reasoning.isNotEmpty)
+              _ActivityRow(
+                marker: _RowMarker(
+                  status: m.reasoningStreaming && m.streaming
+                      ? 'running'
+                      : 'done',
+                ),
+                label: _reasoningPreview(
+                  reasoning,
+                  streaming: m.reasoningStreaming && m.streaming,
+                ),
+                italic: true,
+              ),
+            for (final step in m.activity)
+              _ActivityRow(
+                marker: _RowMarker(status: step.status),
+                label:
+                    step.detail.isNotEmpty
+                        ? '${step.name} · ${step.detail}'
+                        : step.name,
+                error: step.status == 'error',
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Web compactReasoningPreview: strip markdown and collapse whitespace.
+  static String _reasoningPreview(String text, {required bool streaming}) {
+    final cleaned = text
+        .replaceAllMapped(
+          RegExp(r'\[([^\]]+)\]\([^)]+\)'),
+          (m) => m.group(1)!,
+        )
+        .replaceAll(RegExp(r'[*_#`~]+'), '')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (cleaned.isNotEmpty) return cleaned;
+    return streaming ? 'Thinking…' : 'Thinking';
+  }
+}
+
+/// One line inside the activity cluster: a fixed marker column, then a
+/// single truncated label, matching the web ActivityStep layout.
+class _ActivityRow extends StatelessWidget {
+  const _ActivityRow({
+    required this.marker,
+    required this.label,
+    this.italic = false,
+    this.error = false,
+  });
+  final Widget marker;
+  final String label;
+  final bool italic;
+  final bool error;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 18,
+            height: 20,
+            child: Center(child: marker),
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 13,
+                height: 20 / 13,
+                fontWeight: FontWeight.w500,
+                fontStyle: italic ? FontStyle.italic : FontStyle.normal,
+                color:
+                    error
+                        ? Palette.danger.withValues(alpha: 0.85)
+                        : Palette.textSecondary.withValues(alpha: 0.85),
               ),
             ),
+          ),
         ],
       ),
     );
   }
 }
 
-class _StepStatus extends StatelessWidget {
-  const _StepStatus({required this.status});
+/// Status marker for a cluster row. running spins; done is a green check;
+/// refused is a neutral amber shield (a guard said no, not a failure); error
+/// is a red cross.
+class _RowMarker extends StatelessWidget {
+  const _RowMarker({required this.status});
   final String status;
+
   @override
   Widget build(BuildContext context) {
     if (status == 'running') {
-      return  Padding(
-        padding: EdgeInsets.only(top: 2),
-        child: SizedBox(
-          width: 12,
-          height: 12,
-          child: CircularProgressIndicator(
-            strokeWidth: 1.6,
-            color: Palette.accent,
-          ),
+      return SizedBox(
+        width: 12,
+        height: 12,
+        child: CircularProgressIndicator(
+          strokeWidth: 1.6,
+          color: Palette.textTertiary,
         ),
       );
     }
-    if (status == 'error') {
-      return Icon(Icons.error_outline, size: 14, color: Palette.danger);
+    final Color color;
+    final IconData icon;
+    switch (status) {
+      case 'error':
+        color = Palette.danger;
+        icon = Icons.close_rounded;
+      case 'refused':
+        color = Palette.warning;
+        icon = Icons.shield_outlined;
+      default:
+        color = Palette.success;
+        icon = Icons.check_rounded;
     }
-    if (status == 'refused') {
-      // A guard said no: a neutral notice, not a failure.
-      return Icon(Icons.shield_outlined, size: 14, color: Palette.warning);
-    }
-    return Icon(
-      Icons.check_circle_outline,
-      size: 14,
-      color: Palette.success,
-    );
-  }
-}
-
-/// Collapsible "Thinking" panel showing the model's reasoning stream,
-/// expanded automatically while it is still streaming.
-class _ThinkingPanel extends StatefulWidget {
-  const _ThinkingPanel({required this.reasoning, required this.streaming});
-  final String reasoning;
-  final bool streaming;
-
-  @override
-  State<_ThinkingPanel> createState() => _ThinkingPanelState();
-}
-
-class _ThinkingPanelState extends State<_ThinkingPanel> {
-  bool? _override; // null = auto (follow streaming state)
-
-  @override
-  void didUpdateWidget(covariant _ThinkingPanel old) {
-    super.didUpdateWidget(old);
-    if (old.streaming && !widget.streaming) {
-      // Collapse automatically when thinking ends (unless user opened it).
-      if (_override == null) setState(() => _override = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final expanded = _override ?? widget.streaming;
     return Container(
-      margin: const EdgeInsets.only(bottom: 8),
+      width: 14,
+      height: 14,
+      alignment: Alignment.center,
       decoration: BoxDecoration(
-        color: Palette.scrim(0.28),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Palette.borderSoft),
+        shape: BoxShape.circle,
+        border: Border.all(color: color.withValues(alpha: 0.4)),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          InkWell(
-            onTap: () => setState(() => _override = !expanded),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-              child: Row(
-                children: [
-                  Icon(
-                    expanded
-                        ? Icons.expand_more_rounded
-                        : Icons.chevron_right_rounded,
-                    size: 18,
-                    color: Palette.textTertiary,
-                  ),
-                  const SizedBox(width: 4),
-                  Text(
-                    widget.streaming ? 'Thinking…' : 'Thought',
-                    style: TextStyle(
-                      color:
-                          widget.streaming
-                              ? Palette.accentSoft
-                              : Palette.textTertiary,
-                      fontSize: 12.5,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const Spacer(),
-                   Icon(
-                    Icons.psychology_alt_outlined,
-                    size: 14,
-                    color: Palette.textTertiary,
-                  ),
-                ],
-              ),
-            ),
-          ),
-          if (expanded)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
-              child: SelectableText(
-                widget.reasoning.length > 4000
-                    ? '${widget.reasoning.substring(0, 4000)}…'
-                    : widget.reasoning,
-                style:  TextStyle(
-                  color: Palette.textTertiary,
-                  fontSize: 12,
-                  height: 1.4,
-                ),
-              ),
-            ),
-        ],
-      ),
+      child: Icon(icon, size: 10, color: color),
     );
   }
 }
@@ -2089,50 +2181,6 @@ Future<void> _launch(String url) async {
   }
 }
 
-class _TypingDots extends StatefulWidget {
-  const _TypingDots({this.compact = false});
-  final bool compact;
-  @override
-  State<_TypingDots> createState() => _TypingDotsState();
-}
-
-class _TypingDotsState extends State<_TypingDots>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _c = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 900),
-  )..repeat();
-  @override
-  void dispose() {
-    _c.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _c,
-      builder: (_, __) {
-        return Row(
-          mainAxisSize: MainAxisSize.min,
-          children: List.generate(3, (i) {
-            final v = (_c.value * 3 - i).clamp(0.0, 1.0);
-            return Container(
-              width: widget.compact ? 6 : 8,
-              height: widget.compact ? 6 : 8,
-              margin: const EdgeInsets.symmetric(horizontal: 2),
-              decoration: BoxDecoration(
-                color: Palette.accentSoft.withValues(alpha: 0.3 + 0.6 * v),
-                shape: BoxShape.circle,
-              ),
-            );
-          }),
-        );
-      },
-    );
-  }
-}
-
 class _Composer extends StatefulWidget {
   const _Composer({
     required this.controller,
@@ -2146,9 +2194,12 @@ class _Composer extends StatefulWidget {
     required this.recording,
     required this.transcribing,
     required this.recordSeconds,
+    required this.hint,
   });
   final TextEditingController controller;
   final bool busy;
+  /// Placeholder text, chosen like the web composer.
+  final String hint;
   final List<PendingAttachment> pending;
   final VoidCallback onPick;
   final void Function(PendingAttachment) onRemove;
@@ -2342,10 +2393,7 @@ class _ComposerState extends State<_Composer> {
                         fontSize: 15,
                       ),
                       decoration: InputDecoration(
-                        hintText:
-                            widget.busy
-                                ? 'Working on your task…'
-                                : 'Assign a task or ask anything',
+                        hintText: widget.hint,
                         hintStyle:  TextStyle(
                           color: Palette.textTertiary,
                           fontSize: 15,
@@ -2606,71 +2654,6 @@ class _PendingTile extends StatelessWidget {
 /// showing the working spinner, the settled done check, or nothing, so the
 /// title never shifts and the indicator never bounces. The completion state
 /// is a STATIC check — it settles instead of continuing to spin.
-class _StatusPill extends StatelessWidget {
-  const _StatusPill({
-    required this.busy,
-    required this.completed,
-  });
-
-  final bool busy;
-  final bool completed;
-
-  @override
-  Widget build(BuildContext context) {
-    Widget? content;
-    if (busy) {
-      content = _pill(
-         SizedBox(
-          width: 10,
-          height: 10,
-          child: CircularProgressIndicator(
-            strokeWidth: 1.6,
-            color: Palette.accent,
-          ),
-        ),
-        'working…',
-      );
-    } else if (completed) {
-      // Static, non-animating confirmation that the task completed.
-      content = _pill(
-         Icon(Icons.check_circle, size: 13, color: Palette.success),
-        'done',
-      );
-    }
-    return SizedBox(
-      width: 104,
-      height: 24,
-      child: AnimatedSwitcher(
-        duration: const Duration(milliseconds: 200),
-        child: content ?? const SizedBox.shrink(key: ValueKey('empty')),
-      ),
-    );
-  }
-
-  Widget _pill(Widget leading, String label) {
-    return Container(
-      key: ValueKey(label),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        color: Palette.bg3,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Palette.borderSoft),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          leading,
-          const SizedBox(width: 6),
-          Text(
-            label,
-            style:  TextStyle(fontSize: 11, color: Palette.textSecondary),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 /// File artifacts the assistant created during the turn, shown as chips with
 /// a download affordance. Tapping one fetches the file through the gateway
 /// and hands it to the OS viewer.
