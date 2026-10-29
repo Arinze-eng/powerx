@@ -26,6 +26,7 @@ import '../theme/app_theme.dart';
 import '../theme/palette.dart';
 import '../widgets/brand.dart';
 import '../widgets/theme_toggle.dart';
+import '../widgets/latex_markdown.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key, this.session, this.initialPrompt});
@@ -1735,6 +1736,8 @@ class _Bubble extends StatelessWidget {
               data: message.segments[i],
               selectable: true,
               styleSheet: AppTheme.markdown(context),
+              extensionSet: kLatexExtensionSet,
+              builders: kLatexBuilders,
             ),
           ),
         if (message.streaming && message.isEmpty && !hasActivity)

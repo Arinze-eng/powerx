@@ -39,6 +39,11 @@ dependencies:
   # transcription endpoint so speech becomes text in the composer.
   record: ^6.1.2
   permission_handler: ^11.3.1
+  # TeX in assistant replies (web parity with rehype-katex). Pinned: 0.7.4+
+  # needs a newer Flutter than the 3.29.3 the CI builds with.
+  flutter_math_fork: 0.7.3
+  # Markdown syntax extensions for the TeX delimiters above.
+  markdown: ^7.3.0
 
 dependency_overrides:
   # record's transitive Linux federated plugin must match the resolved
