@@ -19,7 +19,8 @@ class ActivityStep {
   String id;
   String name; // tool name or hint text
   String detail; // short argument summary
-  /// start | running | done | error
+  /// running | done | refused | error. `refused` is a guard saying no (not a
+  /// failure); `error` is a real failure. Mirrors the WebUI's SandboxActivityStatus.
   String status;
   final DateTime startedAt;
   int order;
@@ -33,7 +34,8 @@ class ActivityStep {
     this.order = 0,
   }) : startedAt = startedAt ?? DateTime.now();
 
-  bool get isDone => status == 'done' || status == 'error';
+  bool get isDone =>
+      status == 'done' || status == 'error' || status == 'refused';
 
   /// Parse one live `tool_events[]` entry (phase start/end/error).
   static ActivityStep? fromToolEvent(Map<String, dynamic> te,
@@ -43,11 +45,7 @@ class ActivityStep {
     final callId = (te['call_id'] ?? te['callId'] ?? '').toString();
     if (name.isEmpty) return null;
     final detail = summarizeArgs(te['arguments'] ?? te['args']);
-    final status = phase == 'start'
-        ? 'running'
-        : phase == 'error'
-            ? 'error'
-            : 'done';
+    final status = _statusFor(phase, te['outcome']?.toString());
     return ActivityStep(
       id: callId.isNotEmpty
           ? callId
@@ -57,6 +55,22 @@ class ActivityStep {
       status: status,
       order: order,
     );
+  }
+
+  /// How a finished call ended. The host's own `outcome` wins: a guard that
+  /// said no (`refused`) is not a failure and must not look like one. `phase`
+  /// is the fallback for frames that predate the field.
+  static String _statusFor(String phase, String? outcome) {
+    if (phase == 'start') return 'running';
+    switch (outcome) {
+      case 'refused':
+        return 'refused';
+      case 'error':
+        return 'error';
+      case 'ok':
+        return 'done';
+    }
+    return phase == 'error' ? 'error' : 'done';
   }
 
   /// Parse a pre-rendered trace line like `read_file({"path": "x"})` that the
@@ -227,8 +241,12 @@ class ActivityStep {
     return stem.length >= 8 && longer.startsWith(stem);
   }
 
-  static int _statusRank(String s) =>
-      s == 'error' ? 3 : (s == 'done' ? 2 : 1);
+  static int _statusRank(String s) => switch (s) {
+        'error' => 4,
+        'refused' => 3,
+        'done' => 2,
+        _ => 1,
+      };
 
   /// Fold a second observation of this same step into the row already on
   /// screen: the most advanced status wins (a late `running` replay must never

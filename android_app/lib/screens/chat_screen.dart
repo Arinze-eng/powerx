@@ -1878,9 +1878,13 @@ class _StepStatus extends StatelessWidget {
       );
     }
     if (status == 'error') {
-      return  Icon(Icons.error_outline, size: 14, color: Palette.danger);
+      return Icon(Icons.error_outline, size: 14, color: Palette.danger);
     }
-    return  Icon(
+    if (status == 'refused') {
+      // A guard said no: a neutral notice, not a failure.
+      return Icon(Icons.shield_outlined, size: 14, color: Palette.warning);
+    }
+    return Icon(
       Icons.check_circle_outline,
       size: 14,
       color: Palette.success,

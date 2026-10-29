@@ -203,6 +203,39 @@ void main() {
       expect(err.status, 'error');
     });
 
+    test('the host outcome decides: a refusal is not a red failure', () {
+      final refused = ActivityStep.fromToolEvent({
+        'phase': 'error',
+        'name': 'mt5_trade',
+        'call_id': 'c3',
+        'outcome': 'refused',
+      })!;
+      expect(refused.status, 'refused');
+      expect(refused.isDone, isTrue);
+
+      final ok = ActivityStep.fromToolEvent({
+        'phase': 'end',
+        'name': 'document_forge',
+        'call_id': 'c4',
+        'outcome': 'ok',
+      })!;
+      expect(ok.status, 'done');
+
+      final failed = ActivityStep.fromToolEvent({
+        'phase': 'error',
+        'name': 'run_command',
+        'call_id': 'c5',
+        'outcome': 'error',
+      })!;
+      expect(failed.status, 'error');
+    });
+
+    test('a late running replay never reopens a finished row', () {
+      final finished = ActivityStep(id: 'x', name: 'n', status: 'refused');
+      finished.mergeLive(ActivityStep(id: 'x', name: 'n', status: 'running'));
+      expect(finished.status, 'refused');
+    });
+
     test('returns null when name missing', () {
       expect(ActivityStep.fromToolEvent({'phase': 'start'}), isNull);
     });
