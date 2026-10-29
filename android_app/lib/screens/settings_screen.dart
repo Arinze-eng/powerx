@@ -1211,8 +1211,12 @@ class _SignOutButton extends StatelessWidget {
       child: OutlinedButton.icon(
         onPressed: () async {
           await context.read<AppState>().signOut();
+          // Return to the root route. _RootGate is the root and shows the
+          // auth flow, the recovery-code step and Home by status. Pushing a
+          // new '/auth' route here removed the root, so sign-in and sign-up
+          // then ran with no gate on screen until the app was restarted.
           if (context.mounted) {
-            Navigator.of(context).pushNamedAndRemoveUntil('/auth', (r) => false);
+            Navigator.of(context).popUntil((r) => r.isFirst);
           }
         },
         icon: const Icon(Icons.logout_rounded, size: 18),
