@@ -432,3 +432,32 @@ List<ChatMessage> relinkLiveTurn({
   merged[targetIndex] = live;
   return merged;
 }
+/// Opens the live bubble for a turn the user has just sent.
+///
+/// Every send gets its own bubble, bound to [turnId] and appended AFTER the
+/// user row that was just added. A bubble left over from an earlier turn
+/// ([stale]) is retired first, so its later events can no longer write into
+/// it. Reusing the stale bubble is what put a new answer above the new
+/// question, under the previous turn ("my request is lumped with the previous
+/// request").
+ChatMessage beginLiveTurn({
+  required List<ChatMessage> messages,
+  required ChatMessage? stale,
+  required String turnId,
+}) {
+  if (stale != null) {
+    stale.streaming = false;
+    stale.reasoningStreaming = false;
+    for (final s in stale.activity) {
+      if (!s.isDone) s.status = 'done';
+    }
+  }
+  final live = ChatMessage(
+    id: 'live-${DateTime.now().microsecondsSinceEpoch}',
+    role: Role.assistant,
+    streaming: true,
+    turnId: turnId,
+  );
+  messages.add(live);
+  return live;
+}

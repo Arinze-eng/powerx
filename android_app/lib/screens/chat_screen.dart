@@ -1172,6 +1172,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     final state = context.read<AppState>();
     final wireMedia = readyMedia.map((a) => a.toWireMedia()).toList();
+    // One id names this turn end to end: the question row, the answer bubble
+    // and the gateway run. Stored on the rows, so an echo or replay of this
+    // turn matches them instead of opening another bubble.
+    final turnId = newTurnId();
 
     setState(() {
       _messages.add(
@@ -1179,6 +1183,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           id: 'u-${DateTime.now().microsecondsSinceEpoch}',
           role: Role.user,
           text: text,
+          turnId: turnId,
           media:
               readyMedia
                   .map((a) => a.url ?? (a.localPath ?? ''))
