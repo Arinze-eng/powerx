@@ -47,7 +47,7 @@ from nanobot.utils.onlyfiles import (
 
 PAGE = "https://onlyfiles.com/ABC123def/app-debug.apk"
 RAW = "https://onlyfiles.com/dl/1790755869.f9f6b984/ABC123def/app-debug.apk"
-GATEWAY = "https://http--powerx--mxq9vl6k966n.code.run/f/w7wLwZg3IpKk"
+GATEWAY = "https://http--powerx--rhds9jmz8629.code.run/f/w7wLwZg3IpKk"
 
 
 def _clear_gateway_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -137,7 +137,7 @@ def test_delivery_hands_over_the_onlyfiles_link_and_hides_the_alternatives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The exact production shape: a gateway was configured AND a token minted."""
-    monkeypatch.setenv("POWERX_PUBLIC_URL", "https://http--powerx--mxq9vl6k966n.code.run/admin")
+    monkeypatch.setenv("POWERX_PUBLIC_URL", "https://http--powerx--rhds9jmz8629.code.run/admin")
     shared = file_share._normalize_onlyfiles(
         {
             "url": GATEWAY,

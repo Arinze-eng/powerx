@@ -4,7 +4,7 @@ class PowerXConfig {
   /// Override at build time: --dart-define=POWERX_URL=https://your-host
   static const String baseUrl = String.fromEnvironment(
     'POWERX_URL',
-    defaultValue: 'https://http--powerx--mxq9vl6k966n.code.run',
+    defaultValue: 'https://http--powerx--rhds9jmz8629.code.run',
   );
 
   /// User-visible app name. Keep in sync with pubspec `version` below — the

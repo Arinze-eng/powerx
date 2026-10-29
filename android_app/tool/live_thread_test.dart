@@ -18,7 +18,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:powerx_android/services/gateway_api.dart';
 
-const String kOrigin = 'https://http--powerx--mxq9vl6k966n.code.run';
+const String kOrigin = 'https://http--powerx--rhds9jmz8629.code.run';
 
 Future<String> signIn(String email, String password) async {
   final boot = jsonDecode((await http.get(Uri.parse('$kOrigin/webui/bootstrap'))).body)

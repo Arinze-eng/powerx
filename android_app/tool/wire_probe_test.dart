@@ -23,7 +23,7 @@ import 'package:powerx_android/models.dart';
 import 'package:powerx_android/services/gateway_api.dart';
 import 'package:powerx_android/services/nanobot_socket.dart';
 
-const String kOrigin = 'https://http--powerx--mxq9vl6k966n.code.run';
+const String kOrigin = 'https://http--powerx--rhds9jmz8629.code.run';
 
 int _t0 = DateTime.now().millisecondsSinceEpoch;
 String _ts() =>

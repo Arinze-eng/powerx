@@ -1,6 +1,6 @@
 # PowerX Android Client (Native)
 
-A **fully native Flutter client** for your self-hosted [PowerX](https://http--powerx--mxq9vl6k966n.code.run/) AI agent (nanobot gateway). No WebView — it speaks directly to the backend's auth + chat APIs and renders a custom native UI.
+A **fully native Flutter client** for your self-hosted [PowerX](https://http--powerx--rhds9jmz8629.code.run/) AI agent (nanobot gateway). No WebView — it speaks directly to the backend's auth + chat APIs and renders a custom native UI.
 
 ## Architecture
 
@@ -98,7 +98,7 @@ Tokens persist securely (`flutter_secure_storage`) so sign-in survives restarts;
 Default backend:
 
 ```
-https://http--powerx--mxq9vl6k966n.code.run
+https://http--powerx--rhds9jmz8629.code.run
 ```
 
 Override at build time:
