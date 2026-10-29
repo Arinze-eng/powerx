@@ -219,38 +219,61 @@ def external_lookup_signature(tool_name: str, arguments: Any) -> str | None:
 #: list and a null are the same request as a key that was left out entirely.
 _EMPTY_ARGUMENT_VALUES: tuple[Any, ...] = (None, "", [], {})
 
-#: How many of the most recent calls the alternation detector looks at, and how
-#: many full cycles of the pair it needs before calling it a loop. Six calls is
-#: three cycles of A, B -- high confidence, and deliberately more than the four
-#: calls a minimal A,B,A,B rule would need, because an agent legitimately
-#: alternating two probes early in a task must not be stopped.
-STUCK_WINDOW = 6
+#: How many of the most recent calls the cycle detector looks at. Nine is three
+#: full cycles of a three-call loop; the two-call check needs only six of them.
+#: Three cycles everywhere: a task that legitimately repeats a short sequence
+#: once or twice (probe, read, probe) must not be stopped.
+STUCK_WINDOW = 9
 
 
 def stuck_pattern(recent: Sequence[str]) -> str | None:
     """Return a description when *recent* call identities are an unproductive loop.
 
-    Catches the shape a consecutive-repeat guard is blind to: **alternation**.
-    A model that re-issues A, B, A, B never repeats a call twice in a row, so a
-    guard that only compares against the previous call never fires -- while the
-    turn pays a full round trip per call and executes the same two things
-    forever. Standard agent frameworks (OpenHands' stuck detector, LangGraph's
-    ``StuckLoopDetection``) all carry this check alongside the consecutive one;
-    a consecutive-only guard is the gap that produced the measured 119-iteration
-    turn this module exists to bound.
+    A consecutive-repeat guard is blind to a model that cycles through several
+    calls: it never issues the same call twice in a row, yet the turn pays a
+    full round trip per call and runs the same few things forever. Standard
+    agent frameworks (OpenHands' stuck detector, LangGraph's
+    ``StuckLoopDetection``) carry this check alongside the consecutive one.
 
-    Three full cycles (A, B, A, B, A, B) are required rather than the minimum
-    four calls, so a task that legitimately alternates two probes once or twice
-    is untouched. Returns a short reason, or None when nothing is stuck.
+    Checked for cycles of two and three distinct calls, each repeated three
+    times in full (A,B,A,B,A,B and A,B,C,A,B,C,A,B,C). Returns a short reason,
+    or None when nothing is stuck.
     """
     window = [item for item in recent][-STUCK_WINDOW:]
-    if len(window) < STUCK_WINDOW:
-        return None
-    even = window[0::2]
-    odd = window[1::2]
-    if len(set(even)) == 1 and len(set(odd)) == 1 and even[0] != odd[0]:
-        return "an alternating pair of calls repeated three times"
+    for period in (2, 3):
+        span = period * 3
+        if len(window) < span:
+            continue
+        tail = window[-span:]
+        block = tail[:period]
+        if len(set(block)) != period:
+            continue  # a cycle must be made of distinct calls
+        if all(tail[i] == block[i % period] for i in range(span)):
+            if period == 2:
+                return "an alternating pair of calls repeated three times"
+            return "a cycle of three calls repeated three times"
     return None
+
+
+#: Phrases that ask the agent to throw away the attempt in progress and begin
+#: again. Matched only in short messages, so a long instruction that happens to
+#: contain "again" is never read as a restart.
+_RESTART_RE = re.compile(
+    r"\b(?:start|begin|restart|redo)\s+(?:all\s+)?over\b"
+    r"|\b(?:start|begin)\s+(?:all\s+)?(?:again|afresh)\b"
+    r"|\ball over again\b"
+    r"|\bfrom (?:the )?(?:beginning|start|scratch)\b"
+    r"|^\s*restart\s*[.!]*\s*$"
+)
+_RESTART_MAX_WORDS = 10
+
+
+def is_restart_request(text: str) -> bool:
+    """True when *text* is a short message asking the agent to start over."""
+    cleaned = " ".join(text.lower().split())
+    if not cleaned or len(cleaned.split()) > _RESTART_MAX_WORDS:
+        return False
+    return bool(_RESTART_RE.search(cleaned))
 
 
 def normalize_tool_arguments(tool_name: str, arguments: Any) -> dict[str, Any]:

@@ -210,6 +210,19 @@ def test_alternation_is_recognised_as_a_loop() -> None:
     assert stuck_pattern(["a", "a", "b", "b", "a", "a"]) is None
 
 
+def test_three_call_cycle_is_recognised_as_a_loop() -> None:
+    """A, B, C, A, B, C, A, B, C cycles through three calls and never repeats one twice in a row."""
+    from nanobot.utils.runtime import stuck_pattern
+
+    assert stuck_pattern(["a", "b", "c", "a", "b", "c", "a", "b", "c"]) is not None
+    # Two cycles of three is not enough.
+    assert stuck_pattern(["a", "b", "c", "a", "b", "c"]) is None
+    # A cycle that breaks in the last call is not stuck.
+    assert stuck_pattern(["a", "b", "c", "a", "b", "c", "a", "b", "d"]) is None
+    # A block made of one call repeated is the identical-call rule, not a cycle.
+    assert stuck_pattern(["a", "a", "a", "a", "a", "a", "a", "a", "a"]) is None
+
+
 @pytest.mark.asyncio
 async def test_an_alternating_model_is_stopped_too() -> None:
     """A-B-A-B with two *different* calls must also end the turn."""

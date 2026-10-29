@@ -107,6 +107,7 @@ from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
+    is_restart_request,
 )
 
 if TYPE_CHECKING:
@@ -1028,6 +1029,43 @@ class AgentLoop:
         exec_cancelled = await self._exec_session_manager.terminate_by_owner(key)
         return cancelled + sub_cancelled + exec_cancelled
 
+    async def _abandon_active_turn(self, key: str) -> int:
+        """Stop the running turn for *key* and drop its unfinished work.
+
+        Used when the user says to start over. Unlike /stop, the abandoned
+        turn's checkpoint is not restored into history: the user has judged the
+        attempt wrong, so its half-finished tool results must not be replayed.
+        Earlier completed turns stay in the session. Returns how many tasks,
+        subagents, exec sessions and queued messages were dropped.
+        """
+        self._discarding_sessions.add(key)
+        try:
+            cancelled = await self._cancel_active_tasks(key)
+            pending = self._pending_queues.pop(key, None)
+            if pending is not None:
+                while not pending.empty():
+                    try:
+                        pending.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    cancelled += 1
+            session = self.sessions.get_or_create(key)
+            if session.metadata.get(self._PENDING_USER_TURN_KEY) and (
+                session.messages and session.messages[-1].get("role") == "user"
+            ):
+                session.add_message(
+                    "assistant",
+                    "The previous attempt was stopped because the user asked to start over.",
+                )
+            self._clear_pending_user_turn(session)
+            self._clear_runtime_checkpoint(session)
+            session.provider_state = None
+            self.sessions.save(session)
+        finally:
+            self._discarding_sessions.discard(key)
+        logger.info("Abandoned active turn for session {} to start over ({} item(s))", key, cancelled)
+        return cancelled
+
     async def discard_session(self, key: str) -> None:
         """Stop active work for *key* and forget its cached session."""
         self._discarding_sessions.add(key)
@@ -1652,6 +1690,15 @@ class AgentLoop:
                         break
                 if deferred:
                     continue
+                # "Start over" must not be queued for mid-turn injection: a looping
+                # turn would simply ignore it. Abandon the running turn instead and
+                # run the request below as a fresh turn.
+                if (
+                    msg.channel != "system"
+                    and effective_key in self._pending_queues
+                    and is_restart_request(raw)
+                ):
+                    await self._abandon_active_turn(effective_key)
                 # If this session already has an active pending queue (i.e. a task
                 # is processing this session), route the message there for mid-turn
                 # injection instead of creating a competing task.
