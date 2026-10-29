@@ -344,14 +344,14 @@ async def test_image_only_message_allows_empty_text(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_message_rejected_when_more_than_four_images(tmp_path) -> None:
+async def test_message_rejected_when_more_than_max_images(tmp_path) -> None:
     channel = _make_channel()
     mock_conn = AsyncMock()
     envelope = {
         "type": "message",
         "chat_id": "abc123",
         "content": "hi",
-        "media": [{"data_url": _tiny_png_data_url()}] * 5,
+        "media": [{"data_url": _tiny_png_data_url()}] * 21,
         "turn_id": "turn-attachments",
     }
 
@@ -379,10 +379,7 @@ async def test_message_rejected_when_too_many_total_attachments(tmp_path) -> Non
         "chat_id": "abc123",
         "content": "mixed",
         "media": [
-            {"data_url": _tiny_png_data_url()},
-            {"data_url": _tiny_png_data_url()},
-            {"data_url": _tiny_png_data_url()},
-            {"data_url": _tiny_png_data_url()},
+            *({"data_url": _tiny_png_data_url()} for _ in range(20)),
             {"data_url": _data_url("application/pdf", b"%PDF-1.4"), "name": "report.pdf"},
         ],
     }
