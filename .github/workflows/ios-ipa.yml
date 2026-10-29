@@ -49,9 +49,9 @@ jobs:
         working-directory: android_app
         run: flutter analyze
 
-      - name: Run tests
-        working-directory: android_app
-        run: flutter test
+      # Unit tests are not run here. They are platform-independent Dart and the
+      # Android workflow runs the same suite on every push to main. Socket tests
+      # use real loopback timing, which is flaky on the slower macOS runner.
 
       - name: Generate iOS project
         # The repo has no ios/ folder yet. Generate one in a scratch directory
