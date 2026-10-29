@@ -66,7 +66,7 @@ from typing import Any, Iterable
 #: ``nanobot/agent/tools/media.py`` greps for this exact assignment and refuses
 #: to run a sandbox copy that carries a different one, so a stale (CDN-cached)
 #: revision can never masquerade as the current one.
-CLI_VERSION = "1.3.0"
+CLI_VERSION = "1.3.1"
 
 #: Where heavy downloads live so they survive across calls in one sandbox.
 CACHE_DIR = Path(os.getenv("MEDIA_CACHE_DIR", str(Path.home() / ".cache" / "media_cli")))
@@ -2264,6 +2264,146 @@ def _invidious_stream(
     return total
 
 
+def _cut_section(final: Path, section_text: str) -> None:
+    """Trim ``final`` in place to a ``start-end`` range (seconds or HH:MM:SS)."""
+    section = section_text.strip().lstrip("*")
+    start_text, _, end_text = section.partition("-")
+    start = _seconds(start_text)
+    end = _seconds(end_text) if end_text else 0.0
+    trimmed = final.with_name(final.stem + ".section" + final.suffix)
+    # ``-ss`` BEFORE ``-i`` and the length as an OUTPUT ``-t``: both placed
+    # before the input they are input-side options, so ``-ss 10 -to 10`` reads
+    # as "start at 10 and stop at 10" and ffmpeg refuses the whole cut with
+    # "-to value smaller than -ss".
+    cmd = [_require("ffmpeg"), "-v", "error", "-ss", f"{start:.3f}", "-i", str(final)]
+    if end > start:
+        cmd += ["-t", f"{end - start:.3f}"]
+    cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart", "-y", str(trimmed)]
+    proc = run(cmd, timeout=1800)
+    if proc.returncode != 0:
+        raise MediaError(f"could not cut {section} out of the download: {_tail(proc.stderr)}")
+    trimmed.replace(final)
+    info = probe(final)
+    if info.get("bytes", 0) < 1024 or not info.get("has_video"):
+        raise MediaError(f"the cut came out empty ({info.get('bytes')} bytes)")
+
+
+_FASTSAVER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
+
+
+def download_via_fastsaver(
+    args: argparse.Namespace,
+    *,
+    out_dir: Path,
+    target_file: Path | None,
+    timeout: int,
+) -> dict[str, Any]:
+    """Fetch the file behind a FastSaver link the host already obtained.
+
+    The host holds the FastSaver key and has asked for the link; this function
+    only downloads it. The link needs no key, so nothing secret is in the sandbox.
+    The finished file is verified exactly like the Invidious path: it must be
+    media (not a web page), probe with the streams that were asked for, and run
+    for close to the length FastSaver reported.
+    """
+    link = str(getattr(args, "fastsaver_url", "") or "").strip()
+    if not link.startswith("https://"):
+        raise MediaError("no FastSaver link was supplied")
+    wanted_audio = bool(getattr(args, "audio_only", False))
+    duration_hint = float(getattr(args, "fastsaver_duration", 0.0) or 0.0)
+    filename = str(getattr(args, "fastsaver_filename", "") or "")
+    video_id = _invidious_video_id(args.url) or ""
+
+    # The container comes from what FastSaver names the file, and is only
+    # trusted when it is a media extension this tool knows. A made-up extension
+    # would be a lie about the file.
+    named = Path(filename).suffix.lower()
+    if wanted_audio:
+        suffix = ".mp3"
+    elif named in VIDEO_EXT:
+        suffix = named
+    else:
+        suffix = ".mp4"
+    title = Path(filename).stem or video_id or "video"
+
+    if target_file is not None:
+        final = target_file.with_suffix(suffix)
+    else:
+        final = out_dir / _invidious_filename(title, video_id or "fastsaver", suffix)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    part = final.with_name(final.stem + ".fastsaver-part")
+
+    request = urllib.request.Request(link, headers={"User-Agent": _FASTSAVER_UA})
+    total = 0
+    declared: str | None = None
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if response.status not in (200, 206):
+                raise MediaError(f"FastSaver link returned HTTP {response.status}")
+            head = response.read(65536)
+            if len(head) < 12:
+                raise MediaError(f"FastSaver link came back empty ({len(head)} bytes)")
+            if head[:1] == b"<":
+                raise MediaError("FastSaver link came back as a web page, not media")
+            declared = response.headers.get("Content-Length")
+            with part.open("wb") as handle:
+                handle.write(head)
+                total += len(head)
+                while True:
+                    chunk = response.read(1 << 20)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    total += len(chunk)
+    except urllib.error.HTTPError as exc:
+        part.unlink(missing_ok=True)
+        raise MediaError(f"FastSaver link returned HTTP {exc.code}") from exc
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        part.unlink(missing_ok=True)
+        raise MediaError(f"FastSaver link download failed: {exc}") from exc
+    if declared and declared.isdigit() and int(declared) != total:
+        part.unlink(missing_ok=True)
+        raise MediaError(f"FastSaver link was cut short ({total} of {declared} bytes)")
+
+    info = probe(part)
+    if info.get("bytes", 0) < 10240:
+        part.unlink(missing_ok=True)
+        raise MediaError(f"the FastSaver file is only {info.get('bytes')} bytes; not a video")
+    if wanted_audio and not info.get("has_audio"):
+        part.unlink(missing_ok=True)
+        raise MediaError("the FastSaver file carries no audio stream")
+    if not wanted_audio and not (info.get("has_video") and info.get("has_audio")):
+        part.unlink(missing_ok=True)
+        raise MediaError("the FastSaver file lacks a video or an audio stream")
+    if duration_hint and info.get("duration") and info["duration"] < duration_hint * 0.9:
+        part.unlink(missing_ok=True)
+        raise MediaError(
+            f"the FastSaver file is {info['duration']:.1f}s of a {duration_hint:.0f}s video"
+        )
+    part.replace(final)
+
+    if getattr(args, "section", None):
+        _cut_section(final, str(args.section))
+    info = probe(final)
+
+    return {
+        "url": args.url,
+        "directory": str(out_dir),
+        "files": [str(final)],
+        "output": str(final),
+        "output_probe": info,
+        "video_id": video_id,
+        "title": title,
+        "via": "fastsaver",
+        "player_client": "fastsaver",
+        "attempts": ["fastsaver"],
+    }
+
+
 def download_via_invidious(
     args: argparse.Namespace,
     *,
@@ -2390,27 +2530,8 @@ def download_via_invidious(
     # whole stream or a byte range, never a time range, so asking for one is a
     # second step here rather than a flag on the fetch.
     if getattr(args, "section", None):
-        section = str(args.section).strip().lstrip("*")
-        start_text, _, end_text = section.partition("-")
-        start = _seconds(start_text)
-        end = _seconds(end_text) if end_text else 0.0
-        trimmed = final.with_name(final.stem + ".section" + final.suffix)
-        # ``-ss`` BEFORE ``-i`` and the length as an OUTPUT ``-t``: both placed
-        # before the input they are input-side options, so ``-ss 10 -to 10`` reads
-        # as "start at 10 and stop at 10" and ffmpeg refuses the whole cut with
-        # "-to value smaller than -ss".
-        cmd = [_require("ffmpeg"), "-v", "error", "-ss", f"{start:.3f}", "-i", str(final)]
-        if end > start:
-            cmd += ["-t", f"{end - start:.3f}"]
-        cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero",
-                "-movflags", "+faststart", "-y", str(trimmed)]
-        proc = run(cmd, timeout=1800)
-        if proc.returncode != 0:
-            raise MediaError(f"could not cut {section} out of the download: {_tail(proc.stderr)}")
-        trimmed.replace(final)
+        _cut_section(final, str(args.section))
         info = probe(final)
-        if info.get("bytes", 0) < 1024 or not info.get("has_video"):
-            raise MediaError(f"the cut came out empty ({info.get('bytes')} bytes)")
 
     return {
         "url": args.url,
@@ -2434,8 +2555,9 @@ def download_via_invidious(
 def cmd_download(args: argparse.Namespace) -> int:
     """yt-dlp, the one tool that reliably turns a link into a file."""
     via = str(getattr(args, "via", "auto") or "auto").lower()
+    fastsaver_url = str(getattr(args, "fastsaver_url", "") or "").strip()
     ytdlp: str | None = _which("yt-dlp")
-    if via != "invidious" and not ytdlp:
+    if via != "invidious" and not ytdlp and not fastsaver_url:
         ytdlp = _require("yt-dlp")
 
     # ``--out`` is documented as "file or directory" and the model writes
@@ -2465,7 +2587,21 @@ def cmd_download(args: argparse.Namespace) -> int:
     else:
         template = str(out_dir / "%(title).120B [%(id)s].%(ext)s")
 
-    height = {"best": 0, "1080": 1080, "720": 720, "480": 480}.get(str(args.quality), 1080)
+    height = {"best": 0, "1080": 1080, "720": 720, "480": 480, "360": 360}.get(str(args.quality), 1080)
+
+    # FastSaver first, when the host obtained a link for it. The link is only
+    # passed for ``via=auto``; a failure here is not final, it just means the
+    # next path below runs. Nothing about the failure is hidden: it is printed.
+    if fastsaver_url and via == "auto":
+        try:
+            return ok(**download_via_fastsaver(
+                args, out_dir=out_dir, target_file=target_file,
+                timeout=int(args.timeout),
+            ))
+        except MediaError as exc:
+            print(f"[media] FastSaver link failed ({exc}); trying yt-dlp", file=sys.stderr)
+    if via != "invidious" and not ytdlp:
+        ytdlp = _require("yt-dlp")
 
     # Codec preference. YouTube's "best" is now AV1 video + Opus audio, which is
     # the wrong default for a tool whose whole purpose is cutting clips for
@@ -3101,6 +3237,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--section", help="only this range, e.g. *00:01:00-00:02:00")
     p.add_argument("--subtitles", help="language code, e.g. en")
     p.add_argument("--timeout", type=int, default=3600)
+    # Host-only: the host asks FastSaver for a short-lived link and passes it here.
+    # The API key never reaches this command. Hidden from --help on purpose.
+    p.add_argument("--fastsaver-url", default="", help=argparse.SUPPRESS)
+    p.add_argument("--fastsaver-filename", default="", help=argparse.SUPPRESS)
+    p.add_argument("--fastsaver-duration", type=float, default=0.0, help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_download)
 
     p = sub.add_parser("shorts", help="cut publishable vertical clips out of a long video")

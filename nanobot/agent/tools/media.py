@@ -49,6 +49,7 @@ Safety model
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -60,6 +61,7 @@ from loguru import logger
 
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import ToolContext
+from nanobot.utils import fastsaver
 
 #: Raw GitHub base for the two sandbox-side scripts. The sandbox has internet
 #: access (the Novita tool creates boxes with ``allow_internet_access=True``), so
@@ -85,7 +87,7 @@ _REPO = os.getenv("MEDIA_SCRIPT_REPO", "Arinze-eng/powerx")
 #: that is no longer running, the caller gets a loud warning and a retry against a
 #: different source. Bump BOTH constants together whenever the CLI's contract with
 #: this tool changes.
-_CLI_VERSION = "1.3.0"
+_CLI_VERSION = "1.3.1"
 
 #: Where the CLI, its installer and its detached jobs live inside the sandbox.
 _MEDIA_HOME = "$HOME/.media"
@@ -254,6 +256,10 @@ _FLAG_SPEC: dict[str, dict[str, Any]] = {
             "out": "--out", "quality": "--quality", "cookies": "--cookies",
             "section": "--section", "subtitles": "--subtitles", "codec": "--codec",
             "via": "--via",
+            # Host-supplied FastSaver link (see _with_fastsaver_link). Not model-facing.
+            "fastsaver_url": "--fastsaver-url",
+            "fastsaver_filename": "--fastsaver-filename",
+            "fastsaver_duration": "--fastsaver-duration",
         },
         "bools": {"audio_only": "--audio-only", "playlist": "--playlist"},
     },
@@ -515,6 +521,43 @@ def launch_command(action: str, kwargs: dict[str, Any], job_id: str) -> str:
     return "\n".join(lines)
 
 
+async def _with_fastsaver_link(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Ask FastSaver for a download link on the host, for a YouTube ``auto`` download.
+
+    The key stays on the host. Only the short-lived link goes into the sandbox
+    command, as ``--fastsaver-url``. Any ``fastsaver_*`` value the model passed
+    itself is discarded, so the model cannot point the sandbox at an arbitrary
+    link through this path. If FastSaver is not configured, or refuses, the
+    kwargs come back without a link and the sandbox runs yt-dlp as before.
+    """
+    kwargs = {k: v for k, v in kwargs.items() if not str(k).startswith("fastsaver_")}
+    if str(kwargs.get("via") or "auto").lower() != "auto":
+        return kwargs
+    url = str(kwargs.get("url") or "")
+    if not fastsaver.api_key() or not fastsaver.is_youtube_url(url):
+        return kwargs
+    try:
+        link = await asyncio.to_thread(
+            fastsaver.request_download,
+            url,
+            str(kwargs.get("quality") or "1080"),
+            bool(kwargs.get("audio_only")),
+        )
+    except fastsaver.FastSaverError as exc:
+        logger.warning("media_sandbox: FastSaver unavailable, using yt-dlp ({})", exc)
+        return kwargs
+    if not link:
+        return kwargs
+    logger.info("media_sandbox: FastSaver link obtained ({}, {} credits)",
+                link["format"], link["credits"])
+    return {
+        **kwargs,
+        "fastsaver_url": link["download_url"],
+        "fastsaver_filename": link["filename"],
+        "fastsaver_duration": link["duration"],
+    }
+
+
 def _parse_payload(rendered: str) -> dict[str, Any] | None:
     """Pull the CLI's JSON object out of the sandbox command output.
 
@@ -662,13 +705,13 @@ class MediaSandboxTool(Tool):
             "resolution: a 720p source cannot become a real 1080x1920, so shorts from it "
             "come out 404x718 (exactly 9:16) and the result says upscaled=false. "
             "Downloading: action='download' takes a YouTube/other link and saves locally "
-            "(yt-dlp) — quality 1080/720/480/best, audio_only for the soundtrack, "
+            "— quality 1080/720/480/best, audio_only for the soundtrack, "
             "section for a single range, subtitles to pull the platform's own captions. "
-            "When YouTube refuses the sandbox IP (\"Sign in to confirm you're not a "
-            "bot\"), the download automatically retries through a public Invidious "
-            "instance, which asks YouTube from its own IP; the result then says "
-            "via='invidious' and names the instance. Leave via='auto' unless you are "
-            "deliberately testing that fallback. "
+            "For YouTube with via='auto' the order is: FastSaver API first (a paid, "
+            "reliable link fetched on the host; the result says via='fastsaver'), then "
+            "yt-dlp, then a public Invidious instance (via='invidious') when YouTube "
+            "refuses the sandbox IP (\"Sign in to confirm you're not a bot\"). "
+            "Leave via='auto' unless you are deliberately testing one route. "
             "Shorts: action='shorts' transcribes (faster-whisper, local) when there is no "
             "sidecar transcript, scores sentence-boundary windows on words-per-second and "
             "hook words, and writes non-overlapping vertical clips with a thumbnail, an "
@@ -705,7 +748,7 @@ class MediaSandboxTool(Tool):
                 "out": {"type": "string", "description": "Output path inside the sandbox. If it ends in a media extension (e.g. clip.mp4) it is the OUTPUT FILE and the result lands at exactly that path; otherwise it is a directory and the file is named from the source. Defaults to a sibling of the input with a sensible name."},
                 "quality": {"type": "string", "enum": ["1080", "720", "480", "360", "best", "worst"], "description": "action=download: max height to request (default 1080)."},
                 "codec": {"type": "string", "enum": ["h264", "best"], "description": "action=download: 'h264' (default) prefers H.264/AAC, which re-encodes fast and is accepted by TikTok/Instagram and every editor. 'best' takes the platform's raw preference instead (YouTube now serves AV1/Opus), which is only right for a file that will never be edited or re-uploaded."},
-                "via": {"type": "string", "enum": ["auto", "yt-dlp", "invidious"], "description": "action=download: 'auto' (default) uses yt-dlp and falls back to an Invidious instance when YouTube refuses this IP as a bot; 'yt-dlp' never falls back; 'invidious' skips yt-dlp entirely."},
+                "via": {"type": "string", "enum": ["auto", "yt-dlp", "invidious"], "description": "action=download: 'auto' (default) tries FastSaver first for YouTube when it is configured, then yt-dlp, then an Invidious instance when YouTube refuses this IP as a bot; 'yt-dlp' skips FastSaver and never falls back; 'invidious' skips FastSaver and yt-dlp entirely."},
                 "audio_only": {"type": "boolean", "description": "action=download: fetch only the audio track."},
                 "playlist": {"type": "boolean", "description": "action=download: allow a playlist/whole channel. Off by default — one URL means one video."},
                 "section": {"type": "string", "description": "action=download: a single range, e.g. '*00:01:00-00:02:30'."},
@@ -1057,6 +1100,8 @@ class MediaSandboxTool(Tool):
                 }))
 
         # --- a normal media action ----------------------------------------- #
+        if action == "download":
+            kwargs = await _with_fastsaver_link(kwargs)
         command = build_cli_command(action, kwargs)
         if not command:
             return ToolResult.error(
