@@ -458,7 +458,10 @@ void main() {
 
     // The work eventually reports completion.
     gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'idle'});
-    await pumpEventQueue();
+    await settleFrames();
+    for (var i = 0; i < 300 && rec.turnEnds.isEmpty; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
     expect(rec.turnEnds.length, 1);
     expect(sock.isTurnActive(chatId), isFalse);
   });
