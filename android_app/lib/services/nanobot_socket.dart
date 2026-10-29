@@ -275,6 +275,11 @@ class NanobotSocket {
   /// because "we already thought this chat was active" survives a reconnect and
   /// is exactly what a ghost run looks like.
   final Map<String, DateTime> _lastTurnFrameAt = {};
+  /// Chats the user stopped (WebUI parity: the run is released locally at
+  /// once). Until the user sends again, a `goal_status: running` claim that
+  /// carries no turn id of a real run is the stopped run coming back on an
+  /// attach replay, so it is ignored instead of re-opening the busy state.
+  final Set<String> _stoppedChats = {};
   /// A frame this recent means the server really is running this chat's turn.
   static const Duration corroborationWindow = Duration(seconds: 20);
   /// How long an unconfirmed `goal_status: running` claim is believed without
@@ -821,6 +826,14 @@ class NanobotSocket {
               // reopening a finished task cannot re-fire its results.
               break;
             }
+            if (_stoppedChats.contains(chatId) &&
+                (replayTurnId == null ||
+                    replayTurnId.isEmpty ||
+                    replayTurnId.startsWith('webui-system:'))) {
+              // The user stopped this chat: a claim without a real turn id is
+              // the stopped run (or the /stop command itself) coming back.
+              break;
+            }
             final oursPending = _pendingSends.any((x) => x.chatId == chatId);
             if (replayTurnId != null && replayTurnId.isNotEmpty) {
               _currentTurnIds[chatId] = replayTurnId;
@@ -1141,6 +1154,7 @@ class NanobotSocket {
   void dropChat(String chatId) {
     _unconfirmedRuns.remove(chatId)?.cancel();
     _lastTurnFrameAt.remove(chatId);
+    _stoppedChats.remove(chatId);
     _views.remove(chatId);
     _attachedChats.remove(chatId);
     _wantedChats.remove(chatId);
@@ -1161,6 +1175,7 @@ class NanobotSocket {
   void markUserTurn(String chatId) {
     _activeTurns.add(chatId);
     _finalizedTurns.remove(chatId);
+    _stoppedChats.remove(chatId);
   }
 
   /// Start a turn: register the active flag, then send the message frame.
@@ -1172,6 +1187,7 @@ class NanobotSocket {
   }) {
     _activeTurns.add(chatId);
     _finalizedTurns.remove(chatId);
+    _stoppedChats.remove(chatId);
     _lastActedChatId = chatId;
     _wantedChats.add(chatId);
     // Persist BEFORE the frame reaches the socket. If the app is killed (or
@@ -1198,18 +1214,27 @@ class NanobotSocket {
     });
   }
 
-  /// Cancel the running task on [chatId] (server-side /stop semantics).
+  /// Cancel the running task on [chatId]. WebUI parity (useNanobotStream.stop):
+  /// the run is released locally at once, then a plain `/stop` message is sent.
+  /// No turn id is attached: the server answers `/stop` as a system command.
   void stopTask(String chatId) {
-    // Clear the local busy flag only after the server acknowledges; the UI
-    // keeps a bounded grace timer for the pathological case where the
-    // gateway never answers.
+    final stoppedTurnId = _currentTurnIds.remove(chatId);
+    if (stoppedTurnId != null && stoppedTurnId.isNotEmpty) {
+      // A replay of the stopped turn must not re-open it.
+      _completedTurnIds[chatId] = stoppedTurnId;
+    }
+    _stoppedChats.add(chatId);
+    _activeTurns.remove(chatId);
+    _finalizedTurns.add(chatId);
+    _unconfirmedRuns.remove(chatId)?.cancel();
+    _lastTurnFrameAt.remove(chatId);
     _confirmPendingSend(chatId, null);
+    _view(chatId)?.onTurnEnd(const TurnSummary());
     _send({
       'type': 'message',
       'chat_id': chatId,
       'content': '/stop',
       'webui': true,
-      'turn_id': 'stop-${DateTime.now().microsecondsSinceEpoch}',
     });
   }
 

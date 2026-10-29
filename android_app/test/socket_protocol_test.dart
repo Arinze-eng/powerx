@@ -451,7 +451,29 @@ void main() {
     expect(sock.isTurnActive(chatId), isFalse);
   });
 
-  test('stop sends /stop without locally cancelling the turn', () async {
+  test('stop releases the run at once and sends a plain /stop', () async {
+    await sock.connect();
+    final chatId = await sock.newChat();
+    final rec = Recorder();
+    sock.listen(chatId, rec.view());
+    sock.sendMessage(chatId, 'long task');
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+    await pumpEventQueue();
+    expect(sock.isTurnActive(chatId), isTrue);
+
+    sock.stopTask(chatId);
+    await pumpEventQueue();
+
+    // WebUI parity: the UI is released immediately, without waiting on the
+    // server, and the /stop command is a plain message (no turn id).
+    expect(rec.turnEnds.length, 1);
+    expect(sock.isTurnActive(chatId), isFalse);
+    final stopFrame = gw.inbound.lastWhere((f) => f['content'] == '/stop');
+    expect(stopFrame['type'], 'message');
+    expect(stopFrame.containsKey('turn_id'), isFalse);
+  });
+
+  test('a stopped run replayed without a real turn id stays stopped', () async {
     await sock.connect();
     final chatId = await sock.newChat();
     final rec = Recorder();
@@ -463,17 +485,35 @@ void main() {
     sock.stopTask(chatId);
     await pumpEventQueue();
 
-    // The cancel request reached the server...
-    expect(
-        gw.inbound.any((f) => f['type'] == 'message' && f['content'] == '/stop'),
-        isTrue);
-    // ...and the client did NOT assume the turn ended before the server said
-    // so (a server-authoritative stop is what prevents "it just gets cut").
-    expect(rec.turnEnds, isEmpty);
-
-    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'idle'});
+    // The server's stale "running" replay (or the /stop system turn) arrives
+    // after the stop. It must not bring the stopped run back to life.
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+    gw.send({
+      'event': 'goal_status',
+      'chat_id': chatId,
+      'status': 'running',
+      'turn_id': 'webui-system:stop',
+    });
     await pumpEventQueue();
-    expect(rec.turnEnds.length, 1);
+    expect(sock.isTurnActive(chatId), isFalse);
+  });
+
+  test('sending again clears the stop fence', () async {
+    await sock.connect();
+    final chatId = await sock.newChat();
+    final rec = Recorder();
+    sock.listen(chatId, rec.view());
+    sock.sendMessage(chatId, 'first');
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+    await pumpEventQueue();
+    sock.stopTask(chatId);
+    await pumpEventQueue();
+
+    sock.sendMessage(chatId, 'second');
+    await pumpEventQueue();
+    gw.send({'event': 'goal_status', 'chat_id': chatId, 'status': 'running'});
+    await pumpEventQueue();
+    expect(sock.isTurnActive(chatId), isTrue);
   });
 
   test('frames sent while offline are queued and flushed on reconnect',

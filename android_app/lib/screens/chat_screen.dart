@@ -49,7 +49,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   ChatView? _view;
   bool _sending = false; // local send in flight
   bool _remoteRunning = false; // server reports an active turn
-  bool _stopping = false;
   bool _loadingHistory = false;
   bool _connected = false;
   final OnlyFilesUploader _uploader = OnlyFilesUploader();
@@ -74,7 +73,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   /// gateway replays a killed run's wall-clock on every attach, so the
   /// transcript can claim a turn that no longer exists; see [TurnFence].
   final TurnFence _fence = TurnFence();
-  Timer? _stopWatchTimer; // bounded grace window after a /stop request
   /// Canonical-transcript hydration retry (see [_startHydration]).
   Timer? _hydrateTimer;
   int _hydrateAttempt = 0;
@@ -82,11 +80,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _justCompleted = false; // shows the settled "done" check in the pill
   Timer? _completedFadeTimer;
   Timer? _cacheTimer; // debounced local transcript persistence
-
-  /// How long a /stop request may stay unacknowledged before the UI releases
-  /// the composer. The server is authoritative, but a dead socket must not
-  /// lock the user out forever.
-  static const Duration _stopGrace = Duration(seconds: 20);
 
   // ---- Voice notes -------------------------------------------------------
 
@@ -753,12 +746,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             }
           }
         }
-        _cancelStopFallback();
         _stopResyncWatch();
         if (mounted) {
           setState(() {
             _sending = false;
-            _stopping = false;
             _remoteRunning = false;
             _lastEventAt = DateTime.now();
           });
@@ -783,11 +774,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           t.segments.add('⚠️ $detail');
         }
         _liveTurn = null;
-        _cancelStopFallback();
         if (mounted) {
           setState(() {
             _sending = false;
-            _stopping = false;
             _remoteRunning = false;
           });
           _updateWakelock();
@@ -1102,11 +1091,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
       _liveTurn = null;
     }
-    _cancelStopFallback();
     _stopResyncWatch();
     setState(() {
       _sending = false;
-      _stopping = false;
       _remoteRunning = false;
       _lastEventAt = DateTime.now();
     });
@@ -1126,10 +1113,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     });
   }
 
-  void _cancelStopFallback() {
-    _stopWatchTimer?.cancel();
-    _stopWatchTimer = null;
-  }
 
   // ---- File / image attachment -----------------------------------------
 
@@ -1219,7 +1202,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       );
       _pending.clear();
       _sending = true;
-      _stopping = false;
       _lastEventAt = DateTime.now();
     });
     _updateWakelock();
@@ -1254,23 +1236,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  /// Cancel the running task (server `/stop` slash command).
-  ///
-  /// The server is authoritative: the busy state clears when `goal_status
-  /// idle` / `turn_end` arrives. A bounded grace timer only covers a dead
-  /// socket, so a stop is never "cut" locally while work is still finishing.
+  /// Cancel the running task. WebUI parity: the run is released at once (the
+  /// socket settles it locally and sends `/stop`), so the stop control never
+  /// stays up waiting for a server acknowledgement.
   void _stop() {
     final chatId = _chatId;
     if (chatId == null || _socket == null || !_busy) return;
     _touchActivity();
-    setState(() => _stopping = true);
     _socket!.stopTask(chatId);
-    _cancelStopFallback();
-    _stopWatchTimer = Timer(_stopGrace, () {
-      if (mounted && _busy) {
-        _forceClearRunning(reason: 'Task cancelled.');
-      }
-    });
+    _forceClearRunning();
   }
 
   void _fail(String msg) {
@@ -1410,7 +1384,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _resyncTimer?.cancel();
     _settleWatch?.cancel();
     _hydrateTimer?.cancel();
-    _stopWatchTimer?.cancel();
     _recordTick?.cancel();
     // Never leave the mic open: a recorder outliving the screen keeps the
     // Android mic indicator on and blocks other apps.
@@ -1489,7 +1462,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         actions: [
           _StatusPill(
             busy: _busy,
-            stopping: _stopping,
             completed: _justCompleted,
           ),
           if (!_connected)
@@ -1571,7 +1543,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           _Composer(
             controller: _input,
             busy: _busy,
-            stopping: _stopping,
             pending: _pending,
             onPick: _pickFiles,
             onRemove: (a) => setState(() => _pending.remove(a)),
@@ -2162,7 +2133,6 @@ class _Composer extends StatefulWidget {
   const _Composer({
     required this.controller,
     required this.busy,
-    required this.stopping,
     required this.pending,
     required this.onPick,
     required this.onRemove,
@@ -2175,7 +2145,6 @@ class _Composer extends StatefulWidget {
   });
   final TextEditingController controller;
   final bool busy;
-  final bool stopping;
   final List<PendingAttachment> pending;
   final VoidCallback onPick;
   final void Function(PendingAttachment) onRemove;
@@ -2371,9 +2340,7 @@ class _ComposerState extends State<_Composer> {
                       decoration: InputDecoration(
                         hintText:
                             widget.busy
-                                ? (widget.stopping
-                                    ? 'Stopping task…'
-                                    : 'Working on your task…')
+                                ? 'Working on your task…'
                                 : 'Assign a task or ask anything',
                         hintStyle:  TextStyle(
                           color: Palette.textTertiary,
@@ -2417,26 +2384,17 @@ class _ComposerState extends State<_Composer> {
                       customBorder: const CircleBorder(),
                       onTap:
                           widget.busy
-                              ? (widget.stopping ? null : widget.onStop)
+                              ? widget.onStop
                               : widget.onSend,
                       child: Padding(
                         padding: const EdgeInsets.all(11),
                         child:
                             widget.busy
-                                ? (widget.stopping
-                                    ? const SizedBox(
-                                      width: 18,
-                                      height: 18,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                        color: Colors.white,
-                                      ),
-                                    )
-                                    : const Icon(
-                                      Icons.stop_rounded,
-                                      color: Colors.white,
-                                      size: 22,
-                                    ))
+                                ? const Icon(
+                                  Icons.stop_rounded,
+                                  color: Colors.white,
+                                  size: 22,
+                                )
                                 : const Icon(
                                   Icons.arrow_upward_rounded,
                                   color: Colors.white,
@@ -2647,12 +2605,10 @@ class _PendingTile extends StatelessWidget {
 class _StatusPill extends StatelessWidget {
   const _StatusPill({
     required this.busy,
-    required this.stopping,
     required this.completed,
   });
 
   final bool busy;
-  final bool stopping;
   final bool completed;
 
   @override
@@ -2668,7 +2624,7 @@ class _StatusPill extends StatelessWidget {
             color: Palette.accent,
           ),
         ),
-        stopping ? 'stopping…' : 'working…',
+        'working…',
       );
     } else if (completed) {
       // Static, non-animating confirmation that the task completed.
