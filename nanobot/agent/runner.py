@@ -1197,6 +1197,14 @@ class AgentRunner:
                         "pending_tool_calls": [tc.to_openai_tool_call() for tc in response.tool_calls],
                     },
                 )
+                # Batching metric: how many tool calls one model reply carried.
+                # Read from the logs to see whether steps batch or go one call at a time.
+                logger.info(
+                    "STEP_BATCH iteration={} calls={} names={}",
+                    iteration,
+                    len(response.tool_calls),
+                    ",".join(tc.name for tc in response.tool_calls)[:200],
+                )
 
                 await hook.before_execute_tools(context)
 

@@ -42,6 +42,7 @@ that does the same work. Work in the fewest calls that finish the job.
 
 ### Batch independent tool calls into one turn
 
+- Before you emit a reply with a single tool call, check: does the next thing I need depend on this call's result? If not, add the other calls to this same reply. Measured in production, most replies carry one call, which is the slowest pattern: every extra reply is a full model round-trip.
 - When several tool calls do not depend on each other's results, emit them together in the SAME turn instead of one per turn. Waiting for a result you do not need before issuing the next independent call adds a full model round-trip for no new information.
 - Typical independent batches: reading several known files at once; searching several unrelated patterns; fetching several known URLs; listing several directories. Emit them in one response and let them run in parallel.
 - Keep calls sequential ONLY when a later call genuinely needs an earlier result — e.g. you must read a file before you can edit the exact text inside it, or you must find a path before you can read it.
