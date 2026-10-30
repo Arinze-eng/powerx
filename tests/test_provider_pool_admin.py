@@ -368,3 +368,14 @@ def test_pool_test_surfaces_a_lane_failure(monkeypatch, tmp_path) -> None:
     assert result["ok"] is False
     assert result["status"] == 429
     assert result["error"] == "HTTP 429"
+
+
+def test_model_fields_are_pickers_fed_by_load_models(monkeypatch) -> None:
+    monkeypatch.setenv("ADMIN_PASSWORD", "nethunter")
+    response = admin_registry.admin_route(_request("/admin"), "/admin")
+    body = bytes(response.body).decode()
+    assert "<select id='poolModelPick'" in body
+    assert "<select id='modelPick'" in body
+    assert "fillPick($('poolModelPick')" in body
+    assert "fillPick($('modelPick')" in body
+    assert "datalist" not in body

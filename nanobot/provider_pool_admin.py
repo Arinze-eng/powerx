@@ -18,7 +18,8 @@ Enter a base URL and key, click <strong>Load models</strong> to pick from the la
 <div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.5rem'>
 <label>Base URL<input id='poolBaseUrl' type='url' placeholder='https://example.com/v1'></label>
 <label>API key<input id='poolApiKey' type='password' placeholder='sk-...' autocomplete='off'></label>
-<label>Model<input id='poolModel' list='poolModelList' placeholder='gpt-4o-mini'><datalist id='poolModelList'></datalist></label>
+<label>Model<select id='poolModelPick'><option value=''>Click Load models, then pick one</option></select></label>
+<label>Or type a model name<input id='poolModel' placeholder='gpt-4o-mini'></label>
 <label>Label (optional)<input id='poolLabel' placeholder='kyma-1'></label>
 </div>
 <button id='poolAdd'>Add entry</button>
@@ -89,6 +90,7 @@ Enter a base URL and key, click <strong>Load models</strong> to pick from the la
       render(v);
       $('poolApiKey').value = '';
       $('poolModel').value = '';
+      $('poolModelPick').value = '';
       sync(v);
     }).catch(function(e){ setStatus(e.message, false); });
   };
@@ -99,20 +101,29 @@ Enter a base URL and key, click <strong>Load models</strong> to pick from the la
     var passed = rows.filter(function(r){ return r.ok; }).length;
     return 'Tested ' + rows.length + ' lane(s): ' + passed + ' passed, ' + (rows.length - passed) + ' failed.';
   };
+  var fillPick = function(sel, models, current){
+    var placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = models.length ? 'Choose a model' : 'No models found';
+    var options = models.map(function(id){
+      var option = document.createElement('option');
+      option.value = id;
+      option.textContent = id;
+      return option;
+    });
+    sel.replaceChildren.apply(sel, [placeholder].concat(options));
+    if(current && models.indexOf(current) !== -1){ sel.value = current; }
+  };
+  $('poolModelPick').onchange = function(){
+    if(this.value){ $('poolModel').value = this.value; }
+  };
   $('poolLoadModels').onclick = function(){
     var payload = {baseUrl: $('poolBaseUrl').value, apiKey: $('poolApiKey').value};
     if(!payload.baseUrl){ setStatus('Enter the base URL first.', false); return; }
     setStatus('Loading models...');
     req('admin.provider.pool.models', payload).then(function(v){
-      var models = v.models || [];
-      var list = $('poolModelList');
-      list.replaceChildren.apply(list, models.map(function(id){
-        var option = document.createElement('option');
-        option.value = id;
-        return option;
-      }));
-      if(models.length && !$('poolModel').value){ $('poolModel').value = models[0]; }
-      setStatus('Loaded ' + (v.count || 0) + ' model(s). Pick one in the Model field.');
+      fillPick($('poolModelPick'), v.models || [], $('poolModel').value.trim());
+      setStatus('Loaded ' + (v.count || 0) + ' model(s). Pick one from the list, or type your own.');
     }).catch(function(e){ setStatus(e.message, false); });
   };
   $('poolTestAll').onclick = function(){
