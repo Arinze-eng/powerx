@@ -238,6 +238,89 @@ def _lane_timeout_s() -> float | None:
     return value
 
 
+# A silent lane is not given the whole first-byte budget before the next lane
+# starts. After this much silence the next lane is started alongside it, and
+# whichever lane speaks first owns the reply; the other is cancelled. Nothing
+# reaches the user from a lane that does not own the reply, so the only cost
+# of a hedge is a duplicate upstream request.
+DEFAULT_HEDGE_AFTER_S = 3.0
+HEDGE_AFTER_ENV = "PROVIDER_POOL_HEDGE_AFTER_S"
+
+
+def _hedge_after_s() -> float | None:
+    """Silence before the next lane is started too, or None to hedge never."""
+    raw = os.environ.get(HEDGE_AFTER_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_HEDGE_AFTER_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_HEDGE_AFTER_S
+    if value <= 0:
+        return None
+    return value
+
+
+class _HedgeGate:
+    """Which lane owns the streamed reply: the first one that produces a delta."""
+
+    def __init__(self) -> None:
+        self.winner: int | None = None
+        self.streamed = False
+        self.wake = asyncio.Event()
+
+    def claim(self, index: int) -> bool:
+        if self.winner is None:
+            self.winner = index
+            self.wake.set()
+        return self.winner == index
+
+
+class _HedgedRun:
+    """One lane's streamed attempt inside a hedged race."""
+
+    def __init__(
+        self,
+        index: int,
+        entry: dict[str, Any],
+        provider: LLMProvider,
+        gate: _HedgeGate,
+    ) -> None:
+        self.index = index
+        self.entry = entry
+        self.provider = provider
+        self.gate = gate
+        self.started = time.monotonic()
+        self.activity = asyncio.Event()
+        self.settled = False
+        self.task: asyncio.Future[LLMResponse] | None = None
+
+    def wrap(
+        self,
+        callback: Callable[[Any], Awaitable[None]] | None,
+        *,
+        content: bool = False,
+    ) -> Callable[[Any], Awaitable[None]] | None:
+        """Forward a delta only while this lane owns the reply.
+
+        ``None`` stays ``None`` for non-content callbacks: providers switch
+        thinking and tool-call streaming on by the callback being present.
+        """
+        if callback is None and not content:
+            return None
+
+        async def _gated(value: Any) -> None:
+            self.activity.set()
+            if not self.gate.claim(self.index):
+                return
+            if content:
+                self.gate.streamed = True
+            if callback is not None:
+                await callback(value)
+
+        return _gated
+
+
 class PoolProvider(LLMProvider):
     """Rotate chat requests across pool lanes, failing over on transient errors.
 
@@ -512,41 +595,142 @@ class PoolProvider(LLMProvider):
         self._forget(session_key)
         return self._best_failure(first_failure, transient)
 
-    async def _call_lane_stream(
-        self,
-        call: Callable[[], Awaitable[LLMResponse]],
-        entry: dict[str, Any],
-        activity: asyncio.Event,
-    ) -> LLMResponse:
-        """Await one streamed lane: fail over if it goes silent, never cut a live stream.
+    def _silent_lane_response(self, entry: dict[str, Any], budget: float) -> LLMResponse:
+        label = entry.get("label") or entry.get("id") or entry.get("baseUrl") or "lane"
+        return LLMResponse(
+            content=None,
+            finish_reason="error",
+            error_kind="timeout",
+            error_type="lane_timeout",
+            error_code=f"lane_timeout:{label}:first_byte:{budget:g}s",
+            error_should_retry=True,
+        )
 
-        Waits up to the first-byte budget for *activity* (any delta from the lane)
-        or for the call to finish. Silence past the budget is a lane failure. Once
-        the lane has spoken, the call is awaited without a cap, so the provider's
-        own idle timeout remains the only limit on a stalled stream.
+    async def _stream_hedged(
+        self,
+        order: list[tuple[dict[str, Any], LLMProvider]],
+        start: Callable[[_HedgedRun], Awaitable[LLMResponse]],
+        *,
+        budget: float | None,
+        hedge: float | None,
+    ) -> tuple[_HedgedRun | None, LLMResponse | None, list[LLMResponse]]:
+        """Race lanes for one streamed reply.
+
+        Returns ``(run, response, failures)``: the lane that owns the reply and
+        its response, or ``(None, None, failures)`` when every lane failed.
+
+        Lanes are started in order. A lane that fails before speaking hands over
+        to the next one at once. A lane silent for *hedge* seconds starts the next
+        one alongside it, and a lane silent for *budget* seconds is failed over.
+        The first lane to produce a delta owns the reply; the others are cancelled.
         """
-        budget = _first_byte_timeout_s()
-        if budget is None:
-            return await self._call_lane(call, entry)
-        task = asyncio.ensure_future(call())
-        waiter = asyncio.ensure_future(activity.wait())
+        gate = _HedgeGate()
+        queue = list(order)
+        runs: list[_HedgedRun] = []
+        failures: list[LLMResponse] = []
+
+        def launch() -> None:
+            entry, provider = queue.pop(0)
+            run = _HedgedRun(len(runs), entry, provider, gate)
+            run.task = asyncio.ensure_future(start(run))
+            runs.append(run)
+
+        def park_failed(run: _HedgedRun, response: LLMResponse) -> None:
+            self._park(run.entry, response)
+            run.settled = True
+            failures.append(response)
+
         try:
-            await asyncio.wait({task, waiter}, timeout=budget, return_when=asyncio.FIRST_COMPLETED)
-            if not task.done() and not activity.is_set():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-                label = entry.get("label") or entry.get("id") or entry.get("baseUrl") or "lane"
-                return LLMResponse(
-                    content=None,
-                    finish_reason="error",
-                    error_kind="timeout",
-                    error_type="lane_timeout",
-                    error_code=f"lane_timeout:{label}:first_byte:{budget:g}s",
-                    error_should_retry=True,
+            launch()
+            while True:
+                if gate.winner is not None:
+                    win = runs[gate.winner]
+                    losers = [r for r in runs if r is not win and not r.settled]
+                    for r in losers:
+                        r.settled = True
+                        if r.task is not None and not r.task.done():
+                            r.task.cancel()
+                    pending = [r.task for r in losers if r.task is not None]
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    assert win.task is not None
+                    response = await win.task
+                    win.settled = True
+                    if gate.streamed or not self._should_failover(response):
+                        return win, response, failures
+                    # Failed before any content reached the user: rotate on.
+                    park_failed(win, response)
+                    gate = _HedgeGate()
+                    if not queue:
+                        return None, None, failures
+                    launch()
+                    continue
+
+                # Lanes that finished without owning the reply.
+                for r in runs:
+                    if r.settled or r.task is None or not r.task.done():
+                        continue
+                    response = r.task.result()
+                    if not self._should_failover(response):
+                        gate.winner = r.index
+                        break
+                    park_failed(r, response)
+                if gate.winner is not None:
+                    continue
+
+                # Lanes silent past the first-byte budget fail over.
+                if budget is not None:
+                    for r in runs:
+                        if r.settled or r.task is None or r.task.done():
+                            continue
+                        if r.activity.is_set():
+                            continue
+                        if time.monotonic() - r.started >= budget:
+                            r.task.cancel()
+                            await asyncio.gather(r.task, return_exceptions=True)
+                            if gate.winner is not None:
+                                break
+                            park_failed(r, self._silent_lane_response(r.entry, budget))
+                    if gate.winner is not None:
+                        continue
+
+                live = [r for r in runs if not r.settled]
+                newest = runs[-1]
+                if not live and not queue:
+                    return None, None, failures
+                now = time.monotonic()
+                hedge_due = (
+                    hedge is not None
+                    and bool(queue)
+                    and not newest.settled
+                    and not newest.activity.is_set()
+                    and now - newest.started >= hedge
                 )
-            return await task
+                if queue and (newest.settled or hedge_due):
+                    launch()
+                    continue
+
+                deadlines: list[float] = []
+                if hedge is not None and queue and not newest.activity.is_set():
+                    deadlines.append(newest.started + hedge)
+                if budget is not None:
+                    deadlines.extend(
+                        r.started + budget for r in live if not r.activity.is_set()
+                    )
+                timeout = max(0.0, min(deadlines) - now) if deadlines else None
+                wake = asyncio.ensure_future(gate.wake.wait())
+                try:
+                    await asyncio.wait(
+                        [r.task for r in live if r.task is not None] + [wake],
+                        timeout=timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    wake.cancel()
         finally:
-            waiter.cancel()
+            for r in runs:
+                if r.task is not None and not r.task.done():
+                    r.task.cancel()
 
     async def chat_stream(
         self,
@@ -561,60 +745,35 @@ class PoolProvider(LLMProvider):
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        first_failure: LLMResponse | None = None
-        transient: LLMResponse | None = None
-        streamed = False
         session_key = self._current_session()
 
-        async def _track(delta: str) -> None:
-            nonlocal streamed
-            streamed = True
-            if on_content_delta is not None:
-                await on_content_delta(delta)
-
-        def _marking(
-            event: asyncio.Event, callback: Callable[[Any], Awaitable[None]] | None
-        ) -> Callable[[Any], Awaitable[None]] | None:
-            # Keep None as None: providers switch thinking/tool streaming on by callback.
-            if callback is None:
-                return None
-
-            async def _wrapped(value: Any) -> None:
-                event.set()
-                await callback(value)
-
-            return _wrapped
-
-        for entry, provider in self._order():
-            activity = asyncio.Event()
-            # The content callback is always set, so every content delta marks activity.
-            content_marked = _marking(activity, _track)
-            response = await self._call_lane_stream(
-                lambda p=provider, e=entry, cm=content_marked, a=activity: p.chat_stream(
-                    messages=messages,
-                    tools=tools,
-                    model=e.get("model") or model,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    reasoning_effort=reasoning_effort,
-                    tool_choice=tool_choice,
-                    on_content_delta=cm,
-                    on_thinking_delta=_marking(a, on_thinking_delta),
-                    on_tool_call_delta=_marking(a, on_tool_call_delta),
-                ),
-                entry,
-                activity,
+        def _start(run: _HedgedRun) -> Awaitable[LLMResponse]:
+            return run.provider.chat_stream(
+                messages=messages,
+                tools=tools,
+                model=run.entry.get("model") or model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                tool_choice=tool_choice,
+                on_content_delta=run.wrap(on_content_delta, content=True),
+                on_thinking_delta=run.wrap(on_thinking_delta),
+                on_tool_call_delta=run.wrap(on_tool_call_delta),
             )
+
+        budget = _first_byte_timeout_s()
+        # No silence guard means no silence to hedge against: lanes run in turn.
+        hedge = _hedge_after_s() if budget is not None else None
+        winner, response, failures = await self._stream_hedged(
+            self._order(), _start, budget=budget, hedge=hedge
+        )
+        if winner is not None and response is not None:
             # Never rotate after output has reached the user: a retry would duplicate it.
-            if streamed or not self._should_failover(response):
-                self._remember(session_key, entry)
-                return response
-            self._park(entry, response)
-            if first_failure is None:
-                first_failure = response
-            if transient is None and not self._is_terminal_failure(response):
-                transient = response
+            self._remember(session_key, winner.entry)
+            return response
         self._forget(session_key)
+        first_failure = failures[0] if failures else None
+        transient = next((f for f in failures if not self._is_terminal_failure(f)), None)
         return self._best_failure(first_failure, transient)
 
     def get_default_model(self) -> str:
