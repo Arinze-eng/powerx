@@ -155,6 +155,9 @@ _THINKING_STYLE_MAP: dict[
     "thinking_type": lambda on: {"thinking": {"type": "enabled" if on else "disabled"}},
     "enable_thinking": lambda on: {"enable_thinking": on},
     "reasoning_split": lambda on: {"reasoning_split": on},
+    # vLLM / NVIDIA NIM style: the chat template reads ``enable_thinking`` from
+    # ``chat_template_kwargs`` (NVIDIA Nemotron model cards document this).
+    "chat_template_kwargs": lambda on: {"chat_template_kwargs": {"enable_thinking": on}},
 }
 _GATEWAY_REASONING_STYLE_MAP: dict[
     str,
@@ -208,11 +211,36 @@ def _requires_max_completion_tokens(model_name: str) -> bool:
     )
 
 
+#: Env switch that overrides the thinking decision for every model call.
+#: ``auto`` (default) keeps the reasoning_effort-driven behaviour. ``off`` turns
+#: thinking off and ``on`` turns it on, regardless of the speed profile. Any
+#: other value is treated as ``auto`` so a typo cannot silently change behaviour.
+THINKING_MODE_ENV = "POWERX_THINKING"
+
+#: The wire style used when the switch forces thinking on/off for a model that
+#: has no built-in toggle. Set to another ``_THINKING_STYLE_MAP`` key to change
+#: the wire format for a gateway that expects something else.
+THINKING_WIRE_STYLE_DEFAULT = "chat_template_kwargs"
+
+
+def _thinking_mode() -> str:
+    raw = os.getenv(THINKING_MODE_ENV, "").strip().lower()
+    return raw if raw in ("on", "off") else "auto"
+
+
+def _forced_thinking_wire_style() -> str:
+    style = os.getenv("POWERX_THINKING_WIRE", "").strip() or THINKING_WIRE_STYLE_DEFAULT
+    return style if style in _THINKING_STYLE_MAP else THINKING_WIRE_STYLE_DEFAULT
+
+
 def _model_thinking_style(model_name: str) -> str:
     slug = _model_slug(model_name)
     exact = _MODEL_THINKING_STYLES.get(slug)
     if exact:
         return exact
+    # NVIDIA Nemotron (served through NIM) toggles thinking via the chat template.
+    if slug.startswith("nemotron"):
+        return "chat_template_kwargs"
     # A forced-thinking GLM gets no style at all rather than "disabled": the
     # disabled value is rejected by the API, and "enabled" is already its
     # default, so sending nothing is both correct and safe.
@@ -1249,14 +1277,26 @@ class OpenAICompatProvider(LLMProvider):
 
         # Only send thinking controls when reasoning_effort is explicit so
         # omitting the config preserves each provider's default.
-        if reasoning_effort is not None:
-            thinking_enabled = semantic_effort not in ("none", "minimal")
-            for thinking_style in _thinking_styles_for(spec, model_name):
+        thinking_mode = _thinking_mode()
+        if reasoning_effort is not None or thinking_mode != "auto":
+            if thinking_mode == "auto":
+                thinking_enabled = semantic_effort not in ("none", "minimal")
+                thinking_styles = _thinking_styles_for(spec, model_name)
+            else:
+                # The env switch decides, not the speed profile. A model with a
+                # built-in toggle keeps its own wire format; any other model gets
+                # the configured fallback style.
+                thinking_enabled = thinking_mode == "on"
+                thinking_styles = _thinking_styles_for(spec, model_name) or [
+                    _forced_thinking_wire_style()
+                ]
+            for thinking_style in thinking_styles:
                 if not thinking_enabled and slug in _KIMI_ALWAYS_THINKING_MODELS:
                     continue
                 extra = _thinking_extra_body(thinking_style, thinking_enabled)
                 if extra:
                     kwargs.setdefault("extra_body", {}).update(extra)
+        if reasoning_effort is not None:
             gateway_style = getattr(spec, "gateway_reasoning_style", "") if spec else ""
             if (
                 gateway_style
