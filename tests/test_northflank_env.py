@@ -51,7 +51,7 @@ def test_configured_reflects_token(monkeypatch) -> None:
     monkeypatch.setenv(northflank_env.TOKEN_VAR, "nf-test-token")
     assert northflank_env.configured() is True
     cfg = northflank_env.config()
-    assert cfg == {"token": "nf-test-token", "project": "minis", "service": "powerx"}
+    assert cfg == {"token": "nf-test-token", "project": "cdnai", "service": "powerx"}
 
 
 def test_defaults_can_be_overridden(monkeypatch) -> None:
@@ -68,7 +68,7 @@ def test_get_runtime_environment(monkeypatch) -> None:
     assert northflank_env.get_runtime_environment() == {"A": "1"}
     call = _FakeClient.calls[0]
     assert call["method"] == "GET"
-    assert call["url"].endswith("/projects/minis/services/powerx/runtime-environment")
+    assert call["url"].endswith("/projects/cdnai/services/powerx/runtime-environment")
     assert call["headers"]["Authorization"] == "Bearer nf-test-token"
 
 
@@ -82,7 +82,7 @@ def test_set_env_var_merges_and_patches(monkeypatch) -> None:
     assert merged == {"EXISTING": "keep-me", "PROVIDER-POOL-JSON": "{\"entries\":[]}"}
     patch = _FakeClient.calls[1]
     assert patch["method"] == "PATCH"
-    assert patch["url"].endswith("/projects/minis/services/combined/powerx")
+    assert patch["url"].endswith("/projects/cdnai/services/combined/powerx")
     assert patch["json"]["runtimeEnvironment"]["EXISTING"] == "keep-me"
     assert patch["json"]["runtimeEnvironment"]["PROVIDER-POOL-JSON"] == "{\"entries\":[]}"
 
@@ -93,7 +93,7 @@ def test_restart_service(monkeypatch) -> None:
     northflank_env.restart_service()
     call = _FakeClient.calls[0]
     assert call["method"] == "POST"
-    assert call["url"].endswith("/projects/minis/services/powerx/restart")
+    assert call["url"].endswith("/projects/cdnai/services/powerx/restart")
 
 
 def test_http_error_raises(monkeypatch) -> None:

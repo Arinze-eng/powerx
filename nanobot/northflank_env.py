@@ -22,7 +22,7 @@ import httpx
 TOKEN_VAR = "NORTHFLANK_API_TOKEN"
 PROJECT_VAR = "NORTHFLANK_PROJECT_ID"
 SERVICE_VAR = "NORTHFLANK_SERVICE_ID"
-DEFAULT_PROJECT = "minis"
+DEFAULT_PROJECT = "cdnai"
 DEFAULT_SERVICE = "powerx"
 
 API_BASE = os.getenv("NORTHFLANK_API_BASE", "https://api.northflank.com/v1").rstrip("/")
