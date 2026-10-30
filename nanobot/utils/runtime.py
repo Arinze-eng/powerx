@@ -101,6 +101,45 @@ def turn_budget_seconds() -> float:
     return value if value > 0 else 0.0
 
 
+def time_note_enabled() -> bool:
+    """Whether each model request carries the elapsed/remaining time note.
+
+    On by default. ``POWERX_TIME_NOTE=off`` turns it off, which is the switch
+    to use for an A/B comparison or to roll back without a code change.
+    """
+    return os.environ.get("POWERX_TIME_NOTE", "on").strip().lower() != "off"
+
+
+def turn_time_note(elapsed_s: float, budget_s: float) -> dict[str, str]:
+    """A per-request note telling the model how much of the turn budget is gone.
+
+    The note is built fresh for each request and appended to the request view
+    only, never to the saved transcript, so it does not accumulate and does not
+    break the cached prefix. It is the model's only clock: without it the model
+    cannot tell a 2-minute turn from one that is 25 minutes in.
+    """
+    used_s = max(0.0, elapsed_s)
+    left_s = max(0.0, budget_s - used_s)
+    if left_s <= budget_s * 0.25:
+        pacing = (
+            "Less than a quarter of the time is left. Wrap up now: finish the "
+            "step in progress, then give the user what is done and what remains."
+        )
+    else:
+        pacing = (
+            "Keep the remaining work to as few model steps as possible. Batch "
+            "independent tool calls into one step, and do not spend a step on "
+            "anything the user did not ask for."
+        )
+    return {
+        "role": "user",
+        "content": (
+            f"[Time check] {used_s / 60.0:.0f} of {budget_s / 60.0:.0f} minutes used, "
+            f"about {left_s / 60.0:.0f} minutes left in this turn. {pacing}"
+        ),
+    }
+
+
 def empty_tool_result_message(tool_name: str) -> str:
     """Short prompt-safe marker for tools that completed without visible output."""
     return f"({tool_name} completed with no output)"

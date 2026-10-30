@@ -160,7 +160,10 @@ async def test_pending_document_attachment_keeps_body_out_of_prompt(
     injected_user_content = [
         message["content"]
         for message in captured_messages[-1]
-        if message.get("role") == "user" and isinstance(message.get("content"), str)
+        if message.get("role") == "user"
+        and isinstance(message.get("content"), str)
+        # The per-request time note is also a user message; skip it here.
+        and "[Time check]" not in message["content"]
     ][-1]
     assert "check this" in injected_user_content
     assert f"[Attachment: {doc_path}]" in injected_user_content

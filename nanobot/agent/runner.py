@@ -93,7 +93,9 @@ from nanobot.utils.runtime import (
     repeated_external_lookup_error,
     repeated_workspace_violation_error,
     stuck_pattern,
+    time_note_enabled,
     turn_budget_seconds,
+    turn_time_note,
 )
 
 GoalContinueMessage = str | Callable[[], str | None]
@@ -817,9 +819,14 @@ class AgentRunner:
         turn_budget = (
             spec.turn_budget_s if spec.turn_budget_s is not None else turn_budget_seconds()
         )
+        turn_started = time.monotonic()
         turn_deadline = (
-            time.monotonic() + turn_budget if turn_budget and turn_budget > 0 else None
+            turn_started + turn_budget if turn_budget and turn_budget > 0 else None
         )
+        # The model has no clock of its own. When a budget exists, each request
+        # carries elapsed/remaining time so it can batch harder or wrap up as the
+        # budget runs down. Request view only; see ``turn_time_note``.
+        send_time_note = turn_deadline is not None and time_note_enabled()
         pending_stream_content: str | None = None
         provider_state = spec.provider_state
         if spec.strip_image_content_before_provider:
@@ -1119,6 +1126,15 @@ class AgentRunner:
                 if steer_message is not None
                 else messages_for_model
             )
+            # The time note is for this request only. It stays out of
+            # ``supplemental_messages``: that list is folded into the provider's
+            # candidate conversation state, which would carry one stale note per
+            # iteration into every later request.
+            if send_time_note:
+                request_messages = [
+                    *request_messages,
+                    turn_time_note(time.monotonic() - turn_started, turn_budget),
+                ]
             provider_context = conversation_state.prepare_request(
                 messages,
                 context_window_tokens=spec.runtime.context_window_tokens,
