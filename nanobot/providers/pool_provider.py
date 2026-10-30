@@ -199,6 +199,30 @@ def _cooldown_seconds(env_name: str, default: float) -> float:
     return value if value > 0 else 0.0
 
 
+# Streamed requests are judged on time-to-first-activity, not total duration.
+#
+# A healthy lane can stream a long answer for minutes; cutting it at a wall-clock
+# cap threw the work away and re-ran it on another lane. What needs bounding is a
+# lane that goes silent: no content, thinking or tool-call delta within this
+# window means the lane is dead or stalled, and the next lane should answer now.
+DEFAULT_FIRST_BYTE_TIMEOUT_S = 20.0
+FIRST_BYTE_TIMEOUT_ENV = "PROVIDER_POOL_FIRST_BYTE_TIMEOUT_S"
+
+
+def _first_byte_timeout_s() -> float | None:
+    """Silence budget for a streamed lane, or None to disable it."""
+    raw = os.environ.get(FIRST_BYTE_TIMEOUT_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_FIRST_BYTE_TIMEOUT_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_FIRST_BYTE_TIMEOUT_S
+    if value <= 0:
+        return None
+    return value
+
+
 def _lane_timeout_s() -> float | None:
     """Per-lane wall-clock budget, or None to disable the guard entirely."""
     raw = os.environ.get(LANE_TIMEOUT_ENV)
@@ -488,6 +512,42 @@ class PoolProvider(LLMProvider):
         self._forget(session_key)
         return self._best_failure(first_failure, transient)
 
+    async def _call_lane_stream(
+        self,
+        call: Callable[[], Awaitable[LLMResponse]],
+        entry: dict[str, Any],
+        activity: asyncio.Event,
+    ) -> LLMResponse:
+        """Await one streamed lane: fail over if it goes silent, never cut a live stream.
+
+        Waits up to the first-byte budget for *activity* (any delta from the lane)
+        or for the call to finish. Silence past the budget is a lane failure. Once
+        the lane has spoken, the call is awaited without a cap, so the provider's
+        own idle timeout remains the only limit on a stalled stream.
+        """
+        budget = _first_byte_timeout_s()
+        if budget is None:
+            return await self._call_lane(call, entry)
+        task = asyncio.ensure_future(call())
+        waiter = asyncio.ensure_future(activity.wait())
+        try:
+            await asyncio.wait({task, waiter}, timeout=budget, return_when=asyncio.FIRST_COMPLETED)
+            if not task.done() and not activity.is_set():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                label = entry.get("label") or entry.get("id") or entry.get("baseUrl") or "lane"
+                return LLMResponse(
+                    content=None,
+                    finish_reason="error",
+                    error_kind="timeout",
+                    error_type="lane_timeout",
+                    error_code=f"lane_timeout:{label}:first_byte:{budget:g}s",
+                    error_should_retry=True,
+                )
+            return await task
+        finally:
+            waiter.cancel()
+
     async def chat_stream(
         self,
         messages: list[dict[str, Any]],
@@ -512,9 +572,25 @@ class PoolProvider(LLMProvider):
             if on_content_delta is not None:
                 await on_content_delta(delta)
 
+        def _marking(
+            event: asyncio.Event, callback: Callable[[Any], Awaitable[None]] | None
+        ) -> Callable[[Any], Awaitable[None]] | None:
+            # Keep None as None: providers switch thinking/tool streaming on by callback.
+            if callback is None:
+                return None
+
+            async def _wrapped(value: Any) -> None:
+                event.set()
+                await callback(value)
+
+            return _wrapped
+
         for entry, provider in self._order():
-            response = await self._call_lane(
-                lambda p=provider, e=entry: p.chat_stream(
+            activity = asyncio.Event()
+            # The content callback is always set, so every content delta marks activity.
+            content_marked = _marking(activity, _track)
+            response = await self._call_lane_stream(
+                lambda p=provider, e=entry, cm=content_marked, a=activity: p.chat_stream(
                     messages=messages,
                     tools=tools,
                     model=e.get("model") or model,
@@ -522,11 +598,12 @@ class PoolProvider(LLMProvider):
                     temperature=temperature,
                     reasoning_effort=reasoning_effort,
                     tool_choice=tool_choice,
-                    on_content_delta=_track,
-                    on_thinking_delta=on_thinking_delta,
-                    on_tool_call_delta=on_tool_call_delta,
+                    on_content_delta=cm,
+                    on_thinking_delta=_marking(a, on_thinking_delta),
+                    on_tool_call_delta=_marking(a, on_tool_call_delta),
                 ),
                 entry,
+                activity,
             )
             # Never rotate after output has reached the user: a retry would duplicate it.
             if streamed or not self._should_failover(response):
